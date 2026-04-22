@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TeamOfTen — M1</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0d1117;
+        --fg: #e6edf3;
+        --muted: #8b949e;
+        --accent: #58a6ff;
+        --border: #30363d;
+        --card: #161b22;
+        --ok: #3fb950;
+        --err: #f85149;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      header {
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+      header h1 {
+        font-size: 15px;
+        margin: 0;
+        font-weight: 600;
+      }
+      header .status {
+        margin-left: auto;
+        color: var(--muted);
+      }
+      header .dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--err);
+        margin-right: 6px;
+        vertical-align: middle;
+      }
+      header .dot.ok { background: var(--ok); }
+      main {
+        display: grid;
+        grid-template-columns: 1fr 360px;
+        gap: 0;
+        height: calc(100vh - 49px);
+      }
+      @media (max-width: 720px) {
+        main { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+      }
+      #events {
+        padding: 12px 16px;
+        overflow-y: auto;
+        background: var(--bg);
+      }
+      .ev {
+        padding: 6px 10px;
+        margin-bottom: 6px;
+        border-left: 3px solid var(--border);
+        background: var(--card);
+        border-radius: 0 4px 4px 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .ev.text { border-color: var(--accent); }
+      .ev.tool_use { border-color: #a371f7; }
+      .ev.result { border-color: var(--ok); color: var(--muted); font-size: 12px; }
+      .ev.error { border-color: var(--err); color: var(--err); }
+      .ev.agent_started, .ev.agent_stopped, .ev.connected { color: var(--muted); font-size: 12px; }
+      .ev .meta {
+        color: var(--muted);
+        font-size: 11px;
+        margin-bottom: 2px;
+      }
+      form {
+        padding: 16px;
+        border-left: 1px solid var(--border);
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        background: var(--card);
+      }
+      @media (max-width: 720px) {
+        form { border-left: none; border-top: 1px solid var(--border); }
+      }
+      label {
+        font-size: 12px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+      }
+      input, textarea {
+        width: 100%;
+        padding: 8px 10px;
+        background: var(--bg);
+        color: var(--fg);
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        font: inherit;
+      }
+      textarea { min-height: 100px; resize: vertical; }
+      button {
+        padding: 10px;
+        background: var(--accent);
+        color: var(--bg);
+        border: 0;
+        border-radius: 4px;
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>TeamOfTen — M1</h1>
+      <span class="status"><span class="dot" id="wsdot"></span><span id="wsstate">connecting…</span></span>
+    </header>
+    <main>
+      <div id="events"></div>
+      <form id="form">
+        <div>
+          <label for="agent_id">agent id</label>
+          <input id="agent_id" value="w1" autocomplete="off" />
+        </div>
+        <div>
+          <label for="prompt">prompt</label>
+          <textarea id="prompt" placeholder="Ask the agent to do something terse, e.g. 'say hello'"></textarea>
+        </div>
+        <button type="submit" id="submit">start agent</button>
+      </form>
+    </main>
+    <script>
+      const eventsEl = document.getElementById("events");
+      const wsDot = document.getElementById("wsdot");
+      const wsState = document.getElementById("wsstate");
+      const form = document.getElementById("form");
+      const submitBtn = document.getElementById("submit");
+
+      function append(ev) {
+        const div = document.createElement("div");
+        div.className = "ev " + (ev.type || "");
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        const ts = (ev.ts || "").slice(11, 19);
+        meta.textContent = `${ts}  ${ev.agent_id || "?"}  ${ev.type}`;
+        div.appendChild(meta);
+        if (ev.type === "text" && ev.content) {
+          div.appendChild(document.createTextNode(ev.content));
+        } else if (ev.type === "tool_use") {
+          div.appendChild(document.createTextNode(`${ev.name}  ${JSON.stringify(ev.input)}`));
+        } else if (ev.type === "error" && ev.error) {
+          div.appendChild(document.createTextNode(ev.error));
+        } else if (ev.type === "result") {
+          const s = `duration=${ev.duration_ms ?? "?"}ms  cost=$${ev.cost_usd ?? "?"}  error=${ev.is_error}`;
+          div.appendChild(document.createTextNode(s));
+        } else if (ev.prompt) {
+          div.appendChild(document.createTextNode(`prompt: ${ev.prompt}`));
+        }
+        eventsEl.appendChild(div);
+        eventsEl.scrollTop = eventsEl.scrollHeight;
+      }
+
+      let ws;
+      function connect() {
+        const proto = location.protocol === "https:" ? "wss:" : "ws:";
+        ws = new WebSocket(`${proto}//${location.host}/ws`);
+        ws.onopen = () => { wsDot.classList.add("ok"); wsState.textContent = "connected"; };
+        ws.onmessage = (e) => { try { append(JSON.parse(e.data)); } catch (_) {} };
+        ws.onclose = () => {
+          wsDot.classList.remove("ok");
+          wsState.textContent = "disconnected, retrying…";
+          setTimeout(connect, 2000);
+        };
+        ws.onerror = () => ws.close();
+      }
+      connect();
+
+      form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const agent_id = document.getElementById("agent_id").value.trim() || "w1";
+        const prompt = document.getElementById("prompt").value.trim();
+        if (!prompt) return;
+        submitBtn.disabled = true;
+        try {
+          const res = await fetch("/api/agents/start", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ agent_id, prompt }),
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          document.getElementById("prompt").value = "";
+        } catch (err) {
+          append({ ts: new Date().toISOString(), agent_id: "system", type: "error", error: String(err) });
+        } finally {
+          submitBtn.disabled = false;
+        }
+      });
+    </script>
+  </body>
+</html>
