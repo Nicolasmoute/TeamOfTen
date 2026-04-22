@@ -1,8 +1,14 @@
 # TeamOfTen — Claude Code Harness
 
-A personal orchestration harness for **1 coordinator + 10 worker Claude Code agents**, sharing memory and a task board, with a multi-pane web UI, deployed to a single VPS (Zeabur). Max-plan OAuth only — no API keys.
+A personal orchestration harness for a **team of 11 Claude Code agents — 1 Coach + 10 Players** — sharing memory and a task board, with a multi-pane web UI, deployed to a single VPS (Zeabur). Max-plan OAuth only — no API keys.
 
 **Full spec**: [Docs/HARNESS_SPEC.md](Docs/HARNESS_SPEC.md) — read it before touching server code.
+
+## Team vocabulary
+
+- **Coach** (slot id `coach`) — the coordinator. Receives human goals, decomposes into tasks, assigns work. Never writes code. **Only Coach gives orders.**
+- **Players** (slot ids `p1`–`p10`) — workers. Each Player has a **name** (e.g. "Alice") and a **role description** (e.g. "Developer — writes code") both **assigned by Coach** at team-composition time. Players execute work, report back, and may message peers for information — but **Players never give orders** to other Players.
+- **Team** — all 11 agents together. "Team of ten" refers to the 10 Player slots; Coach is always on.
 
 ---
 
@@ -31,7 +37,7 @@ See [Docs/HARNESS_SPEC.md §14](Docs/HARNESS_SPEC.md) for the full M0–M9 build
 
 ## Critical invariants (do not violate without discussion)
 
-1. **Single-writer discipline for state.** Only the coordinator process writes to the SQLite state tables and flushes to kDrive. Workers emit events via `coord_*` MCP tools; coordinator folds them in. Do NOT add code paths where workers directly mutate shared state.
+1. **Single write-handle discipline.** All agents write freely — they chat (`coord_send_message`), claim tasks, update progress, create subtasks, drop notes in shared memory. But every write routes through the harness server process, which holds the only SQLite write handle. Do NOT add code paths where an agent opens its own DB connection or edits `state/*.json` directly. The point is ordering + audit, not restricting agent autonomy.
 
 2. **Per-worktree isolation is the primary concurrency control.** Each worker operates in its own git worktree under `workspaces/wN/`. Locks (`coord_acquire_lock`) are **advisory only**, for logical cross-worktree resources (e.g. "only one worker runs the migration"). Don't reach for locks when a worktree would do.
 

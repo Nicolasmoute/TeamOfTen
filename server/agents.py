@@ -36,8 +36,9 @@ async def run_agent(agent_id: str, prompt: str) -> None:
 
     options = ClaudeAgentOptions(
         system_prompt=(
-            f"You are {agent_id}, a test worker in the TeamOfTen harness. "
-            f"Be terse."
+            f"You are slot {agent_id} in the TeamOfTen harness. "
+            f"M1 is a smoke-test milestone — your name and role will be "
+            f"assigned by Coach in M2. For now, be terse."
         ),
         cwd="/workspaces/default",
         max_turns=10,

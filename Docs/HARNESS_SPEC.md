@@ -154,37 +154,49 @@ harness/
 
 ---
 
-## 4. Agent Roster
+## 4. Agent Roster — the Team
 
-11 agents total: 1 coordinator + 10 workers.
+11 agents total: 1 **Coach** + 10 **Players**. Sports metaphor is deliberate — it makes the hierarchy and accountability natural.
 
-| ID | Role | Responsibility | Default model |
-|---|---|---|---|
-| `coord` | Coordinator | Task decomposition, routing, digest generation, conflict resolution | Sonnet |
-| `w1` … `w10` | Workers | Claim tasks, do the work, report back | Sonnet (upgrade to Opus per-task) |
+| ID | Kind | Name | Role | Default model |
+|---|---|---|---|---|
+| `coach` | Coach | fixed: "Coach" | Team captain — decomposes goals, assigns work, synthesizes progress | Sonnet (optionally Opus) |
+| `p1` … `p10` | Players | **assigned by Coach** (e.g. "Alice", "Ravi") | **assigned by Coach** (e.g. "Developer — writes code", "Reviewer — checks correctness") | Sonnet (upgrade per task) |
 
-### Coordinator responsibilities
+**Name** and **role** for each Player are Coach-assigned, not hardcoded. When you give the Coach a project, the first thing it does is decide the team composition — what roles are needed, who's on the bench — and stamp each active Player with a name + role description. The slot IDs `p1`–`p10` are just slots; Players come and go within them as projects change.
 
-- Reads incoming human goals from `inbox/coord`
-- Breaks them into tasks, writes to `state/tasks.json`
-- Assigns tasks to idle workers (or leaves them unassigned for self-claim)
-- Watches for blocked tasks and reroutes
-- Writes daily/weekly digests to `digests/`
-- Never writes code directly — delegates to workers
+### Coach responsibilities
+
+- Reads incoming human goals from inbox
+- Decides the team composition for the goal: assigns `name` + `role` to each Player it needs to activate
+- Breaks goals into tasks, writes them to the task board
+- **Gives orders** — sends directed tasks/messages to Players
+- Monitors progress, unblocks, reroutes on failure
+- Writes daily/weekly digests
+- Never writes code directly — delegates to Players
 - Runs on a cheap loop (every 60s + on event), not continuously
 
-### Worker responsibilities
+### Player responsibilities
 
-- Polls for claimable tasks (or receives direct assignment from `coord`)
-- Claims via the `coord_claim_task` tool
-- Executes in its own git worktree under `workspaces/wN/`
-- Writes progress events, commits changes, opens PRs or merges to branches
-- Sends messages to other workers when blocked (`coord_send_message`)
-- Writes findings to shared memory via `coord_update_memory`
+- Reads inbox for Coach orders and peer messages
+- Claims open tasks from the board (or executes the ones assigned directly)
+- Does the work in its own git worktree under `workspaces/pN/`
+- Writes progress events, commits, pushes branches, opens PRs
+- **Informs but never orders** — messages Coach and peers to coordinate, shares findings via shared memory, but doesn't assign work to other Players
+- Reports back ("done", "blocked", "need X") via `coord_update_task` / `coord_send_message`
 
-### Why 10 workers specifically
+### The rule: Coach orders, Players report
 
-Max plan realistic concurrency is lower than 10 for continuous loops. The roster defines *potential* agents, not *always-on* agents. You start the ones you need — typically 2–5 concurrent during active work. The harness supports up to 10 spawned simultaneously; beyond that, SDK call overhead and Max plan caps push back.
+This is a **soft rule enforced by prompts** plus a **hard rule enforced structurally**:
+
+- **Soft (prompts)**: Coach's system prompt says "you delegate, never implement"; Player's prompt says "you execute and report, you do not assign work to peers."
+- **Hard (structure)**: top-level tasks can only be created by Coach. A Player calling `coord_create_task` gets its task auto-nested as a subtask of the Player's own parent task (i.e. a Player can break its own work down, but cannot create work for others). A Player cannot set `owner` of any task to another Player.
+
+Players may freely message each other for information ("done with migration", "I think the bug is in X, check?"), but the act of assigning work is reserved for Coach.
+
+### Why 10 Players specifically
+
+Max plan realistic concurrency is lower than 10 for continuous loops. The roster defines *potential* slots, not *always-on* agents. Coach activates the slots it needs — typically 2–5 concurrent during active work. The harness supports up to 10 spawned simultaneously; beyond that, SDK call overhead and Max plan caps push back.
 
 ---
 
@@ -196,13 +208,15 @@ All stored as JSON (state) or Markdown (human-readable notes) on kDrive. In-memo
 
 ```python
 class Agent(BaseModel):
-    id: str                          # "coord", "w1", ... "w10"
-    role: Literal["coordinator", "worker"]
+    id: str                          # "coach", "p1", ... "p10" — fixed slot
+    kind: Literal["coach", "player"]
+    name: str | None                 # Coach-assigned display name (e.g. "Alice"); "Coach" is fixed for the coach slot
+    role: str | None                 # Coach-assigned role description (e.g. "Developer — writes code for the project")
     status: Literal["stopped", "idle", "working", "waiting", "error"]
     current_task_id: str | None
     model: str                       # "claude-sonnet-4-6" etc.
-    workspace_path: str              # "/workspaces/w1"
-    system_prompt_path: str          # "prompts/worker.md"
+    workspace_path: str              # "/workspaces/p1"
+    system_prompt_path: str          # "prompts/player.md"
     loop_config: LoopConfig | None   # if set, agent runs on loop
     started_at: datetime | None
     last_heartbeat: datetime | None
@@ -344,11 +358,18 @@ The harness keeps **hot state in a local SQLite file** and **durable/human-reada
 
 ## 7. Coordination Mechanics
 
-### Write model: single-writer, event-sourced
+### Write model: commons with a single write handle
 
-- Workers **never** mutate `state/*` files or the SQLite tables directly. They call `coord_*` tools, which enqueue intents on the coordinator process.
-- The coordinator is the only writer. It folds incoming events/intents into SQLite, then periodically snapshots to kDrive.
-- This turns "10 agents racing on a shared JSON file" into "10 agents emitting events to one in-process queue" — which is a solved problem.
+Agents collaborate on a shared commons. Every agent (workers AND the coordinator) writes freely — they chat, claim tasks, update progress, create subtasks, drop notes in `memory/`. The design encourages frequent writes.
+
+What makes it sane under 11 concurrent writers: **all writes route through the harness server process**, which holds the only SQLite write handle and serializes incoming `coord_*` tool calls.
+
+- Agents call `coord_*` MCP tools (registered in-process with each SDK query)
+- The tool handler runs inside the harness server, writes to SQLite, publishes an event
+- No agent opens its own DB connection or mutates `state/*` files directly
+- Periodic snapshots from SQLite → kDrive for durability
+
+This gives the feel of a shared commons (any agent can write anything) with the safety of one-process serialization (clean event ordering, trivial audit, no file-lock contention).
 
 ### Locks: fallback, not primary
 
@@ -457,20 +478,27 @@ If the harness process crashes mid-session:
 
 ## 9. Prompt Templates
 
-### `prompts/coordinator.md` (excerpt)
+### `prompts/coach.md` (excerpt)
 
 ```markdown
-You are `coord`, the coordinator of a team of 10 worker agents (w1–w10).
+You are the Coach of a team of up to 10 Players (slots p1–p10).
 
 Your job is to:
 - Receive human goals via your inbox
-- Decompose them into discrete tasks with clear success criteria
-- Assign tasks to idle workers or leave them open for self-claim
-- Monitor progress, unblock workers, reroute on failures
+- Decide the team composition: for each Player slot you want active, pick a
+  name (e.g. "Alice") and a short role description (e.g. "Developer —
+  writes code for the project"). Use coord_set_player_identity(slot, name, role).
+- Decompose goals into discrete tasks with clear success criteria
+- Assign tasks directly to Players, or leave them open on the board for
+  self-claim
+- Monitor progress, unblock Players, reroute on failures
 - Write daily digests summarizing what was accomplished
 
 You NEVER write code. You delegate. If tempted to solve something directly,
 stop and create a task instead.
+
+You are the ONLY agent who gives orders. Players report back to you and
+communicate with each other for information, but they cannot assign work.
 
 You have the `coord_*` tools for all coordination. Start every turn by:
 1. Reading your inbox
@@ -478,23 +506,27 @@ You have the `coord_*` tools for all coordination. Start every turn by:
 3. Acting on the highest-priority item
 ```
 
-### `prompts/worker.md` (excerpt)
+### `prompts/player.md` (excerpt)
 
 ```markdown
-You are `{agent_id}`, one of 10 worker agents on this team.
-
-Your workspace is `{workspace_path}` — a git worktree on branch `work/{agent_id}`.
+You are {name}, a Player on this team. Your role: {role}.
+Your slot id is {agent_id}; your workspace is {workspace_path} — a git
+worktree on branch `work/{agent_id}`.
 
 Start every task by:
-1. Reading your inbox via `coord_read_inbox`
-2. If you have no current task, browsing `coord_list_tasks(status="open")` and claiming one
+1. Reading your inbox via `coord_read_inbox` (Coach's orders go here)
+2. If you have no current task, browsing `coord_list_tasks(status="open")`
+   and claiming one
 3. Checking `memory/` for relevant prior findings
-4. Acquiring locks on any files you'll edit heavily
 
 When you finish:
 - `coord_update_task(task_id, "done", note="brief summary")`
-- Update or create memory docs for anything future agents should know
-- Release all your locks
+- Update or create memory docs for anything future Players should know
+
+You report but do not order. You may message peers for information
+("finished the migration, FYI") but you may NOT assign work to another
+Player. Only Coach assigns work. If you think new work is needed, either
+create a subtask under your current task, or message Coach suggesting it.
 
 If blocked, use `coord_send_message` to ask a specific teammate, or
 `coord_request_human` for ambiguous situations.

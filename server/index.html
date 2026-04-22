@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>TeamOfTen — M1</title>
+    <title>TeamOfTen — Team of 11 (Coach + 10 Players)</title>
     <style>
       :root {
         color-scheme: dark;
@@ -124,21 +124,21 @@
   </head>
   <body>
     <header>
-      <h1>TeamOfTen — M1</h1>
+      <h1>TeamOfTen — Coach + 10 Players</h1>
       <span class="status"><span class="dot" id="wsdot"></span><span id="wsstate">connecting…</span></span>
     </header>
     <main>
       <div id="events"></div>
       <form id="form">
         <div>
-          <label for="agent_id">agent id</label>
-          <input id="agent_id" value="w1" autocomplete="off" />
+          <label for="agent_id">slot (coach or p1…p10)</label>
+          <input id="agent_id" value="p1" autocomplete="off" />
         </div>
         <div>
           <label for="prompt">prompt</label>
-          <textarea id="prompt" placeholder="Ask the agent to do something terse, e.g. 'say hello'"></textarea>
+          <textarea id="prompt" placeholder="Ask this slot to do something terse — e.g. 'say hello'"></textarea>
         </div>
-        <button type="submit" id="submit">start agent</button>
+        <button type="submit" id="submit">run</button>
       </form>
     </main>
     <script>

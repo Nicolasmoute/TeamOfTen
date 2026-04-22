@@ -23,7 +23,9 @@ INDEX_HTML = (Path(__file__).parent / "index.html").read_text(encoding="utf-8")
 
 
 class StartAgentRequest(BaseModel):
-    agent_id: str = Field(default="w1", pattern=r"^[a-z0-9_-]{1,16}$")
+    # Valid slot ids are "coach" or "p1".."p10". The pattern is permissive
+    # for M1; tighter validation lands in M2a once the Agent model exists.
+    agent_id: str = Field(default="p1", pattern=r"^[a-z0-9_-]{1,16}$")
     prompt: str = Field(min_length=1, max_length=10_000)
 
 
