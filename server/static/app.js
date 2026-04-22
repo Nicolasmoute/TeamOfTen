@@ -304,13 +304,18 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
     if (!text && attachments.length === 0) return;
     setSubmitting(true);
     try {
-      // Compose prompt string: include image paths so the agent can Read them.
-      // The agent's cwd is /workspaces/<slot>, but /data/attachments/* is
-      // an absolute path readable from there.
+      // Compose prompt string: include image paths the agent can Read.
+      // We reference each attachment via a workspace-local symlinked path
+      // (/workspaces/<slot>/attachments/<filename>) so the agent sees it
+      // as in-cwd regardless of whether Read has path-subtree restrictions.
       let prompt = text;
       if (attachments.length > 0) {
-        const paths = attachments.map((a) => a.path).join("\n  - ");
-        const header = text ? "\n\nAttached images (use Read to load):\n  - " : "Attached images (use Read to load):\n  - ";
+        const paths = attachments
+          .map((a) => `/workspaces/${slot}/attachments/${a.filename}`)
+          .join("\n  - ");
+        const header = text
+          ? "\n\nAttached images (use Read to load):\n  - "
+          : "Attached images (use Read to load):\n  - ";
         prompt = text + header + paths;
       }
       const res = await fetch("/api/agents/start", {
