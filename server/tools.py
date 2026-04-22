@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from server.db import configured_conn
 from server.events import bus
+from server.kdrive import kdrive
 
 
 def _now_iso() -> str:
@@ -638,8 +640,26 @@ def build_coord_server(caller_id: str) -> Any:
                 "size": len(content),
             }
         )
+
+        # Fire-and-forget mirror to kDrive as a plain .md file under
+        # /harness/memory/<topic>.md. Failures are swallowed and logged
+        # inside KDriveClient — they never block the tool call.
+        if kdrive.enabled:
+            header = (
+                f"<!-- auto-mirrored from the harness memory table\n"
+                f"     topic: {topic}\n"
+                f"     version: {version}\n"
+                f"     last_updated: {now}\n"
+                f"     last_updated_by: {caller_id}\n"
+                f"-->\n\n"
+            )
+            asyncio.create_task(
+                kdrive.write_text(f"memory/{topic}.md", header + content)
+            )
+
         return _ok(
             f"saved memory[{topic}] v{version} ({len(content)} chars)"
+            + (" · mirrored to kDrive" if kdrive.enabled else "")
         )
 
     return create_sdk_mcp_server(

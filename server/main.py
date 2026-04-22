@@ -33,6 +33,7 @@ from server.agents import (
 )
 from server.db import configured_conn, init_db
 from server.events import bus
+from server.kdrive import kdrive
 
 logger = logging.getLogger("harness.main")
 if not logger.handlers:
@@ -130,6 +131,10 @@ async def status() -> dict[str, object]:
             "agent_daily_usd": AGENT_DAILY_CAP_USD,
             "team_daily_usd": TEAM_DAILY_CAP_USD,
             "team_today_usd": round(team_today, 4),
+        },
+        "kdrive": {
+            "enabled": kdrive.enabled,
+            "reason": kdrive.reason,
         },
     }
 

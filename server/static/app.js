@@ -377,6 +377,24 @@ function SettingsDrawer({ onClose, serverStatus }) {
           </section>
 
           <section class="drawer-section">
+            <h3>kDrive mirror</h3>
+            ${serverStatus?.kdrive?.enabled
+              ? html`<p class="muted">
+                  ✓ Connected. Memory docs auto-mirror to
+                  <code>KDRIVE_ROOT_PATH/memory/&lt;topic&gt;.md</code> on update.
+                </p>`
+              : html`<p class="muted">
+                  ✗ Disabled${serverStatus?.kdrive?.reason
+                    ? html` (${serverStatus.kdrive.reason})`
+                    : null}. Set <code>KDRIVE_WEBDAV_URL</code>,
+                  <code>KDRIVE_USER</code>, and
+                  <code>KDRIVE_APP_PASSWORD</code> env vars and redeploy.
+                  The harness works fine without it — writes go to local
+                  SQLite only.
+                </p>`}
+          </section>
+
+          <section class="drawer-section">
             <h3>About</h3>
             <p>
               <strong>TeamOfTen harness</strong><br />
