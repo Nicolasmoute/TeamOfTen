@@ -175,6 +175,50 @@ body {
   font-size: 11px;
 }
 
+.env-cost-sub {
+  color: var(--warn);
+  font-size: 11px;
+  margin-bottom: 6px;
+}
+.env-cost-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.env-cost-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  padding: 3px 0;
+}
+.env-cost-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex-shrink: 0;
+}
+.env-cost-dot.working { background: var(--warn); }
+.env-cost-dot.idle    { background: var(--ok); }
+.env-cost-dot.error   { background: var(--err); }
+.env-cost-id {
+  font-weight: 600;
+  min-width: 34px;
+  color: var(--fg);
+}
+.env-cost-name {
+  flex: 1;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.env-cost-value {
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+
 /* task list inside env pane */
 .env-task-list {
   display: flex;

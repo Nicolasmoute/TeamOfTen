@@ -341,12 +341,44 @@ function EnvTasksSection({ tasks, onCreate }) {
 }
 
 function EnvCostSection({ agents }) {
-  // Placeholder — full cost meter lands in v2d step 2.
   const total = agents.reduce((s, a) => s + (a.cost_estimate_usd || 0), 0);
+  const working = agents.filter((a) => a.status === "working").length;
+  const active = agents
+    .filter(
+      (a) =>
+        (a.cost_estimate_usd || 0) > 0 ||
+        a.status === "working" ||
+        a.status === "error"
+    )
+    .sort(
+      (a, b) => (b.cost_estimate_usd || 0) - (a.cost_estimate_usd || 0)
+    );
   return html`
     <section class="env-section">
-      <h3 class="env-section-title">Cost <span class="env-count">$${total.toFixed(3)}</span></h3>
-      <div class="env-cost-hint">(per-agent breakdown in next step)</div>
+      <h3 class="env-section-title">
+        Cost <span class="env-count">$${total.toFixed(3)}</span>
+      </h3>
+      ${working > 0
+        ? html`<div class="env-cost-sub">${working} agent${working === 1 ? "" : "s"} working now</div>`
+        : null}
+      ${active.length === 0
+        ? html`<div class="env-empty">(no agents have spent yet)</div>`
+        : html`
+            <div class="env-cost-list">
+              ${active.map(
+                (a) => html`
+                  <div class="env-cost-row" key=${a.id}>
+                    <span class=${"env-cost-dot " + (a.status || "stopped")}></span>
+                    <span class="env-cost-id">${a.id}</span>
+                    <span class="env-cost-name">
+                      ${a.name || (a.kind === "player" ? "unassigned" : a.id)}
+                    </span>
+                    <span class="env-cost-value">$${(a.cost_estimate_usd || 0).toFixed(3)}</span>
+                  </div>
+                `
+              )}
+            </div>
+          `}
     </section>
   `;
 }
