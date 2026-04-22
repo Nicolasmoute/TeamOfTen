@@ -20,6 +20,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from server.agents import run_agent
@@ -27,7 +28,8 @@ from server.db import configured_conn, init_db
 from server.events import bus
 
 STARTED_AT = datetime.now(timezone.utc)
-INDEX_HTML = (Path(__file__).parent / "index.html").read_text(encoding="utf-8")
+STATIC_DIR = Path(__file__).parent / "static"
+INDEX_HTML = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
 # Central attachment store. Sits on the same /data volume as the SQLite DB,
 # so images persist across redeploys. Lives outside any agent's workspace
@@ -46,10 +48,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="TeamOfTen harness",
-    version="0.2.1",
+    version="0.2.2",
     description="Personal orchestration harness — Coach + 10 Players.",
     lifespan=lifespan,
 )
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 # ------------------------------------------------------------------

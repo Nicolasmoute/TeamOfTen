@@ -18,4 +18,4 @@ build-backend = "setuptools.build_meta"
 packages = ["server"]
 
 [tool.setuptools.package-data]
-server = ["*.html"]
+server = ["*.html", "static/*.html", "static/*.js", "static/*.css"]
