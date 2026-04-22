@@ -133,7 +133,11 @@ function App() {
       ) {
         loadAgents();
       }
-      if (ev.type === "task_created" || ev.type === "task_updated") {
+      if (
+        ev.type === "task_created" ||
+        ev.type === "task_claimed" ||
+        ev.type === "task_updated"
+      ) {
         loadTasks();
         loadAgents();
       }
@@ -504,6 +508,8 @@ const TIMELINE_TYPES = new Set([
   "text",
   "error",
   "task_created",
+  "task_claimed",
+  "task_updated",
 ]);
 
 function EnvTimelineSection({ conversations }) {
@@ -586,6 +592,21 @@ function EnvTimelineItem({ event }) {
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
       <span class="env-tl-body">+ [${event.task_id}] ${event.title}</span>
+    </div>`;
+  }
+  if (event.type === "task_claimed") {
+    return html`<div class="env-tl-item env-tl-task">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">◆ claimed ${event.task_id}</span>
+    </div>`;
+  }
+  if (event.type === "task_updated") {
+    const note = event.note ? " — " + event.note.slice(0, 60) : "";
+    return html`<div class="env-tl-item env-tl-task">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">${event.task_id}: ${event.old_status} → ${event.new_status}${note}</span>
     </div>`;
   }
   return null;

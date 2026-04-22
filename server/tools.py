@@ -19,6 +19,21 @@ def _new_task_id() -> str:
     return f"t-{today}-{uuid.uuid4().hex[:8]}"
 
 
+# Task state machine. Reject transitions not listed here.
+VALID_TRANSITIONS: dict[str, set[str]] = {
+    "open":        {"claimed", "cancelled"},
+    "claimed":     {"in_progress", "blocked", "done", "cancelled"},
+    "in_progress": {"blocked", "done", "cancelled"},
+    "blocked":     {"in_progress", "cancelled"},
+    "done":        set(),
+    "cancelled":   set(),
+}
+
+
+def _valid_transition(old: str, new: str) -> bool:
+    return new in VALID_TRANSITIONS.get(old, set())
+
+
 def _ok(text: str) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}]}
 
@@ -185,16 +200,195 @@ def build_coord_server(caller_id: str) -> Any:
             + f", priority={priority}"
         )
 
+    @tool(
+        "coord_claim_task",
+        (
+            "Claim an open task — sets you as its owner and moves it to "
+            "status=claimed. Only Players can claim (Coach delegates, never "
+            "executes). Fails if: task is not status=open, you're Coach, or "
+            "you already own another task (finish or cancel it first)."
+        ),
+        {"task_id": str},
+    )
+    async def claim_task(args: dict[str, Any]) -> dict[str, Any]:
+        task_id = (args.get("task_id") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+        if caller_is_coach:
+            return _err(
+                "Coach delegates; only Players claim tasks. If you want to "
+                "assign this task to a Player, message them via "
+                "coord_send_message (that tool lands in M2c)."
+            )
+
+        c = await configured_conn()
+        try:
+            # One-task-at-a-time for Players — enforces focus and keeps
+            # current_task_id well-defined for subtask nesting.
+            cur = await c.execute(
+                "SELECT current_task_id FROM agents WHERE id = ?",
+                (caller_id,),
+            )
+            row = await cur.fetchone()
+            if row and dict(row)["current_task_id"]:
+                return _err(
+                    f"you already own task {dict(row)['current_task_id']}; "
+                    f"complete or cancel it first."
+                )
+
+            # Atomic claim — race-safe via status='open' guard.
+            cur = await c.execute(
+                "UPDATE tasks SET owner = ?, status = 'claimed', "
+                "claimed_at = ? WHERE id = ? AND status = 'open' "
+                "RETURNING id",
+                (caller_id, _now_iso(), task_id),
+            )
+            updated = await cur.fetchone()
+            if not updated:
+                cur = await c.execute(
+                    "SELECT status, owner FROM tasks WHERE id = ?",
+                    (task_id,),
+                )
+                current = await cur.fetchone()
+                if not current:
+                    return _err(f"task {task_id} not found")
+                d = dict(current)
+                return _err(
+                    f"task {task_id} is not open (status={d['status']}, "
+                    f"owner={d['owner'] or '-'})"
+                )
+
+            await c.execute(
+                "UPDATE agents SET current_task_id = ? WHERE id = ?",
+                (task_id, caller_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "task_claimed",
+                "task_id": task_id,
+            }
+        )
+        return _ok(f"claimed {task_id}")
+
+    @tool(
+        "coord_update_task",
+        (
+            "Update task status. Valid transitions:\n"
+            "  open → claimed, cancelled\n"
+            "  claimed → in_progress, blocked, done, cancelled\n"
+            "  in_progress → blocked, done, cancelled\n"
+            "  blocked → in_progress, cancelled\n"
+            "  done/cancelled: terminal\n"
+            "Only the current owner can update the task; Coach can also "
+            "cancel any task. Players: when you mark a task done or "
+            "cancelled, your current_task_id is cleared so you can claim "
+            "the next one. Optional 'note' is logged in the event stream."
+        ),
+        {"task_id": str, "status": str, "note": str},
+    )
+    async def update_task(args: dict[str, Any]) -> dict[str, Any]:
+        task_id = (args.get("task_id") or "").strip()
+        new_status = (args.get("status") or "").strip().lower()
+        note = args.get("note") or ""
+        if not task_id:
+            return _err("task_id is required")
+        if new_status not in ("claimed", "in_progress", "blocked", "done", "cancelled"):
+            return _err(
+                f"invalid status '{new_status}' (must be claimed, "
+                "in_progress, blocked, done, or cancelled)"
+            )
+
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT owner, status FROM tasks WHERE id = ?",
+                (task_id,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"task {task_id} not found")
+            d = dict(row)
+            current_owner: str | None = d["owner"]
+            old_status: str = d["status"]
+
+            # Permission check.
+            if current_owner is None:
+                # task has no owner yet (still 'open'). Only Coach (or
+                # 'cancelled' moves by anyone) — actually still only Coach
+                # can touch unowned tasks.
+                if not caller_is_coach:
+                    return _err(
+                        f"task {task_id} has no owner; only Coach can "
+                        f"change an open task's status."
+                    )
+            elif current_owner != caller_id:
+                # task owned by someone else. Only Coach can cancel.
+                if not (caller_is_coach and new_status == "cancelled"):
+                    return _err(
+                        f"only the task's owner ({current_owner}) can "
+                        f"update it. Coach can additionally cancel any task."
+                    )
+
+            if not _valid_transition(old_status, new_status):
+                return _err(
+                    f"invalid transition: {old_status} → {new_status}"
+                )
+
+            now = _now_iso()
+            if new_status in ("done", "cancelled"):
+                await c.execute(
+                    "UPDATE tasks SET status = ?, completed_at = ? "
+                    "WHERE id = ?",
+                    (new_status, now, task_id),
+                )
+                # Free up the player who was on this task.
+                if current_owner is not None:
+                    await c.execute(
+                        "UPDATE agents SET current_task_id = NULL "
+                        "WHERE id = ? AND current_task_id = ?",
+                        (current_owner, task_id),
+                    )
+            else:
+                await c.execute(
+                    "UPDATE tasks SET status = ? WHERE id = ?",
+                    (new_status, task_id),
+                )
+            await c.commit()
+        finally:
+            await c.close()
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "task_updated",
+                "task_id": task_id,
+                "old_status": old_status,
+                "new_status": new_status,
+                "note": note,
+            }
+        )
+        suffix = f" — {note}" if note else ""
+        return _ok(f"updated {task_id}: {old_status} → {new_status}{suffix}")
+
     return create_sdk_mcp_server(
         name="coord",
-        version="0.2.0",
-        tools=[list_tasks, create_task],
+        version="0.3.0",
+        tools=[list_tasks, create_task, claim_task, update_task],
     )
 
 
 ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_list_tasks",
     "mcp__coord__coord_create_task",
+    "mcp__coord__coord_claim_task",
+    "mcp__coord__coord_update_task",
 ]
 
 # Read-only tools: see the world, touch nothing. Coach uses these + coord.
