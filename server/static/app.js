@@ -510,6 +510,7 @@ const TIMELINE_TYPES = new Set([
   "task_created",
   "task_claimed",
   "task_updated",
+  "message_sent",
 ]);
 
 function EnvTimelineSection({ conversations }) {
@@ -607,6 +608,16 @@ function EnvTimelineItem({ event }) {
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
       <span class="env-tl-body">${event.task_id}: ${event.old_status} → ${event.new_status}${note}</span>
+    </div>`;
+  }
+  if (event.type === "message_sent") {
+    const subj = event.subject ? ` (${event.subject})` : "";
+    const preview = (event.body_preview || "").slice(0, 80);
+    const urgent = event.priority === "interrupt" ? " ⚠" : "";
+    return html`<div class="env-tl-item env-tl-msg">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">→ ${event.to}${urgent}${subj}: ${preview}</span>
     </div>`;
   }
   return null;

@@ -76,6 +76,22 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_type  ON events(type);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_id      TEXT NOT NULL,          -- 'human', 'coach', 'p1'..'p10'
+    to_id        TEXT NOT NULL,          -- agent id or 'broadcast'
+    subject      TEXT,
+    body         TEXT NOT NULL,
+    sent_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    read_at      TEXT,                    -- set when recipient drains inbox
+    in_reply_to  INTEGER REFERENCES messages(id),
+    priority     TEXT NOT NULL DEFAULT 'normal'
+                 CHECK (priority IN ('normal', 'interrupt'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_to_unread ON messages(to_id, read_at);
+CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(from_id);
 """
 
 # Seed agents — idempotent via INSERT OR IGNORE.

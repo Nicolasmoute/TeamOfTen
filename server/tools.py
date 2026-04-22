@@ -377,10 +377,140 @@ def build_coord_server(caller_id: str) -> Any:
         suffix = f" — {note}" if note else ""
         return _ok(f"updated {task_id}: {old_status} → {new_status}{suffix}")
 
+    @tool(
+        "coord_send_message",
+        (
+            "Send a message to another agent or to the whole team.\n"
+            "Params:\n"
+            "- to: recipient slot id ('coach' or 'p1'..'p10'), or 'broadcast' "
+            "to reach the whole team.\n"
+            "- body: message text (required, max 5000 chars)\n"
+            "- subject: optional short subject line (max 200 chars)\n"
+            "- priority: 'normal' (default) or 'interrupt' for urgent items\n"
+            "Messaging is free-form — anyone can message anyone for info "
+            "sharing. Assigning work still only happens through the task "
+            "board (Coach creates + assigns, Players claim)."
+        ),
+        {"to": str, "body": str, "subject": str, "priority": str},
+    )
+    async def send_message(args: dict[str, Any]) -> dict[str, Any]:
+        to = (args.get("to") or "").strip().lower()
+        body = args.get("body") or ""
+        subject = (args.get("subject") or "").strip() or None
+        priority = (args.get("priority") or "normal").strip().lower()
+
+        if not to:
+            return _err("'to' is required (agent id or 'broadcast')")
+        if to not in VALID_RECIPIENTS:
+            return _err(
+                f"invalid recipient '{to}' — must be 'coach', 'p1'..'p10', "
+                "or 'broadcast'"
+            )
+        if to == caller_id:
+            return _err("you can't send a message to yourself")
+        if not body.strip():
+            return _err("body cannot be empty")
+        if len(body) > 5000:
+            return _err(f"body too long ({len(body)} chars, max 5000)")
+        if subject and len(subject) > 200:
+            return _err(f"subject too long ({len(subject)} chars, max 200)")
+        if priority not in ("normal", "interrupt"):
+            return _err(
+                f"invalid priority '{priority}' (must be 'normal' or 'interrupt')"
+            )
+
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "INSERT INTO messages (from_id, to_id, subject, body, priority) "
+                "VALUES (?, ?, ?, ?, ?) RETURNING id",
+                (caller_id, to, subject, body, priority),
+            )
+            row = await cur.fetchone()
+            msg_id = dict(row)["id"] if row else None
+            await c.commit()
+        finally:
+            await c.close()
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "message_sent",
+                "message_id": msg_id,
+                "to": to,
+                "subject": subject,
+                "body_preview": body[:120],
+                "priority": priority,
+            }
+        )
+        preview = body.strip().replace("\n", " ")[:60]
+        return _ok(
+            f"sent to {to}"
+            + (f" (subject: {subject})" if subject else "")
+            + f": \"{preview}\""
+        )
+
+    @tool(
+        "coord_read_inbox",
+        (
+            "Read and drain your unread messages. Returns every unread "
+            "message directed to you (or to 'broadcast') in chronological "
+            "order, then marks them as read. A later call returns an empty "
+            "inbox unless new messages have arrived."
+        ),
+        {},
+    )
+    async def read_inbox(args: dict[str, Any]) -> dict[str, Any]:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id, from_id, to_id, subject, body, sent_at, priority "
+                "FROM messages "
+                "WHERE (to_id = ? OR to_id = 'broadcast') AND read_at IS NULL "
+                "ORDER BY sent_at ASC",
+                (caller_id,),
+            )
+            rows = await cur.fetchall()
+            if not rows:
+                return _ok("(no unread messages)")
+
+            ids = [dict(r)["id"] for r in rows]
+            placeholders = ",".join("?" * len(ids))
+            now = _now_iso()
+            await c.execute(
+                f"UPDATE messages SET read_at = ? WHERE id IN ({placeholders})",
+                (now, *ids),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+
+        lines = [
+            f"{len(rows)} unread message{'s' if len(rows) != 1 else ''}:"
+        ]
+        for i, r in enumerate(rows, 1):
+            d = dict(r)
+            broadcast_note = " [broadcast]" if d["to_id"] == "broadcast" else ""
+            priority_note = " [INTERRUPT]" if d["priority"] == "interrupt" else ""
+            subject_line = f"\n  Subject: {d['subject']}" if d["subject"] else ""
+            lines.append(
+                f"\n[{i}] from {d['from_id']}{broadcast_note}{priority_note} "
+                f"({d['sent_at']}):{subject_line}\n  {d['body']}"
+            )
+        return _ok("\n".join(lines))
+
     return create_sdk_mcp_server(
         name="coord",
-        version="0.3.0",
-        tools=[list_tasks, create_task, claim_task, update_task],
+        version="0.4.0",
+        tools=[
+            list_tasks,
+            create_task,
+            claim_task,
+            update_task,
+            send_message,
+            read_inbox,
+        ],
     )
 
 
@@ -389,7 +519,13 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_create_task",
     "mcp__coord__coord_claim_task",
     "mcp__coord__coord_update_task",
+    "mcp__coord__coord_send_message",
+    "mcp__coord__coord_read_inbox",
 ]
+
+VALID_RECIPIENTS: set[str] = (
+    {"coach", "broadcast"} | {f"p{i}" for i in range(1, 11)}
+)
 
 # Read-only tools: see the world, touch nothing. Coach uses these + coord.
 STANDARD_READ_TOOLS = ["Read", "Grep", "Glob", "ToolSearch"]
