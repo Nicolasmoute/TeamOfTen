@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -507,9 +508,143 @@ def build_coord_server(caller_id: str) -> Any:
             )
         return _ok("\n".join(lines))
 
+    @tool(
+        "coord_list_memory",
+        (
+            "List all topics in the shared memory scratchpad, newest first. "
+            "Returns topic name, version, last_updated, last_updated_by, and "
+            "content length so you can see what's there without reading it."
+        ),
+        {},
+    )
+    async def list_memory(args: dict[str, Any]) -> dict[str, Any]:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT topic, version, last_updated, last_updated_by, "
+                "length(content) AS size FROM memory_docs "
+                "ORDER BY last_updated DESC LIMIT 200"
+            )
+            rows = await cur.fetchall()
+        finally:
+            await c.close()
+        if not rows:
+            return _ok("(memory is empty)")
+        lines = [f"{len(rows)} memory topic{'s' if len(rows) != 1 else ''}:"]
+        for r in rows:
+            d = dict(r)
+            lines.append(
+                f"  {d['topic']}  (v{d['version']}, {d['size']} chars, "
+                f"updated {d['last_updated']} by {d['last_updated_by']})"
+            )
+        return _ok("\n".join(lines))
+
+    @tool(
+        "coord_read_memory",
+        (
+            "Read a shared memory doc by topic. Returns the current content "
+            "plus metadata (version, last_updated, last_updated_by). "
+            "Fails if the topic doesn't exist."
+        ),
+        {"topic": str},
+    )
+    async def read_memory(args: dict[str, Any]) -> dict[str, Any]:
+        topic = (args.get("topic") or "").strip().lower()
+        if not topic:
+            return _err("topic is required")
+        if not MEMORY_TOPIC_RE.match(topic):
+            return _err(
+                f"invalid topic '{topic}' — must be lowercase alphanumeric "
+                "with dashes, 1-64 chars, starting with a letter or digit"
+            )
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT content, version, last_updated, last_updated_by "
+                "FROM memory_docs WHERE topic = ?",
+                (topic,),
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+        if not row:
+            return _err(
+                f"no memory topic '{topic}'. Use coord_list_memory to see "
+                "what's available."
+            )
+        d = dict(row)
+        return _ok(
+            f"[{topic}  v{d['version']}  updated {d['last_updated']} "
+            f"by {d['last_updated_by']}]\n\n{d['content']}"
+        )
+
+    @tool(
+        "coord_update_memory",
+        (
+            "Write or overwrite a shared memory doc. Any agent can update "
+            "any topic — it's a commons. Last write wins; the event log "
+            "preserves the history of all updates. Use this to drop notes "
+            "for other agents (findings, design decisions, gotchas, "
+            "conventions). Topic is the filename-style key; content is the "
+            "full markdown body."
+        ),
+        {"topic": str, "content": str},
+    )
+    async def update_memory(args: dict[str, Any]) -> dict[str, Any]:
+        topic = (args.get("topic") or "").strip().lower()
+        content = args.get("content") or ""
+        if not topic:
+            return _err("topic is required")
+        if not MEMORY_TOPIC_RE.match(topic):
+            return _err(
+                f"invalid topic '{topic}' — must be lowercase alphanumeric "
+                "with dashes, 1-64 chars, starting with a letter or digit"
+            )
+        if not content.strip():
+            return _err("content cannot be empty (use a delete tool later if needed)")
+        if len(content) > MEMORY_CONTENT_MAX:
+            return _err(
+                f"content too long ({len(content)} chars, max {MEMORY_CONTENT_MAX})"
+            )
+        now = _now_iso()
+        c = await configured_conn()
+        try:
+            # UPSERT: insert with version=1, or increment on conflict.
+            cur = await c.execute(
+                "INSERT INTO memory_docs "
+                "(topic, content, last_updated, last_updated_by, version) "
+                "VALUES (?, ?, ?, ?, 1) "
+                "ON CONFLICT(topic) DO UPDATE SET "
+                "  content = excluded.content, "
+                "  last_updated = excluded.last_updated, "
+                "  last_updated_by = excluded.last_updated_by, "
+                "  version = memory_docs.version + 1 "
+                "RETURNING version",
+                (topic, content, now, caller_id),
+            )
+            row = await cur.fetchone()
+            version = dict(row)["version"] if row else 1
+            await c.commit()
+        finally:
+            await c.close()
+
+        await bus.publish(
+            {
+                "ts": now,
+                "agent_id": caller_id,
+                "type": "memory_updated",
+                "topic": topic,
+                "version": version,
+                "size": len(content),
+            }
+        )
+        return _ok(
+            f"saved memory[{topic}] v{version} ({len(content)} chars)"
+        )
+
     return create_sdk_mcp_server(
         name="coord",
-        version="0.4.0",
+        version="0.5.0",
         tools=[
             list_tasks,
             create_task,
@@ -517,6 +652,9 @@ def build_coord_server(caller_id: str) -> Any:
             update_task,
             send_message,
             read_inbox,
+            list_memory,
+            read_memory,
+            update_memory,
         ],
     )
 
@@ -528,7 +666,13 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_update_task",
     "mcp__coord__coord_send_message",
     "mcp__coord__coord_read_inbox",
+    "mcp__coord__coord_list_memory",
+    "mcp__coord__coord_read_memory",
+    "mcp__coord__coord_update_memory",
 ]
+
+MEMORY_TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")
+MEMORY_CONTENT_MAX = 20_000
 
 VALID_RECIPIENTS: set[str] = (
     {"coach", "broadcast"} | {f"p{i}" for i in range(1, 11)}

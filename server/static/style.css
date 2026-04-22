@@ -266,6 +266,8 @@ body {
 .env-tl-task .env-tl-body { color: var(--warn); }
 .env-tl-msg { border-left-color: var(--tool); }
 .env-tl-msg .env-tl-body { color: var(--tool); }
+.env-tl-mem { border-left-color: var(--ok); }
+.env-tl-mem .env-tl-body { color: var(--ok); }
 
 /* task list inside env pane */
 .env-task-list {

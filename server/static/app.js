@@ -511,6 +511,7 @@ const TIMELINE_TYPES = new Set([
   "task_claimed",
   "task_updated",
   "message_sent",
+  "memory_updated",
 ]);
 
 function EnvTimelineSection({ conversations }) {
@@ -618,6 +619,13 @@ function EnvTimelineItem({ event }) {
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
       <span class="env-tl-body">→ ${event.to}${urgent}${subj}: ${preview}</span>
+    </div>`;
+  }
+  if (event.type === "memory_updated") {
+    return html`<div class="env-tl-item env-tl-mem">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">◎ memory/${event.topic} v${event.version} (${event.size} chars)</span>
     </div>`;
   }
   return null;

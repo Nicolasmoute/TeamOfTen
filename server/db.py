@@ -103,6 +103,15 @@ CREATE TABLE IF NOT EXISTS message_reads (
 );
 
 CREATE INDEX IF NOT EXISTS idx_msgreads_agent ON message_reads(agent_id);
+
+-- Shared scratchpad. Overwrite-on-update; event log is the history.
+CREATE TABLE IF NOT EXISTS memory_docs (
+    topic            TEXT PRIMARY KEY,
+    content          TEXT NOT NULL,
+    last_updated     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    last_updated_by  TEXT NOT NULL,
+    version          INTEGER NOT NULL DEFAULT 1
+);
 """
 
 # Seed agents — idempotent via INSERT OR IGNORE.
