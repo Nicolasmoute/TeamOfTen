@@ -629,10 +629,23 @@ One connection per browser tab/window; client-side filtering for panes.
 ## 12. Authentication & Security
 
 ### To Claude (Max plan)
-- `claude login` once on laptop, producing `~/.claude.json`
-- Copy to VPS: `scripts/copy-claude-auth.sh` uses scp
-- Mounted read-write into the container at `/root/.claude.json`
-- When OAuth expires, re-run the copy script
+
+**Corrected per M-1 spike findings (2026-04-22):** OAuth tokens are **not** stored in `~/.claude.json` — that file holds only local CLI config (startups, install method, etc.). The actual tokens live in the OS credential store (Windows Credential Manager, macOS Keychain, Linux Secret Service) or an internal path the CLI manages. **Copying `~/.claude.json` across hosts does not transfer authentication.**
+
+**The actual mechanism — device-code OAuth flow, run once per host:**
+
+1. On the VPS, start the CLI: `claude` (drops into interactive REPL)
+2. At the `>` prompt, type `/login`
+3. CLI prints a URL and a short code
+4. On your laptop, open the URL in a browser, sign in to your Max account, enter the code, approve
+5. VPS confirms "Logged in"; token is now stored locally on the VPS
+6. Exit REPL (`/exit`); `claude -p "..."` non-interactive calls work from any shell on that host
+
+**Implications for the harness:**
+- The previously-planned `scripts/copy-claude-auth.sh` is obsolete — remove from the plan.
+- Whatever path the CLI uses to persist the token must sit on a **mounted volume** so redeploys don't erase auth. The existing `./claude-auth:/root/.claude` mount in docker-compose is still the right shape — but it must hold whatever the CLI actually writes post-`/login`, not a copied file.
+- The install script `https://claude.ai/install.sh` is **geo-blocked** in some regions (confirmed HK / Zeabur's default datacenter). Install via npm instead: `npm install -g @anthropic-ai/claude-code`. The API itself (`api.anthropic.com`) is **not** geo-blocked in those same regions — once the CLI is installed and logged in, runtime queries work.
+- When OAuth expires, re-run `/login` on the VPS.
 
 ### To the UI
 - Single bearer token in `HARNESS_TOKEN` env var
