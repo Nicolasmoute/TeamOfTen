@@ -512,6 +512,8 @@ function EnvCostSection({ agents, serverStatus }) {
   const caps = serverStatus?.caps;
   const teamToday = caps?.team_today_usd ?? 0;
   const teamCap = caps?.team_daily_usd ?? 0;
+  const agentCap = caps?.agent_daily_usd ?? 0;
+  const showCaps = caps && (teamCap > 0 || agentCap > 0);
   const teamPct = teamCap > 0 ? Math.min(100, Math.round((teamToday / teamCap) * 100)) : 0;
   const teamBarClass =
     teamPct >= 100 ? " over" : teamPct >= 80 ? " warn" : "";
@@ -520,15 +522,19 @@ function EnvCostSection({ agents, serverStatus }) {
       <h3 class="env-section-title">
         Cost <span class="env-count">$${total.toFixed(3)}</span>
       </h3>
-      ${caps
+      ${showCaps
         ? html`<div class="env-cap-bar">
             <div class="env-cap-bar-label">
-              today: $${teamToday.toFixed(3)} / $${teamCap.toFixed(2)}
-              ${caps.agent_daily_usd ? html` · per-agent cap $${caps.agent_daily_usd.toFixed(2)}` : null}
+              ${teamCap > 0
+                ? html`today: $${teamToday.toFixed(3)} / $${teamCap.toFixed(2)}`
+                : html`today: $${teamToday.toFixed(3)} (team cap off)`}
+              ${agentCap > 0 ? html` · per-agent cap $${agentCap.toFixed(2)}` : null}
             </div>
-            <div class="env-cap-bar-track">
-              <div class=${"env-cap-bar-fill" + teamBarClass} style=${"width:" + teamPct + "%"}></div>
-            </div>
+            ${teamCap > 0
+              ? html`<div class="env-cap-bar-track">
+                  <div class=${"env-cap-bar-fill" + teamBarClass} style=${"width:" + teamPct + "%"}></div>
+                </div>`
+              : null}
           </div>`
         : null}
       ${working > 0
