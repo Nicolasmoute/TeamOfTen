@@ -19,11 +19,13 @@ import asyncio
 import json
 import logging
 import os
+import sqlite3
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from server.db import configured_conn
+from server.db import DB_PATH, configured_conn
 from server.kdrive import kdrive
 
 logger = logging.getLogger("harness.sync")
@@ -36,6 +38,9 @@ if not logger.handlers:
 
 FLUSH_INTERVAL_SECONDS = int(
     os.environ.get("HARNESS_KDRIVE_FLUSH_INTERVAL", "300")
+)
+SNAPSHOT_INTERVAL_SECONDS = int(
+    os.environ.get("HARNESS_KDRIVE_SNAPSHOT_INTERVAL", "3600")
 )
 
 
@@ -118,6 +123,80 @@ async def flush_today_events() -> int:
             total = (total if total > 0 else 0) + yd
 
     return total
+
+
+def _snapshot_db_sync() -> bytes:
+    """Run SQLite VACUUM INTO a tempfile and return the file contents.
+
+    VACUUM INTO is atomic and safe against concurrent readers/writers
+    (SQLite grabs its own locks). Writing to a tempfile under /tmp
+    (container-local, not the /data volume) avoids pressuring the
+    persistent volume with transient snapshot files.
+    """
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".db", prefix="harness-snap-", dir="/tmp")
+    os.close(tmp_fd)
+    try:
+        # VACUUM INTO doesn't accept parameter binding; the path is a
+        # tempfile we just created so it's safe to embed. Still quote-escape
+        # defensively.
+        safe = tmp_path.replace("'", "''")
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        try:
+            conn.execute(f"VACUUM INTO '{safe}'")
+        finally:
+            conn.close()
+        with open(tmp_path, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+async def snapshot_db() -> int:
+    """Create a point-in-time DB snapshot and upload to kDrive.
+
+    Returns byte count on success, 0 if kDrive disabled, -1 on failure.
+    """
+    if not kdrive.enabled:
+        return 0
+    try:
+        data = await asyncio.to_thread(_snapshot_db_sync)
+    except Exception:
+        logger.exception("VACUUM INTO failed")
+        return -1
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+    remote = f"snapshots/{ts}.db"
+    ok = await kdrive.write_bytes(remote, data)
+    if ok:
+        logger.info("snapshot: %d bytes → kdrive %s", len(data), remote)
+        return len(data)
+    return -1
+
+
+async def snapshot_loop() -> None:
+    """Background task: periodic DB snapshots to kDrive."""
+    if not kdrive.enabled:
+        logger.info("snapshot loop idle: kdrive disabled")
+    else:
+        logger.info(
+            "snapshot loop starting: snapshot every %ds",
+            SNAPSHOT_INTERVAL_SECONDS,
+        )
+    while True:
+        try:
+            if kdrive.enabled:
+                await snapshot_db()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("snapshot cycle failed")
+        try:
+            await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
 
 
 async def flush_loop() -> None:

@@ -34,7 +34,7 @@ from server.agents import (
 from server.db import configured_conn, init_db
 from server.events import bus
 from server.kdrive import kdrive
-from server.sync import flush_loop
+from server.sync import flush_loop, snapshot_loop
 
 logger = logging.getLogger("harness.main")
 if not logger.handlers:
@@ -75,18 +75,21 @@ ALLOWED_EXT = {"png", "jpg", "jpeg", "gif", "webp"}
 async def lifespan(app: FastAPI):
     await init_db()
     ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    # Background task: flush event log to kDrive on a cadence.
-    # Runs even when kDrive is disabled (it's a no-op then) so a later
-    # env-var update can activate it without a restart of the loop itself.
+    # Background tasks: flush event log to kDrive + hourly SQLite
+    # snapshot. Both are no-ops when kDrive is disabled so running them
+    # unconditionally is safe — picks up activation without restart.
     sync_task = asyncio.create_task(flush_loop())
+    snapshot_task = asyncio.create_task(snapshot_loop())
     try:
         yield
     finally:
-        sync_task.cancel()
-        try:
-            await sync_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        for t in (sync_task, snapshot_task):
+            t.cancel()
+        for t in (sync_task, snapshot_task):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 app = FastAPI(

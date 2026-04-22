@@ -101,12 +101,32 @@ class KDriveClient:
             logger.exception("kDrive write failed: %s", full_path)
             return False
 
+    async def write_bytes(self, relative_path: str, data: bytes) -> bool:
+        """Same as write_text but for binary payloads (e.g. SQLite snapshots)."""
+        if not self._enabled:
+            return False
+        full_path = str(PurePosixPath(ROOT_PATH) / relative_path)
+        try:
+            await asyncio.to_thread(self._write_bytes_sync, full_path, data)
+            return True
+        except Exception:
+            logger.exception("kDrive write_bytes failed: %s", full_path)
+            return False
+
     # ---------- sync helpers (run in a thread) ----------
 
     def _write_sync(self, full_path: str, content: str) -> None:
         self._ensure_dir_sync(str(PurePosixPath(full_path).parent))
         self._client.upload_fileobj(
             io.BytesIO(content.encode("utf-8")),
+            full_path,
+            overwrite=True,
+        )
+
+    def _write_bytes_sync(self, full_path: str, data: bytes) -> None:
+        self._ensure_dir_sync(str(PurePosixPath(full_path).parent))
+        self._client.upload_fileobj(
+            io.BytesIO(data),
             full_path,
             overwrite=True,
         )
