@@ -1,0 +1,21 @@
+# Python
+spike/.venv/
+__pycache__/
+*.pyc
+
+# Local spike runs (outputs captured during laptop testing)
+spike/runs/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+
+# Secrets — never commit .claude.json, .claude/, or .env
+.claude.json
+.claude/
+.env
+.env.*
+!.env.example

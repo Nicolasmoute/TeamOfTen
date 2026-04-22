@@ -1,0 +1,15 @@
+# Shell scripts and Dockerfiles must always use LF — CRLF breaks them
+# inside Linux containers.
+*.sh          text eol=lf
+Dockerfile    text eol=lf
+Dockerfile.*  text eol=lf
+
+# Keep markdown and generic text auto-normalized (safe on both OSes)
+*.md          text
+*.txt         text
+*.py          text eol=lf
+*.ts          text eol=lf
+*.tsx         text eol=lf
+*.json        text
+*.yml         text eol=lf
+*.yaml        text eol=lf
