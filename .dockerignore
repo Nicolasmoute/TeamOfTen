@@ -1,0 +1,31 @@
+# Everything that shouldn't end up in the build context
+.git/
+.gitignore
+.gitattributes
+.dockerignore
+.env
+.env.*
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Docs + specs (big, not needed at runtime)
+CLAUDE.md
+Docs/
+
+# M-1 spike artifacts (not part of the real harness)
+spike/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Secrets
+.claude.json
+.claude/
