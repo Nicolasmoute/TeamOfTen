@@ -51,6 +51,7 @@ function App() {
   const [openSlots, setOpenSlots] = useState(["coach"]);
   const [wsConnected, setWsConnected] = useState(false);
   const [envOpen, setEnvOpen] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   // conversations: Map<slotId, Event[]>  (events ordered oldest → newest)
   const [conversations, setConversations] = useState(new Map());
   // bumping this re-runs the WS effect, which re-opens a new connection
@@ -187,6 +188,7 @@ function App() {
         wsConnected=${wsConnected}
         envOpen=${envOpen}
         onToggleEnv=${() => setEnvOpen((v) => !v)}
+        onOpenSettings=${() => setSettingsOpen(true)}
       />
       <main class="panes">
         ${openSlots.length === 0
@@ -211,6 +213,9 @@ function App() {
             onClose=${() => setEnvOpen(false)}
           />`
         : null}
+      ${settingsOpen
+        ? html`<${SettingsDrawer} onClose=${() => setSettingsOpen(false)} />`
+        : null}
     </div>
   `;
 }
@@ -219,7 +224,7 @@ function App() {
 // left rail
 // ------------------------------------------------------------------
 
-function LeftRail({ agents, openSlots, onOpen, wsConnected, envOpen, onToggleEnv }) {
+function LeftRail({ agents, openSlots, onOpen, wsConnected, envOpen, onToggleEnv, onOpenSettings }) {
   const grouped = useMemo(() => {
     const coach = agents.find((a) => a.kind === "coach");
     const players = agents
@@ -265,8 +270,86 @@ function LeftRail({ agents, openSlots, onOpen, wsConnected, envOpen, onToggleEnv
         title=${envOpen ? "Collapse environment panel" : "Open environment panel"}
         onClick=${onToggleEnv}
       >▦</button>
-      <button class="gear" title="Settings (not wired yet)">⚙</button>
+      <button class="gear" title="Settings" onClick=${onOpenSettings}>⚙</button>
     </aside>
+  `;
+}
+
+// ------------------------------------------------------------------
+// settings drawer
+// ------------------------------------------------------------------
+
+function SettingsDrawer({ onClose }) {
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const stop = (e) => e.stopPropagation();
+
+  return html`
+    <div class="drawer-backdrop" onClick=${onClose}>
+      <aside class="drawer" onClick=${stop}>
+        <header class="drawer-head">
+          <h2 class="drawer-title">Settings</h2>
+          <button class="drawer-close" onClick=${onClose} title="Close (Esc)">×</button>
+        </header>
+        <div class="drawer-body">
+          <section class="drawer-section">
+            <h3>Authentication</h3>
+            <p>
+              The <code>claude</code> CLI on this host uses the device-code
+              OAuth flow. Tokens are <em>not</em> in <code>~/.claude.json</code>;
+              they live in the CLI's own credential store. To log in:
+            </p>
+            <ol>
+              <li>Open the Zeabur service terminal</li>
+              <li>Run <code>claude</code></li>
+              <li>At the <code>&gt;</code> prompt, type <code>/login</code></li>
+              <li>Follow the URL it prints on your laptop browser, enter the code, approve</li>
+              <li>Type <code>/exit</code> to leave the REPL</li>
+            </ol>
+            <p class="muted">
+              Token persists on this host across the current container's lifetime.
+              A Zeabur redeploy resets it — re-run the steps above.
+            </p>
+          </section>
+
+          <section class="drawer-section">
+            <h3>Cost caps</h3>
+            <div class="drawer-disabled">
+              <p class="muted">
+                Per-agent daily cost caps are planned for M2e. For now,
+                monitor spend via the <strong>Cost</strong> section in the
+                Environment panel.
+              </p>
+              <label>Daily cap per agent (USD)</label>
+              <input type="number" min="0" step="0.5" value="5.00" disabled />
+              <label>Daily cap for the whole team (USD)</label>
+              <input type="number" min="0" step="1" value="20.00" disabled />
+            </div>
+          </section>
+
+          <section class="drawer-section">
+            <h3>About</h3>
+            <p>
+              <strong>TeamOfTen harness</strong><br />
+              Milestone M2a + v2d<br />
+              1 Coach + 10 Players orchestrated via Claude Agent SDK<br />
+              <a
+                href="https://github.com/Nicolasmoute/TeamOfTen"
+                target="_blank"
+                rel="noopener noreferrer"
+                >github.com/Nicolasmoute/TeamOfTen</a
+              >
+            </p>
+          </section>
+        </div>
+      </aside>
+    </div>
   `;
 }
 
