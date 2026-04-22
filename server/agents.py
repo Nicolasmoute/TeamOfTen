@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import sys
 from datetime import datetime, timezone
 from typing import Any
 
@@ -12,8 +14,16 @@ from claude_agent_sdk import (
     query,
 )
 
+from server.db import configured_conn
 from server.events import bus
 from server.tools import ALLOWED_COORD_TOOLS, build_coord_server
+
+logger = logging.getLogger("harness.agents")
+if not logger.handlers:
+    h = logging.StreamHandler(sys.stdout)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s | %(message)s"))
+    logger.addHandler(h)
+    logger.setLevel(logging.INFO)
 
 
 def _now() -> str:
@@ -24,6 +34,41 @@ async def _emit(agent_id: str, event_type: str, **payload: Any) -> None:
     await bus.publish(
         {"ts": _now(), "agent_id": agent_id, "type": event_type, **payload}
     )
+
+
+async def _set_status(agent_id: str, status: str) -> None:
+    if agent_id == "system":
+        return
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE agents SET status = ?, last_heartbeat = ? WHERE id = ?",
+                (status, _now(), agent_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("set_status failed: agent=%s status=%s", agent_id, status)
+
+
+async def _add_cost(agent_id: str, cost_usd: float | None) -> None:
+    if not cost_usd or agent_id == "system":
+        return
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE agents SET cost_estimate_usd = cost_estimate_usd + ? "
+                "WHERE id = ?",
+                (cost_usd, agent_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("add_cost failed: agent=%s cost=%s", agent_id, cost_usd)
 
 
 def _system_prompt_for(agent_id: str) -> str:
@@ -49,12 +94,9 @@ def _system_prompt_for(agent_id: str) -> str:
 
 
 async def run_agent(agent_id: str, prompt: str) -> None:
-    """Spawn one SDK query for the given slot and stream its events.
-
-    The SDK shells out to the `claude` CLI, which must already be logged in
-    on this host via `/login` (device-code flow).
-    """
+    """Spawn one SDK query for the given slot and stream its events."""
     await _emit(agent_id, "agent_started", prompt=prompt)
+    await _set_status(agent_id, "working")
 
     coord_server = build_coord_server(agent_id)
 
@@ -80,14 +122,19 @@ async def run_agent(agent_id: str, prompt: str) -> None:
                             input=block.input,
                         )
             elif isinstance(msg, ResultMessage):
+                cost = getattr(msg, "total_cost_usd", None)
                 await _emit(
                     agent_id,
                     "result",
                     duration_ms=getattr(msg, "duration_ms", None),
-                    cost_usd=getattr(msg, "total_cost_usd", None),
+                    cost_usd=cost,
                     is_error=msg.is_error,
                 )
-    except Exception as e:  # broad catch is intentional for M2a surface
+                await _add_cost(agent_id, cost)
+    except Exception as e:
         await _emit(agent_id, "error", error=f"{type(e).__name__}: {e}")
+        await _set_status(agent_id, "error")
+    else:
+        await _set_status(agent_id, "idle")
 
     await _emit(agent_id, "agent_stopped")

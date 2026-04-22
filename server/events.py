@@ -1,21 +1,58 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import sys
 from collections import deque
 from typing import Any
+
+from server.db import configured_conn
 
 BACKLOG_SIZE = 500
 QUEUE_SIZE = 500
 
+logger = logging.getLogger("harness.events")
+if not logger.handlers:
+    h = logging.StreamHandler(sys.stdout)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s | %(message)s"))
+    logger.addHandler(h)
+    logger.setLevel(logging.INFO)
+
+
+async def _persist(event: dict[str, Any]) -> None:
+    """Fire-and-forget insert into the events table.
+
+    Swallow errors so a DB hiccup never takes down publish. The in-memory
+    fan-out to WebSocket subscribers already happened before we got here.
+    """
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "INSERT INTO events (ts, agent_id, type, payload) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    event.get("ts", ""),
+                    event.get("agent_id", "system"),
+                    event.get("type", "unknown"),
+                    json.dumps(event),
+                ),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("event persist failed: %r", event.get("type"))
+
 
 class EventBus:
-    """In-process fan-out event bus.
+    """In-process fan-out event bus with SQLite mirror.
 
-    Publishers call `publish()`; subscribers hold an asyncio.Queue and read
-    from it. New subscribers receive the recent backlog on subscribe so a
-    page refresh still sees context.
-
-    M1: in-memory only. M3 will add durable mirror to SQLite/kDrive.
+    Publishers call `publish()`; subscribers hold an asyncio.Queue. New
+    subscribers receive the recent backlog so a page refresh still sees
+    context. Every event is also persisted to SQLite for durable replay
+    across reloads / redeploys.
     """
 
     def __init__(self, backlog: int = BACKLOG_SIZE) -> None:
@@ -28,8 +65,9 @@ class EventBus:
             try:
                 q.put_nowait(event)
             except asyncio.QueueFull:
-                # Drop for that slow subscriber rather than block everyone
                 pass
+        # Fire-and-forget DB mirror — never blocks publish
+        asyncio.create_task(_persist(event))
 
     def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
         q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=QUEUE_SIZE)

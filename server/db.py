@@ -65,6 +65,17 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_status  ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_owner   ON tasks(owner);
 CREATE INDEX IF NOT EXISTS idx_tasks_parent  ON tasks(parent_id);
+
+CREATE TABLE IF NOT EXISTS events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT NOT NULL,
+    agent_id   TEXT NOT NULL,
+    type       TEXT NOT NULL,
+    payload    TEXT NOT NULL                   -- JSON string
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_id, id);
+CREATE INDEX IF NOT EXISTS idx_events_type  ON events(type);
 """
 
 # Seed agents — idempotent via INSERT OR IGNORE.
