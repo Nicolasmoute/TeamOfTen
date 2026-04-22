@@ -5,18 +5,29 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
 
-# Install Node 20 + claude CLI via npm.
+# Install Node 20 + claude CLI via npm + git.
 # Rationale: https://claude.ai/install.sh is geo-blocked in some Zeabur
 # datacenters (confirmed HK, returns 403). registry.npmjs.org is not blocked
 # and api.anthropic.com is reachable from the same regions, so npm install
 # followed by `claude /login` device-code flow works at runtime.
+# git is needed so Player agents can commit/push their work via Bash, and
+# so M4 worktree provisioning works.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && apt-get install -y --no-install-recommends curl ca-certificates git \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g @anthropic-ai/claude-code \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# Default git identity for agents that commit. Override via env at deploy
+# time if you want per-deployment attribution.
+ARG GIT_USER_NAME="TeamOfTen Harness"
+ARG GIT_USER_EMAIL="harness@teamoften.local"
+RUN git config --global user.name "${GIT_USER_NAME}" \
+    && git config --global user.email "${GIT_USER_EMAIL}" \
+    && git config --global init.defaultBranch main \
+    && git config --global --add safe.directory '*'
 
 # Workspaces — one per slot (Coach + p1..p10) plus a default.
 # In M2a these are plain dirs; per-slot git worktrees come in M4+.
