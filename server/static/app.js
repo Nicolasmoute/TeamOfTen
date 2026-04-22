@@ -52,6 +52,7 @@ function App() {
   const [wsConnected, setWsConnected] = useState(false);
   const [envOpen, setEnvOpen] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [serverStatus, setServerStatus] = useState(null);
   // conversations: Map<slotId, Event[]>  (events ordered oldest → newest)
   const [conversations, setConversations] = useState(new Map());
   // bumping this re-runs the WS effect, which re-opens a new connection
@@ -95,10 +96,23 @@ function App() {
     [loadTasks]
   );
 
+  const loadStatus = useCallback(async () => {
+    try {
+      const res = await fetch("/api/status");
+      const data = await res.json();
+      setServerStatus(data);
+    } catch (e) {
+      console.error("loadStatus failed", e);
+    }
+  }, []);
+
   useEffect(() => {
     loadAgents();
     loadTasks();
-  }, [loadAgents, loadTasks]);
+    loadStatus();
+    const statusTimer = setInterval(loadStatus, 30_000);
+    return () => clearInterval(statusTimer);
+  }, [loadAgents, loadTasks, loadStatus]);
 
   // WebSocket: single connection at app root. On close, schedule a
   // re-open by bumping wsAttempt; the effect re-runs, a new socket opens.
@@ -129,9 +143,13 @@ function App() {
         ev.type === "agent_started" ||
         ev.type === "agent_stopped" ||
         ev.type === "result" ||
-        ev.type === "error"
+        ev.type === "error" ||
+        ev.type === "cost_capped"
       ) {
         loadAgents();
+      }
+      if (ev.type === "result" || ev.type === "cost_capped") {
+        loadStatus();
       }
       if (
         ev.type === "task_created" ||
@@ -213,12 +231,16 @@ function App() {
             agents=${agents}
             tasks=${tasks}
             conversations=${conversations}
+            serverStatus=${serverStatus}
             onCreateTask=${createHumanTask}
             onClose=${() => setEnvOpen(false)}
           />`
         : null}
       ${settingsOpen
-        ? html`<${SettingsDrawer} onClose=${() => setSettingsOpen(false)} />`
+        ? html`<${SettingsDrawer}
+            serverStatus=${serverStatus}
+            onClose=${() => setSettingsOpen(false)}
+          />`
         : null}
     </div>
   `;
@@ -283,7 +305,7 @@ function LeftRail({ agents, openSlots, onOpen, wsConnected, envOpen, onToggleEnv
 // settings drawer
 // ------------------------------------------------------------------
 
-function SettingsDrawer({ onClose }) {
+function SettingsDrawer({ onClose, serverStatus }) {
   useEffect(() => {
     const onKey = (e) => {
       if (e.key === "Escape") onClose();
@@ -326,14 +348,31 @@ function SettingsDrawer({ onClose }) {
             <h3>Cost caps</h3>
             <div class="drawer-disabled">
               <p class="muted">
-                Per-agent daily cost caps are planned for M2e. For now,
-                monitor spend via the <strong>Cost</strong> section in the
-                Environment panel.
+                Daily caps are enforced at spawn time — agents whose daily
+                spend hits the cap see a <strong>🚫 spawn blocked</strong>
+                event in the timeline. Edit via the
+                <code>HARNESS_AGENT_DAILY_CAP</code> and
+                <code>HARNESS_TEAM_DAILY_CAP</code> env vars in Zeabur,
+                then redeploy. Set to <code>0</code> to disable either cap.
               </p>
-              <label>Daily cap per agent (USD)</label>
-              <input type="number" min="0" step="0.5" value="5.00" disabled />
-              <label>Daily cap for the whole team (USD)</label>
-              <input type="number" min="0" step="1" value="20.00" disabled />
+              <label>Per-agent daily cap (USD)</label>
+              <input
+                type="number"
+                value=${serverStatus?.caps?.agent_daily_usd?.toFixed(2) ?? "5.00"}
+                disabled
+              />
+              <label>Team daily cap (USD)</label>
+              <input
+                type="number"
+                value=${serverStatus?.caps?.team_daily_usd?.toFixed(2) ?? "20.00"}
+                disabled
+              />
+              <label>Team spent today (USD, live)</label>
+              <input
+                type="number"
+                value=${(serverStatus?.caps?.team_today_usd ?? 0).toFixed(4)}
+                disabled
+              />
             </div>
           </section>
 
@@ -361,7 +400,7 @@ function SettingsDrawer({ onClose }) {
 // environment pane (right side): tasks + cost + timeline
 // ------------------------------------------------------------------
 
-function EnvPane({ agents, tasks, conversations, onCreateTask, onClose }) {
+function EnvPane({ agents, tasks, conversations, serverStatus, onCreateTask, onClose }) {
   return html`
     <aside class="env-pane">
       <header class="env-head">
@@ -370,7 +409,7 @@ function EnvPane({ agents, tasks, conversations, onCreateTask, onClose }) {
       </header>
       <div class="env-body">
         <${EnvTasksSection} tasks=${tasks} onCreate=${onCreateTask} />
-        <${EnvCostSection} agents=${agents} />
+        <${EnvCostSection} agents=${agents} serverStatus=${serverStatus} />
         <${EnvTimelineSection} conversations=${conversations} />
       </div>
     </aside>
@@ -457,7 +496,7 @@ function EnvTasksSection({ tasks, onCreate }) {
   `;
 }
 
-function EnvCostSection({ agents }) {
+function EnvCostSection({ agents, serverStatus }) {
   const total = agents.reduce((s, a) => s + (a.cost_estimate_usd || 0), 0);
   const working = agents.filter((a) => a.status === "working").length;
   const active = agents
@@ -470,11 +509,28 @@ function EnvCostSection({ agents }) {
     .sort(
       (a, b) => (b.cost_estimate_usd || 0) - (a.cost_estimate_usd || 0)
     );
+  const caps = serverStatus?.caps;
+  const teamToday = caps?.team_today_usd ?? 0;
+  const teamCap = caps?.team_daily_usd ?? 0;
+  const teamPct = teamCap > 0 ? Math.min(100, Math.round((teamToday / teamCap) * 100)) : 0;
+  const teamBarClass =
+    teamPct >= 100 ? " over" : teamPct >= 80 ? " warn" : "";
   return html`
     <section class="env-section">
       <h3 class="env-section-title">
         Cost <span class="env-count">$${total.toFixed(3)}</span>
       </h3>
+      ${caps
+        ? html`<div class="env-cap-bar">
+            <div class="env-cap-bar-label">
+              today: $${teamToday.toFixed(3)} / $${teamCap.toFixed(2)}
+              ${caps.agent_daily_usd ? html` · per-agent cap $${caps.agent_daily_usd.toFixed(2)}` : null}
+            </div>
+            <div class="env-cap-bar-track">
+              <div class=${"env-cap-bar-fill" + teamBarClass} style=${"width:" + teamPct + "%"}></div>
+            </div>
+          </div>`
+        : null}
       ${working > 0
         ? html`<div class="env-cost-sub">${working} agent${working === 1 ? "" : "s"} working now</div>`
         : null}
@@ -512,6 +568,7 @@ const TIMELINE_TYPES = new Set([
   "task_updated",
   "message_sent",
   "memory_updated",
+  "cost_capped",
 ]);
 
 function EnvTimelineSection({ conversations }) {
@@ -626,6 +683,14 @@ function EnvTimelineItem({ event }) {
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
       <span class="env-tl-body">◎ memory/${event.topic} v${event.version} (${event.size} chars)</span>
+    </div>`;
+  }
+  if (event.type === "cost_capped") {
+    const reason = (event.reason || "").slice(0, 140);
+    return html`<div class="env-tl-item env-tl-capped">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">🚫 spawn blocked — ${reason}</span>
     </div>`;
   }
   return null;

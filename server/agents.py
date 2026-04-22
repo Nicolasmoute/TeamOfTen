@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 from typing import Any
@@ -83,6 +84,64 @@ async def _set_status(agent_id: str, status: str) -> None:
         logger.exception("set_status failed: agent=%s status=%s", agent_id, status)
 
 
+AGENT_DAILY_CAP_USD = float(os.environ.get("HARNESS_AGENT_DAILY_CAP", "5.0"))
+TEAM_DAILY_CAP_USD = float(os.environ.get("HARNESS_TEAM_DAILY_CAP", "20.0"))
+
+
+def _today_utc_start_iso() -> str:
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
+async def _today_spend(agent_id: str | None = None) -> float:
+    """Sum cost_usd from 'result' events emitted today (UTC). Pass
+    agent_id to scope to one slot, or None for the whole team."""
+    start_ts = _today_utc_start_iso()
+    where = "WHERE type = 'result' AND ts >= ?"
+    params: list[Any] = [start_ts]
+    if agent_id:
+        where += " AND agent_id = ?"
+        params.append(agent_id)
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT COALESCE("
+            "  SUM(CAST(json_extract(payload, '$.cost_usd') AS REAL)), 0"
+            f") AS total FROM events {where}",
+            params,
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    return float(dict(row)["total"] or 0.0) if row else 0.0
+
+
+async def _check_cost_caps(agent_id: str) -> tuple[bool, str]:
+    """Returns (allowed, reason_if_denied)."""
+    if AGENT_DAILY_CAP_USD > 0:
+        agent_today = await _today_spend(agent_id)
+        if agent_today >= AGENT_DAILY_CAP_USD:
+            return (
+                False,
+                f"agent {agent_id} has spent "
+                f"${agent_today:.3f} today, "
+                f"at or above its daily cap of "
+                f"${AGENT_DAILY_CAP_USD:.2f}. Override with "
+                f"HARNESS_AGENT_DAILY_CAP env var.",
+            )
+    if TEAM_DAILY_CAP_USD > 0:
+        team_today = await _today_spend()
+        if team_today >= TEAM_DAILY_CAP_USD:
+            return (
+                False,
+                f"team has spent ${team_today:.3f} today, "
+                f"at or above the team daily cap of "
+                f"${TEAM_DAILY_CAP_USD:.2f}. Override with "
+                f"HARNESS_TEAM_DAILY_CAP env var.",
+            )
+    return True, ""
+
+
 async def _add_cost(agent_id: str, cost_usd: float | None) -> None:
     if not cost_usd or agent_id == "system":
         return
@@ -154,6 +213,15 @@ def _system_prompt_for(agent_id: str) -> str:
 
 async def run_agent(agent_id: str, prompt: str) -> None:
     """Spawn one SDK query for the given slot and stream its events."""
+    # Enforce daily cost caps BEFORE emitting agent_started — if the
+    # caller is over budget we want the rejection visible in the
+    # timeline and no SDK work done.
+    allowed, reason = await _check_cost_caps(agent_id)
+    if not allowed:
+        await _emit(agent_id, "cost_capped", reason=reason, prompt=prompt)
+        logger.warning("cost cap blocked spawn: %s", reason)
+        return
+
     await _emit(agent_id, "agent_started", prompt=prompt)
     await _set_status(agent_id, "working")
 

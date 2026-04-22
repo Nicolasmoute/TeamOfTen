@@ -268,6 +268,31 @@ body {
 .env-tl-msg .env-tl-body { color: var(--tool); }
 .env-tl-mem { border-left-color: var(--ok); }
 .env-tl-mem .env-tl-body { color: var(--ok); }
+.env-tl-capped { border-left-color: var(--err); background: #281417; }
+.env-tl-capped .env-tl-body { color: var(--err); white-space: normal; }
+
+/* cost cap progress bar */
+.env-cap-bar { margin-bottom: 8px; }
+.env-cap-bar-label {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 3px;
+  font-variant-numeric: tabular-nums;
+}
+.env-cap-bar-track {
+  height: 4px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.env-cap-bar-fill {
+  height: 100%;
+  background: var(--ok);
+  transition: width 200ms, background-color 200ms;
+}
+.env-cap-bar-fill.warn { background: var(--warn); }
+.env-cap-bar-fill.over { background: var(--err); }
 
 /* task list inside env pane */
 .env-task-list {

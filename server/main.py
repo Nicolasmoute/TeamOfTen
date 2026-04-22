@@ -25,7 +25,12 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from server.agents import run_agent
+from server.agents import (
+    AGENT_DAILY_CAP_USD,
+    TEAM_DAILY_CAP_USD,
+    _today_spend,
+    run_agent,
+)
 from server.db import configured_conn, init_db
 from server.events import bus
 
@@ -113,13 +118,19 @@ async def root() -> str:
 @app.get("/api/status")
 async def status() -> dict[str, object]:
     now = datetime.now(timezone.utc)
+    team_today = await _today_spend()
     return {
         "ok": True,
         "version": app.version,
-        "milestone": "M2a+v2a",
+        "milestone": "M2",
         "started_at": STARTED_AT.isoformat(),
         "uptime_seconds": int((now - STARTED_AT).total_seconds()),
         "host": os.environ.get("HOSTNAME", "unknown"),
+        "caps": {
+            "agent_daily_usd": AGENT_DAILY_CAP_USD,
+            "team_daily_usd": TEAM_DAILY_CAP_USD,
+            "team_today_usd": round(team_today, 4),
+        },
     }
 
 
