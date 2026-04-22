@@ -164,18 +164,47 @@ async def _ensure_worktree(slot: str) -> dict[str, object]:
 
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Branch may already exist (previous redeploy). git worktree add -b
-    # fails if so; bare git worktree add succeeds for existing branches.
+    # Branch resolution priority:
+    #   1. Local branch already exists → reuse it (post-redeploy where the
+    #      base repo wasn't wiped).
+    #   2. Remote branch origin/<branch> exists → create a local tracking
+    #      branch from it. Critical: a fresh clone has the remote ref but
+    #      no local branch yet; without this step we'd lose committed agent
+    #      work after a base-repo wipe + re-clone.
+    #   3. Neither → create a brand-new branch off PROJECT_BRANCH.
     code, out, _ = await _run(
         ["git", "branch", "--list", branch_name],
         cwd=BASE_REPO_PATH,
     )
-    branch_exists = bool(out.strip())
+    local_exists = bool(out.strip())
 
-    if branch_exists:
+    remote_exists = False
+    if not local_exists:
+        code, out, _ = await _run(
+            ["git", "branch", "-r", "--list", f"origin/{branch_name}"],
+            cwd=BASE_REPO_PATH,
+        )
+        remote_exists = bool(out.strip())
+
+    if local_exists:
         cmd = ["git", "worktree", "add", str(worktree_path), branch_name]
+        source = "local-branch"
+    elif remote_exists:
+        cmd = [
+            "git", "worktree", "add",
+            str(worktree_path),
+            "-b", branch_name,
+            f"origin/{branch_name}",
+        ]
+        source = "origin-tracking"
     else:
-        cmd = ["git", "worktree", "add", "-b", branch_name, str(worktree_path), PROJECT_BRANCH]
+        cmd = [
+            "git", "worktree", "add",
+            "-b", branch_name,
+            str(worktree_path),
+            PROJECT_BRANCH,
+        ]
+        source = "new-from-base"
 
     code, _, err = await _run(cmd, cwd=BASE_REPO_PATH)
     if code != 0:
@@ -188,5 +217,6 @@ async def _ensure_worktree(slot: str) -> dict[str, object]:
         "ok": True,
         "path": str(worktree_path),
         "branch": branch_name,
+        "source": source,
         "status": "created",
     }
