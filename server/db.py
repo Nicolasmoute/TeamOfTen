@@ -84,14 +84,25 @@ CREATE TABLE IF NOT EXISTS messages (
     subject      TEXT,
     body         TEXT NOT NULL,
     sent_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    read_at      TEXT,                    -- set when recipient drains inbox
+    read_at      TEXT,                    -- legacy, unused after v0.4.1
     in_reply_to  INTEGER REFERENCES messages(id),
     priority     TEXT NOT NULL DEFAULT 'normal'
                  CHECK (priority IN ('normal', 'interrupt'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_messages_to_unread ON messages(to_id, read_at);
+CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_id);
 CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(from_id);
+
+-- Per-recipient read tracking. Necessary for broadcasts: the first
+-- recipient to drain must NOT mark the message read for everyone else.
+CREATE TABLE IF NOT EXISTS message_reads (
+    message_id INTEGER NOT NULL REFERENCES messages(id),
+    agent_id   TEXT NOT NULL,
+    read_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (message_id, agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_msgreads_agent ON message_reads(agent_id);
 """
 
 # Seed agents — idempotent via INSERT OR IGNORE.

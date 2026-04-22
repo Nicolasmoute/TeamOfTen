@@ -454,33 +454,40 @@ def build_coord_server(caller_id: str) -> Any:
     @tool(
         "coord_read_inbox",
         (
-            "Read and drain your unread messages. Returns every unread "
-            "message directed to you (or to 'broadcast') in chronological "
-            "order, then marks them as read. A later call returns an empty "
-            "inbox unless new messages have arrived."
+            "Read and drain your unread messages. Returns every message "
+            "targeted at you (direct or broadcast) that you haven't yet "
+            "seen, in chronological order, then marks them as read FOR "
+            "YOU (broadcasts stay unread for other recipients)."
         ),
         {},
     )
     async def read_inbox(args: dict[str, Any]) -> dict[str, Any]:
         c = await configured_conn()
         try:
+            # Per-recipient unread via NOT EXISTS on message_reads — avoids
+            # the broadcast bug where the first reader hides the message
+            # from everyone else.
             cur = await c.execute(
-                "SELECT id, from_id, to_id, subject, body, sent_at, priority "
-                "FROM messages "
-                "WHERE (to_id = ? OR to_id = 'broadcast') AND read_at IS NULL "
-                "ORDER BY sent_at ASC",
-                (caller_id,),
+                "SELECT m.id, m.from_id, m.to_id, m.subject, m.body, "
+                "       m.sent_at, m.priority "
+                "FROM messages m "
+                "WHERE (m.to_id = ? OR m.to_id = 'broadcast') "
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM message_reads r "
+                "    WHERE r.message_id = m.id AND r.agent_id = ?"
+                "  ) "
+                "ORDER BY m.sent_at ASC",
+                (caller_id, caller_id),
             )
             rows = await cur.fetchall()
             if not rows:
                 return _ok("(no unread messages)")
 
-            ids = [dict(r)["id"] for r in rows]
-            placeholders = ",".join("?" * len(ids))
-            now = _now_iso()
-            await c.execute(
-                f"UPDATE messages SET read_at = ? WHERE id IN ({placeholders})",
-                (now, *ids),
+            # Mark each message read by this caller only.
+            await c.executemany(
+                "INSERT OR IGNORE INTO message_reads (message_id, agent_id) "
+                "VALUES (?, ?)",
+                [(dict(r)["id"], caller_id) for r in rows],
             )
             await c.commit()
         finally:
