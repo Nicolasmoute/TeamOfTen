@@ -115,10 +115,48 @@ function category(name) {
 }
 
 // ------------------------------------------------------------------
+// image path helpers (for Read rendering)
+// ------------------------------------------------------------------
+
+const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp)$/i;
+
+function isImagePath(p) {
+  return typeof p === "string" && IMAGE_EXT_RE.test(p);
+}
+
+function imageSrcForPath(path) {
+  // Prefer the /api/attachments route — both /data/attachments/xyz.png
+  // and /workspaces/<slot>/attachments/xyz.png resolve to the same file,
+  // and /api/attachments/xyz.png serves it back to the browser.
+  const m = path.match(/\/attachments\/([^/]+)$/);
+  if (m) return `/api/attachments/${m[1]}`;
+  // Fallback: try the path as-is (will 404 unless it happens to be
+  // under /api/attachments).
+  return path;
+}
+
+// ------------------------------------------------------------------
+// shared result-block rendering
+// ------------------------------------------------------------------
+
+function renderResultBlock(result) {
+  if (!result) return null;
+  const err = !!result.is_error;
+  const content = result.content || "";
+  const trimmed = content.length > 2000 ? content.slice(0, 2000) + "\n…" : content;
+  return html`
+    <div class=${"tool-result-inline" + (err ? " error" : "")}>
+      <div class="tool-result-label">↳ ${err ? "error" : "result"}</div>
+      <pre>${trimmed || "(empty)"}</pre>
+    </div>
+  `;
+}
+
+// ------------------------------------------------------------------
 // Edit diff card — renders input.old_string → input.new_string as red/green blocks
 // ------------------------------------------------------------------
 
-function renderEditCard(name, input) {
+function renderEditCard(name, input, result) {
   const filePath = input.file_path || input.path || "";
   const oldStr = typeof input.old_string === "string" ? input.old_string : "";
   const newStr = typeof input.new_string === "string" ? input.new_string : "";
@@ -135,6 +173,28 @@ function renderEditCard(name, input) {
         <div class="diff-old"><pre>${oldStr || "(empty)"}</pre></div>
         <div class="diff-new"><pre>${newStr || "(empty)"}</pre></div>
       </div>
+      ${result && result.is_error ? renderResultBlock(result) : null}
+    </details>
+  `;
+}
+
+// ------------------------------------------------------------------
+// Read of an image — render <img> inline
+// ------------------------------------------------------------------
+
+function renderReadImageCard(name, input, result) {
+  const path = input.file_path || input.path || "";
+  const src = imageSrcForPath(path);
+  const err = result && result.is_error;
+  return html`
+    <details class="tool-card category-read read-image-card" open>
+      <summary>
+        <span class="tool-name">${name}</span>
+        <span class="tool-summary">${path}</span>
+      </summary>
+      ${err
+        ? renderResultBlock(result)
+        : html`<img class="read-image" src=${src} alt=${path} />`}
     </details>
   `;
 }
@@ -143,7 +203,7 @@ function renderEditCard(name, input) {
 // generic card used by every tool that doesn't have a custom renderer
 // ------------------------------------------------------------------
 
-function renderGenericCard(name, input) {
+function renderGenericCard(name, input, result) {
   const cat = category(name);
   const summary = summarize(name, input);
   return html`
@@ -152,7 +212,8 @@ function renderGenericCard(name, input) {
         <span class="tool-name">${name}</span>
         <span class="tool-summary">${summary}</span>
       </summary>
-      <pre>${JSON.stringify(input, null, 2)}</pre>
+      <pre class="tool-input-json">${JSON.stringify(input, null, 2)}</pre>
+      ${renderResultBlock(result)}
     </details>
   `;
 }
@@ -165,10 +226,15 @@ export function renderToolCall(event) {
   const rawName = event?.name || "?";
   const name = stripMcp(rawName);
   const input = event?.input || {};
+  const result = event?.__result;
 
   if (name === "Edit" && (input.old_string || input.new_string)) {
-    return renderEditCard(name, input);
+    return renderEditCard(name, input, result);
   }
 
-  return renderGenericCard(name, input);
+  if (name === "Read" && isImagePath(input.file_path || input.path)) {
+    return renderReadImageCard(name, input, result);
+  }
+
+  return renderGenericCard(name, input, result);
 }

@@ -236,26 +236,46 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
     };
   }, [slot]);
 
-  // Merge history + live events. History events have __id (DB row id);
-  // liveEvents may include events that arrived after history loaded OR
-  // before (since the WS backlog replays recent events too). We dedupe
-  // by __id where available.
-  const allEvents = useMemo(() => {
+  // Merge history + live events.
+  const mergedEvents = useMemo(() => {
     const seen = new Set();
     const out = [];
     for (const e of history) {
       if (e.__id != null) seen.add(e.__id);
       out.push(e);
     }
-    // For live events, skip any that duplicate a history row via __id
-    // (won't happen since live events don't carry __id, but cheap).
-    // Also skip consecutive identical events (WS backlog + own echo).
     for (const e of liveEvents) {
       if (e.__id != null && seen.has(e.__id)) continue;
       out.push(e);
     }
     return out;
   }, [history, liveEvents]);
+
+  // Pair tool_use ↔ tool_result by id. The tool_result moves INTO its
+  // tool_use's card (available as event.__result). Orphaned results
+  // (no matching tool_use in this pane's event list — shouldn't happen
+  // normally) still render standalone as a safety net.
+  const allEvents = useMemo(() => {
+    const resultByUseId = new Map();
+    const knownUseIds = new Set();
+    for (const e of mergedEvents) {
+      if (e.type === "tool_use" && e.id) knownUseIds.add(e.id);
+      if (e.type === "tool_result" && e.tool_use_id) {
+        resultByUseId.set(e.tool_use_id, e);
+      }
+    }
+    return mergedEvents
+      .filter((e) => {
+        if (e.type !== "tool_result") return true;
+        // drop tool_results that are paired (rendered inside their tool_use)
+        return !(e.tool_use_id && knownUseIds.has(e.tool_use_id));
+      })
+      .map((e) =>
+        e.type === "tool_use" && e.id
+          ? { ...e, __result: resultByUseId.get(e.id) }
+          : e
+      );
+  }, [mergedEvents]);
 
   // auto-scroll to bottom when new events arrive — only if user was already
   // near the bottom (otherwise leave them reading older history in peace).
