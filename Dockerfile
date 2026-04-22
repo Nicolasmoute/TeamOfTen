@@ -23,10 +23,14 @@ RUN apt-get update \
 RUN mkdir -p /workspaces/default /workspaces/coach \
     && for i in 1 2 3 4 5 6 7 8 9 10; do mkdir -p "/workspaces/p${i}"; done
 
-# Persistent data dir for SQLite — mount a Zeabur volume here to survive
-# redeploys. If no volume is mounted, the DB lives on the ephemeral
-# container filesystem and is wiped on each deploy.
-RUN mkdir -p /var/lib/harness
+# Persistent data dir for SQLite — on Zeabur, mount a volume at /data
+# (matches the DB_PATH default in server/db.py). We deliberately do NOT
+# pre-create /data in the image: Zeabur's bind-mount over an already-
+# existing directory causes SQLite's file probe to hang silently at
+# startup (confirmed against M2a, 2026-04-22). Letting the volume
+# create the path avoids that.
+# Without a volume, init_db falls back to creating /data on the
+# ephemeral container filesystem — still works, just not persistent.
 
 WORKDIR /app
 

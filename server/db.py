@@ -18,7 +18,13 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-DB_PATH = os.environ.get("HARNESS_DB_PATH", "/var/lib/harness/harness.db")
+# Default path matches Zeabur's volume convention: mount a volume with the
+# UI's "Mount Directory" set to "/data", and this is where the DB lives.
+# Override with HARNESS_DB_PATH env var for other deploy targets.
+# Known gotcha (learned the hard way in M2a): do NOT pre-create the mount
+# path in the Dockerfile. On Zeabur, bind-mounting a volume over an
+# already-existing directory causes SQLite's file probe to hang silently.
+DB_PATH = os.environ.get("HARNESS_DB_PATH", "/data/harness.db")
 
 # Schema is idempotent — safe to run every startup.
 SCHEMA = """
