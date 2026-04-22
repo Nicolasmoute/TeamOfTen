@@ -20,6 +20,7 @@ from claude_agent_sdk import (
 from server.db import configured_conn
 from server.events import bus
 from server.tools import ALLOWED_COACH_TOOLS, ALLOWED_PLAYER_TOOLS, build_coord_server
+from server.workspaces import workspace_dir
 
 logger = logging.getLogger("harness.agents")
 if not logger.handlers:
@@ -230,7 +231,7 @@ async def run_agent(agent_id: str, prompt: str) -> None:
 
     options = ClaudeAgentOptions(
         system_prompt=_system_prompt_for(agent_id),
-        cwd=f"/workspaces/{agent_id}",
+        cwd=str(workspace_dir(agent_id)),
         max_turns=10,
         mcp_servers={"coord": coord_server},
         allowed_tools=allowed,

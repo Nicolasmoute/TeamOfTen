@@ -35,6 +35,7 @@ from server.db import configured_conn, init_db
 from server.events import bus
 from server.kdrive import kdrive
 from server.sync import flush_loop, snapshot_loop
+from server.workspaces import ensure_workspaces, get_status as get_workspaces_status
 
 logger = logging.getLogger("harness.main")
 if not logger.handlers:
@@ -75,6 +76,11 @@ ALLOWED_EXT = {"png", "jpg", "jpeg", "gif", "webp"}
 async def lifespan(app: FastAPI):
     await init_db()
     ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    # Project-repo clone + per-slot worktrees (no-op if HARNESS_PROJECT_REPO
+    # unset). Logged but errors don't abort startup — agents can still run
+    # in plain dirs if worktree setup fails.
+    workspaces_status = await ensure_workspaces()
+    logger.info("workspaces: %r", workspaces_status)
     # Background tasks: flush event log to kDrive + hourly SQLite
     # snapshot. Both are no-ops when kDrive is disabled so running them
     # unconditionally is safe — picks up activation without restart.
@@ -151,6 +157,7 @@ async def status() -> dict[str, object]:
             "enabled": kdrive.enabled,
             "reason": kdrive.reason,
         },
+        "workspaces": get_workspaces_status(),
     }
 
 
