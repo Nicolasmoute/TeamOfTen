@@ -14,55 +14,101 @@
         --border: #30363d;
         --card: #161b22;
         --ok: #3fb950;
+        --warn: #d29922;
         --err: #f85149;
+        --coach: #d29922;
+        --player: #58a6ff;
       }
       * { box-sizing: border-box; }
       body {
         margin: 0;
         background: var(--bg);
         color: var(--fg);
-        font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       }
       header {
-        padding: 12px 16px;
+        padding: 10px 16px;
         border-bottom: 1px solid var(--border);
         display: flex;
         align-items: center;
         gap: 12px;
       }
-      header h1 {
-        font-size: 15px;
-        margin: 0;
-        font-weight: 600;
-      }
-      header .status {
-        margin-left: auto;
-        color: var(--muted);
-      }
+      header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+      header .status { margin-left: auto; color: var(--muted); font-size: 12px; }
       header .dot {
         display: inline-block;
-        width: 8px;
-        height: 8px;
+        width: 8px; height: 8px;
         border-radius: 50%;
         background: var(--err);
         margin-right: 6px;
         vertical-align: middle;
       }
       header .dot.ok { background: var(--ok); }
+
       main {
         display: grid;
-        grid-template-columns: 1fr 360px;
-        gap: 0;
-        height: calc(100vh - 49px);
+        grid-template-columns: 260px 1fr 320px;
+        height: calc(100vh - 41px);
       }
-      @media (max-width: 720px) {
-        main { grid-template-columns: 1fr; grid-template-rows: 1fr auto; }
+      @media (max-width: 900px) {
+        main { grid-template-columns: 1fr; grid-template-rows: auto 1fr auto; height: auto; }
       }
-      #events {
-        padding: 12px 16px;
+
+      section {
         overflow-y: auto;
-        background: var(--bg);
+        border-right: 1px solid var(--border);
       }
+      section:last-child { border-right: 0; border-left: 1px solid var(--border); }
+      section h2 {
+        margin: 0;
+        padding: 10px 14px;
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+        position: sticky;
+        top: 0;
+        background: var(--bg);
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      section h2 button {
+        margin-left: auto;
+        background: transparent;
+        color: var(--muted);
+        border: 1px solid var(--border);
+        border-radius: 3px;
+        padding: 2px 8px;
+        cursor: pointer;
+        font: inherit;
+        font-size: 11px;
+      }
+      section h2 button:hover { color: var(--fg); }
+
+      /* Team roster */
+      .agent {
+        padding: 6px 14px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .agent .kind-dot {
+        width: 8px; height: 8px; border-radius: 50%;
+        background: var(--muted);
+      }
+      .agent.coach .kind-dot { background: var(--coach); }
+      .agent.player .kind-dot { background: var(--player); }
+      .agent .id { font-weight: 600; min-width: 38px; }
+      .agent .name { color: var(--fg); }
+      .agent .role { color: var(--muted); font-size: 11px; }
+      .agent .unassigned { color: var(--muted); font-style: italic; font-size: 11px; }
+
+      /* Events */
+      .events-wrap { padding: 8px 14px; }
       .ev {
         padding: 6px 10px;
         margin-bottom: 6px;
@@ -76,50 +122,64 @@
       .ev.tool_use { border-color: #a371f7; }
       .ev.result { border-color: var(--ok); color: var(--muted); font-size: 12px; }
       .ev.error { border-color: var(--err); color: var(--err); }
-      .ev.agent_started, .ev.agent_stopped, .ev.connected { color: var(--muted); font-size: 12px; }
-      .ev .meta {
-        color: var(--muted);
-        font-size: 11px;
-        margin-bottom: 2px;
+      .ev.task_created { border-color: var(--warn); }
+      .ev.agent_started, .ev.agent_stopped, .ev.connected {
+        color: var(--muted); font-size: 12px;
       }
+      .ev .meta { color: var(--muted); font-size: 11px; margin-bottom: 2px; }
+
+      /* Tasks */
+      .task {
+        padding: 8px 14px;
+        border-bottom: 1px solid var(--border);
+      }
+      .task .row1 { display: flex; gap: 8px; align-items: center; }
+      .task .id { color: var(--muted); font-size: 11px; }
+      .task .status {
+        font-size: 10px;
+        padding: 1px 6px;
+        border-radius: 3px;
+        background: var(--border);
+        text-transform: uppercase;
+      }
+      .task .status.open { background: #2d4a1e; color: var(--ok); }
+      .task .status.in_progress { background: #2d3f66; color: var(--accent); }
+      .task .status.done { color: var(--muted); }
+      .task .status.blocked { background: #66312d; color: var(--err); }
+      .task .title { margin-top: 2px; }
+      .task .meta { color: var(--muted); font-size: 11px; margin-top: 2px; }
+
+      /* Form */
       form {
-        padding: 16px;
-        border-left: 1px solid var(--border);
+        padding: 12px 14px;
         display: flex;
         flex-direction: column;
-        gap: 10px;
+        gap: 8px;
+        border-top: 1px solid var(--border);
         background: var(--card);
       }
-      @media (max-width: 720px) {
-        form { border-left: none; border-top: 1px solid var(--border); }
-      }
-      label {
-        font-size: 12px;
-        color: var(--muted);
-        text-transform: uppercase;
-        letter-spacing: 0.03em;
-      }
-      input, textarea {
+      label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+      input, textarea, select {
         width: 100%;
-        padding: 8px 10px;
+        padding: 6px 8px;
         background: var(--bg);
         color: var(--fg);
         border: 1px solid var(--border);
-        border-radius: 4px;
+        border-radius: 3px;
         font: inherit;
       }
-      textarea { min-height: 100px; resize: vertical; }
-      button {
-        padding: 10px;
+      textarea { min-height: 80px; resize: vertical; }
+      button.primary {
+        padding: 8px;
         background: var(--accent);
         color: var(--bg);
         border: 0;
-        border-radius: 4px;
+        border-radius: 3px;
         font: inherit;
         font-weight: 600;
         cursor: pointer;
       }
-      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
     </style>
   </head>
   <body>
@@ -128,27 +188,53 @@
       <span class="status"><span class="dot" id="wsdot"></span><span id="wsstate">connecting…</span></span>
     </header>
     <main>
-      <div id="events"></div>
-      <form id="form">
-        <div>
-          <label for="agent_id">slot (coach or p1…p10)</label>
-          <input id="agent_id" value="p1" autocomplete="off" />
-        </div>
-        <div>
+      <!-- LEFT: team roster + form -->
+      <section>
+        <h2>Team <button type="button" id="refreshAgents">refresh</button></h2>
+        <div id="agents"></div>
+        <form id="runForm">
+          <label for="agent_id">run prompt for slot</label>
+          <select id="agent_id"></select>
           <label for="prompt">prompt</label>
-          <textarea id="prompt" placeholder="Ask this slot to do something terse — e.g. 'say hello'"></textarea>
-        </div>
-        <button type="submit" id="submit">run</button>
-      </form>
+          <textarea id="prompt" placeholder="e.g. 'create a task to prototype the auth flow'"></textarea>
+          <button type="submit" class="primary" id="submit">run</button>
+        </form>
+      </section>
+
+      <!-- CENTER: event stream -->
+      <section>
+        <h2>Timeline</h2>
+        <div id="events" class="events-wrap"></div>
+      </section>
+
+      <!-- RIGHT: tasks + create form -->
+      <section>
+        <h2>Task board <button type="button" id="refreshTasks">refresh</button></h2>
+        <div id="tasks"></div>
+        <form id="taskForm">
+          <label for="task_title">add human task</label>
+          <input id="task_title" placeholder="title" autocomplete="off" />
+          <textarea id="task_desc" placeholder="description (optional)"></textarea>
+          <select id="task_priority">
+            <option value="low">low</option>
+            <option value="normal" selected>normal</option>
+            <option value="high">high</option>
+            <option value="urgent">urgent</option>
+          </select>
+          <button type="submit" class="primary">create task</button>
+        </form>
+      </section>
     </main>
+
     <script>
       const eventsEl = document.getElementById("events");
+      const agentsEl = document.getElementById("agents");
+      const tasksEl = document.getElementById("tasks");
+      const agentSelect = document.getElementById("agent_id");
       const wsDot = document.getElementById("wsdot");
       const wsState = document.getElementById("wsstate");
-      const form = document.getElementById("form");
-      const submitBtn = document.getElementById("submit");
 
-      function append(ev) {
+      function appendEvent(ev) {
         const div = document.createElement("div");
         div.className = "ev " + (ev.type || "");
         const meta = document.createElement("div");
@@ -156,20 +242,94 @@
         const ts = (ev.ts || "").slice(11, 19);
         meta.textContent = `${ts}  ${ev.agent_id || "?"}  ${ev.type}`;
         div.appendChild(meta);
-        if (ev.type === "text" && ev.content) {
-          div.appendChild(document.createTextNode(ev.content));
-        } else if (ev.type === "tool_use") {
-          div.appendChild(document.createTextNode(`${ev.name}  ${JSON.stringify(ev.input)}`));
-        } else if (ev.type === "error" && ev.error) {
-          div.appendChild(document.createTextNode(ev.error));
-        } else if (ev.type === "result") {
-          const s = `duration=${ev.duration_ms ?? "?"}ms  cost=$${ev.cost_usd ?? "?"}  error=${ev.is_error}`;
-          div.appendChild(document.createTextNode(s));
-        } else if (ev.prompt) {
-          div.appendChild(document.createTextNode(`prompt: ${ev.prompt}`));
-        }
+        let body = "";
+        if (ev.type === "text" && ev.content) body = ev.content;
+        else if (ev.type === "tool_use") body = `${ev.name}  ${JSON.stringify(ev.input)}`;
+        else if (ev.type === "error" && ev.error) body = ev.error;
+        else if (ev.type === "result") body = `duration=${ev.duration_ms ?? "?"}ms  cost=$${ev.cost_usd ?? "?"}  error=${ev.is_error}`;
+        else if (ev.type === "task_created") body = `[${ev.task_id}] ${ev.title}${ev.parent_id ? " (↳" + ev.parent_id + ")" : ""}`;
+        else if (ev.prompt) body = `prompt: ${ev.prompt}`;
+        if (body) div.appendChild(document.createTextNode(body));
         eventsEl.appendChild(div);
         eventsEl.scrollTop = eventsEl.scrollHeight;
+      }
+
+      async function loadAgents() {
+        const res = await fetch("/api/agents");
+        const { agents } = await res.json();
+        agentsEl.innerHTML = "";
+        agentSelect.innerHTML = "";
+        for (const a of agents) {
+          const row = document.createElement("div");
+          row.className = `agent ${a.kind}`;
+          const dot = document.createElement("span");
+          dot.className = "kind-dot";
+          row.appendChild(dot);
+          const idSpan = document.createElement("span");
+          idSpan.className = "id";
+          idSpan.textContent = a.id;
+          row.appendChild(idSpan);
+          const nameSpan = document.createElement("span");
+          if (a.name) {
+            nameSpan.className = "name";
+            nameSpan.textContent = a.name;
+          } else {
+            nameSpan.className = "unassigned";
+            nameSpan.textContent = "(unassigned)";
+          }
+          row.appendChild(nameSpan);
+          if (a.role) {
+            const roleSpan = document.createElement("span");
+            roleSpan.className = "role";
+            roleSpan.textContent = "— " + a.role;
+            row.appendChild(roleSpan);
+          }
+          agentsEl.appendChild(row);
+
+          const opt = document.createElement("option");
+          opt.value = a.id;
+          opt.textContent = a.name ? `${a.id} — ${a.name}` : a.id;
+          agentSelect.appendChild(opt);
+        }
+        agentSelect.value = agents.find(a => a.kind === "player")?.id ?? "coach";
+      }
+
+      async function loadTasks() {
+        const res = await fetch("/api/tasks");
+        const { tasks } = await res.json();
+        tasksEl.innerHTML = "";
+        if (tasks.length === 0) {
+          const empty = document.createElement("div");
+          empty.className = "task";
+          empty.style.color = "var(--muted)";
+          empty.textContent = "(no tasks yet)";
+          tasksEl.appendChild(empty);
+          return;
+        }
+        for (const t of tasks) {
+          const div = document.createElement("div");
+          div.className = "task";
+          const row1 = document.createElement("div");
+          row1.className = "row1";
+          const id = document.createElement("span");
+          id.className = "id";
+          id.textContent = t.id;
+          row1.appendChild(id);
+          const st = document.createElement("span");
+          st.className = "status " + t.status;
+          st.textContent = t.status;
+          row1.appendChild(st);
+          div.appendChild(row1);
+          const title = document.createElement("div");
+          title.className = "title";
+          title.textContent = t.title;
+          div.appendChild(title);
+          const meta = document.createElement("div");
+          meta.className = "meta";
+          meta.textContent = `by ${t.created_by}  owner ${t.owner || "-"}  pri ${t.priority}${t.parent_id ? "  ↳" + t.parent_id : ""}`;
+          div.appendChild(meta);
+          tasksEl.appendChild(div);
+        }
       }
 
       let ws;
@@ -177,7 +337,14 @@
         const proto = location.protocol === "https:" ? "wss:" : "ws:";
         ws = new WebSocket(`${proto}//${location.host}/ws`);
         ws.onopen = () => { wsDot.classList.add("ok"); wsState.textContent = "connected"; };
-        ws.onmessage = (e) => { try { append(JSON.parse(e.data)); } catch (_) {} };
+        ws.onmessage = (e) => {
+          let ev;
+          try { ev = JSON.parse(e.data); } catch (_) { return; }
+          appendEvent(ev);
+          // Nudge views on relevant events
+          if (ev.type === "task_created" || ev.type === "task_updated") loadTasks();
+          if (ev.type === "agent_started" || ev.type === "agent_stopped") loadAgents();
+        };
         ws.onclose = () => {
           wsDot.classList.remove("ok");
           wsState.textContent = "disconnected, retrying…";
@@ -185,14 +352,13 @@
         };
         ws.onerror = () => ws.close();
       }
-      connect();
 
-      form.addEventListener("submit", async (e) => {
+      document.getElementById("runForm").addEventListener("submit", async (e) => {
         e.preventDefault();
-        const agent_id = document.getElementById("agent_id").value.trim() || "w1";
+        const agent_id = agentSelect.value;
         const prompt = document.getElementById("prompt").value.trim();
         if (!prompt) return;
-        submitBtn.disabled = true;
+        document.getElementById("submit").disabled = true;
         try {
           const res = await fetch("/api/agents/start", {
             method: "POST",
@@ -202,11 +368,39 @@
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           document.getElementById("prompt").value = "";
         } catch (err) {
-          append({ ts: new Date().toISOString(), agent_id: "system", type: "error", error: String(err) });
+          appendEvent({ ts: new Date().toISOString(), agent_id: "system", type: "error", error: String(err) });
         } finally {
-          submitBtn.disabled = false;
+          document.getElementById("submit").disabled = false;
         }
       });
+
+      document.getElementById("taskForm").addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const title = document.getElementById("task_title").value.trim();
+        if (!title) return;
+        const description = document.getElementById("task_desc").value;
+        const priority = document.getElementById("task_priority").value;
+        try {
+          const res = await fetch("/api/tasks", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ title, description, priority }),
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          document.getElementById("task_title").value = "";
+          document.getElementById("task_desc").value = "";
+          await loadTasks();
+        } catch (err) {
+          appendEvent({ ts: new Date().toISOString(), agent_id: "system", type: "error", error: String(err) });
+        }
+      });
+
+      document.getElementById("refreshAgents").addEventListener("click", loadAgents);
+      document.getElementById("refreshTasks").addEventListener("click", loadTasks);
+
+      loadAgents();
+      loadTasks();
+      connect();
     </script>
   </body>
 </html>

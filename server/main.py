@@ -2,31 +2,57 @@ from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from server.agents import run_agent
+from server.db import configured_conn, init_db
 from server.events import bus
-
-app = FastAPI(
-    title="TeamOfTen harness",
-    version="0.1.0",
-    description="Personal orchestration harness — 1 coordinator + 10 worker agents.",
-)
 
 STARTED_AT = datetime.now(timezone.utc)
 INDEX_HTML = (Path(__file__).parent / "index.html").read_text(encoding="utf-8")
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    yield
+
+
+app = FastAPI(
+    title="TeamOfTen harness",
+    version="0.2.0",
+    description="Personal orchestration harness — Coach + 10 Players.",
+    lifespan=lifespan,
+)
+
+
+# ------------------------------------------------------------------
+# Request models
+# ------------------------------------------------------------------
+
+
 class StartAgentRequest(BaseModel):
-    # Valid slot ids are "coach" or "p1".."p10". The pattern is permissive
-    # for M1; tighter validation lands in M2a once the Agent model exists.
-    agent_id: str = Field(default="p1", pattern=r"^[a-z0-9_-]{1,16}$")
+    agent_id: str = Field(default="p1", pattern=r"^(coach|p([1-9]|10))$")
     prompt: str = Field(min_length=1, max_length=10_000)
+
+
+class CreateTaskRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    description: str = Field(default="", max_length=10_000)
+    parent_id: str | None = None
+    priority: str = Field(default="normal", pattern=r"^(low|normal|high|urgent)$")
+
+
+# ------------------------------------------------------------------
+# Pages + health
+# ------------------------------------------------------------------
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -40,11 +66,32 @@ async def status() -> dict[str, object]:
     return {
         "ok": True,
         "version": app.version,
-        "milestone": "M1",
+        "milestone": "M2a",
         "started_at": STARTED_AT.isoformat(),
         "uptime_seconds": int((now - STARTED_AT).total_seconds()),
         "host": os.environ.get("HOSTNAME", "unknown"),
     }
+
+
+# ------------------------------------------------------------------
+# Agents
+# ------------------------------------------------------------------
+
+
+@app.get("/api/agents")
+async def list_agents() -> dict[str, list[dict[str, Any]]]:
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT id, kind, name, role, status, current_task_id, model, "
+            "workspace_path, cost_estimate_usd, started_at, last_heartbeat "
+            "FROM agents ORDER BY "
+            "CASE kind WHEN 'coach' THEN 0 ELSE 1 END, id"
+        )
+        rows = await cur.fetchall()
+    finally:
+        await c.close()
+    return {"agents": [dict(r) for r in rows]}
 
 
 @app.post("/api/agents/start")
@@ -53,6 +100,84 @@ async def start_agent(
 ) -> dict[str, object]:
     background.add_task(run_agent, req.agent_id, req.prompt)
     return {"ok": True, "agent_id": req.agent_id}
+
+
+# ------------------------------------------------------------------
+# Tasks
+# ------------------------------------------------------------------
+
+
+@app.get("/api/tasks")
+async def list_tasks(status: str | None = None, owner: str | None = None) -> dict[str, Any]:
+    where_parts: list[str] = []
+    params: list[Any] = []
+    if status:
+        where_parts.append("status = ?")
+        params.append(status)
+    if owner is not None:
+        if owner.lower() in ("null", "none", "unassigned"):
+            where_parts.append("owner IS NULL")
+        else:
+            where_parts.append("owner = ?")
+            params.append(owner)
+    clause = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            f"SELECT * FROM tasks{clause} ORDER BY created_at DESC", params
+        )
+        rows = await cur.fetchall()
+    finally:
+        await c.close()
+    return {"tasks": [dict(r) for r in rows]}
+
+
+@app.post("/api/tasks")
+async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
+    """Create a top-level task from the UI (attributed to 'human').
+
+    Used before there is a Coach session running to plant an initial goal,
+    or for humans to inject direct tasks. Human-created tasks bypass the
+    Coach-only top-level rule by design — the human IS the coach's boss.
+    """
+    import uuid
+
+    task_id = f"t-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:8]}"
+    parent_id = req.parent_id or None
+
+    c = await configured_conn()
+    try:
+        if parent_id:
+            cur = await c.execute("SELECT id FROM tasks WHERE id = ?", (parent_id,))
+            if (await cur.fetchone()) is None:
+                raise HTTPException(404, detail=f"parent_id {parent_id} not found")
+        await c.execute(
+            "INSERT INTO tasks (id, title, description, parent_id, priority, created_by) "
+            "VALUES (?, ?, ?, ?, ?, 'human')",
+            (task_id, req.title, req.description, parent_id, req.priority),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "human",
+            "type": "task_created",
+            "task_id": task_id,
+            "title": req.title,
+            "parent_id": parent_id,
+            "priority": req.priority,
+        }
+    )
+    return {"ok": True, "task_id": task_id}
+
+
+# ------------------------------------------------------------------
+# WebSocket event stream
+# ------------------------------------------------------------------
 
 
 @app.websocket("/ws")

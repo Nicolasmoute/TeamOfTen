@@ -18,8 +18,15 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Workspace dir for agents' cwd (M1: single shared dir; M4+: per-worker worktrees)
-RUN mkdir -p /workspaces/default && chmod 755 /workspaces
+# Workspaces — one per slot (Coach + p1..p10) plus a default.
+# In M2a these are plain dirs; per-slot git worktrees come in M4+.
+RUN mkdir -p /workspaces/default /workspaces/coach \
+    && for i in 1 2 3 4 5 6 7 8 9 10; do mkdir -p "/workspaces/p${i}"; done
+
+# Persistent data dir for SQLite — mount a Zeabur volume here to survive
+# redeploys. If no volume is mounted, the DB lives on the ephemeral
+# container filesystem and is wiped on each deploy.
+RUN mkdir -p /var/lib/harness
 
 WORKDIR /app
 

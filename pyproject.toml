@@ -1,12 +1,13 @@
 [project]
 name = "teamoften-harness"
-version = "0.1.0"
-description = "Personal orchestration harness — 1 coordinator + 10 Claude Code worker agents"
+version = "0.2.0"
+description = "Personal orchestration harness — Coach + 10 Players, Claude Code agents"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "claude-agent-sdk>=0.1.60",
+    "aiosqlite>=0.20",
 ]
 
 [build-system]
