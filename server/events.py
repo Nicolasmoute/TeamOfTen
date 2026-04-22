@@ -70,9 +70,13 @@ class EventBus:
         asyncio.create_task(_persist(event))
 
     def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
+        """Subscribe to live events only.
+
+        Historical context comes from GET /api/events (DB-backed) since v2a;
+        replaying the in-memory backlog here caused duplicate events in the
+        UI when a pane combined /api/events history with WS events.
+        """
         q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=QUEUE_SIZE)
-        for event in self._backlog:
-            q.put_nowait(event)
         self._queues.add(q)
         return q
 

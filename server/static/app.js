@@ -50,8 +50,8 @@ function App() {
   const [wsConnected, setWsConnected] = useState(false);
   // conversations: Map<slotId, Event[]>  (events ordered oldest → newest)
   const [conversations, setConversations] = useState(new Map());
-  const convRef = useRef(conversations);
-  convRef.current = conversations;
+  // bumping this re-runs the WS effect, which re-opens a new connection
+  const [wsAttempt, setWsAttempt] = useState(0);
 
   // load + refresh agents
   const loadAgents = useCallback(async () => {
@@ -67,24 +67,24 @@ function App() {
     loadAgents();
   }, [loadAgents]);
 
-  // WebSocket: single connection at app root, fan out to conversations
+  // WebSocket: single connection at app root. On close, schedule a
+  // re-open by bumping wsAttempt; the effect re-runs, a new socket opens.
   useEffect(() => {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(`${proto}//${location.host}/ws`);
+    let reopenTimer = null;
     ws.onopen = () => setWsConnected(true);
     ws.onclose = () => {
       setWsConnected(false);
-      // naive reconnect
-      setTimeout(() => {
-        // re-run the effect by re-mounting is not trivial; just reload
-        // the agents list on reconnect via next render and hope WS
-        // opens again (it won't auto without reload). Simpler: reload.
-      }, 2000);
+      reopenTimer = setTimeout(() => setWsAttempt((a) => a + 1), 2000);
+    };
+    ws.onerror = () => {
+      // Let onclose handle the retry; just close so onclose fires.
+      try { ws.close(); } catch (_) { /* ignore */ }
     };
     ws.onmessage = (e) => {
       let ev;
       try { ev = JSON.parse(e.data); } catch (_) { return; }
-      // route to conversation bucket
       const aid = ev.agent_id || "system";
       setConversations((prev) => {
         const next = new Map(prev);
@@ -92,7 +92,6 @@ function App() {
         next.set(aid, [...list, ev]);
         return next;
       });
-      // refresh roster on lifecycle / task events
       if (
         ev.type === "agent_started" ||
         ev.type === "agent_stopped" ||
@@ -103,8 +102,11 @@ function App() {
         loadAgents();
       }
     };
-    return () => ws.close();
-  }, [loadAgents]);
+    return () => {
+      if (reopenTimer) clearTimeout(reopenTimer);
+      try { ws.close(); } catch (_) { /* ignore */ }
+    };
+  }, [loadAgents, wsAttempt]);
 
   const openPane = useCallback((slot) => {
     setOpenSlots((prev) => (prev.includes(slot) ? prev : [...prev, slot]));

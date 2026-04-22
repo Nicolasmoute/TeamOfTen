@@ -196,3 +196,12 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_list_tasks",
     "mcp__coord__coord_create_task",
 ]
+
+# Standard Claude Code tools agents need to do actual work. Image-paste
+# in particular depends on Read to load files at /data/attachments/<id>.
+# Without this the pane sends images but the agent has no way to see them.
+STANDARD_TOOLS = [
+    "Read", "Write", "Edit", "Bash", "Grep", "Glob", "ToolSearch",
+]
+
+ALLOWED_AGENT_TOOLS = STANDARD_TOOLS + ALLOWED_COORD_TOOLS

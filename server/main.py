@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -27,9 +29,32 @@ from server.agents import run_agent
 from server.db import configured_conn, init_db
 from server.events import bus
 
+logger = logging.getLogger("harness.main")
+if not logger.handlers:
+    h = logging.StreamHandler(sys.stdout)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s | %(message)s"))
+    logger.addHandler(h)
+    logger.setLevel(logging.INFO)
+
 STARTED_AT = datetime.now(timezone.utc)
 STATIC_DIR = Path(__file__).parent / "static"
-INDEX_HTML = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+# If package-data shipped /static correctly, INDEX_HTML is the real page.
+# If not, we want a visible error page, not an import crash that makes
+# the container restart-loop with zero logs.
+try:
+    INDEX_HTML = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+except Exception as e:
+    logger.error("static/index.html missing (%s): UI will show a fallback page", e)
+    INDEX_HTML = (
+        "<!doctype html><meta charset=utf-8>"
+        "<title>TeamOfTen — UI missing</title>"
+        "<body style='font-family:monospace;padding:2em;background:#0d1117;color:#e6edf3'>"
+        "<h1>UI assets not packaged</h1>"
+        "<p>server/static/index.html is not present in the installed package. "
+        "Check pyproject.toml <code>[tool.setuptools.package-data]</code>.</p>"
+        "</body>"
+    )
 
 # Central attachment store. Sits on the same /data volume as the SQLite DB,
 # so images persist across redeploys. Lives outside any agent's workspace
@@ -52,7 +77,10 @@ app = FastAPI(
     description="Personal orchestration harness — Coach + 10 Players.",
     lifespan=lifespan,
 )
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+else:
+    logger.error("static dir not found at %s — /static routes will 404", STATIC_DIR)
 
 
 # ------------------------------------------------------------------

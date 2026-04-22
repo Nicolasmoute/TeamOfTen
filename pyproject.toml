@@ -8,6 +8,7 @@ dependencies = [
     "uvicorn[standard]>=0.32",
     "claude-agent-sdk>=0.1.60",
     "aiosqlite>=0.20",
+    "python-multipart>=0.0.9",
 ]
 
 [build-system]
