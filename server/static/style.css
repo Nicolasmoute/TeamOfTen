@@ -219,6 +219,52 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* ---- env timeline ---- */
+.env-timeline-section .env-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 300px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.env-tl-item {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 11px;
+  padding: 2px 0;
+  line-height: 1.4;
+  border-left: 2px solid var(--border);
+  padding-left: 6px;
+}
+.env-tl-ts {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.env-tl-who {
+  color: var(--fg);
+  font-weight: 600;
+  flex-shrink: 0;
+  min-width: 34px;
+}
+.env-tl-arrow { color: var(--muted); flex-shrink: 0; }
+.env-tl-body {
+  color: var(--fg);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.env-tl-started { border-left-color: var(--muted); }
+.env-tl-started .env-tl-body { color: var(--muted); font-style: italic; }
+.env-tl-text { border-left-color: var(--accent); }
+.env-tl-error { border-left-color: var(--err); }
+.env-tl-error .env-tl-body { color: var(--err); }
+.env-tl-task { border-left-color: var(--warn); }
+.env-tl-task .env-tl-body { color: var(--warn); }
+
 /* task list inside env pane */
 .env-task-list {
   display: flex;

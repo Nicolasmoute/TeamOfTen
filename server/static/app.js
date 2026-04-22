@@ -177,6 +177,7 @@ function App() {
         ? html`<${EnvPane}
             agents=${agents}
             tasks=${tasks}
+            conversations=${conversations}
             onCreateTask=${createHumanTask}
             onClose=${() => setEnvOpen(false)}
           />`
@@ -244,7 +245,7 @@ function LeftRail({ agents, openSlots, onOpen, wsConnected, envOpen, onToggleEnv
 // environment pane (right side): tasks + cost + timeline
 // ------------------------------------------------------------------
 
-function EnvPane({ agents, tasks, onCreateTask, onClose }) {
+function EnvPane({ agents, tasks, conversations, onCreateTask, onClose }) {
   return html`
     <aside class="env-pane">
       <header class="env-head">
@@ -254,7 +255,7 @@ function EnvPane({ agents, tasks, onCreateTask, onClose }) {
       <div class="env-body">
         <${EnvTasksSection} tasks=${tasks} onCreate=${onCreateTask} />
         <${EnvCostSection} agents=${agents} />
-        <${EnvTimelineSection} />
+        <${EnvTimelineSection} conversations=${conversations} />
       </div>
     </aside>
   `;
@@ -383,14 +384,99 @@ function EnvCostSection({ agents }) {
   `;
 }
 
-function EnvTimelineSection() {
-  // Placeholder — cross-agent timeline lands in v2d step 3.
+// Event types that belong in the cross-agent timeline. tool_use /
+// tool_result / result / agent_stopped are noise at this altitude
+// (agent panes surface them). `connected` is system chatter.
+const TIMELINE_TYPES = new Set([
+  "agent_started",
+  "text",
+  "error",
+  "task_created",
+]);
+
+function EnvTimelineSection({ conversations }) {
+  const timelineRef = useRef(null);
+  const stickyRef = useRef(true);
+
+  // Flatten all WS-routed events across slots and keep only the ones
+  // that belong at the overview level.
+  const events = useMemo(() => {
+    const merged = [];
+    for (const list of conversations.values()) {
+      for (const ev of list) {
+        if (TIMELINE_TYPES.has(ev.type)) merged.push(ev);
+      }
+    }
+    merged.sort((a, b) => (a.ts || "").localeCompare(b.ts || ""));
+    // Cap at last 80 — this is the overview, not the full log.
+    return merged.slice(-80);
+  }, [conversations]);
+
+  const onScroll = useCallback((e) => {
+    const el = e.currentTarget;
+    stickyRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  }, []);
+
+  useEffect(() => {
+    if (timelineRef.current && stickyRef.current) {
+      timelineRef.current.scrollTop = timelineRef.current.scrollHeight;
+    }
+  }, [events.length]);
+
   return html`
-    <section class="env-section">
-      <h3 class="env-section-title">Timeline</h3>
-      <div class="env-cost-hint">(cross-agent stream in next step)</div>
+    <section class="env-section env-timeline-section">
+      <h3 class="env-section-title">
+        Timeline <span class="env-count">${events.length}</span>
+      </h3>
+      ${events.length === 0
+        ? html`<div class="env-empty">(nothing yet — run a prompt)</div>`
+        : html`
+            <div class="env-timeline" ref=${timelineRef} onScroll=${onScroll}>
+              ${events.map(
+                (ev, i) => html`<${EnvTimelineItem} key=${(ev.__id ?? "l" + i)} event=${ev} />`
+              )}
+            </div>
+          `}
     </section>
   `;
+}
+
+function EnvTimelineItem({ event }) {
+  const ts = (event.ts || "").slice(11, 19);
+  const who = event.agent_id || "?";
+  if (event.type === "agent_started") {
+    const prompt = (event.prompt || "").replace(/\s+/g, " ").slice(0, 80);
+    return html`<div class="env-tl-item env-tl-started">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-arrow">→</span>
+      <span class="env-tl-body">${prompt}</span>
+    </div>`;
+  }
+  if (event.type === "text") {
+    const body = (event.content || "").replace(/\s+/g, " ").slice(0, 120);
+    return html`<div class="env-tl-item env-tl-text">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">${body}</span>
+    </div>`;
+  }
+  if (event.type === "error") {
+    const body = (event.error || "").slice(0, 100);
+    return html`<div class="env-tl-item env-tl-error">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">⚠ ${body}</span>
+    </div>`;
+  }
+  if (event.type === "task_created") {
+    return html`<div class="env-tl-item env-tl-task">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">+ [${event.task_id}] ${event.title}</span>
+    </div>`;
+  }
+  return null;
 }
 
 // ------------------------------------------------------------------
