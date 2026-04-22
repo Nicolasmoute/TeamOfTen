@@ -10,7 +10,9 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ResultMessage,
     TextBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
     query,
 )
 
@@ -34,6 +36,34 @@ async def _emit(agent_id: str, event_type: str, **payload: Any) -> None:
     await bus.publish(
         {"ts": _now(), "agent_id": agent_id, "type": event_type, **payload}
     )
+
+
+_TOOL_RESULT_CAP = 4000
+
+
+def _stringify_tool_result(content: Any) -> str:
+    """Flatten ToolResultBlock.content (str | list[block] | None) to a
+    single string, capped to keep event payloads reasonable.
+
+    Non-text blocks (e.g. images returned by Read) are summarized as
+    `[ImageBlock]` placeholders so the UI shows that something came back
+    without dumping base64 into the event log.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content[:_TOOL_RESULT_CAP]
+    if isinstance(content, list):
+        parts: list[str] = []
+        for b in content:
+            text = getattr(b, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+            else:
+                parts.append(f"[{type(b).__name__}]")
+        joined = "\n".join(parts)
+        return joined[:_TOOL_RESULT_CAP]
+    return str(content)[:_TOOL_RESULT_CAP]
 
 
 async def _set_status(agent_id: str, status: str) -> None:
@@ -119,8 +149,22 @@ async def run_agent(agent_id: str, prompt: str) -> None:
                         await _emit(
                             agent_id,
                             "tool_use",
+                            id=block.id,
                             name=block.name,
                             input=block.input,
+                        )
+            elif isinstance(msg, UserMessage):
+                # Carries tool results; we surface them so the UI can pair
+                # each tool_use with its output.
+                for block in msg.content:
+                    if isinstance(block, ToolResultBlock):
+                        content = _stringify_tool_result(block.content)
+                        await _emit(
+                            agent_id,
+                            "tool_result",
+                            tool_use_id=block.tool_use_id,
+                            content=content,
+                            is_error=bool(getattr(block, "is_error", False)),
                         )
             elif isinstance(msg, ResultMessage):
                 cost = getattr(msg, "total_cost_usd", None)

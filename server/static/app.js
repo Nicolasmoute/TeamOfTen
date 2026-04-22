@@ -414,6 +414,16 @@ function EventItem({ event }) {
     </div>`;
   }
 
+  if (type === "tool_result") {
+    const cls = "event tool_result" + (event.is_error ? " error" : "");
+    const trimmed = (event.content || "").trim();
+    const preview = trimmed.length > 600 ? trimmed.slice(0, 600) + "\n…" : trimmed;
+    return html`<div class=${cls}>
+      <div class="event-meta">${ts}  ↳ result${event.is_error ? " (error)" : ""}</div>
+      <div class="event-body tool-result-body">${preview || "(empty)"}</div>
+    </div>`;
+  }
+
   if (type === "text") {
     return html`<div class="event text">
       <div class="event-meta">${ts}</div>

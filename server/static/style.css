@@ -178,6 +178,21 @@ body {
 }
 .event.text { border-color: var(--accent); }
 .event.tool_use { border-color: var(--tool); padding: 4px 10px; }
+.event.tool_result {
+  border-color: var(--tool);
+  margin-left: 16px;
+  background: #10131a;
+  color: var(--muted);
+  font-size: 12px;
+}
+.event.tool_result.error { color: var(--err); border-color: var(--err); }
+.event.tool_result .tool-result-body {
+  white-space: pre-wrap;
+  max-height: 200px;
+  overflow-y: auto;
+  font-size: 11px;
+  line-height: 1.4;
+}
 .event.result { border-color: var(--ok); color: var(--muted); font-size: 12px; }
 .event.error { border-color: var(--err); color: var(--err); }
 .event.task_created { border-color: var(--warn); }
