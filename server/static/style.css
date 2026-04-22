@@ -353,6 +353,37 @@ body {
 }
 .pane:last-child { border-right: 0; }
 
+/* ---- Split.js gutter between resizable panes ---- */
+.gutter {
+  background-color: var(--border);
+  background-repeat: no-repeat;
+  background-position: 50%;
+  transition: background-color 80ms;
+  flex-shrink: 0;
+}
+.gutter.gutter-horizontal {
+  cursor: col-resize;
+  background-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    transparent calc(50% - 12px),
+    var(--muted) calc(50% - 12px),
+    var(--muted) calc(50% + 12px),
+    transparent calc(50% + 12px),
+    transparent 100%
+  );
+  background-size: 1px 100%;
+  background-position: 50% 50%;
+  background-repeat: no-repeat;
+}
+.gutter.gutter-horizontal:hover {
+  background-color: var(--accent);
+}
+/* Split.js sets inline flex on the siblings — neutralize the static
+   border-right between them since the gutter now provides the visual
+   separator. */
+.pane + .gutter + .pane { border-right: 0; }
+
 .pane-head {
   display: flex;
   align-items: center;

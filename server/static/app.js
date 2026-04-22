@@ -1,6 +1,7 @@
 import { h, render } from "https://esm.sh/preact@10";
-import { useState, useEffect, useMemo, useRef, useCallback } from "https://esm.sh/preact@10/hooks";
+import { useState, useEffect, useMemo, useRef, useCallback, useLayoutEffect } from "https://esm.sh/preact@10/hooks";
 import htm from "https://esm.sh/htm@3";
+import Split from "https://esm.sh/split.js@1.6.5";
 import { renderToolCall } from "/static/tools.js";
 
 const html = htm.bind(h);
@@ -148,6 +149,34 @@ function App() {
   const closePane = useCallback((slot) => {
     setOpenSlots((prev) => prev.filter((s) => s !== slot));
   }, []);
+
+  // Split.js manages drag-resize gutters between agent panes. We tear
+  // down + recreate whenever the set of open slots changes, because
+  // Split.js binds to specific DOM elements and can't handle React-y
+  // dynamic children on its own.
+  useLayoutEffect(() => {
+    if (openSlots.length < 2) return;
+    const selectors = openSlots.map((s) => "#pane-" + s);
+    // Ensure all target elements exist before Split initializes
+    const exist = selectors.every((sel) => document.querySelector(sel));
+    if (!exist) return;
+    let split;
+    try {
+      split = Split(selectors, {
+        sizes: Array(openSlots.length).fill(100 / openSlots.length),
+        minSize: 260,
+        gutterSize: 6,
+        snapOffset: 0,
+        dragInterval: 1,
+      });
+    } catch (e) {
+      console.error("Split init failed", e);
+      return;
+    }
+    return () => {
+      try { split.destroy(); } catch (_) { /* ignore */ }
+    };
+  }, [openSlots]);
 
   return html`
     <div class=${"app" + (envOpen ? " env-open" : "")}>
@@ -656,7 +685,7 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
   const cost = Number(agent?.cost_estimate_usd || 0);
 
   return html`
-    <section class="pane">
+    <section class="pane" id=${"pane-" + slot}>
       <header class="pane-head">
         <span class=${"pane-dot " + status} title=${status}></span>
         <span class="pane-id">${slot}</span>
