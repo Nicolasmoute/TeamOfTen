@@ -46,8 +46,10 @@ function unwrapPersisted(row) {
 
 function App() {
   const [agents, setAgents] = useState([]);
+  const [tasks, setTasks] = useState([]);
   const [openSlots, setOpenSlots] = useState(["coach"]);
   const [wsConnected, setWsConnected] = useState(false);
+  const [envOpen, setEnvOpen] = useState(true);
   // conversations: Map<slotId, Event[]>  (events ordered oldest → newest)
   const [conversations, setConversations] = useState(new Map());
   // bumping this re-runs the WS effect, which re-opens a new connection
@@ -63,9 +65,38 @@ function App() {
       console.error("loadAgents failed", e);
     }
   }, []);
+
+  const loadTasks = useCallback(async () => {
+    try {
+      const res = await fetch("/api/tasks");
+      const data = await res.json();
+      setTasks(data.tasks || []);
+    } catch (e) {
+      console.error("loadTasks failed", e);
+    }
+  }, []);
+
+  const createHumanTask = useCallback(
+    async ({ title, description, priority }) => {
+      const res = await fetch("/api/tasks", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          title,
+          description: description || "",
+          priority: priority || "normal",
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      await loadTasks();
+    },
+    [loadTasks]
+  );
+
   useEffect(() => {
     loadAgents();
-  }, [loadAgents]);
+    loadTasks();
+  }, [loadAgents, loadTasks]);
 
   // WebSocket: single connection at app root. On close, schedule a
   // re-open by bumping wsAttempt; the effect re-runs, a new socket opens.
@@ -96,9 +127,12 @@ function App() {
         ev.type === "agent_started" ||
         ev.type === "agent_stopped" ||
         ev.type === "result" ||
-        ev.type === "error" ||
-        ev.type === "task_created"
+        ev.type === "error"
       ) {
+        loadAgents();
+      }
+      if (ev.type === "task_created" || ev.type === "task_updated") {
+        loadTasks();
         loadAgents();
       }
     };
@@ -116,12 +150,14 @@ function App() {
   }, []);
 
   return html`
-    <div class="app">
+    <div class=${"app" + (envOpen ? " env-open" : "")}>
       <${LeftRail}
         agents=${agents}
         openSlots=${openSlots}
         onOpen=${openPane}
         wsConnected=${wsConnected}
+        envOpen=${envOpen}
+        onToggleEnv=${() => setEnvOpen((v) => !v)}
       />
       <main class="panes">
         ${openSlots.length === 0
@@ -137,6 +173,14 @@ function App() {
                 />`
             )}
       </main>
+      ${envOpen
+        ? html`<${EnvPane}
+            agents=${agents}
+            tasks=${tasks}
+            onCreateTask=${createHumanTask}
+            onClose=${() => setEnvOpen(false)}
+          />`
+        : null}
     </div>
   `;
 }
@@ -145,7 +189,7 @@ function App() {
 // left rail
 // ------------------------------------------------------------------
 
-function LeftRail({ agents, openSlots, onOpen, wsConnected }) {
+function LeftRail({ agents, openSlots, onOpen, wsConnected, envOpen, onToggleEnv }) {
   const grouped = useMemo(() => {
     const coach = agents.find((a) => a.kind === "coach");
     const players = agents
@@ -186,8 +230,134 @@ function LeftRail({ agents, openSlots, onOpen, wsConnected }) {
       ${renderSlot(grouped.coach)}
       ${grouped.players.map(renderSlot)}
       <span class="rail-sep"></span>
+      <button
+        class=${"gear env-toggle" + (envOpen ? " active" : "")}
+        title=${envOpen ? "Collapse environment panel" : "Open environment panel"}
+        onClick=${onToggleEnv}
+      >▦</button>
       <button class="gear" title="Settings (not wired yet)">⚙</button>
     </aside>
+  `;
+}
+
+// ------------------------------------------------------------------
+// environment pane (right side): tasks + cost + timeline
+// ------------------------------------------------------------------
+
+function EnvPane({ agents, tasks, onCreateTask, onClose }) {
+  return html`
+    <aside class="env-pane">
+      <header class="env-head">
+        <span class="env-title">Environment</span>
+        <button class="env-close" onClick=${onClose} title="Collapse">×</button>
+      </header>
+      <div class="env-body">
+        <${EnvTasksSection} tasks=${tasks} onCreate=${onCreateTask} />
+        <${EnvCostSection} agents=${agents} />
+        <${EnvTimelineSection} />
+      </div>
+    </aside>
+  `;
+}
+
+function EnvTasksSection({ tasks, onCreate }) {
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [priority, setPriority] = useState("normal");
+  const [submitting, setSubmitting] = useState(false);
+
+  const submit = useCallback(async (e) => {
+    e.preventDefault();
+    if (!title.trim()) return;
+    setSubmitting(true);
+    try {
+      await onCreate({ title: title.trim(), description, priority });
+      setTitle("");
+      setDescription("");
+      setPriority("normal");
+    } catch (err) {
+      console.error("create task failed", err);
+    } finally {
+      setSubmitting(false);
+    }
+  }, [title, description, priority, onCreate]);
+
+  // show open/claimed/in_progress first, then blocked, then done/cancelled
+  const statusOrder = { open: 0, claimed: 1, in_progress: 2, blocked: 3, done: 4, cancelled: 5 };
+  const sorted = [...tasks].sort(
+    (a, b) => (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9)
+  );
+
+  return html`
+    <section class="env-section">
+      <h3 class="env-section-title">Tasks <span class="env-count">${tasks.length}</span></h3>
+      <div class="env-task-list">
+        ${sorted.length === 0
+          ? html`<div class="env-empty">(no tasks yet)</div>`
+          : sorted.map(
+              (t) => html`
+                <div class=${"env-task status-" + t.status} key=${t.id}>
+                  <div class="env-task-head">
+                    <span class="env-task-status">${t.status}</span>
+                    <span class="env-task-id">${t.id}</span>
+                  </div>
+                  <div class="env-task-title">${t.title}</div>
+                  <div class="env-task-meta">
+                    by ${t.created_by} · owner ${t.owner || "-"} · pri ${t.priority}${t.parent_id ? " · ↳" + t.parent_id : ""}
+                  </div>
+                </div>
+              `
+            )}
+      </div>
+      <form class="env-task-form" onSubmit=${submit}>
+        <input
+          class="env-task-title-input"
+          placeholder="new task title"
+          value=${title}
+          onInput=${(e) => setTitle(e.target.value)}
+          autocomplete="off"
+        />
+        <textarea
+          class="env-task-desc-input"
+          placeholder="description (optional)"
+          value=${description}
+          onInput=${(e) => setDescription(e.target.value)}
+          rows=${2}
+        ></textarea>
+        <div class="env-task-row">
+          <select value=${priority} onChange=${(e) => setPriority(e.target.value)}>
+            <option value="low">low</option>
+            <option value="normal">normal</option>
+            <option value="high">high</option>
+            <option value="urgent">urgent</option>
+          </select>
+          <button class="primary" type="submit" disabled=${submitting || !title.trim()}>
+            ${submitting ? "…" : "create"}
+          </button>
+        </div>
+      </form>
+    </section>
+  `;
+}
+
+function EnvCostSection({ agents }) {
+  // Placeholder — full cost meter lands in v2d step 2.
+  const total = agents.reduce((s, a) => s + (a.cost_estimate_usd || 0), 0);
+  return html`
+    <section class="env-section">
+      <h3 class="env-section-title">Cost <span class="env-count">$${total.toFixed(3)}</span></h3>
+      <div class="env-cost-hint">(per-agent breakdown in next step)</div>
+    </section>
+  `;
+}
+
+function EnvTimelineSection() {
+  // Placeholder — cross-agent timeline lands in v2d step 3.
+  return html`
+    <section class="env-section">
+      <h3 class="env-section-title">Timeline</h3>
+      <div class="env-cost-hint">(cross-agent stream in next step)</div>
+    </section>
   `;
 }
 
