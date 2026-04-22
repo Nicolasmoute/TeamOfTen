@@ -201,7 +201,7 @@ body {
 .event.connected { color: var(--muted); font-size: 12px; }
 .event .prompt { color: var(--fg); margin-top: 4px; }
 
-/* ---- generic tool card ---- */
+/* ---- tool card ---- */
 .tool-card summary {
   list-style: none;
   cursor: pointer;
@@ -210,8 +210,25 @@ body {
   gap: 8px;
 }
 .tool-card summary::-webkit-details-marker { display: none; }
-.tool-card .tool-name { color: var(--tool); font-weight: 600; }
-.tool-card .tool-summary { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.tool-card summary::before {
+  content: "⏺";
+  font-size: 10px;
+  color: var(--muted);
+  line-height: 1;
+  flex-shrink: 0;
+}
+.tool-card.category-read    summary::before { color: var(--accent); }
+.tool-card.category-write   summary::before { color: var(--tool); }
+.tool-card.category-run     summary::before { color: var(--warn); }
+.tool-card.category-coord   summary::before { color: var(--ok); }
+
+.tool-card .tool-name { color: var(--fg); font-weight: 600; }
+.tool-card.category-read  .tool-name { color: var(--accent); }
+.tool-card.category-write .tool-name { color: var(--tool); }
+.tool-card.category-run   .tool-name { color: var(--warn); }
+.tool-card.category-coord .tool-name { color: var(--ok); }
+
+.tool-card .tool-summary { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 .tool-card pre {
   margin: 6px 0 0;
   padding: 6px 8px;
@@ -220,6 +237,42 @@ body {
   font-size: 11px;
   color: var(--muted);
   overflow-x: auto;
+  max-height: 240px;
+}
+
+/* ---- Edit diff card ---- */
+.tool-card.edit-card .diff {
+  margin-top: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+.tool-card.edit-card .diff-old,
+.tool-card.edit-card .diff-new {
+  padding: 0;
+  margin: 0;
+}
+.tool-card.edit-card .diff-old pre,
+.tool-card.edit-card .diff-new pre {
+  margin: 0;
+  padding: 6px 10px;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+  border-radius: 0;
+  background: transparent;
+}
+.tool-card.edit-card .diff-old pre {
+  background: #2d1517;
+  color: #ffa198;
+  border-left: 3px solid var(--err);
+}
+.tool-card.edit-card .diff-new pre {
+  background: #0f2e1a;
+  color: #7ee787;
+  border-left: 3px solid var(--ok);
 }
 
 /* ---- input ---- */
