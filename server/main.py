@@ -231,8 +231,10 @@ async def list_events(
 ) -> dict[str, Any]:
     """Return event history for a pane to restore when it opens.
 
-    Filter by agent_id and/or since_id (exclusive). Caller passes the
-    largest id it has seen; server returns rows with id > since_id.
+    Returns the MOST RECENT `limit` events (ordered chronologically oldest
+    → newest in the response) with id > since_id. Pass since_id=0 to get
+    the tail of the log; pass the largest id you've seen to poll for new
+    rows (used in future polling/paginating flows).
     """
     limit = max(1, min(limit, 1000))
     where_parts: list[str] = ["id > ?"]
@@ -244,12 +246,13 @@ async def list_events(
 
     c = await configured_conn()
     try:
+        # Fetch newest N by id DESC, then reverse to chronological order.
         cur = await c.execute(
             f"SELECT id, ts, agent_id, type, payload FROM events{where} "
-            f"ORDER BY id ASC LIMIT ?",
+            f"ORDER BY id DESC LIMIT ?",
             params + [limit],
         )
-        rows = await cur.fetchall()
+        rows = list(reversed(await cur.fetchall()))
     finally:
         await c.close()
 

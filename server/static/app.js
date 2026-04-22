@@ -202,6 +202,15 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
   const [history, setHistory] = useState([]);
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const bodyRef = useRef(null);
+  // Stay pinned to the bottom while the user is at or near the bottom.
+  // If they've scrolled up to read older events, don't yank them down.
+  const stickToBottomRef = useRef(true);
+
+  const onBodyScroll = useCallback((e) => {
+    const el = e.currentTarget;
+    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distFromBottom < 80;
+  }, []);
 
   // Load persisted history once per slot. We guard so switching panes
   // doesn't refetch constantly.
@@ -248,9 +257,10 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
     return out;
   }, [history, liveEvents]);
 
-  // auto-scroll to bottom when new events arrive
+  // auto-scroll to bottom when new events arrive — only if user was already
+  // near the bottom (otherwise leave them reading older history in peace).
   useEffect(() => {
-    if (bodyRef.current) {
+    if (bodyRef.current && stickToBottomRef.current) {
       bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
     }
   }, [allEvents.length]);
@@ -342,7 +352,7 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
         <span class="pane-cost">$${cost.toFixed(3)}</span>
         <button class="pane-close" onClick=${onClose} title="Close pane">×</button>
       </header>
-      <div class="pane-body" ref=${bodyRef}>
+      <div class="pane-body" ref=${bodyRef} onScroll=${onBodyScroll}>
         ${!historyLoaded ? html`<div class="loading">loading history…</div>` : null}
         ${allEvents.map((ev, i) => html`<${EventItem} key=${(ev.__id ?? "live-" + i)} event=${ev} />`)}
       </div>

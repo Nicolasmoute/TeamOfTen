@@ -197,11 +197,17 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_create_task",
 ]
 
-# Standard Claude Code tools agents need to do actual work. Image-paste
-# in particular depends on Read to load files at /data/attachments/<id>.
-# Without this the pane sends images but the agent has no way to see them.
-STANDARD_TOOLS = [
-    "Read", "Write", "Edit", "Bash", "Grep", "Glob", "ToolSearch",
-]
+# Read-only tools: see the world, touch nothing. Coach uses these + coord.
+STANDARD_READ_TOOLS = ["Read", "Grep", "Glob", "ToolSearch"]
 
-ALLOWED_AGENT_TOOLS = STANDARD_TOOLS + ALLOWED_COORD_TOOLS
+# Mutating tools: Players get these too so they can actually do work.
+STANDARD_WRITE_TOOLS = ["Write", "Edit", "Bash"]
+
+# Coach = read + coord. Matches the spec rule "you never write code, you
+# delegate" — enforced structurally (not just by prompt).
+ALLOWED_COACH_TOOLS = STANDARD_READ_TOOLS + ALLOWED_COORD_TOOLS
+
+# Players get the full standard set + coord.
+ALLOWED_PLAYER_TOOLS = (
+    STANDARD_READ_TOOLS + STANDARD_WRITE_TOOLS + ALLOWED_COORD_TOOLS
+)
