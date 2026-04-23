@@ -101,6 +101,17 @@ def project_configured() -> bool:
     return bool(_project_repo())
 
 
+def refresh_repo_cache() -> None:
+    """Clear the in-process repo/branch cache so the next
+    project_configured() / _project_repo() / _project_branch() call
+    re-reads from DB. Called by PUT /api/team/repo after a save so
+    downstream code reflects the new value (the clone itself still
+    needs a container restart — see set_team_repo docstring)."""
+    global _CACHED_REPO, _CACHED_BRANCH
+    _CACHED_REPO = None
+    _CACHED_BRANCH = None
+
+
 def workspace_dir(slot: str) -> Path:
     """The cwd an agent should run in.
 

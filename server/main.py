@@ -931,9 +931,11 @@ def _normalize_mcp_paste(raw: str) -> dict[str, dict[str, Any]]:
     # (2) our format
     if "servers" in data and isinstance(data["servers"], dict):
         return {n: c for n, c in data["servers"].items() if isinstance(c, dict)}
-    # (3) flat single
+    # (3) flat single — sentinel name includes '.' so it can never pass
+    # _validate_mcp_name (which requires an ASCII identifier). The save
+    # endpoint rewrites this before persisting.
     if "command" in data or "url" in data:
-        return {"__single__": data}
+        return {"<<FLAT>>": data}
     # (4) bare named — validate all values look like configs
     looks_named = all(
         isinstance(v, dict) and ("command" in v or "url" in v)
@@ -947,11 +949,47 @@ def _normalize_mcp_paste(raw: str) -> dict[str, dict[str, Any]]:
     )
 
 
+# Strict ASCII identifier — matches what the SDK accepts for
+# mcp__<server>__<tool> templating. str.isidentifier() accepts
+# Unicode (café, 変数) which would fail downstream.
+_MCP_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
 def _validate_mcp_name(name: str) -> None:
-    if not isinstance(name, str) or not name.isidentifier():
+    if not isinstance(name, str) or not _MCP_NAME_RE.match(name):
         raise HTTPException(
-            400, detail=f"server name {name!r} must be a python identifier (a-z, 0-9, _)"
+            400,
+            detail=f"server name {name!r} must be ASCII: [A-Za-z_][A-Za-z0-9_]*, max 64 chars",
         )
+
+
+def _redact_mcp_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of a server config with sensitive fields masked,
+    so GET endpoints never leak stored tokens.
+
+    - Any string value inside `env` / `headers` that isn't a pure
+      `${VAR}` placeholder is redacted.
+    - `url` is masked via _mask_repo_url (hides userinfo).
+    - `command` / `args` / `type` pass through unchanged — they're
+      public identifiers, not secrets.
+    """
+    if not isinstance(cfg, dict):
+        return cfg
+    out: dict[str, Any] = {}
+    for k, v in cfg.items():
+        if k in ("env", "headers") and isinstance(v, dict):
+            red: dict[str, Any] = {}
+            for kk, vv in v.items():
+                if isinstance(vv, str) and vv.strip().startswith("${") and vv.strip().endswith("}"):
+                    red[kk] = vv
+                else:
+                    red[kk] = "***"
+            out[k] = red
+        elif k == "url" and isinstance(v, str):
+            out[k] = _mask_repo_url(v)
+        else:
+            out[k] = v
+    return out
 
 
 def _load_mcp_row(name: str) -> dict[str, Any] | None:
@@ -1022,9 +1060,13 @@ async def list_mcp_servers() -> dict[str, object]:
     for r in rows:
         d = dict(r)
         try:
-            d["config"] = json.loads(d.pop("config_json") or "{}")
+            raw_cfg = json.loads(d.pop("config_json") or "{}")
         except Exception:
-            d["config"] = {}
+            raw_cfg = {}
+        # Always redact before the wire — raw env values / URL userinfo
+        # may contain a stored token. The plaintext config never leaves
+        # the server.
+        d["config"] = _redact_mcp_config(raw_cfg)
         try:
             d["allowed_tools"] = json.loads(d.pop("allowed_tools_json") or "[]")
         except Exception:
@@ -1046,13 +1088,13 @@ async def save_mcp_server(req: MCPServerSave) -> dict[str, object]:
         raise HTTPException(400, detail=str(e))
 
     # Rename single-config pastes using the supplied name.
-    if set(parsed.keys()) == {"__single__"}:
+    if set(parsed.keys()) == {"<<FLAT>>"}:
         if not req.name:
             raise HTTPException(
                 400,
                 detail="paste is a single flat config — supply 'name' alongside it",
             )
-        parsed = {req.name: parsed["__single__"]}
+        parsed = {req.name: parsed["<<FLAT>>"]}
 
     # Secret scan on the raw paste — flag BEFORE persisting.
     warnings = detect_secrets(req.paste)
@@ -1359,6 +1401,11 @@ async def set_team_repo(req: TeamRepoWrite) -> dict[str, object]:
         )
     await _write_team_config_str("project_repo", repo)
     await _write_team_config_str("project_branch", branch)
+    # Invalidate the in-process cache so project_configured() reflects
+    # the new value on the next call. The clone / worktree setup still
+    # requires a restart — refresh just keeps the DB and cache in sync.
+    from server.workspaces import refresh_repo_cache
+    refresh_repo_cache()
     await bus.publish(
         {
             "ts": datetime.now(timezone.utc).isoformat(),
