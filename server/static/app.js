@@ -163,7 +163,14 @@ function App() {
       (tok ? "?token=" + encodeURIComponent(tok) : "");
     const ws = new WebSocket(wsUrl);
     let reopenTimer = null;
-    ws.onopen = () => setWsConnected(true);
+    ws.onopen = () => {
+      setWsConnected(true);
+      // On (re)connect we may have missed events while offline; refresh
+      // the stateful bits so the UI catches up.
+      loadAgents();
+      loadTasks();
+      loadStatus();
+    };
     ws.onclose = () => {
       setWsConnected(false);
       reopenTimer = setTimeout(() => setWsAttempt((a) => a + 1), 2000);
@@ -208,7 +215,7 @@ function App() {
       if (reopenTimer) clearTimeout(reopenTimer);
       try { ws.close(); } catch (_) { /* ignore */ }
     };
-  }, [loadAgents, wsAttempt]);
+  }, [loadAgents, loadTasks, loadStatus, wsAttempt]);
 
   const openPane = useCallback((slot) => {
     setOpenSlots((prev) => (prev.includes(slot) ? prev : [...prev, slot]));
