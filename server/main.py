@@ -424,6 +424,71 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
 # ------------------------------------------------------------------
 
 
+@app.get("/api/decisions", dependencies=[Depends(require_token)])
+async def list_decisions() -> dict[str, Any]:
+    """List local decision records (recent first, capped at 50).
+
+    Decisions live primarily on kDrive at /harness/decisions/<file>.md
+    with a /data/decisions/ local fallback. This endpoint reads the
+    LOCAL store only — it's the fast path. The kDrive copy is the
+    durable / human-readable mirror; browse it directly from
+    Infomaniak's web UI to see everything ever written.
+    """
+    local_dir = Path(os.environ.get("HARNESS_DECISIONS_DIR", "/data/decisions"))
+    if not local_dir.is_dir():
+        return {"decisions": [], "dir": str(local_dir), "exists": False}
+
+    items: list[dict[str, Any]] = []
+    files = sorted(local_dir.glob("*.md"), key=lambda p: p.name, reverse=True)
+    for p in files[:50]:
+        try:
+            text = p.read_text(encoding="utf-8")
+            # Light frontmatter parse — title only; full parse is overkill here.
+            title = p.stem
+            if text.startswith("---\n"):
+                end = text.find("\n---\n", 4)
+                if end > 0:
+                    for line in text[4:end].splitlines():
+                        if line.startswith("title:"):
+                            title = line[len("title:"):].strip()
+                            break
+            st = p.stat()
+            items.append({
+                "filename": p.name,
+                "title": title,
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+            })
+        except Exception:
+            # Skip unreadable files; surface via /api/health if persistent
+            continue
+    return {"decisions": items, "dir": str(local_dir), "exists": True}
+
+
+@app.get("/api/decisions/{filename}", dependencies=[Depends(require_token)])
+async def get_decision(filename: str) -> dict[str, Any]:
+    """Return the full content of a single decision file.
+
+    Filename validation rejects anything that looks like a path to
+    prevent traversal — decisions live in a flat directory.
+    """
+    if "/" in filename or ".." in filename or not filename.endswith(".md"):
+        raise HTTPException(400, detail="invalid filename")
+    local_dir = Path(os.environ.get("HARNESS_DECISIONS_DIR", "/data/decisions"))
+    target = local_dir / filename
+    if not target.is_file():
+        raise HTTPException(404, detail="not found")
+    try:
+        content = target.read_text(encoding="utf-8")
+    except Exception as e:
+        raise HTTPException(500, detail=f"read failed: {e}")
+    return {
+        "filename": filename,
+        "content": content,
+        "size": len(content),
+    }
+
+
 @app.get("/api/events", dependencies=[Depends(require_token)])
 async def list_events(
     agent: str | None = None,
