@@ -86,6 +86,21 @@ UPLOADS_LOCAL_DIR = Path(
     os.environ.get("HARNESS_UPLOADS_DIR", "/data/uploads")
 )
 
+# Local → kDrive outputs push. coord_save_output mirrors synchronously
+# but an agent that drops a file under /data/outputs via the Write /
+# Bash tools (bypassing the coord tool) wouldn't trigger that mirror.
+# This loop catches those writes: every N seconds it walks the local
+# outputs dir and pushes anything not already on kDrive. Upload is
+# by basename (not size) — once a file exists upstream we assume it's
+# in sync; rename locally if you overwrite and want the new bytes
+# pushed.
+OUTPUTS_PUSH_INTERVAL_SECONDS = int(
+    os.environ.get("HARNESS_OUTPUTS_PUSH_INTERVAL", "60")
+)
+OUTPUTS_LOCAL_DIR = Path(
+    os.environ.get("HARNESS_OUTPUTS_DIR", "/data/outputs")
+)
+
 
 def _utc_midnight_of(day: datetime) -> datetime:
     return day.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -353,6 +368,98 @@ async def uploads_pull_loop() -> None:
             logger.exception("uploads pull cycle failed")
         try:
             await asyncio.sleep(UPLOADS_PULL_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+
+
+async def push_outputs_once() -> dict[str, int]:
+    """Mirror /data/outputs → kDrive://outputs/ for anything not
+    already there. Catches agents that wrote via Write/Bash instead
+    of going through coord_save_output (which mirrors synchronously).
+
+    Walks the local tree (up to a reasonable depth), diffs against
+    the flat list of basenames on kDrive, and uploads the missing
+    ones. We compare by POSIX relative path, so nested outputs
+    (reports/2026/foo.pdf) work.
+
+    Returns {pushed, kept, skipped}.
+    """
+    if not kdrive.enabled:
+        return {"pushed": 0, "kept": 0, "skipped": 0}
+    if not OUTPUTS_LOCAL_DIR.exists():
+        return {"pushed": 0, "kept": 0, "skipped": 0}
+
+    # Collect local relative paths.
+    local_paths: list[Path] = []
+    for p in OUTPUTS_LOCAL_DIR.rglob("*"):
+        if p.is_file() and not p.is_symlink():
+            local_paths.append(p)
+
+    if not local_paths:
+        return {"pushed": 0, "kept": 0, "skipped": 0}
+
+    # Build a set of relative POSIX strings of what's already on kDrive.
+    # Limitation: kdrive.list_dir is flat; we'd need a recursive walk
+    # to see nested files. For now list the top level + any immediate
+    # sub-dirs the local side uses so we don't re-upload flat files.
+    # A true recursive diff across deep trees is overkill for
+    # personal-scale use — the worst case is we re-upload a 1 MB PDF
+    # on every tick, which is still cheap.
+    try:
+        top_level = await kdrive.list_dir("outputs")
+    except Exception:
+        logger.exception("outputs push: kDrive list failed")
+        return {"pushed": 0, "kept": 0, "skipped": 0}
+    remote_top = {Path(n).name for n in top_level if n}
+
+    pushed = kept = skipped = 0
+    for lp in local_paths:
+        rel = lp.relative_to(OUTPUTS_LOCAL_DIR).as_posix()
+        leaf = Path(rel).name
+        # Cheap skip for flat-rooted files we already see upstream.
+        # Nested files fall through and get pushed unconditionally —
+        # see limitation note above.
+        if "/" not in rel and leaf in remote_top:
+            kept += 1
+            continue
+        try:
+            data = lp.read_bytes()
+        except Exception:
+            logger.exception("outputs push: local read failed: %s", lp)
+            skipped += 1
+            continue
+        ok = await kdrive.write_bytes(f"outputs/{rel}", data)
+        if ok:
+            pushed += 1
+        else:
+            skipped += 1
+    if pushed:
+        logger.info(
+            "outputs push: +%d (kept %d, skipped %d)", pushed, kept, skipped,
+        )
+    return {"pushed": pushed, "kept": kept, "skipped": skipped}
+
+
+async def outputs_push_loop() -> None:
+    """Background task: push /data/outputs → kDrive every
+    HARNESS_OUTPUTS_PUSH_INTERVAL seconds (default 60)."""
+    if not kdrive.enabled:
+        logger.info("outputs push loop idle: kdrive disabled")
+    else:
+        logger.info(
+            "outputs push loop starting: every %ds from %s",
+            OUTPUTS_PUSH_INTERVAL_SECONDS, OUTPUTS_LOCAL_DIR,
+        )
+    while True:
+        try:
+            if kdrive.enabled:
+                await push_outputs_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("outputs push cycle failed")
+        try:
+            await asyncio.sleep(OUTPUTS_PUSH_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             raise
 

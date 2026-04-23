@@ -52,6 +52,7 @@ from server.sync import (
     attachments_trim_loop,
     events_trim_loop,
     flush_loop,
+    outputs_push_loop,
     snapshot_loop,
     uploads_pull_loop,
 )
@@ -190,7 +191,8 @@ async def lifespan(app: FastAPI):
     trim_task = asyncio.create_task(events_trim_loop())
     att_trim_task = asyncio.create_task(attachments_trim_loop())
     uploads_task = asyncio.create_task(uploads_pull_loop())
-    bg_tasks = (sync_task, snapshot_task, coach_task, trim_task, att_trim_task, uploads_task)
+    outputs_task = asyncio.create_task(outputs_push_loop())
+    bg_tasks = (sync_task, snapshot_task, coach_task, trim_task, att_trim_task, uploads_task, outputs_task)
     try:
         yield
     finally:
