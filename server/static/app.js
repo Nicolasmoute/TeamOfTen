@@ -2834,13 +2834,21 @@ function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, 
   useEffect(() => { if (activeRoot) loadTree(activeRoot); }, [activeRoot, loadTree]);
   // Live-refresh: when a file-system-changing event lands on the WS,
   // App bumps fsEpoch. Reload the tree so agent-written files appear
-  // without a manual root-click. Skip reload while the user is mid-
-  // edit (dirty draft) to avoid surprising them if they've been
-  // typing; they'll see the new files on their next save / root-click.
+  // without a manual root-click, AND reload the currently-open file
+  // if it exists (e.g. Coach edited CLAUDE.md while the user had it
+  // open — previously the tree refreshed but the editor kept showing
+  // the pre-edit content). Skip either reload while the user is
+  // mid-edit (dirty draft) so we don't yank their typing.
   useEffect(() => {
     if (fsEpoch == null || !activeRoot) return;
-    if (content !== null && draft !== content) return; // dirty, don't yank
+    const dirty = content !== null && draft !== content;
+    if (dirty) return;
     loadTree(activeRoot);
+    // Also re-fetch the open file if any. No-ops if the underlying
+    // file didn't change (we accept the extra HTTP round trip for
+    // the simplicity of not having to correlate which path actually
+    // moved — events are rare at human scale).
+    if (selected) openFile(selected.root, selected.path);
   }, [fsEpoch]);
 
   const activeRootMeta = roots.find((r) => r.key === activeRoot);
