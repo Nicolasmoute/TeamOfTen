@@ -3524,9 +3524,15 @@ function EventItem({ event }) {
   }
 
   if (type === "error") {
+    const extras = [];
+    if (event.cwd) extras.push("cwd: " + event.cwd);
     return html`<div class="event error">
       <div class="event-meta">${ts} error</div>
-      <div class="event-body">${event.error || ""}</div>
+      <div class="event-body">${event.error || ""}${
+        extras.length
+          ? html`<div class="event-error-extras">${extras.join("  ·  ")}</div>`
+          : null
+      }</div>
     </div>`;
   }
 
