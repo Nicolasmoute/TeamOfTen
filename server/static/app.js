@@ -1593,8 +1593,6 @@ function KDriveSection({ serverStatus, health, onRefresh }) {
   const kd = serverStatus?.kdrive;
   const probe = health?.checks?.kdrive; // may be undefined until health loads
   const url = probe?.url ?? kd?.url ?? "";
-  const root = probe?.root ?? kd?.root ?? "";
-  const joined = (url || "") + (root && !url.endsWith("/") ? root : root);
   const forceProbe = useCallback(async () => {
     setForcing(true);
     try {
@@ -1632,7 +1630,6 @@ function KDriveSection({ serverStatus, health, onRefresh }) {
     </p>
     <ul style="margin: 4px 0 8px 0; padding: 0 0 0 18px; font-size: 12px;">
       <li><strong>URL:</strong> <code>${url || "(not set)"}</code></li>
-      <li><strong>Root:</strong> <code>${root || "/"}</code></li>
       ${probe?.probe_file
         ? html`<li><strong>Test file:</strong>
             <code>${probe.probe_file}</code>

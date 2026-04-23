@@ -817,10 +817,9 @@ HARNESS_DOMAIN=harness.example.com
 HARNESS_TOKEN=generate-a-long-random-string
 
 # kDrive
-KDRIVE_WEBDAV_URL=https://connect.drive.infomaniak.com/<your-drive-id>
+KDRIVE_WEBDAV_URL=https://<drive-id>.connect.kdrive.infomaniak.com/TOT
 KDRIVE_USER=you@example.com
 KDRIVE_APP_PASSWORD=generated-app-password
-KDRIVE_ROOT_PATH=/harness
 
 # Claude (defaults to ~/.claude.json mounted in)
 CLAUDE_AUTH_PATH=/root/.claude/auth.json

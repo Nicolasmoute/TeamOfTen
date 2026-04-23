@@ -330,7 +330,6 @@ async def health() -> JSONResponse:
             "skipped": True,
             "reason": kdrive.reason,
             "url": kdrive.url,
-            "root": kdrive.root,
         }
 
     # 5. External MCP servers — reports what HARNESS_MCP_CONFIG yielded
@@ -428,7 +427,6 @@ async def status() -> dict[str, object]:
             "enabled": kdrive.enabled,
             "reason": kdrive.reason,
             "url": kdrive.url,
-            "root": kdrive.root,
         },
         "workspaces": get_workspaces_status(),
     }

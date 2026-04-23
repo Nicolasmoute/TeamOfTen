@@ -8,11 +8,14 @@ Design:
 - Fire-and-forget semantics: a WebDAV hiccup must never block an agent
   tool call. Failures are logged and the local DB is still authoritative.
 
-Config (all optional — kDrive stays disabled unless all are set):
-  KDRIVE_WEBDAV_URL      e.g. https://connect.drive.infomaniak.com/<drive-id>
+Config (all required — kDrive stays disabled unless all are set):
+  KDRIVE_WEBDAV_URL      full path to the folder the app owns on kDrive,
+                         e.g. https://<drive-id>.connect.kdrive.infomaniak.com/TOT
   KDRIVE_USER            your Infomaniak email
   KDRIVE_APP_PASSWORD    app-specific password generated in Infomaniak UI
-  KDRIVE_ROOT_PATH       defaults to "/harness"
+
+All files live directly under the URL — no extra prefix. If you want
+a sub-folder, include it in the URL itself.
 """
 
 from __future__ import annotations
@@ -44,11 +47,6 @@ except Exception:  # pragma: no cover — lib missing in dev env
 WEBDAV_URL = os.environ.get("KDRIVE_WEBDAV_URL", "").strip()
 WEBDAV_USER = os.environ.get("KDRIVE_USER", "").strip()
 WEBDAV_PASS = os.environ.get("KDRIVE_APP_PASSWORD", "").strip()
-# ROOT_PATH is a sub-folder *inside* the base URL. KDRIVE_WEBDAV_URL
-# already points at a dedicated app directory on kDrive (e.g. /TOT),
-# so the default is empty — files land directly under the URL. Set
-# the env var explicitly if you want a deeper prefix.
-ROOT_PATH = os.environ.get("KDRIVE_ROOT_PATH", "").strip()
 
 
 class KDriveClient:
@@ -86,8 +84,7 @@ class KDriveClient:
             self._client = _WebDAVClient(base_url, auth=(WEBDAV_USER, WEBDAV_PASS))
             self._enabled = True
             logger.info(
-                "kDrive enabled (url=%s root=%s user=%s)",
-                base_url, ROOT_PATH, WEBDAV_USER,
+                "kDrive enabled (url=%s user=%s)", base_url, WEBDAV_USER,
             )
         except Exception:
             self._reason = "client init failed"
@@ -105,12 +102,8 @@ class KDriveClient:
     def url(self) -> str:
         return WEBDAV_URL
 
-    @property
-    def root(self) -> str:
-        return ROOT_PATH
-
     async def probe(self) -> dict[str, Any]:
-        """Write a small visible-named file to the configured root so
+        """Write a small visible-named file to the configured URL so
         health checks can surface the actual exception (not just a
         bool). Filename is not dot-prefixed so operators can eyeball
         confirmation on kDrive after configuring creds.
@@ -119,12 +112,12 @@ class KDriveClient:
         render the reason in the UI.
         """
         if not self._enabled:
-            return {"ok": False, "error": self._reason, "url": WEBDAV_URL, "root": ROOT_PATH}
+            return {"ok": False, "error": self._reason, "url": WEBDAV_URL}
         rel = "harness-health-probe.txt"
         full_path = self._resolve(rel)
         try:
             await asyncio.to_thread(self._write_sync, full_path, "ok")
-            return {"ok": True, "url": WEBDAV_URL, "root": ROOT_PATH, "probe_file": full_path}
+            return {"ok": True, "url": WEBDAV_URL, "probe_file": full_path}
         except Exception as e:
             # Capture the full repr — different WebDAV errors carry
             # different metadata (HTTP status, URL, xml body) and the
@@ -132,7 +125,6 @@ class KDriveClient:
             return {
                 "ok": False,
                 "url": WEBDAV_URL,
-                "root": ROOT_PATH,
                 "probe_file": full_path,
                 "error": f"{type(e).__name__}: {str(e)[:400]}",
             }
@@ -140,21 +132,18 @@ class KDriveClient:
     # ---------- async public API ----------
 
     def _resolve(self, relative_path: str) -> str:
-        """Join ROOT_PATH with the caller's relative path and strip any
-        leading slash.
+        """Strip any leading slash from the caller's path so webdav4
+        resolves it relative to the base URL.
 
-        webdav4 resolves paths containing a leading `/` against the
-        host root, bypassing any path component in the base URL — so
-        if your URL is https://host/<drive-id>/TOT/ and we pass
-        '/harness/foo.txt', the request goes to
-        https://host/harness/foo.txt (404 / ResourceConflict) instead
-        of https://host/<drive-id>/TOT/harness/foo.txt.
+        webdav4 (and httpx underneath) treats paths containing a
+        leading `/` as host-root-relative, bypassing any path
+        component in the base URL. Keep everything relative so the
+        URL is the single source of truth for where files live.
         """
-        full = str(PurePosixPath(ROOT_PATH) / relative_path)
-        return full.lstrip("/")
+        return relative_path.lstrip("/")
 
     async def write_text(self, relative_path: str, content: str) -> bool:
-        """Upload `content` as UTF-8 text to `{ROOT_PATH}/{relative_path}`.
+        """Upload `content` as UTF-8 text to `{KDRIVE_WEBDAV_URL}/{relative_path}`.
 
         Returns True on success, False on any failure (error logged).
         Never raises. Safe to call from fire-and-forget create_task().
@@ -182,7 +171,7 @@ class KDriveClient:
             return False
 
     async def read_text(self, relative_path: str) -> str | None:
-        """Download a UTF-8 text file from `{ROOT_PATH}/{relative_path}`.
+        """Download a UTF-8 text file from `{KDRIVE_WEBDAV_URL}/{relative_path}`.
         Returns None if missing or on any failure (not distinguished —
         callers fall back to a local cached copy)."""
         if not self._enabled:
@@ -198,8 +187,8 @@ class KDriveClient:
 
     async def list_dir(self, relative_path: str) -> list[str]:
         """List filenames (basenames, not full paths) under
-        `{ROOT_PATH}/{relative_path}`. Returns [] on any failure or if
-        the directory is missing — callers shouldn't have to catch."""
+        `{KDRIVE_WEBDAV_URL}/{relative_path}`. Returns [] on any failure
+        or if the directory is missing — callers shouldn't have to catch."""
         if not self._enabled:
             return []
         full_path = self._resolve(relative_path)
@@ -210,7 +199,7 @@ class KDriveClient:
             return []
 
     async def remove(self, relative_path: str) -> bool:
-        """Delete a single file at `{ROOT_PATH}/{relative_path}`.
+        """Delete a single file at `{KDRIVE_WEBDAV_URL}/{relative_path}`.
 
         Idempotent: a missing file is treated as success."""
         if not self._enabled:

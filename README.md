@@ -30,10 +30,11 @@ HARNESS_TOKEN=<any long random string>
 HARNESS_PROJECT_REPO=https://<PAT>@github.com/<you>/<repo>.git
 
 # kDrive backup (optional — without it, only SQLite on /data survives restarts)
-KDRIVE_WEBDAV_URL=https://connect.drive.infomaniak.com/<drive-id>/TOT
+KDRIVE_WEBDAV_URL=https://<drive-id>.connect.kdrive.infomaniak.com/TOT
 KDRIVE_USER=<your infomaniak email>
 KDRIVE_APP_PASSWORD=<app-password from Infomaniak settings>
-# Don't also set KDRIVE_ROOT_PATH if your URL already includes /TOT
+# All files land directly under the URL above — include the target
+# folder (e.g. /TOT) in the URL itself. No separate root-path setting.
 
 # External MCP servers (optional)
 HARNESS_MCP_CONFIG=/data/mcp-servers.json  # see mcp-servers.example.json

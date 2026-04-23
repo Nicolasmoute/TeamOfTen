@@ -749,9 +749,10 @@ Special non-agent pane type. Opens in a new column when the 📁 left-rail icon 
 
 ### 13.3 kDrive
 
-- `KDRIVE_WEBDAV_URL` + `KDRIVE_USER` + `KDRIVE_APP_PASSWORD` + `KDRIVE_ROOT_PATH` (defaults `/harness`).
+- `KDRIVE_WEBDAV_URL` + `KDRIVE_USER` + `KDRIVE_APP_PASSWORD`.
+- URL points directly at the folder the harness owns on kDrive (e.g. `.../TOT`). Files land right under it — no separate prefix setting.
 - App-specific password from Infomaniak panel (NOT main password).
-- All four checked on boot; enabled only if all four present.
+- All three checked on boot; enabled only if all three present.
 
 ---
 
@@ -797,10 +798,9 @@ Special non-agent pane type. Opens in a new column when the 📁 left-rail icon 
 | `HARNESS_PROJECT_REPO` | unset | If set, clones to `/workspaces/.project` + creates per-slot worktrees at boot |
 | `HARNESS_PROJECT_BRANCH` | `main` | default branch for fresh worktrees |
 | `CLAUDE_CONFIG_DIR` | `/data/claude` | Claude CLI credentials dir. Baked into the Dockerfile so OAuth (`~/.claude/.credentials.json`) persists on the `/data` volume across Zeabur redeploys. |
-| `KDRIVE_WEBDAV_URL` | unset | Infomaniak WebDAV URL |
+| `KDRIVE_WEBDAV_URL` | unset | Full Infomaniak WebDAV URL, including the target folder (e.g. `.../TOT`). Files land directly under this URL — there's no separate prefix setting. |
 | `KDRIVE_USER` | unset | Infomaniak email |
 | `KDRIVE_APP_PASSWORD` | unset | Infomaniak app-specific password |
-| `KDRIVE_ROOT_PATH` | `/harness` | Prefix inside kDrive (user typically sets to `/TOT` or similar — do NOT duplicate path between URL and this var) |
 
 ---
 
