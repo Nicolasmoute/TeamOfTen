@@ -500,13 +500,34 @@ All paths under `/api/*` except `/api/health` require `Authorization: Bearer $HA
 
 - `GET /api/events?agent=&type=&since_id=&limit=` — history for pane restore or filtered view
 
-### 10.9 Coach tick
+### 10.9 Coach tick + autoloop control
 
 - `POST /api/coach/tick` — fires a Coach drain; 409 if Coach is busy
+- `GET  /api/coach/loop` — `{interval_seconds}`
+- `POST /api/coach/loop` `{interval_seconds: 0..86400}` — runtime-mutable Coach autoloop cadence; 0 disables. Emits `coach_loop_changed`.
 
 ### 10.10 Attachments
 
 - `POST /api/attachments` (multipart) — pasted images → `/data/attachments`; each workspace has a symlink `/workspaces/<slot>/attachments/` pointing there
+
+### 10.11 Context (governance docs)
+
+- `GET  /api/context` — `{"root": ["CLAUDE"]?, "skills": [...], "rules": [...]}` (local ∪ kDrive)
+- `GET  /api/context/{kind}/{name}` — `{kind, name, body, size}`
+- `POST /api/context` `{kind: 'root'|'skills'|'rules', name, body}` — human upsert; emits `context_updated`
+- `DELETE /api/context/{kind}/{name}` — remove; emits `context_deleted`
+
+### 10.12 Files
+
+- `GET  /api/files/roots` — whitelist: `[{key, writable, exists, label}]` for `context`, `knowledge`, `decisions`
+- `GET  /api/files/tree/{root}` — recursive tree (dirs before files, case-insensitive), noise-dirs (`.git`, `__pycache__`, …) hidden
+- `GET  /api/files/read/{root}?path=` — UTF-8 text, 256 KB cap
+- `PUT  /api/files/write/{root}?path=` `{content}` — routes context→ctxmod, knowledge→disk, decisions refused
+
+### 10.13 Agent identity + brief
+
+- `PUT /api/agents/{id}/identity` `{name?, role?}` — upsert name / role; empty string clears. Emits `player_assigned` with `auto: false`.
+- `PUT /api/agents/{id}/brief` `{brief}` — upsert the multi-line context string (≤ 8 KB). Emits `brief_updated`.
 
 ---
 
@@ -527,16 +548,45 @@ All paths under `/api/*` except `/api/health` require `Authorization: Bearer $HA
 
 ### 12.1 Global layout
 
-- **Left rail** (44 px, vertical): WS dot (pulses red when disconnected), Coach + p1..p10 slot buttons, separator, cancel-all (shown only when agents are working), pause toggle, env-panel toggle (▦), settings gear.
-- **Panes area** (center, flex): 2D layout — array of columns, each a vertical stack of agent panes. Split.js horizontal gutters between columns; vertical gutters inside stacked columns. Drop zones at bottom of each column (append) + right edge (new column).
+- **Left rail** (44 px, vertical, top→bottom):
+  - WS dot (pulses red when disconnected)
+  - Coach `C` + `1`–`10` Player slot buttons (see §12.1a for state colors)
+  - separator
+  - 📁 Files pane toggle (opens the file-browser as a special slot `__files`)
+  - separator
+  - layout presets (spread 3-rectangle icon · pair-stack 3-box icon), shown only when ≥ 2 panes open
+  - ⏹ cancel-all (shown only when agents are working)
+  - ❚❚/▶ pause toggle
+  - ▦ env-panel toggle
+  - ⚙ settings gear
+- **Panes area** (center, flex): 2D layout — array of columns, each a vertical stack of panes. Split.js horizontal gutters between columns; vertical gutters inside stacked columns (see §12.2 for drop edges). Includes both `AgentPane`s and the `__files` `FilesPane`.
 - **Env pane** (right, 340 px, toggleable via ⌘/Ctrl+B): Attention / Tasks / Cost / Inbox / Memory / Decisions / Timeline sections. ↓ team-export button in header.
+
+### 12.1a Slot state palette (LeftRail)
+
+One visual language across every slot: full-color text + 1 px border + translucent tinted fill (CSS custom properties switch the hue per state). Five states:
+
+| State | Class | Hue | Trigger |
+|-------|-------|-----|---------|
+| inactive | (none) | muted gray | `status='stopped'` AND no `session_id` |
+| active | `.slot.active` | accent blue | `session_id` is set, or `status ∈ {working, waiting}` |
+| working | `.slot.working` | warn amber (pulses) | `status='working'` |
+| error | `.slot.error` | err red (outline only) | `status='error'` |
+| Coach | `.slot.coach` | ok green | Always on for Coach; beats blue/gray. Working amber and error-red-ring override. |
+
+**Pane-open** is a separate affordance — small fg-colored dot at top-left of the slot button, layered on top of whichever state color is in play. Closing the pane does NOT change the state color — you can see which agents are running from the rail even with every pane closed.
 
 ### 12.2 Slot interactions
 
 - Click closed slot → open as new column on the right.
 - Click already-open slot → scroll pane into view horizontally.
 - Shift-click → stack into rightmost column.
-- Drag pane label → drop on another pane (insert before), bottom strip (append), right rail (new column).
+- Drag pane header → drop on another pane. Which of four **edge zones** the cursor is in when you release picks the effect:
+  - **top / bottom edge band** (middle half horizontally, top or bottom vertical third) → stack before / after the target in its column
+  - **left / right edge band** (≤ 22 % into the target) → new column inserted to the left / right of target's column
+  - The target pane shows a bright accent bar along whichever edge will be used, so the outcome is visible before release.
+- Layout preset buttons (left rail) reshape every open pane in one click: **spread** (one pane per column) or **pair-stack** (two panes per column; odd count → first pane solo).
+- Pane **⇱ pop-out** button (header, visible only when stacked): move the pane to its own new column at the right edge — fastest "undo stacking" without drag.
 
 ### 12.3 Persistence (localStorage)
 
@@ -568,24 +618,33 @@ Composed from live state: `[⏸] [N⚡] [M●] TeamOfTen` where ⏸=paused, N⚡
 ### 12.6 Pane header (left to right)
 
 - Status dot (idle / working / error / stopped) — tooltip: status + last heartbeat + first-started (relative times).
-- Slot id · displayed name · role.
+- Slot id · displayed name · role. The name pill is hidden when it case-insensitively equals the slot id (avoids "coach Coach" stutter).
 - ⚑ Current-task chip (title truncated to 24 chars; full title in tooltip).
-- ● session id indicator + × to clear.
+- ● session id indicator + × to clear. Clear also happens auto-magically if the stored id is rejected on the next turn (see §6.7).
 - `$X.XXX` cumulative cost chip.
 - `Ns · $X.XXX` last-turn duration + cost (hidden while working).
 - ⏹ Cancel (only visible when status=working).
 - Override dot (accent color) when any per-turn setting is non-default.
 - ⌕ In-pane search toggle (filters body by substring match; Escape clears).
 - ↓ Export conversation as markdown.
-- ⚙ Settings popover (model / plan_mode / effort).
+- ⇱ Pop-out (visible only when stacked).
+- ⚙ Settings popover (name / role / save · model / plan_mode / effort · brief textarea + save).
 - × Close pane.
 
 ### 12.7 Pane body
 
-- Loads up to 500 events on mount from `/api/events?agent=<slot>&limit=500`.
+- Loads up to 500 events on mount from `/api/events?agent=<slot>&limit=500`. Server-side fan-out means a pane also sees inbound messages, task assignments TO this slot, and task updates on tasks this slot owns — even though those events' `agent_id` is Coach.
 - Merges persisted + live WS events, deduped by `__id`.
 - Pairs `tool_use` ↔ `tool_result` → renders `tool_result` INSIDE its `tool_use` card.
-- Auto-scroll to bottom IF user was near bottom (< 80 px).
+- `agent_started` events render as **sticky turn headers** — `position: sticky; top: 0` one-line bars showing the prompt of the turn you're currently reading. Scroll past and the next turn's header pushes it off; click any header to expand the full prompt under a dashed divider.
+- Auto-scroll:
+  - Normal (between turns): stick to bottom only if user was within 80 px of it.
+  - While a turn is actively streaming tokens: forced stick-to-bottom so partial text stays visible.
+- Streaming renders (when `HARNESS_STREAM_TOKENS=true`): `text_delta` accumulates into a dashed-border bubble with a blinking amber caret; replaced by the authoritative `text` event when the block completes.
+- `thinking` events render as a collapsed card (`💭 thought · N lines`); click to expand the italic body.
+- Noise filters:
+  - `context_applied` is **hidden** from pane body (still in DB + EnvPane timeline).
+  - 15+ system event types (`task_claimed`, `task_updated`, `memory_updated`, `knowledge_written`, `decision_written`, `context_updated`, `file_written`, `player_assigned`, `session_cleared`, `session_resume_failed`, `commit_pushed`, `coach_loop_changed`, `human_attention`, `paused`/`pause_toggled`, `cost_capped`, `agent_cancelled`, `brief_updated`) render as single-line muted `.sys` rows — no JSON blobs. Unknown types still hit the JSON fallback as a debug escape hatch.
 - Per-tool renderers (`tools.js`):
   - Read — image preview for image paths.
   - Edit — red/green diff card.
@@ -593,6 +652,32 @@ Composed from live state: `[⏸] [N⚡] [M●] TeamOfTen` where ⏸=paused, N⚡
   - `coord_*` tools — structured input + result display.
   - Generic fallback for unknown tools.
 - Empty-pane hint cards with starter prompts (Coach-specific vs Player-specific).
+
+### 12.7a Input area
+
+Right above the textarea:
+- **Mode chips** — `Model` / `plan ✓` / `effort` badges showing current per-pane settings. Accent-tinted when non-default. Model + effort open the settings popover on click; plan toggles inline. A `/ commands` chip on the right seeds the input with `/`.
+- **Slash menu** — typing `/` as the first char of a single-line input pops a floating autocomplete above the textarea. Arrow keys navigate, **Tab** completes into input, **Enter** runs, **Escape** clears.
+- Registered slash commands (all intercepted locally; the agent never sees them):
+  - `/plan` — toggle plan mode
+  - `/model` — open model picker
+  - `/effort [1-4]` — set effort; `/effort 3` sets inline, bare `/effort` opens the popover
+  - `/brief` — open brief editor (in the settings popover)
+  - `/tools` — list this agent's allowed tool names in a dismissable info banner
+  - `/clear` — hit `DELETE /api/agents/<slot>/session`
+  - `/loop [N|off]` — set Coach autoloop interval; bare `/loop` reports current state
+  - `/help` — list every slash command
+- Info banner — `/tools` and `/help` render into a dismissable `.pane-info` panel above the input. `×` to clear.
+- Keyboard: **⌘/Ctrl+Enter** send, **⌘/Ctrl+↑/↓** cycle prompt history, **Esc** closes search/menu, paste image → `/api/attachments`.
+
+### 12.7b Files pane (slot id `__files`)
+
+Special non-agent pane type. Opens in a new column when the 📁 left-rail icon is clicked; participates in the mosaic (drag, stack, pop-out) like any agent pane.
+
+- Left side: root selector chips (`context` / `knowledge` / `decisions` — read-only shows 🔒), then a fully expand/collapse-able tree.
+- Right side: editor — `.md` files default to a rendered preview with `edit`/`preview` toggle; `.txt` opens directly as textarea. Read-only roots hide the save button.
+- `⌘/Ctrl+S` saves. Dirty indicator (`*` in header + "unsaved" in footer) when draft differs from loaded content.
+- Writes route through the owning module: context edits go via `ctxmod.write` (kDrive mirror + cache bust); knowledge edits go to plain disk with the `knowmod.MAX_BODY_CHARS` cap; decisions are not editable. Emits `file_written` on save.
 
 ### 12.8 EnvPane sections
 
