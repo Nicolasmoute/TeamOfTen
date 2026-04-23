@@ -922,42 +922,35 @@ body {
 .pane-dot.error { background: var(--err); }
 .pane-id { font-weight: 600; }
 .pane-name { color: var(--fg); }
-.pane-role { color: var(--muted); font-size: 11px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pane-last-turn {
-  color: var(--muted);
-  font-size: 10px;
-  white-space: nowrap;
-  padding: 0 4px;
-  border-left: 1px solid var(--border);
-}
+/* Current-task pill — now icon-only. Tooltip carries the title. */
 .pane-current-task {
-  background: var(--card, #1a1a1a);
   color: var(--accent);
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  padding: 1px 6px;
-  font-size: 11px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 180px;
-}
-.pane-cost { color: var(--muted); font-size: 11px; }
-.pane-session {
-  color: var(--ok);
-  font-size: 10px;
+  font-size: 13px;
+  padding: 0 2px;
   cursor: help;
 }
+.pane-lock {
+  background: transparent;
+  border: 0;
+  font-size: 13px;
+  padding: 0 3px;
+  cursor: pointer;
+  line-height: 1;
+  filter: grayscale(0.1);
+}
+.pane-lock:hover { filter: none; }
+.pane-lock.locked { filter: none; }
 .pane-session-clear {
   background: transparent;
   border: 0;
   color: var(--muted);
-  font-size: 12px;
+  font-size: 13px;
   padding: 0 2px;
   cursor: pointer;
   line-height: 1;
+  opacity: 0.7;
 }
-.pane-session-clear:hover { color: var(--err); }
+.pane-session-clear:hover { color: var(--err); opacity: 1; }
 .pane-close {
   background: transparent;
   border: 0;

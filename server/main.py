@@ -444,7 +444,7 @@ async def list_agents() -> dict[str, list[dict[str, Any]]]:
         cur = await c.execute(
             "SELECT id, kind, name, role, brief, status, current_task_id, "
             "model, workspace_path, session_id, cost_estimate_usd, "
-            "started_at, last_heartbeat "
+            "started_at, last_heartbeat, locked "
             "FROM agents ORDER BY "
             "CASE kind WHEN 'coach' THEN 0 ELSE 1 END, id"
         )
@@ -763,6 +763,51 @@ async def set_agent_tools(agent_id: str, req: AgentToolsWrite) -> dict[str, obje
         }
     )
     return {"ok": True, "agent_id": agent_id, "tools": clean}
+
+
+class AgentLockWrite(BaseModel):
+    locked: bool = Field(..., description="True to lock the agent off from Coach orchestration.")
+
+
+@app.put("/api/agents/{agent_id}/locked", dependencies=[Depends(require_token)])
+async def set_agent_locked(agent_id: str, req: AgentLockWrite) -> dict[str, object]:
+    """Set the per-agent lock flag.
+
+    When locked:
+      - Coach cannot coord_assign_task a task to this agent
+      - Coach cannot coord_send_message this agent directly
+      - coord_read_inbox skips messages whose sender is 'coach' (direct
+        or broadcast)
+      - The agent can still read all shared docs (memory / knowledge /
+        context / decisions) and responds to human prompts normally.
+
+    Locking Coach itself is a no-op semantically — Coach doesn't take
+    orders from Coach — but we allow the flag for UI symmetry.
+    """
+    if not (agent_id == "coach" or (agent_id.startswith("p") and agent_id[1:].isdigit() and 1 <= int(agent_id[1:]) <= 10)):
+        raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
+    locked = 1 if req.locked else 0
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "UPDATE agents SET locked = ? WHERE id = ?",
+            (locked, agent_id),
+        )
+        changed = cur.rowcount
+        await c.commit()
+    finally:
+        await c.close()
+    if changed == 0:
+        raise HTTPException(404, detail=f"agent {agent_id} not found")
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": agent_id,
+            "type": "lock_updated",
+            "locked": bool(locked),
+        }
+    )
+    return {"ok": True, "agent_id": agent_id, "locked": bool(locked)}
 
 
 @app.delete("/api/agents/{agent_id}/session", dependencies=[Depends(require_token)])

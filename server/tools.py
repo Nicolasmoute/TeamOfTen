@@ -54,6 +54,27 @@ def _err(text: str) -> dict[str, Any]:
     }
 
 
+async def _is_locked(agent_id: str) -> bool:
+    """Return True if the agent's `locked` flag is set. Missing row /
+    DB error returns False — lock is a safety restriction, not a
+    correctness invariant, so failing open is preferable to blocking
+    the whole tool on a hiccup."""
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT locked FROM agents WHERE id = ?", (agent_id,)
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        return False
+    if not row:
+        return False
+    return bool(dict(row).get("locked"))
+
+
 def build_coord_server(caller_id: str) -> Any:
     """Build an in-process MCP server whose tools know which agent is calling.
 
@@ -425,6 +446,17 @@ def build_coord_server(caller_id: str) -> Any:
         if to not in VALID_RECIPIENTS:
             return _err(f"invalid target '{to}' — must be p1..p10")
 
+        # Lock: human can mark a Player off-limits for Coach. When set,
+        # Coach cannot push work; Player still reads docs + answers
+        # human prompts. Fail explicitly so the LLM knows to pick a
+        # different Player rather than retrying.
+        if await _is_locked(to):
+            return _err(
+                f"Player {to} is locked (human marked them off-limits "
+                f"for Coach orchestration). Pick an unlocked Player, or "
+                f"ask the human to unlock {to}."
+            )
+
         c = await configured_conn()
         try:
             # Target Player must exist and be free.
@@ -548,6 +580,16 @@ def build_coord_server(caller_id: str) -> Any:
                 f"invalid priority '{priority}' (must be 'normal' or 'interrupt')"
             )
 
+        # Lock enforcement: Coach cannot direct-message a locked
+        # Player. Broadcasts still go through at send-time (the delivery
+        # filter is in read_inbox) so Coach doesn't have to know the
+        # lock state of every team member when pushing a broadcast.
+        if caller_is_coach and to != "broadcast" and await _is_locked(to):
+            return _err(
+                f"{to} is locked (human marked them off-limits for Coach). "
+                f"Message not sent."
+            )
+
         c = await configured_conn()
         try:
             cur = await c.execute(
@@ -612,12 +654,19 @@ def build_coord_server(caller_id: str) -> Any:
         {},
     )
     async def read_inbox(args: dict[str, Any]) -> dict[str, Any]:
+        # Locked Players ignore every Coach-sourced message (direct or
+        # broadcast). The filter lives at the read layer so a locked
+        # Player flipping back to unlocked still gets the message —
+        # it's queued but invisible while locked. Human and peer-Player
+        # messages pass through unaffected.
+        reader_locked = await _is_locked(caller_id)
+
         c = await configured_conn()
         try:
             # Per-recipient unread via NOT EXISTS on message_reads — avoids
             # the broadcast bug where the first reader hides the message
             # from everyone else.
-            cur = await c.execute(
+            sql = (
                 "SELECT m.id, m.from_id, m.to_id, m.subject, m.body, "
                 "       m.sent_at, m.priority "
                 "FROM messages m "
@@ -626,9 +675,12 @@ def build_coord_server(caller_id: str) -> Any:
                 "    SELECT 1 FROM message_reads r "
                 "    WHERE r.message_id = m.id AND r.agent_id = ?"
                 "  ) "
-                "ORDER BY m.sent_at ASC",
-                (caller_id, caller_id),
             )
+            params: tuple[Any, ...] = (caller_id, caller_id)
+            if reader_locked:
+                sql += "  AND m.from_id != 'coach' "
+            sql += "ORDER BY m.sent_at ASC"
+            cur = await c.execute(sql, params)
             rows = await cur.fetchall()
             if not rows:
                 return _ok("(no unread messages)")

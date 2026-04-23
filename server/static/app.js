@@ -3466,16 +3466,6 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
     }
   }, [allEvents.length, streamLen, isStreaming]);
 
-  // Last-turn stats: find the most recent 'result' event (the SDK
-  // emits one per turn with duration + cost). Surfaces in the pane
-  // header as a compact "last: Ns $X.XX" chip.
-  const lastResult = useMemo(() => {
-    for (let i = mergedEvents.length - 1; i >= 0; i--) {
-      if (mergedEvents[i].type === "result") return mergedEvents[i];
-    }
-    return null;
-  }, [mergedEvents]);
-
   // Filter allEvents by searchQuery for body render. No-op when the
   // query is empty; otherwise a case-insensitive substring match
   // against the most informative fields per type.
@@ -3905,7 +3895,6 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
   const displayName =
     rawName.toLowerCase() === slot.toLowerCase() ? "" : rawName;
   const status = agent?.status || "stopped";
-  const cost = Number(agent?.cost_estimate_usd || 0);
 
   return html`
     <section
@@ -3926,32 +3915,41 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
             class=${"pane-dot " + status}
             title=${statusTooltip(status, agent)}
           ></span>
-          <span class="pane-id">${slot}</span>
-          ${displayName ? html`<span class="pane-name">${displayName}</span>` : null}
-          ${agent?.role ? html`<span class="pane-role">— ${agent.role}</span>` : html`<span class="pane-role"></span>`}
+          <span class="pane-id">${slotShortLabel(slot)}</span>
+          ${displayName
+            ? html`<span
+                class="pane-name"
+                title=${agent?.role ? agent.role : ""}
+              >${displayName}</span>`
+            : null}
         </span>
         ${currentTask
           ? html`<span
-              class="pane-current-task"
+              class="pane-current-task pane-current-task-icon"
               title=${"current task: " + currentTask.title + " (" + currentTask.id + ", " + currentTask.status + ")"}
-            >⚑ ${currentTask.title.slice(0, 24)}${currentTask.title.length > 24 ? "…" : ""}</span>`
+            >⚑</span>`
           : null}
+        <button
+          class=${"pane-lock" + (agent?.locked ? " locked" : "")}
+          onClick=${async () => {
+            await authFetch("/api/agents/" + slot + "/locked", {
+              method: "PUT",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ locked: !agent?.locked }),
+            });
+          }}
+          title=${agent?.locked
+            ? "LOCKED — Coach cannot assign tasks or message this agent; agent skips Coach broadcasts. Click to unlock."
+            : "Unlocked — Coach can assign work and broadcast. Click to lock (this agent becomes human-only)."}
+        >${agent?.locked ? "🔒" : "🔓"}</button>
         ${agent?.session_id
-          ? html`<span class="pane-session" title=${"session " + agent.session_id}>●</span>
-              <button
-                class="pane-session-clear"
-                onClick=${async () => {
-                  await authFetch("/api/agents/" + slot + "/session", { method: "DELETE" });
-                }}
-                title="Clear session — next run starts fresh"
-              >×</button>`
-          : null}
-        <span class="pane-cost">$${cost.toFixed(3)}</span>
-        ${lastResult && status !== "working"
-          ? html`<span
-              class="pane-last-turn"
-              title=${"Last turn: " + (lastResult.duration_ms ? Math.round(lastResult.duration_ms) + "ms" : "?") + ", $" + (lastResult.cost_usd || 0).toFixed(4) + (lastResult.is_error ? " (errored)" : "")}
-            >${(lastResult.duration_ms ? (lastResult.duration_ms / 1000).toFixed(1) + "s" : "?")} · $${(lastResult.cost_usd || 0).toFixed(3)}</span>`
+          ? html`<button
+              class="pane-session-clear"
+              onClick=${async () => {
+                await authFetch("/api/agents/" + slot + "/session", { method: "DELETE" });
+              }}
+              title="Clear session — next run starts fresh"
+            >🗑</button>`
           : null}
         ${status === "working"
           ? html`<button

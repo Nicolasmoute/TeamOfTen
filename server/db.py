@@ -230,6 +230,12 @@ async def init_db() -> None:
                 # ["WebSearch", "WebFetch"]). NULL / empty = baseline
                 # only. Merged in server.agents.run_agent at spawn.
                 ("allowed_extra_tools", "ALTER TABLE agents ADD COLUMN allowed_extra_tools TEXT"),
+                # Per-Player lock flag. When set, Coach cannot assign
+                # tasks to or direct-message this agent, and the agent
+                # skips Coach-originated broadcasts. The agent still
+                # reads all shared docs and responds to human prompts.
+                # INTEGER 0/1 (SQLite has no bool); default 0.
+                ("locked", "ALTER TABLE agents ADD COLUMN locked INTEGER NOT NULL DEFAULT 0"),
             ):
                 try:
                     await db.execute(col_ddl)
