@@ -678,60 +678,57 @@ async def set_agent_brief(agent_id: str, req: AgentBriefWrite) -> dict[str, obje
 # paste an arbitrary tool name and get silently rejected by the SDK.
 # Add to this list alongside any new safe-to-expose tool. These are
 # SDK-native names (not role-baseline ones) that are OFF by default.
+# Applied team-wide via /api/team/tools — one toggle, every agent.
 _EXTRA_TOOL_WHITELIST = {"WebSearch", "WebFetch"}
 
 
-class AgentToolsWrite(BaseModel):
+class TeamToolsWrite(BaseModel):
     tools: list[str] = Field(
         default_factory=list,
-        description="Extra SDK tool names to grant this agent (empty = baseline only).",
+        description="Extra SDK tool names to grant to every agent (empty = baseline only).",
     )
 
 
-@app.get("/api/agents/{agent_id}/tools", dependencies=[Depends(require_token)])
-async def get_agent_tools(agent_id: str) -> dict[str, object]:
-    """Return the extra-tools allowlist for this agent along with the
-    menu of toggleable tools so the UI can render checkboxes without a
-    second round-trip."""
-    if not (agent_id == "coach" or (agent_id.startswith("p") and agent_id[1:].isdigit() and 1 <= int(agent_id[1:]) <= 10)):
-        raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
+async def _read_team_extra_tools() -> list[str]:
+    """Read team_config['extra_tools'] as a list. Empty on missing /
+    malformed — the setter guarantees validity, so malformed should
+    only happen from manual DB edits."""
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT allowed_extra_tools FROM agents WHERE id = ?", (agent_id,)
+            "SELECT value FROM team_config WHERE key = 'extra_tools'"
         )
         row = await cur.fetchone()
     finally:
         await c.close()
     if not row:
-        raise HTTPException(404, detail=f"agent {agent_id} not found")
-    raw = dict(row).get("allowed_extra_tools")
-    current: list[str] = []
-    if raw:
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                current = [t for t in parsed if isinstance(t, str)]
-        except Exception:
-            current = []
+        return []
+    raw = dict(row).get("value") or ""
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [t for t in parsed if isinstance(t, str)]
+
+
+@app.get("/api/team/tools", dependencies=[Depends(require_token)])
+async def get_team_tools() -> dict[str, object]:
+    """Return the team-wide extra-tools allowlist + the menu of
+    toggleable tools so the UI can render checkboxes without a
+    second round-trip."""
     return {
-        "agent_id": agent_id,
-        "tools": current,
+        "tools": await _read_team_extra_tools(),
         "available": sorted(_EXTRA_TOOL_WHITELIST),
     }
 
 
-@app.put("/api/agents/{agent_id}/tools", dependencies=[Depends(require_token)])
-async def set_agent_tools(agent_id: str, req: AgentToolsWrite) -> dict[str, object]:
-    """Replace the extra-tools allowlist for this agent. Entries
-    outside the whitelist are rejected — the UI only offers checkboxes
-    we've vetted, so an out-of-list value likely means a client bug.
-    Takes effect on the next turn.
-    """
-    if not (agent_id == "coach" or (agent_id.startswith("p") and agent_id[1:].isdigit() and 1 <= int(agent_id[1:]) <= 10)):
-        raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
-    # Dedup + sanitize. Order isn't load-bearing (we pass a list to the
-    # SDK, not a set, but duplicates are harmless).
+@app.put("/api/team/tools", dependencies=[Depends(require_token)])
+async def set_team_tools(req: TeamToolsWrite) -> dict[str, object]:
+    """Replace the team-wide extra-tools allowlist. Applies to every
+    agent on their next turn. Entries outside the whitelist are
+    rejected — the UI only offers checkboxes we've vetted."""
     clean: list[str] = []
     seen: set[str] = set()
     for t in req.tools or []:
@@ -741,28 +738,28 @@ async def set_agent_tools(agent_id: str, req: AgentToolsWrite) -> dict[str, obje
             raise HTTPException(400, detail=f"tool '{t}' not in extras whitelist")
         clean.append(t)
         seen.add(t)
-    payload = json.dumps(clean) if clean else None
+    payload = json.dumps(clean)
     c = await configured_conn()
     try:
-        cur = await c.execute(
-            "UPDATE agents SET allowed_extra_tools = ? WHERE id = ?",
-            (payload, agent_id),
+        # UPSERT — team_config.key is PK.
+        await c.execute(
+            "INSERT INTO team_config (key, value) VALUES ('extra_tools', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+            (payload,),
         )
-        changed = cur.rowcount
         await c.commit()
     finally:
         await c.close()
-    if changed == 0:
-        raise HTTPException(404, detail=f"agent {agent_id} not found")
     await bus.publish(
         {
             "ts": datetime.now(timezone.utc).isoformat(),
-            "agent_id": agent_id,
-            "type": "tools_updated",
+            "agent_id": "system",
+            "type": "team_tools_updated",
             "tools": clean,
         }
     )
-    return {"ok": True, "agent_id": agent_id, "tools": clean}
+    return {"ok": True, "tools": clean}
 
 
 class AgentLockWrite(BaseModel):

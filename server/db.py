@@ -137,6 +137,16 @@ CREATE TABLE IF NOT EXISTS turns (
 
 CREATE INDEX IF NOT EXISTS idx_turns_agent      ON turns(agent_id, id);
 CREATE INDEX IF NOT EXISTS idx_turns_ended_at   ON turns(ended_at);
+
+-- Team-wide settings (applies to every agent). Simple key/value store
+-- so we can grow without schema churn. Value is a JSON string — the
+-- caller decides the shape. Current keys:
+--   extra_tools  → JSON array of SDK tool names (WebSearch, WebFetch)
+CREATE TABLE IF NOT EXISTS team_config (
+    key          TEXT PRIMARY KEY,
+    value        TEXT NOT NULL,
+    updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 """
 
 # Seed agents — idempotent via INSERT OR IGNORE.

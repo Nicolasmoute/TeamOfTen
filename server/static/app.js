@@ -309,53 +309,6 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
   const [identitySaving, setIdentitySaving] = useState(false);
   const identityDirty =
     nameDraft !== (initialName || "") || roleDraft !== (initialRole || "");
-  // Extra-tools allowlist — loaded lazily on open so we don't hit the
-  // API until the popover is actually visible. Each toggle PUTs
-  // immediately (small payload, no save button needed).
-  const [extraTools, setExtraTools] = useState([]);     // currently enabled
-  const [extraAvailable, setExtraAvailable] = useState([]); // whitelist from server
-  const [extraSaving, setExtraSaving] = useState(false);
-  useEffect(() => {
-    if (!slot) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await authFetch("/api/agents/" + slot + "/tools");
-        if (!res.ok || cancelled) return;
-        const data = await res.json();
-        if (cancelled) return;
-        setExtraTools(Array.isArray(data.tools) ? data.tools : []);
-        setExtraAvailable(Array.isArray(data.available) ? data.available : []);
-      } catch (e) {
-        console.error("tools load failed", e);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [slot]);
-  const toggleExtra = useCallback(async (name) => {
-    if (!slot) return;
-    const next = extraTools.includes(name)
-      ? extraTools.filter((t) => t !== name)
-      : [...extraTools, name];
-    setExtraTools(next);       // optimistic
-    setExtraSaving(true);
-    try {
-      const res = await authFetch("/api/agents/" + slot + "/tools", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tools: next }),
-      });
-      if (!res.ok) {
-        // Revert on server reject so the UI doesn't silently lie about state.
-        setExtraTools(extraTools);
-      }
-    } catch (e) {
-      console.error("tools save failed", e);
-      setExtraTools(extraTools);
-    } finally {
-      setExtraSaving(false);
-    }
-  }, [slot, extraTools]);
   const saveIdentity = useCallback(async () => {
     if (!slot) return;
     setIdentitySaving(true);
@@ -474,31 +427,6 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
           ${effort === 0 ? "default" : EFFORT_LABELS[effort - 1]}
         </span>
       </div>
-      ${extraAvailable.length > 0
-        ? html`<div class="pane-settings-row pane-settings-extras">
-            <label class="pane-settings-label">Extra tools</label>
-            <div class="pane-settings-extras-body">
-              ${extraAvailable.map(
-                (name) => html`<label
-                  class="pane-settings-extra-item"
-                  key=${name}
-                  title=${"Allow this agent to call " + name + ". Takes effect on the next turn."}
-                >
-                  <input
-                    type="checkbox"
-                    checked=${extraTools.includes(name)}
-                    disabled=${extraSaving}
-                    onChange=${() => toggleExtra(name)}
-                  />
-                  <span>${name}</span>
-                </label>`
-              )}
-              <div class="pane-settings-hint">
-                Off by default so web tools don't fire unexpectedly. Check to enable for this agent only.
-              </div>
-            </div>
-          </div>`
-        : null}
       <div class="pane-settings-row pane-settings-brief">
         <label class="pane-settings-label">Brief</label>
         <textarea
@@ -1653,6 +1581,86 @@ function KDriveSection({ serverStatus, health, onRefresh }) {
   </section>`;
 }
 
+// Team-wide extra-tools allowlist. One toggle set applies to every
+// agent (Coach + p1..p10) on their next turn. Replaced the older
+// per-agent popover checkboxes — flipping the same tool on ten
+// Players was too much friction for a setting that's almost always
+// uniform across the team.
+function TeamToolsSection() {
+  const [tools, setTools] = useState([]);
+  const [available, setAvailable] = useState([]);
+  const [saving, setSaving] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await authFetch("/api/team/tools");
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (cancelled) return;
+        setTools(Array.isArray(data.tools) ? data.tools : []);
+        setAvailable(Array.isArray(data.available) ? data.available : []);
+      } catch (e) {
+        console.error("team tools load failed", e);
+      } finally {
+        if (!cancelled) setLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+  const toggle = useCallback(async (name) => {
+    const next = tools.includes(name)
+      ? tools.filter((t) => t !== name)
+      : [...tools, name];
+    const prev = tools;
+    setTools(next);
+    setSaving(true);
+    try {
+      const res = await authFetch("/api/team/tools", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tools: next }),
+      });
+      if (!res.ok) setTools(prev);
+    } catch (e) {
+      console.error("team tools save failed", e);
+      setTools(prev);
+    } finally {
+      setSaving(false);
+    }
+  }, [tools]);
+  return html`<section class="drawer-section">
+    <h3>Team tools</h3>
+    <p class="muted" style="margin: 0 0 6px 0; font-size: 12px;">
+      Extra SDK tools beyond the role baseline. Applies to every
+      agent on their next turn — off by default so web calls don't
+      fire unexpectedly.
+    </p>
+    ${loaded
+      ? available.length === 0
+        ? html`<p class="muted" style="font-size: 11px;">(no extras available — update <code>_EXTRA_TOOL_WHITELIST</code> in server/main.py)</p>`
+        : html`<div style="display: flex; flex-wrap: wrap; gap: 6px 14px;">
+            ${available.map(
+              (name) => html`<label
+                key=${name}
+                style="display: inline-flex; align-items: center; gap: 5px; font-size: 12px; cursor: pointer; user-select: none;"
+                title=${"Grant " + name + " to the whole team. Next turn."}
+              >
+                <input
+                  type="checkbox"
+                  checked=${tools.includes(name)}
+                  disabled=${saving}
+                  onChange=${() => toggle(name)}
+                />
+                <span>${name}</span>
+              </label>`
+            )}
+          </div>`
+      : html`<p class="muted">loading…</p>`}
+  </section>`;
+}
+
 function SettingsDrawer({ onClose, serverStatus }) {
   // A compact row summarizing the live server status: paused, running
   // agents, ws subscribers. Rendered above the health checks so the
@@ -1796,6 +1804,8 @@ function SettingsDrawer({ onClose, serverStatus }) {
             health=${health}
             onRefresh=${loadHealth}
           />
+
+          <${TeamToolsSection} />
 
           <section class="drawer-section">
             <h3>Layout</h3>
@@ -3591,19 +3601,20 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
         ];
         const list = slot === "coach" ? coach : player;
         // Also fetch /api/health to pick up external MCP servers from
-        // HARNESS_MCP_CONFIG and /api/agents/<slot>/tools for the
-        // per-agent extras the human toggled on in the pane popover.
-        // Both vary at runtime so they can't live in the hardcoded list.
+        // HARNESS_MCP_CONFIG and /api/team/tools for the team-wide
+        // extras (WebSearch / WebFetch) the human toggled on in the
+        // Settings drawer. Both vary at runtime so they can't live in
+        // the hardcoded list.
         Promise.all([
           authFetch("/api/health").then((r) => r.json()).catch(() => null),
-          authFetch("/api/agents/" + slot + "/tools").then((r) => r.json()).catch(() => null),
+          authFetch("/api/team/tools").then((r) => r.json()).catch(() => null),
         ])
           .then(([health, tools]) => {
             const extra_lines = [];
             const extras = Array.isArray(tools?.tools) ? tools.tools : [];
             if (extras.length > 0) {
               extra_lines.push("");
-              extra_lines.push("Extras (granted via settings popover):");
+              extra_lines.push("Team extras (Settings drawer):");
               extra_lines.push("  • " + extras.join(" · "));
             }
             const ext = health?.checks?.mcp_external;
@@ -4461,11 +4472,12 @@ function EventItem({ event }) {
     </div>`;
   }
 
-  if (type === "tools_updated") {
+  if (type === "team_tools_updated" || type === "tools_updated") {
     const list = Array.isArray(event.tools) ? event.tools : [];
     const body = list.length === 0 ? "(baseline only)" : list.join(" · ");
+    const scope = type === "team_tools_updated" ? "team extras" : "extra tools";
     return html`<div class="event sys">
-      <div class="event-meta">${ts} · extra tools → ${body}</div>
+      <div class="event-meta">${ts} · ${scope} → ${body}</div>
     </div>`;
   }
 

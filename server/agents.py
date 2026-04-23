@@ -485,37 +485,35 @@ async def _locked_players() -> list[str]:
     return [dict(r)["id"] for r in rows]
 
 
-async def _get_agent_extra_tools(agent_id: str) -> list[str]:
-    """Read agent.allowed_extra_tools — opt-in extra SDK tool names the
-    human granted this slot beyond the role baseline. Merged into the
-    `allowed_tools` list passed to the SDK on every turn.
+async def _get_team_extra_tools() -> list[str]:
+    """Read the team-wide extra-tools allow-list from team_config.
 
-    Returns an empty list on missing column / parse error / empty value
-    so a bad row can't brick spawning.
+    One setting for the whole team — WebSearch / WebFetch etc. that
+    the human toggled on in the Settings drawer apply to every agent
+    on every turn. Returns [] when the row is missing / empty / malformed
+    so a bad value can't brick spawning.
     """
-    if agent_id == "system":
-        return []
     try:
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT allowed_extra_tools FROM agents WHERE id = ?", (agent_id,)
+                "SELECT value FROM team_config WHERE key = 'extra_tools'"
             )
             row = await cur.fetchone()
         finally:
             await c.close()
     except Exception:
-        logger.exception("get_agent_extra_tools failed: agent=%s", agent_id)
+        logger.exception("get_team_extra_tools failed")
         return []
     if not row:
         return []
-    raw = dict(row).get("allowed_extra_tools")
+    raw = dict(row).get("value")
     if not raw:
         return []
     try:
         parsed = json.loads(raw)
     except Exception:
-        logger.warning("agent %s: allowed_extra_tools is not valid JSON, ignoring", agent_id)
+        logger.warning("team_config.extra_tools is not valid JSON, ignoring")
         return []
     if not isinstance(parsed, list):
         return []
@@ -824,13 +822,13 @@ async def run_agent(
     allowed = list(
         ALLOWED_COACH_TOOLS if agent_id == "coach" else ALLOWED_PLAYER_TOOLS
     )
-    # Per-agent extras the human opted into via the pane settings
-    # popover (e.g. WebSearch / WebFetch). Read fresh each spawn so
-    # toggling a checkbox takes effect on the next turn with no
-    # restart. Duplicates from the baseline are harmless.
-    extra_tools = await _get_agent_extra_tools(agent_id)
-    if extra_tools:
-        allowed.extend(extra_tools)
+    # Team-wide extras the human opted into via the Settings drawer
+    # (e.g. WebSearch / WebFetch). Applies to every agent on every
+    # turn — read fresh each spawn so toggles take effect on the
+    # next run with no restart. Duplicates from the baseline are harmless.
+    team_extras = await _get_team_extra_tools()
+    if team_extras:
+        allowed.extend(team_extras)
     # External MCP servers (GitHub / Linear / Notion / …) come from
     # HARNESS_MCP_CONFIG. Loaded fresh each spawn so edits to the
     # config file take effect on the next turn with no restart. Empty
