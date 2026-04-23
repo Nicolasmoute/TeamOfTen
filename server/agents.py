@@ -359,6 +359,71 @@ async def _clear_session_id(agent_id: str) -> None:
         logger.exception("clear_session_id failed: agent=%s", agent_id)
 
 
+# Soccer surnames used to auto-name a Player slot on first spawn when
+# Coach hasn't explicitly assigned one via coord_set_player_role. Pool
+# is deliberately much larger than 10 so the picker can avoid
+# collisions with existing names. Restricted to last names only and
+# ASCII-friendly (kept diacritics off so the pane label is safe on
+# every terminal / browser).
+_SOCCER_SURNAMES: tuple[str, ...] = (
+    "Mbappe", "Messi", "Ronaldo", "Pele", "Maradona", "Zidane",
+    "Cruyff", "Beckenbauer", "Platini", "Henry", "Beckham", "Rooney",
+    "Kane", "Salah", "Modric", "Neymar", "Xavi", "Iniesta",
+    "Benzema", "Lewandowski", "Haaland", "Vinicius", "Bellingham",
+    "Griezmann", "Pogba", "Kante", "Ibrahimovic", "Drogba", "Eto'o",
+    "Baggio", "Nesta", "Pirlo", "Totti", "Buffon", "Casillas",
+    "Ramos", "Puyol", "Gerrard", "Lampard", "Scholes", "Giggs",
+    "Cantona", "Ronaldinho", "Rivaldo", "Kaka", "Zico", "Garrincha",
+    "Socrates", "Romario", "Yashin", "Figo", "Nedved", "Seedorf",
+)
+
+
+async def _autoname_player(agent_id: str) -> str | None:
+    """If this Player slot has no name yet, pick an unused soccer
+    surname and persist it. Returns the chosen name, or None if the
+    slot already had one / isn't a player / we ran out of names.
+
+    Runs once per slot lifetime (becomes a no-op after first call).
+    """
+    import random
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT kind, name FROM agents WHERE id = ?", (agent_id,)
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        if d["kind"] != "player" or d["name"]:
+            return None
+        cur = await c.execute(
+            "SELECT name FROM agents WHERE kind = 'player' AND name IS NOT NULL"
+        )
+        taken = {dict(r)["name"] for r in await cur.fetchall()}
+        candidates = [n for n in _SOCCER_SURNAMES if n not in taken]
+        if not candidates:
+            return None
+        pick = random.choice(candidates)
+        await c.execute(
+            "UPDATE agents SET name = ? WHERE id = ?", (pick, agent_id)
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    await bus.publish(
+        {
+            "ts": _now(),
+            "agent_id": agent_id,
+            "type": "player_assigned",
+            "name": pick,
+            "auto": True,
+        }
+    )
+    return pick
+
+
 def _system_prompt_for(agent_id: str) -> str:
     if agent_id == "coach":
         return (
@@ -466,6 +531,12 @@ async def run_agent(
         await _emit(agent_id, "paused", prompt=prompt)
         logger.info("paused: refused to spawn %s", agent_id)
         return
+
+    # First-spawn auto-name: if Coach hasn't assigned this Player a
+    # name, pick an unused soccer surname so the pane header reads
+    # "p3 — Mbappe" instead of "p3 — unassigned". Coach's
+    # coord_set_player_role still overrides at any time.
+    await _autoname_player(agent_id)
 
     # Enforce daily cost caps BEFORE emitting agent_started — if the
     # caller is over budget we want the rejection visible in the

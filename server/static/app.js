@@ -3252,7 +3252,12 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
     downloadMarkdown(`${slot}-${stamp}.md`, header + body);
   }, [allEvents, slot, agent]);
 
-  const displayName = agent?.name || (agent?.kind === "player" ? "unassigned" : slot);
+  // If the assigned name just duplicates the slot id (e.g. Coach is
+  // seeded with id='coach' and name='Coach'), skip the name pill —
+  // showing both reads as "coach Coach" which looks like a stutter.
+  const rawName = agent?.name || (agent?.kind === "player" ? "unassigned" : slot);
+  const displayName =
+    rawName.toLowerCase() === slot.toLowerCase() ? "" : rawName;
   const status = agent?.status || "stopped";
   const cost = Number(agent?.cost_estimate_usd || 0);
 
@@ -3276,7 +3281,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
             title=${statusTooltip(status, agent)}
           ></span>
           <span class="pane-id">${slot}</span>
-          <span class="pane-name">${displayName}</span>
+          ${displayName ? html`<span class="pane-name">${displayName}</span>` : null}
           ${agent?.role ? html`<span class="pane-role">— ${agent.role}</span>` : html`<span class="pane-role"></span>`}
         </span>
         ${currentTask
@@ -3417,7 +3422,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
             `
           : null}
         <textarea
-          placeholder=${"Message " + displayName + "… (paste images directly)"}
+          placeholder=${"Message " + (displayName || rawName) + "… (paste images directly)"}
           value=${input}
           onInput=${(e) => {
             setInput(e.target.value);
