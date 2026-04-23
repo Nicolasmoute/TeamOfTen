@@ -684,6 +684,23 @@ async def run_agent(
         logger.info("paused: refused to spawn %s", agent_id)
         return
 
+    # Concurrent-spawn guard: if a turn is already running for this
+    # slot, refuse to start another. maybe_wake_agent already does this,
+    # but the direct POST /api/agents/start path bypasses that helper —
+    # without this check, 100 rapid clicks on the Run button would
+    # spawn 100 Claude subprocesses (the _running_tasks dict assignment
+    # would just overwrite, so cancel-all only kills the last).
+    existing = _running_tasks.get(agent_id)
+    if existing is not None and not existing.done():
+        await _emit(
+            agent_id,
+            "spawn_rejected",
+            reason="already running a turn — wait or ⏹ cancel first",
+            prompt=prompt,
+        )
+        logger.info("spawn_rejected: %s already running", agent_id)
+        return
+
     # First-spawn auto-name: if Coach hasn't assigned this Player a
     # name, pick an unused soccer surname so the pane header reads
     # "p3 — Mbappe" instead of "p3 — unassigned". Coach's

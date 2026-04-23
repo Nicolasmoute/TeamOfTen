@@ -4242,6 +4242,12 @@ function EventItem({ event }) {
     </div>`;
   }
 
+  if (type === "spawn_rejected") {
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · spawn rejected · ${event.reason || ""}</div>
+    </div>`;
+  }
+
   if (type === "agent_cancelled") {
     return html`<div class="event sys">
       <div class="event-meta">${ts} · cancelled</div>
