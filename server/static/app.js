@@ -2416,6 +2416,16 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
     }
   }, [allEvents.length]);
 
+  // Last-turn stats: find the most recent 'result' event (the SDK
+  // emits one per turn with duration + cost). Surfaces in the pane
+  // header as a compact "last: Ns $X.XX" chip.
+  const lastResult = useMemo(() => {
+    for (let i = mergedEvents.length - 1; i >= 0; i--) {
+      if (mergedEvents[i].type === "result") return mergedEvents[i];
+    }
+    return null;
+  }, [mergedEvents]);
+
   // paste handler: capture images, upload, add to attachments strip
   const onPaste = useCallback(async (e) => {
     const items = e.clipboardData?.items || [];
@@ -2548,6 +2558,12 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
               >×</button>`
           : null}
         <span class="pane-cost">$${cost.toFixed(3)}</span>
+        ${lastResult && status !== "working"
+          ? html`<span
+              class="pane-last-turn"
+              title=${"Last turn: " + (lastResult.duration_ms ? Math.round(lastResult.duration_ms) + "ms" : "?") + ", $" + (lastResult.cost_usd || 0).toFixed(4) + (lastResult.is_error ? " (errored)" : "")}
+            >${(lastResult.duration_ms ? (lastResult.duration_ms / 1000).toFixed(1) + "s" : "?")} · $${(lastResult.cost_usd || 0).toFixed(3)}</span>`
+          : null}
         ${status === "working"
           ? html`<button
               class="pane-cancel"

@@ -791,6 +791,13 @@ body {
 .pane-id { font-weight: 600; }
 .pane-name { color: var(--fg); }
 .pane-role { color: var(--muted); font-size: 11px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pane-last-turn {
+  color: var(--muted);
+  font-size: 10px;
+  white-space: nowrap;
+  padding: 0 4px;
+  border-left: 1px solid var(--border);
+}
 .pane-current-task {
   background: var(--card, #1a1a1a);
   color: var(--accent);
