@@ -1221,6 +1221,10 @@ function App() {
                           stacked=${col.length > 1}
                         />`;
                       }
+                      // wsAttempt bumps on every WS reconnect.
+                      // AgentPane re-reads history when it changes so a
+                      // long disconnect (> 60s watchdog) doesn't leave
+                      // events missed during the gap invisible forever.
                       const agent = agents.find((a) => a.id === slot);
                       const currentTask = agent?.current_task_id
                         ? tasks.find((t) => t.id === agent.current_task_id)
@@ -1232,6 +1236,7 @@ function App() {
                         currentTask=${currentTask}
                         liveEvents=${conversations.get(slot) || []}
                         streaming=${streamingText.get(slot)}
+                        wsAttempt=${wsAttempt}
                         openSlots=${openSlots}
                         onClose=${() => closePane(slot)}
                         onDropEdge=${dropOnPaneEdge}
@@ -3167,7 +3172,7 @@ function renderInline(s) {
 // agent pane
 // ------------------------------------------------------------------
 
-function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, onDropEdge, onPopOut, stacked }) {
+function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt, onClose, onDropEdge, onPopOut, stacked }) {
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState([]); // {id, url, path, filename}
   const [submitting, setSubmitting] = useState(false);
@@ -3279,7 +3284,11 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
     return () => {
       cancelled = true;
     };
-  }, [slot]);
+    // Re-read history whenever wsAttempt changes (every WS reconnect).
+    // Long disconnects > 60s watchdog trigger this path, so events that
+    // landed during the gap show up in the pane via the DB re-fetch
+    // instead of being silently missed.
+  }, [slot, wsAttempt]);
 
   // Merge history + live events. Live events don't carry __id (that's
   // assigned by the server's DB INSERT, which happens AFTER WS fan-out),
