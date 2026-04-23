@@ -336,6 +336,27 @@ function App() {
     saveLayout({ openColumns, envOpen });
   }, [openColumns, envOpen]);
 
+  // Global keyboard shortcuts. Kept deliberately small — anything else
+  // belongs scoped to the relevant pane/component.
+  //   Ctrl/Cmd + B : toggle the Environment side-panel.
+  // We ignore the shortcut when the user is typing in a form field so
+  // browser-native Ctrl+B (bold) still works inside textareas that opt
+  // in to it, and so it never steals focus mid-sentence.
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      const mod = e.ctrlKey || e.metaKey;
+      if (!mod) return;
+      const tag = (e.target?.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || e.target?.isContentEditable) return;
+      if (e.key === "b" || e.key === "B") {
+        e.preventDefault();
+        setEnvOpen((v) => !v);
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   // WebSocket: single connection at app root. On close, schedule a
   // re-open by bumping wsAttempt; the effect re-runs, a new socket opens.
   useEffect(() => {
@@ -751,7 +772,7 @@ function LeftRail({ agents, openSlots, onOpen, onStackInLast, wsConnected, envOp
       <span class="rail-sep"></span>
       <button
         class=${"gear env-toggle" + (envOpen ? " active" : "")}
-        title=${envOpen ? "Collapse environment panel" : "Open environment panel"}
+        title=${(envOpen ? "Collapse environment panel" : "Open environment panel") + " (⌘/Ctrl+B)"}
         onClick=${onToggleEnv}
       >▦</button>
       <button class="gear" title="Settings" onClick=${onOpenSettings}>⚙</button>
