@@ -1131,6 +1131,35 @@ function summarizeHealthCheck(c) {
 }
 
 function SettingsDrawer({ onClose, serverStatus }) {
+  // A compact row summarizing the live server status: paused, running
+  // agents, ws subscribers. Rendered above the health checks so the
+  // operator sees the most useful numbers first.
+  const renderRuntime = () => {
+    if (!serverStatus) return null;
+    const running = serverStatus.running_slots || [];
+    const subs = serverStatus.ws_subscribers ?? "?";
+    return html`
+      <ul class="drawer-health-list" style="margin-bottom: 8px;">
+        <li class=${"drawer-health-row " + (serverStatus.paused ? "fail" : "ok")}>
+          <span class="drawer-health-dot" />
+          <span class="drawer-health-name">paused</span>
+          <span class="drawer-health-detail">${serverStatus.paused ? "yes" : "no"}</span>
+        </li>
+        <li class="drawer-health-row ok">
+          <span class="drawer-health-dot" />
+          <span class="drawer-health-name">running</span>
+          <span class="drawer-health-detail">
+            ${running.length === 0 ? "none" : running.join(", ")}
+          </span>
+        </li>
+        <li class="drawer-health-row ok">
+          <span class="drawer-health-dot" />
+          <span class="drawer-health-name">ws subs</span>
+          <span class="drawer-health-detail">${subs}</span>
+        </li>
+      </ul>
+    `;
+  };
   const [health, setHealth] = useState(null);
   const [healthErr, setHealthErr] = useState("");
   const [healthLoading, setHealthLoading] = useState(false);
@@ -1184,6 +1213,7 @@ function SettingsDrawer({ onClose, serverStatus }) {
                 title="Re-probe subsystems"
               >${healthLoading ? "…" : "↻"}</button>
             </h3>
+            ${renderRuntime()}
             ${healthErr
               ? html`<p class="muted">⚠ ${healthErr}</p>`
               : null}
