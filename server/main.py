@@ -26,6 +26,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -170,6 +171,11 @@ app = FastAPI(
     description="Personal orchestration harness — Coach + 10 Players.",
     lifespan=lifespan,
 )
+# Compress responses ≥ 1 KB. /api/events, /api/turns, /api/tasks, and
+# the static JS/CSS are the big wins — JSON arrays and minified JS
+# both compress to ~20% original size. Skip tiny responses so we don't
+# pay the compression overhead for a {"ok": true} reply.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 else:
