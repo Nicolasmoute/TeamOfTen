@@ -110,7 +110,7 @@ class KDriveClient:
         if not self._enabled:
             return {"ok": False, "error": self._reason, "url": WEBDAV_URL, "root": ROOT_PATH}
         rel = "harness-health-probe.txt"
-        full_path = str(PurePosixPath(ROOT_PATH) / rel)
+        full_path = self._resolve(rel)
         try:
             await asyncio.to_thread(self._write_sync, full_path, "ok")
             return {"ok": True, "url": WEBDAV_URL, "root": ROOT_PATH, "probe_file": full_path}
@@ -128,6 +128,20 @@ class KDriveClient:
 
     # ---------- async public API ----------
 
+    def _resolve(self, relative_path: str) -> str:
+        """Join ROOT_PATH with the caller's relative path and strip any
+        leading slash.
+
+        webdav4 resolves paths containing a leading `/` against the
+        host root, bypassing any path component in the base URL — so
+        if your URL is https://host/<drive-id>/TOT/ and we pass
+        '/harness/foo.txt', the request goes to
+        https://host/harness/foo.txt (404 / ResourceConflict) instead
+        of https://host/<drive-id>/TOT/harness/foo.txt.
+        """
+        full = str(PurePosixPath(ROOT_PATH) / relative_path)
+        return full.lstrip("/")
+
     async def write_text(self, relative_path: str, content: str) -> bool:
         """Upload `content` as UTF-8 text to `{ROOT_PATH}/{relative_path}`.
 
@@ -136,7 +150,7 @@ class KDriveClient:
         """
         if not self._enabled:
             return False
-        full_path = str(PurePosixPath(ROOT_PATH) / relative_path)
+        full_path = self._resolve(relative_path)
         try:
             await asyncio.to_thread(self._write_sync, full_path, content)
             return True
@@ -148,7 +162,7 @@ class KDriveClient:
         """Same as write_text but for binary payloads (e.g. SQLite snapshots)."""
         if not self._enabled:
             return False
-        full_path = str(PurePosixPath(ROOT_PATH) / relative_path)
+        full_path = self._resolve(relative_path)
         try:
             await asyncio.to_thread(self._write_bytes_sync, full_path, data)
             return True
@@ -162,7 +176,7 @@ class KDriveClient:
         callers fall back to a local cached copy)."""
         if not self._enabled:
             return None
-        full_path = str(PurePosixPath(ROOT_PATH) / relative_path)
+        full_path = self._resolve(relative_path)
         try:
             return await asyncio.to_thread(self._read_text_sync, full_path)
         except Exception as e:
@@ -177,7 +191,7 @@ class KDriveClient:
         the directory is missing — callers shouldn't have to catch."""
         if not self._enabled:
             return []
-        full_path = str(PurePosixPath(ROOT_PATH) / relative_path)
+        full_path = self._resolve(relative_path)
         try:
             return await asyncio.to_thread(self._list_dir_sync, full_path)
         except Exception:
@@ -190,7 +204,7 @@ class KDriveClient:
         Idempotent: a missing file is treated as success."""
         if not self._enabled:
             return False
-        full_path = str(PurePosixPath(ROOT_PATH) / relative_path)
+        full_path = self._resolve(relative_path)
         try:
             await asyncio.to_thread(self._client.remove, full_path)
             return True
@@ -203,7 +217,9 @@ class KDriveClient:
     # ---------- sync helpers (run in a thread) ----------
 
     def _write_sync(self, full_path: str, content: str) -> None:
-        self._ensure_dir_sync(str(PurePosixPath(full_path).parent))
+        parent = str(PurePosixPath(full_path).parent).lstrip("/")
+        if parent and parent != ".":
+            self._ensure_dir_sync(parent)
         self._client.upload_fileobj(
             io.BytesIO(content.encode("utf-8")),
             full_path,
@@ -211,7 +227,9 @@ class KDriveClient:
         )
 
     def _write_bytes_sync(self, full_path: str, data: bytes) -> None:
-        self._ensure_dir_sync(str(PurePosixPath(full_path).parent))
+        parent = str(PurePosixPath(full_path).parent).lstrip("/")
+        if parent and parent != ".":
+            self._ensure_dir_sync(parent)
         self._client.upload_fileobj(
             io.BytesIO(data),
             full_path,
@@ -243,17 +261,21 @@ class KDriveClient:
 
     def _ensure_dir_sync(self, path: str) -> None:
         # Walk each segment, mkdir if missing. webdav4 doesn't have a
-        # recursive mkdir.
+        # recursive mkdir. Paths are relative to the base URL — a
+        # leading slash would make the server interpret them as
+        # host-root-relative and drop the URL's path component.
+        path = path.lstrip("/")
+        if not path or path == ".":
+            return
         parts = PurePosixPath(path).parts
-        current = PurePosixPath("/")
+        current = ""
         for seg in parts:
             if seg in ("", "/"):
                 continue
-            current = current / seg
-            cur_str = str(current)
+            current = f"{current}/{seg}" if current else seg
             try:
-                if not self._client.exists(cur_str):
-                    self._client.mkdir(cur_str)
+                if not self._client.exists(current):
+                    self._client.mkdir(current)
             except Exception as e:
                 # 405 Method Not Allowed often means it already exists;
                 # re-raise anything else.
