@@ -462,6 +462,58 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
 # ------------------------------------------------------------------
 
 
+_HUMAN_MSG_RECIPIENTS = (
+    {"coach", "broadcast"} | {f"p{i}" for i in range(1, 11)}
+)
+
+
+class HumanMessageRequest(BaseModel):
+    to: str
+    body: str = Field(min_length=1, max_length=5000)
+    subject: str | None = Field(default=None, max_length=200)
+    priority: str = Field(default="normal", pattern=r"^(normal|interrupt)$")
+
+
+@app.post("/api/messages", dependencies=[Depends(require_token)])
+async def send_human_message(req: HumanMessageRequest) -> dict[str, Any]:
+    """Queue a message from the human into an agent's inbox without
+    spawning a turn. Agents pick it up on their next coord_read_inbox
+    call (or their next autonomous tick).
+
+    Use a pane prompt instead if you want to run the agent now."""
+    to = req.to.strip().lower()
+    if to not in _HUMAN_MSG_RECIPIENTS:
+        raise HTTPException(
+            400, detail=f"invalid recipient '{to}'"
+        )
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "INSERT INTO messages (from_id, to_id, subject, body, priority) "
+            "VALUES ('human', ?, ?, ?, ?) RETURNING id",
+            (to, req.subject, req.body, req.priority),
+        )
+        row = await cur.fetchone()
+        msg_id = dict(row)["id"] if row else None
+        await c.commit()
+    finally:
+        await c.close()
+
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "human",
+            "type": "message_sent",
+            "message_id": msg_id,
+            "to": to,
+            "subject": req.subject,
+            "body_preview": (req.body or "")[:120],
+            "priority": req.priority,
+        }
+    )
+    return {"ok": True, "message_id": msg_id}
+
+
 @app.get("/api/messages", dependencies=[Depends(require_token)])
 async def list_messages(limit: int = 50) -> dict[str, Any]:
     """Recent messages (newest first, capped). Full body included —

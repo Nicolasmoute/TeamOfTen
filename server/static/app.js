@@ -1156,9 +1156,21 @@ function EnvAttentionSection({ conversations }) {
   `;
 }
 
+const MESSAGE_RECIPIENTS = [
+  "coach",
+  ...Array.from({ length: 10 }, (_, i) => "p" + (i + 1)),
+  "broadcast",
+];
+
 function EnvInboxSection({ conversations }) {
   const [msgs, setMsgs] = useState([]);
   const [openId, setOpenId] = useState(null);
+  const [composing, setComposing] = useState(false);
+  const [to, setTo] = useState("coach");
+  const [subject, setSubject] = useState("");
+  const [body, setBody] = useState("");
+  const [priority, setPriority] = useState("normal");
+  const [sending, setSending] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -1184,12 +1196,82 @@ function EnvInboxSection({ conversations }) {
     if (messageEventCount > 0) load();
   }, [messageEventCount, load]);
 
-  if (msgs.length === 0) return null;
+  const send = useCallback(async () => {
+    if (!body.trim()) return;
+    setSending(true);
+    try {
+      const res = await authFetch("/api/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          to,
+          subject: subject.trim() || null,
+          body,
+          priority,
+        }),
+      });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      setBody("");
+      setSubject("");
+      setComposing(false);
+    } catch (e) {
+      console.error("send message failed", e);
+    } finally {
+      setSending(false);
+    }
+  }, [to, subject, body, priority]);
+
   return html`
     <section class="env-section">
       <h3 class="env-section-title">
         Messages <span class="env-count">${msgs.length}</span>
+        <button
+          class="env-attention-dismiss-all"
+          style="margin-left: auto; border-color: var(--accent); color: var(--accent);"
+          onClick=${() => setComposing((v) => !v)}
+        >${composing ? "cancel" : "+ send"}</button>
       </h3>
+      ${msgs.length === 0 && !composing
+        ? html`<div class="env-empty">(no messages — click "+ send" to start)</div>`
+        : null}
+      ${composing
+        ? html`<div class="env-msg-composer">
+            <div class="env-msg-composer-row">
+              <label class="env-msg-composer-label">To</label>
+              <select value=${to} onChange=${(e) => setTo(e.target.value)}>
+                ${MESSAGE_RECIPIENTS.map(
+                  (r) => html`<option value=${r}>${r}</option>`
+                )}
+              </select>
+              <select value=${priority} onChange=${(e) => setPriority(e.target.value)}>
+                <option value="normal">normal</option>
+                <option value="interrupt">interrupt</option>
+              </select>
+            </div>
+            <input
+              type="text"
+              class="env-msg-composer-subject"
+              placeholder="subject (optional)"
+              value=${subject}
+              onInput=${(e) => setSubject(e.target.value)}
+            />
+            <textarea
+              class="env-msg-composer-body"
+              placeholder="body…"
+              value=${body}
+              onInput=${(e) => setBody(e.target.value)}
+              rows=${3}
+            ></textarea>
+            <div class="env-msg-composer-row">
+              <button
+                class="primary"
+                style="flex: 1"
+                disabled=${sending || !body.trim()}
+                onClick=${send}
+              >${sending ? "sending…" : "send"}</button>
+            </div>
+          </div>`
+        : null}
       <div class="env-decision-list">
         ${msgs.map((m) => {
           const preview = (m.subject || m.body || "").replace(/\s+/g, " ").slice(0, 80);

@@ -330,6 +330,43 @@ body {
 .env-tl-assigned .env-tl-body { color: var(--fg); }
 
 .env-msg-urgent .env-decision-head { color: var(--err); }
+.env-msg-composer {
+  background: var(--card, #1a1a1a);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px;
+  margin-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.env-msg-composer-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.env-msg-composer-label {
+  color: var(--muted);
+  font-size: 11px;
+  min-width: 24px;
+}
+.env-msg-composer select,
+.env-msg-composer-subject,
+.env-msg-composer-body {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 6px;
+  font: inherit;
+  font-size: 12px;
+}
+.env-msg-composer-body {
+  resize: vertical;
+  min-height: 60px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.env-msg-composer select { flex: 1; }
 .env-msg-preview {
   color: var(--muted);
   font-size: 11px;
