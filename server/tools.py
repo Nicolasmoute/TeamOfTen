@@ -1221,8 +1221,13 @@ def build_coord_server(caller_id: str) -> Any:
         if not caller_is_coach:
             return _err("Only Coach assigns Player names / roles.")
         pid = (args.get("player_id") or "").strip()
-        name = (args.get("name") or "").strip()
-        role = (args.get("role") or "").strip()
+        # Squash any internal whitespace (newlines / tabs / multiple
+        # spaces) to single spaces. name and role render inline in the
+        # pane header — a multi-line name would break layout.
+        def _single_line(s: str) -> str:
+            return " ".join(s.split()).strip()
+        name = _single_line(args.get("name") or "")
+        role = _single_line(args.get("role") or "")
         if not re.fullmatch(r"p([1-9]|10)", pid):
             return _err(f"invalid player_id '{pid}' — expected p1..p10")
         if len(name) > 80:

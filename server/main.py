@@ -575,18 +575,24 @@ async def set_agent_identity(agent_id: str, req: AgentIdentityWrite) -> dict[str
     'player_assigned' with auto:false so the UI refreshes live."""
     if not (agent_id == "coach" or (agent_id.startswith("p") and agent_id[1:].isdigit() and 1 <= int(agent_id[1:]) <= 10)):
         raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
+    # Same single-line normalization coord_set_player_role uses — these
+    # fields render inline in the pane header, any newlines break layout.
+    def _single_line(s: str | None) -> str | None:
+        return " ".join(s.split()).strip() if s else (None if s is None else "")
     sets = []
     vals: list[object] = []
     if req.name is not None:
-        if len(req.name) > 60:
+        name = _single_line(req.name) or ""
+        if len(name) > 60:
             raise HTTPException(400, detail="name too long (max 60 chars)")
         sets.append("name = ?")
-        vals.append(req.name if req.name else None)
+        vals.append(name if name else None)
     if req.role is not None:
-        if len(req.role) > 120:
+        role = _single_line(req.role) or ""
+        if len(role) > 120:
             raise HTTPException(400, detail="role too long (max 120 chars)")
         sets.append("role = ?")
-        vals.append(req.role if req.role else None)
+        vals.append(role if role else None)
     if not sets:
         return {"ok": True, "agent_id": agent_id, "changed": 0}
     c = await configured_conn()
