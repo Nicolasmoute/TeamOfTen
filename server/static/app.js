@@ -241,6 +241,7 @@ const SLASH_COMMANDS = [
   { cmd: "/tools",  desc: "list the tools this agent can use" },
   { cmd: "/clear",  desc: "clear session so the next turn starts fresh" },
   { cmd: "/loop",   desc: "Coach autoloop: /loop 60 → tick every 60s · /loop off" },
+  { cmd: "/tick",   desc: "nudge Coach to drain inbox right now" },
   { cmd: "/help",   desc: "show available slash commands" },
 ];
 
@@ -3491,6 +3492,19 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
           .catch((e) => setInfoText("loop set failed: " + String(e)));
         return true;
       }
+      case "/tick":
+        // Fire a Coach tick right now without waiting for the autoloop
+        // (which may be off or on a long interval). 409 means Coach is
+        // already working; the server will just keep doing what it's
+        // doing.
+        authFetch("/api/coach/tick", { method: "POST" })
+          .then((r) => {
+            if (r.ok) setInfoText("Coach ticked. Watch their pane.");
+            else if (r.status === 409) setInfoText("Coach is already working.");
+            else setInfoText("tick failed: HTTP " + r.status);
+          })
+          .catch((e) => setInfoText("tick failed: " + String(e)));
+        return true;
       case "/help":
         setInfoText(
           "Slash commands (never sent to the agent):\n" +
