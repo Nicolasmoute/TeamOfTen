@@ -47,7 +47,12 @@ from server import files as filesmod
 from server.db import configured_conn, crash_recover, init_db
 from server.events import bus
 from server.kdrive import kdrive
-from server.sync import events_trim_loop, flush_loop, snapshot_loop
+from server.sync import (
+    attachments_trim_loop,
+    events_trim_loop,
+    flush_loop,
+    snapshot_loop,
+)
 from server.workspaces import ensure_workspaces, get_status as get_workspaces_status
 
 logger = logging.getLogger("harness.main")
@@ -145,7 +150,8 @@ async def lifespan(app: FastAPI):
     snapshot_task = asyncio.create_task(snapshot_loop())
     coach_task = asyncio.create_task(coach_tick_loop())
     trim_task = asyncio.create_task(events_trim_loop())
-    bg_tasks = (sync_task, snapshot_task, coach_task, trim_task)
+    att_trim_task = asyncio.create_task(attachments_trim_loop())
+    bg_tasks = (sync_task, snapshot_task, coach_task, trim_task, att_trim_task)
     try:
         yield
     finally:

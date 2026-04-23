@@ -65,6 +65,14 @@ EVENTS_TRIM_INTERVAL_SECONDS = int(
     os.environ.get("HARNESS_EVENTS_TRIM_INTERVAL", "86400")
 )
 
+# Pasted images (see POST /api/attachments) accumulate at
+# /data/attachments. At ~200 KB / paste the volume stays small for
+# months, but on long-running deploys disk fills eventually. Same
+# retention pattern as events: default 30 days, 0 disables.
+ATTACHMENTS_RETENTION_DAYS = int(
+    os.environ.get("HARNESS_ATTACHMENTS_RETENTION_DAYS", "30")
+)
+
 
 def _utc_midnight_of(day: datetime) -> datetime:
     return day.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -304,6 +312,74 @@ async def events_trim_loop() -> None:
             raise
         except Exception:
             logger.exception("events trim cycle failed")
+        try:
+            await asyncio.sleep(EVENTS_TRIM_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+
+
+async def trim_attachments_once() -> int:
+    """Delete files under /data/attachments older than
+    ATTACHMENTS_RETENTION_DAYS. Returns number deleted.
+
+    Safe to run concurrently with uploads — we stat each file and only
+    unlink if its mtime is old enough. A file being written right now
+    has a fresh mtime so we skip it.
+    """
+    if ATTACHMENTS_RETENTION_DAYS <= 0:
+        return 0
+    # ATTACHMENTS_DIR lives in server.main; re-resolve from env rather
+    # than importing to avoid a circular dep.
+    from pathlib import Path as _Path
+    attachments_dir = _Path(
+        os.environ.get("HARNESS_ATTACHMENTS_DIR", "/data/attachments")
+    )
+    if not attachments_dir.is_dir():
+        return 0
+    cutoff_ts = (
+        datetime.now(timezone.utc) - timedelta(days=ATTACHMENTS_RETENTION_DAYS)
+    ).timestamp()
+    deleted = 0
+    for entry in attachments_dir.iterdir():
+        if not entry.is_file():
+            continue
+        try:
+            if entry.stat().st_mtime < cutoff_ts:
+                entry.unlink()
+                deleted += 1
+        except OSError:
+            logger.exception("attachments trim: failed on %s", entry)
+    if deleted:
+        logger.info(
+            "attachments trim: deleted %d file(s) older than %dd",
+            deleted, ATTACHMENTS_RETENTION_DAYS,
+        )
+    return deleted
+
+
+async def attachments_trim_loop() -> None:
+    """Daily-ish sweep of /data/attachments. Same cadence / first-delay
+    convention as events_trim_loop."""
+    if ATTACHMENTS_RETENTION_DAYS <= 0:
+        logger.info(
+            "attachments trim loop disabled (HARNESS_ATTACHMENTS_RETENTION_DAYS=0)"
+        )
+        return
+    logger.info(
+        "attachments trim loop starting: retention=%dd",
+        ATTACHMENTS_RETENTION_DAYS,
+    )
+    try:
+        await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        raise
+    while True:
+        try:
+            await trim_attachments_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("attachments trim cycle failed")
         try:
             await asyncio.sleep(EVENTS_TRIM_INTERVAL_SECONDS)
         except asyncio.CancelledError:
