@@ -35,8 +35,10 @@ if not logger.handlers:
 
 try:
     from webdav4.client import Client as _WebDAVClient  # type: ignore
+    from webdav4.client import ResourceNotFound as _ResourceNotFound  # type: ignore
 except Exception:  # pragma: no cover — lib missing in dev env
     _WebDAVClient = None
+    _ResourceNotFound = None  # type: ignore
 
 
 WEBDAV_URL = os.environ.get("KDRIVE_WEBDAV_URL", "").strip()
@@ -127,14 +129,18 @@ class KDriveClient:
             return []
 
     async def remove(self, relative_path: str) -> bool:
-        """Delete a single file at `{ROOT_PATH}/{relative_path}`."""
+        """Delete a single file at `{ROOT_PATH}/{relative_path}`.
+
+        Idempotent: a missing file is treated as success."""
         if not self._enabled:
             return False
         full_path = str(PurePosixPath(ROOT_PATH) / relative_path)
         try:
             await asyncio.to_thread(self._client.remove, full_path)
             return True
-        except Exception:
+        except Exception as e:
+            if _ResourceNotFound is not None and isinstance(e, _ResourceNotFound):
+                return True
             logger.exception("kDrive remove failed: %s", full_path)
             return False
 
@@ -157,19 +163,19 @@ class KDriveClient:
         )
 
     def _list_dir_sync(self, full_path: str) -> list[str]:
-        # webdav4 ls returns entries with full hrefs; we just want
-        # basenames so callers can re-join under their own root.
+        # ls(detail=False) returns a list of relative path strings. We
+        # want basenames so callers can re-join under their own root.
         try:
             entries = self._client.ls(full_path, detail=False)
         except Exception as e:
-            # 404 → directory doesn't exist yet (e.g. first-ever snapshot
-            # cycle). Return empty silently; anything else propagates.
-            if "404" in str(e):
+            # Missing dir (e.g. first-ever snapshot cycle) — return
+            # empty silently. Anything else propagates.
+            if _ResourceNotFound is not None and isinstance(e, _ResourceNotFound):
                 return []
             raise
         out: list[str] = []
-        for e in entries:
-            name = PurePosixPath(str(e)).name
+        for entry in entries:
+            name = PurePosixPath(str(entry)).name
             if name:
                 out.append(name)
         return out
