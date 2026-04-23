@@ -932,14 +932,15 @@ body {
 .pane-lock {
   background: transparent;
   border: 0;
-  font-size: 13px;
   padding: 0 3px;
   cursor: pointer;
-  line-height: 1;
-  filter: grayscale(0.1);
+  line-height: 0;
+  display: inline-flex;
+  align-items: center;
 }
-.pane-lock:hover { filter: none; }
-.pane-lock.locked { filter: none; }
+.pane-lock.unlocked { color: var(--ok); }
+.pane-lock.locked   { color: var(--err); }
+.pane-lock:hover    { filter: brightness(1.2); }
 .pane-session-clear {
   background: transparent;
   border: 0;

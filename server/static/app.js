@@ -893,6 +893,7 @@ function App() {
         ev.type === "cost_capped" ||
         ev.type === "session_cleared" ||
         ev.type === "player_assigned" ||
+        ev.type === "lock_updated" ||
         ev.type === "agent_cancelled"
       ) {
         loadAgents();
@@ -3929,19 +3930,24 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
               title=${"current task: " + currentTask.title + " (" + currentTask.id + ", " + currentTask.status + ")"}
             >⚑</span>`
           : null}
-        <button
-          class=${"pane-lock" + (agent?.locked ? " locked" : "")}
-          onClick=${async () => {
-            await authFetch("/api/agents/" + slot + "/locked", {
-              method: "PUT",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ locked: !agent?.locked }),
-            });
-          }}
-          title=${agent?.locked
-            ? "LOCKED — Coach cannot assign tasks or message this agent; agent skips Coach broadcasts. Click to unlock."
-            : "Unlocked — Coach can assign work and broadcast. Click to lock (this agent becomes human-only)."}
-        >${agent?.locked ? "🔒" : "🔓"}</button>
+        ${slot !== "coach"
+          ? html`<button
+              class=${"pane-lock" + (agent?.locked ? " locked" : " unlocked")}
+              onClick=${async () => {
+                await authFetch("/api/agents/" + slot + "/locked", {
+                  method: "PUT",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ locked: !agent?.locked }),
+                });
+              }}
+              title=${agent?.locked
+                ? "LOCKED — Coach cannot assign tasks or message this agent; agent skips Coach broadcasts. Click to unlock."
+                : "Unlocked — Coach can assign work and broadcast. Click to lock (this agent becomes human-only)."}
+              dangerouslySetInnerHTML=${{ __html: agent?.locked
+                ? `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="9" width="11" height="8" rx="1.2"/><path d="M7 9V6.5a3 3 0 0 1 6 0V9"/></svg>`
+                : `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="9" width="11" height="8" rx="1.2"/><path d="M7 9V6.5a3 3 0 0 1 5.5-1"/></svg>` }}
+            ></button>`
+          : null}
         ${agent?.session_id
           ? html`<button
               class="pane-session-clear"
@@ -4212,6 +4218,7 @@ function ThinkingItem({ event, ts }) {
 const _HIDDEN_EVENT_TYPES = new Set([
   "context_applied",
   "agent_stopped",
+  "lock_updated",
 ]);
 
 function EventItem({ event }) {
