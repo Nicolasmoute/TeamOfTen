@@ -520,23 +520,6 @@ function App() {
     saveLayout({ openColumns, envOpen });
   }, [openColumns, envOpen]);
 
-  // Reflect live state in the tab title so a backgrounded tab still
-  // signals:
-  //   ⏸          paused (takes precedence over other signals)
-  //   N⚡        N agents currently working
-  //   M●        M slots with unread activity (closed panes only)
-  // When both working and unread are nonzero they're combined.
-  useEffect(() => {
-    const working = agents.filter((a) => a.status === "working").length;
-    const unread = unreadSlots.size;
-    let parts = [];
-    if (paused) parts.push("⏸");
-    if (working > 0) parts.push(`${working}⚡`);
-    if (unread > 0 && !paused) parts.push(`${unread}●`);
-    const prefix = parts.length > 0 ? parts.join(" ") + " " : "";
-    document.title = `${prefix}TeamOfTen`;
-  }, [paused, agents, unreadSlots]);
-
   // Global keyboard shortcuts. Kept deliberately small — anything else
   // belongs scoped to the relevant pane/component.
   //   Ctrl/Cmd + B : toggle the Environment side-panel.
@@ -683,6 +666,26 @@ function App() {
     }
     return out;
   }, [conversations, seenTs, openSlots]);
+
+  // Reflect live state in the tab title so a backgrounded tab still
+  // signals:
+  //   ⏸          paused (takes precedence over other signals)
+  //   N⚡        N agents currently working
+  //   M●        M slots with unread activity (closed panes only)
+  // When both working and unread are nonzero they're combined.
+  // Declared AFTER unreadSlots to avoid a temporal-dead-zone crash on
+  // first render (const hoisting only reserves the binding, not the
+  // value).
+  useEffect(() => {
+    const working = agents.filter((a) => a.status === "working").length;
+    const unread = unreadSlots.size;
+    let parts = [];
+    if (paused) parts.push("⏸");
+    if (working > 0) parts.push(`${working}⚡`);
+    if (unread > 0 && !paused) parts.push(`${unread}●`);
+    const prefix = parts.length > 0 ? parts.join(" ") + " " : "";
+    document.title = `${prefix}TeamOfTen`;
+  }, [paused, agents, unreadSlots]);
 
   // Open a slot as a new standalone column on the right. Also marks
   // the slot as seen so any prior unread badge clears. If the slot is
