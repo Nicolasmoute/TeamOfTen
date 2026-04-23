@@ -1609,27 +1609,35 @@ function TeamToolsSection() {
     })();
     return () => { cancelled = true; };
   }, []);
-  const toggle = useCallback(async (name) => {
-    const next = tools.includes(name)
-      ? tools.filter((t) => t !== name)
-      : [...tools, name];
-    const prev = tools;
-    setTools(next);
-    setSaving(true);
-    try {
-      const res = await authFetch("/api/team/tools", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ tools: next }),
-      });
-      if (!res.ok) setTools(prev);
-    } catch (e) {
-      console.error("team tools save failed", e);
-      setTools(prev);
-    } finally {
-      setSaving(false);
-    }
-  }, [tools]);
+  // Functional state update so we always toggle against the *latest*
+  // tools array, even if the user clicks two checkboxes fast (the
+  // first click's closure would otherwise still see the pre-click
+  // list and overwrite the second toggle's result). The PUT body is
+  // computed inside the updater and then fired off.
+  const toggle = (name) => {
+    setTools((prev) => {
+      const next = prev.includes(name)
+        ? prev.filter((t) => t !== name)
+        : [...prev, name];
+      (async () => {
+        setSaving(true);
+        try {
+          const res = await authFetch("/api/team/tools", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ tools: next }),
+          });
+          if (!res.ok) setTools(prev); // roll back
+        } catch (e) {
+          console.error("team tools save failed", e);
+          setTools(prev);
+        } finally {
+          setSaving(false);
+        }
+      })();
+      return next;
+    });
+  };
   return html`<section class="drawer-section">
     <h3>Team tools</h3>
     <p class="muted" style="margin: 0 0 6px 0; font-size: 12px;">
@@ -1650,7 +1658,6 @@ function TeamToolsSection() {
                 <input
                   type="checkbox"
                   checked=${tools.includes(name)}
-                  disabled=${saving}
                   onChange=${() => toggle(name)}
                 />
                 <span>${name}</span>
@@ -4054,8 +4061,8 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
                 ? "LOCKED — Coach cannot assign tasks or message this agent; agent skips Coach broadcasts. Click to unlock."
                 : "Unlocked — Coach can assign work and broadcast. Click to lock (this agent becomes human-only)."}
               dangerouslySetInnerHTML=${{ __html: agent?.locked
-                ? `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="9" width="11" height="8" rx="1.2"/><path d="M7 9V6.5a3 3 0 0 1 6 0V9"/></svg>`
-                : `<svg viewBox="0 0 20 20" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="9" width="11" height="8" rx="1.2"/><path d="M7 9V6.5a3 3 0 0 1 5.5-1"/></svg>` }}
+                ? `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="9" width="11" height="8" rx="1.2"/><path d="M7 9V6.5a3 3 0 0 1 6 0V9"/></svg>`
+                : `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="9" width="11" height="8" rx="1.2"/><path d="M7 9V6 A3 3 0 0 1 14 4.5"/></svg>` }}
             ></button>`
           : null}
         ${agent?.session_id
