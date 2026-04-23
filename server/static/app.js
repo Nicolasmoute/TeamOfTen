@@ -256,9 +256,29 @@ function savePaneSettings(slot, settings) {
   }
 }
 
-function PaneSettingsPopover({ settings, onChange, onClose }) {
+function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief }) {
   const effort = settings.effort || 0; // 0 = default (server decides)
   const rootRef = useRef(null);
+  const [briefDraft, setBriefDraft] = useState(initialBrief || "");
+  const [briefSaving, setBriefSaving] = useState(false);
+  const [briefSavedAt, setBriefSavedAt] = useState(null);
+  const briefDirty = briefDraft !== (initialBrief || "");
+  const saveBrief = useCallback(async () => {
+    if (!slot) return;
+    setBriefSaving(true);
+    try {
+      const res = await authFetch("/api/agents/" + slot + "/brief", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ brief: briefDraft }),
+      });
+      if (res.ok) setBriefSavedAt(Date.now());
+    } catch (e) {
+      console.error("brief save failed", e);
+    } finally {
+      setBriefSaving(false);
+    }
+  }, [slot, briefDraft]);
   useEffect(() => {
     const onDocClick = (e) => {
       if (!rootRef.current) return;
@@ -313,6 +333,29 @@ function PaneSettingsPopover({ settings, onChange, onClose }) {
         <span class="pane-settings-effort-val">
           ${effort === 0 ? "default" : EFFORT_LABELS[effort - 1]}
         </span>
+      </div>
+      <div class="pane-settings-row pane-settings-brief">
+        <label class="pane-settings-label">Brief</label>
+        <textarea
+          class="pane-settings-textarea"
+          placeholder=${slot === "coach"
+            ? "Team direction, goals for this project, voice Coach should use…"
+            : "Domain for this Player, conventions, tools they should reach for first…"}
+          value=${briefDraft}
+          onInput=${(e) => setBriefDraft(e.target.value)}
+          rows=${5}
+        />
+        <div class="pane-settings-brief-foot">
+          <span class="pane-settings-hint">
+            Appended to every turn's system prompt. Takes effect immediately.
+          </span>
+          <button
+            class="pane-settings-brief-save"
+            onClick=${saveBrief}
+            disabled=${briefSaving || !briefDirty}
+            title=${briefDirty ? "Save brief" : "no changes"}
+          >${briefSaving ? "saving…" : briefDirty ? "save" : briefSavedAt ? "saved" : "saved"}</button>
+        </div>
       </div>
       <div class="pane-settings-actions">
         <button class="pane-settings-reset" onClick=${() => onChange({})}>
@@ -3350,6 +3393,8 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
           ? html`<${PaneSettingsPopover}
               settings=${paneSettings}
               onChange=${setPaneSettings}
+              slot=${slot}
+              initialBrief=${agent?.brief || ""}
               onClose=${() => setSettingsOpen(false)}
             />`
           : null}

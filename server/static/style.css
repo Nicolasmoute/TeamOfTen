@@ -1252,6 +1252,50 @@ body {
   font-size: 11px;
   padding-left: 24px;
 }
+.pane-settings-brief {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+.pane-settings-brief .pane-settings-label {
+  min-width: 0;
+}
+.pane-settings-textarea {
+  width: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  resize: vertical;
+  min-height: 80px;
+}
+.pane-settings-brief-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.pane-settings-brief-save {
+  background: var(--accent);
+  color: var(--bg);
+  border: 0;
+  border-radius: 3px;
+  padding: 3px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.pane-settings-brief-save:disabled {
+  opacity: 0.4;
+  cursor: default;
+  background: var(--border);
+  color: var(--muted);
+}
+
 .pane-settings-actions {
   display: flex;
   gap: 6px;

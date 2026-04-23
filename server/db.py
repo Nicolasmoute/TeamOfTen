@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS agents (
     kind                  TEXT NOT NULL CHECK (kind IN ('coach', 'player')),
     name                  TEXT,
     role                  TEXT,
+    brief                 TEXT,
     status                TEXT NOT NULL DEFAULT 'stopped'
                           CHECK (status IN ('stopped', 'idle', 'working', 'waiting', 'error')),
     current_task_id       TEXT,
@@ -165,6 +166,21 @@ async def init_db() -> None:
             await db.execute("PRAGMA foreign_keys = ON")
             logger.info("init_db: pragmas set, running schema")
             await db.executescript(SCHEMA)
+            # Lightweight manual migrations for columns added after the
+            # original schema shipped. Each ALTER is wrapped so an
+            # already-migrated DB (column already exists) is silently
+            # skipped — SQLite raises OperationalError with 'duplicate
+            # column' in that case. Keep entries append-only; never
+            # remove or re-order.
+            for col_name, col_ddl in (
+                ("brief", "ALTER TABLE agents ADD COLUMN brief TEXT"),
+            ):
+                try:
+                    await db.execute(col_ddl)
+                    logger.info("init_db: migration applied: agents.%s", col_name)
+                except Exception as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
             logger.info("init_db: schema ok, seeding agents")
             await db.executemany(
                 "INSERT OR IGNORE INTO agents "

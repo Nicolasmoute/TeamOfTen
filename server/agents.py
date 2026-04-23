@@ -317,6 +317,32 @@ async def _get_session_id(agent_id: str) -> str | None:
     return v if v else None
 
 
+async def _get_agent_brief(agent_id: str) -> str | None:
+    """Read agent.brief — the human-authored context string for this
+    specific slot, injected into the system prompt on every turn.
+
+    Returns None if the column is NULL / empty or the read failed.
+    """
+    if agent_id == "system":
+        return None
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT brief FROM agents WHERE id = ?", (agent_id,)
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("get_agent_brief failed: agent=%s", agent_id)
+        return None
+    if not row:
+        return None
+    v = dict(row).get("brief")
+    return v if v else None
+
+
 async def _set_session_id(agent_id: str, session_id: str | None) -> None:
     """Persist the SDK's session_id for this agent's last turn. Pure
     instrumentation right now — actual resume-from-session-id lands in
@@ -359,22 +385,20 @@ async def _clear_session_id(agent_id: str) -> None:
         logger.exception("clear_session_id failed: agent=%s", agent_id)
 
 
-# Soccer surnames used to auto-name a Player slot on first spawn when
-# Coach hasn't explicitly assigned one via coord_set_player_role. Pool
-# is deliberately much larger than 10 so the picker can avoid
-# collisions with existing names. Restricted to last names only and
-# ASCII-friendly (kept diacritics off so the pane label is safe on
-# every terminal / browser).
-_SOCCER_SURNAMES: tuple[str, ...] = (
-    "Mbappe", "Messi", "Ronaldo", "Pele", "Maradona", "Zidane",
-    "Cruyff", "Beckenbauer", "Platini", "Henry", "Beckham", "Rooney",
-    "Kane", "Salah", "Modric", "Neymar", "Xavi", "Iniesta",
-    "Benzema", "Lewandowski", "Haaland", "Vinicius", "Bellingham",
-    "Griezmann", "Pogba", "Kante", "Ibrahimovic", "Drogba", "Eto'o",
-    "Baggio", "Nesta", "Pirlo", "Totti", "Buffon", "Casillas",
-    "Ramos", "Puyol", "Gerrard", "Lampard", "Scholes", "Giggs",
-    "Cantona", "Ronaldinho", "Rivaldo", "Kaka", "Zico", "Garrincha",
-    "Socrates", "Romario", "Yashin", "Figo", "Nedved", "Seedorf",
+# Men's Field Lacrosse last names — fits the "team of ten" metaphor
+# (lacrosse puts 10 players on the field, vs 11 for soccer). Pool is
+# larger than 10 so the picker can avoid collisions; all ASCII so the
+# pane label is safe everywhere.
+_LACROSSE_SURNAMES: tuple[str, ...] = (
+    "Rabil", "Powell", "Gait", "Harrison", "Merrill", "Thompson",
+    "Pannell", "Schreiber", "Sowers", "Teat", "Rambo", "Grant",
+    "Crotty", "Danowski", "Hubbard", "Millon", "Ament", "Spallina",
+    "Spencer", "Gray", "Fields", "Galloway", "Durkin", "Ward",
+    "Coffman", "Boyle", "Stanwick", "Colsey", "Queener", "Poskay",
+    "Nardella", "Peyser", "Walters", "Starsia", "Tierney", "Pressler",
+    "Flynn", "Pietramala", "Whipple", "Hogan", "Rodgers", "Greer",
+    "Tucker", "Williams", "Gurenlian", "Riordan", "Manos", "Hurley",
+    "Byrne", "Seibald", "Dunn", "Casey",
 )
 
 
@@ -402,7 +426,7 @@ async def _autoname_player(agent_id: str) -> str | None:
             "SELECT name FROM agents WHERE kind = 'player' AND name IS NOT NULL"
         )
         taken = {dict(r)["name"] for r in await cur.fetchall()}
-        candidates = [n for n in _SOCCER_SURNAMES if n not in taken]
+        candidates = [n for n in _LACROSSE_SURNAMES if n not in taken]
         if not candidates:
             return None
         pick = random.choice(candidates)
@@ -568,14 +592,26 @@ async def run_agent(
     # the next turn with no restart required. Empty string when no
     # context is configured — agents behave as before.
     context_suffix = await build_system_prompt_suffix()
-    system_prompt = _system_prompt_for(agent_id) + context_suffix
-    if context_suffix:
-        # Emit the size (not the content) so a user can see "yes my rules
-        # were picked up" without drowning the timeline in prompt text.
+    # Per-agent brief — free-form context the human set via
+    # PUT /api/agents/{id}/brief. Injected AFTER the governance layer so
+    # it can narrow / specialize without being overwhelmed by team-wide
+    # rules. Empty / NULL column → no suffix.
+    brief_suffix = ""
+    brief_text = await _get_agent_brief(agent_id)
+    if brief_text:
+        brief_suffix = (
+            "\n\n## Agent brief (specific to you, set by the human)\n\n"
+            + brief_text.strip()
+        )
+    system_prompt = _system_prompt_for(agent_id) + context_suffix + brief_suffix
+    if context_suffix or brief_suffix:
+        # Emit sizes (not content) so the user can see "yes my stuff was
+        # picked up" without drowning the timeline in prompt text.
         await _emit(
             agent_id,
             "context_applied",
-            chars=len(context_suffix),
+            chars=len(context_suffix) + len(brief_suffix),
+            brief_chars=len(brief_suffix),
         )
 
     options_kwargs: dict[str, Any] = dict(

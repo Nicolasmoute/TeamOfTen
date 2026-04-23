@@ -364,8 +364,9 @@ async def list_agents() -> dict[str, list[dict[str, Any]]]:
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT id, kind, name, role, status, current_task_id, model, "
-            "workspace_path, cost_estimate_usd, started_at, last_heartbeat "
+            "SELECT id, kind, name, role, brief, status, current_task_id, "
+            "model, workspace_path, session_id, cost_estimate_usd, "
+            "started_at, last_heartbeat "
             "FROM agents ORDER BY "
             "CASE kind WHEN 'coach' THEN 0 ELSE 1 END, id"
         )
@@ -467,6 +468,47 @@ async def cancel_agent_run(agent_id: str) -> dict[str, object]:
     if not cancelled:
         raise HTTPException(409, detail="agent is not currently running")
     return {"ok": True, "agent_id": agent_id}
+
+
+class AgentBriefWrite(BaseModel):
+    brief: str = Field(..., description="Free-form context text; empty string clears.")
+
+
+@app.put("/api/agents/{agent_id}/brief", dependencies=[Depends(require_token)])
+async def set_agent_brief(agent_id: str, req: AgentBriefWrite) -> dict[str, object]:
+    """Human-supplied context text for a specific agent. Appended to
+    the agent's system prompt on every subsequent turn so you can give
+    Coach goals / house style, or a Player domain context, without
+    touching the global CLAUDE.md / skills / rules.
+
+    Empty string clears the brief.
+    """
+    if not (agent_id == "coach" or (agent_id.startswith("p") and agent_id[1:].isdigit() and 1 <= int(agent_id[1:]) <= 10)):
+        raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
+    body = req.brief or ""
+    if len(body) > 8000:
+        raise HTTPException(400, detail=f"brief too long ({len(body)} chars, max 8000)")
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "UPDATE agents SET brief = ? WHERE id = ?",
+            (body if body else None, agent_id),
+        )
+        changed = cur.rowcount
+        await c.commit()
+    finally:
+        await c.close()
+    if changed == 0:
+        raise HTTPException(404, detail=f"agent {agent_id} not found")
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": agent_id,
+            "type": "brief_updated",
+            "size": len(body),
+        }
+    )
+    return {"ok": True, "agent_id": agent_id, "size": len(body)}
 
 
 @app.delete("/api/agents/{agent_id}/session", dependencies=[Depends(require_token)])
