@@ -174,6 +174,30 @@ async def _add_cost(agent_id: str, cost_usd: float | None) -> None:
         logger.exception("add_cost failed: agent=%s cost=%s", agent_id, cost_usd)
 
 
+async def _get_session_id(agent_id: str) -> str | None:
+    """Read agent.session_id (from the last turn's ResultMessage).
+    None when the agent has never run, or DELETE /api/agents/<id>/session
+    has cleared it for a fresh-context restart."""
+    if agent_id == "system":
+        return None
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT session_id FROM agents WHERE id = ?", (agent_id,)
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("get_session_id failed: agent=%s", agent_id)
+        return None
+    if not row:
+        return None
+    v = dict(row).get("session_id")
+    return v if v else None
+
+
 async def _set_session_id(agent_id: str, session_id: str | None) -> None:
     """Persist the SDK's session_id for this agent's last turn. Pure
     instrumentation right now — actual resume-from-session-id lands in
@@ -307,6 +331,13 @@ async def run_agent(
         options_kwargs["permission_mode"] = "plan"
     if effort and effort in _EFFORT_LEVELS:
         options_kwargs["effort"] = _EFFORT_LEVELS[effort]
+
+    # Resume: if the last turn captured a session_id, hand it back to
+    # the SDK so this turn continues that conversation. Cleared via
+    # DELETE /api/agents/<id>/session when the user wants a fresh start.
+    prior_session = await _get_session_id(agent_id)
+    if prior_session:
+        options_kwargs["resume"] = prior_session
 
     options = ClaudeAgentOptions(**options_kwargs)
 
