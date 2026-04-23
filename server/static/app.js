@@ -1397,12 +1397,23 @@ function AgentPane({ slot, agent, liveEvents, onClose, onMoveBefore }) {
     e.dataTransfer.effectAllowed = "move";
   }, [slot]);
   const onDragOver = useCallback((e) => {
-    if (!e.dataTransfer.types.includes("application/x-harness-slot")) return;
+    // dataTransfer.types is a DOMStringList in some browsers — Array.from
+    // normalizes to a plain string[] so .includes is safe.
+    const types = Array.from(e.dataTransfer.types || []);
+    if (!types.includes("application/x-harness-slot")) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
     setDragOver(true);
   }, []);
-  const onDragLeave = useCallback(() => setDragOver(false), []);
+  const onDragLeave = useCallback((e) => {
+    // dragleave fires when the pointer crosses into any child element
+    // of the pane (each child is a leaf target). Only clear the highlight
+    // when the pointer is actually leaving the pane — checked by seeing
+    // whether the element it entered is still a descendant of us.
+    const next = e.relatedTarget;
+    if (next && e.currentTarget.contains(next)) return;
+    setDragOver(false);
+  }, []);
   const onDrop = useCallback((e) => {
     setDragOver(false);
     const dragged = e.dataTransfer.getData("application/x-harness-slot");
