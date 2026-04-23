@@ -1,6 +1,6 @@
 [project]
 name = "teamoften-harness"
-version = "0.2.0"
+version = "0.3.0"
 description = "Personal orchestration harness — Coach + 10 Players, Claude Code agents"
 requires-python = ">=3.12"
 dependencies = [

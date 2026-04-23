@@ -166,7 +166,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="TeamOfTen harness",
-    version="0.2.2",
+    version="0.3.0",
     description="Personal orchestration harness — Coach + 10 Players.",
     lifespan=lifespan,
 )
