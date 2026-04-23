@@ -301,7 +301,29 @@ async def health() -> JSONResponse:
     else:
         checks["kdrive"] = {"ok": True, "skipped": True, "reason": kdrive.reason}
 
-    # 5. Workspaces — only check if HARNESS_PROJECT_REPO set
+    # 5. External MCP servers — reports what HARNESS_MCP_CONFIG yielded
+    # at load time. Purely informational (we don't fail health on a
+    # missing config — it's optional). Re-reads the file each probe so
+    # edits since last boot are visible without restart.
+    mcp_cfg_path = os.environ.get("HARNESS_MCP_CONFIG", "").strip()
+    if mcp_cfg_path:
+        from server.mcp_config import load_external_servers
+        servers, tool_names = load_external_servers()
+        checks["mcp_external"] = {
+            "ok": True,
+            "config_path": mcp_cfg_path,
+            "server_count": len(servers),
+            "servers": sorted(servers.keys()),
+            "allowed_tool_count": len(tool_names),
+        }
+    else:
+        checks["mcp_external"] = {
+            "ok": True,
+            "skipped": True,
+            "reason": "HARNESS_MCP_CONFIG not set — only the in-process 'coord' server is active",
+        }
+
+    # 6. Workspaces — only check if HARNESS_PROJECT_REPO set
     ws_status = get_workspaces_status()
     if ws_status.get("configured"):
         slot_states = ws_status.get("slots") or {}

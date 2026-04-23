@@ -1479,6 +1479,19 @@ function summarizeHealthCheck(c) {
   if (c.error) return String(c.error);
   if (c.version) return String(c.version);
   if (c.exit_code != null) return `exit ${c.exit_code}`;
+  if (typeof c.server_count === "number") {
+    // MCP external block — compose server list + tool count.
+    const names = (c.servers || []).join(", ");
+    return `${c.server_count} server${c.server_count === 1 ? "" : "s"}` +
+      (names ? ` (${names})` : "") +
+      `, ${c.allowed_tool_count || 0} tool${c.allowed_tool_count === 1 ? "" : "s"}`;
+  }
+  if (c.credentials_present != null) {
+    // Claude auth block.
+    return c.credentials_present
+      ? `persisted at ${c.config_dir}`
+      : `no creds at ${c.config_dir}`;
+  }
   if (c.path) return String(c.path);
   if (typeof c.slot_count === "number") return `${c.slot_count} slot${c.slot_count === 1 ? "" : "s"}`;
   if (c.cached != null) return c.ok ? (c.cached ? "ok (cached)" : "ok (fresh probe)") : "probe failed";
