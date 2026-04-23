@@ -101,9 +101,15 @@ All stored in SQLite. In-memory representations are plain dicts (we dropped the 
 
 ### 4.1 Agent
 
-Columns: `id`, `kind ∈ {coach, player}`, `name`, `role`, `status ∈ {stopped, idle, working, waiting, error}`, `current_task_id`, `model` (default `claude-sonnet-4-6`), `workspace_path`, `session_id`, `cost_estimate_usd`, `started_at`, `last_heartbeat`.
+Columns: `id`, `kind ∈ {coach, player}`, `name`, `role`, `brief`, `status ∈ {stopped, idle, working, waiting, error}`, `current_task_id`, `model` (default `claude-sonnet-4-6`), `workspace_path`, `session_id`, `cost_estimate_usd`, `started_at`, `last_heartbeat`.
 
 11 seed rows on init (idempotent): `coach` + `p1`…`p10`.
+
+**Display fields:** `name` (short label like `Rabil`) and `role` (one-line tag like `Frontend dev`) both surface in the pane header; Coach can set them with `coord_set_player_role` and the human via `PUT /api/agents/{id}/identity`. Players without a name get auto-picked a Men's Field Lacrosse surname on first spawn (pool of ~50: Rabil / Powell / Gait / Thompson / …) — fits the "team of ten" metaphor.
+
+**Brief:** `brief` is a free-form multi-line text (≤ 8 KB) the *human* sets per-agent via the pane settings popover or `PUT /api/agents/{id}/brief`. Appended to every turn's system prompt after the governance-layer context, so edits take effect immediately with no restart. Distinct from `role` (short tag, Coach-writable).
+
+**Schema migrations** are append-only in `init_db`: new columns get an `ALTER TABLE ADD COLUMN IF NOT EXISTS`-equivalent (try/except on "duplicate column") so existing deploys upgrade on next boot without data loss. The `brief` column was the first to ride this path.
 
 ### 4.2 Task
 
@@ -213,13 +219,41 @@ Persists via `pause_toggled` WS event so multi-tab UIs stay in sync. Restart cle
 
 ### 6.5 Coach autonomous loop
 
-Env-gated by `HARNESS_COACH_TICK_INTERVAL` (seconds; 0 disables).
+Initial interval from `HARNESS_COACH_TICK_INTERVAL` (seconds; 0 disables). **Runtime-mutable** via `set_coach_interval()` — the background loop re-reads the interval each iteration, so changes take effect on the next tick with no restart.
+
 - Sleep-first pattern — first tick doesn't fire before workspaces/DB are ready.
+- When disabled, the loop idles with a 5 s poll until re-enabled.
 - Skips when Coach is already working or harness is paused.
 - Manually triggerable: `POST /api/coach/tick` (409 if Coach busy).
+- Runtime control:
+  - `GET /api/coach/loop` → `{interval_seconds}`
+  - `POST /api/coach/loop` → `{interval_seconds: 0..86400}`
+  - `/loop [N]` slash command in any pane — `/loop 60` enables 60s ticks, `/loop off` disables, `/loop` reports current state.
 - Prompt: the `COACH_TICK_PROMPT` constant ("Routine tick. Read your inbox…").
 
-### 6.6 Task hierarchy
+### 6.6 Auto-wake on targeted events
+
+Players don't periodically self-poll; they wake only on direct triggers. The `maybe_wake_agent(slot, reason, *, bypass_debounce)` helper spawns a turn for the target if guards pass:
+
+- harness not paused
+- agent not already running
+- (unless `bypass_debounce=True`) `AUTOWAKE_DEBOUNCE_SECONDS` elapsed since the agent's last turn — prevents tight Coach↔Player chat loops
+
+Hooks:
+- `coord_assign_task`  → wakes assignee (`bypass_debounce=True` — discrete action, non-looping)
+- `coord_send_message` → wakes direct recipient (debounce respected — chat can loop)
+- `POST /api/messages` → wakes target (`bypass_debounce=True` — human doesn't auto-reply)
+- Broadcasts do NOT wake (would stampede the team on announcements)
+
+Wake prompt carries context: *"Coach just assigned you task t-X. Use coord_read_inbox + coord_list_tasks to see your work, claim what's yours, and start."*
+
+Debounce env: `HARNESS_AUTOWAKE_DEBOUNCE` (default 10 s, in-memory only).
+
+### 6.7 Stale-session auto-heal
+
+When a stored `session_id` is rejected by the CLI (after a `/login` rotation or CLI upgrade), `run_agent` catches the `ProcessError`, clears the session id, emits `session_resume_failed`, and retries once without `resume=`. No manual pane-× click needed.
+
+### 6.8 Task hierarchy
 
 - Top-level task: Coach creates via `coord_create_task` (no parent_id), or human via `POST /api/tasks`.
 - Subtask: Player creates under their current task via `coord_create_task`. Schema supports unlimited depth.
@@ -240,32 +274,50 @@ Env-gated by `HARNESS_COACH_TICK_INTERVAL` (seconds; 0 disables).
 ### 7.2 Event type catalogue
 
 Agent lifecycle:
-- `agent_started` (fields: prompt, resumed_session)
+- `agent_started` (prompt, resumed_session)
 - `text`
+- `thinking` (content) — final consolidated thought block
+- `text_delta` / `thinking_delta` (block_index, delta) — token-level streaming, **transient** (fans out to WS but skips SQLite persist + backlog); only emitted when `HARNESS_STREAM_TOKENS=true` because the flag crashes some CLI builds
 - `tool_use` (id, name, input)
 - `tool_result` (tool_use_id, content, is_error)
 - `result` (duration_ms, cost_usd, session_id, is_error)
-- `error`
+- `error` (error, cwd)
 - `agent_stopped`
 - `agent_cancelled`
 - `cost_capped` (reason, prompt)
 - `paused` (prompt) — spawn refused while paused
 - `session_cleared`
+- `session_resume_failed` (session_id, error) — precedes a retry without `resume=` when a stale session id is rejected
+- `context_applied` (chars, brief_chars) — system-prompt suffix loaded (hidden from pane body; visible in EnvPane timeline for debugging)
 
 Tasks:
 - `task_created`
 - `task_claimed`
-- `task_assigned`
-- `task_updated` (old_status, new_status, note)
+- `task_assigned` (task_id, to)
+- `task_updated` (task_id, old_status, new_status, note, **owner**) — owner field drives fan-out so Coach cancelling a Player's task shows up in the Player's pane
 
 Coord / comms:
 - `message_sent` (to, subject, body_preview, priority)
 - `memory_updated` (topic, version, size)
 - `decision_written` (title, filename, location, size)
+- `context_updated` / `context_deleted` (kind, name, size)
+- `knowledge_written` (path, size)
+- `file_written` (root, path, size) — human-saved via `PUT /api/files/write/{root}`
+- `brief_updated` (size)
 - `commit_pushed` (sha, message, pushed, push_requested)
 - `human_attention` (subject, body, urgency ∈ {normal, blocker})
-- `player_assigned` (player_id, name, role)
+- `player_assigned` (name, role, auto) — `auto: true` for the lacrosse-surname first-spawn pick, `false` for explicit Coach or human assignments
 - `pause_toggled` (paused)
+- `coach_loop_changed` (interval_seconds)
+
+**Cross-pane fan-out.** The UI and `/api/events?agent=<slot>` both deliver the same event to multiple panes when an event carries a target:
+- `message_sent.to` matches → delivered to sender + recipient (+ every agent for `broadcast`)
+- `task_assigned.to` → delivered to assigner + assignee
+- `task_updated.owner` → delivered to updater + owner
+
+So p3 sees Coach's assignment land live in p3's pane without having to open Coach's pane too.
+
+**Transient events** (`text_delta`, `thinking_delta`) are marked in `events._TRANSIENT_EVENT_TYPES` and skip both the in-memory backlog and the SQLite mirror. They exist only as live WS frames.
 
 ---
 
@@ -287,6 +339,10 @@ All served by `build_coord_server(slot)` — the per-caller closure knows which 
 | `coord_update_memory` | ✓ | ✓ | Full overwrite; mirrors to kDrive; emits `memory_updated` |
 | `coord_commit_push` | — | ✓ | `git add -A && commit && push origin HEAD` in the Player's worktree |
 | `coord_write_decision` | ✓ | — | Append-only markdown in `decisions/<date>-<slug>.md` |
+| `coord_write_context` | ✓ | — | Governance docs (`CLAUDE.md`, `skills/*.md`, `rules/*.md`); injected into every agent's system prompt on their next turn. |
+| `coord_write_knowledge` | ✓ | ✓ | Durable artifact bucket. Free-form paths under `knowledge/` (≤ 4 segments, .md or .txt, ≤ 100 KB). Mirrored to kDrive. |
+| `coord_read_knowledge` | ✓ | ✓ | Read any knowledge doc by path. |
+| `coord_list_knowledge` | ✓ | ✓ | List every knowledge doc (local disk scan). |
 | `coord_set_player_role` | ✓ | — | Write agents.name / role; emits `player_assigned` |
 | `coord_request_human` | ✓ | ✓ | Emit `human_attention` event; urgency ∈ {normal, blocker} |
 
@@ -301,6 +357,39 @@ Coach structurally cannot modify code — enforces "you delegate, never implemen
 
 - `coord_acquire_lock` / `coord_release_lock` — deferred; per-worktree isolation covers primary need.
 - `coord_heartbeat` — SDK `ResultMessage` already updates heartbeat via `_set_status`.
+
+### 8.3 External MCP servers
+
+Optional. `HARNESS_MCP_CONFIG` points at a JSON file:
+
+```json
+{
+  "servers": {
+    "github": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"}
+    },
+    "notion": {
+      "type": "http",
+      "url": "https://mcp.notion.com/sse",
+      "headers": {"Authorization": "Bearer ${NOTION_TOKEN}"}
+    }
+  },
+  "allowed_tools": {
+    "github": ["create_issue", "list_issues", "search_repositories"],
+    "notion": ["search_pages"]
+  }
+}
+```
+
+Behavior (`server/mcp_config.py`):
+- `${VAR}` placeholders expand from `os.environ` at load; missing vars log + expand to empty string.
+- `allowed_tools` is **explicit** (no auto-discovery) — each entry becomes a fully-qualified `mcp__<server>__<tool>` added to the agent's `allowed_tools`. Lists a server without any allowed tools → the server is loaded but unusable (future expansion).
+- Re-read on every spawn, so edits take effect on the next turn with no restart.
+- Failures (missing file / parse error / bad shape) are logged and treated as "no external servers" — the harness keeps working with just `coord`.
+- Both Coach and Players get the same external tools (no role split at this layer).
 
 ---
 
@@ -586,15 +675,21 @@ Composed from live state: `[⏸] [N⚡] [M●] TeamOfTen` where ⏸=paused, N⚡
 | `HARNESS_KDRIVE_FLUSH_INTERVAL` | `300` | seconds between event-log flushes |
 | `HARNESS_KDRIVE_SNAPSHOT_INTERVAL` | `300` | seconds between DB snapshots (was hourly; 5 min closes crash-loss window to ≤ 5 min) |
 | `HARNESS_KDRIVE_SNAPSHOT_RETENTION` | `144` | snapshots retained on kDrive (~12 h at 5 min cadence) |
+| `HARNESS_EVENTS_RETENTION_DAYS` | `30` | days of events kept in SQLite (kDrive JSONL keeps the full archive); 0 disables trimming |
+| `HARNESS_EVENTS_TRIM_INTERVAL` | `86400` | seconds between event-trim passes |
 | `HARNESS_CONTEXT_DIR` | `/data/context` | local cache of kDrive `context/` (CLAUDE.md, skills, rules) |
 | `HARNESS_KNOWLEDGE_DIR` | `/data/knowledge` | agents write durable artifacts here; mirrored to kDrive `knowledge/` |
 | `HARNESS_DECISIONS_DIR` | `/data/decisions` | local fallback when kDrive disabled |
+| `HARNESS_AUTOWAKE_DEBOUNCE` | `10` | seconds before an auto-woken agent can be re-woken (chat ping-pong guard) |
+| `HARNESS_STREAM_TOKENS` | unset (off) | set `true` to enable `include_partial_messages` — token + thinking deltas over WS. Some CLI builds crash on the underlying flag; off by default |
+| `HARNESS_MCP_CONFIG` | unset | path to a JSON file defining external MCP servers (see §8.3) |
 | `HARNESS_PROJECT_REPO` | unset | If set, clones to `/workspaces/.project` + creates per-slot worktrees at boot |
 | `HARNESS_PROJECT_BRANCH` | `main` | default branch for fresh worktrees |
+| `CLAUDE_CONFIG_DIR` | `/data/claude` | Claude CLI credentials dir. Baked into the Dockerfile so OAuth (`~/.claude/.credentials.json`) persists on the `/data` volume across Zeabur redeploys. |
 | `KDRIVE_WEBDAV_URL` | unset | Infomaniak WebDAV URL |
 | `KDRIVE_USER` | unset | Infomaniak email |
 | `KDRIVE_APP_PASSWORD` | unset | Infomaniak app-specific password |
-| `KDRIVE_ROOT_PATH` | `/harness` | Prefix inside kDrive |
+| `KDRIVE_ROOT_PATH` | `/harness` | Prefix inside kDrive (user typically sets to `/TOT` or similar — do NOT duplicate path between URL and this var) |
 
 ---
 
