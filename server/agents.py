@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -87,6 +88,18 @@ async def _set_status(agent_id: str, status: str) -> None:
 
 AGENT_DAILY_CAP_USD = float(os.environ.get("HARNESS_AGENT_DAILY_CAP", "5.0"))
 TEAM_DAILY_CAP_USD = float(os.environ.get("HARNESS_TEAM_DAILY_CAP", "20.0"))
+
+# Standard prompt the autonomous loop and POST /api/coach/tick both
+# send to Coach. Kept here so callers stay in sync.
+COACH_TICK_PROMPT = (
+    "Routine tick. Read your inbox for new human goals and Player updates. "
+    "If there's nothing actionable, end the turn without calling tools. "
+    "Otherwise decompose goals into tasks, assign or reassign as needed, "
+    "and reply to Players who need direction. Be terse."
+)
+COACH_TICK_INTERVAL_SECONDS = int(
+    os.environ.get("HARNESS_COACH_TICK_INTERVAL", "0")
+)
 
 
 def _today_utc_start_iso() -> str:
@@ -312,3 +325,50 @@ async def run_agent(agent_id: str, prompt: str) -> None:
         await _set_status(agent_id, "idle")
 
     await _emit(agent_id, "agent_stopped")
+
+
+async def _coach_is_working() -> bool:
+    """Read coach.status. Treat any error or missing row as 'not working'
+    so a transient DB hiccup doesn't permanently silence the loop."""
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute("SELECT status FROM agents WHERE id = 'coach'")
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("coach autoloop: status read failed")
+        return False
+    return bool(row) and dict(row)["status"] == "working"
+
+
+async def coach_tick_loop() -> None:
+    """Background task: periodically nudge Coach to drain inbox.
+
+    Sleeps first so a tick doesn't fire before workspaces / db are
+    fully ready. Skips when Coach is already working (avoids stacking
+    turns and redundant Sonnet spend). Disabled when interval <= 0."""
+    if COACH_TICK_INTERVAL_SECONDS <= 0:
+        logger.info(
+            "coach autoloop disabled (HARNESS_COACH_TICK_INTERVAL=%d)",
+            COACH_TICK_INTERVAL_SECONDS,
+        )
+        return
+    logger.info(
+        "coach autoloop starting: every %ds", COACH_TICK_INTERVAL_SECONDS
+    )
+    while True:
+        try:
+            await asyncio.sleep(COACH_TICK_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        try:
+            if await _coach_is_working():
+                logger.info("coach autoloop: skipping — coach is working")
+                continue
+            await run_agent("coach", COACH_TICK_PROMPT)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("coach autoloop: tick failed")

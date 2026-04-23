@@ -31,8 +31,10 @@ from pydantic import BaseModel, Field
 
 from server.agents import (
     AGENT_DAILY_CAP_USD,
+    COACH_TICK_PROMPT,
     TEAM_DAILY_CAP_USD,
     _today_spend,
+    coach_tick_loop,
     run_agent,
 )
 from server.db import configured_conn, init_db
@@ -110,12 +112,14 @@ async def lifespan(app: FastAPI):
     # unconditionally is safe — picks up activation without restart.
     sync_task = asyncio.create_task(flush_loop())
     snapshot_task = asyncio.create_task(snapshot_loop())
+    coach_task = asyncio.create_task(coach_tick_loop())
+    bg_tasks = (sync_task, snapshot_task, coach_task)
     try:
         yield
     finally:
-        for t in (sync_task, snapshot_task):
+        for t in bg_tasks:
             t.cancel()
-        for t in (sync_task, snapshot_task):
+        for t in bg_tasks:
             try:
                 await t
             except (asyncio.CancelledError, Exception):
@@ -321,14 +325,6 @@ async def start_agent(
 ) -> dict[str, object]:
     background.add_task(run_agent, req.agent_id, req.prompt)
     return {"ok": True, "agent_id": req.agent_id}
-
-
-COACH_TICK_PROMPT = (
-    "Routine tick. Read your inbox for new human goals and Player updates. "
-    "If there's nothing actionable, end the turn without calling tools. "
-    "Otherwise decompose goals into tasks, assign or reassign as needed, "
-    "and reply to Players who need direction. Be terse."
-)
 
 
 @app.post("/api/coach/tick", dependencies=[Depends(require_token)])
