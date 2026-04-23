@@ -169,13 +169,15 @@ Most likely failure mode: subtle SDK / WebDAV / git-credential issue that needs 
 
 ## Known gotchas
 
-### Claude CLI auth does NOT live in `~/.claude.json`
+### Claude CLI auth: persist via `CLAUDE_CONFIG_DIR` on the /data volume
 
-Confirmed via M-1 spike. `~/.claude.json` holds only local CLI config (numStartups, installMethod). OAuth tokens live in the OS credential store (Windows Credential Manager, macOS Keychain, Linux Secret Service) or an internal CLI-managed path.
+Confirmed via M-1 spike. `~/.claude.json` holds only local CLI config (numStartups, installMethod). OAuth tokens live in `.credentials.json` on Linux (file-based fallback when no libsecret/Secret Service — as in stock containers).
 
-- **Copying `~/.claude.json` across hosts does not transfer auth.**
-- On a new VPS/container: run `claude` → `/login` (slash command in the REPL) → open URL on laptop → enter code → approve. Token now persists locally.
-- The harness Docker image must mount a volume at wherever Linux Claude CLI persists tokens, so redeploys don't lose auth.
+**Fix:** The Dockerfile sets `CLAUDE_CONFIG_DIR=/data/claude`. Because `/data` is already a Zeabur persistent volume, the CLI writes `.credentials.json` and `.claude.json` into `/data/claude/` which survives redeploys.
+
+- On first deploy (or if you rotate secrets): shell into the container, run `claude`, type `/login`, follow the device-code flow once.
+- After that, every redeploy finds the existing token and you don't re-authenticate.
+- `/api/health` exposes `claude_auth.credentials_present: true/false` so you can confirm persistence without logging in to check.
 
 ### Zeabur geo-block: install via npm, not the shell installer
 

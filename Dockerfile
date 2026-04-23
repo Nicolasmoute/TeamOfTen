@@ -3,7 +3,13 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    # Persist Claude CLI auth on the /data volume so `/login` once
+    # survives redeploys. The CLI writes BOTH .claude.json (local
+    # config) and .credentials.json (OAuth token) under this dir.
+    # Without this, every Zeabur redeploy wipes auth and requires a
+    # fresh device-code login.
+    CLAUDE_CONFIG_DIR=/data/claude
 
 # Install Node 20 + claude CLI via npm + git.
 # Rationale: https://claude.ai/install.sh is geo-blocked in some Zeabur

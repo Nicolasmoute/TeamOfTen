@@ -109,6 +109,18 @@ ALLOWED_EXT = {"png", "jpg", "jpeg", "gif", "webp"}
 async def lifespan(app: FastAPI):
     await init_db()
     ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    # Claude CLI credential dir. Set via CLAUDE_CONFIG_DIR in the image
+    # so OAuth tokens written by `claude /login` land on the /data
+    # volume and survive Zeabur redeploys. We mkdir at runtime (not in
+    # the Dockerfile) because Zeabur mounts /data over the image FS,
+    # and pre-created subpaths under the mount point can race / hang —
+    # same rule that applies to /data itself.
+    claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if claude_dir:
+        try:
+            Path(claude_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
+        except Exception:
+            logger.exception("failed to mkdir CLAUDE_CONFIG_DIR=%s", claude_dir)
     # Project-repo clone + per-slot worktrees (no-op if HARNESS_PROJECT_REPO
     # unset). Logged but errors don't abort startup — agents can still run
     # in plain dirs if worktree setup fails.
@@ -244,6 +256,29 @@ async def health() -> JSONResponse:
     checks["claude_cli"] = dict(_CLAUDE_VERSION_CACHE)
     if not _CLAUDE_VERSION_CACHE.get("ok"):
         overall_ok = False
+
+    # 3b. Claude CLI OAuth token persistence. If CLAUDE_CONFIG_DIR is
+    # set and lives on the /data volume, the token survives redeploys.
+    # We report {set, dir, credentials_present} so the UI / a check
+    # script can say "yes auth will persist" at a glance.
+    claude_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if claude_dir:
+        cred = Path(claude_dir) / ".credentials.json"
+        checks["claude_auth"] = {
+            "ok": True,  # informational — doesn't fail health overall
+            "config_dir": claude_dir,
+            "credentials_present": cred.exists(),
+            "hint": (
+                "run `claude /login` inside the container to populate"
+                if not cred.exists() else "persisted via /data volume"
+            ),
+        }
+    else:
+        checks["claude_auth"] = {
+            "ok": True,
+            "skipped": True,
+            "reason": "CLAUDE_CONFIG_DIR not set — auth lives in default ~/.claude and will NOT survive redeploy",
+        }
 
     # 4. kDrive — only check if configured. Cached for 60s to avoid
     # writing a probe file on every health hit.
