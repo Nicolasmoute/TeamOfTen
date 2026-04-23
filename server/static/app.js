@@ -1302,6 +1302,20 @@ function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsCon
       ${renderSlot(grouped.coach)}
       ${grouped.players.map(renderSlot)}
       <span class="rail-sep"></span>
+      <!-- File explorer sits right after the roster — it's conceptually
+           the 12th "thing" you might open in a column, not a global
+           setting, so it belongs closer to the agents than the gears. -->
+      <button
+        class=${"gear files-open" + (openSlots.includes("__files") ? " active" : "")}
+        title="Open the file explorer pane (context, knowledge, decisions)"
+        onClick=${() => onOpen("__files")}
+      >
+        <span class="files-icon" aria-hidden="true">
+          <span class="files-icon-tab"></span>
+          <span class="files-icon-body"></span>
+        </span>
+      </button>
+      <span class="rail-sep"></span>
       ${openSlots.length >= 2
         ? html`<button
             class="gear layout-preset"
@@ -1333,16 +1347,6 @@ function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsCon
         ) + " Keyboard: ⌘/Ctrl+."}
         onClick=${onTogglePause}
       >${paused ? "▶" : "❚❚"}</button>
-      <button
-        class=${"gear files-open" + (openSlots.includes("__files") ? " active" : "")}
-        title="Open the file explorer pane (context, knowledge, decisions)"
-        onClick=${() => onOpen("__files")}
-      >
-        <span class="files-icon" aria-hidden="true">
-          <span class="files-icon-tab"></span>
-          <span class="files-icon-body"></span>
-        </span>
-      </button>
       <button
         class=${"gear env-toggle" + (envOpen ? " active" : "")}
         title=${(envOpen ? "Collapse environment panel" : "Open environment panel") + " (⌘/Ctrl+B)"}
