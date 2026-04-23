@@ -90,6 +90,42 @@ class KDriveClient:
     def reason(self) -> str:
         return self._reason if not self._enabled else "ok"
 
+    @property
+    def url(self) -> str:
+        return WEBDAV_URL
+
+    @property
+    def root(self) -> str:
+        return ROOT_PATH
+
+    async def probe(self) -> dict[str, Any]:
+        """Write a small visible-named file to the configured root so
+        health checks can surface the actual exception (not just a
+        bool). Filename is not dot-prefixed so operators can eyeball
+        confirmation on kDrive after configuring creds.
+
+        Always returns a detail dict even when disabled — callers
+        render the reason in the UI.
+        """
+        if not self._enabled:
+            return {"ok": False, "error": self._reason, "url": WEBDAV_URL, "root": ROOT_PATH}
+        rel = "harness-health-probe.txt"
+        full_path = str(PurePosixPath(ROOT_PATH) / rel)
+        try:
+            await asyncio.to_thread(self._write_sync, full_path, "ok")
+            return {"ok": True, "url": WEBDAV_URL, "root": ROOT_PATH, "probe_file": full_path}
+        except Exception as e:
+            # Capture the full repr — different WebDAV errors carry
+            # different metadata (HTTP status, URL, xml body) and the
+            # operator needs the details to fix config.
+            return {
+                "ok": False,
+                "url": WEBDAV_URL,
+                "root": ROOT_PATH,
+                "probe_file": full_path,
+                "error": f"{type(e).__name__}: {str(e)[:400]}",
+            }
+
     # ---------- async public API ----------
 
     async def write_text(self, relative_path: str, content: str) -> bool:

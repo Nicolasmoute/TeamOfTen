@@ -306,24 +306,32 @@ async def health() -> JSONResponse:
         }
 
     # 4. kDrive — only check if configured. Cached for 60s to avoid
-    # writing a probe file on every health hit.
+    # writing a probe file on every health hit. We cache the full
+    # detail dict (not just a bool) so the UI can keep rendering the
+    # error / URL / root between fresh probes.
     if kdrive.enabled:
         now = time.monotonic()
         last_ts = float(_KDRIVE_PROBE_CACHE["ts"])
-        cached_ok = _KDRIVE_PROBE_CACHE["ok"]
-        if cached_ok is not None and (now - last_ts) < _KDRIVE_PROBE_TTL_SECONDS:
-            checks["kdrive"] = {"ok": bool(cached_ok), "cached": True}
-            if not cached_ok:
+        cached = _KDRIVE_PROBE_CACHE["ok"]
+        if isinstance(cached, dict) and (now - last_ts) < _KDRIVE_PROBE_TTL_SECONDS:
+            checks["kdrive"] = {**cached, "cached": True}
+            if not cached.get("ok"):
                 overall_ok = False
         else:
-            ok = await kdrive.write_text(".harness-health-probe.txt", "ok")
+            detail = await kdrive.probe()
             _KDRIVE_PROBE_CACHE["ts"] = now
-            _KDRIVE_PROBE_CACHE["ok"] = ok
-            checks["kdrive"] = {"ok": ok, "cached": False}
-            if not ok:
+            _KDRIVE_PROBE_CACHE["ok"] = detail
+            checks["kdrive"] = {**detail, "cached": False}
+            if not detail.get("ok"):
                 overall_ok = False
     else:
-        checks["kdrive"] = {"ok": True, "skipped": True, "reason": kdrive.reason}
+        checks["kdrive"] = {
+            "ok": True,
+            "skipped": True,
+            "reason": kdrive.reason,
+            "url": kdrive.url,
+            "root": kdrive.root,
+        }
 
     # 5. External MCP servers — reports what HARNESS_MCP_CONFIG yielded
     # at load time. Purely informational (we don't fail health on a
@@ -419,6 +427,8 @@ async def status() -> dict[str, object]:
         "kdrive": {
             "enabled": kdrive.enabled,
             "reason": kdrive.reason,
+            "url": kdrive.url,
+            "root": kdrive.root,
         },
         "workspaces": get_workspaces_status(),
     }

@@ -1603,6 +1603,77 @@ function summarizeHealthCheck(c) {
   return c.ok ? "ok" : "not ready";
 }
 
+// Distinguishes three states so the operator can debug quickly:
+//   - disabled: env not set (expected reason string)
+//   - enabled + probe ok: ✓ + verified path on kDrive
+//   - enabled + probe fail: ✗ with full exception text + the URL /
+//     root we actually asked webdav4 to hit (the most common failure
+//     mode is a misconfigured URL that silently writes nowhere the
+//     human expects to look).
+function KDriveSection({ serverStatus, health, onRefresh }) {
+  const [forcing, setForcing] = useState(false);
+  const kd = serverStatus?.kdrive;
+  const probe = health?.checks?.kdrive; // may be undefined until health loads
+  const url = probe?.url ?? kd?.url ?? "";
+  const root = probe?.root ?? kd?.root ?? "";
+  const joined = (url || "") + (root && !url.endsWith("/") ? root : root);
+  const forceProbe = useCallback(async () => {
+    setForcing(true);
+    try {
+      await onRefresh?.();
+    } finally {
+      setForcing(false);
+    }
+  }, [onRefresh]);
+  if (!kd?.enabled) {
+    return html`<section class="drawer-section">
+      <h3>kDrive mirror</h3>
+      <p class="muted">
+        ✗ Disabled${kd?.reason ? html` (${kd.reason})` : null}.
+        Set <code>KDRIVE_WEBDAV_URL</code>, <code>KDRIVE_USER</code>,
+        and <code>KDRIVE_APP_PASSWORD</code> env vars and redeploy.
+        The harness works fine without it — writes go to local SQLite only.
+      </p>
+    </section>`;
+  }
+  const probeOk = probe?.ok === true;
+  const probeErr = probe?.error;
+  return html`<section class="drawer-section">
+    <h3>kDrive mirror</h3>
+    <p class="muted" style="margin: 0 0 6px 0;">
+      <strong style=${probeOk ? "color: var(--ok);" : probe ? "color: var(--err);" : "color: var(--muted);"}>
+        ${probeOk ? "✓ probe ok" : probe ? "✗ probe failed" : "…probing"}
+      </strong>
+      ${probe?.cached ? html` <span class="muted">(cached)</span>` : null}
+      <button
+        style="margin-left: 8px; font-size: 11px;"
+        onClick=${forceProbe}
+        disabled=${forcing}
+        title="Refresh health — probe cache is 60s"
+      >${forcing ? "probing…" : "re-probe"}</button>
+    </p>
+    <ul style="margin: 4px 0 8px 0; padding: 0 0 0 18px; font-size: 12px;">
+      <li><strong>URL:</strong> <code>${url || "(not set)"}</code></li>
+      <li><strong>Root:</strong> <code>${root || "/"}</code></li>
+      ${probe?.probe_file
+        ? html`<li><strong>Test file:</strong>
+            <code>${probe.probe_file}</code>
+            ${probeOk ? html` <span class="muted">(look for this on kDrive)</span>` : null}
+          </li>`
+        : null}
+    </ul>
+    ${probeErr
+      ? html`<pre style="margin: 4px 0; padding: 6px 8px; background: #10131a; border: 1px solid var(--err); border-radius: 3px; font-size: 11px; color: var(--err); white-space: pre-wrap;">${probeErr}</pre>`
+      : null}
+    <p class="muted" style="font-size: 11px; margin: 4px 0 0 0;">
+      Memory docs mirror on update; event log every 5 min; DB snapshot every 5 min.
+      If the probe is ok but the directory looks empty, agents haven't
+      written anything yet — trigger a <code>coord_update_memory</code>
+      or wait for the next snapshot tick.
+    </p>
+  </section>`;
+}
+
 function SettingsDrawer({ onClose, serverStatus }) {
   // A compact row summarizing the live server status: paused, running
   // agents, ws subscribers. Rendered above the health checks so the
@@ -1710,26 +1781,6 @@ function SettingsDrawer({ onClose, serverStatus }) {
           </section>
 
           <section class="drawer-section">
-            <h3>Authentication</h3>
-            <p>
-              The <code>claude</code> CLI on this host uses the device-code
-              OAuth flow. Tokens are <em>not</em> in <code>~/.claude.json</code>;
-              they live in the CLI's own credential store. To log in:
-            </p>
-            <ol>
-              <li>Open the Zeabur service terminal</li>
-              <li>Run <code>claude</code></li>
-              <li>At the <code>&gt;</code> prompt, type <code>/login</code></li>
-              <li>Follow the URL it prints on your laptop browser, enter the code, approve</li>
-              <li>Type <code>/exit</code> to leave the REPL</li>
-            </ol>
-            <p class="muted">
-              Token persists on this host across the current container's lifetime.
-              A Zeabur redeploy resets it — re-run the steps above.
-            </p>
-          </section>
-
-          <section class="drawer-section">
             <h3>Cost caps</h3>
             <div class="drawer-disabled">
               <p class="muted">
@@ -1761,23 +1812,11 @@ function SettingsDrawer({ onClose, serverStatus }) {
             </div>
           </section>
 
-          <section class="drawer-section">
-            <h3>kDrive mirror</h3>
-            ${serverStatus?.kdrive?.enabled
-              ? html`<p class="muted">
-                  ✓ Connected. Memory docs auto-mirror to
-                  <code>KDRIVE_ROOT_PATH/memory/&lt;topic&gt;.md</code> on update.
-                </p>`
-              : html`<p class="muted">
-                  ✗ Disabled${serverStatus?.kdrive?.reason
-                    ? html` (${serverStatus.kdrive.reason})`
-                    : null}. Set <code>KDRIVE_WEBDAV_URL</code>,
-                  <code>KDRIVE_USER</code>, and
-                  <code>KDRIVE_APP_PASSWORD</code> env vars and redeploy.
-                  The harness works fine without it — writes go to local
-                  SQLite only.
-                </p>`}
-          </section>
+          <${KDriveSection}
+            serverStatus=${serverStatus}
+            health=${health}
+            onRefresh=${loadHealth}
+          />
 
           <section class="drawer-section">
             <h3>Layout</h3>
