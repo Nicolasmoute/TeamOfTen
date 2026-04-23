@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import subprocess
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
@@ -917,11 +919,9 @@ def build_coord_server(caller_id: str) -> Any:
             if ok:
                 location = f"kDrive:decisions/{filename}"
         if location is None:
-            # Local fallback
-            import os as _os
-            from pathlib import Path as _Path
-            local_dir = _Path(
-                _os.environ.get("HARNESS_DECISIONS_DIR", "/data/decisions")
+            # Local fallback when kDrive disabled or write failed.
+            local_dir = Path(
+                os.environ.get("HARNESS_DECISIONS_DIR", "/data/decisions")
             )
             try:
                 local_dir.mkdir(parents=True, exist_ok=True)
