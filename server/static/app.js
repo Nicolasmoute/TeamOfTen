@@ -640,19 +640,23 @@ function App() {
                     id=${"col-" + colIdx}
                     key=${"col-" + col.join("-")}
                   >
-                    ${col.map(
-                      (slot) =>
-                        html`<${AgentPane}
-                          key=${slot}
-                          slot=${slot}
-                          agent=${agents.find((a) => a.id === slot)}
-                          liveEvents=${conversations.get(slot) || []}
-                          openSlots=${openSlots}
-                          onClose=${() => closePane(slot)}
-                          onStackBelow=${(otherSlot) => stackBelow(otherSlot, slot)}
-                          onMoveBefore=${(otherSlot) => movePaneBefore(otherSlot, slot)}
-                        />`
-                    )}
+                    ${col.map((slot) => {
+                      const agent = agents.find((a) => a.id === slot);
+                      const currentTask = agent?.current_task_id
+                        ? tasks.find((t) => t.id === agent.current_task_id)
+                        : null;
+                      return html`<${AgentPane}
+                        key=${slot}
+                        slot=${slot}
+                        agent=${agent}
+                        currentTask=${currentTask}
+                        liveEvents=${conversations.get(slot) || []}
+                        openSlots=${openSlots}
+                        onClose=${() => closePane(slot)}
+                        onStackBelow=${(otherSlot) => stackBelow(otherSlot, slot)}
+                        onMoveBefore=${(otherSlot) => movePaneBefore(otherSlot, slot)}
+                      />`;
+                    })}
                     <${DropZone}
                       orientation="horizontal"
                       label="drop to append"
@@ -1611,7 +1615,7 @@ function EnvTimelineItem({ event }) {
 // agent pane
 // ------------------------------------------------------------------
 
-function AgentPane({ slot, agent, liveEvents, onClose, onMoveBefore }) {
+function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore }) {
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState([]); // {id, url, path, filename}
   const [submitting, setSubmitting] = useState(false);
@@ -1918,6 +1922,12 @@ function AgentPane({ slot, agent, liveEvents, onClose, onMoveBefore }) {
           <span class="pane-name">${displayName}</span>
           ${agent?.role ? html`<span class="pane-role">— ${agent.role}</span>` : html`<span class="pane-role"></span>`}
         </span>
+        ${currentTask
+          ? html`<span
+              class="pane-current-task"
+              title=${"current task: " + currentTask.title + " (" + currentTask.id + ", " + currentTask.status + ")"}
+            >⚑ ${currentTask.title.slice(0, 24)}${currentTask.title.length > 24 ? "…" : ""}</span>`
+          : null}
         ${agent?.session_id
           ? html`<span class="pane-session" title=${"session " + agent.session_id}>●</span>
               <button

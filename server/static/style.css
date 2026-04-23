@@ -660,6 +660,18 @@ body {
 .pane-id { font-weight: 600; }
 .pane-name { color: var(--fg); }
 .pane-role { color: var(--muted); font-size: 11px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pane-current-task {
+  background: var(--card, #1a1a1a);
+  color: var(--accent);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 180px;
+}
 .pane-cost { color: var(--muted); font-size: 11px; }
 .pane-session {
   color: var(--ok);
