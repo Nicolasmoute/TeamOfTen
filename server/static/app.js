@@ -1591,11 +1591,18 @@ function EnvDecisionsSection({ conversations }) {
   `;
 }
 
+const TASK_STATUS_FILTERS = [
+  { key: "active", label: "active", match: (s) => s !== "done" && s !== "cancelled" },
+  { key: "all", label: "all", match: () => true },
+  { key: "done", label: "done", match: (s) => s === "done" },
+];
+
 function EnvTasksSection({ tasks, onCreate }) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [priority, setPriority] = useState("normal");
   const [submitting, setSubmitting] = useState(false);
+  const [filterKey, setFilterKey] = useState("active");
 
   const submit = useCallback(async (e) => {
     e.preventDefault();
@@ -1615,16 +1622,31 @@ function EnvTasksSection({ tasks, onCreate }) {
 
   // show open/claimed/in_progress first, then blocked, then done/cancelled
   const statusOrder = { open: 0, claimed: 1, in_progress: 2, blocked: 3, done: 4, cancelled: 5 };
-  const sorted = [...tasks].sort(
+  const filter = TASK_STATUS_FILTERS.find((f) => f.key === filterKey) || TASK_STATUS_FILTERS[0];
+  const filtered = tasks.filter((t) => filter.match(t.status));
+  const sorted = [...filtered].sort(
     (a, b) => (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9)
   );
 
   return html`
     <section class="env-section">
-      <h3 class="env-section-title">Tasks <span class="env-count">${tasks.length}</span></h3>
+      <h3 class="env-section-title">
+        Tasks <span class="env-count">${sorted.length}/${tasks.length}</span>
+        <span class="env-task-filter-group" style="margin-left: auto; display: flex; gap: 3px;">
+          ${TASK_STATUS_FILTERS.map(
+            (f) => html`<button
+              class=${"env-task-filter" + (f.key === filterKey ? " active" : "")}
+              onClick=${() => setFilterKey(f.key)}
+              type="button"
+            >${f.label}</button>`
+          )}
+        </span>
+      </h3>
       <div class="env-task-list">
         ${sorted.length === 0
-          ? html`<div class="env-empty">(no tasks yet)</div>`
+          ? html`<div class="env-empty">
+              ${tasks.length === 0 ? "(no tasks yet)" : `(no ${filter.label} tasks)`}
+            </div>`
           : sorted.map(
               (t) => html`
                 <div class=${"env-task status-" + t.status} key=${t.id}>
