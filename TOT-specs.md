@@ -694,7 +694,7 @@ Numbered per the original spec (Docs/HARNESS_SPEC.md §14).
 
 ## 21. What this is not
 
-- Not a product. Personal tool.
+- Not a team or enterprise product. Individual developer tool.
 - Not secure enough for untrusted users. Single-user by design.
 - Not a replacement for Claude Agent Teams — this is specifically **more transparent and less automagical**.
 - Not going to solve "how do I get 10 Claudes to build an app with no input from me." Human remains in the loop.

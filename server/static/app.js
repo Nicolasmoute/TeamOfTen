@@ -826,6 +826,16 @@ function App() {
       if (Array.isArray(stored) && stored.length === n) return stored;
       return Array(n).fill(100 / n);
     };
+    // Split.js sets inline `width`/`height`, but our panes & columns use
+    // `flex: 1 1 0` — flex-basis 0 wins over the inline dimension, so drag
+    // did nothing visible. Override Split.js to write `flex-basis` instead,
+    // which the flex algorithm actually honors.
+    const elementStyle = (dim, size, gutterSize) => ({
+      "flex-basis": `calc(${size}% - ${gutterSize}px)`,
+    });
+    const gutterStyle = (dim, gutterSize) => ({
+      "flex-basis": `${gutterSize}px`,
+    });
     // Outer horizontal split across columns (only if >= 2 columns).
     if (openColumns.length >= 2) {
       const selectors = openColumns.map((_, i) => "#col-" + i);
@@ -840,6 +850,8 @@ function App() {
             snapOffset: 0,
             dragInterval: 1,
             direction: "horizontal",
+            elementStyle,
+            gutterStyle,
             onDragEnd: (arr) => persist(hKey, arr),
           });
           cleanups.push(() => { try { h.destroy(); } catch (_) {} });
@@ -863,6 +875,8 @@ function App() {
           snapOffset: 0,
           dragInterval: 1,
           direction: "vertical",
+          elementStyle,
+          gutterStyle,
           onDragEnd: (arr) => persist(vKey, arr),
         });
         cleanups.push(() => { try { v.destroy(); } catch (_) {} });
@@ -920,6 +934,8 @@ function App() {
                         onClose=${() => closePane(slot)}
                         onStackBelow=${(otherSlot) => stackBelow(otherSlot, slot)}
                         onMoveBefore=${(otherSlot) => movePaneBefore(otherSlot, slot)}
+                        onPopOut=${moveToNewColumn}
+                        stacked=${col.length > 1}
                       />`;
                     })}
                     <${DropZone}
@@ -1100,7 +1116,10 @@ function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsCon
         : null}
       <button
         class=${"gear pause-toggle" + (paused ? " active" : "")}
-        title=${(paused ? "Paused — click to resume" : "Pause harness (blocks new agent runs)") + " (⌘/Ctrl+.)"}
+        title=${(paused
+          ? "Harness is PAUSED — new agent spawns are blocked. Click to resume."
+          : "Pause the harness — stops new agent spawns (in-flight turns keep running)."
+        ) + " Keyboard: ⌘/Ctrl+."}
         onClick=${onTogglePause}
       >${paused ? "▶" : "❚❚"}</button>
       <button
@@ -2392,7 +2411,7 @@ function EnvTimelineItem({ event }) {
 // agent pane
 // ------------------------------------------------------------------
 
-function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore }) {
+function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore, onPopOut, stacked }) {
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState([]); // {id, url, path, filename}
   const [submitting, setSubmitting] = useState(false);
@@ -2764,6 +2783,13 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
           title="Export conversation as markdown"
           disabled=${allEvents.length === 0}
         >↓</button>
+        ${stacked
+          ? html`<button
+              class="pane-pop-out"
+              onClick=${() => onPopOut && onPopOut(slot)}
+              title="Pop out to its own column"
+            >⇱</button>`
+          : null}
         <button
           class="pane-gear"
           onClick=${() => setSettingsOpen((v) => !v)}
