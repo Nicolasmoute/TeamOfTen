@@ -465,6 +465,17 @@ function App() {
     saveLayout({ openColumns, envOpen });
   }, [openColumns, envOpen]);
 
+  // Reflect live state in the tab title so a backgrounded tab still
+  // signals: ⏸ when paused, N⚡ when N agents are working, and the
+  // baseline "TeamOfTen" otherwise.
+  useEffect(() => {
+    const working = agents.filter((a) => a.status === "working").length;
+    let prefix = "";
+    if (paused) prefix = "⏸ ";
+    else if (working > 0) prefix = `${working}⚡ `;
+    document.title = `${prefix}TeamOfTen`;
+  }, [paused, agents]);
+
   // Global keyboard shortcuts. Kept deliberately small — anything else
   // belongs scoped to the relevant pane/component.
   //   Ctrl/Cmd + B : toggle the Environment side-panel.
