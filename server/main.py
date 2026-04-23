@@ -649,6 +649,56 @@ async def list_memory() -> dict[str, Any]:
     return {"docs": [dict(r) for r in rows]}
 
 
+class HumanMemoryWrite(BaseModel):
+    topic: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9\-]{0,63}$")
+    content: str = Field(max_length=20_000)
+
+
+@app.post("/api/memory", dependencies=[Depends(require_token)])
+async def write_memory_from_human(req: HumanMemoryWrite) -> dict[str, Any]:
+    """Upsert a memory doc from the human operator.
+
+    Matches coord_update_memory semantics (full overwrite, not
+    append). last_updated_by is 'human'. Emits 'memory_updated' so
+    open agents pick up the change on their next read_memory."""
+    now = datetime.now(timezone.utc).isoformat()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT version FROM memory_docs WHERE topic = ?", (req.topic,)
+        )
+        row = await cur.fetchone()
+        if row:
+            new_version = int(dict(row)["version"]) + 1
+            await c.execute(
+                "UPDATE memory_docs SET content = ?, last_updated = ?, "
+                "last_updated_by = 'human', version = ? WHERE topic = ?",
+                (req.content, now, new_version, req.topic),
+            )
+        else:
+            new_version = 1
+            await c.execute(
+                "INSERT INTO memory_docs (topic, content, last_updated, "
+                "last_updated_by, version) VALUES (?, ?, ?, 'human', ?)",
+                (req.topic, req.content, now, new_version),
+            )
+        await c.commit()
+    finally:
+        await c.close()
+
+    await bus.publish(
+        {
+            "ts": now,
+            "agent_id": "human",
+            "type": "memory_updated",
+            "topic": req.topic,
+            "version": new_version,
+            "size": len(req.content),
+        }
+    )
+    return {"ok": True, "topic": req.topic, "version": new_version}
+
+
 @app.get("/api/memory/{topic}", dependencies=[Depends(require_token)])
 async def get_memory(topic: str) -> dict[str, Any]:
     """Full content of a single memory doc."""

@@ -1548,6 +1548,11 @@ function EnvMemorySection({ conversations }) {
   const [docs, setDocs] = useState([]);
   const [openTopic, setOpenTopic] = useState(null);
   const [openBody, setOpenBody] = useState("");
+  const [composing, setComposing] = useState(false);
+  const [newTopic, setNewTopic] = useState("");
+  const [newBody, setNewBody] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveErr, setSaveErr] = useState("");
 
   const load = useCallback(async () => {
     try {
@@ -1596,11 +1601,75 @@ function EnvMemorySection({ conversations }) {
     }
   }, [openTopic]);
 
+  const startCompose = useCallback((seedTopic) => {
+    setSaveErr("");
+    setNewTopic(seedTopic || "");
+    setNewBody("");
+    setComposing(true);
+  }, []);
+
+  const save = useCallback(async () => {
+    setSaveErr("");
+    setSaving(true);
+    try {
+      const res = await authFetch("/api/memory", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ topic: newTopic, content: newBody }),
+      });
+      if (!res.ok) {
+        const txt = await res.text();
+        setSaveErr("HTTP " + res.status + ": " + txt.slice(0, 120));
+        return;
+      }
+      setComposing(false);
+      setNewTopic("");
+      setNewBody("");
+      load();
+    } catch (e) {
+      setSaveErr(String(e));
+    } finally {
+      setSaving(false);
+    }
+  }, [newTopic, newBody, load]);
+
   return html`
     <section class="env-section">
       <h3 class="env-section-title">
         Memory <span class="env-count">${docs.length}</span>
+        <button
+          class="env-attention-dismiss-all"
+          style="margin-left: auto; border-color: var(--accent); color: var(--accent);"
+          onClick=${() => (composing ? setComposing(false) : startCompose(""))}
+        >${composing ? "cancel" : "+ write"}</button>
       </h3>
+      ${composing
+        ? html`<div class="env-msg-composer">
+            <input
+              type="text"
+              class="env-msg-composer-subject"
+              placeholder="topic (lowercase, 1–64 chars, a-z 0-9 -)"
+              value=${newTopic}
+              onInput=${(e) => setNewTopic(e.target.value)}
+            />
+            <textarea
+              class="env-msg-composer-body"
+              placeholder="content (markdown welcome)…"
+              value=${newBody}
+              onInput=${(e) => setNewBody(e.target.value)}
+              rows=${5}
+            ></textarea>
+            ${saveErr ? html`<p class="muted" style="color: var(--err)">${saveErr}</p>` : null}
+            <div class="env-msg-composer-row">
+              <button
+                class="primary"
+                style="flex: 1"
+                disabled=${saving || !newTopic.trim()}
+                onClick=${save}
+              >${saving ? "saving…" : "save (overwrites)"}</button>
+            </div>
+          </div>`
+        : null}
       ${docs.length === 0
         ? html`<div class="env-empty">(empty — agents use coord_update_memory)</div>`
         : html`<div class="env-decision-list">
@@ -1773,9 +1842,15 @@ function EnvTasksSection({ tasks, onCreate }) {
     .sort(cmp);
   for (const arr of childrenOf.values()) arr.sort(cmp);
 
-  // Flatten tree with depth info for render.
+  // Flatten tree with depth info for render. `seen` guards against
+  // pathological parent_id cycles — current root-detection excludes
+  // cycle members from the walk, but a future refactor that starts
+  // from arbitrary tasks would infinite-loop without this check.
   const flatWithDepth = [];
+  const seen = new Set();
   const walk = (task, depth) => {
+    if (seen.has(task.id)) return;
+    seen.add(task.id);
     flatWithDepth.push({ task, depth });
     const kids = childrenOf.get(task.id) || [];
     for (const k of kids) walk(k, depth + 1);
