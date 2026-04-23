@@ -83,6 +83,35 @@ function flatSlots(openColumns) {
   return out;
 }
 
+// Split.js size persistence. Sizes are keyed by layout structure so
+// user-dragged widths survive no-op re-renders but reset sensibly
+// when the layout changes structurally (add / remove / move a pane).
+const SPLIT_SIZES_KEY = "harness_split_sizes_v1";
+function loadSplitSizes() {
+  try {
+    const raw = localStorage.getItem(SPLIT_SIZES_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch (_) {
+    return {};
+  }
+}
+function saveSplitSizes(map) {
+  try {
+    // Cap retained keys at 30 to prevent unbounded growth across many
+    // distinct layouts. Simplest: FIFO by insertion order on keys().
+    const keys = Object.keys(map);
+    if (keys.length > 30) {
+      const out = {};
+      for (const k of keys.slice(-30)) out[k] = map[k];
+      localStorage.setItem(SPLIT_SIZES_KEY, JSON.stringify(out));
+      return;
+    }
+    localStorage.setItem(SPLIT_SIZES_KEY, JSON.stringify(map));
+  } catch (_) {
+    /* localStorage disabled */
+  }
+}
+
 // ------------------------------------------------------------------
 // per-pane settings (model / plan mode / effort)
 // ------------------------------------------------------------------
@@ -571,21 +600,36 @@ function App() {
     () => openColumns.map((c) => c.join("|")).join("//"),
     [openColumns]
   );
+  // Persisted drag sizes. We mutate through the ref so changes don't
+  // trigger a re-render (Split.js holds the sizes during drag).
+  const splitSizesRef = useRef(loadSplitSizes());
   useLayoutEffect(() => {
     const cleanups = [];
+    const sizes = splitSizesRef.current;
+    const persist = (key, arr) => {
+      sizes[key] = arr;
+      saveSplitSizes(sizes);
+    };
+    const resolveSizes = (key, n) => {
+      const stored = sizes[key];
+      if (Array.isArray(stored) && stored.length === n) return stored;
+      return Array(n).fill(100 / n);
+    };
     // Outer horizontal split across columns (only if >= 2 columns).
     if (openColumns.length >= 2) {
       const selectors = openColumns.map((_, i) => "#col-" + i);
       const exist = selectors.every((sel) => document.querySelector(sel));
       if (exist) {
+        const hKey = "h:" + layoutSignature;
         try {
           const h = Split(selectors, {
-            sizes: Array(openColumns.length).fill(100 / openColumns.length),
+            sizes: resolveSizes(hKey, openColumns.length),
             minSize: 260,
             gutterSize: 6,
             snapOffset: 0,
             dragInterval: 1,
             direction: "horizontal",
+            onDragEnd: (arr) => persist(hKey, arr),
           });
           cleanups.push(() => { try { h.destroy(); } catch (_) {} });
         } catch (e) {
@@ -599,14 +643,16 @@ function App() {
       const selectors = col.map((s) => "#pane-" + s);
       const exist = selectors.every((sel) => document.querySelector(sel));
       if (!exist) return;
+      const vKey = "v:" + col.join("|");
       try {
         const v = Split(selectors, {
-          sizes: Array(col.length).fill(100 / col.length),
+          sizes: resolveSizes(vKey, col.length),
           minSize: 120,
           gutterSize: 6,
           snapOffset: 0,
           dragInterval: 1,
           direction: "vertical",
+          onDragEnd: (arr) => persist(vKey, arr),
         });
         cleanups.push(() => { try { v.destroy(); } catch (_) {} });
       } catch (e) {
