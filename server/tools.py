@@ -857,9 +857,104 @@ def build_coord_server(caller_id: str) -> Any:
         )
         return _ok(f"committed {sha}: {message}{push_note}")
 
+    @tool(
+        "coord_write_decision",
+        (
+            "Coach-only. Append a dated, immutable architectural decision "
+            "record to /harness/decisions/ on kDrive (or /data/decisions/ "
+            "if kDrive is disabled).\n"
+            "\n"
+            "Unlike memory (which is overwritable scratch), decisions are "
+            "the durable 'we chose X because Y' record. Filename format: "
+            "YYYY-MM-DD-<slug>.md. If a decision with the same slug for "
+            "today already exists, a numeric suffix is appended.\n"
+            "\n"
+            "Params:\n"
+            "- title: short human title (required; becomes the filename slug)\n"
+            "- body: full markdown content (required; context, options, choice, rationale)"
+        ),
+        {"title": str, "body": str},
+    )
+    async def write_decision(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err(
+                "Only Coach writes decisions (durable architectural records). "
+                "Players post findings to memory via coord_update_memory."
+            )
+        title = (args.get("title") or "").strip()
+        body = (args.get("body") or "").strip()
+        if not title:
+            return _err("title is required")
+        if not body:
+            return _err("body is required (empty decisions are not useful)")
+        if len(body) > 40_000:
+            return _err(f"body too long ({len(body)} chars, max 40000)")
+
+        # Slugify the title: lowercase, alphanumerics + dashes, max 48 chars.
+        slug_raw = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+        slug = slug_raw[:48].strip("-") or "decision"
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        now_iso = _now_iso()
+        base_filename = f"{today}-{slug}.md"
+
+        frontmatter = (
+            f"---\n"
+            f"title: {title}\n"
+            f"date: {today}\n"
+            f"ts: {now_iso}\n"
+            f"author: {caller_id}\n"
+            f"---\n\n"
+        )
+        content = frontmatter + body + ("\n" if not body.endswith("\n") else "")
+
+        # Prefer kDrive (the human-readable durable store). Fall back to the
+        # local /data volume so offline agents still get a record.
+        location = None
+        filename = base_filename
+        if kdrive.enabled:
+            ok = await kdrive.write_text(f"decisions/{filename}", content)
+            if ok:
+                location = f"kDrive:decisions/{filename}"
+        if location is None:
+            # Local fallback
+            import os as _os
+            from pathlib import Path as _Path
+            local_dir = _Path(
+                _os.environ.get("HARNESS_DECISIONS_DIR", "/data/decisions")
+            )
+            try:
+                local_dir.mkdir(parents=True, exist_ok=True)
+                # Collision check: append a numeric suffix if needed
+                target = local_dir / filename
+                n = 2
+                while target.exists():
+                    filename = f"{today}-{slug}-{n}.md"
+                    target = local_dir / filename
+                    n += 1
+                target.write_text(content, encoding="utf-8")
+                location = f"local:{target}"
+            except Exception as e:
+                return _err(f"decision write failed: {type(e).__name__}: {e}")
+
+        await bus.publish(
+            {
+                "ts": now_iso,
+                "agent_id": caller_id,
+                "type": "decision_written",
+                "title": title,
+                "filename": filename,
+                "location": location,
+                "size": len(body),
+            }
+        )
+        return _ok(
+            f"decision '{title}' saved to {location} ({len(body)} chars of body)"
+        )
+
     return create_sdk_mcp_server(
         name="coord",
-        version="0.6.0",
+        version="0.7.0",
         tools=[
             list_tasks,
             create_task,
@@ -872,6 +967,7 @@ def build_coord_server(caller_id: str) -> Any:
             read_memory,
             update_memory,
             commit_push,
+            write_decision,
         ],
     )
 
@@ -888,6 +984,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_read_memory",
     "mcp__coord__coord_update_memory",
     "mcp__coord__coord_commit_push",
+    "mcp__coord__coord_write_decision",
 ]
 
 MEMORY_TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")

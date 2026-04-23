@@ -268,6 +268,8 @@ body {
 .env-tl-msg .env-tl-body { color: var(--tool); }
 .env-tl-mem { border-left-color: var(--ok); }
 .env-tl-mem .env-tl-body { color: var(--ok); }
+.env-tl-decision { border-left-color: var(--coach); }
+.env-tl-decision .env-tl-body { color: var(--coach); font-weight: 600; }
 .env-tl-capped { border-left-color: var(--err); background: #281417; }
 .env-tl-capped .env-tl-body { color: var(--err); white-space: normal; }
 .env-tl-commit { border-left-color: var(--accent); }

@@ -736,6 +736,7 @@ const TIMELINE_TYPES = new Set([
   "memory_updated",
   "cost_capped",
   "commit_pushed",
+  "decision_written",
 ]);
 
 function EnvTimelineSection({ conversations }) {
@@ -857,6 +858,13 @@ function EnvTimelineItem({ event }) {
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
       <span class="env-tl-body">◎ memory/${event.topic} v${event.version} (${event.size} chars)</span>
+    </div>`;
+  }
+  if (event.type === "decision_written") {
+    return html`<div class="env-tl-item env-tl-decision">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">✎ decision: ${event.title}</span>
     </div>`;
   }
   if (event.type === "cost_capped") {
