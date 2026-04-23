@@ -130,7 +130,9 @@ class KDriveClient:
                 "hint": "Auth, URL, or target folder is wrong. Verify KDRIVE_WEBDAV_URL points at an existing kDrive folder and the app-password is for this account.",
             }
         # Step 2: write. If listing worked but PUT fails we're looking
-        # at a share-level permission issue or a filename kDrive rejects.
+        # at a share-level permission issue, a filename kDrive rejects,
+        # or an upload-protocol quirk (some WebDAV servers 409 fresh
+        # PUTs sent with chunked transfer-encoding).
         rel = "harness-health-probe.txt"
         full_path = self._resolve(rel)
         try:
@@ -142,14 +144,29 @@ class KDriveClient:
                 "existing_entries": len(entries),
             }
         except Exception as e:
+            # webdav4 HTTPError carries the underlying httpx.Response
+            # on .response — pull the status + body text so the
+            # operator sees what the server actually said, not just
+            # the generic "received 409".
+            err_txt = f"{type(e).__name__}: {str(e)[:400]}"
+            resp = getattr(e, "response", None)
+            if resp is not None:
+                try:
+                    body = resp.text[:400] if resp.text else "(empty body)"
+                except Exception:
+                    body = "(body unreadable)"
+                err_txt = (
+                    f"{type(e).__name__}: HTTP {resp.status_code} {resp.reason_phrase}\n"
+                    f"body: {body}"
+                )
             return {
                 "ok": False,
                 "url": WEBDAV_URL,
                 "step": "write",
                 "probe_file": full_path,
                 "existing_entries": len(entries),
-                "error": f"{type(e).__name__}: {str(e)[:400]}",
-                "hint": "Folder exists and listing works, but PUT was rejected. Check that the Infomaniak app-password has WRITE permission (not read-only), or that the URL points at a folder you own (not a read-only share).",
+                "error": err_txt,
+                "hint": "Folder exists and listing works, but PUT was rejected. Check that the Infomaniak app-password has WRITE permission (not read-only). If the body below mentions 'Precondition' or 'locked', the URL may point at a read-only share.",
             }
 
     # ---------- async public API ----------
