@@ -346,6 +346,30 @@ function timeStr(iso) {
   return (iso || "").slice(11, 19);
 }
 
+// "3m ago", "2h ago", "just now" — coarse human-friendly relative time.
+// Returns "" for missing input so tooltip composition can skip cleanly.
+function relTime(iso) {
+  if (!iso) return "";
+  const then = new Date(iso).getTime();
+  if (!Number.isFinite(then)) return "";
+  const diffSec = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (diffSec < 10) return "just now";
+  if (diffSec < 60) return diffSec + "s ago";
+  if (diffSec < 3600) return Math.round(diffSec / 60) + "m ago";
+  if (diffSec < 86400) return Math.round(diffSec / 3600) + "h ago";
+  return Math.round(diffSec / 86400) + "d ago";
+}
+
+// Compose the pane-dot tooltip from status + timestamps.
+function statusTooltip(status, agent) {
+  const parts = [status];
+  const hb = relTime(agent?.last_heartbeat);
+  if (hb) parts.push("last heartbeat: " + hb);
+  const started = relTime(agent?.started_at);
+  if (started) parts.push("first started: " + started);
+  return parts.join(" · ");
+}
+
 function byNumericSuffix(a, b) {
   const na = parseInt(a.id.slice(1), 10) || 0;
   const nb = parseInt(b.id.slice(1), 10) || 0;
@@ -2625,7 +2649,10 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
           onDragStart=${onDragStart}
           title="Drag to reorder — drop on another pane to move before it"
         >
-          <span class=${"pane-dot " + status} title=${status}></span>
+          <span
+            class=${"pane-dot " + status}
+            title=${statusTooltip(status, agent)}
+          ></span>
           <span class="pane-id">${slot}</span>
           <span class="pane-name">${displayName}</span>
           ${agent?.role ? html`<span class="pane-role">— ${agent.role}</span>` : html`<span class="pane-role"></span>`}
