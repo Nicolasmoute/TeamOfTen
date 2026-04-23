@@ -2,8 +2,6 @@ import { h, render } from "https://esm.sh/preact@10";
 import { useState, useEffect, useMemo, useRef, useCallback, useLayoutEffect } from "https://esm.sh/preact@10/hooks";
 import htm from "https://esm.sh/htm@3";
 import Split from "https://esm.sh/split.js@1.6.5";
-import { marked } from "https://esm.sh/marked@12";
-import DOMPurify from "https://esm.sh/dompurify@3";
 import { renderToolCall } from "/static/tools.js";
 
 const html = htm.bind(h);
@@ -556,26 +554,6 @@ function timeStr(iso) {
   return (iso || "").slice(11, 19);
 }
 
-// Markdown renderer for `text` + `thinking` event bodies. Agent output
-// is untrusted (model can emit anything), so we parse with marked and
-// sanitize with DOMPurify before injecting — standard XSS defense.
-// Config: GFM + line-break-on-single-newline so conversational prose
-// reads naturally without forcing blank lines. Called often (every
-// text event), so marked options are set once at module load.
-marked.setOptions({ gfm: true, breaks: true });
-function renderMarkdown(text) {
-  if (!text) return "";
-  try {
-    const raw = marked.parse(text);
-    return DOMPurify.sanitize(raw);
-  } catch (_) {
-    // Fall back to plain-text escaping so a malformed input never
-    // blanks the pane.
-    const div = document.createElement("div");
-    div.textContent = text;
-    return div.innerHTML;
-  }
-}
 
 // "3m ago", "2h ago", "just now" — coarse human-friendly relative time.
 // Returns "" for missing input so tooltip composition can skip cleanly.
