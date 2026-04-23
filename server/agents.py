@@ -337,10 +337,16 @@ def _today_utc_start_iso() -> str:
 
 
 async def _today_spend(agent_id: str | None = None) -> float:
-    """Sum cost_usd from 'result' events emitted today (UTC). Pass
-    agent_id to scope to one slot, or None for the whole team."""
+    """Sum `turns.cost_usd` for rows that ended today (UTC). Pass
+    agent_id to scope to one slot, or None for the whole team.
+
+    Uses the turns ledger (indexed on agent_id + ended_at) rather
+    than the events table (which would require JSON extraction on
+    every row). Same answer, single-index lookup. The ledger is
+    populated by every ResultMessage via _insert_turn_row.
+    """
     start_ts = _today_utc_start_iso()
-    where = "WHERE type = 'result' AND ts >= ?"
+    where = "WHERE ended_at >= ?"
     params: list[Any] = [start_ts]
     if agent_id:
         where += " AND agent_id = ?"
@@ -348,9 +354,7 @@ async def _today_spend(agent_id: str | None = None) -> float:
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT COALESCE("
-            "  SUM(CAST(json_extract(payload, '$.cost_usd') AS REAL)), 0"
-            f") AS total FROM events {where}",
+            f"SELECT COALESCE(SUM(cost_usd), 0) AS total FROM turns {where}",
             params,
         )
         row = await cur.fetchone()
