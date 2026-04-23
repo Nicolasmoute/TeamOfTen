@@ -53,6 +53,7 @@ from server.sync import (
     events_trim_loop,
     flush_loop,
     snapshot_loop,
+    upload_pull_loop,
 )
 from server.workspaces import ensure_workspaces, get_status as get_workspaces_status
 
@@ -110,6 +111,18 @@ except Exception as e:
 ATTACHMENTS_DIR = Path(os.environ.get("HARNESS_ATTACHMENTS_DIR", "/data/attachments"))
 ALLOWED_EXT = {"png", "jpg", "jpeg", "gif", "webp"}
 
+# Binary deliverables the team ships (docx, pdf, png, zip, …). Written
+# by agents via coord_save_output; mirrored to kDrive under outputs/;
+# also surfaced read-only in the files pane. Lives on /data so it
+# survives restarts.
+OUTPUTS_DIR = Path(os.environ.get("HARNESS_OUTPUTS_DIR", "/data/outputs"))
+
+# Human-uploaded reference material the team reads. Humans drop files
+# on kDrive under upload/; a background loop pulls them into this
+# directory, and per-slot workspaces get a `uploads` symlink so
+# Players can Read ./uploads/foo.pdf from their cwd.
+UPLOAD_DIR = Path(os.environ.get("HARNESS_UPLOAD_DIR", "/data/upload"))
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -127,6 +140,30 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("crash_recover failed (non-fatal)")
     ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    # Per-slot symlinks so agents can say "Read ./uploads/foo.pdf"
+    # from their workspace cwd instead of hardcoding /data paths. Same
+    # pattern the Dockerfile uses for attachments — we do it at runtime
+    # because /workspaces may be a fresh volume where the Dockerfile's
+    # pre-created symlinks got wiped.
+    try:
+        ws_root = Path("/workspaces")
+        if ws_root.exists():
+            for slot_dir in ws_root.iterdir():
+                if not slot_dir.is_dir():
+                    continue
+                link = slot_dir / "uploads"
+                if link.exists() or link.is_symlink():
+                    continue
+                try:
+                    link.symlink_to(UPLOAD_DIR)
+                except OSError:
+                    logger.exception(
+                        "failed to symlink uploads for %s", slot_dir.name
+                    )
+    except Exception:
+        logger.exception("uploads symlink setup failed (non-fatal)")
     # Claude CLI credential dir. Set via CLAUDE_CONFIG_DIR in the image
     # so OAuth tokens written by `claude /login` land on the /data
     # volume and survive Zeabur redeploys. We mkdir at runtime (not in
@@ -152,7 +189,8 @@ async def lifespan(app: FastAPI):
     coach_task = asyncio.create_task(coach_tick_loop())
     trim_task = asyncio.create_task(events_trim_loop())
     att_trim_task = asyncio.create_task(attachments_trim_loop())
-    bg_tasks = (sync_task, snapshot_task, coach_task, trim_task, att_trim_task)
+    upload_task = asyncio.create_task(upload_pull_loop())
+    bg_tasks = (sync_task, snapshot_task, coach_task, trim_task, att_trim_task, upload_task)
     try:
         yield
     finally:

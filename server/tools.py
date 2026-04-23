@@ -13,6 +13,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from server import context as ctxmod
 from server import knowledge as knowmod
+from server import outputs as outmod
 from server.db import configured_conn
 from server.events import bus
 from server.kdrive import kdrive
@@ -950,6 +951,62 @@ def build_coord_server(caller_id: str) -> Any:
         return _ok("\n".join(paths))
 
     @tool(
+        "coord_save_output",
+        (
+            "Save a binary deliverable (docx / pdf / png / zip / …) to "
+            "the team outputs bucket at kDrive outputs/<path> (+ local "
+            "/data/outputs cache). Use for final artifacts the human "
+            "asked for — reports, charts, exports. Text deliverables "
+            "usually belong in knowledge/ instead.\n"
+            "\n"
+            "Path is agent-chosen within limits:\n"
+            "  - at most 4 path segments\n"
+            "  - each segment starts with alphanumeric, no spaces / ..\n"
+            "  - leaf extension must be in the outputs allow-list "
+            "(docx, xlsx, pptx, pdf, png, jpg, gif, webp, svg, zip, "
+            "tar, gz, csv, tsv, md, txt, html, json)\n"
+            "\n"
+            "Content is base64-encoded — read the file with Bash "
+            "(`base64 -w0 foo.docx`) or have your process write base64 "
+            "directly. 20 MB size cap after decoding.\n"
+            "\n"
+            "Overwrites without warning if the path exists — date-stamp "
+            "your filenames if you want history.\n"
+            "\n"
+            "Params:\n"
+            "- path: POSIX relative path under outputs/ (required)\n"
+            "- content_base64: base64-encoded bytes of the file (required)"
+        ),
+        {"path": str, "content_base64": str},
+    )
+    async def save_output(args: dict[str, Any]) -> dict[str, Any]:
+        path = (args.get("path") or "").strip()
+        b64 = args.get("content_base64") or ""
+        try:
+            data = outmod.decode_base64(b64)
+        except ValueError as e:
+            return _err(str(e))
+        try:
+            ok = await outmod.save(path, data, author=caller_id)
+        except ValueError as e:
+            return _err(str(e))
+        if not ok:
+            return _err("outputs write failed — check server logs")
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "output_saved",
+                "path": path,
+                "bytes": len(data),
+            }
+        )
+        return _ok(
+            f"saved outputs[{path}] ({len(data)} bytes)"
+            + (" · mirrored to kDrive" if kdrive.enabled else "")
+        )
+
+    @tool(
         "coord_commit_push",
         (
             "Commit staged+unstaged changes in your worktree and push the "
@@ -1409,6 +1466,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_write_knowledge",
     "mcp__coord__coord_read_knowledge",
     "mcp__coord__coord_list_knowledge",
+    "mcp__coord__coord_save_output",
     "mcp__coord__coord_list_team",
     "mcp__coord__coord_set_player_role",
     "mcp__coord__coord_request_human",

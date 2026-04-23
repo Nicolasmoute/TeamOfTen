@@ -79,6 +79,21 @@ def _roots() -> dict[str, Root]:
             # CLI to change files, then reload the tree here.
             writable=False,
         ),
+        # Binary deliverables the team ships. Written via
+        # coord_save_output; mirrored to kDrive under outputs/.
+        "outputs": Root(
+            "outputs",
+            Path(os.environ.get("HARNESS_OUTPUTS_DIR", "/data/outputs")),
+            writable=False,
+        ),
+        # Human-uploaded reference material. Pulled from kDrive://upload/
+        # every ~60s by sync.upload_pull_loop; each Player has an
+        # `uploads` symlink pointing here so they can Read ./uploads/foo.
+        "upload": Root(
+            "upload",
+            Path(os.environ.get("HARNESS_UPLOAD_DIR", "/data/upload")),
+            writable=False,
+        ),
     }
 
 

@@ -225,6 +225,20 @@ class KDriveClient:
             logger.exception("kDrive read_text failed: %s", full_path)
             return None
 
+    async def read_bytes(self, relative_path: str) -> bytes | None:
+        """Same as read_text but returns raw bytes — use for binary
+        downloads (pdf, docx, images). Returns None on missing / error."""
+        if not self._enabled:
+            return None
+        full_path = self._resolve(relative_path)
+        try:
+            return await asyncio.to_thread(self._read_bytes_sync, full_path)
+        except Exception as e:
+            if _ResourceNotFound is not None and isinstance(e, _ResourceNotFound):
+                return None
+            logger.exception("kDrive read_bytes failed: %s", full_path)
+            return None
+
     async def list_dir(self, relative_path: str) -> list[str]:
         """List filenames (basenames, not full paths) under
         `{KDRIVE_WEBDAV_URL}/{relative_path}`. Returns [] on any failure
@@ -280,6 +294,11 @@ class KDriveClient:
         buf = io.BytesIO()
         self._client.download_fileobj(full_path, buf)
         return buf.getvalue().decode("utf-8", errors="replace")
+
+    def _read_bytes_sync(self, full_path: str) -> bytes:
+        buf = io.BytesIO()
+        self._client.download_fileobj(full_path, buf)
+        return buf.getvalue()
 
     def _list_dir_sync(self, full_path: str) -> list[str]:
         # ls(detail=False) returns a list of relative path strings. We
