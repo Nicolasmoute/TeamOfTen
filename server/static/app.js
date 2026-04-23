@@ -243,6 +243,7 @@ const SLASH_COMMANDS = [
   { cmd: "/loop",   desc: "Coach autoloop: /loop 60 → tick every 60s · /loop off" },
   { cmd: "/tick",   desc: "nudge Coach to drain inbox right now" },
   { cmd: "/status", desc: "show server runtime state (paused, running, spend)" },
+  { cmd: "/spend",  desc: "per-agent spend over last 24h" },
   { cmd: "/help",   desc: "show available slash commands" },
 ];
 
@@ -3540,6 +3541,36 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
             else setInfoText("tick failed: HTTP " + r.status);
           })
           .catch((e) => setInfoText("tick failed: " + String(e)));
+        return true;
+      case "/spend":
+        // Per-agent spend breakdown over the last 24h (or whatever
+        // hours arg, via `/spend 168` for a week etc.). Pulls from
+        // /api/turns/summary — same backing table that gates cost caps.
+        {
+          const h = parseInt(arg, 10);
+          const hours = h > 0 && h <= 720 ? h : 24;
+          authFetch("/api/turns/summary?hours=" + hours)
+            .then((r) => r.json())
+            .then((d) => {
+              if (!d.per_agent || d.per_agent.length === 0) {
+                setInfoText(`No turns recorded in the last ${hours}h.`);
+                return;
+              }
+              const rows = d.per_agent.map((a) => {
+                const errs = a.error_count ? ` · ${a.error_count} err` : "";
+                return (
+                  `${a.agent_id.padEnd(6)} ` +
+                  `$${(a.cost_usd || 0).toFixed(3).padStart(8)} · ` +
+                  `${String(a.count).padStart(3)} turn${a.count === 1 ? "" : "s"}${errs}`
+                );
+              });
+              setInfoText(
+                `Spend last ${hours}h — total $${d.total_cost_usd.toFixed(3)} · ${d.total_turns} turns\n` +
+                rows.join("\n")
+              );
+            })
+            .catch((e) => setInfoText("spend query failed: " + String(e)));
+        }
         return true;
       case "/status":
         // Render a compact snapshot of /api/status into the info
