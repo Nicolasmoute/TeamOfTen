@@ -512,40 +512,51 @@ _LACROSSE_SURNAMES: tuple[str, ...] = (
 )
 
 
+# Serializes _autoname_player across concurrent spawns. Without this,
+# two Players waking at the same millisecond (e.g. Coach broadcasts a
+# batch of task_assigned events) can each see the same 'taken' set and
+# pick the same surname. The lock is per-process only — fine since our
+# harness is single-process by design.
+_AUTONAME_LOCK = asyncio.Lock()
+
+
 async def _autoname_player(agent_id: str) -> str | None:
-    """If this Player slot has no name yet, pick an unused soccer
+    """If this Player slot has no name yet, pick an unused lacrosse
     surname and persist it. Returns the chosen name, or None if the
     slot already had one / isn't a player / we ran out of names.
 
     Runs once per slot lifetime (becomes a no-op after first call).
+    Serialized by _AUTONAME_LOCK so concurrent first-spawns can't
+    pick the same surname before either has committed.
     """
     import random
 
-    c = await configured_conn()
-    try:
-        cur = await c.execute(
-            "SELECT kind, name FROM agents WHERE id = ?", (agent_id,)
-        )
-        row = await cur.fetchone()
-        if not row:
-            return None
-        d = dict(row)
-        if d["kind"] != "player" or d["name"]:
-            return None
-        cur = await c.execute(
-            "SELECT name FROM agents WHERE kind = 'player' AND name IS NOT NULL"
-        )
-        taken = {dict(r)["name"] for r in await cur.fetchall()}
-        candidates = [n for n in _LACROSSE_SURNAMES if n not in taken]
-        if not candidates:
-            return None
-        pick = random.choice(candidates)
-        await c.execute(
-            "UPDATE agents SET name = ? WHERE id = ?", (pick, agent_id)
-        )
-        await c.commit()
-    finally:
-        await c.close()
+    async with _AUTONAME_LOCK:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT kind, name FROM agents WHERE id = ?", (agent_id,)
+            )
+            row = await cur.fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            if d["kind"] != "player" or d["name"]:
+                return None
+            cur = await c.execute(
+                "SELECT name FROM agents WHERE kind = 'player' AND name IS NOT NULL"
+            )
+            taken = {dict(r)["name"] for r in await cur.fetchall()}
+            candidates = [n for n in _LACROSSE_SURNAMES if n not in taken]
+            if not candidates:
+                return None
+            pick = random.choice(candidates)
+            await c.execute(
+                "UPDATE agents SET name = ? WHERE id = ?", (pick, agent_id)
+            )
+            await c.commit()
+        finally:
+            await c.close()
     await bus.publish(
         {
             "ts": _now(),
