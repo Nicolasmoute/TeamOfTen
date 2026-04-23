@@ -3280,16 +3280,22 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
     };
   }, [slot]);
 
-  // Merge history + live events.
+  // Merge history + live events. Live events don't carry __id (that's
+  // assigned by the server's DB INSERT, which happens AFTER WS fan-out),
+  // so if an event fires right before a pane opens it can show up in
+  // both streams. Composite fallback key on (ts, agent_id, type) catches
+  // the overlap without needing a server refactor.
   const mergedEvents = useMemo(() => {
+    const keyOf = (e) =>
+      e.__id != null ? "id:" + e.__id : `c:${e.ts}:${e.agent_id}:${e.type}`;
     const seen = new Set();
     const out = [];
     for (const e of history) {
-      if (e.__id != null) seen.add(e.__id);
+      seen.add(keyOf(e));
       out.push(e);
     }
     for (const e of liveEvents) {
-      if (e.__id != null && seen.has(e.__id)) continue;
+      if (seen.has(keyOf(e))) continue;
       out.push(e);
     }
     return out;
