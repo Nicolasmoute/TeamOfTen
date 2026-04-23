@@ -120,13 +120,8 @@ OUTPUTS_DIR = Path(os.environ.get("HARNESS_OUTPUTS_DIR", "/data/outputs"))
 # Human-uploaded reference material the team reads. Humans drop files
 # on kDrive under uploads/; a background loop pulls them into this
 # directory, and per-slot workspaces get a `uploads` symlink so
-# Players can Read ./uploads/foo.pdf from their cwd. HARNESS_UPLOAD_DIR
-# is accepted as a legacy alias for HARNESS_UPLOADS_DIR.
-UPLOADS_DIR = Path(
-    os.environ.get("HARNESS_UPLOADS_DIR")
-    or os.environ.get("HARNESS_UPLOAD_DIR")
-    or "/data/uploads"
-)
+# Players can Read ./uploads/foo.pdf from their cwd.
+UPLOADS_DIR = Path(os.environ.get("HARNESS_UPLOADS_DIR", "/data/uploads"))
 
 
 @asynccontextmanager

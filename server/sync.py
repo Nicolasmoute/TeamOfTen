@@ -78,17 +78,12 @@ ATTACHMENTS_RETENTION_DAYS = int(
 # kDrive://uploads/ via the web UI or sync client; we mirror them
 # into /data/uploads (which each agent workspace symlinks as
 # ./uploads) so Players can Read ./uploads/foo.pdf. Default 60s —
-# it's user-driven so a minute is snappy enough. The legacy singular
-# env-var names (HARNESS_UPLOAD_*) still work for back-compat.
+# it's user-driven so a minute is snappy enough.
 UPLOADS_PULL_INTERVAL_SECONDS = int(
-    os.environ.get("HARNESS_UPLOADS_PULL_INTERVAL")
-    or os.environ.get("HARNESS_UPLOAD_PULL_INTERVAL")
-    or "60"
+    os.environ.get("HARNESS_UPLOADS_PULL_INTERVAL", "60")
 )
 UPLOADS_LOCAL_DIR = Path(
-    os.environ.get("HARNESS_UPLOADS_DIR")
-    or os.environ.get("HARNESS_UPLOAD_DIR")
-    or "/data/uploads"
+    os.environ.get("HARNESS_UPLOADS_DIR", "/data/uploads")
 )
 
 

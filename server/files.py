@@ -89,15 +89,9 @@ def _roots() -> dict[str, Root]:
         # Human-uploaded reference material. Pulled from kDrive://uploads/
         # every ~60s by sync.uploads_pull_loop; each Player has a
         # `uploads` symlink pointing here so they can Read ./uploads/foo.
-        # Accept the legacy singular env var for back-compat with any
-        # operator who set HARNESS_UPLOAD_DIR before the rename.
         "uploads": Root(
             "uploads",
-            Path(
-                os.environ.get("HARNESS_UPLOADS_DIR")
-                or os.environ.get("HARNESS_UPLOAD_DIR")
-                or "/data/uploads"
-            ),
+            Path(os.environ.get("HARNESS_UPLOADS_DIR", "/data/uploads")),
             writable=False,
         ),
     }
