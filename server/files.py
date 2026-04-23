@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from server import context as ctxmod
+from server import knowledge as knowmod
 
 logger = logging.getLogger("harness.files")
 if not logger.handlers:
@@ -205,11 +206,15 @@ async def write_text(root_key: str, relative: str, content: str) -> dict[str, An
         }
 
     # Generic writable root — ensure parent dir, refuse non-.md for now
-    # (binary writes through a textarea would corrupt).
+    # (binary writes through a textarea would corrupt). Size cap aligns
+    # with knowmod.MAX_BODY_CHARS so an agent writing via the MCP tool
+    # and a human writing via the file browser hit the same ceiling.
     if target.suffix.lower() not in {".md", ".txt"}:
         raise ValueError("only .md and .txt files are editable through this endpoint")
-    if len(content) > ctxmod.MAX_BODY_CHARS * 4:
-        raise ValueError(f"body too long ({len(content)} chars)")
+    if len(content) > knowmod.MAX_BODY_CHARS:
+        raise ValueError(
+            f"body too long ({len(content)} chars, max {knowmod.MAX_BODY_CHARS})"
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
     return {
