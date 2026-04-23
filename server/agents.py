@@ -205,6 +205,14 @@ async def _handle_message(
         duration_ms = getattr(msg, "duration_ms", None)
         num_turns = getattr(msg, "num_turns", None)
         stop_reason = getattr(msg, "stop_reason", None)
+        # Mark the turn as having emitted a terminal result. The SDK
+        # occasionally raises a ProcessError during subprocess teardown
+        # (exit=1 with empty stderr) AFTER delivering ResultMessage —
+        # the turn's actual work completed fine, but the async
+        # generator still reports failure. The run_agent error handler
+        # uses this flag to downgrade that specific case to a log.
+        if turn_ctx is not None:
+            turn_ctx["got_result"] = True
         await _emit(
             agent_id, "result",
             duration_ms=duration_ms,
@@ -1016,33 +1024,53 @@ async def run_agent(
         await _emit(agent_id, "agent_stopped")
         raise
     except Exception as e:
-        # Log the full traceback to stdout so Zeabur captures it; the
-        # event only carries a summary so the UI doesn't drown in stack
-        # frames, but operators can correlate via the timestamp.
-        logger.exception("run_agent failed: agent=%s cwd=%s", agent_id, options_kwargs.get("cwd"))
-        # Friendlier message when a ProcessError was caused by the
-        # model invoking a tool we didn't allow: the CLI exits 1 with
-        # stderr swallowed, which is opaque. We can spot this case by
-        # looking at the last tool_use this turn and checking whether
-        # it's in the `allowed` list we passed to the SDK. Any other
-        # exception path falls through to the original summary.
-        err_msg = f"{type(e).__name__}: {e}"
         is_process_err = type(e).__name__ == "ProcessError"
-        last_tool = turn_ctx.get("last_tool")
-        if is_process_err and last_tool and last_tool not in allowed:
-            err_msg = (
-                f"Agent tried to use tool '{last_tool}' but it is not in "
-                f"allowed_tools for this role. Add it via the pane "
-                f"settings popover (Extra tools) or server/tools.py to "
-                f"enable. Original error: {err_msg}"
+        # Noisy-teardown suppression: if the SDK already delivered a
+        # ResultMessage this turn (work completed) and the subsequent
+        # exception is ProcessError (subprocess died during cleanup),
+        # the turn actually succeeded. Log for the operator but don't
+        # emit a red 'error' event — the 'result' event already covers
+        # the UI. Confirmed behavior against CLI 2.1.118 where a
+        # ~10-exchange turn sometimes exits 1 during teardown despite
+        # a normal result having been returned.
+        if is_process_err and turn_ctx.get("got_result"):
+            logger.warning(
+                "run_agent: suppressed post-result ProcessError for %s (turn completed, subprocess teardown noisy)",
+                agent_id,
             )
-        await _emit(
-            agent_id,
-            "error",
-            error=err_msg,
-            cwd=options_kwargs.get("cwd"),
-        )
-        await _set_status(agent_id, "error")
+            await _set_status(agent_id, "idle")
+        else:
+            # Log the full traceback to stdout so Zeabur captures it;
+            # the event only carries a summary so the UI doesn't drown
+            # in stack frames, but operators can correlate via the
+            # timestamp.
+            logger.exception(
+                "run_agent failed: agent=%s cwd=%s",
+                agent_id, options_kwargs.get("cwd"),
+            )
+            # Friendlier message when a ProcessError was caused by the
+            # model invoking a tool we didn't allow: the CLI exits 1
+            # with stderr swallowed, which is opaque. We can spot this
+            # case by looking at the last tool_use this turn and
+            # checking whether it's in the `allowed` list we passed to
+            # the SDK. Any other exception path falls through to the
+            # original summary.
+            err_msg = f"{type(e).__name__}: {e}"
+            last_tool = turn_ctx.get("last_tool")
+            if is_process_err and last_tool and last_tool not in allowed:
+                err_msg = (
+                    f"Agent tried to use tool '{last_tool}' but it is "
+                    f"not in allowed_tools for this role. Add it via "
+                    f"Options → Team tools or server/tools.py. "
+                    f"Original error: {err_msg}"
+                )
+            await _emit(
+                agent_id,
+                "error",
+                error=err_msg,
+                cwd=options_kwargs.get("cwd"),
+            )
+            await _set_status(agent_id, "error")
     else:
         await _set_status(agent_id, "idle")
     finally:

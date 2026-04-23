@@ -4062,7 +4062,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
                 : "Unlocked — Coach can assign work and broadcast. Click to lock (this agent becomes human-only)."}
               dangerouslySetInnerHTML=${{ __html: agent?.locked
                 ? `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="9" width="11" height="8" rx="1.2"/><path d="M7 9V6.5a3 3 0 0 1 6 0V9"/></svg>`
-                : `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="9" width="11" height="8" rx="1.2"/><path d="M7 9V6 A3 3 0 0 1 14 4.5"/></svg>` }}
+                : `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="9" width="11" height="8" rx="1.2"/><path d="M13 9V6 A3 3 0 0 0 6 4.5"/></svg>` }}
             ></button>`
           : null}
         ${agent?.session_id
