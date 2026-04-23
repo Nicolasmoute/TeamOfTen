@@ -535,7 +535,16 @@ async def run_agent(
         await _emit(agent_id, "agent_stopped")
         raise
     except Exception as e:
-        await _emit(agent_id, "error", error=f"{type(e).__name__}: {e}")
+        # Log the full traceback to stdout so Zeabur captures it; the
+        # event only carries a summary so the UI doesn't drown in stack
+        # frames, but operators can correlate via the timestamp.
+        logger.exception("run_agent failed: agent=%s cwd=%s", agent_id, options_kwargs.get("cwd"))
+        await _emit(
+            agent_id,
+            "error",
+            error=f"{type(e).__name__}: {e}",
+            cwd=options_kwargs.get("cwd"),
+        )
         await _set_status(agent_id, "error")
     else:
         await _set_status(agent_id, "idle")

@@ -76,9 +76,23 @@ def get_status() -> dict[str, object]:
 
 
 async def ensure_workspaces() -> dict[str, object]:
-    """Idempotent setup. Called once at startup. Returns status dict."""
+    """Idempotent setup. Called once at startup. Returns status dict.
+
+    Even when no project repo is configured we still need a real cwd
+    for each slot — the Claude Agent SDK passes cwd to subprocess,
+    which ENOENTs before it can even print a useful error when the
+    path is missing. So mkdir the plain dirs unconditionally.
+    """
+    for slot in SLOT_IDS:
+        try:
+            (WORKSPACES_ROOT / slot).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            logger.exception("workspaces: mkdir failed for %s", slot)
+
     if not project_configured():
-        logger.info("workspaces: HARNESS_PROJECT_REPO unset; staying with plain dirs")
+        logger.info(
+            "workspaces: HARNESS_PROJECT_REPO unset; created plain /workspaces/<slot>/ dirs"
+        )
         return {"configured": False}
 
     status: dict[str, object] = {
