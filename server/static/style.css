@@ -146,6 +146,18 @@ body {
   line-height: 1;
 }
 .env-close:hover { color: var(--fg); }
+.env-export {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+  margin-left: auto;
+}
+.env-export:hover { color: var(--fg); }
+.env-export:disabled { opacity: 0.3; cursor: not-allowed; }
 .env-body {
   flex: 1 1 auto;
   overflow-y: auto;

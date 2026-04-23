@@ -83,6 +83,73 @@ function flatSlots(openColumns) {
   return out;
 }
 
+// Serialize a pane's events to markdown. Used by per-pane export (↓)
+// and whole-team export. `events` may include __result pairings; if
+// not, tool_use/tool_result render separately.
+function formatEventsAsMarkdown(events, { slot, agent, headingLevel = 1 } = {}) {
+  const h = "#".repeat(headingLevel);
+  const h2 = "#".repeat(headingLevel + 1);
+  const lines = [];
+  const name = agent?.name ? ` — ${agent.name}` : "";
+  const role = agent?.role ? ` (${agent.role})` : "";
+  lines.push(`${h} ${slot}${name}${role}`);
+  lines.push(`Events: ${events.length}`);
+  lines.push("");
+  for (const ev of events) {
+    const ts = (ev.ts || "").slice(0, 19).replace("T", " ");
+    lines.push(`${h2} [${ts}] ${ev.type}`);
+    if (ev.type === "agent_started") {
+      lines.push("", "> " + (ev.prompt || "").split("\n").join("\n> "));
+    } else if (ev.type === "text") {
+      lines.push("", ev.content || "");
+    } else if (ev.type === "tool_use") {
+      lines.push("", "**" + (ev.name || "tool") + "**");
+      lines.push("```json");
+      lines.push(JSON.stringify(ev.input || {}, null, 2));
+      lines.push("```");
+      if (ev.__result) {
+        const body = typeof ev.__result.content === "string"
+          ? ev.__result.content
+          : JSON.stringify(ev.__result.content || "");
+        lines.push(ev.__result.is_error ? "*(error)*" : "");
+        lines.push("```");
+        lines.push(body.slice(0, 4000));
+        lines.push("```");
+      }
+    } else if (ev.type === "tool_result") {
+      const body = typeof ev.content === "string" ? ev.content : JSON.stringify(ev.content || "");
+      lines.push("", "```");
+      lines.push(body.slice(0, 4000));
+      lines.push("```");
+    } else if (ev.type === "result") {
+      lines.push("", `_duration ${ev.duration_ms || "?"} ms · cost $${(ev.cost_usd || 0).toFixed(4)}${ev.session_id ? " · session " + ev.session_id : ""}_`);
+    } else if (ev.type === "error") {
+      lines.push("", "```");
+      lines.push(ev.error || "");
+      lines.push("```");
+    } else {
+      const { ts: _t, agent_id: _a, type: _ty, __id: _i, __result: _r, ...rest } = ev;
+      lines.push("", "```json");
+      lines.push(JSON.stringify(rest, null, 2));
+      lines.push("```");
+    }
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+function downloadMarkdown(filename, content) {
+  const blob = new Blob([content], { type: "text/markdown" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
 // Split.js size persistence. Sizes are keyed by layout structure so
 // user-dragged widths survive no-op re-renders but reset sensibly
 // when the layout changes structurally (add / remove / move a pane).
@@ -722,6 +789,7 @@ function App() {
             agents=${agents}
             tasks=${tasks}
             conversations=${conversations}
+            openSlots=${openSlots}
             serverStatus=${serverStatus}
             onCreateTask=${createHumanTask}
             onClose=${() => setEnvOpen(false)}
@@ -997,11 +1065,54 @@ function SettingsDrawer({ onClose, serverStatus }) {
 // environment pane (right side): tasks + cost + timeline
 // ------------------------------------------------------------------
 
-function EnvPane({ agents, tasks, conversations, serverStatus, onCreateTask, onClose }) {
+function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, onCreateTask, onClose }) {
+  const [exporting, setExporting] = useState(false);
+
+  const exportTeam = useCallback(async () => {
+    if (exporting || !openSlots || openSlots.length === 0) return;
+    setExporting(true);
+    try {
+      const sections = [];
+      for (const slot of openSlots) {
+        try {
+          const res = await authFetch(
+            `/api/events?agent=${encodeURIComponent(slot)}&limit=500`
+          );
+          if (!res.ok) continue;
+          const data = await res.json();
+          const events = (data.events || []).map(unwrapPersisted);
+          const agent = agents.find((a) => a.id === slot);
+          sections.push(
+            formatEventsAsMarkdown(events, { slot, agent, headingLevel: 2 })
+          );
+        } catch (e) {
+          console.error("team export: pane fetch failed", slot, e);
+        }
+      }
+      const header = [
+        "# Team of Ten — conversation export",
+        `Exported ${new Date().toISOString()}`,
+        `Panes: ${openSlots.join(", ")}`,
+        "",
+      ].join("\n");
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      downloadMarkdown(`team-${stamp}.md`, header + sections.join("\n---\n\n"));
+    } finally {
+      setExporting(false);
+    }
+  }, [exporting, openSlots, agents]);
+
   return html`
     <aside class="env-pane">
       <header class="env-head">
         <span class="env-title">Environment</span>
+        <button
+          class="env-export"
+          onClick=${exportTeam}
+          disabled=${exporting || !openSlots || openSlots.length === 0}
+          title=${"Export all open panes as a single markdown file"
+            + (openSlots && openSlots.length > 0 ? ` (${openSlots.length} pane${openSlots.length > 1 ? "s" : ""})` : "")}
+        >${exporting ? "…" : "↓"}</button>
         <button class="env-close" onClick=${onClose} title="Collapse">×</button>
       </header>
       <div class="env-body">
@@ -2034,65 +2145,10 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
   );
 
   const exportMarkdown = useCallback(() => {
-    const lines = [];
-    const name = agent?.name ? ` — ${agent.name}` : "";
-    const role = agent?.role ? ` (${agent.role})` : "";
-    lines.push(`# ${slot}${name}${role}`);
-    lines.push(`Exported ${new Date().toISOString()}`);
-    lines.push(`Events: ${allEvents.length}`);
-    lines.push("");
-    for (const ev of allEvents) {
-      const ts = (ev.ts || "").slice(0, 19).replace("T", " ");
-      lines.push(`## [${ts}] ${ev.type}`);
-      if (ev.type === "agent_started") {
-        lines.push("", "> " + (ev.prompt || "").split("\n").join("\n> "));
-      } else if (ev.type === "text") {
-        lines.push("", ev.content || "");
-      } else if (ev.type === "tool_use") {
-        lines.push("", "**" + (ev.name || "tool") + "**");
-        lines.push("```json");
-        lines.push(JSON.stringify(ev.input || {}, null, 2));
-        lines.push("```");
-        if (ev.__result) {
-          const body = typeof ev.__result.content === "string"
-            ? ev.__result.content
-            : JSON.stringify(ev.__result.content || "");
-          lines.push(ev.__result.is_error ? "*(error)*" : "");
-          lines.push("```");
-          lines.push(body.slice(0, 4000));
-          lines.push("```");
-        }
-      } else if (ev.type === "tool_result") {
-        const body = typeof ev.content === "string" ? ev.content : JSON.stringify(ev.content || "");
-        lines.push("", "```");
-        lines.push(body.slice(0, 4000));
-        lines.push("```");
-      } else if (ev.type === "result") {
-        lines.push("", `_duration ${ev.duration_ms || "?"} ms · cost $${(ev.cost_usd || 0).toFixed(4)}${ev.session_id ? " · session " + ev.session_id : ""}_`);
-      } else if (ev.type === "error") {
-        lines.push("", "```");
-        lines.push(ev.error || "");
-        lines.push("```");
-      } else {
-        // Generic fallback: dump the non-envelope fields.
-        const { ts: _t, agent_id: _a, type: _ty, __id: _i, __result: _r, ...rest } = ev;
-        lines.push("", "```json");
-        lines.push(JSON.stringify(rest, null, 2));
-        lines.push("```");
-      }
-      lines.push("");
-    }
-    const blob = new Blob([lines.join("\n")], { type: "text/markdown" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
+    const body = formatEventsAsMarkdown(allEvents, { slot, agent });
+    const header = `Exported ${new Date().toISOString()}\n\n`;
     const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    a.download = `${slot}-${stamp}.md`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    // Revoke after a tick so the browser has had a chance to download.
-    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    downloadMarkdown(`${slot}-${stamp}.md`, header + body);
   }, [allEvents, slot, agent]);
 
   const displayName = agent?.name || (agent?.kind === "player" ? "unassigned" : slot);
