@@ -794,6 +794,37 @@ function App() {
     });
   }, []);
 
+  // Edge-targeted drop onto a specific anchor pane:
+  //   top    — stack dragged ABOVE anchor in anchor's column
+  //   bottom — stack dragged BELOW anchor in anchor's column
+  //   left   — new column to the LEFT of anchor's column (single pane)
+  //   right  — new column to the RIGHT of anchor's column (single pane)
+  const dropOnPaneEdge = useCallback((dragged, anchor, edge) => {
+    if (dragged === anchor) return;
+    setOpenColumns((prev) => {
+      const without = prev
+        .map((col) => col.filter((s) => s !== dragged))
+        .filter((col) => col.length > 0);
+      const targetCol = without.findIndex((col) => col.includes(anchor));
+      if (targetCol < 0) return [...without, [dragged]];
+      if (edge === "top" || edge === "bottom") {
+        return without.map((col, i) => {
+          if (i !== targetCol) return col;
+          const at = col.indexOf(anchor);
+          const ins = edge === "top" ? at : at + 1;
+          return [...col.slice(0, ins), dragged, ...col.slice(ins)];
+        });
+      }
+      // left / right → brand-new column adjacent to target column
+      const insertAt = edge === "left" ? targetCol : targetCol + 1;
+      return [
+        ...without.slice(0, insertAt),
+        [dragged],
+        ...without.slice(insertAt),
+      ];
+    });
+  }, []);
+
   // DnD drop on the "new column" rail — append as a fresh column.
   const moveToNewColumn = useCallback((slot) => {
     setOpenColumns((prev) => {
@@ -932,8 +963,7 @@ function App() {
                         liveEvents=${conversations.get(slot) || []}
                         openSlots=${openSlots}
                         onClose=${() => closePane(slot)}
-                        onStackBelow=${(otherSlot) => stackBelow(otherSlot, slot)}
-                        onMoveBefore=${(otherSlot) => movePaneBefore(otherSlot, slot)}
+                        onDropEdge=${dropOnPaneEdge}
                         onPopOut=${moveToNewColumn}
                         stacked=${col.length > 1}
                       />`;
@@ -2411,7 +2441,7 @@ function EnvTimelineItem({ event }) {
 // agent pane
 // ------------------------------------------------------------------
 
-function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore, onPopOut, stacked }) {
+function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onDropEdge, onPopOut, stacked }) {
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState([]); // {id, url, path, filename}
   const [submitting, setSubmitting] = useState(false);
@@ -2419,7 +2449,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const [paneSettings, setPaneSettings] = useState(() => loadPaneSettings(slot));
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [dragOver, setDragOver] = useState(false);
+  const [dropEdge, setDropEdge] = useState(null); // 'top' | 'bottom' | 'left' | 'right' | null
   // Prompt history for ↑/↓ navigation (Ctrl/Cmd + arrow).
   const [promptHistory, setPromptHistory] = useState(() => loadPromptHistory(slot));
   const [promptHistoryIdx, setPromptHistoryIdx] = useState(null);
@@ -2444,7 +2474,18 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
     if (!types.includes("application/x-harness-slot")) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
-    setDragOver(true);
+    // Divide the pane into edge zones. Left/right 22% → vertical bar
+    // (new column). Top/bottom half of the middle band → horizontal bar
+    // (stack into this column above/below).
+    const rect = e.currentTarget.getBoundingClientRect();
+    const xf = (e.clientX - rect.left) / rect.width;
+    const yf = (e.clientY - rect.top) / rect.height;
+    let edge;
+    if (xf < 0.22) edge = "left";
+    else if (xf > 0.78) edge = "right";
+    else if (yf < 0.5) edge = "top";
+    else edge = "bottom";
+    setDropEdge(edge);
   }, []);
   const onDragLeave = useCallback((e) => {
     // dragleave fires when the pointer crosses into any child element
@@ -2453,15 +2494,16 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
     // whether the element it entered is still a descendant of us.
     const next = e.relatedTarget;
     if (next && e.currentTarget.contains(next)) return;
-    setDragOver(false);
+    setDropEdge(null);
   }, []);
   const onDrop = useCallback((e) => {
-    setDragOver(false);
+    const edge = dropEdge;
+    setDropEdge(null);
     const dragged = e.dataTransfer.getData("application/x-harness-slot");
-    if (!dragged || dragged === slot) return;
+    if (!dragged || dragged === slot || !edge) return;
     e.preventDefault();
-    if (onMoveBefore) onMoveBefore(dragged);
-  }, [slot, onMoveBefore]);
+    if (onDropEdge) onDropEdge(dragged, slot, edge);
+  }, [slot, dropEdge, onDropEdge]);
 
   // Persist whenever settings change (but not on mount — lazy init
   // already picked up the stored value).
@@ -2713,7 +2755,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
 
   return html`
     <section
-      class=${"pane" + (dragOver ? " drag-over" : "")}
+      class=${"pane" + (dropEdge ? " drop-edge-" + dropEdge : "")}
       id=${"pane-" + slot}
       onDragOver=${onDragOver}
       onDragLeave=${onDragLeave}

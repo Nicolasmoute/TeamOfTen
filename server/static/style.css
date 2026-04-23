@@ -669,14 +669,30 @@ body {
   min-height: 0;
   position: relative;
 }
-.pane.drag-over::before {
+/* Edge-targeted drop indicators. A bright bar shows exactly where the
+   dropped pane will land — top/bottom stacks inside this column, left/
+   right creates a new column next to this one. */
+.pane[class*="drop-edge-"]::before {
+  content: "";
+  position: absolute;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+  pointer-events: none;
+  z-index: 15;
+  border-radius: 2px;
+}
+.pane.drop-edge-top::before    { top: 0;    left: 0; right: 0; height: 4px; }
+.pane.drop-edge-bottom::before { bottom: 0; left: 0; right: 0; height: 4px; }
+.pane.drop-edge-left::before   { top: 0; bottom: 0; left: 0;  width: 4px; }
+.pane.drop-edge-right::before  { top: 0; bottom: 0; right: 0; width: 4px; }
+/* Tint the whole pane slightly so it's obvious it's the target. */
+.pane[class*="drop-edge-"]::after {
   content: "";
   position: absolute;
   inset: 0;
-  border: 2px dashed var(--accent);
-  border-radius: 4px;
+  background: rgba(99, 179, 237, 0.05);
   pointer-events: none;
-  z-index: 15;
+  z-index: 14;
 }
 
 /* Drop zones: invisible strips that highlight while a pane is being
