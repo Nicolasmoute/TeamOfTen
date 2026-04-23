@@ -147,6 +147,29 @@ CREATE TABLE IF NOT EXISTS team_config (
     value        TEXT NOT NULL,
     updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- External MCP servers configured via the UI (alongside the existing
+-- file-based HARNESS_MCP_CONFIG path — DB entries are loaded AFTER
+-- the file so UI edits win on name collision).
+--
+-- config_json: the single-server object pulled from the user's paste
+--   ({ "type": "stdio"|"http", "command": ..., "args": [...], ... }).
+-- allowed_tools_json: JSON array of bare tool names (no mcp__<name>__
+--   prefix). UI-managed; server can't use tools that aren't in here.
+-- enabled: 0/1 — disabled entries are kept but not merged into spawns.
+-- last_ok / last_error / last_tested_at: populated by the test
+--   endpoint + the periodic health loop.
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    name             TEXT PRIMARY KEY,
+    config_json      TEXT NOT NULL,
+    allowed_tools_json TEXT NOT NULL DEFAULT '[]',
+    enabled          INTEGER NOT NULL DEFAULT 1,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    last_ok          INTEGER,
+    last_error       TEXT,
+    last_tested_at   TEXT
+);
 """
 
 # Seed agents — idempotent via INSERT OR IGNORE.

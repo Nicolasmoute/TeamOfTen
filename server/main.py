@@ -897,6 +897,379 @@ async def set_team_tools(req: TeamToolsWrite) -> dict[str, object]:
     return {"ok": True, "tools": clean}
 
 
+# ------------------------------------------------------------------
+# MCP external servers (DB-backed, editable from the Settings drawer)
+# ------------------------------------------------------------------
+
+
+def _normalize_mcp_paste(raw: str) -> dict[str, dict[str, Any]]:
+    """Accept one of several paste shapes and return a dict of
+    {server_name: config_dict}. Shapes supported:
+
+      1. Claude-Desktop:   { "mcpServers": { "github": {...}, "notion": {...} } }
+      2. Our file format:  { "servers":    { "github": {...}, "notion": {...} } }
+      3. Flat single:      { "command": "npx", "args": [...], ... }   (name required separately)
+      4. Bare named:       { "github": { "command": ..., ... } }
+
+    For shapes (1) and (2) we return every defined server. For (3) the
+    caller must supply the name. (4) is ambiguous — we treat it as (4)
+    only when every value is a dict-with-command/url and no known
+    reserved keys are present.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("paste is empty")
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        raise ValueError(f"invalid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError("top-level must be a JSON object")
+
+    # (1) Claude-Desktop
+    if "mcpServers" in data and isinstance(data["mcpServers"], dict):
+        return {n: c for n, c in data["mcpServers"].items() if isinstance(c, dict)}
+    # (2) our format
+    if "servers" in data and isinstance(data["servers"], dict):
+        return {n: c for n, c in data["servers"].items() if isinstance(c, dict)}
+    # (3) flat single
+    if "command" in data or "url" in data:
+        return {"__single__": data}
+    # (4) bare named — validate all values look like configs
+    looks_named = all(
+        isinstance(v, dict) and ("command" in v or "url" in v)
+        for v in data.values()
+    )
+    if looks_named and data:
+        return {n: c for n, c in data.items() if isinstance(c, dict)}
+    raise ValueError(
+        "couldn't detect server config shape — expected 'mcpServers', 'servers', "
+        "or a single {command/url, ...} object"
+    )
+
+
+def _validate_mcp_name(name: str) -> None:
+    if not isinstance(name, str) or not name.isidentifier():
+        raise HTTPException(
+            400, detail=f"server name {name!r} must be a python identifier (a-z, 0-9, _)"
+        )
+
+
+def _load_mcp_row(name: str) -> dict[str, Any] | None:
+    import sqlite3
+    from server.db import DB_PATH
+    conn = sqlite3.connect(DB_PATH, timeout=2.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.execute(
+            "SELECT name, config_json, allowed_tools_json, enabled, "
+            "created_at, updated_at, last_ok, last_error, last_tested_at "
+            "FROM mcp_servers WHERE name = ?",
+            (name,),
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["config"] = json.loads(d.pop("config_json") or "{}")
+    except Exception:
+        d["config"] = {}
+    try:
+        d["allowed_tools"] = json.loads(d.pop("allowed_tools_json") or "[]")
+    except Exception:
+        d["allowed_tools"] = []
+    d["enabled"] = bool(d.get("enabled"))
+    d["last_ok"] = None if d.get("last_ok") is None else bool(d["last_ok"])
+    return d
+
+
+class MCPServerSave(BaseModel):
+    paste: str = Field(..., description="Claude-Desktop / file-format / single-config JSON paste.")
+    name: str | None = Field(
+        default=None,
+        description="Required if paste is a single flat config; optional otherwise (names come from the paste).",
+    )
+    allowed_tools: list[str] = Field(
+        default_factory=list,
+        description="Bare tool names (no mcp__<name>__ prefix) to expose. Empty = none until you fill this in.",
+    )
+    enabled: bool = True
+    allow_secrets: bool = Field(
+        default=False,
+        description="Pass true to override the inline-secret warning and save anyway.",
+    )
+
+
+@app.get("/api/mcp/servers", dependencies=[Depends(require_token)])
+async def list_mcp_servers() -> dict[str, object]:
+    """Return every row from mcp_servers, with last-test state."""
+    import sqlite3
+    from server.db import DB_PATH
+    conn = sqlite3.connect(DB_PATH, timeout=2.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.execute(
+            "SELECT name, config_json, allowed_tools_json, enabled, "
+            "created_at, updated_at, last_ok, last_error, last_tested_at "
+            "FROM mcp_servers ORDER BY name"
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["config"] = json.loads(d.pop("config_json") or "{}")
+        except Exception:
+            d["config"] = {}
+        try:
+            d["allowed_tools"] = json.loads(d.pop("allowed_tools_json") or "[]")
+        except Exception:
+            d["allowed_tools"] = []
+        d["enabled"] = bool(d.get("enabled"))
+        d["last_ok"] = None if d.get("last_ok") is None else bool(d["last_ok"])
+        out.append(d)
+    return {"servers": out}
+
+
+@app.post("/api/mcp/servers", dependencies=[Depends(require_token)])
+async def save_mcp_server(req: MCPServerSave) -> dict[str, object]:
+    """Parse a JSON paste and save one or more servers. Returns a
+    summary including per-server secret warnings."""
+    from server.mcp_config import detect_secrets
+    try:
+        parsed = _normalize_mcp_paste(req.paste)
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
+
+    # Rename single-config pastes using the supplied name.
+    if set(parsed.keys()) == {"__single__"}:
+        if not req.name:
+            raise HTTPException(
+                400,
+                detail="paste is a single flat config — supply 'name' alongside it",
+            )
+        parsed = {req.name: parsed["__single__"]}
+
+    # Secret scan on the raw paste — flag BEFORE persisting.
+    warnings = detect_secrets(req.paste)
+    if warnings and not req.allow_secrets:
+        raise HTTPException(
+            400,
+            detail={
+                "secret_warnings": warnings,
+                "hint": "Replace raw tokens with ${VAR} placeholders. "
+                "Re-submit with allow_secrets=true to override.",
+            },
+        )
+
+    # Persist each parsed server. allowed_tools applies to ALL servers
+    # in the paste — callers wanting different lists per server should
+    # save them one at a time.
+    import sqlite3
+    from server.db import DB_PATH
+    saved: list[str] = []
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
+    try:
+        for name, cfg in parsed.items():
+            _validate_mcp_name(name)
+            if not isinstance(cfg, dict):
+                continue
+            conn.execute(
+                "INSERT INTO mcp_servers (name, config_json, allowed_tools_json, enabled) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET "
+                "  config_json = excluded.config_json, "
+                "  allowed_tools_json = excluded.allowed_tools_json, "
+                "  enabled = excluded.enabled, "
+                "  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                (
+                    name,
+                    json.dumps(cfg),
+                    json.dumps(list(req.allowed_tools or [])),
+                    1 if req.enabled else 0,
+                ),
+            )
+            saved.append(name)
+        conn.commit()
+    finally:
+        conn.close()
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "system",
+            "type": "mcp_server_saved",
+            "names": saved,
+        }
+    )
+    return {"ok": True, "saved": saved, "secret_warnings": warnings}
+
+
+class MCPServerPatch(BaseModel):
+    enabled: bool | None = None
+    allowed_tools: list[str] | None = None
+
+
+@app.patch("/api/mcp/servers/{name}", dependencies=[Depends(require_token)])
+async def patch_mcp_server(name: str, req: MCPServerPatch) -> dict[str, object]:
+    """Toggle enabled and/or update the allowed_tools list for an
+    existing row. Leaves config_json alone."""
+    _validate_mcp_name(name)
+    import sqlite3
+    from server.db import DB_PATH
+    updates: list[str] = []
+    params: list[Any] = []
+    if req.enabled is not None:
+        updates.append("enabled = ?")
+        params.append(1 if req.enabled else 0)
+    if req.allowed_tools is not None:
+        clean = [t for t in req.allowed_tools if isinstance(t, str) and t]
+        updates.append("allowed_tools_json = ?")
+        params.append(json.dumps(clean))
+    if not updates:
+        raise HTTPException(400, detail="nothing to update")
+    updates.append("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+    params.append(name)
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
+    try:
+        cur = conn.execute(
+            f"UPDATE mcp_servers SET {', '.join(updates)} WHERE name = ?",
+            params,
+        )
+        changed = cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    if changed == 0:
+        raise HTTPException(404, detail=f"server {name!r} not found")
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "system",
+            "type": "mcp_server_updated",
+            "name": name,
+        }
+    )
+    return {"ok": True}
+
+
+@app.delete("/api/mcp/servers/{name}", dependencies=[Depends(require_token)])
+async def delete_mcp_server(name: str) -> dict[str, object]:
+    _validate_mcp_name(name)
+    import sqlite3
+    from server.db import DB_PATH
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
+    try:
+        cur = conn.execute("DELETE FROM mcp_servers WHERE name = ?", (name,))
+        changed = cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    if changed == 0:
+        raise HTTPException(404, detail=f"server {name!r} not found")
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "system",
+            "type": "mcp_server_deleted",
+            "name": name,
+        }
+    )
+    return {"ok": True}
+
+
+@app.post("/api/mcp/servers/{name}/test", dependencies=[Depends(require_token)])
+async def test_mcp_server(name: str) -> dict[str, object]:
+    """Smoke-test a saved server. For stdio: check the command
+    resolves on $PATH. For http: HEAD the URL. Updates last_ok /
+    last_error / last_tested_at on the row.
+
+    This is NOT a full tool-discovery round-trip — that needs an MCP
+    client we don't bundle yet. It catches the common mis-config
+    modes (wrong npm package name, unreachable URL, typo in command)
+    which accounts for most failures in practice."""
+    _validate_mcp_name(name)
+    row = _load_mcp_row(name)
+    if row is None:
+        raise HTTPException(404, detail=f"server {name!r} not found")
+    cfg = row["config"]
+    # Expand ${VAR} placeholders before probing — otherwise a URL of
+    # "https://host/${TOKEN}" looks bogus.
+    from server.mcp_config import _interpolate
+    cfg = _interpolate(cfg)
+
+    ok: bool = False
+    detail: str = ""
+    kind = (cfg.get("type") or "").lower()
+    if not kind:
+        # Infer from shape.
+        if "command" in cfg:
+            kind = "stdio"
+        elif "url" in cfg:
+            kind = "http"
+    try:
+        if kind == "stdio":
+            command = cfg.get("command") or ""
+            if not command:
+                detail = "no 'command' in config"
+            else:
+                import shutil
+                resolved = shutil.which(command)
+                if resolved:
+                    ok = True
+                    detail = f"command found: {resolved}"
+                else:
+                    detail = f"command {command!r} not on PATH in this container"
+        elif kind == "http":
+            url = cfg.get("url") or ""
+            if not url:
+                detail = "no 'url' in config"
+            else:
+                import httpx
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        r = await client.request("OPTIONS", url)
+                    # Any response at all (even a 4xx) proves the host
+                    # is reachable — many MCP HTTP endpoints reject
+                    # OPTIONS but exist.
+                    ok = True
+                    detail = f"reachable (HTTP {r.status_code})"
+                except Exception as e:
+                    detail = f"connection failed: {type(e).__name__}: {e}"
+        else:
+            detail = f"unknown server type {kind!r} (expected 'stdio' or 'http')"
+    except Exception as e:
+        detail = f"test crashed: {type(e).__name__}: {e}"
+
+    # Persist result.
+    import sqlite3
+    from server.db import DB_PATH
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
+    try:
+        conn.execute(
+            "UPDATE mcp_servers SET last_ok = ?, last_error = ?, "
+            "last_tested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
+            "WHERE name = ?",
+            (1 if ok else 0, None if ok else detail, name),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "system",
+            "type": "mcp_server_tested",
+            "name": name,
+            "ok": ok,
+        }
+    )
+    return {"ok": ok, "detail": detail}
+
+
 class AgentLockWrite(BaseModel):
     locked: bool = Field(..., description="True to lock the agent off from Coach orchestration.")
 

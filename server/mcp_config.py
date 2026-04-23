@@ -54,6 +54,37 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# Common token patterns we should NEVER let land in the DB as raw
+# strings — users should use ${VAR} placeholders pulling from env. The
+# UI save endpoint runs a paste against these and refuses / warns when
+# one matches. Patterns are intentionally loose (prefix + reasonable
+# length) so we catch more than we miss.
+_SECRET_PATTERNS = [
+    (re.compile(r"\bghp_[A-Za-z0-9]{20,}"), "GitHub personal access token"),
+    (re.compile(r"\bgho_[A-Za-z0-9]{20,}"), "GitHub OAuth token"),
+    (re.compile(r"\bghu_[A-Za-z0-9]{20,}"), "GitHub user token"),
+    (re.compile(r"\bsk-[A-Za-z0-9\-_]{20,}"), "API key (Anthropic/OpenAI/…)"),
+    (re.compile(r"\bxoxb-[A-Za-z0-9\-]{20,}"), "Slack bot token"),
+    (re.compile(r"\bxoxp-[A-Za-z0-9\-]{20,}"), "Slack user token"),
+    (re.compile(r"\bAIza[A-Za-z0-9_\-]{30,}"), "Google API key"),
+    # Generic bearer catchall: "Bearer <long opaque thing>". Skipped
+    # when the value still contains a ${VAR} placeholder.
+    (re.compile(r"Bearer\s+(?!\$\{)[A-Za-z0-9\-_\.=]{20,}"), "bearer token"),
+]
+
+
+def detect_secrets(text: str) -> list[str]:
+    """Scan `text` for likely secrets and return a list of human-readable
+    hits. Empty list = clean. Used by the save endpoint to warn before
+    persisting a paste with inlined credentials."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for pat, label in _SECRET_PATTERNS:
+        if pat.search(text) and label not in seen:
+            out.append(label)
+            seen.add(label)
+    return out
+
 logger = logging.getLogger("harness.mcp_config")
 if not logger.handlers:
     h = logging.StreamHandler(sys.stdout)
@@ -94,18 +125,9 @@ def _config_path() -> Path | None:
     return Path(raw)
 
 
-def load_external_servers() -> tuple[dict[str, Any], list[str]]:
-    """Load the MCP config file.
-
-    Returns (servers_dict, allowed_tool_names).
-    - servers_dict: {name: sdk-compatible config dict} — ready to pass
-      as ClaudeAgentOptions.mcp_servers alongside our in-process coord.
-    - allowed_tool_names: list of fully-qualified tool names
-      ('mcp__<server>__<tool>') to extend ALLOWED_*_TOOLS.
-
-    Returns ({}, []) when the config is missing, unreadable, or empty.
-    Never raises — an MCP misconfig should not block the harness.
-    """
+def _load_from_file() -> tuple[dict[str, Any], list[str]]:
+    """Load servers+allow-list from HARNESS_MCP_CONFIG, if configured.
+    Returns ({}, []) on missing / parse-error / wrong shape."""
     path = _config_path()
     if path is None:
         return {}, []
@@ -159,6 +181,83 @@ def load_external_servers() -> tuple[dict[str, Any], list[str]]:
             if not isinstance(t, str) or not t:
                 continue
             tool_names.append(f"mcp__{name}__{t}")
+    return servers_out, tool_names
+
+
+def _load_from_db() -> tuple[dict[str, Any], list[str]]:
+    """Load enabled MCP servers + their allowed tools from the
+    `mcp_servers` table. Returns ({}, []) on DB error / missing table
+    (tests using a bare in-memory DB hit that path)."""
+    try:
+        import sqlite3
+        from server.db import DB_PATH
+    except Exception:
+        return {}, []
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=2.0)
+        try:
+            cur = conn.execute(
+                "SELECT name, config_json, allowed_tools_json "
+                "FROM mcp_servers WHERE enabled = 1"
+            )
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        # Table may not exist (pre-migration DB) or DB locked —
+        # both fine; file-based config still works.
+        return {}, []
+    servers_out: dict[str, Any] = {}
+    tool_names: list[str] = []
+    for name, config_json, allowed_json in rows:
+        if not isinstance(name, str) or not name.isidentifier():
+            logger.warning("mcp_config: DB server %r has invalid name, skipping", name)
+            continue
+        try:
+            cfg = json.loads(config_json or "{}")
+        except Exception:
+            logger.warning("mcp_config: DB server %r config_json is not valid JSON", name)
+            continue
+        if not isinstance(cfg, dict):
+            continue
+        cfg = _interpolate(cfg)
+        try:
+            allowed = json.loads(allowed_json or "[]")
+        except Exception:
+            allowed = []
+        servers_out[name] = cfg
+        for t in allowed or []:
+            if isinstance(t, str) and t:
+                tool_names.append(f"mcp__{name}__{t}")
+    return servers_out, tool_names
+
+
+def load_external_servers() -> tuple[dict[str, Any], list[str]]:
+    """Load MCP servers from both HARNESS_MCP_CONFIG (file) and the
+    mcp_servers DB table. DB entries are loaded SECOND so a UI-managed
+    server overrides a file-based one with the same name.
+
+    Returns (servers_dict, allowed_tool_names).
+    - servers_dict: {name: sdk-compatible config dict} — ready to pass
+      as ClaudeAgentOptions.mcp_servers alongside our in-process coord.
+    - allowed_tool_names: list of fully-qualified tool names
+      ('mcp__<server>__<tool>') to extend ALLOWED_*_TOOLS.
+
+    Never raises — an MCP misconfig should not block the harness.
+    """
+    file_servers, file_tools = _load_from_file()
+    db_servers, db_tools = _load_from_db()
+
+    # DB wins on name collision. Drop file-based tools for any server
+    # that the DB redefines so the two allow-lists don't leak.
+    servers_out: dict[str, Any] = dict(file_servers)
+    tool_names: list[str] = [
+        t for t in file_tools
+        # Filter: split prefix, check server name isn't overridden by DB.
+        if not any(t.startswith(f"mcp__{name}__") for name in db_servers)
+    ]
+    servers_out.update(db_servers)
+    tool_names.extend(db_tools)
 
     if servers_out:
         logger.info(

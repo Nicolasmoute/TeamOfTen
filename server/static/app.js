@@ -1765,6 +1765,246 @@ function TeamModelsSection() {
   </section>`;
 }
 
+// MCP server configuration. Paste a Claude-Desktop-style JSON
+// snippet; parse + detect server name(s); save to the DB. Each saved
+// server gets a row with status dot + enable/disable/delete/test. The
+// loader in server/mcp_config.py merges this with any HARNESS_MCP_CONFIG
+// file — DB wins on name collision.
+function MCPServersSection() {
+  const [servers, setServers] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [paste, setPaste] = useState("");
+  const [pasteName, setPasteName] = useState("");
+  const [pasteTools, setPasteTools] = useState("");
+  const [allowSecrets, setAllowSecrets] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState(null);    // { kind: "ok"|"err", text }
+  const [testing, setTesting] = useState(null);  // server name currently under test
+
+  const reload = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/mcp/servers");
+      if (res.ok) {
+        const data = await res.json();
+        setServers(Array.isArray(data.servers) ? data.servers : []);
+      }
+    } catch (e) {
+      console.error("mcp list failed", e);
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+
+  const save = useCallback(async () => {
+    setSaving(true);
+    setMsg(null);
+    try {
+      const body = {
+        paste,
+        name: pasteName.trim() || null,
+        allowed_tools: pasteTools
+          .split(/[,\s]+/)
+          .map((t) => t.trim())
+          .filter(Boolean),
+        enabled: true,
+        allow_secrets: allowSecrets,
+      };
+      const res = await authFetch("/api/mcp/servers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setMsg({
+          kind: "ok",
+          text: "saved: " + (data.saved || []).join(", ") +
+            ((data.secret_warnings || []).length
+              ? "  (ignored secret warning: " + data.secret_warnings.join(", ") + ")"
+              : ""),
+        });
+        setPaste("");
+        setPasteName("");
+        setPasteTools("");
+        setAllowSecrets(false);
+        await reload();
+      } else {
+        let detail;
+        try {
+          const data = await res.json();
+          detail = typeof data.detail === "string"
+            ? data.detail
+            : JSON.stringify(data.detail);
+        } catch (_) {
+          detail = "HTTP " + res.status;
+        }
+        setMsg({ kind: "err", text: detail });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    } finally {
+      setSaving(false);
+    }
+  }, [paste, pasteName, pasteTools, allowSecrets, reload]);
+
+  const toggle = useCallback(async (name, enabled) => {
+    await authFetch("/api/mcp/servers/" + encodeURIComponent(name), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    await reload();
+  }, [reload]);
+
+  const saveTools = useCallback(async (name, toolsStr) => {
+    const tools = toolsStr.split(/[,\s]+/).map((t) => t.trim()).filter(Boolean);
+    await authFetch("/api/mcp/servers/" + encodeURIComponent(name), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ allowed_tools: tools }),
+    });
+    await reload();
+  }, [reload]);
+
+  const remove = useCallback(async (name) => {
+    if (!confirm("Delete MCP server '" + name + "'? Can be re-added from paste."))
+      return;
+    await authFetch("/api/mcp/servers/" + encodeURIComponent(name), {
+      method: "DELETE",
+    });
+    await reload();
+  }, [reload]);
+
+  const test = useCallback(async (name) => {
+    setTesting(name);
+    try {
+      await authFetch("/api/mcp/servers/" + encodeURIComponent(name) + "/test", {
+        method: "POST",
+      });
+      await reload();
+    } finally {
+      setTesting(null);
+    }
+  }, [reload]);
+
+  return html`<section class="drawer-section">
+    <h3>MCP servers</h3>
+    <p class="muted" style="margin: 0 0 6px 0; font-size: 12px;">
+      Paste a server config from the provider's docs (Claude-Desktop
+      style — or our <code>{servers, allowed_tools}</code> format).
+      Keep secrets in env vars and reference them as
+      <code>\${VAR}</code> — raw tokens get rejected unless you tick
+      the override box.
+    </p>
+    <textarea
+      placeholder=${"{\n  \"mcpServers\": {\n    \"github\": {\n      \"command\": \"npx\",\n      \"args\": [\"-y\", \"@modelcontextprotocol/server-github\"],\n      \"env\": {\"GITHUB_PERSONAL_ACCESS_TOKEN\": \"\${GITHUB_TOKEN}\"}\n    }\n  }\n}"}
+      value=${paste}
+      onInput=${(e) => setPaste(e.target.value)}
+      rows=${8}
+      style="width: 100%; font-family: ui-monospace, monospace; font-size: 11px; background: #10131a; color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 6px 8px; resize: vertical;"
+    />
+    <div style="display: flex; gap: 8px; margin: 4px 0; flex-wrap: wrap;">
+      <input
+        placeholder="name (required for flat pastes)"
+        value=${pasteName}
+        onInput=${(e) => setPasteName(e.target.value)}
+        style="flex: 1; min-width: 120px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 3px 6px; font-size: 12px;"
+      />
+      <input
+        placeholder="allowed tools (comma-separated; e.g. create_issue, list_issues)"
+        value=${pasteTools}
+        onInput=${(e) => setPasteTools(e.target.value)}
+        style="flex: 2; min-width: 180px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 3px 6px; font-size: 12px;"
+      />
+    </div>
+    <div style="display: flex; gap: 10px; align-items: center; margin: 4px 0;">
+      <label style="font-size: 11px; color: var(--muted);">
+        <input
+          type="checkbox"
+          checked=${allowSecrets}
+          onChange=${(e) => setAllowSecrets(e.target.checked)}
+        />
+        save even if secrets detected
+      </label>
+      <button
+        class="primary"
+        disabled=${saving || !paste.trim()}
+        onClick=${save}
+      >${saving ? "saving…" : "save"}</button>
+    </div>
+    ${msg
+      ? html`<div style=${"font-size: 11px; margin: 4px 0; padding: 4px 8px; border-radius: 3px; " + (msg.kind === "ok"
+            ? "color: var(--ok); border: 1px solid var(--ok); background: rgba(63,185,80,0.08);"
+            : "color: var(--err); border: 1px solid var(--err); background: rgba(248,81,73,0.08); white-space: pre-wrap;")}>${msg.text}</div>`
+      : null}
+    <div style="margin-top: 10px;">
+      ${loaded
+        ? servers.length === 0
+          ? html`<p class="muted" style="font-size: 11px;">No MCP servers configured. Paste one above.</p>`
+          : servers.map((s) => html`<${MCPServerCard}
+              key=${s.name}
+              server=${s}
+              testing=${testing === s.name}
+              onToggle=${(e) => toggle(s.name, e)}
+              onSaveTools=${(t) => saveTools(s.name, t)}
+              onDelete=${() => remove(s.name)}
+              onTest=${() => test(s.name)}
+            />`)
+        : html`<p class="muted">loading…</p>`}
+    </div>
+  </section>`;
+}
+
+function MCPServerCard({ server, testing, onToggle, onSaveTools, onDelete, onTest }) {
+  const [toolsDraft, setToolsDraft] = useState(
+    (server.allowed_tools || []).join(", ")
+  );
+  const toolsDirty = toolsDraft !== (server.allowed_tools || []).join(", ");
+  const dot = server.last_ok === null
+    ? "color: var(--muted);"
+    : server.last_ok
+    ? "color: var(--ok);"
+    : "color: var(--err);";
+  const when = server.last_tested_at
+    ? new Date(server.last_tested_at).toLocaleString()
+    : "never tested";
+  return html`<div style="border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px; margin-bottom: 6px; font-size: 12px; opacity: ${server.enabled ? 1 : 0.6};">
+    <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+      <span style=${"font-size: 14px; " + dot}>●</span>
+      <strong>${server.name}</strong>
+      <span class="muted" style="font-size: 10px;">${when}</span>
+      <span style="margin-left: auto; display: flex; gap: 6px;">
+        <button onClick=${() => onToggle(!server.enabled)}>
+          ${server.enabled ? "disable" : "enable"}
+        </button>
+        <button disabled=${testing} onClick=${onTest}>
+          ${testing ? "testing…" : "test"}
+        </button>
+        <button onClick=${onDelete} style="color: var(--err);">delete</button>
+      </span>
+    </div>
+    ${server.last_error
+      ? html`<pre style="margin: 4px 0 0; padding: 4px 6px; background: #10131a; color: var(--err); border-radius: 3px; font-size: 10px; white-space: pre-wrap;">${server.last_error}</pre>`
+      : null}
+    <div style="margin-top: 6px; display: flex; gap: 6px; align-items: center;">
+      <label class="muted" style="font-size: 11px;">allowed tools</label>
+      <input
+        value=${toolsDraft}
+        onInput=${(e) => setToolsDraft(e.target.value)}
+        placeholder="comma-separated (e.g. create_issue, list_issues)"
+        style="flex: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 2px 5px; font-size: 11px; font-family: ui-monospace, monospace;"
+      />
+      ${toolsDirty
+        ? html`<button onClick=${() => onSaveTools(toolsDraft)}>save</button>`
+        : null}
+    </div>
+    <div class="muted" style="font-size: 10px; margin-top: 4px;">
+      type: ${(server.config && (server.config.type || (server.config.url ? "http" : server.config.command ? "stdio" : "?"))) || "?"}
+    </div>
+  </div>`;
+}
+
 function SettingsDrawer({ onClose, serverStatus }) {
   // A compact row summarizing the live server status: paused, running
   // agents, ws subscribers. Rendered above the health checks so the
@@ -1912,6 +2152,8 @@ function SettingsDrawer({ onClose, serverStatus }) {
           <${TeamToolsSection} />
 
           <${TeamModelsSection} />
+
+          <${MCPServersSection} />
 
           <section class="drawer-section">
             <h3>Layout</h3>
