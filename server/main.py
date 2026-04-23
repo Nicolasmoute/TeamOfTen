@@ -666,6 +666,97 @@ async def set_agent_brief(agent_id: str, req: AgentBriefWrite) -> dict[str, obje
     return {"ok": True, "agent_id": agent_id, "size": len(body)}
 
 
+# Allowed extras the UI can toggle — kept narrow so the human can't
+# paste an arbitrary tool name and get silently rejected by the SDK.
+# Add to this list alongside any new safe-to-expose tool. These are
+# SDK-native names (not role-baseline ones) that are OFF by default.
+_EXTRA_TOOL_WHITELIST = {"WebSearch", "WebFetch"}
+
+
+class AgentToolsWrite(BaseModel):
+    tools: list[str] = Field(
+        default_factory=list,
+        description="Extra SDK tool names to grant this agent (empty = baseline only).",
+    )
+
+
+@app.get("/api/agents/{agent_id}/tools", dependencies=[Depends(require_token)])
+async def get_agent_tools(agent_id: str) -> dict[str, object]:
+    """Return the extra-tools allowlist for this agent along with the
+    menu of toggleable tools so the UI can render checkboxes without a
+    second round-trip."""
+    if not (agent_id == "coach" or (agent_id.startswith("p") and agent_id[1:].isdigit() and 1 <= int(agent_id[1:]) <= 10)):
+        raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT allowed_extra_tools FROM agents WHERE id = ?", (agent_id,)
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    if not row:
+        raise HTTPException(404, detail=f"agent {agent_id} not found")
+    raw = dict(row).get("allowed_extra_tools")
+    current: list[str] = []
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                current = [t for t in parsed if isinstance(t, str)]
+        except Exception:
+            current = []
+    return {
+        "agent_id": agent_id,
+        "tools": current,
+        "available": sorted(_EXTRA_TOOL_WHITELIST),
+    }
+
+
+@app.put("/api/agents/{agent_id}/tools", dependencies=[Depends(require_token)])
+async def set_agent_tools(agent_id: str, req: AgentToolsWrite) -> dict[str, object]:
+    """Replace the extra-tools allowlist for this agent. Entries
+    outside the whitelist are rejected — the UI only offers checkboxes
+    we've vetted, so an out-of-list value likely means a client bug.
+    Takes effect on the next turn.
+    """
+    if not (agent_id == "coach" or (agent_id.startswith("p") and agent_id[1:].isdigit() and 1 <= int(agent_id[1:]) <= 10)):
+        raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
+    # Dedup + sanitize. Order isn't load-bearing (we pass a list to the
+    # SDK, not a set, but duplicates are harmless).
+    clean: list[str] = []
+    seen: set[str] = set()
+    for t in req.tools or []:
+        if not isinstance(t, str) or t in seen:
+            continue
+        if t not in _EXTRA_TOOL_WHITELIST:
+            raise HTTPException(400, detail=f"tool '{t}' not in extras whitelist")
+        clean.append(t)
+        seen.add(t)
+    payload = json.dumps(clean) if clean else None
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "UPDATE agents SET allowed_extra_tools = ? WHERE id = ?",
+            (payload, agent_id),
+        )
+        changed = cur.rowcount
+        await c.commit()
+    finally:
+        await c.close()
+    if changed == 0:
+        raise HTTPException(404, detail=f"agent {agent_id} not found")
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": agent_id,
+            "type": "tools_updated",
+            "tools": clean,
+        }
+    )
+    return {"ok": True, "agent_id": agent_id, "tools": clean}
+
+
 @app.delete("/api/agents/{agent_id}/session", dependencies=[Depends(require_token)])
 async def clear_session(agent_id: str) -> dict[str, object]:
     """Clear agent.session_id so the next run starts fresh context.

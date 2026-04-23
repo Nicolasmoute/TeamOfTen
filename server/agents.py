@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -151,6 +152,11 @@ async def _handle_message(
                 # collapsible card in the UI.
                 await _emit(agent_id, "thinking", content=block.thinking)
             elif isinstance(block, ToolUseBlock):
+                # Stash the attempted tool name so the error handler
+                # in run_agent can recognize disallowed-tool
+                # ProcessErrors and emit a friendlier message.
+                if turn_ctx is not None:
+                    turn_ctx["last_tool"] = block.name
                 await _emit(
                     agent_id, "tool_use",
                     id=block.id, name=block.name, input=block.input,
@@ -457,6 +463,43 @@ async def _get_agent_brief(agent_id: str) -> str | None:
     return v if v else None
 
 
+async def _get_agent_extra_tools(agent_id: str) -> list[str]:
+    """Read agent.allowed_extra_tools — opt-in extra SDK tool names the
+    human granted this slot beyond the role baseline. Merged into the
+    `allowed_tools` list passed to the SDK on every turn.
+
+    Returns an empty list on missing column / parse error / empty value
+    so a bad row can't brick spawning.
+    """
+    if agent_id == "system":
+        return []
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT allowed_extra_tools FROM agents WHERE id = ?", (agent_id,)
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("get_agent_extra_tools failed: agent=%s", agent_id)
+        return []
+    if not row:
+        return []
+    raw = dict(row).get("allowed_extra_tools")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        logger.warning("agent %s: allowed_extra_tools is not valid JSON, ignoring", agent_id)
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [t for t in parsed if isinstance(t, str) and t]
+
+
 async def _set_session_id(agent_id: str, session_id: str | None) -> None:
     """Persist the SDK's session_id for this agent's last turn. Pure
     instrumentation right now — actual resume-from-session-id lands in
@@ -759,6 +802,13 @@ async def run_agent(
     allowed = list(
         ALLOWED_COACH_TOOLS if agent_id == "coach" else ALLOWED_PLAYER_TOOLS
     )
+    # Per-agent extras the human opted into via the pane settings
+    # popover (e.g. WebSearch / WebFetch). Read fresh each spawn so
+    # toggling a checkbox takes effect on the next turn with no
+    # restart. Duplicates from the baseline are harmless.
+    extra_tools = await _get_agent_extra_tools(agent_id)
+    if extra_tools:
+        allowed.extend(extra_tools)
     # External MCP servers (GitHub / Linear / Notion / …) come from
     # HARNESS_MCP_CONFIG. Loaded fresh each spawn so edits to the
     # config file take effect on the next turn with no restart. Empty
@@ -888,10 +938,26 @@ async def run_agent(
         # event only carries a summary so the UI doesn't drown in stack
         # frames, but operators can correlate via the timestamp.
         logger.exception("run_agent failed: agent=%s cwd=%s", agent_id, options_kwargs.get("cwd"))
+        # Friendlier message when a ProcessError was caused by the
+        # model invoking a tool we didn't allow: the CLI exits 1 with
+        # stderr swallowed, which is opaque. We can spot this case by
+        # looking at the last tool_use this turn and checking whether
+        # it's in the `allowed` list we passed to the SDK. Any other
+        # exception path falls through to the original summary.
+        err_msg = f"{type(e).__name__}: {e}"
+        is_process_err = type(e).__name__ == "ProcessError"
+        last_tool = turn_ctx.get("last_tool")
+        if is_process_err and last_tool and last_tool not in allowed:
+            err_msg = (
+                f"Agent tried to use tool '{last_tool}' but it is not in "
+                f"allowed_tools for this role. Add it via the pane "
+                f"settings popover (Extra tools) or server/tools.py to "
+                f"enable. Original error: {err_msg}"
+            )
         await _emit(
             agent_id,
             "error",
-            error=f"{type(e).__name__}: {e}",
+            error=err_msg,
             cwd=options_kwargs.get("cwd"),
         )
         await _set_status(agent_id, "error")

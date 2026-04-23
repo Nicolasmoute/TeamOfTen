@@ -2,6 +2,8 @@ import { h, render } from "https://esm.sh/preact@10";
 import { useState, useEffect, useMemo, useRef, useCallback, useLayoutEffect } from "https://esm.sh/preact@10/hooks";
 import htm from "https://esm.sh/htm@3";
 import Split from "https://esm.sh/split.js@1.6.5";
+import { marked } from "https://esm.sh/marked@12";
+import DOMPurify from "https://esm.sh/dompurify@3";
 import { renderToolCall } from "/static/tools.js";
 
 const html = htm.bind(h);
@@ -309,6 +311,53 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
   const [identitySaving, setIdentitySaving] = useState(false);
   const identityDirty =
     nameDraft !== (initialName || "") || roleDraft !== (initialRole || "");
+  // Extra-tools allowlist — loaded lazily on open so we don't hit the
+  // API until the popover is actually visible. Each toggle PUTs
+  // immediately (small payload, no save button needed).
+  const [extraTools, setExtraTools] = useState([]);     // currently enabled
+  const [extraAvailable, setExtraAvailable] = useState([]); // whitelist from server
+  const [extraSaving, setExtraSaving] = useState(false);
+  useEffect(() => {
+    if (!slot) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await authFetch("/api/agents/" + slot + "/tools");
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (cancelled) return;
+        setExtraTools(Array.isArray(data.tools) ? data.tools : []);
+        setExtraAvailable(Array.isArray(data.available) ? data.available : []);
+      } catch (e) {
+        console.error("tools load failed", e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [slot]);
+  const toggleExtra = useCallback(async (name) => {
+    if (!slot) return;
+    const next = extraTools.includes(name)
+      ? extraTools.filter((t) => t !== name)
+      : [...extraTools, name];
+    setExtraTools(next);       // optimistic
+    setExtraSaving(true);
+    try {
+      const res = await authFetch("/api/agents/" + slot + "/tools", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tools: next }),
+      });
+      if (!res.ok) {
+        // Revert on server reject so the UI doesn't silently lie about state.
+        setExtraTools(extraTools);
+      }
+    } catch (e) {
+      console.error("tools save failed", e);
+      setExtraTools(extraTools);
+    } finally {
+      setExtraSaving(false);
+    }
+  }, [slot, extraTools]);
   const saveIdentity = useCallback(async () => {
     if (!slot) return;
     setIdentitySaving(true);
@@ -427,6 +476,31 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
           ${effort === 0 ? "default" : EFFORT_LABELS[effort - 1]}
         </span>
       </div>
+      ${extraAvailable.length > 0
+        ? html`<div class="pane-settings-row pane-settings-extras">
+            <label class="pane-settings-label">Extra tools</label>
+            <div class="pane-settings-extras-body">
+              ${extraAvailable.map(
+                (name) => html`<label
+                  class="pane-settings-extra-item"
+                  key=${name}
+                  title=${"Allow this agent to call " + name + ". Takes effect on the next turn."}
+                >
+                  <input
+                    type="checkbox"
+                    checked=${extraTools.includes(name)}
+                    disabled=${extraSaving}
+                    onChange=${() => toggleExtra(name)}
+                  />
+                  <span>${name}</span>
+                </label>`
+              )}
+              <div class="pane-settings-hint">
+                Off by default so web tools don't fire unexpectedly. Check to enable for this agent only.
+              </div>
+            </div>
+          </div>`
+        : null}
       <div class="pane-settings-row pane-settings-brief">
         <label class="pane-settings-label">Brief</label>
         <textarea
@@ -480,6 +554,27 @@ function slotShortLabel(slotId) {
 
 function timeStr(iso) {
   return (iso || "").slice(11, 19);
+}
+
+// Markdown renderer for `text` + `thinking` event bodies. Agent output
+// is untrusted (model can emit anything), so we parse with marked and
+// sanitize with DOMPurify before injecting — standard XSS defense.
+// Config: GFM + line-break-on-single-newline so conversational prose
+// reads naturally without forcing blank lines. Called often (every
+// text event), so marked options are set once at module load.
+marked.setOptions({ gfm: true, breaks: true });
+function renderMarkdown(text) {
+  if (!text) return "";
+  try {
+    const raw = marked.parse(text);
+    return DOMPurify.sanitize(raw);
+  } catch (_) {
+    // Fall back to plain-text escaping so a malformed input never
+    // blanks the pane.
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+  }
 }
 
 // "3m ago", "2h ago", "just now" — coarse human-friendly relative time.
@@ -1380,16 +1475,17 @@ function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsCon
   const renderSlot = (a) => {
     if (!a) return null;
     const unread = unreadSlots && unreadSlots.has(a.id);
-    // "active" = the agent has an in-play session (first turn has run,
-    // session_id persisted). Decoupled from pane-open state — Coach
-    // can be running / active while its pane is closed, and closing
-    // a pane no longer greys out the rail button.
-    const active = Boolean(a.session_id) || a.status === "working" || a.status === "waiting";
+    // has-session = the agent has spawned at least once (session_id
+    // persisted) OR is currently running / waiting. Distinguishes an
+    // "off" agent (dormant, has memory) from an "unused" one (never
+    // spawned) via dashed-vs-solid border. Pane-open is a separate
+    // class (.open → blue); the two compose cleanly.
+    const hasSession = Boolean(a.session_id) || a.status === "working" || a.status === "waiting";
     const classes = [
       "slot",
       a.kind,
       a.status || "stopped",
-      active ? "active" : "",
+      hasSession ? "has-session" : "",
       openSlots.includes(a.id) ? "open" : "",
       unread ? "unread" : "",
     ].filter(Boolean).join(" ");
@@ -3487,12 +3583,22 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
         ];
         const list = slot === "coach" ? coach : player;
         // Also fetch /api/health to pick up external MCP servers from
-        // HARNESS_MCP_CONFIG — those tools vary per deploy so they
-        // can't live in a hardcoded list.
-        authFetch("/api/health")
-          .then((r) => r.json())
-          .then((d) => {
-            const ext = d?.checks?.mcp_external;
+        // HARNESS_MCP_CONFIG and /api/agents/<slot>/tools for the
+        // per-agent extras the human toggled on in the pane popover.
+        // Both vary at runtime so they can't live in the hardcoded list.
+        Promise.all([
+          authFetch("/api/health").then((r) => r.json()).catch(() => null),
+          authFetch("/api/agents/" + slot + "/tools").then((r) => r.json()).catch(() => null),
+        ])
+          .then(([health, tools]) => {
+            const extra_lines = [];
+            const extras = Array.isArray(tools?.tools) ? tools.tools : [];
+            if (extras.length > 0) {
+              extra_lines.push("");
+              extra_lines.push("Extras (granted via settings popover):");
+              extra_lines.push("  • " + extras.join(" · "));
+            }
+            const ext = health?.checks?.mcp_external;
             const mcp_lines = [];
             if (ext && !ext.skipped && ext.server_count > 0) {
               mcp_lines.push("");
@@ -3506,12 +3612,11 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
             setInfoText(
               "Tools for " + slot + ":\n" +
               list.map((l) => "• " + l).join("\n") +
+              extra_lines.join("\n") +
               mcp_lines.join("\n")
             );
           })
           .catch(() => {
-            // Fall back to just the hardcoded list if /api/health
-            // errors — better than nothing.
             setInfoText("Tools for " + slot + ":\n" + list.map((l) => "• " + l).join("\n"));
           });
         return true;
@@ -4075,7 +4180,10 @@ function ThinkingItem({ event, ts }) {
       ${ts}  💭 thought ${open ? "▾" : "▸"}  <span class="thinking-sub">${lines} line${lines === 1 ? "" : "s"}</span>
     </div>
     ${open
-      ? html`<div class="event-body thinking-body">${content}</div>`
+      ? html`<div
+          class="event-body thinking-body markdown"
+          dangerouslySetInnerHTML=${{ __html: renderMarkdown(content) }}
+        />`
       : null}
   </div>`;
 }
@@ -4083,8 +4191,12 @@ function ThinkingItem({ event, ts }) {
 // Event types that are pure audit noise in the pane body — they're
 // useful in the DB / EnvPane timeline for debugging ("did my context
 // get picked up?") but shouldn't clutter the conversation view.
+// agent_stopped is redundant with the preceding `result` row (which
+// already carries duration/cost/error); hiding it removes a dangling
+// bare line at the end of every turn.
 const _HIDDEN_EVENT_TYPES = new Set([
   "context_applied",
+  "agent_stopped",
 ]);
 
 function EventItem({ event }) {
@@ -4113,7 +4225,10 @@ function EventItem({ event }) {
   if (type === "text") {
     return html`<div class="event text">
       <div class="event-meta">${ts}</div>
-      <div class="event-body">${event.content || ""}</div>
+      <div
+        class="event-body markdown"
+        dangerouslySetInnerHTML=${{ __html: renderMarkdown(event.content || "") }}
+      />
     </div>`;
   }
 

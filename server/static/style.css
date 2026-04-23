@@ -80,12 +80,14 @@ body {
      green   = Coach (the Captain — always on, overrides gray/blue)
 */
 .slot {
-  --slot-color: var(--muted);               /* gray by default */
-  --slot-fill: rgba(139, 148, 158, 0.12);   /* muted @ 12% */
+  /* Default = UNUSED: never spawned, no session. Dashed border reads
+     as "empty seat". Promoted to solid once .has-session is added. */
+  --slot-color: var(--muted);               /* gray */
+  --slot-fill: transparent;
   width: 32px;
   height: 32px;
   border-radius: 6px;
-  border: 1px solid var(--slot-color);
+  border: 1px dashed var(--slot-color);
   background: var(--slot-fill);
   color: var(--slot-color);
   font: inherit;
@@ -108,33 +110,27 @@ body {
   pointer-events: none;
 }
 
-/* BLUE — agent is ACTIVE: has a live session id (first turn has run)
-   or is working / waiting. Decoupled from pane-open state so closing
-   a pane doesn't grey out the rail button. */
-.slot.active {
+/* OFF — spawned before, now idle. Solid gray frame + faint fill
+   distinguishes from the dashed "unused" default. */
+.slot.has-session {
+  --slot-fill: rgba(139, 148, 158, 0.12);
+  border-style: solid;
+}
+
+/* BLUE — pane is OPEN. The primary "where am I looking" signal. Beats
+   has-session/coach base (same specificity, later wins) but is still
+   overridden by working/error below. */
+.slot.open {
   --slot-color: var(--accent);              /* #58a6ff */
   --slot-fill: rgba(88, 166, 255, 0.14);
-}
-/* Pane-open marker: a small dot at top-right of the slot button.
-   Subtle, doesn't fight the activity color. Visible on top of any
-   state (coach/active/working/error/stopped). */
-.slot.open::after {
-  content: "";
-  position: absolute;
-  top: 3px;
-  left: 3px;
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--fg);
-  opacity: 0.7;
-  pointer-events: none;
+  border-style: solid;
 }
 
 /* AMBER — agent is running a turn. Pulses so it reads as "live". */
 .slot.working {
   --slot-color: var(--warn);                /* #d29922 */
   --slot-fill: rgba(210, 153, 34, 0.18);
+  border-style: solid;
   animation: slot-working-pulse 1.8s ease-in-out infinite;
 }
 @keyframes slot-working-pulse {
@@ -146,14 +142,17 @@ body {
 .slot.error {
   --slot-color: var(--err);                 /* #f85149 */
   --slot-fill: rgba(248, 81, 73, 0.14);
+  border-style: solid;
 }
 
-/* GREEN — Coach. Declared last so it beats .slot.open (equal specificity
-   → later wins). When Coach is running, amber still wins via the more-
-   specific .slot.coach.working rule below. */
-.slot.coach {
+/* GREEN — Coach base color when the pane is NOT open. .slot.open is
+   declared earlier so it wins on pane-open (blue trumps green). When
+   Coach is running, amber still wins via the more-specific
+   .slot.coach.working rule below. */
+.slot.coach:not(.open) {
   --slot-color: var(--ok);                  /* #3fb950 */
   --slot-fill: rgba(63, 185, 80, 0.15);
+  border-style: solid;
 }
 /* Coach + working: amber wins. */
 .slot.coach.working {
@@ -1287,6 +1286,33 @@ body {
   margin-bottom: 2px;
 }
 
+.pane-settings-extras {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+.pane-settings-extras .pane-settings-label { min-width: 0; }
+.pane-settings-extras-body {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  padding: 2px 0;
+}
+.pane-settings-extra-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--fg);
+  cursor: pointer;
+  user-select: none;
+}
+.pane-settings-extra-item input[type="checkbox"] { margin: 0; }
+.pane-settings-extras-body .pane-settings-hint {
+  flex-basis: 100%;
+  margin-top: 2px;
+}
+
 .pane-settings-brief {
   flex-direction: column;
   align-items: stretch;
@@ -1396,6 +1422,99 @@ body {
 .event-body {
   white-space: pre-wrap;
 }
+
+/* Markdown-rendered bodies (text + thinking events). Marked wraps
+   paragraphs in <p>, so we let normal block layout take over and drop
+   the pre-wrap used for plain-text fallback. The element styles below
+   are intentionally conservative — this is a chat pane, not a doc
+   viewer, so we lean on defaults and only tweak what looks wrong
+   inside dark narrow tiles. */
+.event-body.markdown {
+  white-space: normal;
+}
+.event-body.markdown > *:first-child { margin-top: 0; }
+.event-body.markdown > *:last-child  { margin-bottom: 0; }
+.event-body.markdown p {
+  margin: 0 0 8px 0;
+  white-space: pre-wrap;                    /* preserve single-line breaks within a paragraph */
+}
+.event-body.markdown h1,
+.event-body.markdown h2,
+.event-body.markdown h3,
+.event-body.markdown h4 {
+  margin: 10px 0 4px 0;
+  color: var(--fg);
+  font-weight: 600;
+  line-height: 1.25;
+}
+.event-body.markdown h1 { font-size: 16px; }
+.event-body.markdown h2 { font-size: 15px; }
+.event-body.markdown h3 { font-size: 14px; }
+.event-body.markdown h4 { font-size: 13px; }
+.event-body.markdown strong { color: var(--fg); font-weight: 600; }
+.event-body.markdown em     { font-style: italic; }
+.event-body.markdown ul,
+.event-body.markdown ol {
+  margin: 2px 0 8px 0;
+  padding-left: 20px;
+}
+.event-body.markdown li { margin: 1px 0; }
+.event-body.markdown a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.event-body.markdown a:hover { text-decoration: underline; }
+.event-body.markdown code {
+  background: #10131a;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 4px;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.event-body.markdown pre {
+  background: #10131a;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin: 4px 0 8px 0;
+  overflow-x: auto;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.event-body.markdown pre code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font-size: inherit;
+}
+.event-body.markdown blockquote {
+  margin: 4px 0 8px 0;
+  padding: 2px 10px;
+  border-left: 3px solid var(--muted);
+  color: var(--muted);
+}
+.event-body.markdown table {
+  border-collapse: collapse;
+  margin: 4px 0 8px 0;
+  font-size: 12px;
+}
+.event-body.markdown th,
+.event-body.markdown td {
+  border: 1px solid var(--border);
+  padding: 3px 8px;
+  text-align: left;
+}
+.event-body.markdown th { background: #10131a; }
+.event-body.markdown hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 8px 0;
+}
+/* Thinking body stays italic overall — override for code/pre so inline
+   code reads cleanly inside italicized prose. */
+.event.thinking .thinking-body.markdown code,
+.event.thinking .thinking-body.markdown pre { font-style: normal; }
 .event.text { border-color: var(--accent); }
 .event.tool_use { border-color: var(--tool); padding: 4px 10px; }
 

@@ -225,6 +225,11 @@ async def init_db() -> None:
             # remove or re-order.
             for col_name, col_ddl in (
                 ("brief", "ALTER TABLE agents ADD COLUMN brief TEXT"),
+                # JSON array of SDK tool names the human granted this
+                # slot in addition to the role baseline (e.g.
+                # ["WebSearch", "WebFetch"]). NULL / empty = baseline
+                # only. Merged in server.agents.run_agent at spawn.
+                ("allowed_extra_tools", "ALTER TABLE agents ADD COLUMN allowed_extra_tools TEXT"),
             ):
                 try:
                     await db.execute(col_ddl)
