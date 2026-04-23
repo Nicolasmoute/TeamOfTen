@@ -44,7 +44,7 @@ from server.agents import (
 )
 from server import context as ctxmod
 from server import files as filesmod
-from server.db import configured_conn, init_db
+from server.db import configured_conn, crash_recover, init_db
 from server.events import bus
 from server.kdrive import kdrive
 from server.sync import events_trim_loop, flush_loop, snapshot_loop
@@ -108,6 +108,18 @@ ALLOWED_EXT = {"png", "jpg", "jpeg", "gif", "webp"}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    # Crash recovery — reset orphaned state left over from an unclean
+    # shutdown. Happens right after init_db so subsequent reads see
+    # consistent status. Cheap no-op on a clean DB.
+    try:
+        reset = await crash_recover()
+        if reset["agents_reset"] or reset["tasks_reset"]:
+            logger.info(
+                "crash recovery: agents_reset=%d tasks_reset=%d",
+                reset["agents_reset"], reset["tasks_reset"],
+            )
+    except Exception:
+        logger.exception("crash_recover failed (non-fatal)")
     ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
     # Claude CLI credential dir. Set via CLAUDE_CONFIG_DIR in the image
     # so OAuth tokens written by `claude /login` land on the /data

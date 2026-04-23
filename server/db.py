@@ -148,6 +148,33 @@ SEED_AGENTS: list[tuple[str, str, str | None, str | None, str]] = [
 ]
 
 
+async def crash_recover() -> dict[str, int]:
+    """Reset orphaned state left behind by an unclean shutdown.
+
+    If the server died mid-turn, the DB still says agents are
+    `working` and tasks are `in_progress`, but no subprocess is
+    actually running any of that. Reset:
+      - agents.status ∈ {working, waiting} → idle
+      - tasks.status = 'in_progress' → claimed (owner kept so the
+        Player knows what they were doing when next spawned)
+
+    Returns a dict of how many rows were touched for logging. Safe
+    to call repeatedly — a no-op on a clean DB.
+    """
+    async with aiosqlite.connect(DB_PATH, timeout=10.0) as db:
+        cur = await db.execute(
+            "UPDATE agents SET status = 'idle' "
+            "WHERE status IN ('working', 'waiting')"
+        )
+        agents_reset = cur.rowcount
+        cur = await db.execute(
+            "UPDATE tasks SET status = 'claimed' WHERE status = 'in_progress'"
+        )
+        tasks_reset = cur.rowcount
+        await db.commit()
+    return {"agents_reset": agents_reset, "tasks_reset": tasks_reset}
+
+
 async def init_db() -> None:
     """Create schema + seed agents. Called once on FastAPI startup.
 
