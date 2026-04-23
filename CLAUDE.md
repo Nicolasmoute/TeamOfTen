@@ -121,15 +121,60 @@ deployed Zeabur instance — see "What needs verification" below.
    open / close.
 - **Keyboard shortcut** ✓ ⌘/Ctrl+B toggles the EnvPane.
 
+**Post-spec continuous delivery (everything shipped since milestone numbering stopped):**
+- **Auto-wake** ✓ task assignments + direct messages auto-spawn the
+   target's turn with an inline wake prompt. 10 s debounce for chat
+   (prevents ping-pong); bypassed for discrete actions. Cost-cap
+   check short-circuits before a storm of `cost_capped` events.
+- **Stale-session auto-heal** ✓ a `ProcessError` on resume clears
+   `session_id` and retries once — no more manual pane × clicks
+   after `/login` rotation / CLI upgrade.
+- **Per-agent brief** ✓ `agents.brief` column, injected into every
+   turn's system prompt after governance context. Editable via pane
+   settings popover or `PUT /api/agents/{id}/brief`.
+- **Lacrosse auto-naming** ✓ first-spawn picks an unused surname
+   from a ~50-entry pool (Rabil, Powell, Gait, …); race-safe via
+   module-level `asyncio.Lock`.
+- **Turns ledger** ✓ dedicated `turns` table populated on every
+   `ResultMessage`. `GET /api/turns` + `/api/turns/summary` endpoints.
+   Cost-cap check reads this instead of JSON-extracting events.
+- **Fan-out** ✓ inter-agent events (message_sent, task_assigned,
+   task_updated) render in both actor's and target's panes; history
+   reload matches via SQL json_extract.
+- **Retention loops** ✓ events trim (30d default), attachments
+   trim (30d default). Both mirror the pattern, configurable via env.
+- **Crash recovery** ✓ zombie agents.status / tasks.in_progress reset
+   on boot via `crash_recover()`.
+- **Sticky turn headers** ✓ each `agent_started` is a `position:
+   sticky` one-line bar in the pane body.
+- **Token streaming** ✓ opt-in via `HARNESS_STREAM_TOKENS=true`
+   (off by default — some CLI builds crash on the underlying flag).
+- **Compact system renderers** ✓ 15+ event types rendered as
+   single-line `.sys` rows instead of JSON blobs.
+- **Input mode chips + slash commands** ✓ `/plan /model /effort
+   /brief /tools /clear /loop /tick /status /spend /help`. All
+   intercepted locally; unrecognized slashes still fall through.
+- **Files pane** ✓ `__files` special slot with root selector, tree,
+   .md preview/edit toggle. Live-reloads on fs events.
+- **External MCP servers** ✓ `HARNESS_MCP_CONFIG` + server/mcp_config.py
+   +example file in repo root. Health surface reports parse errors.
+- **CI** ✓ GitHub Actions runs pytest on every push. ~113 tests.
+- **Docker HEALTHCHECK** ✓ curls /api/health every 30 s.
+- **OAuth persistence** ✓ `CLAUDE_CONFIG_DIR=/data/claude` so tokens
+   survive Zeabur redeploys.
+- **5-min DB snapshots** ✓ down from hourly, keeps 144 (~12 h).
+- **Runtime Coach loop** ✓ `/loop N` / `/loop off` without restart.
+
 **Next likely:**
 - **Mobile UI polish** — touch-drag doesn't work with HTML5 DnD;
-   layout breakpoints for < 900px need a rethink.
+   layout breakpoints for < 900 px need a rethink.
 - **Pane collapse / minimize** — currently panes are all-or-nothing
    open. A "minimize to header" state would help watching many stacks.
 - **Whole-team conversation export** — combine all open panes into
    one markdown file with agent-prefixed headings.
-- **Test suite** — no pytest yet; the coord tools are small enough to
-   cover quickly.
+- **Task ↔ message link** — schema relation so 're: t-42' queries work.
+- **Coach digest tool** — scheduled weekly summary, dropped into
+   decisions or knowledge.
 
 ## What needs verification (when user is next active)
 
