@@ -482,11 +482,16 @@ def build_coord_server(caller_id: str) -> Any:
         # time.
         try:
             from server.agents import maybe_wake_agent
+            # Task assignment is a discrete action (not conversational)
+            # so bypass the ping-pong debounce — Coach should be able to
+            # push a new task to a Player even if the Player just
+            # finished the previous turn a few seconds ago.
             await maybe_wake_agent(
                 to,
                 f"Coach just assigned you task {task_id}. "
                 f"Use coord_read_inbox + coord_list_tasks to see your work, "
                 f"claim what's yours, and start.",
+                bypass_debounce=True,
             )
         except Exception:
             pass

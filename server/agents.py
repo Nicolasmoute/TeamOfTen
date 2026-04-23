@@ -755,19 +755,28 @@ async def run_agent(
     await _emit(agent_id, "agent_stopped")
 
 
-async def maybe_wake_agent(agent_id: str, reason: str) -> bool:
+async def maybe_wake_agent(
+    agent_id: str,
+    reason: str,
+    *,
+    bypass_debounce: bool = False,
+) -> bool:
     """Spawn a turn for `agent_id` with `reason` as the prompt, if and
     only if all guards pass:
 
       - harness not paused
       - agent not already running (don't stack turns)
       - this agent's previous turn ended more than
-        AUTOWAKE_DEBOUNCE_SECONDS ago (prevents tight ping-pong between
-        Coach ↔ Player when they message each other)
+        AUTOWAKE_DEBOUNCE_SECONDS ago, UNLESS bypass_debounce=True
+
+    The debounce exists to prevent tight Coach↔Player ping-pong when
+    agents chat-reply to each other. Discrete actions (task assignment,
+    human message) are NOT ping-pongy and should wake the target even
+    if they just finished a turn — callers pass bypass_debounce=True
+    for those paths.
 
     Returns True if a spawn was scheduled, False otherwise. Cost caps
-    are enforced inside run_agent itself so we don't duplicate that
-    check here.
+    are enforced inside run_agent itself so we don't duplicate here.
     """
     if agent_id == "system":
         return False
@@ -775,15 +784,16 @@ async def maybe_wake_agent(agent_id: str, reason: str) -> bool:
         return False
     if agent_id in _running_tasks:
         return False
-    last_end = _last_turn_ended_at.get(agent_id, 0.0)
-    if last_end and (time.monotonic() - last_end) < AUTOWAKE_DEBOUNCE_SECONDS:
-        logger.info(
-            "auto-wake skipped: %s ended a turn %.1fs ago (<%ds debounce)",
-            agent_id,
-            time.monotonic() - last_end,
-            AUTOWAKE_DEBOUNCE_SECONDS,
-        )
-        return False
+    if not bypass_debounce:
+        last_end = _last_turn_ended_at.get(agent_id, 0.0)
+        if last_end and (time.monotonic() - last_end) < AUTOWAKE_DEBOUNCE_SECONDS:
+            logger.info(
+                "auto-wake skipped: %s ended a turn %.1fs ago (<%ds debounce)",
+                agent_id,
+                time.monotonic() - last_end,
+                AUTOWAKE_DEBOUNCE_SECONDS,
+            )
+            return False
     logger.info("auto-wake: spawning %s — %s", agent_id, reason[:80])
     asyncio.create_task(run_agent(agent_id, reason))
     return True

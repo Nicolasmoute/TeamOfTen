@@ -788,10 +788,14 @@ async def send_human_message(req: HumanMessageRequest) -> dict[str, Any]:
     if to != "broadcast":
         from server.agents import maybe_wake_agent
         subj = f" (subject: {req.subject})" if req.subject else ""
+        # Human messages are not ping-pongy — the human isn't going to
+        # auto-reply to the agent's reply, so skip the debounce and
+        # wake even if the agent just finished a turn.
         await maybe_wake_agent(
             to,
             f"New message from the human{subj}. "
             f"Use coord_read_inbox to read it and respond.",
+            bypass_debounce=True,
         )
     return {"ok": True, "message_id": msg_id}
 
