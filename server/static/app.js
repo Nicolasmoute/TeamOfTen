@@ -1603,7 +1603,13 @@ function EnvTasksSection({ tasks, onCreate }) {
   const [description, setDescription] = useState("");
   const [priority, setPriority] = useState("normal");
   const [submitting, setSubmitting] = useState(false);
-  const [filterKey, setFilterKey] = useState("active");
+  const [filterKey, setFilterKey] = useState(
+    () => localStorage.getItem("harness_task_filter_v1") || "active"
+  );
+  useEffect(() => {
+    try { localStorage.setItem("harness_task_filter_v1", filterKey); }
+    catch (_) { /* private mode */ }
+  }, [filterKey]);
 
   const submit = useCallback(async (e) => {
     e.preventDefault();
