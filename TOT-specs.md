@@ -1,456 +1,700 @@
-# TeamOfTen — Specs
+# TeamOfTen — Full Specs
 
-A personal orchestration harness for **1 Coach + 10 Player** Claude Code
-agents, sharing state and coordinating through a single FastAPI mono-service.
-This document enumerates the app's behavior as it exists on `main`. It is
-descriptive, not aspirational — every line should match the running code.
+Comprehensive reference for every spec considered since the app's inception. Merges the original design (Docs/HARNESS_SPEC.md) with everything that has actually shipped, plus paths deliberately not taken.
 
-The rule of thumb: **everything below is verifiable against the code in
-the repo**. If you find a gap, it's either a bug, this doc is stale, or
-a "next likely" item in [CLAUDE.md](CLAUDE.md#next-likely).
+**Three companion docs**:
+- **[Docs/HARNESS_SPEC.md](Docs/HARNESS_SPEC.md)** — the original design spec (frozen reference; section numbers preserved here so you can cross-read).
+- **[CLAUDE.md](CLAUDE.md)** — project context for Claude sessions (what's done / next likely / known gotchas).
+- **This doc** — the superset: original intent, evolution, current surface, open questions, scrapped ideas.
 
 ---
 
-## 1. Purpose and shape
+## 1. Vision
 
-- **Team**: exactly 11 agents — 1 Coach (`coach`) + 10 Players (`p1`…`p10`).
-- **Hierarchy**: Coach gives orders; Players execute. Players never give
-  orders to peers — they can message peers for info, but cannot assign.
-- **Single billing**: runs on Max-plan OAuth, one credential shared across
-  all agents. No `ANTHROPIC_API_KEY` code paths.
-- **Single write-handle discipline**: every state mutation (task, message,
-  memory, event) routes through the harness server process, which holds
-  the only SQLite write handle. Agents never write SQLite directly; they
-  call MCP tools.
-- **Per-worktree isolation**: each Player runs in its own git worktree
-  under `/workspaces/<slot>/project/` on branch `work/<slot>`.
+### 1.1 Primary goals (unchanged since day 0)
 
-## 2. Tech stack
+1. **Run 1 Coach + 10 Players in parallel** on a single VPS, all using Claude Agent SDK authenticated via one Max-plan OAuth session. Shared billing; no `ANTHROPIC_API_KEY` path.
+2. **Full transparency** — every agent's activity visible in UI; no hidden orchestration.
+3. **Shared state** — common task board, common memory, direct inter-agent messaging.
+4. **Access anywhere** — tiling multi-pane desktop UI, single-view mobile (mobile polish still pending).
+5. **Disposable VPS** — nothing permanent on the server; durable state on Infomaniak kDrive via WebDAV.
+6. **Easy deploy** — one repo, one service, auto-deploy on push (Zeabur → GitHub main).
+7. **`/loop` friendly** — agents run semi-autonomously with bounded iteration caps; human interjections via inbox.
 
-- Backend: Python 3.12 + FastAPI + WebSocket + aiosqlite, single mono-service
-- Agent runtime: Claude Agent SDK (Python), authenticated via `claude /login`
-- Frontend: Preact 10 + htm + Split.js (no build step; ESM from esm.sh)
-- Hot-path state: SQLite on `/data/harness.db`
-- Durable mirror: kDrive WebDAV — memory docs (live), decisions (live),
-  event log (5-min flush), hourly VACUUM INTO snapshots
-- Deploy: Docker container on Zeabur, auto-pulled from GitHub `main`
-- TLS / ingress: Zeabur (no Caddy)
+### 1.2 Explicit non-goals
 
-## 3. Storage model
+- Multi-user / multi-tenant.
+- API-key billing (the whole point is Max-plan sharing).
+- Enterprise compliance features.
+- Beating Anthropic's Agent Teams — this is specifically **more transparent and less automagical**.
+- Persistent pause state — deliberately in-memory, restart resumes.
+- Automatic `tasks.parent_id` cycle detection at the DB level (defensive `seen` guard in UI walk is enough).
 
-### 3.1 SQLite tables
+---
 
-- `agents` — id, kind, name, role, status, current_task_id, model,
-  workspace_path, session_id, cost_estimate_usd, started_at,
-  last_heartbeat. 11 seed rows inserted idempotently on init.
-- `tasks` — id, title, description, status, owner, created_by, created_at,
-  claimed_at, completed_at, parent_id, priority, tags, artifacts.
-  Status ∈ {open, claimed, in_progress, blocked, done, cancelled}.
-  Priority ∈ {low, normal, high, urgent}.
-- `events` — id, ts, agent_id, type, payload (JSON). The audit log.
-- `messages` — id, from_id, to_id, subject, body, sent_at, read_at,
-  in_reply_to, priority. Priority ∈ {normal, interrupt}.
-- `message_reads` — junction table tracking per-recipient read state for
-  broadcast handling.
-- `memory_docs` — topic PK, content, last_updated, last_updated_by, version.
+## 2. The Team (11 agents, sports metaphor)
 
-### 3.2 kDrive (when configured)
+### 2.1 Roles
 
+| ID | Kind | Name | Role | Default model |
+|----|------|------|------|--------------|
+| `coach` | Coach | fixed: "Coach" | Team captain — decomposes goals, assigns work, synthesizes progress | Sonnet (configurable) |
+| `p1`…`p10` | Players | **assigned by Coach** (e.g. "Alice", "Ravi") | **assigned by Coach** (e.g. "Developer — writes code", "QA — runs tests") | Sonnet, per-pane override |
+
+Player names and roles are written via `coord_set_player_role(player_id, name, role)` (Coach-only). Slots `p1`…`p10` are permanent; names/roles rotate with projects.
+
+### 2.2 The rule: Coach orders, Players report
+
+Two enforcement layers — **soft** (system prompts) and **hard** (structural).
+
+Soft:
+- Coach's system prompt: "you delegate, never implement".
+- Player's: "you execute and report, you do not assign work to peers".
+
+Hard:
+- Only Coach can create top-level tasks. Players can create subtasks only (parent_id must be an owned task).
+- Only Coach can call `coord_set_player_role` and `coord_write_decision`.
+- Only Coach can call `coord_assign_task` (push-assign to a Player).
+- Players are the only kind that can call `coord_commit_push`, `coord_claim_task`.
+- Structural tool permissioning via `ALLOWED_COACH_TOOLS` vs `ALLOWED_PLAYER_TOOLS` in `server/tools.py`.
+
+Messaging (`coord_send_message`) is open to both — Players can inform each other ("finished migration, FYI") but cannot assign work.
+
+### 2.3 Why 10 Players specifically
+
+Max-plan realistic concurrency is lower than 10 for continuous loops. The roster defines *potential* slots, not *always-on* agents. Coach activates the slots it needs — typically 2–5 concurrent during active work.
+
+---
+
+## 3. Tech stack (as deployed)
+
+| Layer | Choice | Rationale |
+|-------|--------|-----------|
+| Agent runtime | Claude Agent SDK (Python) | Programmatic control; Max-plan OAuth; native streaming |
+| Backend | FastAPI + WebSocket + aiosqlite | Single-process, shared in-memory state |
+| Frontend | Preact 10 + htm + Split.js (no build step) | ESM from esm.sh; zero build, fast load |
+| UI state | Local `useState` + `useMemo` (no Zustand) | Simpler than originally spec'd |
+| Hot-path DB | SQLite on `/data/harness.db`, DELETE journal mode | ACID; no race conditions; volume-friendly |
+| Durable mirror | Infomaniak kDrive via WebDAV (webdav4 lib) | Swiss hosting; human-readable; no rclone daemon |
+| Auth to Claude | `claude /login` device-code flow per host | OAuth tokens in OS credential store (NOT `~/.claude.json`) |
+| Auth to UI | Bearer token (`HARNESS_TOKEN`), optional | Personal-use; token gate + localStorage paste UX |
+| Deploy | Docker container on Zeabur, auto-pulled from GitHub `main` | No Caddy needed (Zeabur handles TLS) |
+
+### 3.1 Deviations from the original spec
+
+| Original | Shipped | Why |
+|----------|---------|-----|
+| React + react-mosaic + Vite | Preact + htm + Split.js | No build step; simpler |
+| Zustand for state | Plain React hooks | Scope didn't justify a store |
+| Docker Compose (app + Caddy) | Single Dockerfile on Zeabur | Zeabur owns ingress / TLS |
+| `~/.claude.json` copy script | `claude /login` device-code per host | M-1 spike proved OAuth tokens aren't in that file |
+| `curl https://claude.ai/install.sh` | `npm install -g @anthropic-ai/claude-code` | Zeabur EU region 403s the install.sh host |
+| `workspaces/` gitignored plain dirs | Per-Player git worktrees under `/workspaces/<slot>/project/` on `work/<slot>` branches | M4 design |
+| One-tier WebDAV state | Two-tier: SQLite hot + kDrive durable | WebDAV too slow/race-prone for 11 concurrent writers |
+| Tailscale-only deploy | Public Zeabur deploy + optional bearer token | Switched preference pre-M0 |
+
+---
+
+## 4. Data model
+
+All stored in SQLite. In-memory representations are plain dicts (we dropped the pydantic models from the original spec — SQLite rows + Pydantic request validators are enough).
+
+### 4.1 Agent
+
+Columns: `id`, `kind ∈ {coach, player}`, `name`, `role`, `status ∈ {stopped, idle, working, waiting, error}`, `current_task_id`, `model` (default `claude-sonnet-4-6`), `workspace_path`, `session_id`, `cost_estimate_usd`, `started_at`, `last_heartbeat`.
+
+11 seed rows on init (idempotent): `coach` + `p1`…`p10`.
+
+### 4.2 Task
+
+Columns: `id`, `title`, `description`, `status ∈ {open, claimed, in_progress, blocked, done, cancelled}`, `owner` (FK agents.id), `created_by` (`'human'` or agent id), `created_at`, `claimed_at`, `completed_at`, `parent_id` (FK tasks.id), `priority ∈ {low, normal, high, urgent}`, `tags` (JSON array), `artifacts` (JSON array).
+
+Indexed on status / owner / parent_id.
+
+### 4.3 Message
+
+Columns: `id AUTOINC`, `from_id` (agent id or `'human'`), `to_id` (agent id or `'broadcast'`), `subject`, `body`, `sent_at`, `read_at` (legacy; unused after v0.4.1), `in_reply_to`, `priority ∈ {normal, interrupt}`.
+
+### 4.4 Message reads (broadcast tracking)
+
+Junction table `(message_id, agent_id)` with `read_at`. Needed because one broadcast has N recipients — a single `read_at` on the message itself would fire the first time any recipient drains.
+
+### 4.5 Event
+
+Columns: `id AUTOINC`, `ts`, `agent_id`, `type`, `payload` (JSON blob).
+
+Append-only; the audit log. Full event-type enumeration lives in §7.2.
+
+### 4.6 Memory doc
+
+Columns: `topic PK`, `content`, `last_updated`, `last_updated_by`, `version`.
+
+Topic validated by `MEMORY_TOPIC_RE = r"^[a-z0-9][a-z0-9\-]{0,63}$"` — prevents path traversal when the same topic names a file on kDrive.
+
+### 4.7 Locks (deferred)
+
+Originally spec'd; not implemented. Per-worktree isolation covers the primary need. If re-added later, filename: `/state/locks.json` on kDrive or a `locks` table.
+
+---
+
+## 5. Storage layout
+
+### 5.1 Two-tier: hot SQLite + durable kDrive
+
+**Hot state (single source of truth)**: SQLite on `/data/harness.db`. All 11 agents' tool calls write through the harness server process (see §6.1).
+
+**Durable mirror (kDrive, when configured)**:
 - `memory/<topic>.md` — mirrors every `coord_update_memory` synchronously.
-- `decisions/<date>-<slug>.md` — append-only architectural records.
-- `events/<YYYY-MM-DD>.jsonl` — today's events, flushed every 5 min.
-  During UTC 00:00–02:00 yesterday's file is re-flushed for boundary safety.
-- `snapshots/<ts>.db` — hourly `VACUUM INTO` of the full DB. Retention
-  capped at `HARNESS_KDRIVE_SNAPSHOT_RETENTION` (default 48).
+- `decisions/<date>-<slug>.md` — append-only architectural records, Coach-only via `coord_write_decision`.
+- `events/<YYYY-MM-DD>.jsonl` — today's events flushed every 5 min (`HARNESS_KDRIVE_FLUSH_INTERVAL`). During UTC 00:00–02:00 yesterday's file is re-flushed so late events don't get lost at the day boundary.
+- `snapshots/<ts>.db` — hourly `VACUUM INTO` of the full DB. Retention capped at `HARNESS_KDRIVE_SNAPSHOT_RETENTION` (default 48 ≈ 2 days hourly).
 
-## 4. Agent lifecycle
+### 5.2 Why not one-tier WebDAV
 
-### 4.1 Per-turn flow (`run_agent`)
+WebDAV is too slow and race-prone under 11 concurrent writers. Original spec intended `tasks.json` / `agents.json` / per-agent inboxes on kDrive directly; early design showed this failing under contention.
 
-1. **Global pause check** — if the harness is paused, emit `paused` and
-   return.
-2. **Cost cap check** — per-agent and team daily caps. On breach, emit
-   `cost_capped` and return.
-3. Emit `agent_started` (carrying `resumed_session: bool`); set status to
-   `working`.
-4. Read prior `session_id` from agents table; pass to SDK as `resume=...`
-   if non-null so the conversation continues.
-5. Build `ClaudeAgentOptions` with `cwd=/workspaces/<slot>`, `max_turns=10`,
-   MCP `coord` server (per-caller tool identity), tool allowlist by kind
-   (Coach: read + coord; Player: read + write + coord).
-6. Stream messages: `text`, `tool_use`, `tool_result` surface as events;
-   `result` records duration + cost + session_id, persists session_id and
-   accumulates cost_estimate_usd.
-7. Register task in `_running_tasks[slot]` so the cancel endpoint can abort.
-8. On `asyncio.CancelledError`: emit `agent_cancelled`, set status `idle`,
-   re-raise (task ends cancelled).
-9. On other exceptions: emit `error`, set status `error`.
-10. On clean exit: set status `idle`, emit `agent_stopped`.
+### 5.3 Memory is scratchpad (intentionally no history)
 
-### 4.2 Per-turn overrides
+If history matters, the event log (`memory_updated` events) has the audit. Decisions is the append-only durable record; memory is the "living now" commons.
 
-Sent via `POST /api/agents/start`:
-- `model: str | None` → SDK `model` (default = container's default).
-- `plan_mode: bool` → SDK `permission_mode="plan"`.
-- `effort: 1..4` → SDK `effort` literal (low/medium/high/max).
+---
 
-### 4.3 Coach autoloop
+## 6. Coordination mechanics
 
-- Env-gated by `HARNESS_COACH_TICK_INTERVAL` (seconds; 0 disables).
-- Sleep-first so first tick doesn't fire before workspaces are ready.
-- Skips when Coach is already working OR harness is paused.
-- Fires `run_agent("coach", COACH_TICK_PROMPT)` on each tick.
-- Manual trigger: `POST /api/coach/tick` (409 if Coach is busy).
+### 6.1 Single write-handle discipline
 
-### 4.4 Cost caps
+All state mutations (tasks, messages, memory, events, agent status) route through the harness server process. The server holds the only SQLite write handle. Agents never open their own DB connection; they call MCP tools.
 
-- Per-agent: `HARNESS_AGENT_DAILY_CAP` (default 5.00 USD).
-- Team: `HARNESS_TEAM_DAILY_CAP` (default 20.00 USD).
-- Sum derived from `result` events emitted today (UTC). Set to 0 to disable.
+This gives:
+- Clean event ordering (one serial stream, auditable).
+- Trivial concurrency (no file locks, no optimistic-concurrency retry loops).
+- Single place to publish events to the WS bus.
 
-## 5. MCP `coord_` tools
+### 6.2 Per-worktree isolation > locks
 
-All in-process MCP tools served by a per-caller `build_coord_server(slot)`
-so the tool body knows which agent invoked it. Names prefixed
-`mcp__coord__coord_`.
+File-level isolation comes from per-Player git worktrees: two Players editing the same file do so in isolated trees. Conflict surfaces at merge, a much cleaner failure mode than a held lock from a crashed agent.
 
-| Tool                     | Coach | Player | Effect |
-|--------------------------|:-----:|:------:|--------|
-| `coord_list_tasks`       |  ✓    |   ✓    | Filter by status / owner. |
-| `coord_create_task`      |  ✓ (top-level) | ✓ (subtasks only) | Only Coach creates top-level tasks. |
-| `coord_claim_task`       |  —    |   ✓    | Claim open task; refuses when already owning one. |
-| `coord_update_task`      |  ✓ (any) | ✓ (own) | Transitions: open→claimed→in_progress→(blocked)→(done\|cancelled). Done/cancelled clears owner's current_task_id. |
-| `coord_assign_task`      |  ✓    |   —    | Push-assign an open task to a Player. |
-| `coord_send_message`     |  ✓    |   ✓    | coach / p1..p10 / "broadcast". interrupt priority for urgent. |
-| `coord_read_inbox`       |  ✓    |   ✓    | Marks messages read per-recipient. |
-| `coord_list_memory`      |  ✓    |   ✓    | List topics. |
-| `coord_read_memory`      |  ✓    |   ✓    | Read content. |
-| `coord_update_memory`    |  ✓    |   ✓    | Full overwrite; mirrors to kDrive. |
-| `coord_commit_push`      |  —    |   ✓    | `git add -A` + commit + optional push in slot's worktree. Emits `commit_pushed`. |
-| `coord_write_decision`   |  ✓    |   —    | Append-only markdown decision record. |
-| `coord_set_player_role`  |  ✓    |   —    | Write agents.name / agents.role; emits `player_assigned`. |
-| `coord_request_human`    |  ✓    |   ✓    | Emit `human_attention` event (UI banner). urgency ∈ {normal, blocker}. |
+`coord_acquire_lock` / `coord_release_lock` from the original spec are **not implemented**. They were to be advisory-only for cross-worktree logical resources ("only one Player runs the migration") — deferred until a real use-case appears.
 
-Plus standard Claude SDK tools: `Read / Grep / Glob / ToolSearch` (both
-kinds), `Write / Edit / Bash` (Players only — Coach structurally can't
-touch code).
+### 6.3 Cost caps
 
-## 6. HTTP API
+Enforced **before** `agent_started` is emitted so a capped attempt doesn't count as a turn in the audit log.
 
-All paths under `/api/*` except `/api/health` require
-`Authorization: Bearer $HARNESS_TOKEN` when the env var is set.
+- Per-agent daily: `HARNESS_AGENT_DAILY_CAP` (default $5.00). 0 disables.
+- Team daily: `HARNESS_TEAM_DAILY_CAP` (default $20.00). 0 disables.
+- Both computed by summing `cost_usd` from `result` events emitted today (UTC).
+- Blocked spawns emit a `cost_capped` event with the reason string.
 
-### 6.1 Readiness
+### 6.4 Global pause
 
-- `GET /api/health` → per-subsystem probe (db / static / claude_cli /
-  kdrive / workspaces). 200 when all required green, 503 otherwise.
-  Body always carries `checks`. Public (no auth).
-- `GET /api/status` → version, uptime, host, paused flag,
-  running_slots, ws_subscribers, caps (per-agent/team/today),
-  kdrive enabled+reason, workspaces.
+`POST /api/pause {paused: bool}` flips an in-memory flag. When paused:
+- `run_agent` emits `paused` and returns (cheaper than the cost-cap check; no DB write).
+- Coach autoloop skips ticks.
+- In-flight turns are **not** cancelled (use `cancel-all` for that).
 
-### 6.2 Agents
+Persists via `pause_toggled` WS event so multi-tab UIs stay in sync. Restart clears the flag.
 
-- `GET /api/agents` → full roster (sorted Coach first, then p1..p10).
-- `POST /api/agents/start` `{ agent_id, prompt, model?, plan_mode?, effort? }`
-  → enqueues `run_agent`.
-- `POST /api/agents/cancel-all` → cancels every in-flight task.
-- `POST /api/agents/{id}/cancel` → cancels one; 409 if not running.
-- `DELETE /api/agents/{id}/session` → clears session_id so next run
-  starts a fresh SDK conversation.
+### 6.5 Coach autonomous loop
 
-### 6.3 Pause
+Env-gated by `HARNESS_COACH_TICK_INTERVAL` (seconds; 0 disables).
+- Sleep-first pattern — first tick doesn't fire before workspaces/DB are ready.
+- Skips when Coach is already working or harness is paused.
+- Manually triggerable: `POST /api/coach/tick` (409 if Coach busy).
+- Prompt: the `COACH_TICK_PROMPT` constant ("Routine tick. Read your inbox…").
 
-- `GET /api/pause` → `{ paused: bool }`.
-- `POST /api/pause` `{ paused: bool }` → in-memory flag, emits
-  `pause_toggled`.
+### 6.6 Task hierarchy
 
-### 6.4 Tasks
+- Top-level task: Coach creates via `coord_create_task` (no parent_id), or human via `POST /api/tasks`.
+- Subtask: Player creates under their current task via `coord_create_task`. Schema supports unlimited depth.
+- Done/cancelled clears the owner's `current_task_id`.
+- Cancel cascades only to the owner's pointer, NOT to subtasks (intentional — matches `coord_update_task` behavior).
 
-- `GET /api/tasks` → all tasks.
-- `POST /api/tasks` `{ title, description?, priority?, parent_id? }` →
-  creates task with `created_by='human'`.
-- `POST /api/tasks/{id}/cancel` → status → cancelled, clears owner's
-  current_task_id if that task.
+---
 
-### 6.5 Messages
+## 7. Events (the audit log + live WS stream)
 
-- `GET /api/messages?limit=N` → recent messages (≤ 200).
-- `POST /api/messages` `{ to, subject?, body, priority? }` → queue from
-  human without spawning a turn. `from_id='human'`.
+### 7.1 Mechanics
 
-### 6.6 Memory
+- `publish(event)` fans out to every live WS subscriber via `asyncio.Queue`, then fires `asyncio.create_task(_persist(event))` for SQLite.
+- No backlog replay on subscribe (duplicate events would pollute the UI; UI reads `GET /api/events` for history).
+- Heartbeat ping every 30 s of quiet over WS (type `ping`, filtered out of conversations client-side).
+- Client watchdog: if no message for 60 s, force-close WS → reconnect. Bumps `wsAttempt` state to re-run the effect.
 
-- `GET /api/memory` → topic index (size, version, last_updated_by).
-- `GET /api/memory/{topic}` → full content.
-- `POST /api/memory` `{ topic, content }` → upsert with
-  `last_updated_by='human'`, auto-bumps version. Mirrors to kDrive same
-  as agent writes.
-
-### 6.7 Decisions
-
-- `GET /api/decisions` → list (filename / title / size / mtime).
-- `GET /api/decisions/{filename}` → full markdown content. Validates
-  filename (no slashes, ends with `.md`).
-
-### 6.8 Events
-
-- `GET /api/events?agent=&type=&since_id=&limit=` → paginated history;
-  most recent `limit`, ordered oldest→newest in response.
-
-### 6.9 Coach tick
-
-- `POST /api/coach/tick` → fires one autoloop-equivalent tick; 409 if
-  Coach is already working.
-
-### 6.10 Attachments
-
-- `POST /api/attachments` (multipart) → uploads pasted image to
-  `/data/attachments`, returns `{ id, filename, url }`. Each
-  workspace has a `/workspaces/<slot>/attachments/` symlink to the
-  shared directory.
-
-## 7. WebSocket `/ws`
-
-Single connection at app-root. Auth via `?token=<HARNESS_TOKEN>` query
-string (browsers can't set Authorization on WS).
-
-### 7.1 Server→client
-
-- `connected` — sent on accept.
-- `ping` — every 30s of quiet, so client can detect zombie connections.
-- All domain events (same shape as persisted rows).
-
-### 7.2 Event types (by category)
+### 7.2 Event type catalogue
 
 Agent lifecycle:
-`agent_started` (carries `resumed_session`), `text`, `tool_use`,
-`tool_result`, `result` (duration_ms, cost_usd, session_id, is_error),
-`error`, `agent_stopped`, `agent_cancelled`, `cost_capped`, `paused`,
-`session_cleared`.
+- `agent_started` (fields: prompt, resumed_session)
+- `text`
+- `tool_use` (id, name, input)
+- `tool_result` (tool_use_id, content, is_error)
+- `result` (duration_ms, cost_usd, session_id, is_error)
+- `error`
+- `agent_stopped`
+- `agent_cancelled`
+- `cost_capped` (reason, prompt)
+- `paused` (prompt) — spawn refused while paused
+- `session_cleared`
 
 Tasks:
-`task_created`, `task_claimed`, `task_assigned`, `task_updated`.
+- `task_created`
+- `task_claimed`
+- `task_assigned`
+- `task_updated` (old_status, new_status, note)
 
 Coord / comms:
-`message_sent`, `memory_updated`, `decision_written`, `commit_pushed`,
-`human_attention` (urgency: normal | blocker), `player_assigned`,
-`pause_toggled`.
+- `message_sent` (to, subject, body_preview, priority)
+- `memory_updated` (topic, version, size)
+- `decision_written` (title, filename, location, size)
+- `commit_pushed` (sha, message, pushed, push_requested)
+- `human_attention` (subject, body, urgency ∈ {normal, blocker})
+- `player_assigned` (player_id, name, role)
+- `pause_toggled` (paused)
 
-### 7.3 Client watchdog
+---
 
-Tracks last-message time. If > 60 s without any message, the client
-force-closes the socket and the `onclose` handler schedules a 2 s
-reconnect (bumping `wsAttempt` state).
+## 8. MCP `coord_` tools
 
-## 8. UI — global
+All served by `build_coord_server(slot)` — the per-caller closure knows which agent invoked the tool, so no agent has to pass its own identity. Registered as in-process MCP tools on each SDK query.
 
-### 8.1 Layout
+| Tool | Coach | Player | Effect |
+|------|:-----:|:------:|--------|
+| `coord_list_tasks` | ✓ | ✓ | Filter by status / owner |
+| `coord_create_task` | ✓ (top-level) | ✓ (subtasks only, must parent to owned task) | |
+| `coord_claim_task` | — | ✓ | Claim open task; refuses if already owning one |
+| `coord_update_task` | ✓ (any) | ✓ (own) | Valid transitions: open→claimed→in_progress→(blocked\|done\|cancelled). Clears owner's current_task_id on done/cancelled. |
+| `coord_assign_task` | ✓ | — | Push-assign to a specific Player; emits `task_assigned` |
+| `coord_send_message` | ✓ | ✓ | Recipients: coach / p1..p10 / broadcast; priority: normal / interrupt |
+| `coord_read_inbox` | ✓ | ✓ | Marks messages read per-recipient (broadcast-safe via `message_reads`) |
+| `coord_list_memory` | ✓ | ✓ | List topics |
+| `coord_read_memory` | ✓ | ✓ | Read content |
+| `coord_update_memory` | ✓ | ✓ | Full overwrite; mirrors to kDrive; emits `memory_updated` |
+| `coord_commit_push` | — | ✓ | `git add -A && commit && push origin HEAD` in the Player's worktree |
+| `coord_write_decision` | ✓ | — | Append-only markdown in `decisions/<date>-<slug>.md` |
+| `coord_set_player_role` | ✓ | — | Write agents.name / role; emits `player_assigned` |
+| `coord_request_human` | ✓ | ✓ | Emit `human_attention` event; urgency ∈ {normal, blocker} |
 
-- **Left rail** (44 px): WS dot, Coach + p1..p10 slot buttons, separator,
-  cancel-all (when any agent is working), pause toggle, env-panel toggle,
-  settings gear.
-- **Panes area**: 2D — array of columns, each column is a vertical stack
-  of agent panes. Split.js provides horizontal gutters between columns
-  and vertical gutters inside stacked columns. Sizes persist per layout
-  signature (`harness_split_sizes_v1`, capped 30 keys).
-- **Env pane** (right, ~340 px, toggleable): Attention / Tasks / Cost /
-  Inbox / Memory / Decisions / Timeline sections.
+### 8.1 Standard SDK tools
 
-### 8.2 Opening / stacking / moving panes
+- **Both kinds**: `Read`, `Grep`, `Glob`, `ToolSearch`.
+- **Players only**: `Write`, `Edit`, `Bash`.
 
-- Click a slot button: open as a new column on the right. If already
-  open, scroll the pane into view.
-- Shift-click a slot button: stack into the rightmost column.
-- Drag a pane's label area onto another pane: insert before it (handles
-  both within-column reorder and cross-column move).
-- Drag onto the bottom strip of a column: append to that column.
-- Drag onto the thin strip at the right edge of `.panes`: new column.
+Coach structurally cannot modify code — enforces "you delegate, never implement".
 
-### 8.3 Persistence keys (localStorage)
+### 8.2 Dropped from original spec
 
-- `harness_layout_v1` — `openColumns` + `envOpen`.
-- `harness_split_sizes_v1` — Split.js sizes per layout signature.
-- `harness_pane_settings_v1` — per-slot model / plan_mode / effort.
-- `harness_prompt_history_v1` — per-slot last 40 prompts.
-- `harness_task_filter_v1` — active / all / done.
-- `harness_attention_dismissed_v1` — dismissed `human_attention` event ids.
+- `coord_acquire_lock` / `coord_release_lock` — deferred; per-worktree isolation covers primary need.
+- `coord_heartbeat` — SDK `ResultMessage` already updates heartbeat via `_set_status`.
 
-### 8.4 Keyboard shortcuts (global, ignored in form fields)
+---
 
-- **⌘/Ctrl + B** — toggle env panel.
-- **⌘/Ctrl + .** — toggle pause.
-- Inside a pane input:
-  - **⌘/Ctrl + Enter** — send.
-  - **⌘/Ctrl + ↑ / ↓** — cycle prompt history.
-  - **Paste image** → uploads to `/api/attachments`, adds path to prompt.
-- Inside the settings popover / drawer / in-pane search:
-  - **Escape** — close.
+## 9. Agent lifecycle
 
-### 8.5 Tab title
+### 9.1 Per-turn flow (`run_agent`)
 
-Composed from live state: `⏸ N⚡ M● TeamOfTen` where `⏸` = paused,
-`N⚡` = working agents, `M●` = unread slots. Empty prefix = idle.
+1. **Paused check** — if paused, emit `paused` and return (no DB writes).
+2. **Cost cap check** — per-agent and team daily. Blocked attempts emit `cost_capped`.
+3. **Session load** — read prior `session_id` from agents table (for SDK resume).
+4. Emit `agent_started` with `resumed_session: bool`. Set status `working`.
+5. Build `ClaudeAgentOptions`:
+   - `system_prompt` — role-specific (Coach vs Player template).
+   - `cwd` — `/workspaces/<slot>`.
+   - `max_turns=10`.
+   - `mcp_servers={"coord": coord_server}`.
+   - `allowed_tools` — ALLOWED_COACH_TOOLS or ALLOWED_PLAYER_TOOLS.
+   - `model` — per-pane override if set.
+   - `permission_mode="plan"` — if plan_mode override set.
+   - `effort` — if effort override set (1..4 → "low"/"medium"/"high"/"max").
+   - `resume=<session_id>` — if non-null.
+6. Register task in `_running_tasks[slot]` so `POST /api/agents/<id>/cancel` can abort.
+7. Stream SDK messages:
+   - `AssistantMessage` → emit `text` / `tool_use` events.
+   - `UserMessage` (carries tool results) → emit `tool_result`.
+   - `ResultMessage` → emit `result`, persist session_id, add to cost_estimate_usd.
+8. Exception handling:
+   - `asyncio.CancelledError` → emit `agent_cancelled`, set status idle, re-raise.
+   - Other → emit `error`, set status error.
+   - Else → set status idle.
+9. Always emit `agent_stopped` and pop from `_running_tasks`.
 
-## 9. Pane — per-agent
+### 9.2 Per-turn overrides (via `POST /api/agents/start`)
 
-### 9.1 Header (left to right)
+| Field | Type | Maps to |
+|-------|------|---------|
+| `model` | str | SDK `model` |
+| `plan_mode` | bool | SDK `permission_mode="plan"` |
+| `effort` | 1..4 | SDK `effort` literal |
 
-- Status dot (green idle / amber working / red error / gray stopped),
-  tooltip: status + last heartbeat + first-started relative times.
-- Slot id · displayed name · role (from `coord_set_player_role`).
-- ⚑ Current-task chip (title truncated to 24 chars, full tooltip).
-- ● Session id indicator when resumable; × clears (DELETE session).
+All optional; stored per-pane in localStorage (`harness_pane_settings_v1`).
+
+### 9.3 Cancellation
+
+- `POST /api/agents/<id>/cancel` — 409 if agent isn't running.
+- `POST /api/agents/cancel-all` — iterates every in-flight task. Registered **before** the path-param version so "cancel-all" doesn't match as an agent_id.
+- Cancellation propagates via `task.cancel()` → `CancelledError` in the SDK query loop → run_agent's except branch cleanly ends.
+
+### 9.4 Session resume (M5 step 2)
+
+- `ResultMessage.session_id` captured and persisted per-turn.
+- Next turn reads it, passes as `resume=<id>` to `ClaudeAgentOptions`.
+- `DELETE /api/agents/<id>/session` clears the stored id — next run starts fresh. UI exposes this via a × next to the ● session indicator in the pane header.
+
+### 9.5 Crash recovery (minimum viable)
+
+- On restart, `init_db()` is idempotent — schema + seed agents restore cleanly.
+- Hourly `VACUUM INTO` snapshots give fresh-VPS recovery (copy snapshot back into `/data/harness.db`).
+- Tasks left in `in_progress` on crash are NOT auto-reset (original spec had this; deferred — can be added if incidents show it's needed).
+
+---
+
+## 10. HTTP API
+
+All paths under `/api/*` except `/api/health` require `Authorization: Bearer $HARNESS_TOKEN` when the env var is set. WS uses `?token=` query param.
+
+### 10.1 Readiness & observability
+
+- `GET /api/health` (public) — per-subsystem probe: db / static / claude_cli / kdrive / workspaces. 200 when all required green; 503 otherwise. Body always carries `{checks: {...}}`.
+- `GET /api/status` — version, uptime, host, `paused`, `running_slots`, `ws_subscribers`, `caps` (per-agent / team / today), kdrive status, workspaces status.
+
+### 10.2 Agents
+
+- `GET /api/agents`
+- `POST /api/agents/start` `{agent_id, prompt, model?, plan_mode?, effort?}`
+- `POST /api/agents/cancel-all`
+- `POST /api/agents/{id}/cancel` (409 if not running)
+- `DELETE /api/agents/{id}/session`
+
+### 10.3 Pause
+
+- `GET /api/pause` → `{paused: bool}`
+- `POST /api/pause` `{paused: bool}` → emits `pause_toggled` on transition
+
+### 10.4 Tasks
+
+- `GET /api/tasks`
+- `POST /api/tasks` `{title, description?, priority?, parent_id?}` (created_by='human')
+- `POST /api/tasks/{id}/cancel` (idempotent; clears owner's current_task_id)
+
+### 10.5 Messages
+
+- `GET /api/messages?limit=N` — recent (≤ 200) newest-first
+- `POST /api/messages` `{to, subject?, body, priority?}` — queues from human; emits `message_sent`
+
+### 10.6 Memory
+
+- `GET /api/memory` — topic index
+- `GET /api/memory/{topic}` — full content
+- `POST /api/memory` `{topic, content}` — human upsert; emits `memory_updated`
+
+### 10.7 Decisions
+
+- `GET /api/decisions`
+- `GET /api/decisions/{filename}`
+
+### 10.8 Events
+
+- `GET /api/events?agent=&type=&since_id=&limit=` — history for pane restore or filtered view
+
+### 10.9 Coach tick
+
+- `POST /api/coach/tick` — fires a Coach drain; 409 if Coach is busy
+
+### 10.10 Attachments
+
+- `POST /api/attachments` (multipart) — pasted images → `/data/attachments`; each workspace has a symlink `/workspaces/<slot>/attachments/` pointing there
+
+---
+
+## 11. WebSocket `/ws`
+
+- Single connection at app-root.
+- Auth: `?token=<HARNESS_TOKEN>` query (browsers can't set Authorization on WS).
+- Server→client:
+  - `{"type": "connected"}` on accept.
+  - `{"type": "ping"}` every 30 s of quiet.
+  - All domain events (same envelope shape as persisted event rows).
+- Client doesn't send — subscription is implicit (every subscriber gets every event).
+- Client watchdog: see §7.1.
+
+---
+
+## 12. UI
+
+### 12.1 Global layout
+
+- **Left rail** (44 px, vertical): WS dot (pulses red when disconnected), Coach + p1..p10 slot buttons, separator, cancel-all (shown only when agents are working), pause toggle, env-panel toggle (▦), settings gear.
+- **Panes area** (center, flex): 2D layout — array of columns, each a vertical stack of agent panes. Split.js horizontal gutters between columns; vertical gutters inside stacked columns. Drop zones at bottom of each column (append) + right edge (new column).
+- **Env pane** (right, 340 px, toggleable via ⌘/Ctrl+B): Attention / Tasks / Cost / Inbox / Memory / Decisions / Timeline sections. ↓ team-export button in header.
+
+### 12.2 Slot interactions
+
+- Click closed slot → open as new column on the right.
+- Click already-open slot → scroll pane into view horizontally.
+- Shift-click → stack into rightmost column.
+- Drag pane label → drop on another pane (insert before), bottom strip (append), right rail (new column).
+
+### 12.3 Persistence (localStorage)
+
+| Key | Purpose |
+|-----|---------|
+| `harness_layout_v1` | openColumns + envOpen |
+| `harness_split_sizes_v1` | Split.js sizes per layout signature (capped 30 keys) |
+| `harness_pane_settings_v1` | per-slot model / plan_mode / effort |
+| `harness_prompt_history_v1` | per-slot last 40 submitted prompts |
+| `harness_task_filter_v1` | active / all / done |
+| `harness_attention_dismissed_v1` | dismissed human_attention event ids (capped 200) |
+
+### 12.4 Keyboard shortcuts
+
+Global (ignored in form fields):
+- **⌘/Ctrl+B** — toggle env panel.
+- **⌘/Ctrl+.** — toggle pause.
+
+Inside a pane input:
+- **⌘/Ctrl+Enter** — send.
+- **⌘/Ctrl+↑/↓** — cycle prompt history.
+- **Escape** (in search / settings popover) — close.
+- Paste image → `/api/attachments` → adds path to prompt.
+
+### 12.5 Tab title
+
+Composed from live state: `[⏸] [N⚡] [M●] TeamOfTen` where ⏸=paused, N⚡=working count, M●=unread slots.
+
+### 12.6 Pane header (left to right)
+
+- Status dot (idle / working / error / stopped) — tooltip: status + last heartbeat + first-started (relative times).
+- Slot id · displayed name · role.
+- ⚑ Current-task chip (title truncated to 24 chars; full title in tooltip).
+- ● session id indicator + × to clear.
 - `$X.XXX` cumulative cost chip.
-- `Ns · $X.XXX` last-turn duration+cost (hidden while working).
-- ⏹ Cancel in-flight button (only shown when status=working).
-- Override dot (accent color) when pane has per-turn override settings.
-- ⌕ In-pane search toggle.
+- `Ns · $X.XXX` last-turn duration + cost (hidden while working).
+- ⏹ Cancel (only visible when status=working).
+- Override dot (accent color) when any per-turn setting is non-default.
+- ⌕ In-pane search toggle (filters body by substring match; Escape clears).
 - ↓ Export conversation as markdown.
-- ⚙ Per-pane settings popover (model / plan_mode / effort).
+- ⚙ Settings popover (model / plan_mode / effort).
 - × Close pane.
 
-### 9.2 Body
+### 12.7 Pane body
 
-- Loads up to 500 events on mount via `/api/events?agent=<slot>&limit=500`.
-- Merges persisted history with live WS events, deduplicates by `__id`.
-- Pairs `tool_use` ↔ `tool_result` by `tool_use_id` → renders them inline.
-- Auto-scroll to bottom IF the user is already near the bottom (≤80 px).
-- Per-tool renderers (Read / Edit / Bash / Grep / Glob / coord_* /
-  generic). Read on an image path inlines the image preview.
-- Edit renders as a red/green diff card.
-- Empty-pane hint with example prompts for Coach / brief for Players.
+- Loads up to 500 events on mount from `/api/events?agent=<slot>&limit=500`.
+- Merges persisted + live WS events, deduped by `__id`.
+- Pairs `tool_use` ↔ `tool_result` → renders `tool_result` INSIDE its `tool_use` card.
+- Auto-scroll to bottom IF user was near bottom (< 80 px).
+- Per-tool renderers (`tools.js`):
+  - Read — image preview for image paths.
+  - Edit — red/green diff card.
+  - Bash / Grep / Glob — inline output summary.
+  - `coord_*` tools — structured input + result display.
+  - Generic fallback for unknown tools.
+- Empty-pane hint cards with starter prompts (Coach-specific vs Player-specific).
 
-### 9.3 Input footer
+### 12.8 EnvPane sections
 
-- Textarea with paste-image support.
-- Attachments strip (below input, above send button) with × per item.
-- Hint row: "⌘/Ctrl+Enter to send · ⌘/Ctrl+↑↓ history".
+1. **Attention** (pinned banner when any undismissed `human_attention` exists) — loads persisted + live events; dismissed set in localStorage keyed by `__id`.
+2. **Tasks** — active/all/done filter (persisted). Subtasks indented with ↳. × cancel button per active row. Bottom form creates top-level task as 'human'.
+3. **Cost** — per-agent list sorted by spend, total, caps display.
+4. **Inbox** — 50 most recent messages. Click to expand full body. `+ send` opens composer (to / subject / body / priority).
+5. **Memory** — topic list with version + last_updated_by. Click to expand. `+ write` opens composer.
+6. **Decisions** — append-only list. Click to expand full markdown.
+7. **Timeline** — flat chronological stream of overview-worthy event types (capped last 80, sticky-to-bottom).
 
-### 9.4 Per-pane settings popover (⚙)
+### 12.9 Settings drawer
 
-- Model override (default / Opus 4.7 / Sonnet 4.6 / Haiku 4.5).
-- Plan-mode checkbox.
-- Effort slider (default / low / med / high / max).
-- Reset + Done buttons. Click-outside / Escape closes.
-
-## 10. Env pane — team-level
-
-Section order top → bottom:
-
-### 10.1 Attention
-Pinned banner when any `human_attention` event is undismissed. Loads
-both persisted (`?type=human_attention&limit=100`) and live events.
-Per-item × and "dismiss all" header button. Dismissal is localStorage
-keyed by event __id.
-
-### 10.2 Tasks
-Active / all / done filter (persisted). Hierarchy rendered: subtasks
-indent under parent with ↳ + left border. Cancel × button per
-active row (confirm before firing). Bottom form creates a new
-top-level task as `human`.
-
-### 10.3 Cost
-Total across team + per-agent list sorted by spend. Shows caps +
-team spent today. Working count.
-
-### 10.4 Inbox
-Latest 50 messages, click-to-expand. + send opens a composer (to /
-priority / subject / body). Refreshes on `message_sent`.
-
-### 10.5 Memory
-Lists topics with version + last_updated_by. Click row to expand
-content. + write opens an inline composer for human memory writes.
-
-### 10.6 Decisions
-Lists appends. Click row to load + expand full markdown. Refreshes
-on `decision_written`.
-
-### 10.7 Timeline
-Flat chronological stream filtered to overview-worthy event types
-(`agent_started`, `text`, `error`, all `task_*`, `message_sent`,
-`memory_updated`, `cost_capped`, `commit_pushed`, `decision_written`,
-`human_attention`, `player_assigned`, `agent_cancelled`, `paused`,
-`pause_toggled`). Capped at last 80. Sticky-to-bottom auto-scroll.
-
-Env header has a `↓` team-export button (parallel-fetches open panes
-and merges into one markdown with H1 header + H2-per-pane sections).
-
-## 11. Settings drawer
-
-- **Health** section: runtime row (paused / running / ws subs) +
-  per-subsystem health dots + ↻ refresh.
+- **Health** section: runtime strip (paused / running / ws subs) + per-subsystem dots + ↻ refresh.
 - **Authentication**: copy for the `claude /login` device-code flow.
-- **Cost caps**: read-only display of current caps (edit via env var).
+- **Cost caps**: read-only display (edit via env vars).
 - **kDrive mirror**: enabled/disabled + reason.
-- **Layout**: reset Split.js sizes (clears localStorage key + reload).
-- **About**: project line + shortcut reference.
+- **Layout**: "Reset resize state" clears `harness_split_sizes_v1` and reloads.
+- **About**: shortcut reference.
 
-## 12. Config (env vars)
+---
+
+## 13. Security & auth
+
+### 13.1 To Claude
+
+`claude /login` device-code flow, run **once per host**:
+1. On the VPS, run `claude` (interactive REPL).
+2. At `>` prompt, type `/login`.
+3. CLI prints URL + short code.
+4. Open URL on laptop, sign in to Max account, enter code, approve.
+5. Token persisted to OS credential store (NOT `~/.claude.json`).
+6. Exit REPL; non-interactive `claude -p "…"` works from any shell on that host.
+
+**Implications**:
+- Redeploys erase the container filesystem — token must sit on a mounted volume or every redeploy re-requires `/login`.
+- The install script `https://claude.ai/install.sh` is geo-blocked in Zeabur's EU datacenter (403). Dockerfile installs via `npm install -g @anthropic-ai/claude-code` — `registry.npmjs.org` is reachable, and `api.anthropic.com` is not blocked at runtime.
+
+### 13.2 To the UI
+
+- `HARNESS_TOKEN` env var, optional.
+- When set: every `/api/*` except `/api/health` requires `Authorization: Bearer <token>`; WS uses `?token=`.
+- UI shows a TokenGate overlay on 401 (stores in localStorage, reload).
+- Unset env = open API (single-user personal harness, no public exposure intended).
+
+### 13.3 kDrive
+
+- `KDRIVE_WEBDAV_URL` + `KDRIVE_USER` + `KDRIVE_APP_PASSWORD` + `KDRIVE_ROOT_PATH` (defaults `/harness`).
+- App-specific password from Infomaniak panel (NOT main password).
+- All four checked on boot; enabled only if all four present.
+
+---
+
+## 14. Deployment
+
+### 14.1 Dockerfile
+
+- Base: `python:3.12-slim`.
+- Adds: Node 20 (NodeSource), `npm install -g @anthropic-ai/claude-code`, git.
+- Default git identity: `"TeamOfTen Harness" <harness@teamoften.local>`.
+- Pre-creates `/workspaces/{coach,p1..p10,default}` with `/attachments/` symlinks.
+- Does NOT pre-create `/data` — Zeabur's volume mount over an existing directory hangs SQLite silently (confirmed 2026-04-22).
+
+### 14.2 Zeabur
+
+- GitHub auto-pull from `main`.
+- Volume mount at `/data` for SQLite persistence.
+- Env vars set in service panel.
+- TLS / ingress handled by Zeabur — no Caddy needed.
+
+### 14.3 Env vars (complete table)
 
 | Var | Default | Purpose |
 |-----|--------:|---------|
-| `HARNESS_TOKEN` | unset | If set, all `/api/*` except `/api/health` need `Bearer <token>`; WS uses `?token=`. |
-| `HARNESS_DB_PATH` | `/data/harness.db` | SQLite path. |
-| `HARNESS_AGENT_DAILY_CAP` | `5.0` | USD per agent per day. 0 disables. |
-| `HARNESS_TEAM_DAILY_CAP` | `20.0` | USD across team per day. 0 disables. |
+| `HARNESS_TOKEN` | unset | Bearer token for /api/*. Unset = open. |
+| `HARNESS_DB_PATH` | `/data/harness.db` | SQLite path |
+| `HARNESS_AGENT_DAILY_CAP` | `5.0` | USD per agent per day. 0 = unlimited. |
+| `HARNESS_TEAM_DAILY_CAP` | `20.0` | USD across team per day. 0 = unlimited. |
 | `HARNESS_COACH_TICK_INTERVAL` | `0` | seconds between Coach autoloop ticks. 0 disables. |
-| `HARNESS_KDRIVE_FLUSH_INTERVAL` | `300` | seconds between event-log flushes. |
-| `HARNESS_KDRIVE_SNAPSHOT_INTERVAL` | `3600` | seconds between DB snapshots. |
-| `HARNESS_KDRIVE_SNAPSHOT_RETENTION` | `48` | snapshots retained on kDrive. |
-| `HARNESS_DECISIONS_DIR` | `/data/decisions` | local fallback for decisions. |
-| `HARNESS_PROJECT_REPO` | unset | if set, clones to `/workspaces/.project` and creates worktrees at boot. |
-| `HARNESS_PROJECT_BRANCH` | `main` | default branch for fresh worktrees. |
-| `KDRIVE_WEBDAV_URL` / `KDRIVE_USER` / `KDRIVE_APP_PASSWORD` / `KDRIVE_ROOT_PATH` | unset / unset / unset / `/harness` | kDrive mirror. All three of the first three must be set to enable. |
+| `HARNESS_KDRIVE_FLUSH_INTERVAL` | `300` | seconds between event-log flushes |
+| `HARNESS_KDRIVE_SNAPSHOT_INTERVAL` | `3600` | seconds between DB snapshots |
+| `HARNESS_KDRIVE_SNAPSHOT_RETENTION` | `48` | snapshots retained on kDrive |
+| `HARNESS_DECISIONS_DIR` | `/data/decisions` | local fallback when kDrive disabled |
+| `HARNESS_PROJECT_REPO` | unset | If set, clones to `/workspaces/.project` + creates per-slot worktrees at boot |
+| `HARNESS_PROJECT_BRANCH` | `main` | default branch for fresh worktrees |
+| `KDRIVE_WEBDAV_URL` | unset | Infomaniak WebDAV URL |
+| `KDRIVE_USER` | unset | Infomaniak email |
+| `KDRIVE_APP_PASSWORD` | unset | Infomaniak app-specific password |
+| `KDRIVE_ROOT_PATH` | `/harness` | Prefix inside kDrive |
 
-## 13. Guarantees and non-goals
+---
 
-**Guarantees**
-- No agent writes SQLite directly — every mutation is through an MCP
-  tool funneled through the server process.
-- `human_attention` events survive restarts (DB-persisted + API-fetched).
-- Sessions resume across turns unless explicitly cleared.
-- Task cancel clears the owner's `current_task_id` so the agent is
-  unblocked for the next claim.
-- Pause blocks new starts + autoloop ticks; existing in-flight turns
-  continue until they complete (or until explicit cancel).
-- Cost caps are enforced **before** `agent_started` is emitted, so a
-  capped attempt doesn't count as a turn.
+## 15. Test suite
 
-**Non-goals / out of scope**
-- Multi-tenant authz — this is a single-user personal harness.
-- Horizontal scaling — single-process; fan-out happens in 11 SDK
-  subprocesses.
-- Browser-native Ctrl+F as a replacement for ⌕ in-pane search
-  (browser Ctrl+F only searches rendered DOM; ⌕ filters ALL loaded
-  events).
-- Persisted pause state — intentionally in-memory; restart resumes.
-- Automatic cycle detection for `tasks.parent_id` — defensive `seen`
-  guard in the render walk, but no DB-level enforcement.
+Under `server/tests/`, pytest-asyncio auto mode, DB-level (no FastAPI TestClient so the suite doesn't pull `claude-agent-sdk` at import time).
 
-## 14. Test suite
+- `test_db.py` — schema smoke, 11-agent seed, idempotent init. (3 tests)
+- `test_events.py` — bus publish/subscribe/persist round-trip; late-subscriber has empty backlog (invariant). (3 tests)
+- `test_tools_consts.py` — VALID_RECIPIENTS shape, MEMORY_TOPIC_RE accept/reject, coord-tool name prefix, Coach/Player allowlist split. (7 tests)
+- `test_tasks_sm.py` — status default, CHECK constraint enforcement on status + kind, cancel clears owner. (4 tests)
 
-Under `server/tests/`, pytest-asyncio auto mode, DB-level (no FastAPI
-TestClient so the suite doesn't pull in claude-agent-sdk).
+**Total: 17 tests.** Run: `uv sync --extra dev && uv run pytest`.
 
-- `test_db.py` — schema smoke, 11-agent seeding, idempotent init.
-- `test_events.py` — bus publish/subscribe/persist round-trip,
-  late-subscriber backlog intentionally empty.
-- `test_tools_consts.py` — VALID_RECIPIENTS shape, MEMORY_TOPIC_RE
-  accept/reject, coord-tool naming, Coach/Player allowlist split.
-- `test_tasks_sm.py` — status default, status CHECK, cancel clears
-  owner, agent kind CHECK.
+---
 
-Run: `uv sync --extra dev && uv run pytest`.
+## 16. Milestone status
 
-## 15. Known gotchas (from CLAUDE.md)
+Numbered per the original spec (Docs/HARNESS_SPEC.md §14).
 
-- Claude CLI OAuth tokens do NOT live in `~/.claude.json` — use
-  `claude /login` per host.
-- Zeabur's default region 403s `claude.ai/install.sh`. Dockerfile
-  installs via `npm install -g @anthropic-ai/claude-code` instead.
-- Do NOT pre-create `/data` in the image; let the volume mount create
-  it or SQLite will hang silently at startup.
-- `.gitattributes` forces LF on `*.sh` and `Dockerfile*` — new scripts
-  need the same treatment or they fail in Linux containers with
-  `$'\r': command not found`.
+| Milestone | Scope | Status |
+|-----------|-------|--------|
+| **M-1** — Max OAuth feasibility spike | 3–5 parallel `query()` on Max plan | ✓ (2026-04-22) |
+| **M0** — Bones | FastAPI skeleton, Dockerfile, Zeabur auto-deploy | ✓ |
+| **M1** — One agent | Single SDK agent streaming to WS UI | ✓ |
+| **M2a** — State + roster | SQLite + 11-agent roster + first coord_* tools | ✓ |
+| **M2b** — Task state machine | claim / update / done transitions | ✓ |
+| **M2c** — Inter-agent chat | send_message / read_inbox / per-recipient unread tracking | ✓ |
+| **M2d** — Shared memory | list/read/update memory tools | ✓ |
+| **M2e** — Cost caps | per-agent + team daily, pre-spawn enforced | ✓ |
+| **M3/1** — kDrive memory mirror | synchronous on update | ✓ |
+| **M3/2** — Event log flush | 5-min + yesterday-replay at day boundary | ✓ |
+| **M3/3** — DB snapshots | hourly VACUUM INTO + retention | ✓ |
+| **M4/1** — Git in container | git installed + default identity | ✓ |
+| **M4/2** — Per-slot worktrees | clone + worktree materialization on boot | ✓ |
+| **M4/3** — `coord_commit_push` | Player-only; emits commit_pushed | ✓ |
+| **M5/1** — session_id capture | persist per-turn | ✓ |
+| **M5/2** — session_id resume | pass as SDK `resume=` kwarg | ✓ |
+| **v2 (a–d)** — Preact frontend rewrite | slim rail, tileable panes, per-tool renderers, image paste, EnvPane, SettingsDrawer | ✓ |
+| **Auth** — `HARNESS_TOKEN` bearer gate | opt-in via env | ✓ |
+| **/api/health** — per-subsystem probe | cached, public | ✓ |
+| **M6/7/8/9** — Polish | 2D column stacking, drag/drop, pane export, team export, drawer health section, pane collapse alternatives (size persistence), in-pane search, prompt history, cancel/cancel-all, pause, team composition (`coord_set_player_role`), attention UI, inbox composer, memory composer, task hierarchy render, task cancel, filter, last-turn chip, unread dot, scroll-into-view, tab title, WS heartbeat | ✓ (incremental) |
+
+**Pending / next likely:**
+- Mobile UI polish (HTML5 DnD doesn't fire on touch; layout breakpoints for < 900 px need a rethink).
+- Pane collapse (minimize to header) — deferred because fighting Split.js's inline sizes is non-trivial.
+- Automated crash-recovery (reset in_progress tasks on restart) — wait for real incidents before prioritizing.
+- Daily/weekly digest generation by Coach — needs the autoloop running regularly first.
+
+---
+
+## 17. Open questions (from original spec + new)
+
+### 17.1 From the original spec (§15)
+
+1. **Opus for Coach?** — Coach does more reasoning, less typing. Pane settings popover supports per-turn override, so de facto answer is "yes, when needed". No automatic default.
+2. **Weekly Max-plan usage cap?** — Not implemented. Per-agent + team daily is the current bound.
+3. **Agent self-termination on task done?** — Currently each turn ends after one pass through the SDK query loop; agent doesn't re-loop without a new prompt. Coach autoloop handles "wake up periodically".
+4. **Multi-repo support?** — One HARNESS_PROJECT_REPO; no routing for multiple. Extensible but not built.
+5. **Record/replay?** — Event log enables replay; no replay tooling built.
+6. **Conflict detection across worktrees?** — None yet; merge-at-the-end is the fallback.
+7. **Hard cost caps vs soft warnings?** — Current caps are HARD (reject spawn). No soft-warn mode.
+
+### 17.2 New, from shipping
+
+8. **Daily digest generation** — spec'd but not written. Coach autoloop is the hook; a `coord_write_digest` tool + scheduled UTC-00:00 tick would do it.
+9. **Session_id rotation policy** — right now sessions can live forever (until user clicks × on the header dot). Auto-rotate after N turns?
+10. **Memory deletion** — intentionally no delete tool. If noise accumulates, user edits content to empty string or overwrites the topic.
+11. **Broadcast message delivery ordering** — message_reads tracks per-recipient, but delivery to inboxes is whatever order `read_inbox` fires in. Acceptable.
+12. **Agent crash in the middle of tool call** — run_agent's try/except catches it, emits `error`. The tool call may have partially committed (e.g. task updated but message not sent). Best-effort; no two-phase commit.
+
+---
+
+## 18. Abandoned / not-taken decisions
+
+- **rclone daemon** — dropped in favor of direct WebDAV via webdav4. No daemon to supervise; clean sync control.
+- **React + react-mosaic + Vite** — dropped in favor of Preact + htm + Split.js (no build step).
+- **Zustand** — dropped; plain hooks are enough.
+- **Docker Compose with Caddy** — dropped; Zeabur handles TLS / ingress.
+- **Copying `~/.claude.json` across hosts** — dropped per M-1 spike; tokens live in OS credential store.
+- **`scripts/copy-claude-auth.sh`** — deleted from the plan.
+- **`tailscale-only` public exposure model** — deferred; current deploy is public with optional bearer token.
+- **Pydantic models for Agent / Task / Message / MemoryDoc** — replaced with plain SQLite rows + request-shape Pydantic validators.
+- **`coord_acquire_lock` / `coord_release_lock`** — deferred; per-worktree isolation suffices.
+- **Per-worktree `git` pre-commit conflict hook** — not built.
+- **`coord_heartbeat`** — SDK `ResultMessage` already updates heartbeat via `_set_status`.
+- **Multiple layout presets ("overview", "focus", "debug")** — dropped; manual layout + localStorage persistence is enough.
+- **Command palette (Cmd+K)** — not built; ⌘/Ctrl+B / ⌘/Ctrl+. cover the common toggles.
+- **PWA manifest + push notifications** — deferred to mobile polish; not built.
+- **Pane drag-to-pop-out-window** — not built.
+- **Layout presets persistence** — not built; single persisted layout per browser.
+
+---
+
+## 19. Guarantees (hard invariants)
+
+1. No agent writes SQLite directly — every mutation funnels through an MCP tool handler in the server process.
+2. Cost caps enforced **before** `agent_started` is emitted so capped attempts don't count as turns.
+3. Task cancel clears the owner's `current_task_id` so the Player is unblocked for the next claim.
+4. Pause blocks new starts + autoloop ticks; in-flight turns continue until they complete or are explicitly cancelled.
+5. `human_attention` events survive restarts (DB-persisted + API-fetched by the UI banner).
+6. Session resume across turns unless explicitly cleared via `DELETE /api/agents/<id>/session`.
+7. Coach is structurally incapable of modifying code (no Write/Edit/Bash tools in its allowlist).
+
+---
+
+## 20. Known gotchas (from CLAUDE.md)
+
+1. Claude CLI OAuth tokens do NOT live in `~/.claude.json`. Use `claude /login` per host.
+2. Zeabur's default region 403s `claude.ai/install.sh`. Dockerfile installs via npm.
+3. Do NOT pre-create `/data` in the image — Zeabur's volume mount over an existing dir hangs SQLite silently at startup.
+4. `.gitattributes` forces LF on `*.sh` and `Dockerfile*`. New scripts need the same or they fail in Linux containers with `$'\r': command not found`.
+5. SQLite WAL journal mode hangs on Zeabur volumes — stick to DELETE journal mode.
+
+---
+
+## 21. What this is not
+
+- Not a product. Personal tool.
+- Not secure enough for untrusted users. Single-user by design.
+- Not a replacement for Claude Agent Teams — this is specifically **more transparent and less automagical**.
+- Not going to solve "how do I get 10 Claudes to build an app with no input from me." Human remains in the loop.
