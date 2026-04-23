@@ -23,6 +23,7 @@ import sqlite3
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from server.db import DB_PATH, configured_conn
@@ -330,8 +331,7 @@ async def trim_attachments_once() -> int:
         return 0
     # ATTACHMENTS_DIR lives in server.main; re-resolve from env rather
     # than importing to avoid a circular dep.
-    from pathlib import Path as _Path
-    attachments_dir = _Path(
+    attachments_dir = Path(
         os.environ.get("HARNESS_ATTACHMENTS_DIR", "/data/attachments")
     )
     if not attachments_dir.is_dir():
