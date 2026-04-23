@@ -462,6 +462,25 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
 # ------------------------------------------------------------------
 
 
+@app.get("/api/messages", dependencies=[Depends(require_token)])
+async def list_messages(limit: int = 50) -> dict[str, Any]:
+    """Recent messages (newest first, capped). Full body included —
+    the UI decides how much to show."""
+    limit = max(1, min(limit, 200))
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT id, from_id, to_id, subject, body, sent_at, "
+            "in_reply_to, priority "
+            "FROM messages ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cur.fetchall()
+    finally:
+        await c.close()
+    return {"messages": [dict(r) for r in rows]}
+
+
 @app.get("/api/memory", dependencies=[Depends(require_token)])
 async def list_memory() -> dict[str, Any]:
     """List shared-memory topics (flat table, not paginated — this

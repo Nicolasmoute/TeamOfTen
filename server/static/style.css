@@ -329,6 +329,21 @@ body {
 .env-tl-assigned { border-left-color: var(--coach); }
 .env-tl-assigned .env-tl-body { color: var(--fg); }
 
+.env-msg-urgent .env-decision-head { color: var(--err); }
+.env-msg-preview {
+  color: var(--muted);
+  font-size: 11px;
+  padding: 0 8px 6px 26px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.env-msg-subject {
+  padding: 4px 8px 0 10px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
 /* Pinned attention section: banner above the other env sections when
    any undismissed human_attention events are live. */
 .env-section.env-attention {

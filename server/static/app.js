@@ -1008,6 +1008,7 @@ function EnvPane({ agents, tasks, conversations, serverStatus, onCreateTask, onC
         <${EnvAttentionSection} conversations=${conversations} />
         <${EnvTasksSection} tasks=${tasks} onCreate=${onCreateTask} />
         <${EnvCostSection} agents=${agents} serverStatus=${serverStatus} />
+        <${EnvInboxSection} conversations=${conversations} />
         <${EnvMemorySection} conversations=${conversations} />
         <${EnvDecisionsSection} conversations=${conversations} />
         <${EnvTimelineSection} conversations=${conversations} />
@@ -1150,6 +1151,74 @@ function EnvAttentionSection({ conversations }) {
             </div>
           `
         )}
+      </div>
+    </section>
+  `;
+}
+
+function EnvInboxSection({ conversations }) {
+  const [msgs, setMsgs] = useState([]);
+  const [openId, setOpenId] = useState(null);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/messages?limit=50");
+      if (!res.ok) return;
+      const data = await res.json();
+      setMsgs(data.messages || []);
+    } catch (e) {
+      console.error("loadMessages failed", e);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const messageEventCount = useMemo(() => {
+    let n = 0;
+    for (const list of conversations.values()) {
+      for (const ev of list) if (ev.type === "message_sent") n++;
+    }
+    return n;
+  }, [conversations]);
+  useEffect(() => {
+    if (messageEventCount > 0) load();
+  }, [messageEventCount, load]);
+
+  if (msgs.length === 0) return null;
+  return html`
+    <section class="env-section">
+      <h3 class="env-section-title">
+        Messages <span class="env-count">${msgs.length}</span>
+      </h3>
+      <div class="env-decision-list">
+        ${msgs.map((m) => {
+          const preview = (m.subject || m.body || "").replace(/\s+/g, " ").slice(0, 80);
+          const isOpen = openId === m.id;
+          const urgent = m.priority === "interrupt";
+          return html`
+            <div
+              class=${"env-decision" + (urgent ? " env-msg-urgent" : "")}
+              key=${m.id}
+            >
+              <button
+                class="env-decision-head"
+                onClick=${() => setOpenId(isOpen ? null : m.id)}
+              >
+                <span class="env-decision-arrow">${isOpen ? "▾" : "▸"}</span>
+                <span class="env-decision-title">
+                  ${m.from_id} → ${m.to_id}${urgent ? " ⚠" : ""}
+                </span>
+                <span class="env-decision-meta">${(m.sent_at || "").slice(11, 16)}</span>
+              </button>
+              ${isOpen
+                ? html`<div class="env-msg-body">
+                    ${m.subject ? html`<div class="env-msg-subject">${m.subject}</div>` : null}
+                    <pre class="env-decision-body">${m.body}</pre>
+                  </div>`
+                : html`<div class="env-msg-preview">${preview}</div>`}
+            </div>
+          `;
+        })}
       </div>
     </section>
   `;
