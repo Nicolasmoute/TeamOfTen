@@ -1287,7 +1287,6 @@ function SettingsDrawer({ onClose, serverStatus }) {
             <h3>About</h3>
             <p>
               <strong>TeamOfTen harness</strong><br />
-              Milestone M2a + v2d<br />
               1 Coach + 10 Players orchestrated via Claude Agent SDK<br />
               <a
                 href="https://github.com/Nicolasmoute/TeamOfTen"
@@ -1295,6 +1294,11 @@ function SettingsDrawer({ onClose, serverStatus }) {
                 rel="noopener noreferrer"
                 >github.com/Nicolasmoute/TeamOfTen</a
               >
+            </p>
+            <p class="muted" style="font-size: 11px; margin-top: 6px;">
+              Shortcuts: ⌘/Ctrl+B toggle env panel · ⌘/Ctrl+. toggle pause ·
+              ⌘/Ctrl+Enter in a pane input to send · ⌘/Ctrl+↑↓ in a pane
+              input to cycle prompt history.
             </p>
           </section>
         </div>
