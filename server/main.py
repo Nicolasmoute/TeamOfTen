@@ -1080,8 +1080,22 @@ async def list_events(
     where_parts: list[str] = ["id > ?"]
     params: list[Any] = [since_id]
     if agent:
-        where_parts.append("agent_id = ?")
-        params.append(agent)
+        # Fan-out: include events where this agent is the recipient,
+        # not only the actor. Mirrors the WS-side fan-out so opening a
+        # pane's history matches what the pane would have shown live.
+        #   - type=message_sent & to_id matches (or 'broadcast')
+        #   - type=task_assigned & to matches
+        where_parts.append(
+            "("
+            "agent_id = ?"
+            " OR (type = 'message_sent' AND ("
+            "     json_extract(payload, '$.to_id') = ?"
+            "     OR json_extract(payload, '$.to_id') = 'broadcast'"
+            "))"
+            " OR (type = 'task_assigned' AND json_extract(payload, '$.to') = ?)"
+            ")"
+        )
+        params.extend([agent, agent, agent])
     if type:
         where_parts.append("type = ?")
         params.append(type)

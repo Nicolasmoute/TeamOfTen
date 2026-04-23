@@ -741,10 +741,36 @@ function App() {
         });
         return;
       }
+      // Cross-pane fan-out: inter-agent events land in BOTH the actor's
+      // pane and the target's pane so a user watching p3 can see the
+      // message from Coach without having to open Coach's pane too.
+      // Events carry an explicit recipient:
+      //   - message_sent: to_id (an agent id, 'coach', or 'broadcast')
+      //   - task_assigned: to    (always a slot id)
+      // Broadcasts fan to every agent id we know about.
+      const fanoutTargets = new Set();
+      fanoutTargets.add(aid);
+      if (ev.type === "message_sent") {
+        const toId = ev.to_id;
+        if (toId === "broadcast") {
+          ["coach", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "p10"]
+            .forEach((s) => fanoutTargets.add(s));
+        } else if (toId) {
+          fanoutTargets.add(toId);
+        }
+      } else if (ev.type === "task_assigned") {
+        if (ev.to) fanoutTargets.add(ev.to);
+      }
       setConversations((prev) => {
         const next = new Map(prev);
-        const list = next.get(aid) || [];
-        next.set(aid, [...list, ev]);
+        for (const tgt of fanoutTargets) {
+          const list = next.get(tgt) || [];
+          // Same event object carries a stable __id from the server, so
+          // we dedupe defensively — a refresh that replays history
+          // should not double the fan-out copies.
+          if (ev.__id != null && list.some((e) => e.__id === ev.__id)) continue;
+          next.set(tgt, [...list, ev]);
+        }
         return next;
       });
       // Clear the matching streaming buffer when the authoritative final
@@ -3912,6 +3938,30 @@ function EventItem({ event }) {
     return html`<div class="event task_created">
       <div class="event-meta">${ts}  task_created</div>
       [${event.task_id}] ${event.title}${parent}
+    </div>`;
+  }
+
+  if (type === "task_assigned") {
+    // Shows in both Coach's pane (as actor) and the assignee's pane
+    // (fan-out). "from → to" phrasing keeps the direction readable
+    // from either angle.
+    return html`<div class="event task_assigned">
+      <div class="event-meta">${ts}  task_assigned</div>
+      <div class="event-body">
+        ${event.agent_id} → ${event.to} · ${event.task_id}
+      </div>
+    </div>`;
+  }
+
+  if (type === "message_sent") {
+    const subj = event.subject ? `  (${event.subject})` : "";
+    const urgent = event.priority === "interrupt" ? " ⚠" : "";
+    const preview = (event.body_preview || "").slice(0, 160);
+    return html`<div class="event message_sent">
+      <div class="event-meta">
+        ${ts}  ${event.agent_id} → ${event.to}${urgent}${subj}
+      </div>
+      <div class="event-body">${preview}</div>
     </div>`;
   }
 

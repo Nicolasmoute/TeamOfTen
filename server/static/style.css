@@ -1453,6 +1453,9 @@ body {
 .event.result { border-color: var(--ok); color: var(--muted); font-size: 12px; }
 .event.error { border-color: var(--err); color: var(--err); }
 .event.task_created { border-color: var(--warn); }
+.event.task_assigned { border-color: var(--warn); color: var(--muted); font-size: 12px; }
+.event.message_sent { border-color: var(--tool); font-size: 12px; }
+.event.message_sent .event-body { color: var(--fg); margin-top: 2px; }
 .event.agent_started,
 .event.agent_stopped,
 .event.connected { color: var(--muted); font-size: 12px; }
