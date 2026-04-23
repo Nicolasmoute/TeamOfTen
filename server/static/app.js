@@ -1765,6 +1765,130 @@ function TeamModelsSection() {
   </section>`;
 }
 
+// Project repo configuration. DB-backed (team_config) with env
+// fallback. Edits take effect on the next container restart — live
+// worktrees keep their old `git remote`, so changing the URL
+// mid-session doesn't affect in-flight Players.
+function TeamRepoSection() {
+  const [data, setData] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+  const [repoDraft, setRepoDraft] = useState("");
+  const [branchDraft, setBranchDraft] = useState("");
+  const [allowSecrets, setAllowSecrets] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState(null);
+
+  const reload = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/team/repo");
+      if (res.ok) {
+        const d = await res.json();
+        setData(d);
+        setRepoDraft(d.repo || "");
+        setBranchDraft(d.branch && d.branch !== "main" ? d.branch : "");
+      }
+    } catch (e) {
+      console.error("repo load failed", e);
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+
+  const save = useCallback(async () => {
+    setSaving(true);
+    setMsg(null);
+    try {
+      const res = await authFetch("/api/team/repo", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          repo: repoDraft,
+          branch: branchDraft,
+          allow_secrets: allowSecrets,
+        }),
+      });
+      if (res.ok) {
+        const d = await res.json();
+        setMsg({
+          kind: "ok",
+          text: "saved · redeploy to apply" +
+            ((d.secret_warnings || []).length
+              ? "  (kept raw secret despite warning: " + d.secret_warnings.join(", ") + ")"
+              : ""),
+        });
+        setAllowSecrets(false);
+        await reload();
+      } else {
+        let detail;
+        try {
+          const d = await res.json();
+          detail = typeof d.detail === "string" ? d.detail : JSON.stringify(d.detail);
+        } catch (_) {
+          detail = "HTTP " + res.status;
+        }
+        setMsg({ kind: "err", text: detail });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    } finally {
+      setSaving(false);
+    }
+  }, [repoDraft, branchDraft, allowSecrets, reload]);
+
+  return html`<section class="drawer-section">
+    <h3>Project repo</h3>
+    <p class="muted" style="margin: 0 0 6px 0; font-size: 12px;">
+      The GitHub (or any git) URL the team clones into per-Player
+      worktrees. Use a <code>\${VAR}</code> placeholder for your
+      PAT so the token stays in the Zeabur env, not in the DB —
+      e.g. <code>https://\${GITHUB_TOKEN}@github.com/you/repo.git</code>.
+      Changes apply on the next container restart.
+    </p>
+    ${loaded && data
+      ? html`<div style="font-size: 11px; color: var(--muted); margin-bottom: 6px;">
+          <div>current: ${data.repo_masked || "(unset)"} <span class="muted">· source: ${data.repo_source}</span></div>
+          <div>branch: ${data.branch} <span class="muted">· source: ${data.branch_source}</span></div>
+          ${data.env_repo_set && data.repo_source === "db"
+            ? html`<div style="color: var(--warn);">⚠ HARNESS_PROJECT_REPO env is also set — DB value wins</div>`
+            : null}
+        </div>`
+      : null}
+    <input
+      placeholder="https://\${GITHUB_TOKEN}@github.com/you/repo.git"
+      value=${repoDraft}
+      onInput=${(e) => setRepoDraft(e.target.value)}
+      style="width: 100%; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 4px 8px; font-size: 12px; font-family: ui-monospace, monospace; margin-bottom: 4px;"
+    />
+    <input
+      placeholder="branch (default: main)"
+      value=${branchDraft}
+      onInput=${(e) => setBranchDraft(e.target.value)}
+      style="width: 100%; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 4px 8px; font-size: 12px; margin-bottom: 4px;"
+    />
+    <div style="display: flex; gap: 10px; align-items: center;">
+      <label style="font-size: 11px; color: var(--muted);">
+        <input
+          type="checkbox"
+          checked=${allowSecrets}
+          onChange=${(e) => setAllowSecrets(e.target.checked)}
+        />
+        save even if raw secret detected
+      </label>
+      <button
+        class="primary"
+        disabled=${saving}
+        onClick=${save}
+      >${saving ? "saving…" : "save"}</button>
+    </div>
+    ${msg
+      ? html`<div style=${"font-size: 11px; margin: 6px 0 0; padding: 4px 8px; border-radius: 3px; " + (msg.kind === "ok"
+            ? "color: var(--ok); border: 1px solid var(--ok); background: rgba(63,185,80,0.08);"
+            : "color: var(--err); border: 1px solid var(--err); background: rgba(248,81,73,0.08); white-space: pre-wrap;")}>${msg.text}</div>`
+      : null}
+  </section>`;
+}
+
 // MCP server configuration. Paste a Claude-Desktop-style JSON
 // snippet; parse + detect server name(s); save to the DB. Each saved
 // server gets a row with status dot + enable/disable/delete/test. The
@@ -2152,6 +2276,8 @@ function SettingsDrawer({ onClose, serverStatus }) {
           <${TeamToolsSection} />
 
           <${TeamModelsSection} />
+
+          <${TeamRepoSection} />
 
           <${MCPServersSection} />
 

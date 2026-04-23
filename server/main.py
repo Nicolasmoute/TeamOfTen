@@ -1270,6 +1270,107 @@ async def test_mcp_server(name: str) -> dict[str, object]:
     return {"ok": ok, "detail": detail}
 
 
+# ------------------------------------------------------------------
+# Project repo (HARNESS_PROJECT_REPO replacement, DB-backed)
+# ------------------------------------------------------------------
+
+
+class TeamRepoWrite(BaseModel):
+    repo: str = Field(
+        "",
+        description="Project repo URL. Include PAT via ${VAR} placeholder for auth. Empty clears.",
+    )
+    branch: str = Field(
+        "",
+        description="Branch to base per-Player worktrees on. Empty = 'main'.",
+    )
+    allow_secrets: bool = Field(
+        default=False,
+        description="Override the raw-token warning and save anyway.",
+    )
+
+
+def _mask_repo_url(url: str) -> str:
+    """Redact any userinfo component in the URL so the UI can show it
+    without leaking a PAT. Preserves ${VAR} placeholders visibly."""
+    if not url:
+        return ""
+    # Pattern: https://<userinfo>@host/path. Userinfo is everything
+    # between "//" and the first "@" (bounded by the next "/").
+    m = re.match(r"^(https?://)([^@/]+)@(.+)$", url)
+    if not m:
+        return url
+    scheme, userinfo, rest = m.group(1), m.group(2), m.group(3)
+    # Keep env placeholders readable; mask real tokens.
+    if userinfo.startswith("${") and userinfo.endswith("}"):
+        return f"{scheme}{userinfo}@{rest}"
+    return f"{scheme}***@{rest}"
+
+
+@app.get("/api/team/repo", dependencies=[Depends(require_token)])
+async def get_team_repo() -> dict[str, object]:
+    """Return the currently-active repo/branch + their source
+    (db vs env vs unset), so the UI can show where the setting lives."""
+    db_repo = await _read_team_config_str("project_repo")
+    db_branch = await _read_team_config_str("project_branch")
+    env_repo = os.environ.get("HARNESS_PROJECT_REPO", "").strip()
+    env_branch = os.environ.get("HARNESS_PROJECT_BRANCH", "").strip()
+    if db_repo:
+        active_repo, repo_source = db_repo, "db"
+    elif env_repo:
+        active_repo, repo_source = env_repo, "env"
+    else:
+        active_repo, repo_source = "", "unset"
+    if db_branch:
+        active_branch, branch_source = db_branch, "db"
+    elif env_branch:
+        active_branch, branch_source = env_branch, "env"
+    else:
+        active_branch, branch_source = "main", "default"
+    return {
+        "repo": active_repo,
+        "repo_masked": _mask_repo_url(active_repo),
+        "repo_source": repo_source,
+        "branch": active_branch,
+        "branch_source": branch_source,
+        "env_repo_set": bool(env_repo),
+    }
+
+
+@app.put("/api/team/repo", dependencies=[Depends(require_token)])
+async def set_team_repo(req: TeamRepoWrite) -> dict[str, object]:
+    """Save repo + branch to team_config. Takes effect on the NEXT
+    container restart — existing clones + worktrees stay pointing at
+    the old remote. Secret-scan rejects raw tokens unless
+    allow_secrets=true."""
+    from server.mcp_config import detect_secrets
+    repo = (req.repo or "").strip()
+    branch = (req.branch or "").strip()
+    warnings = detect_secrets(repo) if repo else []
+    if warnings and not req.allow_secrets:
+        raise HTTPException(
+            400,
+            detail={
+                "secret_warnings": warnings,
+                "hint": "Replace raw tokens with ${VAR} placeholders (the "
+                "placeholder expands at clone time from the Zeabur env). "
+                "Re-submit with allow_secrets=true to override.",
+            },
+        )
+    await _write_team_config_str("project_repo", repo)
+    await _write_team_config_str("project_branch", branch)
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "system",
+            "type": "team_repo_updated",
+            "repo_masked": _mask_repo_url(repo),
+            "branch": branch or "main",
+        }
+    )
+    return {"ok": True, "secret_warnings": warnings}
+
+
 class AgentLockWrite(BaseModel):
     locked: bool = Field(..., description="True to lock the agent off from Coach orchestration.")
 

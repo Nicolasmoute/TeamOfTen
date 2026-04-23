@@ -31,16 +31,74 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-PROJECT_REPO = os.environ.get("HARNESS_PROJECT_REPO", "").strip()
-PROJECT_BRANCH = os.environ.get("HARNESS_PROJECT_BRANCH", "main").strip() or "main"
 WORKSPACES_ROOT = Path(os.environ.get("HARNESS_WORKSPACES_ROOT", "/workspaces"))
 BASE_REPO_PATH = WORKSPACES_ROOT / ".project"
 
 SLOT_IDS: list[str] = ["coach"] + [f"p{i}" for i in range(1, 11)]
 
+# Project repo + branch are resolved DB-first, env-fallback. The DB
+# value (set via Options → Project repo) persists across redeploys;
+# the env var (HARNESS_PROJECT_REPO / HARNESS_PROJECT_BRANCH) is the
+# initial bootstrap path. Both are read once per process; changing
+# the DB value requires a redeploy to take effect (existing worktrees
+# keep their old `git remote`).
+_CACHED_REPO: str | None = None
+_CACHED_BRANCH: str | None = None
+
+
+def _read_team_config_sync(key: str) -> str:
+    """Synchronous team_config read — used at process startup before
+    the asyncio loop is guaranteed up. Returns "" on any error /
+    missing row so env fallback kicks in."""
+    try:
+        import json
+        import sqlite3
+        from server.db import DB_PATH
+        conn = sqlite3.connect(DB_PATH, timeout=2.0)
+        try:
+            cur = conn.execute(
+                "SELECT value FROM team_config WHERE key = ?", (key,)
+            )
+            row = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return ""
+    if not row:
+        return ""
+    raw = (row[0] or "").strip()
+    if raw.startswith('"') and raw.endswith('"'):
+        try:
+            v = json.loads(raw)
+            if isinstance(v, str):
+                return v
+        except Exception:
+            pass
+    return raw
+
+
+def _project_repo() -> str:
+    global _CACHED_REPO
+    if _CACHED_REPO is not None:
+        return _CACHED_REPO
+    db_val = _read_team_config_sync("project_repo")
+    env_val = os.environ.get("HARNESS_PROJECT_REPO", "").strip()
+    _CACHED_REPO = db_val or env_val or ""
+    return _CACHED_REPO
+
+
+def _project_branch() -> str:
+    global _CACHED_BRANCH
+    if _CACHED_BRANCH is not None:
+        return _CACHED_BRANCH
+    db_val = _read_team_config_sync("project_branch")
+    env_val = os.environ.get("HARNESS_PROJECT_BRANCH", "").strip()
+    _CACHED_BRANCH = db_val or env_val or "main"
+    return _CACHED_BRANCH
+
 
 def project_configured() -> bool:
-    return bool(PROJECT_REPO)
+    return bool(_project_repo())
 
 
 def workspace_dir(slot: str) -> Path:
@@ -57,7 +115,7 @@ def workspace_dir(slot: str) -> Path:
 def get_status() -> dict[str, object]:
     """Snapshot of workspace state for /api/status. Cheap — just stats."""
     if not project_configured():
-        return {"configured": False, "reason": "HARNESS_PROJECT_REPO not set"}
+        return {"configured": False, "reason": "no project repo set (Options → Project repo or HARNESS_PROJECT_REPO)"}
     slot_state = {}
     for s in SLOT_IDS:
         wt = workspace_dir(s)
@@ -68,8 +126,8 @@ def get_status() -> dict[str, object]:
         }
     return {
         "configured": True,
-        "repo": PROJECT_REPO,
-        "branch": PROJECT_BRANCH,
+        "repo": _project_repo(),
+        "branch": _project_branch(),
         "base_cloned": BASE_REPO_PATH.exists(),
         "slots": slot_state,
     }
@@ -91,14 +149,14 @@ async def ensure_workspaces() -> dict[str, object]:
 
     if not project_configured():
         logger.info(
-            "workspaces: HARNESS_PROJECT_REPO unset; created plain /workspaces/<slot>/ dirs"
+            "workspaces: no project repo set; created plain /workspaces/<slot>/ dirs"
         )
         return {"configured": False}
 
     status: dict[str, object] = {
         "configured": True,
-        "repo": PROJECT_REPO,
-        "branch": PROJECT_BRANCH,
+        "repo": _project_repo(),
+        "branch": _project_branch(),
         "slots": {},
     }
 
@@ -144,9 +202,11 @@ async def _ensure_base_clone() -> None:
         logger.info("base repo already present at %s", BASE_REPO_PATH)
         return
     BASE_REPO_PATH.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("cloning %s (branch %s) → %s", PROJECT_REPO, PROJECT_BRANCH, BASE_REPO_PATH)
+    repo = _project_repo()
+    branch = _project_branch()
+    logger.info("cloning %s (branch %s) → %s", repo, branch, BASE_REPO_PATH)
     code, out, err = await _run(
-        ["git", "clone", "--branch", PROJECT_BRANCH, PROJECT_REPO, str(BASE_REPO_PATH)],
+        ["git", "clone", "--branch", branch, repo, str(BASE_REPO_PATH)],
         timeout=300,
     )
     if code != 0:
@@ -216,7 +276,7 @@ async def _ensure_worktree(slot: str) -> dict[str, object]:
             "git", "worktree", "add",
             "-b", branch_name,
             str(worktree_path),
-            PROJECT_BRANCH,
+            _project_branch(),
         ]
         source = "new-from-base"
 
