@@ -471,7 +471,9 @@ function App() {
     });
     markSeen(slot);
   }, [markSeen]);
-  // Remove a pane, dropping the column if it becomes empty.
+  // Remove a pane, dropping the column if it becomes empty. Mark as
+  // seen through the current last event, since an open pane is
+  // considered always-seen — closing it acknowledges what was visible.
   const closePane = useCallback((slot) => {
     setOpenColumns((prev) => {
       const out = prev
@@ -479,7 +481,8 @@ function App() {
         .filter((col) => col.length > 0);
       return out;
     });
-  }, []);
+    markSeen(slot);
+  }, [markSeen]);
   // Append a slot to the bottom of the rightmost (last) column. If
   // slot already open anywhere else, move it. If no columns yet, opens
   // as the first one.
