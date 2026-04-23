@@ -242,6 +242,7 @@ const SLASH_COMMANDS = [
   { cmd: "/clear",  desc: "clear session so the next turn starts fresh" },
   { cmd: "/loop",   desc: "Coach autoloop: /loop 60 → tick every 60s · /loop off" },
   { cmd: "/tick",   desc: "nudge Coach to drain inbox right now" },
+  { cmd: "/status", desc: "show server runtime state (paused, running, spend)" },
   { cmd: "/help",   desc: "show available slash commands" },
 ];
 
@@ -3512,6 +3513,29 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
             else setInfoText("tick failed: HTTP " + r.status);
           })
           .catch((e) => setInfoText("tick failed: " + String(e)));
+        return true;
+      case "/status":
+        // Render a compact snapshot of /api/status into the info
+        // banner. Human-readable, not the raw JSON.
+        authFetch("/api/status")
+          .then((r) => r.json())
+          .then((d) => {
+            const caps = d.caps || {};
+            const running = (d.running_slots || []).join(", ") || "none";
+            const lines = [
+              `paused: ${d.paused ? "yes" : "no"}`,
+              `running: ${running}`,
+              `team today: $${(caps.team_today_usd || 0).toFixed(3)}` +
+                (caps.team_daily_usd
+                  ? ` / $${caps.team_daily_usd.toFixed(2)} cap`
+                  : " (no cap)"),
+              `ws subscribers: ${d.ws_subscribers ?? "?"}`,
+              `uptime: ${Math.round((d.uptime_seconds || 0) / 60)} min`,
+              `kdrive: ${d.kdrive?.enabled ? "on" : "off — " + (d.kdrive?.reason || "?")}`,
+            ];
+            setInfoText(lines.join("\n"));
+          })
+          .catch((e) => setInfoText("status failed: " + String(e)));
         return true;
       case "/help":
         setInfoText(
