@@ -1246,10 +1246,11 @@ function EnvTimelineItem({ event }) {
   const who = event.agent_id || "?";
   if (event.type === "agent_started") {
     const prompt = (event.prompt || "").replace(/\s+/g, " ").slice(0, 80);
+    const arrow = event.resumed_session ? "↻" : "→";
     return html`<div class="env-tl-item env-tl-started">
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
-      <span class="env-tl-arrow">→</span>
+      <span class="env-tl-arrow" title=${event.resumed_session ? "resumed prior session" : "fresh start"}>${arrow}</span>
       <span class="env-tl-body">${prompt}</span>
     </div>`;
   }

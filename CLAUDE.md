@@ -84,13 +84,27 @@ deployed Zeabur instance — see "What needs verification" below.
    that cadence. Skips when Coach is already working. Manual trigger:
    `POST /api/coach/tick` (409 if busy).
 
+- **M5 step 2** ✓ `ClaudeAgentOptions(resume=<session_id>)` wired;
+   agent_started events carry `resumed_session: bool`; UI shows ↻ vs →
+   in the timeline. DELETE /api/agents/<id>/session clears the stored
+   id to force a fresh turn.
+- **Escalation tool** ✓ `coord_request_human(subject, body, urgency?)`
+   (both Coach and Players); emits a `human_attention` event. EnvPane
+   surfaces undismissed escalations as a pinned red banner, restored
+   across page reloads from /api/events?type=human_attention. Dismissal
+   is local-only (per-__id in localStorage).
+- **2D layout** ✓ columns can stack multiple panes; shift-click a slot
+   in the left rail stacks into the last column; each axis gets its own
+   Split.js resize gutter.
+- **Pane settings popover** ✓ per-pane model / plan-mode / effort
+   controls with localStorage persistence; wired through to
+   `ClaudeAgentOptions` server-side.
+
 **Next likely:**
-- **M5 step 2**: actually USE the captured session_id to resume — needs
-   confirmed SDK API for `ClaudeAgentOptions` (resume kwarg name is
-   speculative).
-- **`coord_request_human` escalation tool**: when an agent is stuck,
-   raise a high-visibility event that the UI surfaces prominently.
+- **Drag-to-move panes** between columns (currently shift-click is the
+   only way to re-arrange — drag-and-drop is the "real" fix).
 - **Mobile UI polish.**
+- **Conversation export** (per-pane or whole-team to a markdown file).
 
 ## What needs verification (when user is next active)
 

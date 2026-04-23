@@ -312,7 +312,17 @@ async def run_agent(
         logger.warning("cost cap blocked spawn: %s", reason)
         return
 
-    await _emit(agent_id, "agent_started", prompt=prompt)
+    # Read prior session BEFORE emitting agent_started so the event
+    # carries the resume flag — the UI can visually distinguish fresh
+    # turns from continuations.
+    prior_session = await _get_session_id(agent_id)
+
+    await _emit(
+        agent_id,
+        "agent_started",
+        prompt=prompt,
+        resumed_session=bool(prior_session),
+    )
     await _set_status(agent_id, "working")
 
     coord_server = build_coord_server(agent_id)
@@ -332,10 +342,8 @@ async def run_agent(
     if effort and effort in _EFFORT_LEVELS:
         options_kwargs["effort"] = _EFFORT_LEVELS[effort]
 
-    # Resume: if the last turn captured a session_id, hand it back to
-    # the SDK so this turn continues that conversation. Cleared via
-    # DELETE /api/agents/<id>/session when the user wants a fresh start.
-    prior_session = await _get_session_id(agent_id)
+    # Resume: if the last turn captured a session_id (loaded above),
+    # hand it back to the SDK so this turn continues that conversation.
     if prior_session:
         options_kwargs["resume"] = prior_session
 
