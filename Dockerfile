@@ -68,5 +68,14 @@ RUN pip install .
 
 EXPOSE 8000
 
+# Healthcheck. Hits /api/health every 30s; two misses in a row mark
+# the container unhealthy (90 s boot grace so init_db + workspaces
+# have time). Endpoint is public (doesn't require HARNESS_TOKEN),
+# curl is already installed above. --fail makes non-2xx exit 22, so
+# /api/health returning 503 (any required subsystem red) correctly
+# marks the container unhealthy without us parsing the body.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=2 \
+    CMD curl -fsS "http://127.0.0.1:${PORT:-8000}/api/health" > /dev/null || exit 1
+
 # Listen on $PORT if Zeabur sets one, fall back to 8000
 CMD ["sh", "-c", "exec uvicorn server.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
