@@ -806,14 +806,26 @@ Special non-agent pane type. Opens in a new column when the 📁 left-rail icon 
 
 ## 15. Test suite
 
-Under `server/tests/`, pytest-asyncio auto mode, DB-level (no FastAPI TestClient so the suite doesn't pull `claude-agent-sdk` at import time).
+Under `server/tests/`, pytest-asyncio auto mode. Most tests are DB-level (exercise the schema + helpers directly without the FastAPI TestClient). A handful import `server.agents` — OK in CI because `uv sync --extra dev` installs `claude-agent-sdk` as a prod dep; tests never actually spawn a subprocess.
 
-- `test_db.py` — schema smoke, 11-agent seed, idempotent init. (3 tests)
-- `test_events.py` — bus publish/subscribe/persist round-trip; late-subscriber has empty backlog (invariant). (3 tests)
-- `test_tools_consts.py` — VALID_RECIPIENTS shape, MEMORY_TOPIC_RE accept/reject, coord-tool name prefix, Coach/Player allowlist split. (7 tests)
-- `test_tasks_sm.py` — status default, CHECK constraint enforcement on status + kind, cancel clears owner. (4 tests)
+- `test_db.py` — schema smoke, 11-agent seed, idempotent init. (3)
+- `test_events.py` — bus publish/subscribe/persist round-trip; late-subscriber has empty backlog (invariant). (3)
+- `test_tools_consts.py` — VALID_RECIPIENTS shape, MEMORY_TOPIC_RE, coord-tool name prefix, Coach/Player allowlist split. (7)
+- `test_tasks_sm.py` — status default, CHECK constraints, cancel clears owner. (4)
+- `test_context.py` — governance docs: validate, write/read/delete, size + empty-body rejection, TTL cache. (15)
+- `test_knowledge.py` — artifact bucket: traversal guards, extension check, depth limit, list_paths. (13)
+- `test_files.py` — files-browser backend: _resolve safety, tree walk, write routing. (14)
+- `test_mcp_config.py` — external MCP loader: skip paths, interpolation, validation. (13)
+- `test_turns.py` — turns ledger: schema, insert, defaults, indexes. (4)
+- `test_crash_recover.py` — boot reset of working/waiting agents + in_progress tasks. (4)
+- `test_retention.py` — trim_events_once + trim_attachments_once cutoff + disabled cases. (7)
+- `test_autoname.py` — lacrosse pool pick, no-op on already-named, race-safe under concurrent gather. (5)
+- `test_agents_helpers.py` — _today_spend, _get_agent_brief, _clear_session_id. (8)
+- `test_concurrent_spawn_guard.py` — spawn_rejected fires when _running_tasks has a live task. (2)
 
-**Total: 17 tests.** Run: `uv sync --extra dev && uv run pytest`.
+**Total: 106 tests.** CI (`.github/workflows/tests.yml`) runs the suite on every push + PR.
+
+Local: `uv sync --extra dev && uv run pytest -ra --strict-markers`.
 
 ---
 
