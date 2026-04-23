@@ -419,11 +419,16 @@ async def run_agent(
         max_turns=10,
         mcp_servers={"coord": coord_server},
         allowed_tools=allowed,
-        # Stream every token + thinking delta as StreamEvent messages so
-        # the UI can show a live "typing" cursor instead of a dead pause
-        # while a turn is in flight.
-        include_partial_messages=True,
     )
+    # Partial-message streaming (token-by-token text + thinking deltas)
+    # is off by default: the option is understood by recent SDK
+    # versions but the corresponding CLI flag crashes exit=1 on some
+    # Claude Code CLI builds (confirmed against 2.1.118). Flip
+    # HARNESS_STREAM_TOKENS=true once you've verified your CLI handles
+    # it (e.g. `claude --help | grep partial`). Turns still complete
+    # fine without streaming — you just don't get the typing cursor.
+    if os.environ.get("HARNESS_STREAM_TOKENS", "").lower() in ("1", "true", "yes"):
+        options_kwargs["include_partial_messages"] = True
     if model:
         options_kwargs["model"] = model
     if plan_mode:
