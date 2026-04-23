@@ -74,16 +74,21 @@ ATTACHMENTS_RETENTION_DAYS = int(
     os.environ.get("HARNESS_ATTACHMENTS_RETENTION_DAYS", "30")
 )
 
-# kDrive → local upload pull. Users drop reference docs at
-# kDrive://upload/ via the web UI or sync client; we mirror them into
-# /data/upload (which each agent workspace symlinks as ./uploads) so
-# Players can Read ./uploads/foo.pdf. Default 60s — it's user-driven
-# so a minute is snappy enough.
-UPLOAD_PULL_INTERVAL_SECONDS = int(
-    os.environ.get("HARNESS_UPLOAD_PULL_INTERVAL", "60")
+# kDrive → local uploads pull. Users drop reference docs at
+# kDrive://uploads/ via the web UI or sync client; we mirror them
+# into /data/uploads (which each agent workspace symlinks as
+# ./uploads) so Players can Read ./uploads/foo.pdf. Default 60s —
+# it's user-driven so a minute is snappy enough. The legacy singular
+# env-var names (HARNESS_UPLOAD_*) still work for back-compat.
+UPLOADS_PULL_INTERVAL_SECONDS = int(
+    os.environ.get("HARNESS_UPLOADS_PULL_INTERVAL")
+    or os.environ.get("HARNESS_UPLOAD_PULL_INTERVAL")
+    or "60"
 )
-UPLOAD_LOCAL_DIR = Path(
-    os.environ.get("HARNESS_UPLOAD_DIR", "/data/upload")
+UPLOADS_LOCAL_DIR = Path(
+    os.environ.get("HARNESS_UPLOADS_DIR")
+    or os.environ.get("HARNESS_UPLOAD_DIR")
+    or "/data/uploads"
 )
 
 
@@ -268,9 +273,9 @@ async def snapshot_loop() -> None:
 
 
 async def pull_uploads_once() -> dict[str, int]:
-    """Mirror kDrive://upload/ → UPLOAD_LOCAL_DIR.
+    """Mirror kDrive://uploads/ → UPLOADS_LOCAL_DIR.
 
-    - Lists kDrive upload/ (empty list if disabled or missing).
+    - Lists kDrive uploads/ (empty list if disabled or missing).
     - Downloads every file not already present locally (size-based
       heuristic, cheap — kDrive webdav `ls` doesn't give us cheap
       per-file mtime, and re-downloading a 100MB PDF every minute
@@ -283,15 +288,15 @@ async def pull_uploads_once() -> dict[str, int]:
     if not kdrive.enabled:
         return {"added": 0, "removed": 0, "kept": 0}
     try:
-        remote_names = await kdrive.list_dir("upload")
+        remote_names = await kdrive.list_dir("uploads")
     except Exception:
-        logger.exception("upload pull: remote list failed")
+        logger.exception("uploads pull: remote list failed")
         return {"added": 0, "removed": 0, "kept": 0}
-    # Normalize: kDrive may return "upload/foo.pdf" or "foo.pdf"
+    # Normalize: kDrive may return "uploads/foo.pdf" or "foo.pdf"
     # depending on server — strip to basename.
     remote_set = {Path(n).name for n in remote_names if n}
-    UPLOAD_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
-    local_files = {p.name: p for p in UPLOAD_LOCAL_DIR.iterdir() if p.is_file() and not p.is_symlink()}
+    UPLOADS_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
+    local_files = {p.name: p for p in UPLOADS_LOCAL_DIR.iterdir() if p.is_file() and not p.is_symlink()}
     added = kept = removed = 0
     # Delete local files that vanished upstream.
     for name, lp in local_files.items():
@@ -300,7 +305,7 @@ async def pull_uploads_once() -> dict[str, int]:
                 lp.unlink()
                 removed += 1
             except OSError:
-                logger.exception("upload pull: failed to remove %s", lp)
+                logger.exception("uploads pull: failed to remove %s", lp)
     # Pull new files (anything we don't already have by name). This
     # does NOT refresh an edited file — rename on kDrive (e.g. add
     # version suffix) if you update a document and want agents to see
@@ -313,35 +318,35 @@ async def pull_uploads_once() -> dict[str, int]:
         # text. We don't decode; just stream bytes to disk so agents
         # can Read/Bash the file with the correct byte content.
         try:
-            data = await kdrive.read_bytes(f"upload/{name}")
+            data = await kdrive.read_bytes(f"uploads/{name}")
         except Exception:
-            logger.exception("upload pull: download failed: %s", name)
+            logger.exception("uploads pull: download failed: %s", name)
             continue
         if data is None:
-            logger.warning("upload pull: %s not found on re-fetch", name)
+            logger.warning("uploads pull: %s not found on re-fetch", name)
             continue
-        target = UPLOAD_LOCAL_DIR / name
+        target = UPLOADS_LOCAL_DIR / name
         try:
             target.write_bytes(data)
             added += 1
         except Exception:
-            logger.exception("upload pull: local write failed: %s", target)
+            logger.exception("uploads pull: local write failed: %s", target)
     if added or removed:
         logger.info(
-            "upload pull: +%d -%d (kept %d)", added, removed, kept,
+            "uploads pull: +%d -%d (kept %d)", added, removed, kept,
         )
     return {"added": added, "removed": removed, "kept": kept}
 
 
-async def upload_pull_loop() -> None:
-    """Background task: poll kDrive://upload/ every
-    HARNESS_UPLOAD_PULL_INTERVAL seconds (default 60)."""
+async def uploads_pull_loop() -> None:
+    """Background task: poll kDrive://uploads/ every
+    HARNESS_UPLOADS_PULL_INTERVAL seconds (default 60)."""
     if not kdrive.enabled:
-        logger.info("upload pull loop idle: kdrive disabled")
+        logger.info("uploads pull loop idle: kdrive disabled")
     else:
         logger.info(
-            "upload pull loop starting: every %ds → %s",
-            UPLOAD_PULL_INTERVAL_SECONDS, UPLOAD_LOCAL_DIR,
+            "uploads pull loop starting: every %ds → %s",
+            UPLOADS_PULL_INTERVAL_SECONDS, UPLOADS_LOCAL_DIR,
         )
     while True:
         try:
@@ -350,9 +355,9 @@ async def upload_pull_loop() -> None:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("upload pull cycle failed")
+            logger.exception("uploads pull cycle failed")
         try:
-            await asyncio.sleep(UPLOAD_PULL_INTERVAL_SECONDS)
+            await asyncio.sleep(UPLOADS_PULL_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             raise
 

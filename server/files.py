@@ -86,12 +86,18 @@ def _roots() -> dict[str, Root]:
             Path(os.environ.get("HARNESS_OUTPUTS_DIR", "/data/outputs")),
             writable=False,
         ),
-        # Human-uploaded reference material. Pulled from kDrive://upload/
-        # every ~60s by sync.upload_pull_loop; each Player has an
+        # Human-uploaded reference material. Pulled from kDrive://uploads/
+        # every ~60s by sync.uploads_pull_loop; each Player has a
         # `uploads` symlink pointing here so they can Read ./uploads/foo.
-        "upload": Root(
-            "upload",
-            Path(os.environ.get("HARNESS_UPLOAD_DIR", "/data/upload")),
+        # Accept the legacy singular env var for back-compat with any
+        # operator who set HARNESS_UPLOAD_DIR before the rename.
+        "uploads": Root(
+            "uploads",
+            Path(
+                os.environ.get("HARNESS_UPLOADS_DIR")
+                or os.environ.get("HARNESS_UPLOAD_DIR")
+                or "/data/uploads"
+            ),
             writable=False,
         ),
     }

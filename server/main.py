@@ -53,7 +53,7 @@ from server.sync import (
     events_trim_loop,
     flush_loop,
     snapshot_loop,
-    upload_pull_loop,
+    uploads_pull_loop,
 )
 from server.workspaces import ensure_workspaces, get_status as get_workspaces_status
 
@@ -118,10 +118,15 @@ ALLOWED_EXT = {"png", "jpg", "jpeg", "gif", "webp"}
 OUTPUTS_DIR = Path(os.environ.get("HARNESS_OUTPUTS_DIR", "/data/outputs"))
 
 # Human-uploaded reference material the team reads. Humans drop files
-# on kDrive under upload/; a background loop pulls them into this
+# on kDrive under uploads/; a background loop pulls them into this
 # directory, and per-slot workspaces get a `uploads` symlink so
-# Players can Read ./uploads/foo.pdf from their cwd.
-UPLOAD_DIR = Path(os.environ.get("HARNESS_UPLOAD_DIR", "/data/upload"))
+# Players can Read ./uploads/foo.pdf from their cwd. HARNESS_UPLOAD_DIR
+# is accepted as a legacy alias for HARNESS_UPLOADS_DIR.
+UPLOADS_DIR = Path(
+    os.environ.get("HARNESS_UPLOADS_DIR")
+    or os.environ.get("HARNESS_UPLOAD_DIR")
+    or "/data/uploads"
+)
 
 
 @asynccontextmanager
@@ -141,7 +146,7 @@ async def lifespan(app: FastAPI):
         logger.exception("crash_recover failed (non-fatal)")
     ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     # Per-slot symlinks so agents can say "Read ./uploads/foo.pdf"
     # from their workspace cwd instead of hardcoding /data paths. Same
     # pattern the Dockerfile uses for attachments — we do it at runtime
@@ -157,7 +162,7 @@ async def lifespan(app: FastAPI):
                 if link.exists() or link.is_symlink():
                     continue
                 try:
-                    link.symlink_to(UPLOAD_DIR)
+                    link.symlink_to(UPLOADS_DIR)
                 except OSError:
                     logger.exception(
                         "failed to symlink uploads for %s", slot_dir.name
@@ -189,8 +194,8 @@ async def lifespan(app: FastAPI):
     coach_task = asyncio.create_task(coach_tick_loop())
     trim_task = asyncio.create_task(events_trim_loop())
     att_trim_task = asyncio.create_task(attachments_trim_loop())
-    upload_task = asyncio.create_task(upload_pull_loop())
-    bg_tasks = (sync_task, snapshot_task, coach_task, trim_task, att_trim_task, upload_task)
+    uploads_task = asyncio.create_task(uploads_pull_loop())
+    bg_tasks = (sync_task, snapshot_task, coach_task, trim_task, att_trim_task, uploads_task)
     try:
         yield
     finally:
