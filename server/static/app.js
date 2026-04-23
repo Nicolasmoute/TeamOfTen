@@ -1023,6 +1023,19 @@ function App() {
                     key=${"col-" + col.join("-")}
                   >
                     ${col.map((slot) => {
+                      // Special slots (prefix __) render a non-agent pane.
+                      // Currently just __files; room to add __knowledge etc.
+                      if (slot === "__files") {
+                        return html`<${FilesPane}
+                          key=${slot}
+                          slot=${slot}
+                          authedFetch=${authedFetch}
+                          onClose=${() => closePane(slot)}
+                          onDropEdge=${dropOnPaneEdge}
+                          onPopOut=${moveToNewColumn}
+                          stacked=${col.length > 1}
+                        />`;
+                      }
                       const agent = agents.find((a) => a.id === slot);
                       const currentTask = agent?.current_task_id
                         ? tasks.find((t) => t.id === agent.current_task_id)
@@ -1241,6 +1254,16 @@ function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsCon
         ) + " Keyboard: ⌘/Ctrl+."}
         onClick=${onTogglePause}
       >${paused ? "▶" : "❚❚"}</button>
+      <button
+        class=${"gear files-open" + (openSlots.includes("__files") ? " active" : "")}
+        title="Open the file explorer pane (context, knowledge, decisions)"
+        onClick=${() => onOpen("__files")}
+      >
+        <span class="files-icon" aria-hidden="true">
+          <span class="files-icon-tab"></span>
+          <span class="files-icon-body"></span>
+        </span>
+      </button>
       <button
         class=${"gear env-toggle" + (envOpen ? " active" : "")}
         title=${(envOpen ? "Collapse environment panel" : "Open environment panel") + " (⌘/Ctrl+B)"}
@@ -2524,6 +2547,394 @@ function EnvTimelineItem({ event }) {
     </div>`;
   }
   return null;
+}
+
+// ------------------------------------------------------------------
+// files pane — a browsable tree + an editor for text files. Lives
+// as a special slot (__files) in openColumns, so it participates in
+// the normal drag/resize/stack affordances like an agent pane.
+// ------------------------------------------------------------------
+
+function FilesPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, stacked }) {
+  const [roots, setRoots] = useState([]);
+  const [activeRoot, setActiveRoot] = useState(null);
+  const [tree, setTree] = useState(null);
+  const [selected, setSelected] = useState(null); // {root, path}
+  const [expanded, setExpanded] = useState(new Set()); // "root:relpath" strings
+  const [content, setContent] = useState(null); // authoritative loaded text
+  const [draft, setDraft] = useState(""); // textarea buffer
+  const [meta, setMeta] = useState(null); // {size, mtime}
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+  const [previewMd, setPreviewMd] = useState(true);
+
+  // Drop handling reuses the same protocol as AgentPane so DnD works
+  // the same way — we just refuse to become a drag source.
+  const [dropEdge, setDropEdge] = useState(null);
+  const onDragOver = useCallback((e) => {
+    const types = Array.from(e.dataTransfer.types || []);
+    if (!types.includes("application/x-harness-slot")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    const rect = e.currentTarget.getBoundingClientRect();
+    const xf = (e.clientX - rect.left) / rect.width;
+    const yf = (e.clientY - rect.top) / rect.height;
+    let edge;
+    if (xf < 0.22) edge = "left";
+    else if (xf > 0.78) edge = "right";
+    else if (yf < 0.5) edge = "top";
+    else edge = "bottom";
+    setDropEdge(edge);
+  }, []);
+  const onDragLeave = useCallback((e) => {
+    const next = e.relatedTarget;
+    if (next && e.currentTarget.contains(next)) return;
+    setDropEdge(null);
+  }, []);
+  const onDrop = useCallback((e) => {
+    const edge = dropEdge;
+    setDropEdge(null);
+    const dragged = e.dataTransfer.getData("application/x-harness-slot");
+    if (!dragged || dragged === slot || !edge) return;
+    e.preventDefault();
+    if (onDropEdge) onDropEdge(dragged, slot, edge);
+  }, [slot, dropEdge, onDropEdge]);
+
+  const loadRoots = useCallback(async () => {
+    try {
+      const res = await authedFetch("/api/files/roots");
+      const data = await res.json();
+      setRoots(Array.isArray(data) ? data : []);
+      if (!activeRoot && Array.isArray(data) && data.length > 0) {
+        setActiveRoot(data[0].key);
+      }
+    } catch (e) {
+      setErr("roots load failed: " + String(e));
+    }
+  }, [authedFetch, activeRoot]);
+
+  const loadTree = useCallback(async (rootKey) => {
+    if (!rootKey) return;
+    try {
+      const res = await authedFetch("/api/files/tree/" + rootKey);
+      const data = await res.json();
+      setTree(data);
+    } catch (e) {
+      setErr("tree load failed: " + String(e));
+    }
+  }, [authedFetch]);
+
+  useEffect(() => { loadRoots(); }, [loadRoots]);
+  useEffect(() => { if (activeRoot) loadTree(activeRoot); }, [activeRoot, loadTree]);
+
+  const activeRootMeta = roots.find((r) => r.key === activeRoot);
+
+  const openFile = useCallback(async (root, path) => {
+    setLoading(true);
+    setErr("");
+    try {
+      const res = await authedFetch(
+        "/api/files/read/" + root + "?path=" + encodeURIComponent(path)
+      );
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error("HTTP " + res.status + ": " + body.slice(0, 200));
+      }
+      const data = await res.json();
+      setSelected({ root, path });
+      setContent(data.content);
+      setDraft(data.content);
+      setMeta({ size: data.size, mtime: data.mtime });
+    } catch (e) {
+      setErr("read failed: " + String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [authedFetch]);
+
+  const save = useCallback(async () => {
+    if (!selected || !activeRootMeta?.writable) return;
+    setSaving(true);
+    setErr("");
+    try {
+      const res = await authedFetch(
+        "/api/files/write/" + selected.root +
+          "?path=" + encodeURIComponent(selected.path),
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: draft }),
+        }
+      );
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error("HTTP " + res.status + ": " + body.slice(0, 200));
+      }
+      setContent(draft);
+      // Refresh the tree so a newly-created file shows up.
+      loadTree(activeRoot);
+    } catch (e) {
+      setErr("save failed: " + String(e));
+    } finally {
+      setSaving(false);
+    }
+  }, [authedFetch, selected, activeRootMeta, draft, loadTree, activeRoot]);
+
+  const dirty = content !== null && draft !== content;
+  const isMd = selected?.path?.toLowerCase().endsWith(".md");
+
+  return html`
+    <section
+      class=${"pane files-pane" + (dropEdge ? " drop-edge-" + dropEdge : "")}
+      id=${"pane-" + slot}
+      onDragOver=${onDragOver}
+      onDragLeave=${onDragLeave}
+      onDrop=${onDrop}
+    >
+      <header class="pane-head">
+        <span class="pane-drag-handle" title="Files pane">
+          <span class="pane-dot idle" />
+          <span class="pane-id">files</span>
+          ${selected
+            ? html`<span class="pane-name">${selected.root} / ${selected.path}${dirty ? " *" : ""}</span>`
+            : html`<span class="pane-name">pick a file</span>`}
+        </span>
+        ${dirty
+          ? html`<button
+              class="pane-files-save"
+              onClick=${save}
+              disabled=${saving}
+              title="Save (⌘/Ctrl+S)"
+            >${saving ? "saving…" : "save"}</button>`
+          : null}
+        ${stacked
+          ? html`<button class="pane-pop-out" onClick=${() => onPopOut(slot)}
+              title="Pop out to its own column">⇱</button>`
+          : null}
+        <button class="pane-close" onClick=${onClose} title="Close">×</button>
+      </header>
+
+      <div class="files-body">
+        <nav class="files-tree">
+          <div class="files-tree-roots">
+            ${roots.map((r) => html`
+              <button
+                key=${r.key}
+                class=${"files-root" + (r.key === activeRoot ? " active" : "")}
+                onClick=${() => setActiveRoot(r.key)}
+                title=${r.writable ? "editable" : "read-only"}
+              >${r.key}${r.writable ? "" : " 🔒"}</button>
+            `)}
+          </div>
+          ${tree
+            ? html`<${FileTreeNode}
+                node=${tree}
+                root=${activeRoot}
+                path=""
+                depth=${0}
+                expanded=${expanded}
+                setExpanded=${setExpanded}
+                selected=${selected}
+                onPick=${openFile}
+              />`
+            : html`<div class="files-empty">loading…</div>`}
+        </nav>
+
+        <section class="files-editor">
+          ${err ? html`<div class="files-err">${err}</div>` : null}
+          ${!selected
+            ? html`<div class="files-empty">Pick a file on the left.</div>`
+            : loading
+            ? html`<div class="files-empty">loading…</div>`
+            : html`
+              ${isMd
+                ? html`<div class="files-md-toolbar">
+                    <button
+                      class=${previewMd ? "active" : ""}
+                      onClick=${() => setPreviewMd(true)}
+                    >preview</button>
+                    <button
+                      class=${!previewMd ? "active" : ""}
+                      onClick=${() => setPreviewMd(false)}
+                    >edit</button>
+                  </div>`
+                : null}
+              ${isMd && previewMd
+                ? html`<div
+                    class="files-md-preview"
+                    dangerouslySetInnerHTML=${{ __html: renderMarkdown(draft) }}
+                  />`
+                : html`<textarea
+                    class="files-textarea"
+                    value=${draft}
+                    readOnly=${!activeRootMeta?.writable}
+                    onInput=${(e) => setDraft(e.target.value)}
+                    onKeyDown=${(e) => {
+                      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
+                        e.preventDefault();
+                        save();
+                      }
+                    }}
+                    spellcheck=${false}
+                  />`}
+              <div class="files-editor-foot">
+                ${meta ? html`<span>${meta.size} bytes</span>` : null}
+                ${dirty ? html`<span class="dirty">unsaved</span>` : null}
+                ${!activeRootMeta?.writable ? html`<span>read-only</span>` : null}
+              </div>
+            `}
+        </section>
+      </div>
+    </section>
+  `;
+}
+
+function FileTreeNode({ node, root, path, depth, expanded, setExpanded, selected, onPick }) {
+  const key = root + ":" + (node.path || "");
+  const isOpen = depth === 0 || expanded.has(key);
+  const toggle = () => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  };
+  if (node.type === "file") {
+    const isSel = selected?.root === root && selected?.path === node.path;
+    return html`
+      <div
+        class=${"files-node file" + (isSel ? " selected" : "")}
+        style=${"padding-left:" + (depth * 12 + 8) + "px"}
+        onClick=${() => onPick(root, node.path)}
+        title=${node.path}
+      >
+        <span class="files-node-icon">📄</span>
+        <span class="files-node-name">${node.name}</span>
+      </div>
+    `;
+  }
+  return html`
+    ${depth > 0
+      ? html`<div
+          class="files-node dir"
+          style=${"padding-left:" + (depth * 12 + 8) + "px"}
+          onClick=${toggle}
+        >
+          <span class="files-node-icon">${isOpen ? "▾" : "▸"}</span>
+          <span class="files-node-name">${node.name || root}</span>
+        </div>`
+      : null}
+    ${isOpen
+      ? (node.children || []).map((child) => html`
+          <${FileTreeNode}
+            key=${root + ":" + (child.path || child.name)}
+            node=${child}
+            root=${root}
+            path=${child.path || ""}
+            depth=${depth + 1}
+            expanded=${expanded}
+            setExpanded=${setExpanded}
+            selected=${selected}
+            onPick=${onPick}
+          />
+        `)
+      : null}
+  `;
+}
+
+// Minimal markdown renderer — headings, paragraphs, code fences, lists,
+// inline code/bold/italic/links. Deliberately small; if we need real
+// rendering later we can drop in micromark or similar.
+function renderMarkdown(md) {
+  if (!md) return "";
+  const esc = (s) =>
+    String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  const lines = md.split(/\r?\n/);
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    // Fenced code block
+    const fence = /^```(\w*)$/.exec(line);
+    if (fence) {
+      const lang = fence[1];
+      const buf = [];
+      i++;
+      while (i < lines.length && !/^```$/.test(lines[i])) {
+        buf.push(lines[i]);
+        i++;
+      }
+      i++; // skip closing fence
+      out.push(
+        `<pre class="md-code"><code${lang ? ` data-lang="${esc(lang)}"` : ""}>${esc(buf.join("\n"))}</code></pre>`
+      );
+      continue;
+    }
+    // Heading
+    const h = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (h) {
+      const lvl = h[1].length;
+      out.push(`<h${lvl} class="md-h">${renderInline(esc(h[2]))}</h${lvl}>`);
+      i++;
+      continue;
+    }
+    // Unordered list block
+    if (/^[-*]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^[-*]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^[-*]\s+/, ""));
+        i++;
+      }
+      out.push(
+        "<ul class=\"md-ul\">" +
+          items.map((t) => "<li>" + renderInline(esc(t)) + "</li>").join("") +
+          "</ul>"
+      );
+      continue;
+    }
+    // Ordered list block
+    if (/^\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\d+\.\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\d+\.\s+/, ""));
+        i++;
+      }
+      out.push(
+        "<ol class=\"md-ol\">" +
+          items.map((t) => "<li>" + renderInline(esc(t)) + "</li>").join("") +
+          "</ol>"
+      );
+      continue;
+    }
+    // Blank line → paragraph break
+    if (!line.trim()) { i++; continue; }
+    // Paragraph (collect until blank)
+    const buf = [line];
+    i++;
+    while (i < lines.length && lines[i].trim() && !/^(#{1,6}\s|[-*]\s|\d+\.\s|```)/.test(lines[i])) {
+      buf.push(lines[i]);
+      i++;
+    }
+    out.push("<p class=\"md-p\">" + renderInline(esc(buf.join(" "))) + "</p>");
+  }
+  return out.join("\n");
+}
+
+function renderInline(s) {
+  return s
+    // links [text](url)
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g,
+      '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    // inline code
+    .replace(/`([^`]+)`/g, '<code class="md-ic">$1</code>')
+    // bold
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    // italic (avoid already-escaped patterns)
+    .replace(/(^|\W)\*([^*]+)\*(\W|$)/g, "$1<em>$2</em>$3");
 }
 
 // ------------------------------------------------------------------

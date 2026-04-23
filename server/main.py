@@ -43,6 +43,7 @@ from server.agents import (
     set_paused,
 )
 from server import context as ctxmod
+from server import files as filesmod
 from server.db import configured_conn, init_db
 from server.events import bus
 from server.kdrive import kdrive
@@ -870,6 +871,63 @@ async def delete_context(kind: str, name: str) -> dict[str, Any]:
         }
     )
     return {"ok": True}
+
+
+class FileWrite(BaseModel):
+    content: str = Field(..., description="UTF-8 text body")
+
+
+@app.get("/api/files/roots", dependencies=[Depends(require_token)])
+async def files_roots() -> list[dict[str, Any]]:
+    """List the named roots the explorer is allowed to browse."""
+    return filesmod.list_roots()
+
+
+@app.get("/api/files/tree/{root}", dependencies=[Depends(require_token)])
+async def files_tree(root: str) -> dict[str, Any]:
+    """Recursive tree under a named root. Directories before files, both
+    sorted case-insensitively. Missing root → empty tree, not 404."""
+    try:
+        return filesmod.tree(root)
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
+
+
+@app.get("/api/files/read/{root}", dependencies=[Depends(require_token)])
+async def files_read(root: str, path: str = Query(..., description="relative to root")) -> dict[str, Any]:
+    try:
+        return filesmod.read_text(root, path)
+    except FileNotFoundError:
+        raise HTTPException(404, detail="not found")
+    except PermissionError as e:
+        raise HTTPException(403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
+
+
+@app.put("/api/files/write/{root}", dependencies=[Depends(require_token)])
+async def files_write(
+    root: str,
+    req: FileWrite,
+    path: str = Query(..., description="relative to root"),
+) -> dict[str, Any]:
+    try:
+        result = await filesmod.write_text(root, path, req.content)
+    except PermissionError as e:
+        raise HTTPException(403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "human",
+            "type": "file_written",
+            "root": root,
+            "path": path,
+            "size": result["size"],
+        }
+    )
+    return {"ok": True, **result}
 
 
 @app.get("/api/events", dependencies=[Depends(require_token)])
