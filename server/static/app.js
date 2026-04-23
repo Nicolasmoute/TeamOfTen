@@ -3035,6 +3035,31 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
 // event renderer (v2b generic; v2c adds per-tool richness)
 // ------------------------------------------------------------------
 
+function TurnHeader({ event, ts }) {
+  const [open, setOpen] = useState(false);
+  const prompt = event.prompt || "";
+  const oneLiner = prompt.replace(/\s+/g, " ").trim();
+  const arrow = event.resumed_session ? "↻" : "→";
+  return html`<div class=${"event agent_started turn-header" + (open ? " open" : "")}>
+    <div
+      class="turn-header-row"
+      onClick=${() => setOpen((v) => !v)}
+      title=${open ? "collapse" : "expand full prompt"}
+    >
+      <span
+        class="turn-header-arrow"
+        title=${event.resumed_session ? "resumed prior session" : "fresh start"}
+      >${arrow}</span>
+      <span class="turn-header-ts">${ts}</span>
+      <span class="turn-header-prompt">${oneLiner || "(empty prompt)"}</span>
+      <span class="turn-header-chev">${open ? "▾" : "▸"}</span>
+    </div>
+    ${open && prompt
+      ? html`<div class="turn-header-full">${prompt}</div>`
+      : null}
+  </div>`;
+}
+
 function ThinkingItem({ event, ts }) {
   const [open, setOpen] = useState(false);
   const content = event.content || "";
@@ -3104,10 +3129,11 @@ function EventItem({ event }) {
   }
 
   if (type === "agent_started") {
-    return html`<div class="event agent_started">
-      <div class="event-meta">${ts}  agent_started</div>
-      ${event.prompt ? html`<div class="prompt">${event.prompt}</div>` : null}
-    </div>`;
+    // Sticky "turn header" — collapses to a one-line prompt preview
+    // that sticks to the top of the scrolled pane until the next
+    // agent_started event pushes it up. Click to expand the full
+    // prompt. Emulates Claude Code's history browser.
+    return html`<${TurnHeader} event=${event} ts=${ts} />`;
   }
 
   if (type === "agent_stopped") {

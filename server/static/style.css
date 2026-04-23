@@ -1204,6 +1204,69 @@ body {
 .event.connected { color: var(--muted); font-size: 12px; }
 .event .prompt { color: var(--fg); margin-top: 4px; }
 
+/* Turn header — renders each agent_started event as a one-line
+   collapsible bar that uses position: sticky to hover at the top of
+   the scrolled pane-body. As the user scrolls further back in history,
+   the next agent_started pushes the current one out of the sticky
+   position, so the visible header always matches the prompt of the
+   turn you're currently reading (Claude Code's pattern). */
+.event.agent_started.turn-header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--bg);
+  border-left: 3px solid var(--accent);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  margin: 8px -12px;              /* cancel pane-body padding so it spans edge-to-edge */
+  padding: 6px 12px;
+  border-radius: 0;
+}
+.turn-header-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+.turn-header-arrow {
+  color: var(--accent);
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+.turn-header-ts {
+  color: var(--muted);
+  font-size: 10px;
+  flex: 0 0 auto;
+}
+.turn-header-prompt {
+  color: var(--fg);
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-style: italic;
+}
+.turn-header-chev {
+  color: var(--muted);
+  flex: 0 0 auto;
+}
+.turn-header.open .turn-header-prompt {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+.turn-header-full {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+  white-space: pre-wrap;
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
 /* ---- tool card ---- */
 .tool-card summary {
   list-style: none;
