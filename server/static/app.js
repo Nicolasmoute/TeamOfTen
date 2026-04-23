@@ -466,15 +466,21 @@ function App() {
   }, [openColumns, envOpen]);
 
   // Reflect live state in the tab title so a backgrounded tab still
-  // signals: ⏸ when paused, N⚡ when N agents are working, and the
-  // baseline "TeamOfTen" otherwise.
+  // signals:
+  //   ⏸          paused (takes precedence over other signals)
+  //   N⚡        N agents currently working
+  //   M●        M slots with unread activity (closed panes only)
+  // When both working and unread are nonzero they're combined.
   useEffect(() => {
     const working = agents.filter((a) => a.status === "working").length;
-    let prefix = "";
-    if (paused) prefix = "⏸ ";
-    else if (working > 0) prefix = `${working}⚡ `;
+    const unread = unreadSlots.size;
+    let parts = [];
+    if (paused) parts.push("⏸");
+    if (working > 0) parts.push(`${working}⚡`);
+    if (unread > 0 && !paused) parts.push(`${unread}●`);
+    const prefix = parts.length > 0 ? parts.join(" ") + " " : "";
     document.title = `${prefix}TeamOfTen`;
-  }, [paused, agents]);
+  }, [paused, agents, unreadSlots]);
 
   // Global keyboard shortcuts. Kept deliberately small — anything else
   // belongs scoped to the relevant pane/component.
@@ -603,13 +609,29 @@ function App() {
   }, [conversations, seenTs, openSlots]);
 
   // Open a slot as a new standalone column on the right. Also marks
-  // the slot as seen so any prior unread badge clears.
+  // the slot as seen so any prior unread badge clears. If the slot is
+  // already open, scroll its pane into view — user probably clicked
+  // to find it.
   const openPane = useCallback((slot) => {
+    let alreadyOpen = false;
     setOpenColumns((prev) => {
-      if (flatSlots(prev).includes(slot)) return prev;
+      if (flatSlots(prev).includes(slot)) {
+        alreadyOpen = true;
+        return prev;
+      }
       return [...prev, [slot]];
     });
     markSeen(slot);
+    if (alreadyOpen) {
+      // Defer to next tick so layout settles if the state update
+      // also opened another pane on the same click.
+      setTimeout(() => {
+        const el = document.getElementById("pane-" + slot);
+        if (el?.scrollIntoView) {
+          el.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+        }
+      }, 0);
+    }
   }, [markSeen]);
   // Remove a pane, dropping the column if it becomes empty. Mark as
   // seen through the current last event, since an open pane is
