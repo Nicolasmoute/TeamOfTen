@@ -51,6 +51,20 @@ SNAPSHOT_RETENTION = int(
     os.environ.get("HARNESS_KDRIVE_SNAPSHOT_RETENTION", "144")
 )
 
+# How long events stay in the SQLite `events` table. Older rows are
+# deleted by events_trim_loop (runs daily). kDrive's daily JSONL
+# mirrors keep the full permanent history, so trimming the hot DB
+# just keeps it performant — it's not data loss. Set to 0 to disable
+# trimming (events grow forever).
+EVENTS_RETENTION_DAYS = int(
+    os.environ.get("HARNESS_EVENTS_RETENTION_DAYS", "30")
+)
+# Seconds between trim passes. 24 h by default — events are small so
+# more-frequent trimming has no benefit.
+EVENTS_TRIM_INTERVAL_SECONDS = int(
+    os.environ.get("HARNESS_EVENTS_TRIM_INTERVAL", "86400")
+)
+
 
 def _utc_midnight_of(day: datetime) -> datetime:
     return day.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -228,6 +242,70 @@ async def snapshot_loop() -> None:
             logger.exception("snapshot cycle failed")
         try:
             await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+
+
+async def trim_events_once() -> int:
+    """Delete rows from `events` older than EVENTS_RETENTION_DAYS.
+
+    Returns the number of rows deleted, or 0 if trimming is disabled
+    / nothing old enough existed. Safe to run concurrently with
+    writes — SQLite serializes.
+
+    The kDrive daily JSONL mirror is the source of truth for
+    permanent history; this function just keeps the hot SQLite table
+    from growing unbounded.
+    """
+    if EVENTS_RETENTION_DAYS <= 0:
+        return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(days=EVENTS_RETENTION_DAYS)
+    cutoff_iso = cutoff.isoformat()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "DELETE FROM events WHERE ts < ?", (cutoff_iso,)
+        )
+        deleted = cur.rowcount
+        await c.commit()
+    finally:
+        await c.close()
+    if deleted:
+        logger.info(
+            "events trim: deleted %d rows older than %s (retention=%dd)",
+            deleted, cutoff_iso, EVENTS_RETENTION_DAYS,
+        )
+    return deleted
+
+
+async def events_trim_loop() -> None:
+    """Background task: prune old events daily. Runs once shortly after
+    boot so fresh deploys don't accumulate before first trim, then
+    every EVENTS_TRIM_INTERVAL_SECONDS thereafter."""
+    if EVENTS_RETENTION_DAYS <= 0:
+        logger.info(
+            "events trim loop disabled (HARNESS_EVENTS_RETENTION_DAYS=0)"
+        )
+        return
+    logger.info(
+        "events trim loop starting: retention=%dd, interval=%ds",
+        EVENTS_RETENTION_DAYS, EVENTS_TRIM_INTERVAL_SECONDS,
+    )
+    # Kick the first pass shortly after boot (not immediately, so db
+    # init and workspaces settle first).
+    try:
+        await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        raise
+    while True:
+        try:
+            await trim_events_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("events trim cycle failed")
+        try:
+            await asyncio.sleep(EVENTS_TRIM_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             raise
 
