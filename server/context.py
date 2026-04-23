@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path, PurePosixPath
 
 from server.kdrive import kdrive
@@ -46,6 +47,20 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 # The three kinds we support. Anything else is rejected at the API edge.
 VALID_KINDS: tuple[str, ...] = ("root", "skills", "rules")
+
+# Size cap — same as decisions. A single context doc over 40 KB is
+# almost certainly a mistake and would bloat every agent's system
+# prompt for the rest of its life.
+MAX_BODY_CHARS = 40_000
+
+# TTL cache for list_all(). build_system_prompt_suffix() is called on
+# every agent spawn; without this the WebDAV round trips would
+# dominate turn latency. Cache is busted on every write/delete from
+# this process. External edits (e.g. via the Infomaniak web UI) get
+# picked up within the TTL window.
+_LIST_TTL_SECONDS = 60.0
+_list_cache: dict[str, list[str]] | None = None
+_list_cache_at: float = 0.0
 
 
 def _local_path(kind: str, name: str) -> Path:
@@ -81,10 +96,19 @@ def validate(kind: str, name: str) -> str | None:
 async def write(kind: str, name: str, content: str) -> bool:
     """Write to both local cache and kDrive mirror. Returns True if the
     local write succeeds (kDrive is best-effort per our usual model —
-    failures there are logged, not raised)."""
+    failures there are logged, not raised).
+
+    Raises ValueError for invalid kind/name, empty body, or oversize
+    body — so every caller (MCP tool, HTTP endpoint) is protected
+    without each one having to re-validate.
+    """
     err = validate(kind, name)
     if err:
         raise ValueError(err)
+    if not content or not content.strip():
+        raise ValueError("body is required (empty context docs are not useful)")
+    if len(content) > MAX_BODY_CHARS:
+        raise ValueError(f"body too long ({len(content)} chars, max {MAX_BODY_CHARS})")
     lp = _local_path(kind, name)
     lp.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -97,6 +121,7 @@ async def write(kind: str, name: str, content: str) -> bool:
     # crash between local-write and next-flush doesn't lose edits.
     if kdrive.enabled:
         await kdrive.write_text(_remote_path(kind, name), content)
+    _invalidate_list_cache()
     return True
 
 
@@ -136,7 +161,28 @@ async def delete(kind: str, name: str) -> bool:
         logger.exception("context delete failed locally: %s", lp)
     if kdrive.enabled:
         await kdrive.remove(_remote_path(kind, name))
+    _invalidate_list_cache()
     return True
+
+
+def _invalidate_list_cache() -> None:
+    """Clear the list_all() TTL cache. Called after every successful
+    write/delete from this process. External kDrive edits still have
+    to wait out the TTL."""
+    global _list_cache, _list_cache_at
+    _list_cache = None
+    _list_cache_at = 0.0
+
+
+def _clean_basename(entry: str) -> str:
+    """Normalize a kDrive ls() entry to a bare filename.
+
+    webdav4's ls() returns basenames already in most cases, but some
+    servers include trailing slashes for directories or whole paths —
+    so strip both to be safe.
+    """
+    s = str(entry).rstrip("/")
+    return PurePosixPath(s).name
 
 
 async def list_all() -> dict[str, list[str]]:
@@ -144,7 +190,17 @@ async def list_all() -> dict[str, list[str]]:
 
     Shape: {"root": ["CLAUDE"] or [], "skills": [...], "rules": [...]}.
     Names are returned without the .md suffix.
+
+    Result cached for _LIST_TTL_SECONDS so build_system_prompt_suffix()
+    (called once per agent spawn) doesn't repeat three WebDAV round
+    trips per turn. Cache is busted by any write/delete in this process.
     """
+    global _list_cache, _list_cache_at
+    now = time.monotonic()
+    if _list_cache is not None and (now - _list_cache_at) < _LIST_TTL_SECONDS:
+        # Return a defensive copy so callers can't mutate the cached value.
+        return {k: list(v) for k, v in _list_cache.items()}
+
     out: dict[str, list[str]] = {"root": [], "skills": [], "rules": []}
     # Local pass
     root = CONTEXT_DIR / "CLAUDE.md"
@@ -156,28 +212,34 @@ async def list_all() -> dict[str, list[str]]:
             for f in d.iterdir():
                 if f.is_file() and f.suffix == ".md":
                     out[kind].append(f.stem)
-    # kDrive pass — union in anything we don't have locally yet
+    # kDrive pass — union in anything we don't have locally yet.
+    # Normalize basenames so dir entries with trailing slashes
+    # ("skills/", "rules/") don't accidentally match "CLAUDE.md".
     if kdrive.enabled:
         try:
-            root_names = await kdrive.list_dir("context")
+            root_entries = await kdrive.list_dir("context")
+            root_names = {_clean_basename(e) for e in root_entries}
             if "CLAUDE.md" in root_names and "CLAUDE" not in out["root"]:
                 out["root"].append("CLAUDE")
         except Exception:
             logger.exception("context kdrive root list failed")
         for kind in ("skills", "rules"):
             try:
-                names = await kdrive.list_dir(f"context/{kind}")
+                entries = await kdrive.list_dir(f"context/{kind}")
             except Exception:
                 logger.exception("context kdrive list failed: %s", kind)
                 continue
-            for n in names:
-                if n.endswith(".md"):
+            for raw in entries:
+                n = _clean_basename(raw)
+                if n.endswith(".md") and len(n) > 3:
                     stem = n[:-3]
                     if stem not in out[kind]:
                         out[kind].append(stem)
     for k in out:
         out[k].sort()
-    return out
+    _list_cache = out
+    _list_cache_at = now
+    return {k: list(v) for k, v in out.items()}
 
 
 async def build_system_prompt_suffix() -> str:

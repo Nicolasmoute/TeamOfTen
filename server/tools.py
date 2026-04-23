@@ -990,13 +990,6 @@ def build_coord_server(caller_id: str) -> Any:
         kind = (args.get("kind") or "").strip()
         name = (args.get("name") or "").strip()
         body = args.get("body") or ""
-        err = ctxmod.validate(kind, name)
-        if err:
-            return _err(err)
-        if not body.strip():
-            return _err("body is required (empty context docs are not useful)")
-        if len(body) > 40_000:
-            return _err(f"body too long ({len(body)} chars, max 40000)")
         try:
             ok = await ctxmod.write(kind, name, body)
         except ValueError as e:

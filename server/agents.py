@@ -392,6 +392,14 @@ async def run_agent(
     # context is configured — agents behave as before.
     context_suffix = await build_system_prompt_suffix()
     system_prompt = _system_prompt_for(agent_id) + context_suffix
+    if context_suffix:
+        # Emit the size (not the content) so a user can see "yes my rules
+        # were picked up" without drowning the timeline in prompt text.
+        await _emit(
+            agent_id,
+            "context_applied",
+            chars=len(context_suffix),
+        )
 
     options_kwargs: dict[str, Any] = dict(
         system_prompt=system_prompt,
