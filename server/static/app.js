@@ -412,6 +412,11 @@ function App() {
   const [authChallenge, setAuthChallenge] = useState(false);
   // conversations: Map<slotId, Event[]>  (events ordered oldest → newest)
   const [conversations, setConversations] = useState(new Map());
+  // streamingText: Map<slotId, {text, thinking}> — partial-token deltas
+  // accumulated between content_block_start and the consolidated
+  // AssistantMessage that follows. Surfaces as a live-typing bubble at
+  // the end of each pane timeline. Not persisted (ephemeral by design).
+  const [streamingText, setStreamingText] = useState(new Map());
   // Per-slot latest ts the user has "acknowledged" by opening that
   // pane. Slots currently in openColumns are always considered seen.
   // Lives in React state only (session-scoped) — a page reload
@@ -591,12 +596,52 @@ function App() {
       // in conversations or refresh any state based on it.
       if (ev.type === "ping") return;
       const aid = ev.agent_id || "system";
+      // Streaming deltas update a separate ephemeral buffer so the
+      // conversations list (persisted / reloaded) stays clean. Text &
+      // thinking are kept in distinct slots per agent; either can be
+      // active independently.
+      if (ev.type === "text_delta" || ev.type === "thinking_delta") {
+        setStreamingText((prev) => {
+          const next = new Map(prev);
+          const cur = next.get(aid) || { text: "", thinking: "" };
+          const key = ev.type === "text_delta" ? "text" : "thinking";
+          next.set(aid, { ...cur, [key]: cur[key] + (ev.delta || "") });
+          return next;
+        });
+        return;
+      }
       setConversations((prev) => {
         const next = new Map(prev);
         const list = next.get(aid) || [];
         next.set(aid, [...list, ev]);
         return next;
       });
+      // Clear the matching streaming buffer when the authoritative final
+      // block arrives, or the turn ends. Prevents the partial bubble
+      // lingering after the real text/thinking event renders.
+      if (ev.type === "text" || ev.type === "thinking") {
+        setStreamingText((prev) => {
+          const cur = prev.get(aid);
+          if (!cur) return prev;
+          const next = new Map(prev);
+          const key = ev.type === "text" ? "text" : "thinking";
+          next.set(aid, { ...cur, [key]: "" });
+          return next;
+        });
+      }
+      if (
+        ev.type === "result" ||
+        ev.type === "agent_stopped" ||
+        ev.type === "agent_cancelled" ||
+        ev.type === "error"
+      ) {
+        setStreamingText((prev) => {
+          if (!prev.has(aid)) return prev;
+          const next = new Map(prev);
+          next.set(aid, { text: "", thinking: "" });
+          return next;
+        });
+      }
       if (
         ev.type === "agent_started" ||
         ev.type === "agent_stopped" ||
@@ -988,6 +1033,7 @@ function App() {
                         agent=${agent}
                         currentTask=${currentTask}
                         liveEvents=${conversations.get(slot) || []}
+                        streaming=${streamingText.get(slot)}
                         openSlots=${openSlots}
                         onClose=${() => closePane(slot)}
                         onDropEdge=${dropOnPaneEdge}
@@ -2484,7 +2530,7 @@ function EnvTimelineItem({ event }) {
 // agent pane
 // ------------------------------------------------------------------
 
-function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onDropEdge, onPopOut, stacked }) {
+function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, onDropEdge, onPopOut, stacked }) {
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState([]); // {id, url, path, filename}
   const [submitting, setSubmitting] = useState(false);
@@ -2634,11 +2680,14 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onDropEdge, 
 
   // auto-scroll to bottom when new events arrive — only if user was already
   // near the bottom (otherwise leave them reading older history in peace).
+  // Also follows streaming-text length so typing tokens scroll with them.
+  const streamLen =
+    (streaming?.text?.length || 0) + (streaming?.thinking?.length || 0);
   useEffect(() => {
     if (bodyRef.current && stickToBottomRef.current) {
       bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
     }
-  }, [allEvents.length]);
+  }, [allEvents.length, streamLen]);
 
   // Last-turn stats: find the most recent 'result' event (the SDK
   // emits one per turn with duration + cost). Surfaces in the pane
@@ -2928,6 +2977,18 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onDropEdge, 
           ? html`<div class="pane-empty-hint">No events match "${searchQuery}".</div>`
           : null}
         ${visibleEvents.map((ev, i) => html`<${EventItem} key=${(ev.__id ?? "live-" + i)} event=${ev} />`)}
+        ${streaming && streaming.thinking
+          ? html`<div class="event thinking streaming">
+              <div class="event-meta">💭 thinking…</div>
+              <div class="event-body thinking-body">${streaming.thinking}<span class="stream-cursor" /></div>
+            </div>`
+          : null}
+        ${streaming && streaming.text
+          ? html`<div class="event text streaming">
+              <div class="event-meta">…</div>
+              <div class="event-body">${streaming.text}<span class="stream-cursor" /></div>
+            </div>`
+          : null}
       </div>
       <footer class="pane-input">
         ${attachments.length > 0
@@ -2974,6 +3035,24 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onDropEdge, 
 // event renderer (v2b generic; v2c adds per-tool richness)
 // ------------------------------------------------------------------
 
+function ThinkingItem({ event, ts }) {
+  const [open, setOpen] = useState(false);
+  const content = event.content || "";
+  const lines = content.split(/\n/).length;
+  return html`<div class=${"event thinking" + (open ? " open" : "")}>
+    <div
+      class="event-meta thinking-head"
+      onClick=${() => setOpen((v) => !v)}
+      title=${open ? "collapse" : "expand"}
+    >
+      ${ts}  💭 thought ${open ? "▾" : "▸"}  <span class="thinking-sub">${lines} line${lines === 1 ? "" : "s"}</span>
+    </div>
+    ${open
+      ? html`<div class="event-body thinking-body">${content}</div>`
+      : null}
+  </div>`;
+}
+
 function EventItem({ event }) {
   const type = event.type;
   const ts = timeStr(event.ts);
@@ -3000,6 +3079,12 @@ function EventItem({ event }) {
       <div class="event-meta">${ts}</div>
       <div class="event-body">${event.content || ""}</div>
     </div>`;
+  }
+
+  if (type === "thinking") {
+    // Collapsible by default — thinking is often long and the user can
+    // expand when debugging a turn's reasoning.
+    return html`<${ThinkingItem} event=${event} ts=${ts} />`;
   }
 
   if (type === "error") {

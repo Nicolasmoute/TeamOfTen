@@ -11,7 +11,9 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     ResultMessage,
+    StreamEvent,
     TextBlock,
+    ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
@@ -389,6 +391,10 @@ async def run_agent(
         max_turns=10,
         mcp_servers={"coord": coord_server},
         allowed_tools=allowed,
+        # Stream every token + thinking delta as StreamEvent messages so
+        # the UI can show a live "typing" cursor instead of a dead pause
+        # while a turn is in flight.
+        include_partial_messages=True,
     )
     if model:
         options_kwargs["model"] = model
@@ -417,6 +423,14 @@ async def run_agent(
                 for block in msg.content:
                     if isinstance(block, TextBlock):
                         await _emit(agent_id, "text", content=block.text)
+                    elif isinstance(block, ThinkingBlock):
+                        # Final consolidated thinking content — surfaces
+                        # as a collapsible card in the UI.
+                        await _emit(
+                            agent_id,
+                            "thinking",
+                            content=block.thinking,
+                        )
                     elif isinstance(block, ToolUseBlock):
                         await _emit(
                             agent_id,
@@ -424,6 +438,37 @@ async def run_agent(
                             id=block.id,
                             name=block.name,
                             input=block.input,
+                        )
+            elif isinstance(msg, StreamEvent):
+                # Partial-message deltas. Only the raw Anthropic streaming
+                # event types we care about get mirrored to WS — the rest
+                # (message_start, content_block_start, message_stop, …)
+                # just consolidate into the AssistantMessage we already
+                # handle above.
+                evt = getattr(msg, "event", None)
+                if not isinstance(evt, dict):
+                    continue
+                if evt.get("type") != "content_block_delta":
+                    continue
+                delta = evt.get("delta") or {}
+                dt = delta.get("type")
+                if dt == "text_delta":
+                    text = delta.get("text", "")
+                    if text:
+                        await _emit(
+                            agent_id,
+                            "text_delta",
+                            block_index=evt.get("index"),
+                            delta=text,
+                        )
+                elif dt == "thinking_delta":
+                    text = delta.get("thinking", "")
+                    if text:
+                        await _emit(
+                            agent_id,
+                            "thinking_delta",
+                            block_index=evt.get("index"),
+                            delta=text,
                         )
             elif isinstance(msg, UserMessage):
                 # Carries tool results; we surface them so the UI can pair

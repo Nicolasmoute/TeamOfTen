@@ -1127,6 +1127,60 @@ body {
 }
 .event.text { border-color: var(--accent); }
 .event.tool_use { border-color: var(--tool); padding: 4px 10px; }
+
+/* Streaming bubble: same shape as a normal text event but tinted to
+   read as "in progress" plus a blinking caret at the end so the eye
+   sees the text actually growing rather than a static block. */
+.event.streaming {
+  border-color: var(--warn);
+  border-style: dashed;
+  opacity: 0.95;
+}
+.stream-cursor {
+  display: inline-block;
+  width: 0.5em;
+  height: 1em;
+  background: var(--warn);
+  vertical-align: -2px;
+  margin-left: 2px;
+  animation: stream-cursor-blink 1s step-end infinite;
+}
+@keyframes stream-cursor-blink {
+  0%, 50%  { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+/* Thinking blocks: muted, collapsed by default so a chatty turn
+   doesn't drown the timeline. Header is clickable; body pre-wraps
+   and is capped so runaway thoughts don't blow out the pane. */
+.event.thinking {
+  border-color: var(--muted);
+  background: #121418;
+  color: var(--muted);
+  font-size: 12px;
+}
+.event.thinking.streaming {
+  border-color: var(--warn);
+  border-style: dashed;
+}
+.event.thinking .thinking-head {
+  cursor: pointer;
+  user-select: none;
+}
+.event.thinking .thinking-sub {
+  color: var(--muted);
+  opacity: 0.7;
+  margin-left: 6px;
+}
+.event.thinking .thinking-body {
+  white-space: pre-wrap;
+  font-style: italic;
+  max-height: 240px;
+  overflow-y: auto;
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--border);
+}
 .event.tool_result {
   border-color: var(--tool);
   margin-left: 16px;

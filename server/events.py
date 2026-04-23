@@ -12,6 +12,16 @@ from server.db import configured_conn
 BACKLOG_SIZE = 500
 QUEUE_SIZE = 500
 
+# Event types that fire many-per-second during a streaming turn (one per
+# token-level delta from the model). Skipping them from the SQLite mirror
+# + in-memory backlog keeps the events table from exploding and keeps
+# reload-history cheap. They still fan out to live WS subscribers because
+# that's how the UI shows a "typing" effect.
+_TRANSIENT_EVENT_TYPES: frozenset[str] = frozenset({
+    "text_delta",
+    "thinking_delta",
+})
+
 logger = logging.getLogger("harness.events")
 if not logger.handlers:
     h = logging.StreamHandler(sys.stdout)
@@ -60,14 +70,17 @@ class EventBus:
         self._backlog: deque[dict[str, Any]] = deque(maxlen=backlog)
 
     async def publish(self, event: dict[str, Any]) -> None:
-        self._backlog.append(event)
+        transient = event.get("type") in _TRANSIENT_EVENT_TYPES
+        if not transient:
+            self._backlog.append(event)
         for q in list(self._queues):
             try:
                 q.put_nowait(event)
             except asyncio.QueueFull:
                 pass
-        # Fire-and-forget DB mirror — never blocks publish
-        asyncio.create_task(_persist(event))
+        if not transient:
+            # Fire-and-forget DB mirror — never blocks publish
+            asyncio.create_task(_persist(event))
 
     def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
         """Subscribe to live events only.
