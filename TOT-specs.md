@@ -137,7 +137,15 @@ Columns: `topic PK`, `content`, `last_updated`, `last_updated_by`, `version`.
 
 Topic validated by `MEMORY_TOPIC_RE = r"^[a-z0-9][a-z0-9\-]{0,63}$"` — prevents path traversal when the same topic names a file on kDrive.
 
-### 4.7 Locks (deferred)
+### 4.7 Turns ledger
+
+Columns: `id AUTOINC`, `agent_id`, `started_at`, `ended_at`, `duration_ms`, `cost_usd`, `session_id`, `num_turns` (SDK's internal tool-roundtrip counter), `stop_reason`, `is_error`, `model`, `plan_mode`, `effort`.
+
+One row per `ResultMessage` via `_insert_turn_row`. Narrow + indexed on `(agent_id, id)` and `ended_at` so the daily-spend query that gates cost caps (`_today_spend`) is a single-index `SUM` instead of a JSON-extract scan of the events table.
+
+Cancelled turns and turns that errored before producing a `ResultMessage` are NOT in this table — they're in events only. Which is to say: this is the "completed turn" ledger, not "attempted turn". Analytics on completion rate should pair with `error` / `agent_cancelled` events from the firehose.
+
+### 4.8 Locks (deferred)
 
 Originally spec'd; not implemented. Per-worktree isolation covers the primary need. If re-added later, filename: `/state/locks.json` on kDrive or a `locks` table.
 
@@ -444,11 +452,13 @@ All optional; stored per-pane in localStorage (`harness_pane_settings_v1`).
 - Next turn reads it, passes as `resume=<id>` to `ClaudeAgentOptions`.
 - `DELETE /api/agents/<id>/session` clears the stored id — next run starts fresh. UI exposes this via a × next to the ● session indicator in the pane header.
 
-### 9.5 Crash recovery (minimum viable)
+### 9.5 Crash recovery
 
 - On restart, `init_db()` is idempotent — schema + seed agents restore cleanly.
-- Hourly `VACUUM INTO` snapshots give fresh-VPS recovery (copy snapshot back into `/data/harness.db`).
-- Tasks left in `in_progress` on crash are NOT auto-reset (original spec had this; deferred — can be added if incidents show it's needed).
+- `crash_recover()` runs right after `init_db` in lifespan and resets zombie state left behind by an unclean shutdown:
+  - `agents.status ∈ {working, waiting}` → `idle`
+  - `tasks.status = 'in_progress'` → `claimed` (owner preserved so the Player knows what they were doing when next woken)
+- 5-min `VACUUM INTO` snapshots (see §5.2) give fresh-VPS recovery: copy the latest `/harness/snapshots/*.db` back into `/data/harness.db`, boot, and the auto-wake / autoloop paths pick up in-flight work.
 
 ---
 
@@ -528,6 +538,20 @@ All paths under `/api/*` except `/api/health` require `Authorization: Bearer $HA
 
 - `PUT /api/agents/{id}/identity` `{name?, role?}` — upsert name / role; empty string clears. Emits `player_assigned` with `auto: false`.
 - `PUT /api/agents/{id}/brief` `{brief}` — upsert the multi-line context string (≤ 8 KB). Emits `brief_updated`.
+
+### 10.14 Turns ledger
+
+One row per SDK `ResultMessage` — see §4.8. Indexed on `(agent_id, id)` and `ended_at`; backs the cost-cap check (`_today_spend`) and any analytics dashboards.
+
+- `GET /api/turns?agent=&since_id=&limit=` — row-level detail, newest first (up to 1000)
+- `GET /api/turns/summary?hours=N` — per-agent aggregate over a rolling window (1h..30d, default 24h):
+  ```
+  { window_hours: 24,
+    since: "2026-04-22T…",
+    total_turns: 45,
+    total_cost_usd: 1.23,
+    per_agent: [{agent_id, count, cost_usd, avg_duration_ms, error_count}, …] }
+  ```
 
 ---
 
@@ -762,6 +786,8 @@ Special non-agent pane type. Opens in a new column when the 📁 left-rail icon 
 | `HARNESS_KDRIVE_SNAPSHOT_RETENTION` | `144` | snapshots retained on kDrive (~12 h at 5 min cadence) |
 | `HARNESS_EVENTS_RETENTION_DAYS` | `30` | days of events kept in SQLite (kDrive JSONL keeps the full archive); 0 disables trimming |
 | `HARNESS_EVENTS_TRIM_INTERVAL` | `86400` | seconds between event-trim passes |
+| `HARNESS_ATTACHMENTS_RETENTION_DAYS` | `30` | days of pasted-image files kept on `/data/attachments`; 0 disables trimming |
+| `HARNESS_ATTACHMENTS_DIR` | `/data/attachments` | where `POST /api/attachments` writes pasted images |
 | `HARNESS_CONTEXT_DIR` | `/data/context` | local cache of kDrive `context/` (CLAUDE.md, skills, rules) |
 | `HARNESS_KNOWLEDGE_DIR` | `/data/knowledge` | agents write durable artifacts here; mirrored to kDrive `knowledge/` |
 | `HARNESS_DECISIONS_DIR` | `/data/decisions` | local fallback when kDrive disabled |
