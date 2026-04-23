@@ -216,8 +216,15 @@ Planned expansion per spec §3: `server/`, `web/`, `prompts/`, `workspaces/`, `s
 
 - **Quick concurrency test on running Zeabur container**: `claude -p "test"` then `for i in $(seq 1 10); do claude -p "hi $i" & done; wait`
 - **Local spike re-run on Windows** (for laptop-only tests): `claude -p "..."` — no setup needed, Claude CLI 2.1.104 already installed
-- **Run tests** (once M2 lands): `uv run pytest server/tests/` (planned)
-- **Run dev server** (once M0 lands): `uv run uvicorn server.main:app --reload` (planned)
+- **Run tests**: `uv sync --extra dev && uv run pytest`
+  — or with plain venv: `pip install -e .[dev] && pytest`
+  Test suite lives in `server/tests/`. Current coverage: DB schema
+  smoke, event-bus round-trip, tool validation constants, task-state
+  machine. All tests are DB-level (no FastAPI TestClient yet) so they
+  run fast and don't need claude-agent-sdk wired up.
+- **Run dev server**: `uv run uvicorn server.main:app --reload`
+  — or `uvicorn server.main:app --reload` with a plain venv.
+  Default binds :8000.
 
 ---
 
