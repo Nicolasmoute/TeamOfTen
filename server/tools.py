@@ -12,6 +12,7 @@ from typing import Any
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
 from server import context as ctxmod
+from server import knowledge as knowmod
 from server.db import configured_conn
 from server.events import bus
 from server.kdrive import kdrive
@@ -759,6 +760,94 @@ def build_coord_server(caller_id: str) -> Any:
         )
 
     @tool(
+        "coord_write_knowledge",
+        (
+            "Write a durable artifact to the team knowledge bucket at "
+            "kDrive knowledge/<path> (+ local /data/knowledge cache). "
+            "Distinct from memory (overwritable scratchpad keyed by topic) "
+            "and context (governance docs, Coach-only): knowledge is the "
+            "free-form output bucket for reports, research, specs, and "
+            "designs — anything worth reading again weeks from now.\n"
+            "\n"
+            "Path is agent-chosen within limits:\n"
+            "  - must end in .md or .txt\n"
+            "  - at most 4 path segments (e.g. 'reports/2026/04/weekly.md')\n"
+            "  - each segment must start with alphanumeric; no spaces or /..\n"
+            "\n"
+            "Overwrites without warning if the path exists — date-stamp "
+            "your filenames if you want history (reports/2026-04-23-review.md).\n"
+            "\n"
+            "Params:\n"
+            "- path: POSIX relative path under knowledge/ (required)\n"
+            "- body: full markdown or plain text content (required)"
+        ),
+        {"path": str, "body": str},
+    )
+    async def write_knowledge(args: dict[str, Any]) -> dict[str, Any]:
+        path = (args.get("path") or "").strip()
+        body = args.get("body") or ""
+        try:
+            ok = await knowmod.write(path, body, author=caller_id)
+        except ValueError as e:
+            return _err(str(e))
+        if not ok:
+            return _err("knowledge write failed — check server logs")
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "knowledge_written",
+                "path": path,
+                "size": len(body),
+            }
+        )
+        return _ok(
+            f"saved knowledge[{path}] ({len(body)} chars)"
+            + (" · mirrored to kDrive" if kdrive.enabled else "")
+        )
+
+    @tool(
+        "coord_read_knowledge",
+        (
+            "Read a knowledge doc by path. Local cache first, kDrive "
+            "fallback. Returns the full body as text; caller should "
+            "chunk or summarize for prompt brevity if needed.\n"
+            "\n"
+            "Use coord_list_knowledge to discover what's already been "
+            "written before asking a Player to redo similar work.\n"
+            "\n"
+            "Params:\n"
+            "- path: POSIX relative path under knowledge/ (required)"
+        ),
+        {"path": str},
+    )
+    async def read_knowledge(args: dict[str, Any]) -> dict[str, Any]:
+        path = (args.get("path") or "").strip()
+        try:
+            body = await knowmod.read(path)
+        except ValueError as e:
+            return _err(str(e))
+        if body is None:
+            return _err(f"knowledge[{path}] not found")
+        return _ok(
+            f"knowledge[{path}] ({len(body)} chars):\n\n{body}"
+        )
+
+    @tool(
+        "coord_list_knowledge",
+        (
+            "List every knowledge doc currently stored (POSIX paths, "
+            "sorted). Cheap — reads a disk directory. No params."
+        ),
+        {},
+    )
+    async def list_knowledge(args: dict[str, Any]) -> dict[str, Any]:
+        paths = knowmod.list_paths()
+        if not paths:
+            return _ok("(no knowledge docs yet)")
+        return _ok("\n".join(paths))
+
+    @tool(
         "coord_commit_push",
         (
             "Commit staged+unstaged changes in your worktree and push the "
@@ -1132,6 +1221,9 @@ def build_coord_server(caller_id: str) -> Any:
             commit_push,
             write_decision,
             write_context,
+            write_knowledge,
+            read_knowledge,
+            list_knowledge,
             set_player_role,
             request_human,
         ],
@@ -1152,6 +1244,9 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_commit_push",
     "mcp__coord__coord_write_decision",
     "mcp__coord__coord_write_context",
+    "mcp__coord__coord_write_knowledge",
+    "mcp__coord__coord_read_knowledge",
+    "mcp__coord__coord_list_knowledge",
     "mcp__coord__coord_set_player_role",
     "mcp__coord__coord_request_human",
 ]
