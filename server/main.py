@@ -802,9 +802,10 @@ async def cancel_task_from_human(task_id: str) -> dict[str, Any]:
 # ------------------------------------------------------------------
 
 
-_HUMAN_MSG_RECIPIENTS = (
-    {"coach", "broadcast"} | {f"p{i}" for i in range(1, 11)}
-)
+# Single source of truth for valid message recipients — defined in
+# tools.py because that's where coord_send_message uses it. Re-exposed
+# here so POST /api/messages validates the same way.
+from server.tools import VALID_RECIPIENTS as _HUMAN_MSG_RECIPIENTS  # noqa: E402
 
 
 class HumanMessageRequest(BaseModel):
