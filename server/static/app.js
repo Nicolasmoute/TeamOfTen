@@ -4364,11 +4364,17 @@ function EventItem({ event }) {
   }
 
   if (type === "session_cleared" || type === "session_resume_failed") {
+    // Visually louder than the generic .sys row — this is a real
+    // conversation break. The next agent_started will be a fresh
+    // session, so the separator helps the eye find where one
+    // conversation ended and the next began.
     const msg = type === "session_cleared"
-      ? "session cleared"
-      : `session resume failed · ${event.error || ""}`;
-    return html`<div class="event sys">
-      <div class="event-meta">${ts} · ${msg}</div>
+      ? "SESSION CLEARED — next turn starts fresh"
+      : `SESSION RESUME FAILED — ${event.error || ""}`;
+    return html`<div class="event session-break">
+      <span class="session-break-rule" />
+      <span class="session-break-label">${ts} · ${msg}</span>
+      <span class="session-break-rule" />
     </div>`;
   }
 
