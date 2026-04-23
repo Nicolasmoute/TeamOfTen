@@ -830,21 +830,63 @@ function saveDismissedAttention(ids) {
 
 function EnvAttentionSection({ conversations }) {
   const [dismissed, setDismissed] = useState(() => loadDismissedAttention());
+  const [persisted, setPersisted] = useState([]);
+
+  // Load persisted escalations on mount so page reloads don't lose
+  // undismissed banners. We re-fetch whenever a fresh human_attention
+  // arrives over WS (the live copy lacks __id until the DB write
+  // returns, so the fetch lets us get the canonical id for future
+  // dismissal persistence across reloads).
+  const liveCount = useMemo(() => {
+    let n = 0;
+    for (const list of conversations.values()) {
+      for (const ev of list) if (ev.type === "human_attention") n++;
+    }
+    return n;
+  }, [conversations]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await authFetch(
+          "/api/events?type=human_attention&limit=100"
+        );
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled) return;
+        setPersisted((data.events || []).map(unwrapPersisted));
+      } catch (e) {
+        console.error("attention history load failed", e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [liveCount]);
 
   const open = useMemo(() => {
-    const out = [];
+    const seen = new Set();
+    const all = [];
+    // Persisted first (canonical ids); live later dedupes by __id.
+    for (const ev of persisted) {
+      const k = ev.__id != null ? String(ev.__id) : `${ev.ts}:${ev.agent_id}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      all.push({ ...ev, __key: k });
+    }
     for (const list of conversations.values()) {
       for (const ev of list) {
         if (ev.type !== "human_attention") continue;
-        const key = ev.__id != null ? String(ev.__id) : `${ev.ts}:${ev.agent_id}`;
-        if (dismissed.has(key)) continue;
-        out.push({ ...ev, __key: key });
+        const k = ev.__id != null ? String(ev.__id) : `${ev.ts}:${ev.agent_id}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        all.push({ ...ev, __key: k });
       }
     }
+    const out = all.filter((ev) => !dismissed.has(ev.__key));
     // Newest first — user sees the most urgent escalation at the top.
     out.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
     return out;
-  }, [conversations, dismissed]);
+  }, [conversations, persisted, dismissed]);
 
   const dismiss = useCallback((key) => {
     setDismissed((prev) => {

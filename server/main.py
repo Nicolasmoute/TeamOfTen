@@ -529,6 +529,7 @@ async def get_decision(filename: str) -> dict[str, Any]:
 @app.get("/api/events", dependencies=[Depends(require_token)])
 async def list_events(
     agent: str | None = None,
+    type: str | None = None,
     since_id: int = 0,
     limit: int = 200,
 ) -> dict[str, Any]:
@@ -538,6 +539,10 @@ async def list_events(
     → newest in the response) with id > since_id. Pass since_id=0 to get
     the tail of the log; pass the largest id you've seen to poll for new
     rows (used in future polling/paginating flows).
+
+    Optional `type` narrows to a single event type (e.g.
+    'human_attention') — useful when the UI wants to surface historical
+    escalations across page reloads.
     """
     limit = max(1, min(limit, 1000))
     where_parts: list[str] = ["id > ?"]
@@ -545,6 +550,9 @@ async def list_events(
     if agent:
         where_parts.append("agent_id = ?")
         params.append(agent)
+    if type:
+        where_parts.append("type = ?")
+        params.append(type)
     where = " WHERE " + " AND ".join(where_parts)
 
     c = await configured_conn()
