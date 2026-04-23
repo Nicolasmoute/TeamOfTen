@@ -55,6 +55,14 @@ def validate(relative_path: str) -> str | None:
     """Return None if the path is acceptable, else a human-readable error."""
     if not relative_path:
         return "path is required"
+    # Check raw segments BEFORE handing to PurePosixPath: that class
+    # silently strips '.' and normalizes, so './foo.md' would otherwise
+    # pass validation and land at knowledge/foo.md (harmless but
+    # surprising — reject explicitly so paths are always taken at face
+    # value). Leading '/' also split into an empty first segment.
+    raw_parts = relative_path.replace("\\", "/").split("/")
+    if any(seg in ("", ".", "..") for seg in raw_parts):
+        return "path must not contain empty, '.' or '..' segments"
     # Normalize separators.
     p = PurePosixPath(relative_path.replace("\\", "/"))
     parts = p.parts
