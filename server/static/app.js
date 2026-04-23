@@ -7,6 +7,32 @@ import { renderToolCall } from "/static/tools.js";
 const html = htm.bind(h);
 
 // ------------------------------------------------------------------
+// auth: bearer token stored in localStorage
+// ------------------------------------------------------------------
+
+const TOKEN_KEY = "harness_token";
+
+function getToken() {
+  try { return localStorage.getItem(TOKEN_KEY) || ""; } catch (_) { return ""; }
+}
+function setToken(t) {
+  try {
+    if (t) localStorage.setItem(TOKEN_KEY, t);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch (_) {}
+}
+
+// Wrap fetch to add Authorization header when we have a token. Servers
+// without HARNESS_TOKEN configured ignore the header.
+async function authFetch(url, init) {
+  const token = getToken();
+  const opts = { ...(init || {}) };
+  opts.headers = { ...(opts.headers || {}) };
+  if (token) opts.headers["Authorization"] = "Bearer " + token;
+  return fetch(url, opts);
+}
+
+// ------------------------------------------------------------------
 // helpers
 // ------------------------------------------------------------------
 
@@ -53,35 +79,47 @@ function App() {
   const [envOpen, setEnvOpen] = useState(true);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [serverStatus, setServerStatus] = useState(null);
+  const [authChallenge, setAuthChallenge] = useState(false);
   // conversations: Map<slotId, Event[]>  (events ordered oldest → newest)
   const [conversations, setConversations] = useState(new Map());
   // bumping this re-runs the WS effect, which re-opens a new connection
   const [wsAttempt, setWsAttempt] = useState(0);
 
+  // Wrap authFetch so a 401 anywhere flips the global gate.
+  const authedFetch = useCallback(async (url, init) => {
+    const res = await authFetch(url, init);
+    if (res.status === 401 || res.status === 403) {
+      setAuthChallenge(true);
+    }
+    return res;
+  }, []);
+
   // load + refresh agents
   const loadAgents = useCallback(async () => {
     try {
-      const res = await fetch("/api/agents");
+      const res = await authedFetch("/api/agents");
+      if (!res.ok) return;
       const data = await res.json();
       setAgents(data.agents || []);
     } catch (e) {
       console.error("loadAgents failed", e);
     }
-  }, []);
+  }, [authedFetch]);
 
   const loadTasks = useCallback(async () => {
     try {
-      const res = await fetch("/api/tasks");
+      const res = await authedFetch("/api/tasks");
+      if (!res.ok) return;
       const data = await res.json();
       setTasks(data.tasks || []);
     } catch (e) {
       console.error("loadTasks failed", e);
     }
-  }, []);
+  }, [authedFetch]);
 
   const createHumanTask = useCallback(
     async ({ title, description, priority }) => {
-      const res = await fetch("/api/tasks", {
+      const res = await authedFetch("/api/tasks", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -93,18 +131,19 @@ function App() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       await loadTasks();
     },
-    [loadTasks]
+    [loadTasks, authedFetch]
   );
 
   const loadStatus = useCallback(async () => {
     try {
-      const res = await fetch("/api/status");
+      const res = await authedFetch("/api/status");
+      if (!res.ok) return;
       const data = await res.json();
       setServerStatus(data);
     } catch (e) {
       console.error("loadStatus failed", e);
     }
-  }, []);
+  }, [authedFetch]);
 
   useEffect(() => {
     loadAgents();
@@ -118,7 +157,11 @@ function App() {
   // re-open by bumping wsAttempt; the effect re-runs, a new socket opens.
   useEffect(() => {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${proto}//${location.host}/ws`);
+    const tok = getToken();
+    const wsUrl =
+      `${proto}//${location.host}/ws` +
+      (tok ? "?token=" + encodeURIComponent(tok) : "");
+    const ws = new WebSocket(wsUrl);
     let reopenTimer = null;
     ws.onopen = () => setWsConnected(true);
     ws.onclose = () => {
@@ -243,6 +286,54 @@ function App() {
             onClose=${() => setSettingsOpen(false)}
           />`
         : null}
+      ${authChallenge
+        ? html`<${TokenGate}
+            onSubmit=${(t) => {
+              setToken(t);
+              location.reload();
+            }}
+          />`
+        : null}
+    </div>
+  `;
+}
+
+function TokenGate({ onSubmit }) {
+  const [val, setVal] = useState("");
+  return html`
+    <div class="drawer-backdrop">
+      <div class="drawer" style="width: 380px;">
+        <header class="drawer-head">
+          <h2 class="drawer-title">Authentication required</h2>
+        </header>
+        <div class="drawer-body">
+          <p>
+            This harness has <code>HARNESS_TOKEN</code> configured. Paste
+            its value here — it'll be saved in this browser's
+            localStorage and sent with every request.
+          </p>
+          <input
+            type="password"
+            value=${val}
+            onInput=${(e) => setVal(e.target.value)}
+            onKeyDown=${(e) => { if (e.key === "Enter" && val) onSubmit(val); }}
+            placeholder="bearer token"
+            class="env-task-title-input"
+            style="font-family: ui-monospace; font-size: 13px;"
+            autofocus
+          />
+          <button
+            class="primary"
+            style="margin-top: 12px; width: 100%;"
+            disabled=${!val}
+            onClick=${() => onSubmit(val)}
+          >save & reload</button>
+          <p class="muted" style="margin-top: 16px; font-size: 11px;">
+            If you don't have the token, find it in your Zeabur service's
+            Variables tab.
+          </p>
+        </div>
+      </div>
     </div>
   `;
 }
@@ -758,9 +849,13 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
     let cancelled = false;
     async function load() {
       try {
-        const res = await fetch(
+        const res = await authFetch(
           `/api/events?agent=${encodeURIComponent(slot)}&limit=500`
         );
+        if (!res.ok) {
+          if (!cancelled) setHistoryLoaded(true);
+          return;
+        }
         const data = await res.json();
         if (cancelled) return;
         setHistory((data.events || []).map(unwrapPersisted));
@@ -842,7 +937,7 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
       const form = new FormData();
       form.append("file", file, `pasted-${Date.now()}.${ext}`);
       try {
-        const res = await fetch("/api/attachments", {
+        const res = await authFetch("/api/attachments", {
           method: "POST",
           body: form,
         });
@@ -878,7 +973,7 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
           : "Attached images (use Read to load):\n  - ";
         prompt = text + header + paths;
       }
-      const res = await fetch("/api/agents/start", {
+      const res = await authFetch("/api/agents/start", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ agent_id: slot, prompt }),
@@ -919,7 +1014,7 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
               <button
                 class="pane-session-clear"
                 onClick=${async () => {
-                  await fetch("/api/agents/" + slot + "/session", { method: "DELETE" });
+                  await authFetch("/api/agents/" + slot + "/session", { method: "DELETE" });
                 }}
                 title="Clear session — next run starts fresh"
               >×</button>`

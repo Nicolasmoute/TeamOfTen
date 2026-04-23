@@ -15,9 +15,12 @@ from typing import Any
 
 from fastapi import (
     BackgroundTasks,
+    Depends,
     FastAPI,
     File,
+    Header,
     HTTPException,
+    Query,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
@@ -47,6 +50,26 @@ if not logger.handlers:
 
 STARTED_AT = datetime.now(timezone.utc)
 STATIC_DIR = Path(__file__).parent / "static"
+
+# Optional bearer-token auth. If unset, the API is wide open (current
+# behavior). If set, every /api/* call (except /api/health) and the
+# WebSocket must present `Authorization: Bearer <token>` (or for WS,
+# `?token=<token>` in the URL since browsers can't add headers to WS
+# connections).
+HARNESS_TOKEN = os.environ.get("HARNESS_TOKEN", "").strip()
+
+
+async def require_token(
+    authorization: str | None = Header(default=None),
+) -> None:
+    """FastAPI dependency. No-op when HARNESS_TOKEN is unset."""
+    if not HARNESS_TOKEN:
+        return
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    presented = authorization[len("Bearer "):].strip()
+    if presented != HARNESS_TOKEN:
+        raise HTTPException(status_code=403, detail="invalid bearer token")
 
 # If package-data shipped /static correctly, INDEX_HTML is the real page.
 # If not, we want a visible error page, not an import crash that makes
@@ -239,11 +262,15 @@ async def health() -> JSONResponse:
     else:
         checks["workspaces"] = {"ok": True, "skipped": True}
 
-    body: dict[str, object] = {"ok": overall_ok, "checks": checks}
+    body: dict[str, object] = {
+        "ok": overall_ok,
+        "auth_required": bool(HARNESS_TOKEN),
+        "checks": checks,
+    }
     return JSONResponse(body, status_code=200 if overall_ok else 503)
 
 
-@app.get("/api/status")
+@app.get("/api/status", dependencies=[Depends(require_token)])
 async def status() -> dict[str, object]:
     now = datetime.now(timezone.utc)
     team_today = await _today_spend()
@@ -272,7 +299,7 @@ async def status() -> dict[str, object]:
 # ------------------------------------------------------------------
 
 
-@app.get("/api/agents")
+@app.get("/api/agents", dependencies=[Depends(require_token)])
 async def list_agents() -> dict[str, list[dict[str, Any]]]:
     c = await configured_conn()
     try:
@@ -288,7 +315,7 @@ async def list_agents() -> dict[str, list[dict[str, Any]]]:
     return {"agents": [dict(r) for r in rows]}
 
 
-@app.post("/api/agents/start")
+@app.post("/api/agents/start", dependencies=[Depends(require_token)])
 async def start_agent(
     req: StartAgentRequest, background: BackgroundTasks
 ) -> dict[str, object]:
@@ -296,7 +323,7 @@ async def start_agent(
     return {"ok": True, "agent_id": req.agent_id}
 
 
-@app.delete("/api/agents/{agent_id}/session")
+@app.delete("/api/agents/{agent_id}/session", dependencies=[Depends(require_token)])
 async def clear_session(agent_id: str) -> dict[str, object]:
     """Clear agent.session_id so the next run starts fresh context.
 
@@ -331,7 +358,7 @@ async def clear_session(agent_id: str) -> dict[str, object]:
 # ------------------------------------------------------------------
 
 
-@app.get("/api/tasks")
+@app.get("/api/tasks", dependencies=[Depends(require_token)])
 async def list_tasks(status: str | None = None, owner: str | None = None) -> dict[str, Any]:
     where_parts: list[str] = []
     params: list[Any] = []
@@ -357,7 +384,7 @@ async def list_tasks(status: str | None = None, owner: str | None = None) -> dic
     return {"tasks": [dict(r) for r in rows]}
 
 
-@app.post("/api/tasks")
+@app.post("/api/tasks", dependencies=[Depends(require_token)])
 async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
     """Create a top-level task from the UI (attributed to 'human')."""
     task_id = f"t-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:8]}"
@@ -397,7 +424,7 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
 # ------------------------------------------------------------------
 
 
-@app.get("/api/events")
+@app.get("/api/events", dependencies=[Depends(require_token)])
 async def list_events(
     agent: str | None = None,
     since_id: int = 0,
@@ -454,7 +481,7 @@ async def list_events(
 # ------------------------------------------------------------------
 
 
-@app.post("/api/attachments")
+@app.post("/api/attachments", dependencies=[Depends(require_token)])
 async def upload_attachment(file: UploadFile = File(...)) -> dict[str, Any]:
     """Accept an image upload, store under /data/attachments/<id>.<ext>.
 
@@ -486,7 +513,7 @@ async def upload_attachment(file: UploadFile = File(...)) -> dict[str, Any]:
     }
 
 
-@app.get("/api/attachments/{filename}")
+@app.get("/api/attachments/{filename}", dependencies=[Depends(require_token)])
 async def get_attachment(filename: str):
     # Reject path traversal attempts
     if "/" in filename or ".." in filename:
@@ -507,7 +534,12 @@ async def get_attachment(filename: str):
 
 
 @app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket) -> None:
+async def ws_endpoint(ws: WebSocket, token: str | None = Query(default=None)) -> None:
+    if HARNESS_TOKEN and token != HARNESS_TOKEN:
+        # Browsers can't set Authorization headers on WS connections, so
+        # we accept ?token=<...> in the URL instead.
+        await ws.close(code=4401, reason="invalid or missing token")
+        return
     await ws.accept()
     q = bus.subscribe()
     try:
