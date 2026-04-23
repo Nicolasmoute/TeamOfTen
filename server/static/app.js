@@ -83,6 +83,106 @@ function flatSlots(openColumns) {
   return out;
 }
 
+// ------------------------------------------------------------------
+// per-pane settings (model / plan mode / effort)
+// ------------------------------------------------------------------
+
+const PANE_SETTINGS_KEY = "harness_pane_settings_v1";
+
+// Default: let the server pick (will use claude-sonnet-4-6 or whatever
+// is set in Dockerfile env). Users can override per-pane.
+const MODEL_OPTIONS = [
+  { value: "", label: "default" },
+  { value: "claude-opus-4-7", label: "Opus 4.7" },
+  { value: "claude-sonnet-4-6", label: "Sonnet 4.6" },
+  { value: "claude-haiku-4-5-20251001", label: "Haiku 4.5" },
+];
+
+// Effort: 1=low, 2=med, 3=high, 4=max. Mapped server-side to a
+// thinking budget in tokens (see server/agents.py once wired).
+const EFFORT_LABELS = ["low", "med", "high", "max"];
+
+function loadPaneSettings(slot) {
+  try {
+    const raw = localStorage.getItem(PANE_SETTINGS_KEY);
+    if (!raw) return {};
+    const all = JSON.parse(raw);
+    return (all && typeof all === "object" && all[slot]) || {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function hasSettingOverride(s) {
+  return !!(s && (s.model || s.planMode || s.effort));
+}
+
+function savePaneSettings(slot, settings) {
+  try {
+    const raw = localStorage.getItem(PANE_SETTINGS_KEY);
+    const all = raw ? JSON.parse(raw) : {};
+    if (!settings || Object.keys(settings).length === 0) delete all[slot];
+    else all[slot] = settings;
+    localStorage.setItem(PANE_SETTINGS_KEY, JSON.stringify(all));
+  } catch (_) {
+    // localStorage disabled — silent no-op.
+  }
+}
+
+function PaneSettingsPopover({ settings, onChange, onClose }) {
+  const effort = settings.effort || 0; // 0 = default (server decides)
+  return html`
+    <div class="pane-settings-pop" onClick=${(e) => e.stopPropagation()}>
+      <div class="pane-settings-row">
+        <label class="pane-settings-label">Model</label>
+        <select
+          class="pane-settings-select"
+          value=${settings.model || ""}
+          onChange=${(e) => onChange({ ...settings, model: e.target.value || undefined })}
+        >
+          ${MODEL_OPTIONS.map(
+            (m) => html`<option value=${m.value}>${m.label}</option>`
+          )}
+        </select>
+      </div>
+      <div class="pane-settings-row">
+        <label class="pane-settings-label">
+          <input
+            type="checkbox"
+            checked=${!!settings.planMode}
+            onChange=${(e) => onChange({ ...settings, planMode: e.target.checked || undefined })}
+          />
+          Plan mode
+        </label>
+        <span class="pane-settings-hint">Agent outlines an approach before touching code.</span>
+      </div>
+      <div class="pane-settings-row">
+        <label class="pane-settings-label">Effort</label>
+        <input
+          type="range"
+          min="0"
+          max="4"
+          value=${effort}
+          class="pane-settings-slider"
+          onInput=${(e) => {
+            const v = parseInt(e.target.value, 10);
+            onChange({ ...settings, effort: v > 0 ? v : undefined });
+          }}
+        />
+        <span class="pane-settings-effort-val">
+          ${effort === 0 ? "default" : EFFORT_LABELS[effort - 1]}
+        </span>
+      </div>
+      <div class="pane-settings-actions">
+        <button class="pane-settings-reset" onClick=${() => onChange({})}>
+          reset
+        </button>
+        <button class="pane-settings-close" onClick=${onClose}>done</button>
+      </div>
+    </div>
+  `;
+}
+
 function saveLayout(layout) {
   try {
     localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
@@ -1097,7 +1197,15 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
   const [submitting, setSubmitting] = useState(false);
   const [history, setHistory] = useState([]);
   const [historyLoaded, setHistoryLoaded] = useState(false);
+  const [paneSettings, setPaneSettings] = useState(() => loadPaneSettings(slot));
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const bodyRef = useRef(null);
+
+  // Persist whenever settings change (but not on mount — lazy init
+  // already picked up the stored value).
+  useEffect(() => {
+    savePaneSettings(slot, paneSettings);
+  }, [slot, paneSettings]);
   // Stay pinned to the bottom while the user is at or near the bottom.
   // If they've scrolled up to read older events, don't yank them down.
   const stickToBottomRef = useRef(true);
@@ -1238,10 +1346,16 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
           : "Attached images (use Read to load):\n  - ";
         prompt = text + header + paths;
       }
+      // Include per-pane overrides. Server ignores unknown fields
+      // (pydantic v2 default) until tick 2b wires them through.
+      const reqBody = { agent_id: slot, prompt };
+      if (paneSettings.model) reqBody.model = paneSettings.model;
+      if (paneSettings.planMode) reqBody.plan_mode = true;
+      if (paneSettings.effort) reqBody.effort = paneSettings.effort;
       const res = await authFetch("/api/agents/start", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ agent_id: slot, prompt }),
+        body: JSON.stringify(reqBody),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setInput("");
@@ -1251,7 +1365,7 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
     } finally {
       setSubmitting(false);
     }
-  }, [input, attachments, slot]);
+  }, [input, attachments, slot, paneSettings]);
 
   const onKeyDown = useCallback(
     (e) => {
@@ -1285,7 +1399,22 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
               >×</button>`
           : null}
         <span class="pane-cost">$${cost.toFixed(3)}</span>
+        ${hasSettingOverride(paneSettings)
+          ? html`<span class="pane-setting-dot" title="pane overrides active" />`
+          : null}
+        <button
+          class="pane-gear"
+          onClick=${() => setSettingsOpen((v) => !v)}
+          title="Pane settings"
+        >⚙</button>
         <button class="pane-close" onClick=${onClose} title="Close pane">×</button>
+        ${settingsOpen
+          ? html`<${PaneSettingsPopover}
+              settings=${paneSettings}
+              onChange=${setPaneSettings}
+              onClose=${() => setSettingsOpen(false)}
+            />`
+          : null}
       </header>
       <div class="pane-body" ref=${bodyRef} onScroll=${onBodyScroll}>
         ${!historyLoaded ? html`<div class="loading">loading history…</div>` : null}
