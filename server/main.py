@@ -323,6 +323,35 @@ async def start_agent(
     return {"ok": True, "agent_id": req.agent_id}
 
 
+COACH_TICK_PROMPT = (
+    "Routine tick. Read your inbox for new human goals and Player updates. "
+    "If there's nothing actionable, end the turn without calling tools. "
+    "Otherwise decompose goals into tasks, assign or reassign as needed, "
+    "and reply to Players who need direction. Be terse."
+)
+
+
+@app.post("/api/coach/tick", dependencies=[Depends(require_token)])
+async def coach_tick(background: BackgroundTasks) -> dict[str, object]:
+    """Nudge Coach to drain its inbox. Foundation of the autonomous
+    loop — a cron or background task can hit this at intervals.
+
+    Rejects if Coach is already working (prevents tick stacking under
+    load). Caller can retry on the next interval."""
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT status FROM agents WHERE id = 'coach'"
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    if row and dict(row)["status"] == "working":
+        raise HTTPException(409, detail="coach is already working")
+    background.add_task(run_agent, "coach", COACH_TICK_PROMPT)
+    return {"ok": True, "prompt": COACH_TICK_PROMPT}
+
+
 @app.delete("/api/agents/{agent_id}/session", dependencies=[Depends(require_token)])
 async def clear_session(agent_id: str) -> dict[str, object]:
     """Clear agent.session_id so the next run starts fresh context.
