@@ -353,6 +353,7 @@ function App() {
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [serverStatus, setServerStatus] = useState(null);
+  const [paused, setPaused] = useState(false);
   const [authChallenge, setAuthChallenge] = useState(false);
   // conversations: Map<slotId, Event[]>  (events ordered oldest → newest)
   const [conversations, setConversations] = useState(new Map());
@@ -424,13 +425,40 @@ function App() {
     }
   }, [authedFetch]);
 
+  const loadPause = useCallback(async () => {
+    try {
+      const res = await authedFetch("/api/pause");
+      if (!res.ok) return;
+      const data = await res.json();
+      setPaused(Boolean(data.paused));
+    } catch (e) {
+      console.error("loadPause failed", e);
+    }
+  }, [authedFetch]);
+
+  const togglePause = useCallback(async () => {
+    try {
+      const res = await authedFetch("/api/pause", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ paused: !paused }),
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      setPaused(Boolean(data.paused));
+    } catch (e) {
+      console.error("togglePause failed", e);
+    }
+  }, [authedFetch, paused]);
+
   useEffect(() => {
     loadAgents();
     loadTasks();
     loadStatus();
+    loadPause();
     const statusTimer = setInterval(loadStatus, 30_000);
     return () => clearInterval(statusTimer);
-  }, [loadAgents, loadTasks, loadStatus]);
+  }, [loadAgents, loadTasks, loadStatus, loadPause]);
 
   // Persist layout (open slots + env panel state) on every change.
   useEffect(() => {
@@ -505,6 +533,9 @@ function App() {
         ev.type === "agent_cancelled"
       ) {
         loadAgents();
+      }
+      if (ev.type === "pause_toggled") {
+        setPaused(Boolean(ev.paused));
       }
       if (ev.type === "result" || ev.type === "cost_capped") {
         loadStatus();
@@ -742,6 +773,8 @@ function App() {
         envOpen=${envOpen}
         onToggleEnv=${() => setEnvOpen((v) => !v)}
         onOpenSettings=${() => setSettingsOpen(true)}
+        paused=${paused}
+        onTogglePause=${togglePause}
       />
       <main class="panes">
         ${openColumns.length === 0
@@ -894,7 +927,7 @@ function TokenGate({ onSubmit }) {
 // left rail
 // ------------------------------------------------------------------
 
-function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, onOpenSettings }) {
+function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, onOpenSettings, paused, onTogglePause }) {
   const grouped = useMemo(() => {
     const coach = agents.find((a) => a.kind === "coach");
     const players = agents
@@ -939,6 +972,11 @@ function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsCon
       ${renderSlot(grouped.coach)}
       ${grouped.players.map(renderSlot)}
       <span class="rail-sep"></span>
+      <button
+        class=${"gear pause-toggle" + (paused ? " active" : "")}
+        title=${paused ? "Paused — click to resume" : "Pause harness (blocks new agent runs)"}
+        onClick=${onTogglePause}
+      >${paused ? "▶" : "❚❚"}</button>
       <button
         class=${"gear env-toggle" + (envOpen ? " active" : "")}
         title=${(envOpen ? "Collapse environment panel" : "Open environment panel") + " (⌘/Ctrl+B)"}
@@ -1785,6 +1823,8 @@ const TIMELINE_TYPES = new Set([
   "human_attention",
   "player_assigned",
   "agent_cancelled",
+  "paused",
+  "pause_toggled",
 ]);
 
 function EnvTimelineSection({ conversations }) {
@@ -1923,6 +1963,20 @@ function EnvTimelineItem({ event }) {
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
       <span class="env-tl-body">${urgency} ${subj}</span>
+    </div>`;
+  }
+  if (event.type === "paused") {
+    return html`<div class="env-tl-item env-tl-paused">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">⏸ spawn blocked — harness is paused</span>
+    </div>`;
+  }
+  if (event.type === "pause_toggled") {
+    return html`<div class="env-tl-item env-tl-paused">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">${event.paused ? "⏸ harness paused" : "▶ harness resumed"}</span>
     </div>`;
   }
   if (event.type === "agent_cancelled") {

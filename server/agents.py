@@ -94,6 +94,21 @@ TEAM_DAILY_CAP_USD = float(os.environ.get("HARNESS_TEAM_DAILY_CAP", "20.0"))
 # Populated by run_agent; cleared on completion (success or error).
 _running_tasks: dict[str, asyncio.Task[Any]] = {}
 
+# Global pause switch: when True, run_agent rejects new starts (emits
+# a 'paused' event) and coach_tick_loop skips its tick. In-flight turns
+# are NOT cancelled — to stop those, use POST /api/agents/<id>/cancel.
+# In-memory only: a restart lifts the pause automatically.
+_paused = False
+
+
+def is_paused() -> bool:
+    return _paused
+
+
+def set_paused(v: bool) -> None:
+    global _paused
+    _paused = bool(v)
+
 
 async def cancel_agent(agent_id: str) -> bool:
     """Cancel the in-flight SDK query for `agent_id`, if any. Returns
@@ -326,6 +341,13 @@ async def run_agent(
       approach before touching tools.
     - effort: 1..4 → "low" | "medium" | "high" | "max" thinking budget.
     """
+    # Global pause short-circuits before the cost check; users pausing
+    # the harness shouldn't also burn a DB write counting cost.
+    if _paused:
+        await _emit(agent_id, "paused", prompt=prompt)
+        logger.info("paused: refused to spawn %s", agent_id)
+        return
+
     # Enforce daily cost caps BEFORE emitting agent_started — if the
     # caller is over budget we want the rejection visible in the
     # timeline and no SDK work done.
@@ -477,6 +499,9 @@ async def coach_tick_loop() -> None:
         except asyncio.CancelledError:
             raise
         try:
+            if _paused:
+                logger.info("coach autoloop: skipping — harness paused")
+                continue
             if await _coach_is_working():
                 logger.info("coach autoloop: skipping — coach is working")
                 continue

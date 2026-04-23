@@ -342,6 +342,17 @@ body {
 .env-tl-assigned .env-tl-body { color: var(--fg); }
 .env-tl-cancelled { border-left-color: var(--warn); }
 .env-tl-cancelled .env-tl-body { color: var(--warn); }
+.env-tl-paused { border-left-color: var(--warn); background: #2a2117; }
+.env-tl-paused .env-tl-body { color: var(--warn); font-weight: 600; }
+
+/* Pause toggle in LeftRail — active state uses warn color so the
+   "harness is paused" state is impossible to miss. */
+.pause-toggle.active {
+  background: var(--warn);
+  color: var(--bg);
+  border-radius: 6px;
+  box-shadow: 0 0 8px rgba(210, 153, 34, 0.6);
+}
 
 .env-msg-urgent .env-decision-head { color: var(--err); }
 .env-msg-composer {

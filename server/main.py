@@ -37,7 +37,9 @@ from server.agents import (
     _today_spend,
     cancel_agent,
     coach_tick_loop,
+    is_paused,
     run_agent,
+    set_paused,
 )
 from server.db import configured_conn, init_db
 from server.events import bus
@@ -339,6 +341,37 @@ async def start_agent(
         effort=req.effort,
     )
     return {"ok": True, "agent_id": req.agent_id}
+
+
+class PauseRequest(BaseModel):
+    paused: bool
+
+
+@app.get("/api/pause", dependencies=[Depends(require_token)])
+async def get_pause_state() -> dict[str, bool]:
+    """Read the global pause flag. In-memory; restarts clear it."""
+    return {"paused": is_paused()}
+
+
+@app.post("/api/pause", dependencies=[Depends(require_token)])
+async def set_pause_state(req: PauseRequest) -> dict[str, bool]:
+    """Flip the global pause flag. When paused:
+    - run_agent rejects new starts and emits 'paused' events
+    - the Coach autoloop skips its ticks
+    - in-flight turns are NOT cancelled (use /cancel for that)
+    """
+    was = is_paused()
+    set_paused(req.paused)
+    if was != req.paused:
+        await bus.publish(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "agent_id": "human",
+                "type": "pause_toggled",
+                "paused": req.paused,
+            }
+        )
+    return {"paused": is_paused()}
 
 
 @app.post("/api/coach/tick", dependencies=[Depends(require_token)])
