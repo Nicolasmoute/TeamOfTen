@@ -240,6 +240,7 @@ const SLASH_COMMANDS = [
   { cmd: "/brief",  desc: "edit this agent's brief" },
   { cmd: "/tools",  desc: "list the tools this agent can use" },
   { cmd: "/clear",  desc: "clear session so the next turn starts fresh" },
+  { cmd: "/cancel", desc: "cancel the in-flight turn on this pane" },
   { cmd: "/loop",   desc: "Coach autoloop: /loop 60 → tick every 60s · /loop off" },
   { cmd: "/tick",   desc: "nudge Coach to drain inbox right now" },
   { cmd: "/status", desc: "show server runtime state (paused, running, spend)" },
@@ -3444,6 +3445,18 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
         authFetch("/api/agents/" + slot + "/session", { method: "DELETE" })
           .then(() => setInfoText("Session cleared. Next turn starts fresh."))
           .catch((e) => setInfoText("Session clear failed: " + String(e)));
+        return true;
+      case "/cancel":
+        // Cancel the in-flight turn for THIS pane's agent. Server
+        // returns 409 if nothing's running (same semantics as the
+        // header ⏹ button hitting the same endpoint).
+        authFetch("/api/agents/" + slot + "/cancel", { method: "POST" })
+          .then((r) => {
+            if (r.ok) setInfoText("Cancel requested — turn will stop at the next await.");
+            else if (r.status === 409) setInfoText("Nothing to cancel — agent is idle.");
+            else setInfoText("cancel failed: HTTP " + r.status);
+          })
+          .catch((e) => setInfoText("cancel failed: " + String(e)));
         return true;
       case "/tools": {
         const coach = [
