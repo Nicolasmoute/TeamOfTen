@@ -71,12 +71,19 @@ class KDriveClient:
             self._reason = "webdav4 not installed"
             logger.warning("kDrive disabled: %s", self._reason)
             return
+        # httpx (webdav4's HTTP layer) applies RFC 3986 URL resolution:
+        # if the base URL lacks a trailing '/', the last path segment
+        # is treated as a "file" and stripped when joining relatives.
+        # e.g. base='https://host/TOT' + 'harness/foo' resolves to
+        # 'https://host/harness/foo' — the '/TOT' silently disappears.
+        # Normalize once here so operators don't have to remember.
+        base_url = WEBDAV_URL if WEBDAV_URL.endswith("/") else WEBDAV_URL + "/"
         try:
-            self._client = _WebDAVClient(WEBDAV_URL, auth=(WEBDAV_USER, WEBDAV_PASS))
+            self._client = _WebDAVClient(base_url, auth=(WEBDAV_USER, WEBDAV_PASS))
             self._enabled = True
             logger.info(
                 "kDrive enabled (url=%s root=%s user=%s)",
-                WEBDAV_URL, ROOT_PATH, WEBDAV_USER,
+                base_url, ROOT_PATH, WEBDAV_USER,
             )
         except Exception:
             self._reason = "client init failed"
