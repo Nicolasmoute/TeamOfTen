@@ -952,9 +952,57 @@ def build_coord_server(caller_id: str) -> Any:
             f"decision '{title}' saved to {location} ({len(body)} chars of body)"
         )
 
+    @tool(
+        "coord_request_human",
+        (
+            "Escalate to the human operator. Use when stuck, blocked on a "
+            "decision only the human can make, or when something looks "
+            "wrong enough that the team should pause.\n"
+            "\n"
+            "Emits a high-visibility 'human_attention' event the UI surfaces "
+            "prominently. Does NOT block the agent — you should still mark "
+            "your task blocked / cancelled / done as appropriate.\n"
+            "\n"
+            "Params:\n"
+            "- subject: short headline (required, max 200 chars)\n"
+            "- body: longer explanation incl. what you tried (required)\n"
+            "- urgency: 'normal' (default) or 'blocker' (whole-team gating)"
+        ),
+        {"subject": str, "body": str, "urgency": str},
+    )
+    async def request_human(args: dict[str, Any]) -> dict[str, Any]:
+        subject = (args.get("subject") or "").strip()
+        body = (args.get("body") or "").strip()
+        urgency = (args.get("urgency") or "normal").strip().lower()
+        if not subject:
+            return _err("subject is required")
+        if not body:
+            return _err("body is required (explain what you tried)")
+        if len(subject) > 200:
+            return _err(f"subject too long ({len(subject)} chars, max 200)")
+        if len(body) > 10_000:
+            return _err(f"body too long ({len(body)} chars, max 10000)")
+        if urgency not in ("normal", "blocker"):
+            return _err("urgency must be 'normal' or 'blocker'")
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "human_attention",
+                "subject": subject,
+                "body": body,
+                "urgency": urgency,
+            }
+        )
+        return _ok(
+            f"human notified ({urgency}): {subject}. "
+            "Continue or pause your current task as appropriate."
+        )
+
     return create_sdk_mcp_server(
         name="coord",
-        version="0.7.0",
+        version="0.8.0",
         tools=[
             list_tasks,
             create_task,
@@ -968,6 +1016,7 @@ def build_coord_server(caller_id: str) -> Any:
             update_memory,
             commit_push,
             write_decision,
+            request_human,
         ],
     )
 
@@ -985,6 +1034,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_update_memory",
     "mcp__coord__coord_commit_push",
     "mcp__coord__coord_write_decision",
+    "mcp__coord__coord_request_human",
 ]
 
 MEMORY_TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")
