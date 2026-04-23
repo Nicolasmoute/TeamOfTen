@@ -3949,11 +3949,36 @@ function renderMarkdown(md) {
   return out.join("\n");
 }
 
+// Only allow URL schemes we trust to appear in agent/user-produced
+// markdown. javascript:, data:, vbscript: etc. would let any rendered
+// link fire code on click — exfiltrating the HARNESS_TOKEN from
+// localStorage is a one-liner once you're in-origin. Relative and
+// fragment links pass through unchanged. Everything else becomes a
+// plain-text "#" so the text still renders but the link is inert.
+function _safeHref(raw) {
+  const url = String(raw).trim();
+  if (!url) return "#";
+  if (url.startsWith("#") || url.startsWith("/") || url.startsWith("./") || url.startsWith("../")) {
+    return url;
+  }
+  const m = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(url);
+  if (!m) return url; // no scheme → treat as relative
+  const scheme = m[1].toLowerCase();
+  if (scheme === "http" || scheme === "https" || scheme === "mailto") {
+    return url;
+  }
+  return "#";
+}
+
 function renderInline(s) {
   return s
-    // links [text](url)
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g,
-      '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    // links [text](url) — scheme-filtered via _safeHref
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, url) => {
+      const href = _safeHref(url)
+        .replace(/"/g, "&quot;")
+        .replace(/</g, "&lt;");
+      return `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>`;
+    })
     // inline code
     .replace(/`([^`]+)`/g, '<code class="md-ic">$1</code>')
     // bold

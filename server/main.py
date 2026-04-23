@@ -22,6 +22,7 @@ from fastapi import (
     Header,
     HTTPException,
     Query,
+    Request,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
@@ -87,6 +88,20 @@ async def require_token(
     presented = authorization[len("Bearer "):].strip()
     if presented != HARNESS_TOKEN:
         raise HTTPException(status_code=403, detail="invalid bearer token")
+
+
+def audit_actor(request: Request) -> dict[str, str]:
+    """Attach source metadata to destructive-action events.
+
+    Single-user deploy: source is always "human". But the harness
+    token can be shared across devices or (accidentally) leaked; when
+    it is, the IP + UA on each audit event is the only way to tell
+    which device fired a destructive change after the fact. Cheap to
+    attach, impossible to recover later.
+    """
+    ip = request.client.host if request.client else ""
+    ua = request.headers.get("user-agent", "")[:120]
+    return {"source": "human", "ip": ip, "ua": ua}
 
 # If package-data shipped /static correctly, INDEX_HTML is the real page.
 # If not, we want a visible error page, not an import crash that makes
@@ -622,7 +637,11 @@ class AgentIdentityWrite(BaseModel):
 
 
 @app.put("/api/agents/{agent_id}/identity", dependencies=[Depends(require_token)])
-async def set_agent_identity(agent_id: str, req: AgentIdentityWrite) -> dict[str, object]:
+async def set_agent_identity(
+    agent_id: str,
+    req: AgentIdentityWrite,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
     """Human upsert for name + role. Either field omitted → left alone;
     passed as empty string → cleared (column set to NULL). Emits
     'player_assigned' with auto:false so the UI refreshes live."""
@@ -668,6 +687,7 @@ async def set_agent_identity(agent_id: str, req: AgentIdentityWrite) -> dict[str
             "name": req.name,
             "role": req.role,
             "auto": False,
+            "actor": actor,
         }
     )
     return {"ok": True, "agent_id": agent_id, "changed": changed}
@@ -678,7 +698,11 @@ class AgentBriefWrite(BaseModel):
 
 
 @app.put("/api/agents/{agent_id}/brief", dependencies=[Depends(require_token)])
-async def set_agent_brief(agent_id: str, req: AgentBriefWrite) -> dict[str, object]:
+async def set_agent_brief(
+    agent_id: str,
+    req: AgentBriefWrite,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
     """Human-supplied context text for a specific agent. Appended to
     the agent's system prompt on every subsequent turn so you can give
     Coach goals / house style, or a Player domain context, without
@@ -709,6 +733,7 @@ async def set_agent_brief(agent_id: str, req: AgentBriefWrite) -> dict[str, obje
             "agent_id": agent_id,
             "type": "brief_updated",
             "size": len(body),
+            "actor": actor,
         }
     )
     return {"ok": True, "agent_id": agent_id, "size": len(body)}
@@ -840,7 +865,10 @@ async def get_team_models() -> dict[str, object]:
 
 
 @app.put("/api/team/models", dependencies=[Depends(require_token)])
-async def set_team_models(req: TeamModelsWrite) -> dict[str, object]:
+async def set_team_models(
+    req: TeamModelsWrite,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
     """Set both per-role defaults. Empty string clears (reverts to SDK
     default)."""
     for role, value in (("coach", req.coach or ""), ("players", req.players or "")):
@@ -854,13 +882,17 @@ async def set_team_models(req: TeamModelsWrite) -> dict[str, object]:
             "type": "team_models_updated",
             "coach": req.coach or "",
             "players": req.players or "",
+            "actor": actor,
         }
     )
     return {"ok": True, "coach": req.coach or "", "players": req.players or ""}
 
 
 @app.put("/api/team/tools", dependencies=[Depends(require_token)])
-async def set_team_tools(req: TeamToolsWrite) -> dict[str, object]:
+async def set_team_tools(
+    req: TeamToolsWrite,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
     """Replace the team-wide extra-tools allowlist. Applies to every
     agent on their next turn. Entries outside the whitelist are
     rejected — the UI only offers checkboxes we've vetted."""
@@ -892,6 +924,7 @@ async def set_team_tools(req: TeamToolsWrite) -> dict[str, object]:
             "agent_id": "system",
             "type": "team_tools_updated",
             "tools": clean,
+            "actor": actor,
         }
     )
     return {"ok": True, "tools": clean}
@@ -1078,7 +1111,10 @@ async def list_mcp_servers() -> dict[str, object]:
 
 
 @app.post("/api/mcp/servers", dependencies=[Depends(require_token)])
-async def save_mcp_server(req: MCPServerSave) -> dict[str, object]:
+async def save_mcp_server(
+    req: MCPServerSave,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
     """Parse a JSON paste and save one or more servers. Returns a
     summary including per-server secret warnings."""
     from server.mcp_config import detect_secrets
@@ -1145,6 +1181,7 @@ async def save_mcp_server(req: MCPServerSave) -> dict[str, object]:
             "agent_id": "system",
             "type": "mcp_server_saved",
             "names": saved,
+            "actor": actor,
         }
     )
     return {"ok": True, "saved": saved, "secret_warnings": warnings}
@@ -1156,7 +1193,11 @@ class MCPServerPatch(BaseModel):
 
 
 @app.patch("/api/mcp/servers/{name}", dependencies=[Depends(require_token)])
-async def patch_mcp_server(name: str, req: MCPServerPatch) -> dict[str, object]:
+async def patch_mcp_server(
+    name: str,
+    req: MCPServerPatch,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
     """Toggle enabled and/or update the allowed_tools list for an
     existing row. Leaves config_json alone."""
     _validate_mcp_name(name)
@@ -1193,13 +1234,17 @@ async def patch_mcp_server(name: str, req: MCPServerPatch) -> dict[str, object]:
             "agent_id": "system",
             "type": "mcp_server_updated",
             "name": name,
+            "actor": actor,
         }
     )
     return {"ok": True}
 
 
 @app.delete("/api/mcp/servers/{name}", dependencies=[Depends(require_token)])
-async def delete_mcp_server(name: str) -> dict[str, object]:
+async def delete_mcp_server(
+    name: str,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
     _validate_mcp_name(name)
     import sqlite3
     from server.db import DB_PATH
@@ -1218,6 +1263,7 @@ async def delete_mcp_server(name: str) -> dict[str, object]:
             "agent_id": "system",
             "type": "mcp_server_deleted",
             "name": name,
+            "actor": actor,
         }
     )
     return {"ok": True}
@@ -1380,7 +1426,10 @@ async def get_team_repo() -> dict[str, object]:
 
 
 @app.put("/api/team/repo", dependencies=[Depends(require_token)])
-async def set_team_repo(req: TeamRepoWrite) -> dict[str, object]:
+async def set_team_repo(
+    req: TeamRepoWrite,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
     """Save repo + branch to team_config. Takes effect on the NEXT
     container restart — existing clones + worktrees stay pointing at
     the old remote. Secret-scan rejects raw tokens unless
@@ -1413,13 +1462,16 @@ async def set_team_repo(req: TeamRepoWrite) -> dict[str, object]:
             "type": "team_repo_updated",
             "repo_masked": _mask_repo_url(repo),
             "branch": branch or "main",
+            "actor": actor,
         }
     )
     return {"ok": True, "secret_warnings": warnings}
 
 
 @app.post("/api/team/repo/provision", dependencies=[Depends(require_token)])
-async def provision_team_repo() -> dict[str, object]:
+async def provision_team_repo(
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
     """Run `ensure_workspaces()` live so a repo URL saved via the UI
     takes effect without a container restart. Idempotent — existing
     `.git` worktrees are left alone; only missing ones get cloned /
@@ -1440,6 +1492,7 @@ async def provision_team_repo() -> dict[str, object]:
             "type": "team_repo_provisioned",
             "configured": bool(status.get("configured")),
             "error": status.get("error"),
+            "actor": actor,
         }
     )
     return {"ok": "error" not in status, "status": status}
@@ -1450,7 +1503,11 @@ class AgentLockWrite(BaseModel):
 
 
 @app.put("/api/agents/{agent_id}/locked", dependencies=[Depends(require_token)])
-async def set_agent_locked(agent_id: str, req: AgentLockWrite) -> dict[str, object]:
+async def set_agent_locked(
+    agent_id: str,
+    req: AgentLockWrite,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
     """Set the per-agent lock flag.
 
     When locked:
@@ -1485,13 +1542,17 @@ async def set_agent_locked(agent_id: str, req: AgentLockWrite) -> dict[str, obje
             "agent_id": agent_id,
             "type": "lock_updated",
             "locked": bool(locked),
+            "actor": actor,
         }
     )
     return {"ok": True, "agent_id": agent_id, "locked": bool(locked)}
 
 
 @app.delete("/api/agents/{agent_id}/session", dependencies=[Depends(require_token)])
-async def clear_session(agent_id: str) -> dict[str, object]:
+async def clear_session(
+    agent_id: str,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
     """Clear agent.session_id so the next run starts fresh context.
 
     Useful when an agent's conversation has drifted or when the human
@@ -1515,6 +1576,7 @@ async def clear_session(agent_id: str) -> dict[str, object]:
             "ts": datetime.now(timezone.utc).isoformat(),
             "agent_id": agent_id,
             "type": "session_cleared",
+            "actor": actor,
         }
     )
     return {"ok": True, "agent_id": agent_id}
@@ -1534,7 +1596,10 @@ def _valid_slot(sid: str) -> bool:
 
 
 @app.post("/api/agents/sessions/clear", dependencies=[Depends(require_token)])
-async def clear_sessions_batch(req: BatchClearSessionsRequest) -> dict[str, object]:
+async def clear_sessions_batch(
+    req: BatchClearSessionsRequest,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
     """Batch version of DELETE /api/agents/<id>/session. Clears
     session_id on every selected agent so next turn starts fresh.
 
@@ -1575,6 +1640,7 @@ async def clear_sessions_batch(req: BatchClearSessionsRequest) -> dict[str, obje
                 "ts": now,
                 "agent_id": sid,
                 "type": "session_cleared",
+                "actor": actor,
             }
         )
     return {"ok": True, "cleared": targets, "updated": updated}
