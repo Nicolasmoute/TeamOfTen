@@ -3446,7 +3446,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
           "coord_list_memory · coord_read_memory · coord_update_memory",
           "coord_write_decision · coord_write_context",
           "coord_write_knowledge · coord_read_knowledge · coord_list_knowledge",
-          "coord_set_player_role · coord_request_human",
+          "coord_list_team · coord_set_player_role · coord_request_human",
         ];
         const player = [
           "Read · Grep · Glob · ToolSearch · Write · Edit · Bash",
@@ -3454,10 +3454,37 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
           "coord_send_message · coord_read_inbox",
           "coord_list_memory · coord_read_memory · coord_update_memory",
           "coord_write_knowledge · coord_read_knowledge · coord_list_knowledge",
-          "coord_commit_push · coord_request_human",
+          "coord_list_team · coord_commit_push · coord_request_human",
         ];
         const list = slot === "coach" ? coach : player;
-        setInfoText("Tools for " + slot + ":\n" + list.map((l) => "• " + l).join("\n"));
+        // Also fetch /api/health to pick up external MCP servers from
+        // HARNESS_MCP_CONFIG — those tools vary per deploy so they
+        // can't live in a hardcoded list.
+        authFetch("/api/health")
+          .then((r) => r.json())
+          .then((d) => {
+            const ext = d?.checks?.mcp_external;
+            const mcp_lines = [];
+            if (ext && !ext.skipped && ext.server_count > 0) {
+              mcp_lines.push("");
+              mcp_lines.push(
+                `External MCP (${ext.server_count} servers, ${ext.allowed_tool_count} tools):`
+              );
+              for (const name of ext.servers || []) {
+                mcp_lines.push("  • " + name);
+              }
+            }
+            setInfoText(
+              "Tools for " + slot + ":\n" +
+              list.map((l) => "• " + l).join("\n") +
+              mcp_lines.join("\n")
+            );
+          })
+          .catch(() => {
+            // Fall back to just the hardcoded list if /api/health
+            // errors — better than nothing.
+            setInfoText("Tools for " + slot + ":\n" + list.map((l) => "• " + l).join("\n"));
+          });
         return true;
       }
       case "/loop": {
