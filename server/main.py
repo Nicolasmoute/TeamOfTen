@@ -320,14 +320,38 @@ async def health() -> JSONResponse:
     mcp_cfg_path = os.environ.get("HARNESS_MCP_CONFIG", "").strip()
     if mcp_cfg_path:
         from server.mcp_config import load_external_servers
-        servers, tool_names = load_external_servers()
-        checks["mcp_external"] = {
-            "ok": True,
-            "config_path": mcp_cfg_path,
-            "server_count": len(servers),
-            "servers": sorted(servers.keys()),
-            "allowed_tool_count": len(tool_names),
-        }
+        # Do a parallel sanity read so we can distinguish file-missing /
+        # parse-error / no-servers-in-file from each other —
+        # load_external_servers collapses all three to (empty, empty)
+        # and only logs. Report here so the UI surfaces the failure.
+        mcp_status: dict[str, Any] = {"config_path": mcp_cfg_path}
+        cfg_file = Path(mcp_cfg_path)
+        if not cfg_file.is_file():
+            mcp_status.update({"ok": False, "error": "file does not exist"})
+        else:
+            try:
+                raw = cfg_file.read_text(encoding="utf-8")
+                parsed = json.loads(raw)
+                if not isinstance(parsed, dict):
+                    raise ValueError("top-level must be a JSON object")
+                servers_in = parsed.get("servers")
+                if servers_in is not None and not isinstance(servers_in, dict):
+                    raise ValueError("'servers' key must be an object")
+                servers, tool_names = load_external_servers()
+                mcp_status.update({
+                    "ok": True,
+                    "server_count": len(servers),
+                    "servers": sorted(servers.keys()),
+                    "allowed_tool_count": len(tool_names),
+                })
+            except Exception as e:
+                mcp_status.update({
+                    "ok": False,
+                    "error": f"{type(e).__name__}: {str(e)[:200]}",
+                })
+        if not mcp_status.get("ok"):
+            overall_ok = False
+        checks["mcp_external"] = mcp_status
     else:
         checks["mcp_external"] = {
             "ok": True,
