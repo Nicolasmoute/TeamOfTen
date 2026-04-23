@@ -399,7 +399,6 @@ async def status() -> dict[str, object]:
     return {
         "ok": True,
         "version": app.version,
-        "milestone": "M2",
         "started_at": STARTED_AT.isoformat(),
         "uptime_seconds": int((now - STARTED_AT).total_seconds()),
         "host": os.environ.get("HOSTNAME", "unknown"),
