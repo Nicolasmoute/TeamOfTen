@@ -4461,10 +4461,19 @@ function EventItem({ event }) {
     </div>`;
   }
 
-  // fallback
-  return html`<div class="event">
-    <div class="event-meta">${ts}  ${type}</div>
-    <div class="event-body">${JSON.stringify(event).slice(0, 300)}</div>
+  if (type === "tools_updated") {
+    const list = Array.isArray(event.tools) ? event.tools : [];
+    const body = list.length === 0 ? "(baseline only)" : list.join(" · ");
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · extra tools → ${body}</div>
+    </div>`;
+  }
+
+  // Fallback — unknown event type. Render as a compact .sys row with
+  // just the type name; no JSON dump. If we ever need the details,
+  // they're still in /api/events?id=<__id>.
+  return html`<div class="event sys">
+    <div class="event-meta">${ts} · ${type}</div>
   </div>`;
 }
 
