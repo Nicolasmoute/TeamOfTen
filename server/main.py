@@ -10,7 +10,7 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1168,6 +1168,48 @@ async def list_turns(
     finally:
         await c.close()
     return {"turns": [dict(r) for r in rows]}
+
+
+@app.get("/api/turns/summary", dependencies=[Depends(require_token)])
+async def turns_summary(hours: int = 24) -> dict[str, Any]:
+    """Per-agent aggregate over the last `hours` (default 24).
+
+    Returns total spend / turn count / average duration, plus a
+    per-agent breakdown sorted by cost descending. Cheap — runs a
+    single grouped SELECT against the indexed `turns` table.
+
+    Use `/api/turns` for row-level detail; this endpoint is for
+    charts and dashboards.
+    """
+    hours = max(1, min(hours, 24 * 30))  # 1h..30d
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT agent_id, COUNT(*) AS count, "
+            "COALESCE(SUM(cost_usd), 0) AS cost_usd, "
+            "COALESCE(AVG(duration_ms), 0) AS avg_duration_ms, "
+            "SUM(is_error) AS error_count "
+            "FROM turns WHERE ended_at >= ? "
+            "GROUP BY agent_id ORDER BY cost_usd DESC",
+            (cutoff,),
+        )
+        per_agent = [dict(r) for r in await cur.fetchall()]
+        cur = await c.execute(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(cost_usd), 0) AS cost_usd "
+            "FROM turns WHERE ended_at >= ?",
+            (cutoff,),
+        )
+        total_row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    return {
+        "window_hours": hours,
+        "since": cutoff,
+        "total_turns": int(total_row["count"] or 0),
+        "total_cost_usd": float(total_row["cost_usd"] or 0),
+        "per_agent": per_agent,
+    }
 
 
 @app.get("/api/events", dependencies=[Depends(require_token)])
