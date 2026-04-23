@@ -475,6 +475,21 @@ def build_coord_server(caller_id: str) -> Any:
                 "to": to,
             }
         )
+        # Auto-wake the assignee so the task actually starts moving
+        # instead of waiting for someone to poke them. Debounced +
+        # pause-respecting inside maybe_wake_agent; late import to
+        # avoid a circular tools.py ↔ agents.py dependency at load
+        # time.
+        try:
+            from server.agents import maybe_wake_agent
+            await maybe_wake_agent(
+                to,
+                f"Coach just assigned you task {task_id}. "
+                f"Use coord_read_inbox + coord_list_tasks to see your work, "
+                f"claim what's yours, and start.",
+            )
+        except Exception:
+            pass
         return _ok(f"assigned {task_id} → {to}")
 
     @tool(
@@ -544,6 +559,21 @@ def build_coord_server(caller_id: str) -> Any:
                 "priority": priority,
             }
         )
+        # Auto-wake direct recipients so they actually read + respond.
+        # Skip broadcasts — waking every agent on every team announcement
+        # would spiral costs. If you want broadcasts to nudge everyone,
+        # Coach can @-mention specific slots instead.
+        if to != "broadcast":
+            try:
+                from server.agents import maybe_wake_agent
+                subj = f" (subject: {subject})" if subject else ""
+                await maybe_wake_agent(
+                    to,
+                    f"New message from {caller_id}{subj}. "
+                    f"Use coord_read_inbox to read it and respond.",
+                )
+            except Exception:
+                pass
         preview = body.strip().replace("\n", " ")[:60]
         return _ok(
             f"sent to {to}"

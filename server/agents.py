@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -219,6 +220,35 @@ COACH_TICK_PROMPT = (
 COACH_TICK_INTERVAL_SECONDS = int(
     os.environ.get("HARNESS_COACH_TICK_INTERVAL", "0")
 )
+
+# Mutable Coach tick interval — initialized from the env var, but
+# changeable at runtime via set_coach_interval() (POST /api/coach/loop
+# or the /loop slash command). The loop reads this each iteration, so
+# changes take effect on the NEXT tick without restart.
+_coach_tick_interval: int = COACH_TICK_INTERVAL_SECONDS
+
+
+def get_coach_interval() -> int:
+    return _coach_tick_interval
+
+
+def set_coach_interval(seconds: int) -> None:
+    """Update the Coach autoloop cadence at runtime. 0 disables. The
+    loop polls this every few seconds so changes take effect promptly."""
+    global _coach_tick_interval
+    _coach_tick_interval = max(0, int(seconds))
+    logger.info("coach autoloop interval set to %ds", _coach_tick_interval)
+
+
+# Auto-wake: when Coach assigns a task to p3 or messages p3, we start
+# a turn for p3 with a wake prompt so the Player actually engages —
+# without this, assignments just sit in the DB doing nothing. Debounce
+# prevents tight ping-pong loops: if an agent finished a turn within
+# AUTOWAKE_DEBOUNCE_SECONDS, skip. Independent of the Coach autoloop.
+AUTOWAKE_DEBOUNCE_SECONDS = int(
+    os.environ.get("HARNESS_AUTOWAKE_DEBOUNCE", "10")
+)
+_last_turn_ended_at: dict[str, float] = {}
 
 
 def _today_utc_start_iso() -> str:
@@ -712,8 +742,47 @@ async def run_agent(
         await _set_status(agent_id, "idle")
     finally:
         _running_tasks.pop(agent_id, None)
+        # Stamp when this turn ended so the auto-wake debounce can see
+        # it on the next incoming event. Pure in-memory — a restart
+        # clears the record, which is fine (first post-restart wake
+        # just fires immediately).
+        _last_turn_ended_at[agent_id] = time.monotonic()
 
     await _emit(agent_id, "agent_stopped")
+
+
+async def maybe_wake_agent(agent_id: str, reason: str) -> bool:
+    """Spawn a turn for `agent_id` with `reason` as the prompt, if and
+    only if all guards pass:
+
+      - harness not paused
+      - agent not already running (don't stack turns)
+      - this agent's previous turn ended more than
+        AUTOWAKE_DEBOUNCE_SECONDS ago (prevents tight ping-pong between
+        Coach ↔ Player when they message each other)
+
+    Returns True if a spawn was scheduled, False otherwise. Cost caps
+    are enforced inside run_agent itself so we don't duplicate that
+    check here.
+    """
+    if agent_id == "system":
+        return False
+    if _paused:
+        return False
+    if agent_id in _running_tasks:
+        return False
+    last_end = _last_turn_ended_at.get(agent_id, 0.0)
+    if last_end and (time.monotonic() - last_end) < AUTOWAKE_DEBOUNCE_SECONDS:
+        logger.info(
+            "auto-wake skipped: %s ended a turn %.1fs ago (<%ds debounce)",
+            agent_id,
+            time.monotonic() - last_end,
+            AUTOWAKE_DEBOUNCE_SECONDS,
+        )
+        return False
+    logger.info("auto-wake: spawning %s — %s", agent_id, reason[:80])
+    asyncio.create_task(run_agent(agent_id, reason))
+    return True
 
 
 async def _coach_is_working() -> bool:
@@ -735,24 +804,29 @@ async def _coach_is_working() -> bool:
 async def coach_tick_loop() -> None:
     """Background task: periodically nudge Coach to drain inbox.
 
-    Sleeps first so a tick doesn't fire before workspaces / db are
-    fully ready. Skips when Coach is already working (avoids stacking
-    turns and redundant Sonnet spend). Disabled when interval <= 0."""
-    if COACH_TICK_INTERVAL_SECONDS <= 0:
-        logger.info(
-            "coach autoloop disabled (HARNESS_COACH_TICK_INTERVAL=%d)",
-            COACH_TICK_INTERVAL_SECONDS,
-        )
-        return
+    Reads _coach_tick_interval each iteration so set_coach_interval()
+    (from /api/coach/loop or the /loop slash command) can toggle the
+    cadence at runtime with no restart. When the interval is <= 0,
+    the loop idles with a short poll until it's re-enabled."""
     logger.info(
-        "coach autoloop starting: every %ds", COACH_TICK_INTERVAL_SECONDS
+        "coach autoloop running (initial interval %ds; 0=disabled)",
+        _coach_tick_interval,
     )
     while True:
+        interval = _coach_tick_interval
         try:
-            await asyncio.sleep(COACH_TICK_INTERVAL_SECONDS)
+            if interval <= 0:
+                # Idle poll — wake every 5s to check if someone enabled
+                # us via set_coach_interval().
+                await asyncio.sleep(5)
+                continue
+            await asyncio.sleep(interval)
         except asyncio.CancelledError:
             raise
         try:
+            if _coach_tick_interval <= 0:
+                # Disabled between sleep start and now — skip this tick.
+                continue
             if _paused:
                 logger.info("coach autoloop: skipping — harness paused")
                 continue

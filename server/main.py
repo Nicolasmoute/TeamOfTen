@@ -422,6 +422,34 @@ async def set_pause_state(req: PauseRequest) -> dict[str, bool]:
     return {"paused": is_paused()}
 
 
+class CoachLoopRequest(BaseModel):
+    interval_seconds: int = Field(..., ge=0, le=86_400)
+
+
+@app.get("/api/coach/loop", dependencies=[Depends(require_token)])
+async def get_coach_loop() -> dict[str, object]:
+    from server.agents import get_coach_interval
+    return {"interval_seconds": get_coach_interval()}
+
+
+@app.post("/api/coach/loop", dependencies=[Depends(require_token)])
+async def set_coach_loop(req: CoachLoopRequest) -> dict[str, object]:
+    """Set Coach's autoloop interval at runtime. 0 disables. The
+    background loop re-reads this each iteration, so changes take
+    effect on the next tick (no restart)."""
+    from server.agents import set_coach_interval
+    set_coach_interval(req.interval_seconds)
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "coach",
+            "type": "coach_loop_changed",
+            "interval_seconds": req.interval_seconds,
+        }
+    )
+    return {"ok": True, "interval_seconds": req.interval_seconds}
+
+
 @app.post("/api/coach/tick", dependencies=[Depends(require_token)])
 async def coach_tick(background: BackgroundTasks) -> dict[str, object]:
     """Nudge Coach to drain its inbox. Foundation of the autonomous
@@ -723,11 +751,10 @@ class HumanMessageRequest(BaseModel):
 
 @app.post("/api/messages", dependencies=[Depends(require_token)])
 async def send_human_message(req: HumanMessageRequest) -> dict[str, Any]:
-    """Queue a message from the human into an agent's inbox without
-    spawning a turn. Agents pick it up on their next coord_read_inbox
-    call (or their next autonomous tick).
-
-    Use a pane prompt instead if you want to run the agent now."""
+    """Queue a message from the human into an agent's inbox AND auto-wake
+    the recipient so they read + respond without needing a separate
+    prompt. Debounced inside maybe_wake_agent so rapid messages don't
+    stack turns. Broadcasts don't auto-wake (would spiral)."""
     to = req.to.strip().lower()
     if to not in _HUMAN_MSG_RECIPIENTS:
         raise HTTPException(
@@ -758,6 +785,14 @@ async def send_human_message(req: HumanMessageRequest) -> dict[str, Any]:
             "priority": req.priority,
         }
     )
+    if to != "broadcast":
+        from server.agents import maybe_wake_agent
+        subj = f" (subject: {req.subject})" if req.subject else ""
+        await maybe_wake_agent(
+            to,
+            f"New message from the human{subj}. "
+            f"Use coord_read_inbox to read it and respond.",
+        )
     return {"ok": True, "message_id": msg_id}
 
 
@@ -1083,14 +1118,14 @@ async def list_events(
         # Fan-out: include events where this agent is the recipient,
         # not only the actor. Mirrors the WS-side fan-out so opening a
         # pane's history matches what the pane would have shown live.
-        #   - type=message_sent & to_id matches (or 'broadcast')
-        #   - type=task_assigned & to matches
+        #   - type=message_sent & .to matches (or 'broadcast')
+        #   - type=task_assigned & .to matches
         where_parts.append(
             "("
             "agent_id = ?"
             " OR (type = 'message_sent' AND ("
-            "     json_extract(payload, '$.to_id') = ?"
-            "     OR json_extract(payload, '$.to_id') = 'broadcast'"
+            "     json_extract(payload, '$.to') = ?"
+            "     OR json_extract(payload, '$.to') = 'broadcast'"
             "))"
             " OR (type = 'task_assigned' AND json_extract(payload, '$.to') = ?)"
             ")"

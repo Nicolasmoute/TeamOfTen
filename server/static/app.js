@@ -240,6 +240,7 @@ const SLASH_COMMANDS = [
   { cmd: "/brief",  desc: "edit this agent's brief" },
   { cmd: "/tools",  desc: "list the tools this agent can use" },
   { cmd: "/clear",  desc: "clear session so the next turn starts fresh" },
+  { cmd: "/loop",   desc: "Coach autoloop: /loop 60 → tick every 60s · /loop off" },
   { cmd: "/help",   desc: "show available slash commands" },
 ];
 
@@ -751,7 +752,7 @@ function App() {
       const fanoutTargets = new Set();
       fanoutTargets.add(aid);
       if (ev.type === "message_sent") {
-        const toId = ev.to_id;
+        const toId = ev.to;
         if (toId === "broadcast") {
           ["coach", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "p10"]
             .forEach((s) => fanoutTargets.add(s));
@@ -3395,6 +3396,47 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
         ];
         const list = slot === "coach" ? coach : player;
         setInfoText("Tools for " + slot + ":\n" + list.map((l) => "• " + l).join("\n"));
+        return true;
+      }
+      case "/loop": {
+        // Toggle / set Coach's autoloop interval at runtime.
+        //   /loop            → report current state
+        //   /loop 60         → tick every 60 seconds
+        //   /loop 0 | off    → disable
+        let target = null;
+        const a = arg.trim().toLowerCase();
+        if (!a) {
+          authFetch("/api/coach/loop")
+            .then((r) => r.json())
+            .then((d) => {
+              setInfoText(
+                d.interval_seconds
+                  ? `Coach autoloop: every ${d.interval_seconds}s. '/loop off' to stop.`
+                  : "Coach autoloop: OFF. '/loop 60' to start a 60s tick."
+              );
+            })
+            .catch((e) => setInfoText("loop query failed: " + String(e)));
+          return true;
+        }
+        if (a === "off" || a === "0" || a === "stop") target = 0;
+        else target = parseInt(a, 10);
+        if (target == null || isNaN(target) || target < 0) {
+          setInfoText("usage: /loop [seconds | off]");
+          return true;
+        }
+        authFetch("/api/coach/loop", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ interval_seconds: target }),
+        })
+          .then(() => {
+            setInfoText(
+              target === 0
+                ? "Coach autoloop stopped."
+                : `Coach autoloop: every ${target}s. First tick in ~${target}s.`
+            );
+          })
+          .catch((e) => setInfoText("loop set failed: " + String(e)));
         return true;
       }
       case "/help":
