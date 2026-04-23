@@ -724,6 +724,101 @@ async def get_team_tools() -> dict[str, object]:
     }
 
 
+# Per-role default models — one per role (coach, players). Per-pane
+# overrides still win; these kick in only when the pane hasn't chosen
+# a specific model.
+_ROLE_MODEL_DEFAULTS = {
+    "coach": "claude-opus-4-7",
+    "players": "claude-sonnet-4-6",
+}
+# Model names we let the UI pick. Keep in sync with MODEL_OPTIONS in
+# app.js. Empty string is also accepted and means "SDK default".
+_MODEL_WHITELIST = {
+    "",
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+}
+
+
+class TeamModelsWrite(BaseModel):
+    coach: str = Field("", description="Default model for Coach. Empty = SDK default.")
+    players: str = Field("", description="Default model for p1..p10. Empty = SDK default.")
+
+
+async def _read_team_config_str(key: str) -> str:
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT value FROM team_config WHERE key = ?", (key,)
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    if not row:
+        return ""
+    raw = (dict(row).get("value") or "").strip()
+    # Stored as JSON string ("claude-opus-4-7"); unwrap if so.
+    if raw.startswith('"') and raw.endswith('"'):
+        try:
+            v = json.loads(raw)
+            if isinstance(v, str):
+                return v
+        except Exception:
+            pass
+    return raw
+
+
+async def _write_team_config_str(key: str, value: str) -> None:
+    payload = json.dumps(value)
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO team_config (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+            (key, payload),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+
+@app.get("/api/team/models", dependencies=[Depends(require_token)])
+async def get_team_models() -> dict[str, object]:
+    """Return current per-role default models + the suggested defaults.
+
+    The UI shows `suggested` as inline hints ("default: Opus 4.7") so
+    users know what to revert to. Empty string means "SDK default"
+    (whatever `DEFAULT_MODEL` env gives us)."""
+    return {
+        "coach": await _read_team_config_str("coach_default_model"),
+        "players": await _read_team_config_str("players_default_model"),
+        "suggested": _ROLE_MODEL_DEFAULTS,
+        "available": sorted(_MODEL_WHITELIST - {""}),
+    }
+
+
+@app.put("/api/team/models", dependencies=[Depends(require_token)])
+async def set_team_models(req: TeamModelsWrite) -> dict[str, object]:
+    """Set both per-role defaults. Empty string clears (reverts to SDK
+    default)."""
+    for role, value in (("coach", req.coach or ""), ("players", req.players or "")):
+        if value not in _MODEL_WHITELIST:
+            raise HTTPException(400, detail=f"unknown model '{value}' for {role}")
+        await _write_team_config_str(f"{role}_default_model", value)
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "system",
+            "type": "team_models_updated",
+            "coach": req.coach or "",
+            "players": req.players or "",
+        }
+    )
+    return {"ok": True, "coach": req.coach or "", "players": req.players or ""}
+
+
 @app.put("/api/team/tools", dependencies=[Depends(require_token)])
 async def set_team_tools(req: TeamToolsWrite) -> dict[str, object]:
     """Replace the team-wide extra-tools allowlist. Applies to every

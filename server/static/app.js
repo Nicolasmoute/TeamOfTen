@@ -1661,6 +1661,103 @@ function TeamToolsSection() {
   </section>`;
 }
 
+// Per-role default models. Two dropdowns (Coach / Players) with
+// suggested defaults shown as inline hints. Per-pane overrides set
+// via the gear popover still win — these only apply when a pane
+// hasn't picked its own model.
+function TeamModelsSection() {
+  const [coachModel, setCoachModel] = useState("");
+  const [playersModel, setPlayersModel] = useState("");
+  const [suggested, setSuggested] = useState({});
+  const [available, setAvailable] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [savedAt, setSavedAt] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await authFetch("/api/team/models");
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (cancelled) return;
+        setCoachModel(data.coach || "");
+        setPlayersModel(data.players || "");
+        setSuggested(data.suggested || {});
+        setAvailable(Array.isArray(data.available) ? data.available : []);
+      } catch (e) {
+        console.error("team models load failed", e);
+      } finally {
+        if (!cancelled) setLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+  const save = useCallback(async (coach, players) => {
+    setSaving(true);
+    try {
+      const res = await authFetch("/api/team/models", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ coach, players }),
+      });
+      if (res.ok) setSavedAt(Date.now());
+    } catch (e) {
+      console.error("team models save failed", e);
+    } finally {
+      setSaving(false);
+    }
+  }, []);
+  const onCoachChange = (v) => { setCoachModel(v); save(v, playersModel); };
+  const onPlayersChange = (v) => { setPlayersModel(v); save(coachModel, v); };
+  const labelFor = (id) => {
+    const m = MODEL_OPTIONS.find((o) => o.value === id);
+    return m ? m.label : id;
+  };
+  return html`<section class="drawer-section">
+    <h3>Default models</h3>
+    <p class="muted" style="margin: 0 0 6px 0; font-size: 12px;">
+      Fallback model per role when a pane hasn't set its own. The
+      gear popover on any pane still overrides. Empty = SDK default.
+    </p>
+    ${loaded
+      ? html`<div style="display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center; font-size: 12px;">
+          <label>Coach</label>
+          <div>
+            <select
+              value=${coachModel}
+              disabled=${saving}
+              onChange=${(e) => onCoachChange(e.target.value)}
+            >
+              <option value="">SDK default</option>
+              ${available.map((m) => html`<option value=${m}>${labelFor(m)}</option>`)}
+            </select>
+            ${suggested.coach
+              ? html` <span class="muted" style="margin-left: 6px;">suggested: ${labelFor(suggested.coach)}</span>`
+              : null}
+          </div>
+          <label>Players</label>
+          <div>
+            <select
+              value=${playersModel}
+              disabled=${saving}
+              onChange=${(e) => onPlayersChange(e.target.value)}
+            >
+              <option value="">SDK default</option>
+              ${available.map((m) => html`<option value=${m}>${labelFor(m)}</option>`)}
+            </select>
+            ${suggested.players
+              ? html` <span class="muted" style="margin-left: 6px;">suggested: ${labelFor(suggested.players)}</span>`
+              : null}
+          </div>
+        </div>
+        ${savedAt
+          ? html`<p class="muted" style="font-size: 11px; margin: 6px 0 0 0;">saved · takes effect on next turn</p>`
+          : null}`
+      : html`<p class="muted">loading…</p>`}
+  </section>`;
+}
+
 function SettingsDrawer({ onClose, serverStatus }) {
   // A compact row summarizing the live server status: paused, running
   // agents, ws subscribers. Rendered above the health checks so the
@@ -1806,6 +1903,8 @@ function SettingsDrawer({ onClose, serverStatus }) {
           />
 
           <${TeamToolsSection} />
+
+          <${TeamModelsSection} />
 
           <section class="drawer-section">
             <h3>Layout</h3>

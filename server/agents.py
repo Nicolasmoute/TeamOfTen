@@ -485,6 +485,43 @@ async def _locked_players() -> list[str]:
     return [dict(r)["id"] for r in rows]
 
 
+async def _get_role_default_model(agent_id: str) -> str | None:
+    """Read the per-role default model from team_config.
+
+    Keys:
+      coach_default_model   applies when agent_id == 'coach'
+      players_default_model applies to p1..p10
+
+    Returns None when the row is missing / empty / unreadable so the
+    caller can fall back to the SDK default (or the per-pane override
+    that takes precedence upstream).
+    """
+    key = "coach_default_model" if agent_id == "coach" else "players_default_model"
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT value FROM team_config WHERE key = ?", (key,)
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("get_role_default_model failed: agent=%s", agent_id)
+        return None
+    if not row:
+        return None
+    val = (dict(row).get("value") or "").strip()
+    # team_config values are stored as JSON; unwrap if so, but tolerate
+    # a raw string too (future-proof for a manual DB edit).
+    if val.startswith('"') and val.endswith('"'):
+        try:
+            val = json.loads(val)
+        except Exception:
+            pass
+    return val or None
+
+
 async def _get_team_extra_tools() -> list[str]:
     """Read the team-wide extra-tools allow-list from team_config.
 
@@ -898,6 +935,13 @@ async def run_agent(
     # fine without streaming — you just don't get the typing cursor.
     if os.environ.get("HARNESS_STREAM_TOKENS", "").lower() in ("1", "true", "yes"):
         options_kwargs["include_partial_messages"] = True
+    # Model resolution precedence (highest -> lowest):
+    #   1. per-pane override (`model` arg, from the gear popover)
+    #   2. per-role team default (team_config: coach_default_model /
+    #      players_default_model), set in the Settings drawer
+    #   3. SDK default (no kwarg passed)
+    if not model:
+        model = await _get_role_default_model(agent_id)
     if model:
         options_kwargs["model"] = model
     if plan_mode:
