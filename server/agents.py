@@ -523,6 +523,13 @@ _LACROSSE_SURNAMES: tuple[str, ...] = (
 # harness is single-process by design.
 _AUTONAME_LOCK = asyncio.Lock()
 
+# Serializes the concurrent-spawn guard's check + register. Without
+# this, two parallel run_agent coroutines can both pass the 'already
+# running?' check before either has claimed the slot in _running_tasks,
+# and we end up with two simultaneous Claude subprocesses for the
+# same agent. Held only for check + register + (if rejected) one emit.
+_SPAWN_LOCK = asyncio.Lock()
+
 
 async def _autoname_player(agent_id: str) -> str | None:
     """If this Player slot has no name yet, pick an unused lacrosse
@@ -684,14 +691,25 @@ async def run_agent(
         logger.info("paused: refused to spawn %s", agent_id)
         return
 
-    # Concurrent-spawn guard: if a turn is already running for this
-    # slot, refuse to start another. maybe_wake_agent already does this,
-    # but the direct POST /api/agents/start path bypasses that helper —
-    # without this check, 100 rapid clicks on the Run button would
-    # spawn 100 Claude subprocesses (the _running_tasks dict assignment
-    # would just overwrite, so cancel-all only kills the last).
-    existing = _running_tasks.get(agent_id)
-    if existing is not None and not existing.done():
+    # Concurrent-spawn guard: check + claim the slot atomically under
+    # _SPAWN_LOCK so two parallel run_agent coroutines can't both pass
+    # the check before either has registered in _running_tasks. The
+    # lock also means maybe_wake_agent and direct /api/agents/start
+    # callers see the same ordering — no duplicated subprocesses for
+    # the same slot regardless of entry path.
+    rejected = False
+    this_task = asyncio.current_task()
+    async with _SPAWN_LOCK:
+        existing = _running_tasks.get(agent_id)
+        if existing is not None and not existing.done():
+            rejected = True
+        elif this_task is not None:
+            # Claim the slot synchronously with the check so no other
+            # coroutine can race past its own guard. The full setup
+            # (autoname / cost cap / session read) continues AFTER the
+            # lock releases, which is fine — we already hold the slot.
+            _running_tasks[agent_id] = this_task
+    if rejected:
         await _emit(
             agent_id,
             "spawn_rejected",
@@ -714,6 +732,10 @@ async def run_agent(
     if not allowed:
         await _emit(agent_id, "cost_capped", reason=reason, prompt=prompt)
         logger.warning("cost cap blocked spawn: %s", reason)
+        # Release the slot we claimed under _SPAWN_LOCK so the next
+        # attempt (after the user raises the cap / tomorrow rolls
+        # over) isn't rejected for "already running".
+        _running_tasks.pop(agent_id, None)
         return
 
     # Read prior session BEFORE emitting agent_started so the event
@@ -802,12 +824,9 @@ async def run_agent(
 
     options = ClaudeAgentOptions(**options_kwargs)
 
-    # Register this task so POST /api/agents/<id>/cancel can abort it.
-    # current_task() works here because run_agent is always invoked via
-    # asyncio.create_task (directly or via BackgroundTasks).
-    this_task = asyncio.current_task()
-    if this_task is not None:
-        _running_tasks[agent_id] = this_task
+    # (slot already claimed under _SPAWN_LOCK above — the old
+    # register-here block has been hoisted; we're past the concurrent-
+    # spawn guard AND the cost cap early return by this point.)
 
     # Per-turn context the ResultMessage handler needs to append a row
     # to the turns ledger. started_at is stamped fresh on each _iterate
