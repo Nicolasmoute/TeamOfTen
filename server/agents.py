@@ -161,6 +161,26 @@ async def _add_cost(agent_id: str, cost_usd: float | None) -> None:
         logger.exception("add_cost failed: agent=%s cost=%s", agent_id, cost_usd)
 
 
+async def _set_session_id(agent_id: str, session_id: str | None) -> None:
+    """Persist the SDK's session_id for this agent's last turn. Pure
+    instrumentation right now — actual resume-from-session-id lands in
+    a later M5 step once we confirm the SDK API surface."""
+    if not session_id or agent_id == "system":
+        return
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE agents SET session_id = ? WHERE id = ?",
+                (session_id, agent_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("set_session_id failed: agent=%s", agent_id)
+
+
 def _system_prompt_for(agent_id: str) -> str:
     if agent_id == "coach":
         return (
@@ -269,14 +289,17 @@ async def run_agent(agent_id: str, prompt: str) -> None:
                         )
             elif isinstance(msg, ResultMessage):
                 cost = getattr(msg, "total_cost_usd", None)
+                session_id = getattr(msg, "session_id", None)
                 await _emit(
                     agent_id,
                     "result",
                     duration_ms=getattr(msg, "duration_ms", None),
                     cost_usd=cost,
                     is_error=msg.is_error,
+                    session_id=session_id,
                 )
                 await _add_cost(agent_id, cost)
+                await _set_session_id(agent_id, session_id)
     except Exception as e:
         await _emit(agent_id, "error", error=f"{type(e).__name__}: {e}")
         await _set_status(agent_id, "error")

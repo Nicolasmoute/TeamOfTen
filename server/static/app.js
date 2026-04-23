@@ -913,6 +913,9 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
         <span class="pane-id">${slot}</span>
         <span class="pane-name">${displayName}</span>
         ${agent?.role ? html`<span class="pane-role">— ${agent.role}</span>` : html`<span class="pane-role"></span>`}
+        ${agent?.session_id
+          ? html`<span class="pane-session" title=${"session " + agent.session_id}>●</span>`
+          : null}
         <span class="pane-cost">$${cost.toFixed(3)}</span>
         <button class="pane-close" onClick=${onClose} title="Close pane">×</button>
       </header>

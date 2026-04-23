@@ -437,6 +437,11 @@ body {
 .pane-name { color: var(--fg); }
 .pane-role { color: var(--muted); font-size: 11px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pane-cost { color: var(--muted); font-size: 11px; }
+.pane-session {
+  color: var(--ok);
+  font-size: 10px;
+  cursor: help;
+}
 .pane-close {
   background: transparent;
   border: 0;
