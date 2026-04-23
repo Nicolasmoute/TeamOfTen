@@ -21,7 +21,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -135,6 +135,84 @@ class CreateTaskRequest(BaseModel):
 @app.get("/", response_class=HTMLResponse)
 async def root() -> str:
     return INDEX_HTML
+
+
+@app.get("/api/health")
+async def health() -> JSONResponse:
+    """Per-subsystem readiness probe. Returns 200 if everything required
+    is green, 503 if any subsystem is failing, with a `checks` object
+    detailing each. Skipped subsystems (kdrive/workspaces when unconfigured)
+    don't fail the overall ok flag.
+    """
+    checks: dict[str, dict[str, object]] = {}
+    overall_ok = True
+
+    # 1. Database writability
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute("SELECT 1")
+        finally:
+            await c.close()
+        checks["db"] = {"ok": True}
+    except Exception as e:
+        checks["db"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        overall_ok = False
+
+    # 2. Static files present
+    static_ok = STATIC_DIR.is_dir() and (STATIC_DIR / "index.html").exists()
+    checks["static"] = {
+        "ok": static_ok,
+        "path": str(STATIC_DIR),
+    }
+    if not static_ok:
+        overall_ok = False
+
+    # 3. claude CLI installed
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise
+        if proc.returncode == 0:
+            checks["claude_cli"] = {"ok": True, "version": stdout_b.decode().strip()}
+        else:
+            checks["claude_cli"] = {"ok": False, "exit_code": proc.returncode}
+            overall_ok = False
+    except Exception as e:
+        checks["claude_cli"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        overall_ok = False
+
+    # 4. kDrive — only check if configured. A skipped check doesn't break health.
+    if kdrive.enabled:
+        ok = await kdrive.write_text(".harness-health-probe.txt", "ok")
+        checks["kdrive"] = {"ok": ok}
+        if not ok:
+            overall_ok = False
+    else:
+        checks["kdrive"] = {"ok": True, "skipped": True, "reason": kdrive.reason}
+
+    # 5. Workspaces — only check if HARNESS_PROJECT_REPO set
+    ws_status = get_workspaces_status()
+    if ws_status.get("configured"):
+        slot_states = ws_status.get("slots") or {}
+        all_git = bool(slot_states) and all(
+            isinstance(s, dict) and s.get("is_git") for s in slot_states.values()
+        )
+        checks["workspaces"] = {"ok": all_git, "slot_count": len(slot_states)}
+        if not all_git:
+            overall_ok = False
+    else:
+        checks["workspaces"] = {"ok": True, "skipped": True}
+
+    body: dict[str, object] = {"ok": overall_ok, "checks": checks}
+    return JSONResponse(body, status_code=200 if overall_ok else 503)
 
 
 @app.get("/api/status")
