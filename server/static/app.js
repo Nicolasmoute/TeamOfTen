@@ -183,6 +183,37 @@ function saveSplitSizes(map) {
 // per-pane settings (model / plan mode / effort)
 // ------------------------------------------------------------------
 
+const PROMPT_HISTORY_KEY = "harness_prompt_history_v1";
+const PROMPT_HISTORY_MAX_PER_SLOT = 40;
+
+function loadPromptHistory(slot) {
+  try {
+    const raw = localStorage.getItem(PROMPT_HISTORY_KEY);
+    if (!raw) return [];
+    const all = JSON.parse(raw);
+    const list = all && typeof all === "object" ? all[slot] : null;
+    return Array.isArray(list) ? list : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function pushPromptHistory(slot, text) {
+  try {
+    const raw = localStorage.getItem(PROMPT_HISTORY_KEY);
+    const all = raw ? JSON.parse(raw) : {};
+    const list = Array.isArray(all[slot]) ? all[slot] : [];
+    // Don't store consecutive duplicates.
+    if (list.length > 0 && list[list.length - 1] === text) return list;
+    const next = [...list, text].slice(-PROMPT_HISTORY_MAX_PER_SLOT);
+    all[slot] = next;
+    localStorage.setItem(PROMPT_HISTORY_KEY, JSON.stringify(all));
+    return next;
+  } catch (_) {
+    return [];
+  }
+}
+
 const PANE_SETTINGS_KEY = "harness_pane_settings_v1";
 
 // Default: let the server pick (will use claude-sonnet-4-6 or whatever
@@ -2288,6 +2319,9 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
   const [paneSettings, setPaneSettings] = useState(() => loadPaneSettings(slot));
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  // Prompt history for ↑/↓ navigation (Ctrl/Cmd + arrow).
+  const [promptHistory, setPromptHistory] = useState(() => loadPromptHistory(slot));
+  const [promptHistoryIdx, setPromptHistoryIdx] = useState(null);
   const bodyRef = useRef(null);
 
   // HTML5 DnD: the pane header is the drag source; the whole pane is
@@ -2491,6 +2525,9 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
         body: JSON.stringify(reqBody),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const nextHistory = pushPromptHistory(slot, text);
+      setPromptHistory(nextHistory);
+      setPromptHistoryIdx(null);
       setInput("");
       setAttachments([]);
     } catch (err) {
@@ -2502,12 +2539,36 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
 
   const onKeyDown = useCallback(
     (e) => {
+      // Ctrl/Cmd + Enter submits.
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
         submit();
+        return;
+      }
+      // Ctrl/Cmd + ↑ / ↓ cycles prompt history. Plain arrows stay as
+      // normal textarea caret navigation.
+      if ((e.metaKey || e.ctrlKey) && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+        if (promptHistory.length === 0) return;
+        e.preventDefault();
+        let nextIdx;
+        if (e.key === "ArrowUp") {
+          nextIdx = promptHistoryIdx == null
+            ? promptHistory.length - 1
+            : Math.max(0, promptHistoryIdx - 1);
+        } else {
+          if (promptHistoryIdx == null) return;
+          nextIdx = promptHistoryIdx + 1;
+          if (nextIdx >= promptHistory.length) {
+            setPromptHistoryIdx(null);
+            setInput("");
+            return;
+          }
+        }
+        setPromptHistoryIdx(nextIdx);
+        setInput(promptHistory[nextIdx]);
       }
     },
-    [submit]
+    [submit, promptHistory, promptHistoryIdx]
   );
 
   const exportMarkdown = useCallback(() => {
@@ -2628,13 +2689,16 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
         <textarea
           placeholder=${"Message " + displayName + "… (paste images directly)"}
           value=${input}
-          onInput=${(e) => setInput(e.target.value)}
+          onInput=${(e) => {
+            setInput(e.target.value);
+            if (promptHistoryIdx != null) setPromptHistoryIdx(null);
+          }}
           onPaste=${onPaste}
           onKeyDown=${onKeyDown}
           rows=${3}
         ></textarea>
         <div class="pane-input-row">
-          <span class="hint">⌘/Ctrl+Enter to send</span>
+          <span class="hint">⌘/Ctrl+Enter to send · ⌘/Ctrl+↑↓ history</span>
           <button
             class="primary"
             disabled=${submitting || (!input.trim() && attachments.length === 0)}
