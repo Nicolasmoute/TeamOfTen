@@ -1124,6 +1124,8 @@ async def list_events(
         # pane's history matches what the pane would have shown live.
         #   - type=message_sent & .to matches (or 'broadcast')
         #   - type=task_assigned & .to matches
+        #   - type=task_updated & .owner matches (Coach cancelling a
+        #     Player's task should show in the Player's history too)
         where_parts.append(
             "("
             "agent_id = ?"
@@ -1132,9 +1134,10 @@ async def list_events(
             "     OR json_extract(payload, '$.to') = 'broadcast'"
             "))"
             " OR (type = 'task_assigned' AND json_extract(payload, '$.to') = ?)"
+            " OR (type = 'task_updated' AND json_extract(payload, '$.owner') = ?)"
             ")"
         )
-        params.extend([agent, agent, agent])
+        params.extend([agent, agent, agent, agent])
     if type:
         where_parts.append("type = ?")
         params.append(type)

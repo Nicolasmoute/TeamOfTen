@@ -761,6 +761,11 @@ function App() {
         }
       } else if (ev.type === "task_assigned") {
         if (ev.to) fanoutTargets.add(ev.to);
+      } else if (ev.type === "task_updated") {
+        // Status changes to a task owned by someone else (Coach
+        // cancelling / blocking a task assigned to p3) should show up
+        // in the owner's pane too.
+        if (ev.owner && ev.owner !== ev.agent_id) fanoutTargets.add(ev.owner);
       }
       setConversations((prev) => {
         const next = new Map(prev);

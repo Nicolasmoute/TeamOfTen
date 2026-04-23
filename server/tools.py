@@ -382,6 +382,11 @@ def build_coord_server(caller_id: str) -> Any:
                 "old_status": old_status,
                 "new_status": new_status,
                 "note": note,
+                # Include owner so the UI can fan out this event to the
+                # owner's pane — Coach cancelling/blocking a task assigned
+                # to p3 should be visible from p3 even when the update
+                # didn't originate there.
+                "owner": current_owner,
             }
         )
         suffix = f" — {note}" if note else ""
