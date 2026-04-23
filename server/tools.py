@@ -223,9 +223,10 @@ def build_coord_server(caller_id: str) -> Any:
             return _err("task_id is required")
         if caller_is_coach:
             return _err(
-                "Coach delegates; only Players claim tasks. If you want to "
-                "assign this task to a Player, message them via "
-                "coord_send_message (that tool lands in M2c)."
+                "Coach delegates; only Players claim tasks. Use "
+                "coord_assign_task(task_id, to) to push-assign this "
+                "to a specific Player, or coord_send_message to nudge "
+                "one to claim it themselves."
             )
 
         c = await configured_conn()

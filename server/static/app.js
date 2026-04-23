@@ -2620,8 +2620,8 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
           : "Attached images (use Read to load):\n  - ";
         prompt = text + header + paths;
       }
-      // Include per-pane overrides. Server ignores unknown fields
-      // (pydantic v2 default) until tick 2b wires them through.
+      // Include per-pane overrides. The server forwards these to
+      // ClaudeAgentOptions (model / permission_mode="plan" / effort).
       const reqBody = { agent_id: slot, prompt };
       if (paneSettings.model) reqBody.model = paneSettings.model;
       if (paneSettings.planMode) reqBody.plan_mode = true;
