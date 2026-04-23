@@ -890,7 +890,10 @@ async def maybe_wake_agent(
     for those paths.
 
     Returns True if a spawn was scheduled, False otherwise. Cost caps
-    are enforced inside run_agent itself so we don't duplicate here.
+    are checked here AND inside run_agent — the early check avoids a
+    storm of cost_capped events when a cap is hit (e.g. Coach assigns
+    10 tasks while team-capped, each assign would otherwise spawn a
+    turn that immediately fails).
     """
     if agent_id == "system":
         return False
@@ -908,6 +911,15 @@ async def maybe_wake_agent(
                 AUTOWAKE_DEBOUNCE_SECONDS,
             )
             return False
+    # Cost cap: if we'd just spawn a turn that would fail the cap check
+    # in run_agent, skip silently instead of burning an event + DB write.
+    # A manual spawn through the UI / API still goes through run_agent
+    # and emits cost_capped the usual way — this is a noise guard for
+    # the automatic path only.
+    allowed, _reason = await _check_cost_caps(agent_id)
+    if not allowed:
+        logger.info("auto-wake skipped for %s: cost cap hit", agent_id)
+        return False
     logger.info("auto-wake: spawning %s — %s", agent_id, reason[:80])
     asyncio.create_task(run_agent(agent_id, reason))
     return True
