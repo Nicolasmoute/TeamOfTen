@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        # Astral's uv is faster than pip + handles httptools etc. out
+        # of the box on Linux (dev Windows hosts can't build that wheel,
+        # which is why the author runs tests in CI rather than locally).
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Sync dependencies
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync --extra dev
+
+      - name: Run pytest
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv run pytest -ra --strict-markers
