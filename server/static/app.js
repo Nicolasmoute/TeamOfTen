@@ -1201,6 +1201,28 @@ function SettingsDrawer({ onClose, serverStatus }) {
           </section>
 
           <section class="drawer-section">
+            <h3>Layout</h3>
+            <p class="muted">
+              Column widths + stack heights are saved per layout shape
+              in <code>harness_split_sizes_v1</code>. Click to reset to
+              equal distribution (requires a page reload for Split.js
+              to rebind).
+            </p>
+            <button
+              class="primary"
+              style="margin-top: 6px;"
+              onClick=${() => {
+                try { localStorage.removeItem("harness_split_sizes_v1"); } catch (_) {}
+                location.reload();
+              }}
+            >Reset resize state</button>
+            <p class="muted" style="margin-top: 12px; font-size: 11px;">
+              Slot open/close + env panel state and per-pane settings
+              are separate — this only resets column widths.
+            </p>
+          </section>
+
+          <section class="drawer-section">
             <h3>About</h3>
             <p>
               <strong>TeamOfTen harness</strong><br />
