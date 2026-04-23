@@ -1348,10 +1348,16 @@ function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsCon
   const renderSlot = (a) => {
     if (!a) return null;
     const unread = unreadSlots && unreadSlots.has(a.id);
+    // "active" = the agent has an in-play session (first turn has run,
+    // session_id persisted). Decoupled from pane-open state — Coach
+    // can be running / active while its pane is closed, and closing
+    // a pane no longer greys out the rail button.
+    const active = Boolean(a.session_id) || a.status === "working" || a.status === "waiting";
     const classes = [
       "slot",
       a.kind,
       a.status || "stopped",
+      active ? "active" : "",
       openSlots.includes(a.id) ? "open" : "",
       unread ? "unread" : "",
     ].filter(Boolean).join(" ");

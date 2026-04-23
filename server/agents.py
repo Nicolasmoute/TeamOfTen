@@ -606,13 +606,17 @@ async def run_agent(
     # turns from continuations.
     prior_session = await _get_session_id(agent_id)
 
+    # Status flip BEFORE the agent_started WS event, not after: the UI
+    # handler refetches /api/agents on agent_started to repaint the
+    # left-rail slot, and it needs to see status='working' on that
+    # fetch — otherwise it paints the amber pulse one event late.
+    await _set_status(agent_id, "working")
     await _emit(
         agent_id,
         "agent_started",
         prompt=prompt,
         resumed_session=bool(prior_session),
     )
-    await _set_status(agent_id, "working")
 
     coord_server = build_coord_server(agent_id)
     allowed = ALLOWED_COACH_TOOLS if agent_id == "coach" else ALLOWED_PLAYER_TOOLS
