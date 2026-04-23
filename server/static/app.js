@@ -260,6 +260,11 @@ function App() {
   const [authChallenge, setAuthChallenge] = useState(false);
   // conversations: Map<slotId, Event[]>  (events ordered oldest → newest)
   const [conversations, setConversations] = useState(new Map());
+  // Per-slot latest ts the user has "acknowledged" by opening that
+  // pane. Slots currently in openColumns are always considered seen.
+  // Lives in React state only (session-scoped) — a page reload
+  // legitimately re-shows the "new activity since last visit" badge.
+  const [seenTs, setSeenTs] = useState({});
   // bumping this re-runs the WS effect, which re-opens a new connection
   const [wsAttempt, setWsAttempt] = useState(0);
 
@@ -424,13 +429,48 @@ function App() {
 
   const openSlots = useMemo(() => flatSlots(openColumns), [openColumns]);
 
-  // Open a slot as a new standalone column on the right.
+  // Mark a slot as seen up through its current latest event. Used when
+  // the user opens a pane, shift-clicks an already-open slot, etc.
+  const markSeen = useCallback((slot) => {
+    setSeenTs((prev) => {
+      // Read the latest ts at mark-time from a ref-like pattern —
+      // passing conversations as a dep here would force this callback
+      // to rebuild on every event, which is wasteful.
+      const list = conversationsRef.current.get(slot);
+      if (!list || !list.length) return prev;
+      const lastTs = list[list.length - 1].ts || new Date().toISOString();
+      if (prev[slot] === lastTs) return prev;
+      return { ...prev, [slot]: lastTs };
+    });
+  }, []);
+  // Keep a non-state reference current for use inside stable callbacks.
+  const conversationsRef = useRef(conversations);
+  useEffect(() => { conversationsRef.current = conversations; }, [conversations]);
+
+  // Compute which slots have unread activity: they have events newer
+  // than their seen ts AND are not currently open (open panes are
+  // considered always seen, since the user can see events landing).
+  const unreadSlots = useMemo(() => {
+    const out = new Set();
+    for (const [slot, list] of conversations) {
+      if (openSlots.includes(slot)) continue;
+      if (!list.length) continue;
+      const last = list[list.length - 1].ts || "";
+      if (!last) continue;
+      if (last > (seenTs[slot] || "")) out.add(slot);
+    }
+    return out;
+  }, [conversations, seenTs, openSlots]);
+
+  // Open a slot as a new standalone column on the right. Also marks
+  // the slot as seen so any prior unread badge clears.
   const openPane = useCallback((slot) => {
     setOpenColumns((prev) => {
       if (flatSlots(prev).includes(slot)) return prev;
       return [...prev, [slot]];
     });
-  }, []);
+    markSeen(slot);
+  }, [markSeen]);
   // Remove a pane, dropping the column if it becomes empty.
   const closePane = useCallback((slot) => {
     setOpenColumns((prev) => {
@@ -456,7 +496,8 @@ function App() {
       ];
       return next;
     });
-  }, []);
+    markSeen(slot);
+  }, [markSeen]);
 
   // Stack a slot below an existing column (used by the pane header's
   // "+ stack below" action). If slot already open, move it; otherwise add.
@@ -576,6 +617,7 @@ function App() {
       <${LeftRail}
         agents=${agents}
         openSlots=${openSlots}
+        unreadSlots=${unreadSlots}
         onOpen=${openPane}
         onStackInLast=${stackInLast}
         wsConnected=${wsConnected}
@@ -729,7 +771,7 @@ function TokenGate({ onSubmit }) {
 // left rail
 // ------------------------------------------------------------------
 
-function LeftRail({ agents, openSlots, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, onOpenSettings }) {
+function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, onOpenSettings }) {
   const grouped = useMemo(() => {
     const coach = agents.find((a) => a.kind === "coach");
     const players = agents
@@ -740,15 +782,18 @@ function LeftRail({ agents, openSlots, onOpen, onStackInLast, wsConnected, envOp
 
   const renderSlot = (a) => {
     if (!a) return null;
+    const unread = unreadSlots && unreadSlots.has(a.id);
     const classes = [
       "slot",
       a.kind,
       a.status || "stopped",
       openSlots.includes(a.id) ? "open" : "",
+      unread ? "unread" : "",
     ].filter(Boolean).join(" ");
-    const tooltip = a.name
-      ? `${a.id} — ${a.name}${a.role ? " — " + a.role : ""} (${a.status || "stopped"}) — shift-click to stack in last column`
-      : `${a.id} — unassigned (${a.status || "stopped"}) — shift-click to stack in last column`;
+    const baseTip = a.name
+      ? `${a.id} — ${a.name}${a.role ? " — " + a.role : ""} (${a.status || "stopped"})`
+      : `${a.id} — unassigned (${a.status || "stopped"})`;
+    const tooltip = baseTip + " — shift-click to stack in last column" + (unread ? " — NEW activity since last open" : "");
     return html`
       <button
         key=${a.id}
@@ -757,6 +802,7 @@ function LeftRail({ agents, openSlots, onOpen, onStackInLast, wsConnected, envOp
         onClick=${(e) => (e.shiftKey ? onStackInLast(a.id) : onOpen(a.id))}
       >
         ${slotShortLabel(a.id)}
+        ${unread ? html`<span class="slot-unread" />` : null}
       </button>
     `;
   };

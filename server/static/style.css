@@ -69,6 +69,18 @@ body {
   cursor: pointer;
   padding: 0;
   transition: background 80ms, color 80ms, border-color 80ms;
+  position: relative;
+}
+.slot .slot-unread {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 4px var(--accent);
+  pointer-events: none;
 }
 .slot:hover { background: var(--card); color: var(--fg); }
 .slot.coach { color: var(--coach); }
