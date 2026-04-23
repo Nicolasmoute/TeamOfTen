@@ -953,6 +953,61 @@ def build_coord_server(caller_id: str) -> Any:
         )
 
     @tool(
+        "coord_set_player_role",
+        (
+            "Coach-only. Assign a Player their human-readable name and "
+            "role description. Stored on the agents row so the UI can "
+            "label the pane (e.g. 'p3 — Alice — Frontend developer').\n"
+            "\n"
+            "Re-callable: overwrites prior values. Pass empty strings to "
+            "clear. Emits a 'player_assigned' event so the UI refreshes "
+            "the LeftRail / pane header immediately.\n"
+            "\n"
+            "Params:\n"
+            "- player_id: one of p1..p10 (required)\n"
+            "- name: short human name like 'Alice' (required)\n"
+            "- role: one-line role description (required)"
+        ),
+        {"player_id": str, "name": str, "role": str},
+    )
+    async def set_player_role(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("Only Coach assigns Player names / roles.")
+        pid = (args.get("player_id") or "").strip()
+        name = (args.get("name") or "").strip()
+        role = (args.get("role") or "").strip()
+        if not re.fullmatch(r"p([1-9]|10)", pid):
+            return _err(f"invalid player_id '{pid}' — expected p1..p10")
+        if len(name) > 80:
+            return _err(f"name too long ({len(name)} chars, max 80)")
+        if len(role) > 300:
+            return _err(f"role too long ({len(role)} chars, max 300)")
+
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "UPDATE agents SET name = ?, role = ? WHERE id = ?",
+                (name or None, role or None, pid),
+            )
+            if cur.rowcount == 0:
+                return _err(f"player '{pid}' not found")
+            await c.commit()
+        finally:
+            await c.close()
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "player_assigned",
+                "player_id": pid,
+                "name": name,
+                "role": role,
+            }
+        )
+        return _ok(f"{pid} → {name or '(no name)'} — {role or '(no role)'}")
+
+    @tool(
         "coord_request_human",
         (
             "Escalate to the human operator. Use when stuck, blocked on a "
@@ -1016,6 +1071,7 @@ def build_coord_server(caller_id: str) -> Any:
             update_memory,
             commit_push,
             write_decision,
+            set_player_role,
             request_human,
         ],
     )
@@ -1034,6 +1090,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_update_memory",
     "mcp__coord__coord_commit_push",
     "mcp__coord__coord_write_decision",
+    "mcp__coord__coord_set_player_role",
     "mcp__coord__coord_request_human",
 ]
 

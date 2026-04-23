@@ -404,7 +404,8 @@ function App() {
         ev.type === "result" ||
         ev.type === "error" ||
         ev.type === "cost_capped" ||
-        ev.type === "session_cleared"
+        ev.type === "session_cleared" ||
+        ev.type === "player_assigned"
       ) {
         loadAgents();
       }
@@ -1354,6 +1355,7 @@ const TIMELINE_TYPES = new Set([
   "commit_pushed",
   "decision_written",
   "human_attention",
+  "player_assigned",
 ]);
 
 function EnvTimelineSection({ conversations }) {
@@ -1492,6 +1494,14 @@ function EnvTimelineItem({ event }) {
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
       <span class="env-tl-body">${urgency} ${subj}</span>
+    </div>`;
+  }
+  if (event.type === "player_assigned") {
+    const summary = `${event.player_id} → ${event.name || "(no name)"}${event.role ? " — " + event.role : ""}`;
+    return html`<div class="env-tl-item env-tl-assigned">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">☻ ${summary}</span>
     </div>`;
   }
   if (event.type === "cost_capped") {

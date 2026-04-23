@@ -326,6 +326,8 @@ body {
 .env-tl-commit .env-tl-body { color: var(--accent); }
 .env-tl-attention { border-left-color: var(--err); background: #2c1a22; }
 .env-tl-attention .env-tl-body { color: var(--err); font-weight: 600; }
+.env-tl-assigned { border-left-color: var(--coach); }
+.env-tl-assigned .env-tl-body { color: var(--fg); }
 
 /* Pinned attention section: banner above the other env sections when
    any undismissed human_attention events are live. */
