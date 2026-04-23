@@ -473,6 +473,25 @@ body {
   font-style: italic;
   padding: 4px 0;
 }
+.pane-empty-hint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 24px 16px;
+  text-align: center;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  margin: 24px auto;
+  max-width: 480px;
+  background: var(--card);
+}
+.pane-empty-hint em {
+  color: var(--fg);
+  font-style: normal;
+  background: var(--bg);
+  padding: 1px 6px;
+  border-radius: 3px;
+}
 
 /* ---- events ---- */
 .event {

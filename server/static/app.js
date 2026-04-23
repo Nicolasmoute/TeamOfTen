@@ -105,13 +105,13 @@ function unwrapPersisted(row) {
 function App() {
   const [agents, setAgents] = useState([]);
   const [tasks, setTasks] = useState([]);
-  const _initialLayout = loadLayout();
+  // Lazy initializers: loadLayout() runs once per mount, not on every render.
   const [openSlots, setOpenSlots] = useState(
-    _initialLayout?.openSlots ?? ["coach"]
+    () => loadLayout()?.openSlots ?? ["coach"]
   );
   const [wsConnected, setWsConnected] = useState(false);
   const [envOpen, setEnvOpen] = useState(
-    _initialLayout?.envOpen ?? true
+    () => loadLayout()?.envOpen ?? true
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [serverStatus, setServerStatus] = useState(null);
@@ -1072,6 +1072,16 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
       </header>
       <div class="pane-body" ref=${bodyRef} onScroll=${onBodyScroll}>
         ${!historyLoaded ? html`<div class="loading">loading history…</div>` : null}
+        ${historyLoaded && allEvents.length === 0
+          ? html`<div class="pane-empty-hint">
+              No conversation yet for ${slot}.
+              ${slot === "coach"
+                ? html` Try a goal like:<br />
+                    <em>"Decompose into tasks: build a tic-tac-toe game in React"</em><br />
+                    or just <em>"What's on the team board?"</em>.`
+                : html` Type a prompt below to spawn this Player.`}
+            </div>`
+          : null}
         ${allEvents.map((ev, i) => html`<${EventItem} key=${(ev.__id ?? "live-" + i)} event=${ev} />`)}
       </div>
       <footer class="pane-input">
