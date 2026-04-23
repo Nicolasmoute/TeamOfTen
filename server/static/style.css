@@ -547,6 +547,15 @@ body {
   cursor: pointer;
 }
 .env-task-cancel:hover { color: var(--err); }
+.env-task-branch {
+  color: var(--muted);
+  font-size: 11px;
+  margin-right: 2px;
+}
+.env-task-child {
+  border-left: 2px solid var(--border);
+  padding-left: 6px;
+}
 
 .env-task-filter.active {
   background: var(--accent);

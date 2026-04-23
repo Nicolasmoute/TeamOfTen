@@ -1753,9 +1753,35 @@ function EnvTasksSection({ tasks, onCreate }) {
   const statusOrder = { open: 0, claimed: 1, in_progress: 2, blocked: 3, done: 4, cancelled: 5 };
   const filter = TASK_STATUS_FILTERS.find((f) => f.key === filterKey) || TASK_STATUS_FILTERS[0];
   const filtered = tasks.filter((t) => filter.match(t.status));
-  const sorted = [...filtered].sort(
-    (a, b) => (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9)
-  );
+
+  // Hierarchical layout: render roots first, then their children
+  // indented below each. "Root" = no parent, or parent not in the
+  // filtered set (so a filter hiding a parent still surfaces the
+  // children as roots instead of making them disappear).
+  const filteredIds = new Set(filtered.map((t) => t.id));
+  const childrenOf = new Map();
+  for (const t of filtered) {
+    if (t.parent_id && filteredIds.has(t.parent_id)) {
+      const arr = childrenOf.get(t.parent_id) || [];
+      arr.push(t);
+      childrenOf.set(t.parent_id, arr);
+    }
+  }
+  const cmp = (a, b) => (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9);
+  const roots = filtered
+    .filter((t) => !t.parent_id || !filteredIds.has(t.parent_id))
+    .sort(cmp);
+  for (const arr of childrenOf.values()) arr.sort(cmp);
+
+  // Flatten tree with depth info for render.
+  const flatWithDepth = [];
+  const walk = (task, depth) => {
+    flatWithDepth.push({ task, depth });
+    const kids = childrenOf.get(task.id) || [];
+    for (const k of kids) walk(k, depth + 1);
+  };
+  for (const r of roots) walk(r, 0);
+  const sorted = flatWithDepth;
 
   return html`
     <section class="env-section">
@@ -1777,11 +1803,16 @@ function EnvTasksSection({ tasks, onCreate }) {
               ${tasks.length === 0 ? "(no tasks yet)" : `(no ${filter.label} tasks)`}
             </div>`
           : sorted.map(
-              (t) => {
+              ({ task: t, depth }) => {
                 const active = t.status !== "done" && t.status !== "cancelled";
                 return html`
-                  <div class=${"env-task status-" + t.status} key=${t.id}>
+                  <div
+                    class=${"env-task status-" + t.status + (depth > 0 ? " env-task-child" : "")}
+                    style=${depth > 0 ? `margin-left: ${depth * 14}px` : ""}
+                    key=${t.id}
+                  >
                     <div class="env-task-head">
+                      ${depth > 0 ? html`<span class="env-task-branch">↳</span>` : null}
                       <span class="env-task-status">${t.status}</span>
                       <span class="env-task-id">${t.id}</span>
                       ${active
@@ -1797,7 +1828,7 @@ function EnvTasksSection({ tasks, onCreate }) {
                     </div>
                     <div class="env-task-title">${t.title}</div>
                     <div class="env-task-meta">
-                      by ${t.created_by} · owner ${t.owner || "-"} · pri ${t.priority}${t.parent_id ? " · ↳" + t.parent_id : ""}
+                      by ${t.created_by} · owner ${t.owner || "-"} · pri ${t.priority}
                     </div>
                   </div>
                 `;
