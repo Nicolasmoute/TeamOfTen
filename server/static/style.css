@@ -67,20 +67,35 @@ body {
   animation: none;
   box-shadow: none;
 }
+/* ---- Slot button design system ----
+   Every slot uses the same shape language: full-color text, full-color
+   1px border, translucent fill in that same color. Only the hue changes
+   per state. No style mixes solid/transparent fills — pick a role color
+   and apply it consistently across text + border + tinted bg.
+
+     gray    = inactive (no pane open, not running)
+     blue    = active & waiting (pane open, idle)
+     amber   = working (turn in flight, pulses)
+     red     = error (last turn failed)
+     green   = Coach (the Captain — always on, overrides gray/blue)
+*/
 .slot {
+  --slot-color: var(--muted);               /* gray by default */
+  --slot-fill: rgba(139, 148, 158, 0.12);   /* muted @ 12% */
   width: 32px;
   height: 32px;
   border-radius: 6px;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--muted);
+  border: 1px solid var(--slot-color);
+  background: var(--slot-fill);
+  color: var(--slot-color);
   font: inherit;
   font-weight: 600;
   cursor: pointer;
   padding: 0;
-  transition: background 80ms, color 80ms, border-color 80ms;
+  transition: color 80ms, border-color 80ms, background 80ms, box-shadow 80ms;
   position: relative;
 }
+.slot:hover { filter: brightness(1.3); }
 .slot .slot-unread {
   position: absolute;
   top: 2px;
@@ -92,60 +107,47 @@ body {
   box-shadow: 0 0 4px var(--accent);
   pointer-events: none;
 }
-.slot:hover { background: var(--card); color: var(--fg); }
 
-/* Open (non-Coach) — a selected, idle player pane. Subtle card bg,
-   accent border to read as "picked". */
-.slot.open { background: var(--card); color: var(--fg); border-color: var(--accent); }
+/* BLUE — pane is open and waiting. */
+.slot.open {
+  --slot-color: var(--accent);              /* #58a6ff */
+  --slot-fill: rgba(88, 166, 255, 0.14);
+}
 
-/* A Player actively running a turn — glowing amber so it's the single
-   thing your eye catches scanning the rail. */
+/* AMBER — agent is running a turn. Pulses so it reads as "live". */
 .slot.working {
-  background: var(--warn);
-  color: var(--bg);
-  border-color: var(--warn);
-  box-shadow: 0 0 10px rgba(210, 153, 34, 0.75);
+  --slot-color: var(--warn);                /* #d29922 */
+  --slot-fill: rgba(210, 153, 34, 0.18);
   animation: slot-working-pulse 1.8s ease-in-out infinite;
 }
 @keyframes slot-working-pulse {
-  0%, 100% { box-shadow: 0 0 8px rgba(210, 153, 34, 0.55); }
-  50%      { box-shadow: 0 0 14px rgba(210, 153, 34, 0.95); }
+  0%, 100% { box-shadow: 0 0 6px rgba(210, 153, 34, 0.4); }
+  50%      { box-shadow: 0 0 14px rgba(210, 153, 34, 0.85); }
 }
 
-/* Error means the last turn failed. Red as a quiet outline only — no
-   solid red button screaming for every transient blip. Hover reveals
-   the detail via title=. */
+/* RED — last turn errored. Same visual language, just red. */
 .slot.error {
-  background: transparent;
-  color: var(--err);
-  border-color: var(--err);
+  --slot-color: var(--err);                 /* #f85149 */
+  --slot-fill: rgba(248, 81, 73, 0.14);
 }
 
-/* Coach is the Captain — always present, always glowing green. Declared
-   LAST so its look beats .slot.open's accent/card styles (equal-specificity
-   rules — later wins). When Coach is actively running a turn the amber
-   .slot.working rule takes over (also equal specificity, declared later
-   than .slot.coach only on the .working branch — see the .slot.coach.working
-   override below). */
+/* GREEN — Coach. Declared last so it beats .slot.open (equal specificity
+   → later wins). When Coach is running, amber still wins via the more-
+   specific .slot.coach.working rule below. */
 .slot.coach {
-  color: var(--bg);
-  background: var(--ok);
-  border-color: var(--ok);
-  box-shadow: 0 0 8px rgba(63, 185, 80, 0.55);
+  --slot-color: var(--ok);                  /* #3fb950 */
+  --slot-fill: rgba(63, 185, 80, 0.15);
 }
-/* Coach-and-working: glow-pulse amber like any working slot. */
+/* Coach + working: amber wins. */
 .slot.coach.working {
-  background: var(--warn);
-  border-color: var(--warn);
-  box-shadow: 0 0 10px rgba(210, 153, 34, 0.75);
+  --slot-color: var(--warn);
+  --slot-fill: rgba(210, 153, 34, 0.18);
 }
-/* Coach-and-error: keep green dominance but hint at the error with a
-   red inner ring. Coach is "always on" — we don't flip it to red. */
+/* Coach + error: green frame with a thin red hint ring. Coach stays "on". */
 .slot.coach.error {
-  background: var(--ok);
-  border-color: var(--ok);
-  box-shadow: 0 0 8px rgba(63, 185, 80, 0.55), inset 0 0 0 2px var(--err);
-  color: var(--bg);
+  --slot-color: var(--ok);
+  --slot-fill: rgba(63, 185, 80, 0.15);
+  box-shadow: inset 0 0 0 2px var(--err);
 }
 .gear {
   width: 32px;
