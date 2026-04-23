@@ -99,12 +99,37 @@ deployed Zeabur instance — see "What needs verification" below.
 - **Pane settings popover** ✓ per-pane model / plan-mode / effort
    controls with localStorage persistence; wired through to
    `ClaudeAgentOptions` server-side.
+- **Drag-to-move panes** ✓ grab a pane's label area, drop on another
+   pane to insert before it, on a column's bottom strip to append, or
+   on the right rail to open a new column. Custom MIME type so we
+   don't collide with image paste.
+- **Split.js size persistence** ✓ user-dragged column widths / stack
+   heights survive add/remove/move, keyed by layout signature in
+   localStorage (harness_split_sizes_v1).
+- **Pane export** ✓ ↓ button in header downloads conversation as
+   markdown (one ## per event, paired tool_use/tool_result inline).
+- **Team composition** ✓ `coord_set_player_role(player_id, name, role)`
+   (Coach-only) writes agents.name/role; `player_assigned` event
+   refreshes UI live.
+- **Memory / Inbox / Decisions UI** ✓ EnvPane sections with
+   click-to-expand read + live WS refresh. Inbox has a human→agent
+   composer (POST /api/messages with from_id='human').
+- **Current task chip** ✓ pane header shows the agent's
+   current_task_id title (⚑) when it's working on one.
+- **LeftRail unread dot** ✓ accent-colored dot appears on a slot
+   button when events arrived while its pane was closed; clears on
+   open / close.
+- **Keyboard shortcut** ✓ ⌘/Ctrl+B toggles the EnvPane.
 
 **Next likely:**
-- **Drag-to-move panes** between columns (currently shift-click is the
-   only way to re-arrange — drag-and-drop is the "real" fix).
-- **Mobile UI polish.**
-- **Conversation export** (per-pane or whole-team to a markdown file).
+- **Mobile UI polish** — touch-drag doesn't work with HTML5 DnD;
+   layout breakpoints for < 900px need a rethink.
+- **Pane collapse / minimize** — currently panes are all-or-nothing
+   open. A "minimize to header" state would help watching many stacks.
+- **Whole-team conversation export** — combine all open panes into
+   one markdown file with agent-prefixed headings.
+- **Test suite** — no pytest yet; the coord tools are small enough to
+   cover quickly.
 
 ## What needs verification (when user is next active)
 
