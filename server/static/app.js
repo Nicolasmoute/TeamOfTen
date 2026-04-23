@@ -549,6 +549,9 @@ function App() {
   // AssistantMessage that follows. Surfaces as a live-typing bubble at
   // the end of each pane timeline. Not persisted (ephemeral by design).
   const [streamingText, setStreamingText] = useState(new Map());
+  // Bumped every time a file-system-changing event lands on the WS.
+  // FilesPane watches this to reload the tree without manual refresh.
+  const [fsEpoch, setFsEpoch] = useState(0);
   // Per-slot latest ts the user has "acknowledged" by opening that
   // pane. Slots currently in openColumns are always considered seen.
   // Lives in React state only (session-scoped) — a page reload
@@ -831,6 +834,20 @@ function App() {
       ) {
         loadTasks();
         loadAgents();
+      }
+      // Filesystem-changing events — bump fsEpoch so FilesPane reloads
+      // its tree. Covers agents writing via coord_write_* MCP tools,
+      // humans writing via the files pane editor, context edits, and
+      // decision records. Cheap (one integer tick) so no harm if
+      // nobody's watching.
+      if (
+        ev.type === "file_written" ||
+        ev.type === "knowledge_written" ||
+        ev.type === "context_updated" ||
+        ev.type === "context_deleted" ||
+        ev.type === "decision_written"
+      ) {
+        setFsEpoch((n) => n + 1);
       }
     };
     return () => {
@@ -1193,6 +1210,7 @@ function App() {
                           key=${slot}
                           slot=${slot}
                           authedFetch=${authedFetch}
+                          fsEpoch=${fsEpoch}
                           onClose=${() => closePane(slot)}
                           onDropEdge=${dropOnPaneEdge}
                           onPopOut=${moveToNewColumn}
@@ -2728,7 +2746,7 @@ function EnvTimelineItem({ event }) {
 // the normal drag/resize/stack affordances like an agent pane.
 // ------------------------------------------------------------------
 
-function FilesPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, stacked }) {
+function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, stacked }) {
   const [roots, setRoots] = useState([]);
   const [activeRoot, setActiveRoot] = useState(null);
   const [tree, setTree] = useState(null);
@@ -2800,6 +2818,16 @@ function FilesPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, stacked }
 
   useEffect(() => { loadRoots(); }, [loadRoots]);
   useEffect(() => { if (activeRoot) loadTree(activeRoot); }, [activeRoot, loadTree]);
+  // Live-refresh: when a file-system-changing event lands on the WS,
+  // App bumps fsEpoch. Reload the tree so agent-written files appear
+  // without a manual root-click. Skip reload while the user is mid-
+  // edit (dirty draft) to avoid surprising them if they've been
+  // typing; they'll see the new files on their next save / root-click.
+  useEffect(() => {
+    if (fsEpoch == null || !activeRoot) return;
+    if (content !== null && draft !== content) return; // dirty, don't yank
+    loadTree(activeRoot);
+  }, [fsEpoch]);
 
   const activeRootMeta = roots.find((r) => r.key === activeRoot);
 
