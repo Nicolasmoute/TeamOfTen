@@ -463,6 +463,28 @@ async def _get_agent_brief(agent_id: str) -> str | None:
     return v if v else None
 
 
+async def _locked_players() -> list[str]:
+    """Return sorted list of Player slot ids that have locked=1.
+
+    Used to inject a Coach-side hint into the system prompt so Coach
+    plans around the constraint instead of burning turns hitting the
+    tool-layer rejection. Swallows DB errors (returns empty) — the
+    tool-layer enforcement is authoritative; this is just guidance.
+    """
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id FROM agents WHERE kind = 'player' AND locked = 1 ORDER BY id"
+            )
+            rows = await cur.fetchall()
+        finally:
+            await c.close()
+    except Exception:
+        return []
+    return [dict(r)["id"] for r in rows]
+
+
 async def _get_agent_extra_tools(agent_id: str) -> list[str]:
     """Read agent.allowed_extra_tools — opt-in extra SDK tool names the
     human granted this slot beyond the role baseline. Merged into the
@@ -833,7 +855,25 @@ async def run_agent(
             "\n\n## Agent brief (specific to you, set by the human)\n\n"
             + brief_text.strip()
         )
-    system_prompt = _system_prompt_for(agent_id) + context_suffix + brief_suffix
+    # Lock-state suffix — Coach-only. Tells Coach up-front which
+    # Players are off-limits so they plan around the constraint
+    # instead of wasting turns hitting the tool-layer rejection.
+    # Only injected when at least one Player is locked; a fully-
+    # unlocked team gets no extra text.
+    lock_suffix = ""
+    if agent_id == "coach":
+        locked_list = await _locked_players()
+        if locked_list:
+            lock_suffix = (
+                "\n\n## Roster availability (right now)\n\n"
+                "The human has LOCKED the following Player(s): "
+                + ", ".join(locked_list)
+                + ". Do NOT assign tasks to them, do NOT direct-message "
+                "them, and remember broadcasts also skip them. Work "
+                "around this constraint — pick other Players or tell "
+                "the human if no suitable unlocked Player remains."
+            )
+    system_prompt = _system_prompt_for(agent_id) + context_suffix + brief_suffix + lock_suffix
     if context_suffix or brief_suffix:
         # Emit sizes (not content) so the user can see "yes my stuff was
         # picked up" without drowning the timeline in prompt text.

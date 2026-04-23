@@ -1221,7 +1221,7 @@ def build_coord_server(caller_id: str) -> Any:
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT id, kind, name, role, brief, status, current_task_id "
+                "SELECT id, kind, name, role, brief, status, current_task_id, locked "
                 "FROM agents ORDER BY "
                 "CASE kind WHEN 'coach' THEN 0 ELSE 1 END, id"
             )
@@ -1241,6 +1241,12 @@ def build_coord_server(caller_id: str) -> Any:
             bits.append(f"· {d['status']}")
             if d.get("current_task_id"):
                 bits.append(f"· on {d['current_task_id']}")
+            # LOCKED marker: render loudly so the model skims it. The
+            # enforcement is also at the tool layer, but telling Coach
+            # up-front saves wasted turns trying to assign to a locked
+            # slot.
+            if d.get("locked"):
+                bits.append("· 🔒 LOCKED (off-limits for Coach)")
             header = " ".join(bits)
             if d.get("brief"):
                 # Keep it terse in the listing — full brief is retrievable
