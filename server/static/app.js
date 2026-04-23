@@ -475,6 +475,29 @@ function App() {
     });
   }, []);
 
+  // DnD drop on the "end of column" strip — append to that column.
+  const moveToColEnd = useCallback((slot, colIdx) => {
+    setOpenColumns((prev) => {
+      const without = prev
+        .map((col) => col.filter((s) => s !== slot))
+        .filter((col) => col.length > 0);
+      if (colIdx >= without.length) return [...without, [slot]];
+      return without.map((col, i) =>
+        i === colIdx ? [...col, slot] : col
+      );
+    });
+  }, []);
+
+  // DnD drop on the "new column" rail — append as a fresh column.
+  const moveToNewColumn = useCallback((slot) => {
+    setOpenColumns((prev) => {
+      const without = prev
+        .map((col) => col.filter((s) => s !== slot))
+        .filter((col) => col.length > 0);
+      return [...without, [slot]];
+    });
+  }, []);
+
   // Split.js: horizontal split across columns, vertical split inside each
   // multi-pane column. Rebind whenever the layout structure changes.
   // A stable structure signature lets us skip reinit on no-op renders.
@@ -542,28 +565,40 @@ function App() {
       <main class="panes">
         ${openColumns.length === 0
           ? html`<div class="empty">Pick a slot on the left to open a pane.</div>`
-          : openColumns.map(
-              (col, colIdx) =>
-                html`<div
-                  class=${"pane-col" + (col.length > 1 ? " stacked" : "")}
-                  id=${"col-" + colIdx}
-                  key=${"col-" + col.join("-")}
-                >
-                  ${col.map(
-                    (slot) =>
-                      html`<${AgentPane}
-                        key=${slot}
-                        slot=${slot}
-                        agent=${agents.find((a) => a.id === slot)}
-                        liveEvents=${conversations.get(slot) || []}
-                        openSlots=${openSlots}
-                        onClose=${() => closePane(slot)}
-                        onStackBelow=${(otherSlot) => stackBelow(otherSlot, slot)}
-                        onMoveBefore=${(otherSlot) => movePaneBefore(otherSlot, slot)}
-                      />`
-                  )}
-                </div>`
-            )}
+          : html`
+              ${openColumns.map(
+                (col, colIdx) =>
+                  html`<div
+                    class=${"pane-col" + (col.length > 1 ? " stacked" : "")}
+                    id=${"col-" + colIdx}
+                    key=${"col-" + col.join("-")}
+                  >
+                    ${col.map(
+                      (slot) =>
+                        html`<${AgentPane}
+                          key=${slot}
+                          slot=${slot}
+                          agent=${agents.find((a) => a.id === slot)}
+                          liveEvents=${conversations.get(slot) || []}
+                          openSlots=${openSlots}
+                          onClose=${() => closePane(slot)}
+                          onStackBelow=${(otherSlot) => stackBelow(otherSlot, slot)}
+                          onMoveBefore=${(otherSlot) => movePaneBefore(otherSlot, slot)}
+                        />`
+                    )}
+                    <${DropZone}
+                      orientation="horizontal"
+                      label="drop to append"
+                      onDrop=${(slot) => moveToColEnd(slot, colIdx)}
+                    />
+                  </div>`
+              )}
+              <${DropZone}
+                orientation="vertical"
+                label="new column"
+                onDrop=${moveToNewColumn}
+              />
+            `}
       </main>
       ${envOpen
         ? html`<${EnvPane}
@@ -589,6 +624,42 @@ function App() {
             }}
           />`
         : null}
+    </div>
+  `;
+}
+
+// A thin strip that only highlights when a pane is being dragged.
+// Used for "append to column end" and "create new column" targets.
+function DropZone({ orientation, label, onDrop }) {
+  const [active, setActive] = useState(false);
+  const onDragOver = useCallback((e) => {
+    const types = Array.from(e.dataTransfer.types || []);
+    if (!types.includes("application/x-harness-slot")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    setActive(true);
+  }, []);
+  const onDragLeave = useCallback((e) => {
+    const next = e.relatedTarget;
+    if (next && e.currentTarget.contains(next)) return;
+    setActive(false);
+  }, []);
+  const handleDrop = useCallback((e) => {
+    setActive(false);
+    const dragged = e.dataTransfer.getData("application/x-harness-slot");
+    if (!dragged) return;
+    e.preventDefault();
+    onDrop(dragged);
+  }, [onDrop]);
+  return html`
+    <div
+      class=${"drop-zone drop-zone-" + orientation + (active ? " active" : "")}
+      onDragOver=${onDragOver}
+      onDragLeave=${onDragLeave}
+      onDrop=${handleDrop}
+      title=${label}
+    >
+      ${active ? html`<span class="drop-zone-label">${label}</span>` : null}
     </div>
   `;
 }

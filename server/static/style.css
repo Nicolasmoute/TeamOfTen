@@ -533,6 +533,38 @@ body {
   pointer-events: none;
   z-index: 15;
 }
+
+/* Drop zones: invisible strips that highlight while a pane is being
+   dragged. Horizontal strips sit at the bottom of each column and
+   append to that column on drop; the vertical strip sits at the far
+   right of .panes and opens a brand new column. */
+.drop-zone {
+  transition: background 80ms;
+}
+.drop-zone-horizontal {
+  flex: 0 0 12px;
+  min-height: 12px;
+  width: 100%;
+}
+.drop-zone-vertical {
+  flex: 0 0 14px;
+  align-self: stretch;
+}
+.drop-zone.active {
+  background: rgba(99, 179, 237, 0.2); /* accent-ish */
+  box-shadow: inset 0 0 0 2px var(--accent);
+  position: relative;
+}
+.drop-zone-label {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: var(--accent);
+  font-size: 10px;
+  white-space: nowrap;
+  pointer-events: none;
+}
 .pane-drag-handle {
   display: flex;
   align-items: center;
