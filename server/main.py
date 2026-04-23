@@ -929,7 +929,21 @@ async def ws_endpoint(ws: WebSocket, token: str | None = Query(default=None)) ->
             }
         )
         while True:
-            event = await q.get()
+            # Heartbeat: if nothing to send for WS_PING_INTERVAL
+            # seconds, send a ping so the client can detect zombie
+            # connections where TCP reports alive but no traffic flows
+            # (common with some intermediate proxies).
+            try:
+                event = await asyncio.wait_for(q.get(), timeout=30.0)
+            except asyncio.TimeoutError:
+                await ws.send_json(
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "agent_id": "system",
+                        "type": "ping",
+                    }
+                )
+                continue
             await ws.send_json(event)
     except WebSocketDisconnect:
         pass

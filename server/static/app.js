@@ -574,7 +574,17 @@ function App() {
       (tok ? "?token=" + encodeURIComponent(tok) : "");
     const ws = new WebSocket(wsUrl);
     let reopenTimer = null;
+    // Zombie-connection watchdog: server sends a 'ping' every 30s of
+    // quiet, so 60s without any message means the connection is
+    // effectively dead. Force-close triggers onclose → reconnect.
+    let lastMessageAt = Date.now();
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastMessageAt > 60_000) {
+        try { ws.close(); } catch (_) { /* ignore */ }
+      }
+    }, 15_000);
     ws.onopen = () => {
+      lastMessageAt = Date.now();
       setWsConnected(true);
       // On (re)connect we may have missed events while offline; refresh
       // the stateful bits so the UI catches up.
@@ -591,8 +601,12 @@ function App() {
       try { ws.close(); } catch (_) { /* ignore */ }
     };
     ws.onmessage = (e) => {
+      lastMessageAt = Date.now();
       let ev;
       try { ev = JSON.parse(e.data); } catch (_) { return; }
+      // Heartbeat ping is an implementation detail — don't surface it
+      // in conversations or refresh any state based on it.
+      if (ev.type === "ping") return;
       const aid = ev.agent_id || "system";
       setConversations((prev) => {
         const next = new Map(prev);
@@ -630,6 +644,7 @@ function App() {
     };
     return () => {
       if (reopenTimer) clearTimeout(reopenTimer);
+      clearInterval(watchdog);
       try { ws.close(); } catch (_) { /* ignore */ }
     };
   }, [loadAgents, loadTasks, loadStatus, wsAttempt]);
