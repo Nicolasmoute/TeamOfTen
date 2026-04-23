@@ -522,6 +522,30 @@ body {
   flex: 1 1 0;
   min-width: 0;
   min-height: 0;
+  position: relative;
+}
+.pane.drag-over::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 2px dashed var(--accent);
+  border-radius: 4px;
+  pointer-events: none;
+  z-index: 15;
+}
+.pane-drag-handle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  cursor: grab;
+  /* Tell the browser to use this element's bounds for the drag image,
+     not just the text. */
+  user-select: none;
+}
+.pane-drag-handle:active {
+  cursor: grabbing;
 }
 
 /* ---- Split.js gutter between resizable panes ---- */

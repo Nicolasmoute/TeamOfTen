@@ -455,6 +455,26 @@ function App() {
     });
   }, []);
 
+  // Drag-to-move: insert `slot` into the same column as `anchorSlot`,
+  // immediately BEFORE the anchor. Used by HTML5 DnD from one pane's
+  // header onto another pane's body. Handles both within-column
+  // reorder and cross-column moves, including empty-column cleanup.
+  const movePaneBefore = useCallback((slot, anchorSlot) => {
+    if (slot === anchorSlot) return;
+    setOpenColumns((prev) => {
+      const without = prev
+        .map((col) => col.filter((s) => s !== slot))
+        .filter((col) => col.length > 0);
+      const targetCol = without.findIndex((col) => col.includes(anchorSlot));
+      if (targetCol < 0) return [...without, [slot]];
+      return without.map((col, i) => {
+        if (i !== targetCol) return col;
+        const at = col.indexOf(anchorSlot);
+        return [...col.slice(0, at), slot, ...col.slice(at)];
+      });
+    });
+  }, []);
+
   // Split.js: horizontal split across columns, vertical split inside each
   // multi-pane column. Rebind whenever the layout structure changes.
   // A stable structure signature lets us skip reinit on no-op renders.
@@ -539,6 +559,7 @@ function App() {
                         openSlots=${openSlots}
                         onClose=${() => closePane(slot)}
                         onStackBelow=${(otherSlot) => stackBelow(otherSlot, slot)}
+                        onMoveBefore=${(otherSlot) => movePaneBefore(otherSlot, slot)}
                       />`
                   )}
                 </div>`
@@ -1356,7 +1377,7 @@ function EnvTimelineItem({ event }) {
 // agent pane
 // ------------------------------------------------------------------
 
-function AgentPane({ slot, agent, liveEvents, onClose }) {
+function AgentPane({ slot, agent, liveEvents, onClose, onMoveBefore }) {
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState([]); // {id, url, path, filename}
   const [submitting, setSubmitting] = useState(false);
@@ -1364,7 +1385,31 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
   const [historyLoaded, setHistoryLoaded] = useState(false);
   const [paneSettings, setPaneSettings] = useState(() => loadPaneSettings(slot));
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
   const bodyRef = useRef(null);
+
+  // HTML5 DnD: the pane header is the drag source; the whole pane is
+  // the drop target (drop inserts the dragged slot BEFORE this pane
+  // in its column). The payload is carried via a custom MIME so we
+  // don't confuse other drag sources (e.g. image paste).
+  const onDragStart = useCallback((e) => {
+    e.dataTransfer.setData("application/x-harness-slot", slot);
+    e.dataTransfer.effectAllowed = "move";
+  }, [slot]);
+  const onDragOver = useCallback((e) => {
+    if (!e.dataTransfer.types.includes("application/x-harness-slot")) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    setDragOver(true);
+  }, []);
+  const onDragLeave = useCallback(() => setDragOver(false), []);
+  const onDrop = useCallback((e) => {
+    setDragOver(false);
+    const dragged = e.dataTransfer.getData("application/x-harness-slot");
+    if (!dragged || dragged === slot) return;
+    e.preventDefault();
+    if (onMoveBefore) onMoveBefore(dragged);
+  }, [slot, onMoveBefore]);
 
   // Persist whenever settings change (but not on mount — lazy init
   // already picked up the stored value).
@@ -1547,12 +1592,25 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
   const cost = Number(agent?.cost_estimate_usd || 0);
 
   return html`
-    <section class="pane" id=${"pane-" + slot}>
+    <section
+      class=${"pane" + (dragOver ? " drag-over" : "")}
+      id=${"pane-" + slot}
+      onDragOver=${onDragOver}
+      onDragLeave=${onDragLeave}
+      onDrop=${onDrop}
+    >
       <header class="pane-head">
-        <span class=${"pane-dot " + status} title=${status}></span>
-        <span class="pane-id">${slot}</span>
-        <span class="pane-name">${displayName}</span>
-        ${agent?.role ? html`<span class="pane-role">— ${agent.role}</span>` : html`<span class="pane-role"></span>`}
+        <span
+          class="pane-drag-handle"
+          draggable=${true}
+          onDragStart=${onDragStart}
+          title="Drag to reorder — drop on another pane to move before it"
+        >
+          <span class=${"pane-dot " + status} title=${status}></span>
+          <span class="pane-id">${slot}</span>
+          <span class="pane-name">${displayName}</span>
+          ${agent?.role ? html`<span class="pane-role">— ${agent.role}</span>` : html`<span class="pane-role"></span>`}
+        </span>
         ${agent?.session_id
           ? html`<span class="pane-session" title=${"session " + agent.session_id}>●</span>
               <button
