@@ -74,12 +74,73 @@ def _stringify_tool_result(content: Any) -> str:
     return str(content)[:_TOOL_RESULT_CAP]
 
 
-async def _handle_message(agent_id: str, msg: Any) -> None:
+async def _insert_turn_row(
+    *,
+    agent_id: str,
+    started_at: str,
+    ended_at: str,
+    duration_ms: int | None,
+    cost_usd: float | None,
+    session_id: str | None,
+    num_turns: int | None,
+    stop_reason: str | None,
+    is_error: bool,
+    model: str | None,
+    plan_mode: bool,
+    effort: int | None,
+) -> None:
+    """Insert one row into the `turns` ledger — cheap analytics table
+    (one row per SDK ResultMessage). Errors are swallowed: losing a
+    ledger row should never break the live turn, the event log is
+    still the source of truth for audit."""
+    if agent_id == "system":
+        return
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "INSERT INTO turns ("
+                "agent_id, started_at, ended_at, duration_ms, cost_usd, "
+                "session_id, num_turns, stop_reason, is_error, "
+                "model, plan_mode, effort"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    agent_id,
+                    started_at,
+                    ended_at,
+                    duration_ms,
+                    cost_usd,
+                    session_id,
+                    num_turns,
+                    stop_reason,
+                    1 if is_error else 0,
+                    model,
+                    1 if plan_mode else 0,
+                    effort,
+                ),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("insert_turn_row failed: agent=%s", agent_id)
+
+
+async def _handle_message(
+    agent_id: str,
+    msg: Any,
+    turn_ctx: dict[str, Any] | None = None,
+) -> None:
     """Turn one SDK message into one or more bus events.
 
     Extracted from run_agent so the stale-session retry path can
     reuse it without duplicating the dispatch chain. Unknown message
     types are silently skipped — future SDK additions won't break us.
+
+    When a ResultMessage arrives AND turn_ctx is passed, also appends
+    a row to the `turns` analytics ledger. turn_ctx carries the
+    per-turn inputs that aren't on the ResultMessage itself (model
+    override, plan_mode flag, effort level, started_at stamp).
     """
     if isinstance(msg, AssistantMessage):
         for block in msg.content:
@@ -135,15 +196,33 @@ async def _handle_message(agent_id: str, msg: Any) -> None:
     elif isinstance(msg, ResultMessage):
         cost = getattr(msg, "total_cost_usd", None)
         session_id = getattr(msg, "session_id", None)
+        duration_ms = getattr(msg, "duration_ms", None)
+        num_turns = getattr(msg, "num_turns", None)
+        stop_reason = getattr(msg, "stop_reason", None)
         await _emit(
             agent_id, "result",
-            duration_ms=getattr(msg, "duration_ms", None),
+            duration_ms=duration_ms,
             cost_usd=cost,
             is_error=msg.is_error,
             session_id=session_id,
         )
         await _add_cost(agent_id, cost)
         await _set_session_id(agent_id, session_id)
+        if turn_ctx is not None:
+            await _insert_turn_row(
+                agent_id=agent_id,
+                started_at=turn_ctx.get("started_at") or _now(),
+                ended_at=_now(),
+                duration_ms=duration_ms,
+                cost_usd=cost,
+                session_id=session_id,
+                num_turns=num_turns,
+                stop_reason=str(stop_reason) if stop_reason is not None else None,
+                is_error=bool(msg.is_error),
+                model=turn_ctx.get("model"),
+                plan_mode=bool(turn_ctx.get("plan_mode")),
+                effort=turn_ctx.get("effort"),
+            )
 
 
 async def _set_status(agent_id: str, status: str) -> None:
@@ -695,11 +774,21 @@ async def run_agent(
     if this_task is not None:
         _running_tasks[agent_id] = this_task
 
+    # Per-turn context the ResultMessage handler needs to append a row
+    # to the turns ledger. started_at is stamped fresh on each _iterate
+    # call so a stale-session retry doesn't reuse the first try's clock.
+    turn_ctx: dict[str, Any] = {
+        "model": model,
+        "plan_mode": plan_mode,
+        "effort": effort,
+    }
+
     async def _iterate(opts: ClaudeAgentOptions) -> None:
         # Tiny indirection so we can retry the whole iteration once
         # after stale-session cleanup without duplicating the body.
+        turn_ctx["started_at"] = _now()
         async for msg in query(prompt=prompt, options=opts):
-            await _handle_message(agent_id, msg)
+            await _handle_message(agent_id, msg, turn_ctx)
 
     try:
         try:

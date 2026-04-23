@@ -113,6 +113,30 @@ CREATE TABLE IF NOT EXISTS memory_docs (
     last_updated_by  TEXT NOT NULL,
     version          INTEGER NOT NULL DEFAULT 1
 );
+
+-- Per-turn analytics ledger. One row per SDK ResultMessage — cheap
+-- indexed queries for 'how much did p3 spend this week'. Parallel to
+-- the events table but narrower: just the numbers, no free text. The
+-- events table still has the full turn trail for audit; this is for
+-- charts.
+CREATE TABLE IF NOT EXISTS turns (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id       TEXT NOT NULL,
+    started_at     TEXT NOT NULL,
+    ended_at       TEXT NOT NULL,
+    duration_ms    INTEGER,
+    cost_usd       REAL,
+    session_id     TEXT,
+    num_turns      INTEGER,     -- SDK's own internal turn counter (tool roundtrips)
+    stop_reason    TEXT,
+    is_error       INTEGER NOT NULL DEFAULT 0,
+    model          TEXT,
+    plan_mode      INTEGER NOT NULL DEFAULT 0,
+    effort         INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_turns_agent      ON turns(agent_id, id);
+CREATE INDEX IF NOT EXISTS idx_turns_ended_at   ON turns(ended_at);
 """
 
 # Seed agents — idempotent via INSERT OR IGNORE.

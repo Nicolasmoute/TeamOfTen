@@ -1120,6 +1120,40 @@ async def files_write(
     return {"ok": True, **result}
 
 
+@app.get("/api/turns", dependencies=[Depends(require_token)])
+async def list_turns(
+    agent: str | None = None,
+    limit: int = 100,
+    since_id: int = 0,
+) -> dict[str, Any]:
+    """Per-turn ledger — one row per SDK result.
+
+    Narrow by agent id; paginate with since_id. Returns newest first
+    (most-recent-first makes 'how expensive was the last hour' queries
+    a simple LIMIT without ordering server-side).
+    """
+    limit = max(1, min(limit, 1000))
+    where: list[str] = ["id > ?"]
+    params: list[Any] = [since_id]
+    if agent:
+        where.append("agent_id = ?")
+        params.append(agent)
+    where_sql = " WHERE " + " AND ".join(where)
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT id, agent_id, started_at, ended_at, duration_ms, "
+            "cost_usd, session_id, num_turns, stop_reason, is_error, "
+            "model, plan_mode, effort "
+            f"FROM turns{where_sql} ORDER BY id DESC LIMIT ?",
+            params + [limit],
+        )
+        rows = await cur.fetchall()
+    finally:
+        await c.close()
+    return {"turns": [dict(r) for r in rows]}
+
+
 @app.get("/api/events", dependencies=[Depends(require_token)])
 async def list_events(
     agent: str | None = None,
