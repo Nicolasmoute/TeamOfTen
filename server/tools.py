@@ -1152,6 +1152,54 @@ def build_coord_server(caller_id: str) -> Any:
         )
 
     @tool(
+        "coord_list_team",
+        (
+            "Read the current team roster: slot id, name, role, brief, "
+            "status, and currently-claimed task (if any) for every agent "
+            "on the team (Coach + p1..p10).\n"
+            "\n"
+            "Useful at the start of a fresh turn to remember who's on "
+            "the team, what they're working on, and what their domain "
+            "is — agents don't carry cross-turn memory of this without "
+            "reading it. No params."
+        ),
+        {},
+    )
+    async def list_team(args: dict[str, Any]) -> dict[str, Any]:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id, kind, name, role, brief, status, current_task_id "
+                "FROM agents ORDER BY "
+                "CASE kind WHEN 'coach' THEN 0 ELSE 1 END, id"
+            )
+            rows = await cur.fetchall()
+        finally:
+            await c.close()
+        if not rows:
+            return _ok("(no agents in the roster — init_db never ran)")
+        lines: list[str] = []
+        for r in rows:
+            d = dict(r)
+            bits = [d["id"]]
+            if d.get("name") and d["name"] != d["id"]:
+                bits.append(d["name"])
+            if d.get("role"):
+                bits.append(f"({d['role']})")
+            bits.append(f"· {d['status']}")
+            if d.get("current_task_id"):
+                bits.append(f"· on {d['current_task_id']}")
+            header = " ".join(bits)
+            if d.get("brief"):
+                # Keep it terse in the listing — full brief is retrievable
+                # via /api/agents if needed.
+                preview = str(d["brief"])[:140].replace("\n", " ")
+                lines.append(f"{header}\n    brief: {preview}")
+            else:
+                lines.append(header)
+        return _ok("\n".join(lines))
+
+    @tool(
         "coord_set_player_role",
         (
             "Coach-only. Assign a Player their human-readable name and "
@@ -1274,6 +1322,7 @@ def build_coord_server(caller_id: str) -> Any:
             write_knowledge,
             read_knowledge,
             list_knowledge,
+            list_team,
             set_player_role,
             request_human,
         ],
@@ -1297,6 +1346,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_write_knowledge",
     "mcp__coord__coord_read_knowledge",
     "mcp__coord__coord_list_knowledge",
+    "mcp__coord__coord_list_team",
     "mcp__coord__coord_set_player_role",
     "mcp__coord__coord_request_human",
 ]
