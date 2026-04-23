@@ -146,6 +146,11 @@ else:
 class StartAgentRequest(BaseModel):
     agent_id: str = Field(default="p1", pattern=r"^(coach|p([1-9]|10))$")
     prompt: str = Field(min_length=1, max_length=20_000)
+    # Per-turn overrides set via the pane settings popover. Any omitted
+    # falls back to the SDK / Dockerfile defaults.
+    model: str | None = Field(default=None, max_length=120)
+    plan_mode: bool = False
+    effort: int | None = Field(default=None, ge=1, le=4)
 
 
 class CreateTaskRequest(BaseModel):
@@ -323,7 +328,14 @@ async def list_agents() -> dict[str, list[dict[str, Any]]]:
 async def start_agent(
     req: StartAgentRequest, background: BackgroundTasks
 ) -> dict[str, object]:
-    background.add_task(run_agent, req.agent_id, req.prompt)
+    background.add_task(
+        run_agent,
+        req.agent_id,
+        req.prompt,
+        model=req.model,
+        plan_mode=req.plan_mode,
+        effort=req.effort,
+    )
     return {"ok": True, "agent_id": req.agent_id}
 
 

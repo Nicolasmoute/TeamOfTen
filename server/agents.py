@@ -259,8 +259,26 @@ def _system_prompt_for(agent_id: str) -> str:
     )
 
 
-async def run_agent(agent_id: str, prompt: str) -> None:
-    """Spawn one SDK query for the given slot and stream its events."""
+# UI effort levels (1..4) map directly onto the SDK's Literal values.
+_EFFORT_LEVELS = {1: "low", 2: "medium", 3: "high", 4: "max"}
+
+
+async def run_agent(
+    agent_id: str,
+    prompt: str,
+    *,
+    model: str | None = None,
+    plan_mode: bool = False,
+    effort: int | None = None,
+) -> None:
+    """Spawn one SDK query for the given slot and stream its events.
+
+    Optional per-turn overrides:
+    - model: SDK `model` kwarg (e.g. "claude-opus-4-7"). None = SDK default.
+    - plan_mode: sets permission_mode="plan" so the agent outlines an
+      approach before touching tools.
+    - effort: 1..4 → "low" | "medium" | "high" | "max" thinking budget.
+    """
     # Enforce daily cost caps BEFORE emitting agent_started — if the
     # caller is over budget we want the rejection visible in the
     # timeline and no SDK work done.
@@ -276,13 +294,21 @@ async def run_agent(agent_id: str, prompt: str) -> None:
     coord_server = build_coord_server(agent_id)
     allowed = ALLOWED_COACH_TOOLS if agent_id == "coach" else ALLOWED_PLAYER_TOOLS
 
-    options = ClaudeAgentOptions(
+    options_kwargs: dict[str, Any] = dict(
         system_prompt=_system_prompt_for(agent_id),
         cwd=str(workspace_dir(agent_id)),
         max_turns=10,
         mcp_servers={"coord": coord_server},
         allowed_tools=allowed,
     )
+    if model:
+        options_kwargs["model"] = model
+    if plan_mode:
+        options_kwargs["permission_mode"] = "plan"
+    if effort and effort in _EFFORT_LEVELS:
+        options_kwargs["effort"] = _EFFORT_LEVELS[effort]
+
+    options = ClaudeAgentOptions(**options_kwargs)
 
     try:
         async for msg in query(prompt=prompt, options=options):

@@ -131,8 +131,22 @@ function savePaneSettings(slot, settings) {
 
 function PaneSettingsPopover({ settings, onChange, onClose }) {
   const effort = settings.effort || 0; // 0 = default (server decides)
+  const rootRef = useRef(null);
+  useEffect(() => {
+    const onDocClick = (e) => {
+      if (!rootRef.current) return;
+      if (!rootRef.current.contains(e.target)) onClose();
+    };
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [onClose]);
   return html`
-    <div class="pane-settings-pop" onClick=${(e) => e.stopPropagation()}>
+    <div class="pane-settings-pop" ref=${rootRef} onClick=${(e) => e.stopPropagation()}>
       <div class="pane-settings-row">
         <label class="pane-settings-label">Model</label>
         <select
