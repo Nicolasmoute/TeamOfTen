@@ -123,6 +123,16 @@ async def cancel_agent(agent_id: str) -> bool:
     task.cancel()
     return True
 
+
+async def cancel_all_agents() -> list[str]:
+    """Cancel every in-flight run. Returns the list of agent ids that
+    were actually cancelled (skips already-finished tasks)."""
+    cancelled: list[str] = []
+    for agent_id in list(_running_tasks.keys()):
+        if await cancel_agent(agent_id):
+            cancelled.append(agent_id)
+    return cancelled
+
 # Standard prompt the autonomous loop and POST /api/coach/tick both
 # send to Coach. Kept here so callers stay in sync.
 COACH_TICK_PROMPT = (

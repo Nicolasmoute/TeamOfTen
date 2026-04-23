@@ -786,6 +786,12 @@ function App() {
         onOpenSettings=${() => setSettingsOpen(true)}
         paused=${paused}
         onTogglePause=${togglePause}
+        onCancelAll=${async () => {
+          const working = agents.filter((a) => a.status === "working").length;
+          if (working === 0) return;
+          if (!confirm(`Cancel ${working} running agent${working === 1 ? "" : "s"}?`)) return;
+          await authedFetch("/api/agents/cancel-all", { method: "POST" });
+        }}
       />
       <main class="panes">
         ${openColumns.length === 0
@@ -938,7 +944,8 @@ function TokenGate({ onSubmit }) {
 // left rail
 // ------------------------------------------------------------------
 
-function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, onOpenSettings, paused, onTogglePause }) {
+function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, onOpenSettings, paused, onTogglePause, onCancelAll }) {
+  const workingCount = agents.filter((a) => a.status === "working").length;
   const grouped = useMemo(() => {
     const coach = agents.find((a) => a.kind === "coach");
     const players = agents
@@ -983,6 +990,13 @@ function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsCon
       ${renderSlot(grouped.coach)}
       ${grouped.players.map(renderSlot)}
       <span class="rail-sep"></span>
+      ${workingCount > 0
+        ? html`<button
+            class="gear cancel-all"
+            title=${"Cancel all " + workingCount + " running agent" + (workingCount === 1 ? "" : "s")}
+            onClick=${onCancelAll}
+          >⏹</button>`
+        : null}
       <button
         class=${"gear pause-toggle" + (paused ? " active" : "")}
         title=${paused ? "Paused — click to resume" : "Pause harness (blocks new agent runs)"}

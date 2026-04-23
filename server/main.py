@@ -36,6 +36,7 @@ from server.agents import (
     TEAM_DAILY_CAP_USD,
     _today_spend,
     cancel_agent,
+    cancel_all_agents,
     coach_tick_loop,
     is_paused,
     run_agent,
@@ -393,6 +394,14 @@ async def coach_tick(background: BackgroundTasks) -> dict[str, object]:
         raise HTTPException(409, detail="coach is already working")
     background.add_task(run_agent, "coach", COACH_TICK_PROMPT)
     return {"ok": True, "prompt": COACH_TICK_PROMPT}
+
+
+@app.post("/api/agents/cancel-all", dependencies=[Depends(require_token)])
+async def cancel_all_runs() -> dict[str, object]:
+    """Cancel every currently-running agent. Returns the list of ids
+    that were actually cancelled (finished tasks are skipped)."""
+    cancelled = await cancel_all_agents()
+    return {"ok": True, "cancelled": cancelled}
 
 
 @app.post("/api/agents/{agent_id}/cancel", dependencies=[Depends(require_token)])
