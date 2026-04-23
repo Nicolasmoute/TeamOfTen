@@ -103,30 +103,53 @@ class KDriveClient:
         return WEBDAV_URL
 
     async def probe(self) -> dict[str, Any]:
-        """Write a small visible-named file to the configured URL so
-        health checks can surface the actual exception (not just a
-        bool). Filename is not dot-prefixed so operators can eyeball
-        confirmation on kDrive after configuring creds.
+        """Two-step health check:
+          1. PROPFIND the base URL (lists the target folder) — proves
+             auth + URL are correct and the folder exists.
+          2. PUT a small visible file — proves write permission.
 
-        Always returns a detail dict even when disabled — callers
-        render the reason in the UI.
+        Reports which step failed so the operator doesn't have to guess
+        between "wrong credentials", "wrong URL", "folder missing", and
+        "read-only share". Always returns a detail dict even when
+        disabled — callers render the reason in the UI.
         """
         if not self._enabled:
             return {"ok": False, "error": self._reason, "url": WEBDAV_URL}
+        # Step 1: list the configured folder. "" means "the base URL
+        # itself". A ResourceNotFound here means the folder path in
+        # the URL doesn't exist on kDrive; a 401/403 means auth; a
+        # connection error means URL hostname / scheme is wrong.
+        try:
+            entries = await asyncio.to_thread(self._list_dir_sync, "")
+        except Exception as e:
+            return {
+                "ok": False,
+                "url": WEBDAV_URL,
+                "step": "list",
+                "error": f"{type(e).__name__}: {str(e)[:400]}",
+                "hint": "Auth, URL, or target folder is wrong. Verify KDRIVE_WEBDAV_URL points at an existing kDrive folder and the app-password is for this account.",
+            }
+        # Step 2: write. If listing worked but PUT fails we're looking
+        # at a share-level permission issue or a filename kDrive rejects.
         rel = "harness-health-probe.txt"
         full_path = self._resolve(rel)
         try:
             await asyncio.to_thread(self._write_sync, full_path, "ok")
-            return {"ok": True, "url": WEBDAV_URL, "probe_file": full_path}
+            return {
+                "ok": True,
+                "url": WEBDAV_URL,
+                "probe_file": full_path,
+                "existing_entries": len(entries),
+            }
         except Exception as e:
-            # Capture the full repr — different WebDAV errors carry
-            # different metadata (HTTP status, URL, xml body) and the
-            # operator needs the details to fix config.
             return {
                 "ok": False,
                 "url": WEBDAV_URL,
+                "step": "write",
                 "probe_file": full_path,
+                "existing_entries": len(entries),
                 "error": f"{type(e).__name__}: {str(e)[:400]}",
+                "hint": "Folder exists and listing works, but PUT was rejected. Check that the Infomaniak app-password has WRITE permission (not read-only), or that the URL points at a folder you own (not a read-only share).",
             }
 
     # ---------- async public API ----------

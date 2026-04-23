@@ -1638,7 +1638,10 @@ function KDriveSection({ serverStatus, health, onRefresh }) {
         : null}
     </ul>
     ${probeErr
-      ? html`<pre style="margin: 4px 0; padding: 6px 8px; background: #10131a; border: 1px solid var(--err); border-radius: 3px; font-size: 11px; color: var(--err); white-space: pre-wrap;">${probeErr}</pre>`
+      ? html`<pre style="margin: 4px 0; padding: 6px 8px; background: #10131a; border: 1px solid var(--err); border-radius: 3px; font-size: 11px; color: var(--err); white-space: pre-wrap;">${probe?.step ? "failed at: " + probe.step + "\n" : ""}${probeErr}</pre>`
+      : null}
+    ${probe?.hint
+      ? html`<p class="muted" style="font-size: 11px; margin: 4px 0; font-style: italic;">${probe.hint}</p>`
       : null}
     <p class="muted" style="font-size: 11px; margin: 4px 0 0 0;">
       Memory docs mirror on update; event log every 5 min; DB snapshot every 5 min.
