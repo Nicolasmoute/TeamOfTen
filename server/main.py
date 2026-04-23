@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -137,6 +138,13 @@ async def root() -> str:
     return INDEX_HTML
 
 
+# Health-check caches. Avoid hammering kDrive / spawning subprocesses on
+# every probe (Zeabur or external monitors may poll every 30s).
+_CLAUDE_VERSION_CACHE: dict[str, object] = {}  # populated once per process
+_KDRIVE_PROBE_CACHE: dict[str, object] = {"ts": 0.0, "ok": None}
+_KDRIVE_PROBE_TTL_SECONDS = 60.0
+
+
 @app.get("/api/health")
 async def health() -> JSONResponse:
     """Per-subsystem readiness probe. Returns 200 if everything required
@@ -168,33 +176,53 @@ async def health() -> JSONResponse:
     if not static_ok:
         overall_ok = False
 
-    # 3. claude CLI installed
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "claude", "--version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+    # 3. claude CLI installed — cached for process lifetime (version
+    # doesn't change at runtime).
+    if not _CLAUDE_VERSION_CACHE:
         try:
-            stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        except asyncio.TimeoutError:
-            proc.kill()
-            raise
-        if proc.returncode == 0:
-            checks["claude_cli"] = {"ok": True, "version": stdout_b.decode().strip()}
-        else:
-            checks["claude_cli"] = {"ok": False, "exit_code": proc.returncode}
-            overall_ok = False
-    except Exception as e:
-        checks["claude_cli"] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                raise
+            if proc.returncode == 0:
+                _CLAUDE_VERSION_CACHE.update(
+                    {"ok": True, "version": stdout_b.decode().strip()}
+                )
+            else:
+                _CLAUDE_VERSION_CACHE.update(
+                    {"ok": False, "exit_code": proc.returncode}
+                )
+        except Exception as e:
+            _CLAUDE_VERSION_CACHE.update(
+                {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            )
+    checks["claude_cli"] = dict(_CLAUDE_VERSION_CACHE)
+    if not _CLAUDE_VERSION_CACHE.get("ok"):
         overall_ok = False
 
-    # 4. kDrive — only check if configured. A skipped check doesn't break health.
+    # 4. kDrive — only check if configured. Cached for 60s to avoid
+    # writing a probe file on every health hit.
     if kdrive.enabled:
-        ok = await kdrive.write_text(".harness-health-probe.txt", "ok")
-        checks["kdrive"] = {"ok": ok}
-        if not ok:
-            overall_ok = False
+        now = time.monotonic()
+        last_ts = float(_KDRIVE_PROBE_CACHE["ts"])
+        cached_ok = _KDRIVE_PROBE_CACHE["ok"]
+        if cached_ok is not None and (now - last_ts) < _KDRIVE_PROBE_TTL_SECONDS:
+            checks["kdrive"] = {"ok": bool(cached_ok), "cached": True}
+            if not cached_ok:
+                overall_ok = False
+        else:
+            ok = await kdrive.write_text(".harness-health-probe.txt", "ok")
+            _KDRIVE_PROBE_CACHE["ts"] = now
+            _KDRIVE_PROBE_CACHE["ok"] = ok
+            checks["kdrive"] = {"ok": ok, "cached": False}
+            if not ok:
+                overall_ok = False
     else:
         checks["kdrive"] = {"ok": True, "skipped": True, "reason": kdrive.reason}
 
