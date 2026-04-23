@@ -229,6 +229,42 @@ const MODEL_OPTIONS = [
 // thinking budget in tokens (see server/agents.py once wired).
 const EFFORT_LABELS = ["low", "med", "high", "max"];
 
+// Harness slash commands — intercepted locally, never forwarded to the
+// agent. Actions fire via a small context object so each pane can wire
+// its own handlers (settings popover, session clear, etc.). To add one:
+// append below; the autocomplete picks up everything here.
+const SLASH_COMMANDS = [
+  { cmd: "/plan",   desc: "toggle plan mode for the next turn" },
+  { cmd: "/model",  desc: "open the model picker" },
+  { cmd: "/effort", desc: "open the effort slider (low…max)" },
+  { cmd: "/brief",  desc: "edit this agent's brief" },
+  { cmd: "/tools",  desc: "list the tools this agent can use" },
+  { cmd: "/clear",  desc: "clear session so the next turn starts fresh" },
+  { cmd: "/help",   desc: "show available slash commands" },
+];
+
+function SlashMenu({ query, selectedIdx, onPick, onHover }) {
+  const filtered = SLASH_COMMANDS.filter((c) =>
+    c.cmd.startsWith(query.toLowerCase())
+  );
+  if (filtered.length === 0) return null;
+  return html`
+    <div class="slash-menu">
+      ${filtered.map((c, i) => html`
+        <div
+          class=${"slash-item" + (i === selectedIdx ? " selected" : "")}
+          key=${c.cmd}
+          onMouseEnter=${() => onHover(i)}
+          onMouseDown=${(e) => { e.preventDefault(); onPick(c.cmd); }}
+        >
+          <span class="slash-cmd">${c.cmd}</span>
+          <span class="slash-desc">${c.desc}</span>
+        </div>
+      `)}
+    </div>
+  `;
+}
+
 function loadPaneSettings(slot) {
   try {
     const raw = localStorage.getItem(PANE_SETTINGS_KEY);
@@ -2993,6 +3029,13 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
   const [paneSettings, setPaneSettings] = useState(() => loadPaneSettings(slot));
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [dropEdge, setDropEdge] = useState(null); // 'top' | 'bottom' | 'left' | 'right' | null
+  // Slash-command autocomplete. Open whenever the input starts with "/"
+  // and has no newlines (commands are single-line). selectedIdx tracks
+  // arrow-key navigation.
+  const [slashIdx, setSlashIdx] = useState(0);
+  // Transient info banner — used by /tools and /help to show output
+  // without bothering the agent. Cleared on dismiss or next slash run.
+  const [infoText, setInfoText] = useState(null);
   // Prompt history for ↑/↓ navigation (Ctrl/Cmd + arrow).
   const [promptHistory, setPromptHistory] = useState(() => loadPromptHistory(slot));
   const [promptHistoryIdx, setPromptHistoryIdx] = useState(null);
@@ -3211,9 +3254,87 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
     setAttachments((prev) => prev.filter((a) => a.id !== id));
   }, []);
 
+  // Intercept slash commands locally before they ever reach an agent.
+  // Returns true if the input was a recognized slash command (and was
+  // handled); false otherwise so normal submit flow continues.
+  const runSlashCommand = useCallback((raw) => {
+    const [first, ...rest] = raw.trim().split(/\s+/);
+    const cmd = first.toLowerCase();
+    const arg = rest.join(" ");
+    switch (cmd) {
+      case "/plan":
+        setPaneSettings((s) => ({ ...s, planMode: !s.planMode }));
+        setInfoText("Plan mode: " + (!paneSettings.planMode ? "ON" : "OFF"));
+        return true;
+      case "/model":
+        setSettingsOpen(true);
+        setInfoText(null);
+        return true;
+      case "/effort": {
+        const n = parseInt(arg, 10);
+        if (n >= 1 && n <= 4) {
+          setPaneSettings((s) => ({ ...s, effort: n }));
+          setInfoText("Effort: " + EFFORT_LABELS[n - 1]);
+        } else {
+          setSettingsOpen(true);
+        }
+        return true;
+      }
+      case "/brief":
+        setSettingsOpen(true);
+        return true;
+      case "/clear":
+        authFetch("/api/agents/" + slot + "/session", { method: "DELETE" })
+          .then(() => setInfoText("Session cleared. Next turn starts fresh."))
+          .catch((e) => setInfoText("Session clear failed: " + String(e)));
+        return true;
+      case "/tools": {
+        const coach = [
+          "Read · Grep · Glob · ToolSearch",
+          "coord_list_tasks · coord_create_task · coord_assign_task · coord_update_task",
+          "coord_send_message · coord_read_inbox",
+          "coord_list_memory · coord_read_memory · coord_update_memory",
+          "coord_write_decision · coord_write_context",
+          "coord_write_knowledge · coord_read_knowledge · coord_list_knowledge",
+          "coord_set_player_role · coord_request_human",
+        ];
+        const player = [
+          "Read · Grep · Glob · ToolSearch · Write · Edit · Bash",
+          "coord_list_tasks · coord_create_task · coord_claim_task · coord_update_task",
+          "coord_send_message · coord_read_inbox",
+          "coord_list_memory · coord_read_memory · coord_update_memory",
+          "coord_write_knowledge · coord_read_knowledge · coord_list_knowledge",
+          "coord_commit_push · coord_request_human",
+        ];
+        const list = slot === "coach" ? coach : player;
+        setInfoText("Tools for " + slot + ":\n" + list.map((l) => "• " + l).join("\n"));
+        return true;
+      }
+      case "/help":
+        setInfoText(
+          "Slash commands (never sent to the agent):\n" +
+          SLASH_COMMANDS.map((c) => `${c.cmd.padEnd(8)} — ${c.desc}`).join("\n")
+        );
+        return true;
+      default:
+        return false;
+    }
+  }, [slot, paneSettings]);
+
   const submit = useCallback(async () => {
     const text = input.trim();
     if (!text && attachments.length === 0) return;
+    // Slash commands short-circuit: handle locally, don't send to agent.
+    if (text.startsWith("/")) {
+      const handled = runSlashCommand(text);
+      if (handled) {
+        setInput("");
+        return;
+      }
+      // Unrecognized slash — let it fall through so the agent sees it
+      // (Claude Code's own slash commands like /init are handled by the
+      // CLI, which we don't currently intercept).
+    }
     setSubmitting(true);
     try {
       // Compose prompt string: include image paths the agent can Read.
@@ -3254,8 +3375,55 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
     }
   }, [input, attachments, slot, paneSettings]);
 
+  // slashOpen: show autocomplete when the input is a single-line "/…"
+  // prefix. We intentionally close once the user inserts a newline —
+  // that means they've committed to a multi-line prompt, not a command.
+  const slashOpen = input.startsWith("/") && !input.includes("\n");
+  const slashQuery = slashOpen ? input.split(/\s/)[0] : "";
+  const slashFiltered = slashOpen
+    ? SLASH_COMMANDS.filter((c) => c.cmd.startsWith(slashQuery.toLowerCase()))
+    : [];
+  // Keep the selection in bounds as the filter narrows.
+  useEffect(() => {
+    setSlashIdx(0);
+  }, [slashQuery]);
+
   const onKeyDown = useCallback(
     (e) => {
+      // Slash menu navigation — only when it's open AND populated.
+      if (slashOpen && slashFiltered.length > 0) {
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          setSlashIdx((i) => Math.min(slashFiltered.length - 1, i + 1));
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          setSlashIdx((i) => Math.max(0, i - 1));
+          return;
+        }
+        if (e.key === "Tab") {
+          e.preventDefault();
+          const pick = slashFiltered[Math.min(slashIdx, slashFiltered.length - 1)];
+          if (pick) setInput(pick.cmd + " ");
+          return;
+        }
+        if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
+          e.preventDefault();
+          const pick = slashFiltered[Math.min(slashIdx, slashFiltered.length - 1)];
+          if (pick) {
+            // Run the picked command immediately — no confirmation.
+            runSlashCommand(pick.cmd);
+            setInput("");
+          }
+          return;
+        }
+        if (e.key === "Escape") {
+          e.preventDefault();
+          setInput("");
+          return;
+        }
+      }
       // Ctrl/Cmd + Enter submits.
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
@@ -3285,7 +3453,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
         setInput(promptHistory[nextIdx]);
       }
     },
-    [submit, promptHistory, promptHistoryIdx]
+    [submit, promptHistory, promptHistoryIdx, slashOpen, slashFiltered, slashIdx, runSlashCommand]
   );
 
   const exportMarkdown = useCallback(() => {
@@ -3452,6 +3620,16 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
           : null}
       </div>
       <footer class="pane-input">
+        ${infoText
+          ? html`<div class="pane-info">
+              <pre class="pane-info-body">${infoText}</pre>
+              <button
+                class="pane-info-close"
+                onClick=${() => setInfoText(null)}
+                title="Dismiss"
+              >×</button>
+            </div>`
+          : null}
         ${attachments.length > 0
           ? html`
               <div class="attachments">
@@ -3466,19 +3644,67 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
               </div>
             `
           : null}
-        <textarea
-          placeholder=${"Message " + (displayName || rawName) + "… (paste images directly)"}
-          value=${input}
-          onInput=${(e) => {
-            setInput(e.target.value);
-            if (promptHistoryIdx != null) setPromptHistoryIdx(null);
-          }}
-          onPaste=${onPaste}
-          onKeyDown=${onKeyDown}
-          rows=${3}
-        ></textarea>
+        <!-- Compact mode chips: one-glance view of the pane's current
+             model / plan / effort, each clickable to open the full
+             settings popover. Mirrors the Claude-Code-style inline
+             bar so users don't have to go hunting for the gear. -->
+        <div class="pane-modes">
+          <button
+            class=${"pane-mode-chip" + (paneSettings.model ? " active" : "")}
+            onClick=${() => setSettingsOpen(true)}
+            title="Model (click to change)"
+          >
+            ${(MODEL_OPTIONS.find((m) => m.value === (paneSettings.model || "")) || MODEL_OPTIONS[0]).label}
+          </button>
+          <button
+            class=${"pane-mode-chip" + (paneSettings.planMode ? " active" : "")}
+            onClick=${() => setPaneSettings((s) => ({ ...s, planMode: !s.planMode }))}
+            title="Plan mode (click to toggle)"
+          >
+            ${paneSettings.planMode ? "plan ✓" : "plan"}
+          </button>
+          <button
+            class=${"pane-mode-chip" + (paneSettings.effort ? " active" : "")}
+            onClick=${() => setSettingsOpen(true)}
+            title="Effort (click to change)"
+          >
+            ${paneSettings.effort
+              ? EFFORT_LABELS[paneSettings.effort - 1]
+              : "effort"}
+          </button>
+          <span class="pane-modes-spacer"></span>
+          <button
+            class="pane-mode-chip pane-mode-slash"
+            onClick=${() => setInput("/")}
+            title="Slash commands"
+          >/ commands</button>
+        </div>
+        <div class="pane-input-wrap">
+          <textarea
+            placeholder=${"Message " + (displayName || rawName) + "… (type / for commands)"}
+            value=${input}
+            onInput=${(e) => {
+              setInput(e.target.value);
+              if (promptHistoryIdx != null) setPromptHistoryIdx(null);
+            }}
+            onPaste=${onPaste}
+            onKeyDown=${onKeyDown}
+            rows=${3}
+          ></textarea>
+          ${slashOpen && slashFiltered.length > 0
+            ? html`<${SlashMenu}
+                query=${slashQuery}
+                selectedIdx=${Math.min(slashIdx, slashFiltered.length - 1)}
+                onPick=${(cmd) => {
+                  runSlashCommand(cmd);
+                  setInput("");
+                }}
+                onHover=${(i) => setSlashIdx(i)}
+              />`
+            : null}
+        </div>
         <div class="pane-input-row">
-          <span class="hint">⌘/Ctrl+Enter to send · ⌘/Ctrl+↑↓ history</span>
+          <span class="hint">⌘/Ctrl+Enter to send · ⌘/Ctrl+↑↓ history · / for commands</span>
           <button
             class="primary"
             disabled=${submitting || (!input.trim() && attachments.length === 0)}

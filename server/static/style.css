@@ -1666,6 +1666,111 @@ body {
   padding: 6px 8px;
   font: inherit;
 }
+/* Compact mode chips shown right above the textarea. Each chip reads
+   the current pane setting (model / plan / effort). Active chips pick
+   up the accent color so a non-default setting is visible at a glance. */
+.pane-modes {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+.pane-modes-spacer { flex: 1 1 auto; }
+.pane-mode-chip {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 12px;
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 10px;
+  cursor: pointer;
+  transition: color 80ms, border-color 80ms, background 80ms;
+}
+.pane-mode-chip:hover { color: var(--fg); }
+.pane-mode-chip.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(88, 166, 255, 0.08);
+}
+.pane-mode-slash { font-family: ui-monospace, Menlo, Consolas, monospace; }
+
+/* Dismissable info banner — used by /tools and /help to show output
+   without pushing anything to the agent. */
+.pane-info {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 3px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.pane-info-body {
+  margin: 0;
+  flex: 1 1 auto;
+  white-space: pre-wrap;
+  color: var(--fg);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.pane-info-close {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 4px;
+}
+.pane-info-close:hover { color: var(--fg); }
+
+/* Slash-command autocomplete. Positioned absolutely above the textarea. */
+.pane-input-wrap { position: relative; }
+.slash-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  margin-bottom: 4px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  max-height: 240px;
+  overflow-y: auto;
+  z-index: 10;
+}
+.slash-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.slash-item.selected,
+.slash-item:hover {
+  background: rgba(88, 166, 255, 0.12);
+}
+.slash-cmd {
+  color: var(--accent);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-weight: 600;
+  flex: 0 0 auto;
+  min-width: 72px;
+}
+.slash-desc {
+  color: var(--muted);
+  flex: 1 1 auto;
+}
+
 .pane-input-row {
   display: flex;
   align-items: center;
