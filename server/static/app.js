@@ -1072,23 +1072,27 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, onCrea
     if (exporting || !openSlots || openSlots.length === 0) return;
     setExporting(true);
     try {
-      const sections = [];
-      for (const slot of openSlots) {
-        try {
-          const res = await authFetch(
-            `/api/events?agent=${encodeURIComponent(slot)}&limit=500`
-          );
-          if (!res.ok) continue;
-          const data = await res.json();
-          const events = (data.events || []).map(unwrapPersisted);
-          const agent = agents.find((a) => a.id === slot);
-          sections.push(
-            formatEventsAsMarkdown(events, { slot, agent, headingLevel: 2 })
-          );
-        } catch (e) {
-          console.error("team export: pane fetch failed", slot, e);
-        }
-      }
+      // Fetch each pane's events in parallel — server handles them
+      // concurrently and a full-team export used to be 11× sequential.
+      const results = await Promise.all(
+        openSlots.map(async (slot) => {
+          try {
+            const res = await authFetch(
+              `/api/events?agent=${encodeURIComponent(slot)}&limit=500`
+            );
+            if (!res.ok) return { slot, events: [] };
+            const data = await res.json();
+            return { slot, events: (data.events || []).map(unwrapPersisted) };
+          } catch (e) {
+            console.error("team export: pane fetch failed", slot, e);
+            return { slot, events: [] };
+          }
+        })
+      );
+      const sections = results.map(({ slot, events }) => {
+        const agent = agents.find((a) => a.id === slot);
+        return formatEventsAsMarkdown(events, { slot, agent, headingLevel: 2 });
+      });
       const header = [
         "# Team of Ten — conversation export",
         `Exported ${new Date().toISOString()}`,
