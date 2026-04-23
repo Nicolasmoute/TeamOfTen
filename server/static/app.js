@@ -144,7 +144,8 @@ function App() {
         ev.type === "agent_stopped" ||
         ev.type === "result" ||
         ev.type === "error" ||
-        ev.type === "cost_capped"
+        ev.type === "cost_capped" ||
+        ev.type === "session_cleared"
       ) {
         loadAgents();
       }
@@ -914,7 +915,14 @@ function AgentPane({ slot, agent, liveEvents, onClose }) {
         <span class="pane-name">${displayName}</span>
         ${agent?.role ? html`<span class="pane-role">— ${agent.role}</span>` : html`<span class="pane-role"></span>`}
         ${agent?.session_id
-          ? html`<span class="pane-session" title=${"session " + agent.session_id}>●</span>`
+          ? html`<span class="pane-session" title=${"session " + agent.session_id}>●</span>
+              <button
+                class="pane-session-clear"
+                onClick=${async () => {
+                  await fetch("/api/agents/" + slot + "/session", { method: "DELETE" });
+                }}
+                title="Clear session — next run starts fresh"
+              >×</button>`
           : null}
         <span class="pane-cost">$${cost.toFixed(3)}</span>
         <button class="pane-close" onClick=${onClose} title="Close pane">×</button>

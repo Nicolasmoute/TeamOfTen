@@ -296,6 +296,36 @@ async def start_agent(
     return {"ok": True, "agent_id": req.agent_id}
 
 
+@app.delete("/api/agents/{agent_id}/session")
+async def clear_session(agent_id: str) -> dict[str, object]:
+    """Clear agent.session_id so the next run starts fresh context.
+
+    Useful when an agent's conversation has drifted or when the human
+    wants to start a new thread without losing task/memory state.
+    """
+    if not (agent_id == "coach" or (agent_id.startswith("p") and agent_id[1:].isdigit() and 1 <= int(agent_id[1:]) <= 10)):
+        raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "UPDATE agents SET session_id = NULL WHERE id = ?", (agent_id,)
+        )
+        changed = cur.rowcount
+        await c.commit()
+    finally:
+        await c.close()
+    if changed == 0:
+        raise HTTPException(404, detail=f"agent {agent_id} not found")
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": agent_id,
+            "type": "session_cleared",
+        }
+    )
+    return {"ok": True, "agent_id": agent_id}
+
+
 # ------------------------------------------------------------------
 # Tasks
 # ------------------------------------------------------------------

@@ -442,6 +442,16 @@ body {
   font-size: 10px;
   cursor: help;
 }
+.pane-session-clear {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 0 2px;
+  cursor: pointer;
+  line-height: 1;
+}
+.pane-session-clear:hover { color: var(--err); }
 .pane-close {
   background: transparent;
   border: 0;
