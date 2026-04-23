@@ -69,6 +69,16 @@ def _roots() -> dict[str, Root]:
             Path(os.environ.get("HARNESS_DECISIONS_DIR", "/data/decisions")),
             writable=False,  # decisions are append-only records, not editable
         ),
+        "workspaces": Root(
+            "workspaces",
+            Path(os.environ.get("HARNESS_WORKSPACES_DIR", "/workspaces")),
+            # Read-only from the UI. Each Player has a git worktree at
+            # /workspaces/<slot>/project/ on branch work/<slot>; edits
+            # from the browser would fight the agent's git operations
+            # (auto-commit, pull, etc). Use coord_commit_push or git
+            # CLI to change files, then reload the tree here.
+            writable=False,
+        ),
     }
 
 
@@ -125,12 +135,17 @@ def _walk(base: Path, current: Path) -> dict[str, Any]:
         return {"name": current.name, "type": "dir", "children": []}
 
     children: list[dict[str, Any]] = []
+    # Skip symlinks entirely. The workspaces tree has per-slot
+    # `attachments/` symlinks pointing at /data/attachments which is
+    # cross-root; following them would leak upload content into every
+    # Player's tree. Regular files + real directories only.
     dirs = sorted(
-        (e for e in entries if e.is_dir() and e.name not in SKIP_DIRNAMES),
+        (e for e in entries
+         if e.is_dir() and not e.is_symlink() and e.name not in SKIP_DIRNAMES),
         key=lambda e: e.name.lower(),
     )
     files = sorted(
-        (e for e in entries if e.is_file()),
+        (e for e in entries if e.is_file() and not e.is_symlink()),
         key=lambda e: e.name.lower(),
     )
     for d in dirs:
