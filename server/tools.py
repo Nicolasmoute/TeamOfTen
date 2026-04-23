@@ -490,12 +490,16 @@ def build_coord_server(caller_id: str) -> Any:
             # Task assignment is a discrete action (not conversational)
             # so bypass the ping-pong debounce — Coach should be able to
             # push a new task to a Player even if the Player just
-            # finished the previous turn a few seconds ago.
+            # finished the previous turn a few seconds ago. The task is
+            # already at status='claimed' with owner=<to> (atomic UPDATE
+            # above), so the wake prompt tells the Player to move it to
+            # in_progress + start — not to "claim".
             await maybe_wake_agent(
                 to,
-                f"Coach just assigned you task {task_id}. "
-                f"Use coord_read_inbox + coord_list_tasks to see your work, "
-                f"claim what's yours, and start.",
+                f"Coach assigned you task {task_id} (status=claimed, "
+                f"you're the owner). Use coord_list_tasks to see the "
+                f"title/description, coord_update_task to move it to "
+                f"in_progress, then start the work.",
                 bypass_debounce=True,
             )
         except Exception:
@@ -577,10 +581,16 @@ def build_coord_server(caller_id: str) -> Any:
             try:
                 from server.agents import maybe_wake_agent
                 subj = f" (subject: {subject})" if subject else ""
+                # Include a body preview inline so the recipient doesn't
+                # have to spend a tool-call to see what the message was —
+                # keeps the conversation snappy. Full body + mark-read
+                # still requires coord_read_inbox for anything longer.
+                preview_snippet = body.strip().replace("\n", " ")[:240]
                 await maybe_wake_agent(
                     to,
-                    f"New message from {caller_id}{subj}. "
-                    f"Use coord_read_inbox to read it and respond.",
+                    f"New message from {caller_id}{subj}: \"{preview_snippet}\"\n\n"
+                    f"Call coord_read_inbox to mark it read and see any "
+                    f"other queued messages, then respond as appropriate.",
                 )
             except Exception:
                 pass
