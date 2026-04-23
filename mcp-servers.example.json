@@ -1,0 +1,59 @@
+{
+  "_comment": "Example HARNESS_MCP_CONFIG file. Set HARNESS_MCP_CONFIG=/data/mcp-servers.json (or wherever you put this) and restart the harness. See TOT-specs.md §8.3 for full semantics. ${VAR} placeholders expand from os.environ at load time so tokens stay out of the file.",
+
+  "servers": {
+    "github": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      }
+    },
+
+    "notion": {
+      "type": "http",
+      "url": "https://mcp.notion.com/sse",
+      "headers": {
+        "Authorization": "Bearer ${NOTION_TOKEN}"
+      }
+    },
+
+    "slack": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-slack"],
+      "env": {
+        "SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}",
+        "SLACK_TEAM_ID": "${SLACK_TEAM_ID}"
+      }
+    }
+  },
+
+  "allowed_tools": {
+    "_comment": "Explicit allow-list per server. We do NOT auto-discover tools — that would let a misbehaving MCP server expose writes you never reviewed. Each entry becomes an mcp__<server>__<tool> name added to every agent's allowed_tools.",
+
+    "github": [
+      "search_repositories",
+      "search_issues",
+      "list_issues",
+      "get_issue",
+      "create_issue",
+      "add_issue_comment",
+      "get_pull_request",
+      "list_pull_requests"
+    ],
+
+    "notion": [
+      "search_pages",
+      "get_page",
+      "get_block_children"
+    ],
+
+    "slack": [
+      "slack_list_channels",
+      "slack_get_channel_history",
+      "slack_post_message"
+    ]
+  }
+}
