@@ -40,12 +40,15 @@ FLUSH_INTERVAL_SECONDS = int(
     os.environ.get("HARNESS_KDRIVE_FLUSH_INTERVAL", "300")
 )
 SNAPSHOT_INTERVAL_SECONDS = int(
-    os.environ.get("HARNESS_KDRIVE_SNAPSHOT_INTERVAL", "3600")
+    os.environ.get("HARNESS_KDRIVE_SNAPSHOT_INTERVAL", "300")
 )
 # How many DB snapshots to keep on kDrive. Older ones are deleted after
-# each successful upload. 48 = ~2 days of hourly snapshots.
+# each successful upload. 144 = ~12 h of 5-min snapshots. Was 48 (~2 days
+# hourly); dropped to 5 min cadence per §5.2 so a crash loses ≤ 5 min of
+# state. Snapshots are single-digit KB at this scale so the bandwidth is
+# trivial.
 SNAPSHOT_RETENTION = int(
-    os.environ.get("HARNESS_KDRIVE_SNAPSHOT_RETENTION", "48")
+    os.environ.get("HARNESS_KDRIVE_SNAPSHOT_RETENTION", "144")
 )
 
 
