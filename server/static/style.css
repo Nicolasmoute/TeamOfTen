@@ -371,6 +371,41 @@ body {
   border-radius: 6px;
 }
 
+/* Layout preset buttons — tiny schematic icons drawn with nested spans
+   so they visually match the layout they apply. */
+.layout-preset { padding: 2px 4px; }
+.layout-icon {
+  display: inline-flex;
+  gap: 2px;
+  width: 18px;
+  height: 14px;
+  align-items: stretch;
+  justify-content: center;
+}
+.layout-icon > span {
+  flex: 1 1 0;
+  border: 1px solid currentColor;
+  border-radius: 1px;
+  background: transparent;
+}
+.layout-icon-pairs > span {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  border: 0;
+  padding: 0;
+}
+.layout-icon-pairs > span > i {
+  flex: 1 1 0;
+  border: 1px solid currentColor;
+  border-radius: 1px;
+  background: transparent;
+}
+.layout-preset:hover .layout-icon > span,
+.layout-preset:hover .layout-icon-pairs > span > i {
+  background: currentColor;
+}
+
 .env-msg-urgent .env-decision-head { color: var(--err); }
 .env-msg-composer {
   background: var(--card, #1a1a1a);

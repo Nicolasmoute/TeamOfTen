@@ -835,6 +835,32 @@ function App() {
     });
   }, []);
 
+  // Quick-layout presets. Re-flow every currently-open pane into a fresh
+  // layout without touching which panes are open or their order.
+  //   "spread": every pane in its own column   [a][b][c][d]
+  //   "pairs":  two stacked per column; if odd, first one is solo
+  //             [a] [b over c] [d over e]
+  const applyLayoutPreset = useCallback((preset) => {
+    setOpenColumns((prev) => {
+      const slots = prev.flat();
+      if (slots.length === 0) return [];
+      if (preset === "spread") return slots.map((s) => [s]);
+      if (preset === "pairs") {
+        const cols = [];
+        let i = 0;
+        if (slots.length % 2 === 1) {
+          cols.push([slots[0]]);
+          i = 1;
+        }
+        for (; i < slots.length; i += 2) {
+          cols.push([slots[i], slots[i + 1]]);
+        }
+        return cols;
+      }
+      return prev;
+    });
+  }, []);
+
   // Split.js: horizontal split across columns, vertical split inside each
   // multi-pane column. Rebind whenever the layout structure changes.
   // A stable structure signature lets us skip reinit on no-op renders.
@@ -932,6 +958,7 @@ function App() {
         onOpenSettings=${() => setSettingsOpen(true)}
         paused=${paused}
         onTogglePause=${togglePause}
+        onLayoutPreset=${applyLayoutPreset}
         onCancelAll=${async () => {
           const working = agents.filter((a) => a.status === "working").length;
           if (working === 0) return;
@@ -1091,7 +1118,7 @@ function TokenGate({ onSubmit }) {
 // left rail
 // ------------------------------------------------------------------
 
-function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, onOpenSettings, paused, onTogglePause, onCancelAll }) {
+function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, onOpenSettings, paused, onTogglePause, onLayoutPreset, onCancelAll }) {
   const workingCount = agents.filter((a) => a.status === "working").length;
   const grouped = useMemo(() => {
     const coach = agents.find((a) => a.kind === "coach");
@@ -1137,6 +1164,22 @@ function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsCon
       ${renderSlot(grouped.coach)}
       ${grouped.players.map(renderSlot)}
       <span class="rail-sep"></span>
+      ${openSlots.length >= 2
+        ? html`<button
+            class="gear layout-preset"
+            title="Spread: one pane per column"
+            onClick=${() => onLayoutPreset && onLayoutPreset("spread")}
+          ><span class="layout-icon layout-icon-spread">
+            <span></span><span></span><span></span>
+          </span></button>
+          <button
+            class="gear layout-preset"
+            title="Pair stack: two panes per column (odd count → first one is solo)"
+            onClick=${() => onLayoutPreset && onLayoutPreset("pairs")}
+          ><span class="layout-icon layout-icon-pairs">
+            <span><i></i><i></i></span><span><i></i><i></i></span><span><i></i><i></i></span>
+          </span></button>`
+        : null}
       ${workingCount > 0
         ? html`<button
             class="gear cancel-all"
