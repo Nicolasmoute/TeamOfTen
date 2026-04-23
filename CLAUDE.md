@@ -73,15 +73,24 @@ deployed Zeabur instance — see "What needs verification" below.
 - **Empty-pane hints** ✓ when an agent pane has no events, shows a hint
    card with example prompts (Coach gets two starters; Players get a short
    line). Hint disappears after the first event arrives.
+- **Decisions** ✓ `coord_write_decision` (Coach-only) writes
+   `/data/decisions/<date>-<slug>.md` + kDrive mirror; `GET /api/decisions`
+   + `/api/decisions/{filename}` expose them; EnvPane Decisions section
+   lists with click-to-expand body, refreshes on `decision_written` events.
+- **Snapshot retention** ✓ kDrive snapshot loop prunes oldest beyond
+   `HARNESS_KDRIVE_SNAPSHOT_RETENTION` (default 48 ≈ 2 days hourly).
+- **Coach autoloop** ✓ env-gated background task: when
+   `HARNESS_COACH_TICK_INTERVAL > 0`, Coach is nudged to drain inbox at
+   that cadence. Skips when Coach is already working. Manual trigger:
+   `POST /api/coach/tick` (409 if busy).
 
 **Next likely:**
 - **M5 step 2**: actually USE the captured session_id to resume — needs
    confirmed SDK API for `ClaudeAgentOptions` (resume kwarg name is
    speculative).
-- **Decisions/digests** files on kDrive (need Coach to actively run on a
-   loop to populate them).
-- **Coach autonomous loop**: cron-style trigger so Coach drains inbox
-   periodically without manual prompts.
+- **`coord_request_human` escalation tool**: when an agent is stuck,
+   raise a high-visibility event that the UI surfaces prominently.
+- **Mobile UI polish.**
 
 ## What needs verification (when user is next active)
 
@@ -98,6 +107,8 @@ fastest single read on subsystem state. Then:
 8. **Auth gate**: set `HARNESS_TOKEN`, redeploy, confirm UI prompts for token; clear localStorage to retest cold path
 9. **session_id** appears as ● in pane header after a Coach turn completes
 10. **Layout persistence**: open p3, refresh page, p3 still open
+11. **Coach autoloop**: set `HARNESS_COACH_TICK_INTERVAL=120`, redeploy, confirm Coach pane shows a `routine tick` agent_started event ~every 2 min and that ticks skip while a previous turn is still working
+12. **Snapshot retention**: with kDrive enabled, after RETENTION+1 hourly snapshots, confirm only the newest RETENTION remain on kDrive
 
 Most likely failure mode: subtle SDK / WebDAV / git-credential issue that needs a small fix.
 
