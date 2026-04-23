@@ -50,24 +50,43 @@ deployed Zeabur instance — see "What needs verification" below.
    - Event log flushed every 5 min to `/harness/events/<date>.jsonl`
      (with yesterday-replay during 00:00–02:00 UTC for boundary safety)
    - Hourly `VACUUM INTO` snapshot to `/harness/snapshots/<ts>.db`
-- **M4 (1/2)** ✓ Per-Player git worktrees:
+- **M4 (1/2/3)** ✓ Per-Player git worktrees:
    - `git` installed in container with default identity
    - On boot, if `HARNESS_PROJECT_REPO` is set, clone to `/workspaces/.project`
      and create worktree `/workspaces/<slot>/project` on branch `work/<slot>`
    - Branch resolution preserves `origin/work/<slot>` history if it exists
+   - `coord_commit_push` MCP tool (Player-only; rejects Coach) wraps
+     `git add -A && commit && push origin HEAD` and emits a `commit_pushed`
+     event. Push expects creds via PAT-in-URL on `HARNESS_PROJECT_REPO`.
+- **M5 step 1** ✓ session_id captured on `ResultMessage` and persisted to
+   `agents.session_id`. Green ● indicator in pane header when present;
+   `DELETE /api/agents/<slot>/session` clears it (button next to the dot).
+- **Auth (opt-in)** ✓ `HARNESS_TOKEN` env: when set, every `/api/*` (except
+   `/api/health`) requires `Authorization: Bearer <token>`; WebSocket uses
+   `?token=`. UI shows a paste-modal when 401 returned, saves to localStorage,
+   reloads. Backwards compatible: unset env = open API as before.
+- **`/api/health`** ✓ per-subsystem readiness probe (db / static / claude_cli
+   / kdrive / workspaces). Cached: claude_cli once per process, kdrive 60s.
+   Returns 503 when any required subsystem fails. Public endpoint.
+- **Layout persistence** ✓ `openSlots` + `envOpen` saved to localStorage
+   (`harness_layout_v1`); restored on reload via lazy initializers.
+- **Empty-pane hints** ✓ when an agent pane has no events, shows a hint
+   card with example prompts (Coach gets two starters; Players get a short
+   line). Hint disappears after the first event arrives.
 
 **Next likely:**
-- **M4 step 3**: agent commit/push helper (or document credentials.helper
-   for HARNESS_PROJECT_REPO with embedded PAT)
-- **M5**: SDK hooks. Risky one (PreToolUse inbox-inject) likely deferred
-   in favor of the polling pattern that already works. Useful pieces:
-   session_id capture for resume, TaskCompleted hook
+- **M5 step 2**: actually USE the captured session_id to resume — needs
+   confirmed SDK API for `ClaudeAgentOptions` (resume kwarg name is
+   speculative).
 - **Decisions/digests** files on kDrive (need Coach to actively run on a
-   loop to populate them)
+   loop to populate them).
+- **Coach autonomous loop**: cron-style trigger so Coach drains inbox
+   periodically without manual prompts.
 
 ## What needs verification (when user is next active)
 
-A lot has shipped without exercise. Before depending on any of this:
+A lot has shipped without exercise. Hit `/api/health` first — it's the
+fastest single read on subsystem state. Then:
 
 1. **Zeabur redeploy succeeds** with the latest commit (heavy git install + worktree boot might surface issues)
 2. **Cost cap blocks spawn** when an agent is over its daily limit
@@ -76,6 +95,9 @@ A lot has shipped without exercise. Before depending on any of this:
 5. **Image paste** end-to-end: paste in pane → upload → agent Read → describe
 6. **Per-tool renderers** display nicely in the timeline
 7. **Tasks**: human creates → coach assigns via msg → player claims → updates → done
+8. **Auth gate**: set `HARNESS_TOKEN`, redeploy, confirm UI prompts for token; clear localStorage to retest cold path
+9. **session_id** appears as ● in pane header after a Coach turn completes
+10. **Layout persistence**: open p3, refresh page, p3 still open
 
 Most likely failure mode: subtle SDK / WebDAV / git-credential issue that needs a small fix.
 
