@@ -139,23 +139,40 @@ Originally spec'd; not implemented. Per-worktree isolation covers the primary ne
 
 ## 5. Storage layout
 
-### 5.1 Two-tier: hot SQLite + durable kDrive
+Three tiers, by role: **live state** (fast, ephemeral), **durable backup** (kDrive, survives crashes), **code** (GitHub).
 
-**Hot state (single source of truth)**: SQLite on `/data/harness.db`. All 11 agents' tool calls write through the harness server process (see §6.1).
+### 5.1 Live state — SQLite on `/data/harness.db`
 
-**Durable mirror (kDrive, when configured)**:
-- `memory/<topic>.md` — mirrors every `coord_update_memory` synchronously.
-- `decisions/<date>-<slug>.md` — append-only architectural records, Coach-only via `coord_write_decision`.
-- `events/<YYYY-MM-DD>.jsonl` — today's events flushed every 5 min (`HARNESS_KDRIVE_FLUSH_INTERVAL`). During UTC 00:00–02:00 yesterday's file is re-flushed so late events don't get lost at the day boundary.
-- `snapshots/<ts>.db` — hourly `VACUUM INTO` of the full DB. Retention capped at `HARNESS_KDRIVE_SNAPSHOT_RETENTION` (default 48 ≈ 2 days hourly).
+Single source of truth for everything the agents read/write during a turn. All writes route through the harness process (§6.1). Covers: the roster, the task board, the mailbox, the shared notebook, and the firehose log.
 
-### 5.2 Why not one-tier WebDAV
+### 5.2 Durable backup — kDrive (WebDAV)
+
+Every layer of live state has a corresponding mirror on kDrive so a crashed server can restart from near-complete history.
+
+| kDrive path | What | Cadence |
+|---|---|---|
+| `memory/<topic>.md` | Shared notebook | synchronous on every `coord_update_memory` |
+| `decisions/<date>-<slug>.md` | Append-only architectural decisions | synchronous on every `coord_write_decision` (Coach-only) |
+| `events/<YYYY-MM-DD>.jsonl` | Firehose log (one file per day) | every 5 min (`HARNESS_KDRIVE_FLUSH_INTERVAL`); 00:00–02:00 UTC re-flushes yesterday to catch boundary-straddling events |
+| `snapshots/<ts>.db` | Full `VACUUM INTO` of the DB | **every 5 min** (`HARNESS_KDRIVE_SNAPSHOT_INTERVAL`). Retention `HARNESS_KDRIVE_SNAPSHOT_RETENTION` (default 144 = ~12 h of history) |
+| `context/` | Governance docs — `CLAUDE.md`, `skills/*.md`, `rules/*.md`. Readable by all agents; writable only by Coach (via `coord_write_context`) and the user (via the UI). Loaded into every agent's system prompt at spawn. | synchronous on write |
+| `knowledge/<path>.md` | Durable artifacts agents produce (reports, research, specs, designs). Free-for-all writes via normal Write tool into `/data/knowledge/`. | every 5 min mirror |
+
+Context docs (CLAUDE.md / skills / rules) are **not** the same as the notebook: notebook is a free scratchpad anyone can overwrite; context is governance, restricted to Coach + human. The system prompt loader concatenates the relevant context files at turn start so changes take effect on the next turn.
+
+The 5-min snapshot cadence (down from the prior hourly setting) guarantees worst-case crash loss ≤ 5 min for roster/tasks/mailbox/notebook state. Snapshots are single-digit KB at this scale so the bandwidth is trivial.
+
+### 5.3 Code — GitHub
+
+Project repositories do **not** mirror to kDrive. `HARNESS_PROJECT_REPO` points at a GitHub repo (with PAT in the URL). The server clones it to `/workspaces/.project` at boot and materializes a per-Player worktree at `/workspaces/<slot>/project` on branch `work/<slot>`. Players push via `coord_commit_push` — GitHub is their durability story.
+
+### 5.4 Why not one-tier WebDAV
 
 WebDAV is too slow and race-prone under 11 concurrent writers. Original spec intended `tasks.json` / `agents.json` / per-agent inboxes on kDrive directly; early design showed this failing under contention.
 
-### 5.3 Memory is scratchpad (intentionally no history)
+### 5.5 Memory is scratchpad (intentionally no history)
 
-If history matters, the event log (`memory_updated` events) has the audit. Decisions is the append-only durable record; memory is the "living now" commons.
+If history matters, the event log (`memory_updated` events) has the audit. Decisions is the append-only durable record; memory is the "living now" commons; context is the governance layer above both.
 
 ---
 
@@ -567,8 +584,10 @@ Composed from live state: `[⏸] [N⚡] [M●] TeamOfTen` where ⏸=paused, N⚡
 | `HARNESS_TEAM_DAILY_CAP` | `20.0` | USD across team per day. 0 = unlimited. |
 | `HARNESS_COACH_TICK_INTERVAL` | `0` | seconds between Coach autoloop ticks. 0 disables. |
 | `HARNESS_KDRIVE_FLUSH_INTERVAL` | `300` | seconds between event-log flushes |
-| `HARNESS_KDRIVE_SNAPSHOT_INTERVAL` | `3600` | seconds between DB snapshots |
-| `HARNESS_KDRIVE_SNAPSHOT_RETENTION` | `48` | snapshots retained on kDrive |
+| `HARNESS_KDRIVE_SNAPSHOT_INTERVAL` | `300` | seconds between DB snapshots (was hourly; 5 min closes crash-loss window to ≤ 5 min) |
+| `HARNESS_KDRIVE_SNAPSHOT_RETENTION` | `144` | snapshots retained on kDrive (~12 h at 5 min cadence) |
+| `HARNESS_CONTEXT_DIR` | `/data/context` | local cache of kDrive `context/` (CLAUDE.md, skills, rules) |
+| `HARNESS_KNOWLEDGE_DIR` | `/data/knowledge` | agents write durable artifacts here; mirrored to kDrive `knowledge/` |
 | `HARNESS_DECISIONS_DIR` | `/data/decisions` | local fallback when kDrive disabled |
 | `HARNESS_PROJECT_REPO` | unset | If set, clones to `/workspaces/.project` + creates per-slot worktrees at boot |
 | `HARNESS_PROJECT_BRANCH` | `main` | default branch for fresh worktrees |
@@ -620,6 +639,11 @@ Numbered per the original spec (Docs/HARNESS_SPEC.md §14).
 | **M6/7/8/9** — Polish | 2D column stacking, drag/drop, pane export, team export, drawer health section, pane collapse alternatives (size persistence), in-pane search, prompt history, cancel/cancel-all, pause, team composition (`coord_set_player_role`), attention UI, inbox composer, memory composer, task hierarchy render, task cancel, filter, last-turn chip, unread dot, scroll-into-view, tab title, WS heartbeat | ✓ (incremental) |
 
 **Pending / next likely:**
+- **Data backup upgrade (§5.2)** — drop snapshot interval from hourly to 5 min; bump retention to 144. Closes crash-loss window to ≤ 5 min. One-line config change.
+- **Context folder** (§5.2, `context/`) — `CLAUDE.md` / `skills/*.md` / `rules/*.md` loaded into every agent's system prompt. New Coach-only MCP tool `coord_write_context`, UI editor for the human, synchronous kDrive mirror on write. Not yet implemented.
+- **Knowledge folder** (§5.2, `knowledge/`) — durable artifact bucket for agent-produced markdown. Local dir at `/data/knowledge/`, mirrored to kDrive every 5 min. UI browser pane. Not yet implemented.
+- **Live-streaming tokens + thinking blocks** — shipped in the UI (pane renders partial text with blinking caret; thinking shown as collapsible card).
+- **Sticky turn headers** in the pane body — shipped (each `agent_started` is a position:sticky one-liner that always shows the prompt of the turn currently on screen).
 - Mobile UI polish (HTML5 DnD doesn't fire on touch; layout breakpoints for < 900 px need a rethink).
 - Pane collapse (minimize to header) — deferred because fighting Split.js's inline sizes is non-trivial.
 - Automated crash-recovery (reset in_progress tasks on restart) — wait for real incidents before prioritizing.
