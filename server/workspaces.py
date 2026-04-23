@@ -115,11 +115,21 @@ def refresh_repo_cache() -> None:
 def workspace_dir(slot: str) -> Path:
     """The cwd an agent should run in.
 
-    Worktree path when project is configured; plain workspace dir otherwise.
+    Prefers the per-slot git worktree when it exists on disk; falls back
+    to the plain /workspaces/<slot>/ directory otherwise. The filesystem
+    check (not just the config flag) prevents the "repo configured but
+    never provisioned" footgun: if the DB says a repo is set but
+    ensure_workspaces() hasn't run yet (or is still running), the agent
+    still gets a real cwd and unrelated tasks (chat, research, doc
+    writing, coord_* tools) keep working. Only code-touching work
+    (`coord_commit_push`, Bash in the repo) would then fail loudly —
+    and those are the tasks that genuinely need a worktree.
     """
     base = WORKSPACES_ROOT / slot
     if project_configured():
-        return base / "project"
+        worktree = base / "project"
+        if (worktree / ".git").exists():
+            return worktree
     return base
 
 
@@ -129,11 +139,16 @@ def get_status() -> dict[str, object]:
         return {"configured": False, "reason": "no project repo set (Options → Project repo or HARNESS_PROJECT_REPO)"}
     slot_state = {}
     for s in SLOT_IDS:
-        wt = workspace_dir(s)
+        # Report the *intended* worktree path even when the fallback
+        # kicks in, so the UI can spot "repo configured but worktree
+        # missing" (fallback_active=True) and prompt for provisioning.
+        worktree = WORKSPACES_ROOT / s / "project"
+        actual = workspace_dir(s)
         slot_state[s] = {
-            "path": str(wt),
-            "exists": wt.exists(),
-            "is_git": (wt / ".git").exists(),
+            "path": str(worktree),
+            "exists": worktree.exists(),
+            "is_git": (worktree / ".git").exists(),
+            "fallback_active": actual != worktree,
         }
     return {
         "configured": True,

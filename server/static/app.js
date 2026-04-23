@@ -1776,6 +1776,7 @@ function TeamRepoSection() {
   const [branchDraft, setBranchDraft] = useState("");
   const [allowSecrets, setAllowSecrets] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [provisioning, setProvisioning] = useState(false);
   const [msg, setMsg] = useState(null);
 
   const reload = useCallback(async () => {
@@ -1812,7 +1813,7 @@ function TeamRepoSection() {
         const d = await res.json();
         setMsg({
           kind: "ok",
-          text: "saved · redeploy to apply" +
+          text: "saved · click 'provision now' to apply" +
             ((d.secret_warnings || []).length
               ? "  (kept raw secret despite warning: " + d.secret_warnings.join(", ") + ")"
               : ""),
@@ -1836,6 +1837,51 @@ function TeamRepoSection() {
     }
   }, [repoDraft, branchDraft, allowSecrets, reload]);
 
+  // Clone + worktree-add live so the saved repo takes effect without
+  // a container restart. Idempotent — existing .git worktrees are
+  // untouched. Can take 10–60s for a fresh first clone; button stays
+  // disabled while the request is in-flight.
+  const provision = useCallback(async () => {
+    setProvisioning(true);
+    setMsg(null);
+    try {
+      const res = await authFetch("/api/team/repo/provision", {
+        method: "POST",
+      });
+      if (res.ok) {
+        const d = await res.json().catch(() => ({}));
+        const st = d.status || {};
+        if (st.configured === false) {
+          setMsg({ kind: "err", text: "No repo set. Save a URL first, then provision." });
+        } else if (st.error) {
+          setMsg({ kind: "err", text: "clone failed: " + st.error });
+        } else {
+          const slots = st.slots || {};
+          const created = Object.values(slots).filter((s) => s && s.status === "created").length;
+          const already = Object.values(slots).filter((s) => s && s.status === "already-present").length;
+          const failed = Object.values(slots).filter((s) => s && !s.ok).length;
+          setMsg({
+            kind: failed ? "err" : "ok",
+            text: `provisioned · ${created} new worktree${created === 1 ? "" : "s"}, ${already} already present${failed ? `, ${failed} failed` : ""}`,
+          });
+        }
+      } else {
+        let detail;
+        try {
+          const d = await res.json();
+          detail = typeof d.detail === "string" ? d.detail : JSON.stringify(d.detail);
+        } catch (_) {
+          detail = "HTTP " + res.status;
+        }
+        setMsg({ kind: "err", text: detail });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    } finally {
+      setProvisioning(false);
+    }
+  }, []);
+
   return html`<section class="drawer-section">
     <h3>Project repo</h3>
     <p class="muted" style="margin: 0 0 6px 0; font-size: 12px;">
@@ -1843,7 +1889,8 @@ function TeamRepoSection() {
       worktrees. Use a <code>\${VAR}</code> placeholder for your
       PAT so the token stays in the Zeabur env, not in the DB —
       e.g. <code>https://\${GITHUB_TOKEN}@github.com/you/repo.git</code>.
-      Changes apply on the next container restart.
+      After saving, hit <em>provision now</em> to clone + create
+      worktrees live (no restart needed).
     </p>
     ${loaded && data
       ? html`<div style="font-size: 11px; color: var(--muted); margin-bottom: 6px;">
@@ -1877,9 +1924,15 @@ function TeamRepoSection() {
       </label>
       <button
         class="primary"
-        disabled=${saving}
+        disabled=${saving || provisioning}
         onClick=${save}
       >${saving ? "saving…" : "save"}</button>
+      <button
+        type="button"
+        disabled=${saving || provisioning || !(data && data.repo)}
+        onClick=${provision}
+        title="Clone + create worktrees now, without a restart. Idempotent."
+      >${provisioning ? "provisioning…" : "provision now"}</button>
     </div>
     ${msg
       ? html`<div style=${"font-size: 11px; margin: 6px 0 0; padding: 4px 8px; border-radius: 3px; " + (msg.kind === "ok"
@@ -1894,6 +1947,147 @@ function TeamRepoSection() {
 // server gets a row with status dot + enable/disable/delete/test. The
 // loader in server/mcp_config.py merges this with any HARNESS_MCP_CONFIG
 // file — DB wins on name collision.
+// Batch "clear session_id" for any subset of agents. All ticked by
+// default; Clear POSTs one request with the checked set so next turn
+// for those agents starts a fresh conversation.
+function SessionsSection() {
+  const [agents, setAgents] = useState([]);
+  const [selected, setSelected] = useState({});  // { slotId: bool }
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);  // { kind: "ok"|"err", text }
+
+  const reload = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/agents");
+      if (!res.ok) return;
+      const data = await res.json();
+      const list = Array.isArray(data.agents) ? data.agents : [];
+      setAgents(list);
+      setSelected((prev) => {
+        const next = {};
+        for (const a of list) {
+          next[a.id] = prev[a.id] === undefined ? true : prev[a.id];
+        }
+        return next;
+      });
+    } catch (e) {
+      console.error("sessions load failed", e);
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+
+  const toggle = (id) => setSelected((s) => ({ ...s, [id]: !s[id] }));
+  const setAll = (v) => setSelected((s) => {
+    const next = {};
+    for (const a of agents) next[a.id] = v;
+    return next;
+  });
+
+  const targets = agents.filter((a) => selected[a.id]).map((a) => a.id);
+  const withSession = agents.filter((a) => a.session_id).map((a) => a.id);
+
+  const clearSelected = async () => {
+    if (targets.length === 0 || busy) return;
+    const confirmed = window.confirm(
+      `Clear session_id on ${targets.length} agent${targets.length === 1 ? "" : "s"}? `
+      + `Their next turn will start without prior conversation context `
+      + `(tasks / memory are unaffected).`
+    );
+    if (!confirmed) return;
+    setBusy(true);
+    setMsg(null);
+    try {
+      const res = await authFetch("/api/agents/sessions/clear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ agents: targets }),
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const n = Array.isArray(data.cleared) ? data.cleared.length : targets.length;
+        setMsg({ kind: "ok", text: `Cleared ${n} session${n === 1 ? "" : "s"}.` });
+        await reload();
+      } else {
+        const body = await res.text().catch(() => "");
+        setMsg({ kind: "err", text: `HTTP ${res.status}: ${body || "clear failed"}` });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return html`<section class="drawer-section">
+    <h3>Sessions</h3>
+    <p class="muted" style="margin: 0 0 8px 0; font-size: 12px;">
+      Tick the agents whose conversation you want to reset, then Clear.
+      Equivalent to the pane header 🗑 button but in batch. Only clears
+      the SDK <code>session_id</code> — tasks, memory, inbox, briefs
+      are untouched. Agents with no active session show dimmed.
+    </p>
+    ${loaded
+      ? agents.length === 0
+        ? html`<p class="muted">No agents registered.</p>`
+        : html`<div style="display: flex; flex-wrap: wrap; gap: 6px 14px; margin-bottom: 8px;">
+            ${agents.map((a) => {
+              const has = !!a.session_id;
+              return html`<label
+                key=${a.id}
+                title=${has ? "Session present — will be cleared" : "No active session"}
+                style=${"display: inline-flex; align-items: center; gap: 5px; "
+                  + "font-size: 12px; cursor: pointer; user-select: none; "
+                  + (has ? "" : "opacity: 0.55;")}
+              >
+                <input
+                  type="checkbox"
+                  checked=${!!selected[a.id]}
+                  disabled=${busy}
+                  onChange=${() => toggle(a.id)}
+                />
+                <span>${slotShortLabel(a.id)}${a.name ? " · " + a.name : ""}${has ? "" : " (none)"}</span>
+              </label>`;
+            })}
+          </div>
+          <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+            <button
+              type="button"
+              disabled=${busy}
+              onClick=${() => setAll(true)}
+            >Select all</button>
+            <button
+              type="button"
+              disabled=${busy}
+              onClick=${() => setAll(false)}
+            >Select none</button>
+            <button
+              type="button"
+              disabled=${busy || withSession.length === 0}
+              onClick=${() => setSelected(() => {
+                const next = {};
+                for (const a of agents) next[a.id] = !!a.session_id;
+                return next;
+              })}
+              title="Tick only agents that currently have a session"
+            >Only active (${withSession.length})</button>
+            <button
+              class="primary"
+              type="button"
+              disabled=${busy || targets.length === 0}
+              onClick=${clearSelected}
+            >${busy ? "Clearing…" : `Clear ${targets.length} session${targets.length === 1 ? "" : "s"}`}</button>
+            ${msg
+              ? html`<span style=${"font-size: 12px; color: " + (msg.kind === "ok" ? "var(--ok)" : "var(--err)") + ";"}>${msg.text}</span>`
+              : null}
+          </div>`
+      : html`<p class="muted">loading…</p>`}
+  </section>`;
+}
+
+
 function MCPServersSection() {
   const [servers, setServers] = useState([]);
   const [loaded, setLoaded] = useState(false);
@@ -2280,6 +2474,8 @@ function SettingsDrawer({ onClose, serverStatus }) {
           <${TeamRepoSection} />
 
           <${MCPServersSection} />
+
+          <${SessionsSection} />
 
           <section class="drawer-section">
             <h3>Layout</h3>

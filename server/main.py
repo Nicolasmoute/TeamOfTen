@@ -1418,6 +1418,33 @@ async def set_team_repo(req: TeamRepoWrite) -> dict[str, object]:
     return {"ok": True, "secret_warnings": warnings}
 
 
+@app.post("/api/team/repo/provision", dependencies=[Depends(require_token)])
+async def provision_team_repo() -> dict[str, object]:
+    """Run `ensure_workspaces()` live so a repo URL saved via the UI
+    takes effect without a container restart. Idempotent — existing
+    `.git` worktrees are left alone; only missing ones get cloned /
+    added. Can take tens of seconds for a large first clone.
+    """
+    from server.workspaces import ensure_workspaces, refresh_repo_cache
+    # Drop any stale cache first so the call reads the latest DB value.
+    refresh_repo_cache()
+    try:
+        status = await ensure_workspaces()
+    except Exception as e:
+        logger.exception("ensure_workspaces failed from /provision")
+        raise HTTPException(500, detail=f"provision failed: {e}") from e
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "system",
+            "type": "team_repo_provisioned",
+            "configured": bool(status.get("configured")),
+            "error": status.get("error"),
+        }
+    )
+    return {"ok": "error" not in status, "status": status}
+
+
 class AgentLockWrite(BaseModel):
     locked: bool = Field(..., description="True to lock the agent off from Coach orchestration.")
 
@@ -1491,6 +1518,66 @@ async def clear_session(agent_id: str) -> dict[str, object]:
         }
     )
     return {"ok": True, "agent_id": agent_id}
+
+
+class BatchClearSessionsRequest(BaseModel):
+    agents: list[str] | None = Field(
+        None,
+        description="Slot ids to clear. Omit / empty = clear every agent.",
+    )
+
+
+def _valid_slot(sid: str) -> bool:
+    return sid == "coach" or (
+        sid.startswith("p") and sid[1:].isdigit() and 1 <= int(sid[1:]) <= 10
+    )
+
+
+@app.post("/api/agents/sessions/clear", dependencies=[Depends(require_token)])
+async def clear_sessions_batch(req: BatchClearSessionsRequest) -> dict[str, object]:
+    """Batch version of DELETE /api/agents/<id>/session. Clears
+    session_id on every selected agent so next turn starts fresh.
+
+    `agents` semantics:
+    - key omitted / value null → all 11 slots
+    - empty list []           → clear nothing (no-op; prevents an API
+      consumer's empty allow-list from accidentally wiping everyone)
+    - list of slot ids         → exactly those
+    """
+    if req.agents is None:
+        targets = ["coach"] + [f"p{i}" for i in range(1, 11)]
+    else:
+        if len(req.agents) > 11:
+            raise HTTPException(400, detail="too many agent ids (max 11)")
+        targets = []
+        for sid in req.agents:
+            if not isinstance(sid, str) or not _valid_slot(sid):
+                raise HTTPException(400, detail=f"invalid agent_id '{sid}'")
+            if sid not in targets:
+                targets.append(sid)
+    if not targets:
+        return {"ok": True, "cleared": []}
+    c = await configured_conn()
+    try:
+        placeholders = ",".join("?" * len(targets))
+        cur = await c.execute(
+            f"UPDATE agents SET session_id = NULL WHERE id IN ({placeholders})",
+            targets,
+        )
+        updated = cur.rowcount if cur.rowcount is not None else 0
+        await c.commit()
+    finally:
+        await c.close()
+    now = datetime.now(timezone.utc).isoformat()
+    for sid in targets:
+        await bus.publish(
+            {
+                "ts": now,
+                "agent_id": sid,
+                "type": "session_cleared",
+            }
+        )
+    return {"ok": True, "cleared": targets, "updated": updated}
 
 
 # ------------------------------------------------------------------
