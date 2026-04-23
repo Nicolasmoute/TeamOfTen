@@ -35,6 +35,7 @@ from server.agents import (
     COACH_TICK_PROMPT,
     TEAM_DAILY_CAP_USD,
     _today_spend,
+    cancel_agent,
     coach_tick_loop,
     run_agent,
 )
@@ -359,6 +360,25 @@ async def coach_tick(background: BackgroundTasks) -> dict[str, object]:
         raise HTTPException(409, detail="coach is already working")
     background.add_task(run_agent, "coach", COACH_TICK_PROMPT)
     return {"ok": True, "prompt": COACH_TICK_PROMPT}
+
+
+@app.post("/api/agents/{agent_id}/cancel", dependencies=[Depends(require_token)])
+async def cancel_agent_run(agent_id: str) -> dict[str, object]:
+    """Abort an in-flight SDK query. Returns 409 if the agent isn't
+    currently running, 200 if the cancellation was delivered."""
+    if not (
+        agent_id == "coach"
+        or (
+            agent_id.startswith("p")
+            and agent_id[1:].isdigit()
+            and 1 <= int(agent_id[1:]) <= 10
+        )
+    ):
+        raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
+    cancelled = await cancel_agent(agent_id)
+    if not cancelled:
+        raise HTTPException(409, detail="agent is not currently running")
+    return {"ok": True, "agent_id": agent_id}
 
 
 @app.delete("/api/agents/{agent_id}/session", dependencies=[Depends(require_token)])

@@ -340,6 +340,8 @@ body {
 .env-tl-attention .env-tl-body { color: var(--err); font-weight: 600; }
 .env-tl-assigned { border-left-color: var(--coach); }
 .env-tl-assigned .env-tl-body { color: var(--fg); }
+.env-tl-cancelled { border-left-color: var(--warn); }
+.env-tl-cancelled .env-tl-body { color: var(--warn); }
 
 .env-msg-urgent .env-decision-head { color: var(--err); }
 .env-msg-composer {
@@ -778,6 +780,18 @@ body {
   line-height: 1;
 }
 .pane-close:hover { color: var(--fg); }
+
+.pane-cancel {
+  background: transparent;
+  border: 1px solid var(--err);
+  color: var(--err);
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-size: 11px;
+  cursor: pointer;
+  line-height: 1;
+}
+.pane-cancel:hover { background: rgba(255, 80, 100, 0.15); }
 
 .pane-gear, .pane-export {
   background: transparent;

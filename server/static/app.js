@@ -501,7 +501,8 @@ function App() {
         ev.type === "error" ||
         ev.type === "cost_capped" ||
         ev.type === "session_cleared" ||
-        ev.type === "player_assigned"
+        ev.type === "player_assigned" ||
+        ev.type === "agent_cancelled"
       ) {
         loadAgents();
       }
@@ -1777,6 +1778,7 @@ const TIMELINE_TYPES = new Set([
   "decision_written",
   "human_attention",
   "player_assigned",
+  "agent_cancelled",
 ]);
 
 function EnvTimelineSection({ conversations }) {
@@ -1915,6 +1917,13 @@ function EnvTimelineItem({ event }) {
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
       <span class="env-tl-body">${urgency} ${subj}</span>
+    </div>`;
+  }
+  if (event.type === "agent_cancelled") {
+    return html`<div class="env-tl-item env-tl-cancelled">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">⏹ cancelled</span>
     </div>`;
   }
   if (event.type === "player_assigned") {
@@ -2218,6 +2227,15 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
               >×</button>`
           : null}
         <span class="pane-cost">$${cost.toFixed(3)}</span>
+        ${status === "working"
+          ? html`<button
+              class="pane-cancel"
+              onClick=${async () => {
+                await authFetch("/api/agents/" + slot + "/cancel", { method: "POST" });
+              }}
+              title="Cancel the in-flight turn"
+            >⏹</button>`
+          : null}
         ${hasSettingOverride(paneSettings)
           ? html`<span class="pane-setting-dot" title="pane overrides active" />`
           : null}

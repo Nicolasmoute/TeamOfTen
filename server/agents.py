@@ -89,6 +89,25 @@ async def _set_status(agent_id: str, status: str) -> None:
 AGENT_DAILY_CAP_USD = float(os.environ.get("HARNESS_AGENT_DAILY_CAP", "5.0"))
 TEAM_DAILY_CAP_USD = float(os.environ.get("HARNESS_TEAM_DAILY_CAP", "20.0"))
 
+# Currently-running agent tasks, keyed by slot id. Used by the cancel
+# endpoint to abort a spiraling run without waiting for max_turns / cap.
+# Populated by run_agent; cleared on completion (success or error).
+_running_tasks: dict[str, asyncio.Task[Any]] = {}
+
+
+async def cancel_agent(agent_id: str) -> bool:
+    """Cancel the in-flight SDK query for `agent_id`, if any. Returns
+    True if a task was cancelled, False if the agent wasn't running.
+
+    The cancellation propagates as asyncio.CancelledError up through
+    the `async for msg in query(...)` loop — run_agent's exception
+    handler catches it, emits an 'error' event, and sets status=error."""
+    task = _running_tasks.get(agent_id)
+    if task is None or task.done():
+        return False
+    task.cancel()
+    return True
+
 # Standard prompt the autonomous loop and POST /api/coach/tick both
 # send to Coach. Kept here so callers stay in sync.
 COACH_TICK_PROMPT = (
@@ -353,6 +372,13 @@ async def run_agent(
 
     options = ClaudeAgentOptions(**options_kwargs)
 
+    # Register this task so POST /api/agents/<id>/cancel can abort it.
+    # current_task() works here because run_agent is always invoked via
+    # asyncio.create_task (directly or via BackgroundTasks).
+    this_task = asyncio.current_task()
+    if this_task is not None:
+        _running_tasks[agent_id] = this_task
+
     try:
         async for msg in query(prompt=prompt, options=options):
             if isinstance(msg, AssistantMessage):
@@ -393,11 +419,23 @@ async def run_agent(
                 )
                 await _add_cost(agent_id, cost)
                 await _set_session_id(agent_id, session_id)
+    except asyncio.CancelledError:
+        # User (or the cost cap) asked us to stop. Emit a distinct
+        # event so the timeline shows "cancelled" rather than a
+        # generic error, set status back to idle, and re-raise so the
+        # task ends in the cancelled state.
+        await _emit(agent_id, "agent_cancelled")
+        await _set_status(agent_id, "idle")
+        _running_tasks.pop(agent_id, None)
+        await _emit(agent_id, "agent_stopped")
+        raise
     except Exception as e:
         await _emit(agent_id, "error", error=f"{type(e).__name__}: {e}")
         await _set_status(agent_id, "error")
     else:
         await _set_status(agent_id, "idle")
+    finally:
+        _running_tasks.pop(agent_id, None)
 
     await _emit(agent_id, "agent_stopped")
 
