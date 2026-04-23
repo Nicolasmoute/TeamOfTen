@@ -24,6 +24,7 @@ from claude_agent_sdk import (
 from server.context import build_system_prompt_suffix
 from server.db import configured_conn
 from server.events import bus
+from server.mcp_config import load_external_servers
 from server.tools import ALLOWED_COACH_TOOLS, ALLOWED_PLAYER_TOOLS, build_coord_server
 from server.workspaces import workspace_dir
 
@@ -619,7 +620,16 @@ async def run_agent(
     )
 
     coord_server = build_coord_server(agent_id)
-    allowed = ALLOWED_COACH_TOOLS if agent_id == "coach" else ALLOWED_PLAYER_TOOLS
+    allowed = list(
+        ALLOWED_COACH_TOOLS if agent_id == "coach" else ALLOWED_PLAYER_TOOLS
+    )
+    # External MCP servers (GitHub / Linear / Notion / …) come from
+    # HARNESS_MCP_CONFIG. Loaded fresh each spawn so edits to the
+    # config file take effect on the next turn with no restart. Empty
+    # when no config — existing coord-only behavior preserved.
+    external_servers, external_tools = load_external_servers()
+    allowed.extend(external_tools)
+    mcp_servers: dict[str, Any] = {"coord": coord_server, **external_servers}
 
     # Governance-layer docs (CLAUDE.md / skills / rules) from kDrive/disk.
     # Appended to the hardcoded role brief so context edits take effect on
@@ -652,7 +662,7 @@ async def run_agent(
         system_prompt=system_prompt,
         cwd=str(workspace_dir(agent_id)),
         max_turns=10,
-        mcp_servers={"coord": coord_server},
+        mcp_servers=mcp_servers,
         allowed_tools=allowed,
     )
     # Partial-message streaming (token-by-token text + thinking deltas)
