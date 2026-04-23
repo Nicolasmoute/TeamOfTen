@@ -1669,6 +1669,68 @@ function AgentPane({ slot, agent, liveEvents, onClose, onMoveBefore }) {
     [submit]
   );
 
+  const exportMarkdown = useCallback(() => {
+    const lines = [];
+    const name = agent?.name ? ` — ${agent.name}` : "";
+    const role = agent?.role ? ` (${agent.role})` : "";
+    lines.push(`# ${slot}${name}${role}`);
+    lines.push(`Exported ${new Date().toISOString()}`);
+    lines.push(`Events: ${allEvents.length}`);
+    lines.push("");
+    for (const ev of allEvents) {
+      const ts = (ev.ts || "").slice(0, 19).replace("T", " ");
+      lines.push(`## [${ts}] ${ev.type}`);
+      if (ev.type === "agent_started") {
+        lines.push("", "> " + (ev.prompt || "").split("\n").join("\n> "));
+      } else if (ev.type === "text") {
+        lines.push("", ev.content || "");
+      } else if (ev.type === "tool_use") {
+        lines.push("", "**" + (ev.name || "tool") + "**");
+        lines.push("```json");
+        lines.push(JSON.stringify(ev.input || {}, null, 2));
+        lines.push("```");
+        if (ev.__result) {
+          const body = typeof ev.__result.content === "string"
+            ? ev.__result.content
+            : JSON.stringify(ev.__result.content || "");
+          lines.push(ev.__result.is_error ? "*(error)*" : "");
+          lines.push("```");
+          lines.push(body.slice(0, 4000));
+          lines.push("```");
+        }
+      } else if (ev.type === "tool_result") {
+        const body = typeof ev.content === "string" ? ev.content : JSON.stringify(ev.content || "");
+        lines.push("", "```");
+        lines.push(body.slice(0, 4000));
+        lines.push("```");
+      } else if (ev.type === "result") {
+        lines.push("", `_duration ${ev.duration_ms || "?"} ms · cost $${(ev.cost_usd || 0).toFixed(4)}${ev.session_id ? " · session " + ev.session_id : ""}_`);
+      } else if (ev.type === "error") {
+        lines.push("", "```");
+        lines.push(ev.error || "");
+        lines.push("```");
+      } else {
+        // Generic fallback: dump the non-envelope fields.
+        const { ts: _t, agent_id: _a, type: _ty, __id: _i, __result: _r, ...rest } = ev;
+        lines.push("", "```json");
+        lines.push(JSON.stringify(rest, null, 2));
+        lines.push("```");
+      }
+      lines.push("");
+    }
+    const blob = new Blob([lines.join("\n")], { type: "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    a.download = `${slot}-${stamp}.md`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Revoke after a tick so the browser has had a chance to download.
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }, [allEvents, slot, agent]);
+
   const displayName = agent?.name || (agent?.kind === "player" ? "unassigned" : slot);
   const status = agent?.status || "stopped";
   const cost = Number(agent?.cost_estimate_usd || 0);
@@ -1707,6 +1769,12 @@ function AgentPane({ slot, agent, liveEvents, onClose, onMoveBefore }) {
         ${hasSettingOverride(paneSettings)
           ? html`<span class="pane-setting-dot" title="pane overrides active" />`
           : null}
+        <button
+          class="pane-export"
+          onClick=${exportMarkdown}
+          title="Export conversation as markdown"
+          disabled=${allEvents.length === 0}
+        >↓</button>
         <button
           class="pane-gear"
           onClick=${() => setSettingsOpen((v) => !v)}

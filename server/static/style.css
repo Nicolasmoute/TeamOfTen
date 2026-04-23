@@ -673,7 +673,7 @@ body {
 }
 .pane-close:hover { color: var(--fg); }
 
-.pane-gear {
+.pane-gear, .pane-export {
   background: transparent;
   border: 0;
   color: var(--muted);
@@ -682,7 +682,8 @@ body {
   padding: 0 4px;
   line-height: 1;
 }
-.pane-gear:hover { color: var(--fg); }
+.pane-gear:hover, .pane-export:hover { color: var(--fg); }
+.pane-export:disabled { opacity: 0.3; cursor: not-allowed; }
 .pane-setting-dot {
   width: 6px; height: 6px;
   border-radius: 50%;
