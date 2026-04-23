@@ -113,6 +113,31 @@ class KDriveClient:
             logger.exception("kDrive write_bytes failed: %s", full_path)
             return False
 
+    async def list_dir(self, relative_path: str) -> list[str]:
+        """List filenames (basenames, not full paths) under
+        `{ROOT_PATH}/{relative_path}`. Returns [] on any failure or if
+        the directory is missing — callers shouldn't have to catch."""
+        if not self._enabled:
+            return []
+        full_path = str(PurePosixPath(ROOT_PATH) / relative_path)
+        try:
+            return await asyncio.to_thread(self._list_dir_sync, full_path)
+        except Exception:
+            logger.exception("kDrive list_dir failed: %s", full_path)
+            return []
+
+    async def remove(self, relative_path: str) -> bool:
+        """Delete a single file at `{ROOT_PATH}/{relative_path}`."""
+        if not self._enabled:
+            return False
+        full_path = str(PurePosixPath(ROOT_PATH) / relative_path)
+        try:
+            await asyncio.to_thread(self._client.remove, full_path)
+            return True
+        except Exception:
+            logger.exception("kDrive remove failed: %s", full_path)
+            return False
+
     # ---------- sync helpers (run in a thread) ----------
 
     def _write_sync(self, full_path: str, content: str) -> None:
@@ -130,6 +155,24 @@ class KDriveClient:
             full_path,
             overwrite=True,
         )
+
+    def _list_dir_sync(self, full_path: str) -> list[str]:
+        # webdav4 ls returns entries with full hrefs; we just want
+        # basenames so callers can re-join under their own root.
+        try:
+            entries = self._client.ls(full_path, detail=False)
+        except Exception as e:
+            # 404 → directory doesn't exist yet (e.g. first-ever snapshot
+            # cycle). Return empty silently; anything else propagates.
+            if "404" in str(e):
+                return []
+            raise
+        out: list[str] = []
+        for e in entries:
+            name = PurePosixPath(str(e)).name
+            if name:
+                out.append(name)
+        return out
 
     def _ensure_dir_sync(self, path: str) -> None:
         # Walk each segment, mkdir if missing. webdav4 doesn't have a

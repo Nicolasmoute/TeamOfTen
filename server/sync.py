@@ -42,6 +42,11 @@ FLUSH_INTERVAL_SECONDS = int(
 SNAPSHOT_INTERVAL_SECONDS = int(
     os.environ.get("HARNESS_KDRIVE_SNAPSHOT_INTERVAL", "3600")
 )
+# How many DB snapshots to keep on kDrive. Older ones are deleted after
+# each successful upload. 48 = ~2 days of hourly snapshots.
+SNAPSHOT_RETENTION = int(
+    os.environ.get("HARNESS_KDRIVE_SNAPSHOT_RETENTION", "48")
+)
 
 
 def _utc_midnight_of(day: datetime) -> datetime:
@@ -172,8 +177,33 @@ async def snapshot_db() -> int:
     ok = await kdrive.write_bytes(remote, data)
     if ok:
         logger.info("snapshot: %d bytes → kdrive %s", len(data), remote)
+        await _prune_snapshots()
         return len(data)
     return -1
+
+
+async def _prune_snapshots() -> None:
+    """Keep at most SNAPSHOT_RETENTION snapshots on kDrive. Filenames
+    sort lexicographically by ISO timestamp, so newest = greatest.
+
+    Best-effort; failures are logged and ignored — the next cycle will
+    try again. SNAPSHOT_RETENTION <= 0 disables pruning."""
+    if SNAPSHOT_RETENTION <= 0:
+        return
+    try:
+        names = await kdrive.list_dir("snapshots")
+    except Exception:
+        logger.exception("snapshot prune: list failed")
+        return
+    snaps = sorted(n for n in names if n.endswith(".db"))
+    excess = len(snaps) - SNAPSHOT_RETENTION
+    if excess <= 0:
+        return
+    to_delete = snaps[:excess]
+    for name in to_delete:
+        ok = await kdrive.remove(f"snapshots/{name}")
+        if ok:
+            logger.info("snapshot prune: removed %s", name)
 
 
 async def snapshot_loop() -> None:
