@@ -569,9 +569,98 @@ function EnvPane({ agents, tasks, conversations, serverStatus, onCreateTask, onC
       <div class="env-body">
         <${EnvTasksSection} tasks=${tasks} onCreate=${onCreateTask} />
         <${EnvCostSection} agents=${agents} serverStatus=${serverStatus} />
+        <${EnvDecisionsSection} conversations=${conversations} />
         <${EnvTimelineSection} conversations=${conversations} />
       </div>
     </aside>
+  `;
+}
+
+function EnvDecisionsSection({ conversations }) {
+  const [decisions, setDecisions] = useState([]);
+  const [exists, setExists] = useState(true);
+  const [openFile, setOpenFile] = useState(null);
+  const [openBody, setOpenBody] = useState("");
+
+  const load = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/decisions");
+      if (!res.ok) return;
+      const data = await res.json();
+      setDecisions(data.decisions || []);
+      setExists(data.exists !== false);
+    } catch (e) {
+      console.error("loadDecisions failed", e);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Refresh when a Coach writes a new decision (decision_written events
+  // arrive across all conversations; trigger on any of them).
+  const decisionEventCount = useMemo(() => {
+    let n = 0;
+    for (const list of conversations.values()) {
+      for (const ev of list) if (ev.type === "decision_written") n++;
+    }
+    return n;
+  }, [conversations]);
+  useEffect(() => {
+    if (decisionEventCount > 0) load();
+  }, [decisionEventCount, load]);
+
+  const toggle = useCallback(async (filename) => {
+    if (openFile === filename) {
+      setOpenFile(null);
+      setOpenBody("");
+      return;
+    }
+    setOpenFile(filename);
+    setOpenBody("loading…");
+    try {
+      const res = await authFetch("/api/decisions/" + encodeURIComponent(filename));
+      if (!res.ok) {
+        setOpenBody("(failed to load: HTTP " + res.status + ")");
+        return;
+      }
+      const data = await res.json();
+      setOpenBody(data.content || "");
+    } catch (e) {
+      setOpenBody("(failed to load: " + e + ")");
+    }
+  }, [openFile]);
+
+  return html`
+    <section class="env-section">
+      <h3 class="env-section-title">
+        Decisions <span class="env-count">${decisions.length}</span>
+      </h3>
+      ${!exists
+        ? html`<div class="env-cost-hint">
+            (no decisions written yet — Coach uses coord_write_decision)
+          </div>`
+        : decisions.length === 0
+        ? html`<div class="env-empty">(empty)</div>`
+        : html`<div class="env-decision-list">
+            ${decisions.map(
+              (d) => html`
+                <div class="env-decision" key=${d.filename}>
+                  <button
+                    class="env-decision-head"
+                    onClick=${() => toggle(d.filename)}
+                  >
+                    <span class="env-decision-arrow">${openFile === d.filename ? "▾" : "▸"}</span>
+                    <span class="env-decision-title">${d.title}</span>
+                    <span class="env-decision-meta">${d.filename.slice(0, 10)}</span>
+                  </button>
+                  ${openFile === d.filename
+                    ? html`<pre class="env-decision-body">${openBody}</pre>`
+                    : null}
+                </div>
+              `
+            )}
+          </div>`}
+    </section>
   `;
 }
 

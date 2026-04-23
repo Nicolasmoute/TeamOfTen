@@ -219,6 +219,44 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* ---- env decisions ---- */
+.env-decision-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.env-decision-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  background: transparent;
+  border: 0;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  padding: 4px 0;
+  cursor: pointer;
+}
+.env-decision-head:hover { color: var(--coach); }
+.env-decision-arrow { color: var(--muted); width: 10px; flex-shrink: 0; }
+.env-decision-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.env-decision-meta { color: var(--muted); font-size: 10px; flex-shrink: 0; }
+.env-decision-body {
+  margin: 4px 0 8px 16px;
+  padding: 8px 10px;
+  background: var(--card);
+  border-left: 2px solid var(--coach);
+  border-radius: 0 3px 3px 0;
+  font-size: 11px;
+  color: var(--fg);
+  white-space: pre-wrap;
+  max-height: 300px;
+  overflow-y: auto;
+  line-height: 1.5;
+}
+
 /* ---- env timeline ---- */
 .env-timeline-section .env-timeline {
   display: flex;
