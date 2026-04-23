@@ -792,12 +792,110 @@ function EnvPane({ agents, tasks, conversations, serverStatus, onCreateTask, onC
         <button class="env-close" onClick=${onClose} title="Collapse">×</button>
       </header>
       <div class="env-body">
+        <${EnvAttentionSection} conversations=${conversations} />
         <${EnvTasksSection} tasks=${tasks} onCreate=${onCreateTask} />
         <${EnvCostSection} agents=${agents} serverStatus=${serverStatus} />
         <${EnvDecisionsSection} conversations=${conversations} />
         <${EnvTimelineSection} conversations=${conversations} />
       </div>
     </aside>
+  `;
+}
+
+// Human-attention escalations emitted by coord_request_human. The UI
+// surfaces them prominently until the user clicks "dismiss" — dismissal
+// is local-only (by __id in localStorage), because the DB event is an
+// immutable historical record.
+const ATTENTION_DISMISSED_KEY = "harness_attention_dismissed_v1";
+
+function loadDismissedAttention() {
+  try {
+    const raw = localStorage.getItem(ATTENTION_DISMISSED_KEY);
+    return new Set(raw ? JSON.parse(raw) : []);
+  } catch (_) {
+    return new Set();
+  }
+}
+
+function saveDismissedAttention(ids) {
+  try {
+    // Cap retained ids to the most recent 200 so this doesn't grow
+    // without bound.
+    const arr = Array.from(ids).slice(-200);
+    localStorage.setItem(ATTENTION_DISMISSED_KEY, JSON.stringify(arr));
+  } catch (_) {
+    // disabled localStorage — silent no-op.
+  }
+}
+
+function EnvAttentionSection({ conversations }) {
+  const [dismissed, setDismissed] = useState(() => loadDismissedAttention());
+
+  const open = useMemo(() => {
+    const out = [];
+    for (const list of conversations.values()) {
+      for (const ev of list) {
+        if (ev.type !== "human_attention") continue;
+        const key = ev.__id != null ? String(ev.__id) : `${ev.ts}:${ev.agent_id}`;
+        if (dismissed.has(key)) continue;
+        out.push({ ...ev, __key: key });
+      }
+    }
+    // Newest first — user sees the most urgent escalation at the top.
+    out.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
+    return out;
+  }, [conversations, dismissed]);
+
+  const dismiss = useCallback((key) => {
+    setDismissed((prev) => {
+      const next = new Set(prev);
+      next.add(key);
+      saveDismissedAttention(next);
+      return next;
+    });
+  }, []);
+  const dismissAll = useCallback(() => {
+    setDismissed((prev) => {
+      const next = new Set(prev);
+      for (const ev of open) next.add(ev.__key);
+      saveDismissedAttention(next);
+      return next;
+    });
+  }, [open]);
+
+  if (open.length === 0) return null;
+
+  return html`
+    <section class="env-section env-attention">
+      <h3 class="env-section-title">
+        ⚠ Attention <span class="env-count">${open.length}</span>
+        <button class="env-attention-dismiss-all" onClick=${dismissAll}
+          title="Dismiss all escalations">dismiss all</button>
+      </h3>
+      <div class="env-attention-list">
+        ${open.map(
+          (ev) => html`
+            <div
+              class=${"env-attention-item " + (ev.urgency === "blocker" ? "blocker" : "normal")}
+              key=${ev.__key}
+            >
+              <div class="env-attention-head">
+                <span class="env-attention-who">${ev.agent_id}</span>
+                ${ev.urgency === "blocker"
+                  ? html`<span class="env-attention-pill">BLOCKER</span>`
+                  : null}
+                <span class="env-attention-ts">${(ev.ts || "").slice(11, 16)}</span>
+                <button class="env-attention-dismiss"
+                  onClick=${() => dismiss(ev.__key)}
+                  title="Dismiss">×</button>
+              </div>
+              <div class="env-attention-subject">${ev.subject}</div>
+              <div class="env-attention-body">${ev.body}</div>
+            </div>
+          `
+        )}
+      </div>
+    </section>
   `;
 }
 
@@ -1051,6 +1149,7 @@ const TIMELINE_TYPES = new Set([
   "cost_capped",
   "commit_pushed",
   "decision_written",
+  "human_attention",
 ]);
 
 function EnvTimelineSection({ conversations }) {
@@ -1179,6 +1278,15 @@ function EnvTimelineItem({ event }) {
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
       <span class="env-tl-body">✎ decision: ${event.title}</span>
+    </div>`;
+  }
+  if (event.type === "human_attention") {
+    const urgency = event.urgency === "blocker" ? "⛔" : "⚠";
+    const subj = (event.subject || "").slice(0, 80);
+    return html`<div class="env-tl-item env-tl-attention">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">${urgency} ${subj}</span>
     </div>`;
   }
   if (event.type === "cost_capped") {

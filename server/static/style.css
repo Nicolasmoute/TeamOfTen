@@ -312,6 +312,93 @@ body {
 .env-tl-capped .env-tl-body { color: var(--err); white-space: normal; }
 .env-tl-commit { border-left-color: var(--accent); }
 .env-tl-commit .env-tl-body { color: var(--accent); }
+.env-tl-attention { border-left-color: var(--err); background: #2c1a22; }
+.env-tl-attention .env-tl-body { color: var(--err); font-weight: 600; }
+
+/* Pinned attention section: banner above the other env sections when
+   any undismissed human_attention events are live. */
+.env-section.env-attention {
+  background: #2c1a22;
+  border: 1px solid var(--err);
+  border-radius: 6px;
+  padding: 8px 10px 10px;
+  margin-bottom: 10px;
+}
+.env-section.env-attention .env-section-title {
+  color: var(--err);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.env-attention-dismiss-all {
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid var(--err);
+  color: var(--err);
+  border-radius: 3px;
+  font-size: 10px;
+  padding: 1px 6px;
+  cursor: pointer;
+}
+.env-attention-dismiss-all:hover { background: rgba(255, 80, 100, 0.1); }
+.env-attention-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.env-attention-item {
+  background: #1a0f13;
+  border-left: 3px solid var(--err);
+  padding: 6px 8px;
+  border-radius: 3px;
+}
+.env-attention-item.blocker {
+  border-left-width: 5px;
+  background: #33131c;
+}
+.env-attention-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.env-attention-who { color: var(--fg); font-weight: 600; }
+.env-attention-pill {
+  background: var(--err);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 2px;
+  letter-spacing: 0.5px;
+}
+.env-attention-ts { color: var(--muted); }
+.env-attention-dismiss {
+  margin-left: auto;
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 3px;
+}
+.env-attention-dismiss:hover { color: var(--err); }
+.env-attention-subject {
+  margin-top: 3px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.env-attention-body {
+  margin-top: 3px;
+  color: var(--fg);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 140px;
+  overflow-y: auto;
+}
 
 /* cost cap progress bar */
 .env-cap-bar { margin-bottom: 8px; }
