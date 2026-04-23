@@ -13,9 +13,19 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# Docs + specs (big, not needed at runtime)
+# Docs + specs (not needed at runtime — agents read them from GitHub
+# or the knowledge bucket if they want reference)
 CLAUDE.md
+README.md
+TOT-specs.md
 Docs/
+
+# CI / dev infra
+.github/
+scripts/
+
+# Example configs (templates, not loaded by the app)
+mcp-servers.example.json
 
 # M-1 spike artifacts (not part of the real harness)
 spike/
