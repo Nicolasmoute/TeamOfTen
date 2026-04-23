@@ -1456,6 +1456,20 @@ body {
 .event.task_assigned { border-color: var(--warn); color: var(--muted); font-size: 12px; }
 .event.message_sent { border-color: var(--tool); font-size: 12px; }
 .event.message_sent .event-body { color: var(--fg); margin-top: 2px; }
+
+/* System / progress events — single line, muted so they fade into
+   the background vs. the main assistant text. Same shape as other
+   .event entries but collapsed padding. */
+.event.sys {
+  border-color: var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  padding: 2px 10px;
+}
+.event.sys .event-meta {
+  color: var(--muted);
+  margin-bottom: 0;
+}
 .event.agent_started,
 .event.agent_stopped,
 .event.connected { color: var(--muted); font-size: 12px; }

@@ -3983,6 +3983,121 @@ function EventItem({ event }) {
     </div>`;
   }
 
+  // Compact renderers for system / progress events. Kept on a single
+  // line so they don't dominate the pane — no raw JSON dumps. Each
+  // still carries enough info that the reader can track what happened
+  // without digging into the EnvPane timeline.
+  if (type === "task_claimed") {
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ${event.agent_id} claimed ${event.task_id}</div>
+    </div>`;
+  }
+
+  if (type === "task_updated") {
+    const arrow = `${event.old_status} → ${event.new_status}`;
+    const note = event.note ? ` — ${event.note}` : "";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ${event.task_id}: ${arrow}${note}</div>
+    </div>`;
+  }
+
+  if (type === "memory_updated") {
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · memory/${event.topic} v${event.version} (${event.size} chars)</div>
+    </div>`;
+  }
+
+  if (type === "knowledge_written") {
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · knowledge/${event.path} (${event.size} chars)</div>
+    </div>`;
+  }
+
+  if (type === "decision_written") {
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · decision: ${event.title}</div>
+    </div>`;
+  }
+
+  if (type === "context_updated" || type === "context_deleted") {
+    const verb = type === "context_deleted" ? "deleted" : "updated";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · context/${event.kind}/${event.name} ${verb}</div>
+    </div>`;
+  }
+
+  if (type === "file_written") {
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ${event.root}/${event.path} saved (${event.size} b)</div>
+    </div>`;
+  }
+
+  if (type === "player_assigned") {
+    const bits = [];
+    if (event.name) bits.push(`name=${event.name}`);
+    if (event.role) bits.push(`role="${event.role}"`);
+    const src = event.auto ? " (auto)" : "";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ${event.agent_id}: ${bits.join(" ") || "cleared"}${src}</div>
+    </div>`;
+  }
+
+  if (type === "session_cleared" || type === "session_resume_failed") {
+    const msg = type === "session_cleared"
+      ? "session cleared"
+      : `session resume failed · ${event.error || ""}`;
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ${msg}</div>
+    </div>`;
+  }
+
+  if (type === "commit_pushed") {
+    const push = event.pushed ? "↑" : event.push_requested ? "✗push" : "local";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ${event.sha} ${push} — ${event.message}</div>
+    </div>`;
+  }
+
+  if (type === "coach_loop_changed") {
+    const s = event.interval_seconds;
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · coach autoloop ${s > 0 ? `every ${s}s` : "OFF"}</div>
+    </div>`;
+  }
+
+  if (type === "human_attention") {
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ⚠ human attention: ${event.subject || ""}</div>
+    </div>`;
+  }
+
+  if (type === "paused" || type === "pause_toggled") {
+    const body = type === "pause_toggled"
+      ? (event.paused ? "harness paused" : "harness resumed")
+      : "spawn blocked — harness is paused";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ${body}</div>
+    </div>`;
+  }
+
+  if (type === "cost_capped") {
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · cost cap · ${event.reason || ""}</div>
+    </div>`;
+  }
+
+  if (type === "agent_cancelled") {
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · cancelled</div>
+    </div>`;
+  }
+
+  if (type === "brief_updated") {
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · brief updated (${event.size} chars)</div>
+    </div>`;
+  }
+
   if (type === "task_assigned") {
     // Shows in both Coach's pane (as actor) and the assignee's pane
     // (fan-out). "from → to" phrasing keeps the direction readable
