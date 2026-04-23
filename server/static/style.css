@@ -1252,6 +1252,24 @@ body {
   font-size: 11px;
   padding-left: 24px;
 }
+.pane-settings-input {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 3px 6px;
+  font: inherit;
+  font-size: 12px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.pane-settings-identity-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: -4px;
+  margin-bottom: 2px;
+}
+
 .pane-settings-brief {
   flex-direction: column;
   align-items: stretch;

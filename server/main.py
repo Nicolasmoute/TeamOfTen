@@ -470,6 +470,57 @@ async def cancel_agent_run(agent_id: str) -> dict[str, object]:
     return {"ok": True, "agent_id": agent_id}
 
 
+class AgentIdentityWrite(BaseModel):
+    name: str | None = Field(None, description="Short display name; '' clears.")
+    role: str | None = Field(None, description="One-line role tag shown in the pane header; '' clears.")
+
+
+@app.put("/api/agents/{agent_id}/identity", dependencies=[Depends(require_token)])
+async def set_agent_identity(agent_id: str, req: AgentIdentityWrite) -> dict[str, object]:
+    """Human upsert for name + role. Either field omitted → left alone;
+    passed as empty string → cleared (column set to NULL). Emits
+    'player_assigned' with auto:false so the UI refreshes live."""
+    if not (agent_id == "coach" or (agent_id.startswith("p") and agent_id[1:].isdigit() and 1 <= int(agent_id[1:]) <= 10)):
+        raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
+    sets = []
+    vals: list[object] = []
+    if req.name is not None:
+        if len(req.name) > 60:
+            raise HTTPException(400, detail="name too long (max 60 chars)")
+        sets.append("name = ?")
+        vals.append(req.name if req.name else None)
+    if req.role is not None:
+        if len(req.role) > 120:
+            raise HTTPException(400, detail="role too long (max 120 chars)")
+        sets.append("role = ?")
+        vals.append(req.role if req.role else None)
+    if not sets:
+        return {"ok": True, "agent_id": agent_id, "changed": 0}
+    c = await configured_conn()
+    try:
+        vals.append(agent_id)
+        cur = await c.execute(
+            f"UPDATE agents SET {', '.join(sets)} WHERE id = ?", tuple(vals)
+        )
+        changed = cur.rowcount
+        await c.commit()
+    finally:
+        await c.close()
+    if changed == 0:
+        raise HTTPException(404, detail=f"agent {agent_id} not found")
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": agent_id,
+            "type": "player_assigned",
+            "name": req.name,
+            "role": req.role,
+            "auto": False,
+        }
+    )
+    return {"ok": True, "agent_id": agent_id, "changed": changed}
+
+
 class AgentBriefWrite(BaseModel):
     brief: str = Field(..., description="Free-form context text; empty string clears.")
 

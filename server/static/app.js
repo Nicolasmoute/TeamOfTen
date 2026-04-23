@@ -292,13 +292,33 @@ function savePaneSettings(slot, settings) {
   }
 }
 
-function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief }) {
+function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, initialName, initialRole }) {
   const effort = settings.effort || 0; // 0 = default (server decides)
   const rootRef = useRef(null);
   const [briefDraft, setBriefDraft] = useState(initialBrief || "");
   const [briefSaving, setBriefSaving] = useState(false);
   const [briefSavedAt, setBriefSavedAt] = useState(null);
   const briefDirty = briefDraft !== (initialBrief || "");
+  const [nameDraft, setNameDraft] = useState(initialName || "");
+  const [roleDraft, setRoleDraft] = useState(initialRole || "");
+  const [identitySaving, setIdentitySaving] = useState(false);
+  const identityDirty =
+    nameDraft !== (initialName || "") || roleDraft !== (initialRole || "");
+  const saveIdentity = useCallback(async () => {
+    if (!slot) return;
+    setIdentitySaving(true);
+    try {
+      await authFetch("/api/agents/" + slot + "/identity", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: nameDraft, role: roleDraft }),
+      });
+    } catch (e) {
+      console.error("identity save failed", e);
+    } finally {
+      setIdentitySaving(false);
+    }
+  }, [slot, nameDraft, roleDraft]);
   const saveBrief = useCallback(async () => {
     if (!slot) return;
     setBriefSaving(true);
@@ -330,6 +350,38 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief }
   }, [onClose]);
   return html`
     <div class="pane-settings-pop" ref=${rootRef} onClick=${(e) => e.stopPropagation()}>
+      <!-- Identity: name + role. Distinct from the brief below — these
+           are short display labels shown in the pane header; the brief
+           is the long context string that lands in the system prompt. -->
+      <div class="pane-settings-row">
+        <label class="pane-settings-label">Name</label>
+        <input
+          class="pane-settings-input"
+          placeholder=${slot === "coach" ? "Coach" : "e.g. Rabil"}
+          value=${nameDraft}
+          onInput=${(e) => setNameDraft(e.target.value)}
+          maxlength="60"
+        />
+      </div>
+      <div class="pane-settings-row">
+        <label class="pane-settings-label">Role</label>
+        <input
+          class="pane-settings-input"
+          placeholder=${slot === "coach" ? "Team captain" : "e.g. Frontend dev"}
+          value=${roleDraft}
+          onInput=${(e) => setRoleDraft(e.target.value)}
+          maxlength="120"
+        />
+      </div>
+      ${identityDirty
+        ? html`<div class="pane-settings-identity-actions">
+            <button
+              class="pane-settings-brief-save"
+              onClick=${saveIdentity}
+              disabled=${identitySaving}
+            >${identitySaving ? "saving…" : "save name + role"}</button>
+          </div>`
+        : null}
       <div class="pane-settings-row">
         <label class="pane-settings-label">Model</label>
         <select
@@ -3567,6 +3619,8 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
               onChange=${setPaneSettings}
               slot=${slot}
               initialBrief=${agent?.brief || ""}
+              initialName=${agent?.name || ""}
+              initialRole=${agent?.role || ""}
               onClose=${() => setSettingsOpen(false)}
             />`
           : null}

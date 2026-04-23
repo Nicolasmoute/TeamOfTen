@@ -56,10 +56,15 @@ class KDriveClient:
         self._enabled = False
         self._reason: str = ""
 
-        if not (WEBDAV_URL and WEBDAV_USER and WEBDAV_PASS):
-            self._reason = (
-                "KDRIVE_WEBDAV_URL / KDRIVE_USER / KDRIVE_APP_PASSWORD not all set"
-            )
+        missing: list[str] = []
+        if not WEBDAV_URL:
+            missing.append("KDRIVE_WEBDAV_URL")
+        if not WEBDAV_USER:
+            missing.append("KDRIVE_USER")
+        if not WEBDAV_PASS:
+            missing.append("KDRIVE_APP_PASSWORD")
+        if missing:
+            self._reason = f"missing env: {', '.join(missing)}"
             logger.info("kDrive disabled: %s", self._reason)
             return
         if _WebDAVClient is None:
