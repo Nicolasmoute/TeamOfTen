@@ -72,6 +72,78 @@ def _stringify_tool_result(content: Any) -> str:
     return str(content)[:_TOOL_RESULT_CAP]
 
 
+async def _handle_message(agent_id: str, msg: Any) -> None:
+    """Turn one SDK message into one or more bus events.
+
+    Extracted from run_agent so the stale-session retry path can
+    reuse it without duplicating the dispatch chain. Unknown message
+    types are silently skipped — future SDK additions won't break us.
+    """
+    if isinstance(msg, AssistantMessage):
+        for block in msg.content:
+            if isinstance(block, TextBlock):
+                await _emit(agent_id, "text", content=block.text)
+            elif isinstance(block, ThinkingBlock):
+                # Final consolidated thinking content — surfaces as a
+                # collapsible card in the UI.
+                await _emit(agent_id, "thinking", content=block.thinking)
+            elif isinstance(block, ToolUseBlock):
+                await _emit(
+                    agent_id, "tool_use",
+                    id=block.id, name=block.name, input=block.input,
+                )
+    elif isinstance(msg, StreamEvent):
+        # Partial-message deltas. Only the raw Anthropic streaming
+        # event types we care about get mirrored to WS — the rest
+        # (message_start, content_block_start, message_stop, …) just
+        # consolidate into the AssistantMessage we already handle.
+        evt = getattr(msg, "event", None)
+        if not isinstance(evt, dict):
+            return
+        if evt.get("type") != "content_block_delta":
+            return
+        delta = evt.get("delta") or {}
+        dt = delta.get("type")
+        if dt == "text_delta":
+            text = delta.get("text", "")
+            if text:
+                await _emit(
+                    agent_id, "text_delta",
+                    block_index=evt.get("index"), delta=text,
+                )
+        elif dt == "thinking_delta":
+            text = delta.get("thinking", "")
+            if text:
+                await _emit(
+                    agent_id, "thinking_delta",
+                    block_index=evt.get("index"), delta=text,
+                )
+    elif isinstance(msg, UserMessage):
+        # Carries tool results; we surface them so the UI can pair
+        # each tool_use with its output.
+        for block in msg.content:
+            if isinstance(block, ToolResultBlock):
+                content = _stringify_tool_result(block.content)
+                await _emit(
+                    agent_id, "tool_result",
+                    tool_use_id=block.tool_use_id,
+                    content=content,
+                    is_error=bool(getattr(block, "is_error", False)),
+                )
+    elif isinstance(msg, ResultMessage):
+        cost = getattr(msg, "total_cost_usd", None)
+        session_id = getattr(msg, "session_id", None)
+        await _emit(
+            agent_id, "result",
+            duration_ms=getattr(msg, "duration_ms", None),
+            cost_usd=cost,
+            is_error=msg.is_error,
+            session_id=session_id,
+        )
+        await _add_cost(agent_id, cost)
+        await _set_session_id(agent_id, session_id)
+
+
 async def _set_status(agent_id: str, status: str) -> None:
     if agent_id == "system":
         return
@@ -265,6 +337,28 @@ async def _set_session_id(agent_id: str, session_id: str | None) -> None:
         logger.exception("set_session_id failed: agent=%s", agent_id)
 
 
+async def _clear_session_id(agent_id: str) -> None:
+    """Forget a stored session_id so the next turn starts fresh.
+
+    Used when a `resume=<session>` attempt fails (stale session — e.g.
+    after a CLI re-login or CLI version bump) so we auto-heal instead
+    of staying stuck forever on a bad reference.
+    """
+    if agent_id == "system":
+        return
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE agents SET session_id = NULL WHERE id = ?", (agent_id,)
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("clear_session_id failed: agent=%s", agent_id)
+
+
 def _system_prompt_for(agent_id: str) -> str:
     if agent_id == "coach":
         return (
@@ -450,85 +544,41 @@ async def run_agent(
     if this_task is not None:
         _running_tasks[agent_id] = this_task
 
+    async def _iterate(opts: ClaudeAgentOptions) -> None:
+        # Tiny indirection so we can retry the whole iteration once
+        # after stale-session cleanup without duplicating the body.
+        async for msg in query(prompt=prompt, options=opts):
+            await _handle_message(agent_id, msg)
+
     try:
-        async for msg in query(prompt=prompt, options=options):
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, TextBlock):
-                        await _emit(agent_id, "text", content=block.text)
-                    elif isinstance(block, ThinkingBlock):
-                        # Final consolidated thinking content — surfaces
-                        # as a collapsible card in the UI.
-                        await _emit(
-                            agent_id,
-                            "thinking",
-                            content=block.thinking,
-                        )
-                    elif isinstance(block, ToolUseBlock):
-                        await _emit(
-                            agent_id,
-                            "tool_use",
-                            id=block.id,
-                            name=block.name,
-                            input=block.input,
-                        )
-            elif isinstance(msg, StreamEvent):
-                # Partial-message deltas. Only the raw Anthropic streaming
-                # event types we care about get mirrored to WS — the rest
-                # (message_start, content_block_start, message_stop, …)
-                # just consolidate into the AssistantMessage we already
-                # handle above.
-                evt = getattr(msg, "event", None)
-                if not isinstance(evt, dict):
-                    continue
-                if evt.get("type") != "content_block_delta":
-                    continue
-                delta = evt.get("delta") or {}
-                dt = delta.get("type")
-                if dt == "text_delta":
-                    text = delta.get("text", "")
-                    if text:
-                        await _emit(
-                            agent_id,
-                            "text_delta",
-                            block_index=evt.get("index"),
-                            delta=text,
-                        )
-                elif dt == "thinking_delta":
-                    text = delta.get("thinking", "")
-                    if text:
-                        await _emit(
-                            agent_id,
-                            "thinking_delta",
-                            block_index=evt.get("index"),
-                            delta=text,
-                        )
-            elif isinstance(msg, UserMessage):
-                # Carries tool results; we surface them so the UI can pair
-                # each tool_use with its output.
-                for block in msg.content:
-                    if isinstance(block, ToolResultBlock):
-                        content = _stringify_tool_result(block.content)
-                        await _emit(
-                            agent_id,
-                            "tool_result",
-                            tool_use_id=block.tool_use_id,
-                            content=content,
-                            is_error=bool(getattr(block, "is_error", False)),
-                        )
-            elif isinstance(msg, ResultMessage):
-                cost = getattr(msg, "total_cost_usd", None)
-                session_id = getattr(msg, "session_id", None)
+        try:
+            await _iterate(options)
+        except Exception as e:
+            # Stale session auto-heal: when we tried to resume a prior
+            # session and the CLI rejected it (happens after /login
+            # rotation or CLI upgrade — the session id is a reference
+            # the new CLI can't validate), clear the stored id and
+            # retry once without resume. Only retry when the failure
+            # matches the narrow pattern: we had a prior_session AND
+            # the error came from the SDK subprocess layer.
+            is_process_err = type(e).__name__ == "ProcessError"
+            if prior_session and is_process_err:
+                logger.warning(
+                    "agent %s: resume of session=%s failed, clearing and retrying fresh",
+                    agent_id, prior_session,
+                )
                 await _emit(
                     agent_id,
-                    "result",
-                    duration_ms=getattr(msg, "duration_ms", None),
-                    cost_usd=cost,
-                    is_error=msg.is_error,
-                    session_id=session_id,
+                    "session_resume_failed",
+                    session_id=prior_session,
+                    error=f"{type(e).__name__}: {e}",
                 )
-                await _add_cost(agent_id, cost)
-                await _set_session_id(agent_id, session_id)
+                await _clear_session_id(agent_id)
+                options_kwargs.pop("resume", None)
+                retry_options = ClaudeAgentOptions(**options_kwargs)
+                await _iterate(retry_options)
+            else:
+                raise
     except asyncio.CancelledError:
         # User (or the cost cap) asked us to stop. Emit a distinct
         # event so the timeline shows "cancelled" rather than a
