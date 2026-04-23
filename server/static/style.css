@@ -415,14 +415,27 @@ body {
   font-size: 13px;
   font-style: italic;
 }
+/* A column can hold 1+ panes stacked vertically. Multi-column layouts
+   get horizontal Split.js gutters between .pane-col siblings; stacked
+   columns get vertical Split.js gutters between .pane siblings. */
+.pane-col {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+}
+.pane-col:last-child { border-right: 0; }
+.pane-col + .gutter + .pane-col { border-right: 0; }
+
 .pane {
   display: flex;
   flex-direction: column;
   flex: 1 1 0;
   min-width: 0;
-  border-right: 1px solid var(--border);
+  min-height: 0;
 }
-.pane:last-child { border-right: 0; }
 
 /* ---- Split.js gutter between resizable panes ---- */
 .gutter {
@@ -450,10 +463,24 @@ body {
 .gutter.gutter-horizontal:hover {
   background-color: var(--accent);
 }
-/* Split.js sets inline flex on the siblings — neutralize the static
-   border-right between them since the gutter now provides the visual
-   separator. */
-.pane + .gutter + .pane { border-right: 0; }
+.gutter.gutter-vertical {
+  cursor: row-resize;
+  background-image: linear-gradient(
+    to right,
+    transparent 0,
+    transparent calc(50% - 12px),
+    var(--muted) calc(50% - 12px),
+    var(--muted) calc(50% + 12px),
+    transparent calc(50% + 12px),
+    transparent 100%
+  );
+  background-size: 100% 1px;
+  background-position: 50% 50%;
+  background-repeat: no-repeat;
+}
+.gutter.gutter-vertical:hover {
+  background-color: var(--accent);
+}
 
 .pane-head {
   display: flex;

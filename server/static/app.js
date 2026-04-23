@@ -38,21 +38,49 @@ async function authFetch(url, init) {
 
 const LAYOUT_KEY = "harness_layout_v1";
 
+// openColumns is a 2D array: outer = columns left-to-right; inner = panes
+// stacked top-to-bottom in that column. e.g. [["coach"], ["p1","p2"], ["p3"]]
+// renders as 3 columns: solo Coach | (p1 over p2) | solo p3 — the "H I I H"
+// pattern users want.
+//
+// v1 layouts persisted just openSlots: string[] (flat); we migrate by
+// putting each slot in its own column.
 function loadLayout() {
   try {
     const raw = localStorage.getItem(LAYOUT_KEY);
     if (!raw) return null;
     const v = JSON.parse(raw);
-    // Defensive validation — corrupted payload falls back to defaults.
     if (!v || typeof v !== "object") return null;
-    if (!Array.isArray(v.openSlots)) return null;
+    let openColumns = null;
+    if (Array.isArray(v.openColumns)) {
+      openColumns = v.openColumns
+        .map((col) =>
+          Array.isArray(col)
+            ? col.filter((s) => typeof s === "string").slice(0, 11)
+            : null
+        )
+        .filter((col) => col && col.length > 0)
+        .slice(0, 11);
+    } else if (Array.isArray(v.openSlots)) {
+      openColumns = v.openSlots
+        .filter((s) => typeof s === "string")
+        .slice(0, 11)
+        .map((s) => [s]);
+    }
+    if (!openColumns) return null;
     return {
-      openSlots: v.openSlots.filter((s) => typeof s === "string").slice(0, 11),
+      openColumns,
       envOpen: typeof v.envOpen === "boolean" ? v.envOpen : true,
     };
   } catch (_) {
     return null;
   }
+}
+
+function flatSlots(openColumns) {
+  const out = [];
+  for (const col of openColumns) for (const s of col) out.push(s);
+  return out;
 }
 
 function saveLayout(layout) {
@@ -106,8 +134,8 @@ function App() {
   const [agents, setAgents] = useState([]);
   const [tasks, setTasks] = useState([]);
   // Lazy initializers: loadLayout() runs once per mount, not on every render.
-  const [openSlots, setOpenSlots] = useState(
-    () => loadLayout()?.openSlots ?? ["coach"]
+  const [openColumns, setOpenColumns] = useState(
+    () => loadLayout()?.openColumns ?? [["coach"]]
   );
   const [wsConnected, setWsConnected] = useState(false);
   const [envOpen, setEnvOpen] = useState(
@@ -191,8 +219,8 @@ function App() {
 
   // Persist layout (open slots + env panel state) on every change.
   useEffect(() => {
-    saveLayout({ openSlots, envOpen });
-  }, [openSlots, envOpen]);
+    saveLayout({ openColumns, envOpen });
+  }, [openColumns, envOpen]);
 
   // WebSocket: single connection at app root. On close, schedule a
   // re-open by bumping wsAttempt; the effect re-runs, a new socket opens.
@@ -259,40 +287,111 @@ function App() {
     };
   }, [loadAgents, loadTasks, loadStatus, wsAttempt]);
 
+  const openSlots = useMemo(() => flatSlots(openColumns), [openColumns]);
+
+  // Open a slot as a new standalone column on the right.
   const openPane = useCallback((slot) => {
-    setOpenSlots((prev) => (prev.includes(slot) ? prev : [...prev, slot]));
+    setOpenColumns((prev) => {
+      if (flatSlots(prev).includes(slot)) return prev;
+      return [...prev, [slot]];
+    });
   }, []);
+  // Remove a pane, dropping the column if it becomes empty.
   const closePane = useCallback((slot) => {
-    setOpenSlots((prev) => prev.filter((s) => s !== slot));
+    setOpenColumns((prev) => {
+      const out = prev
+        .map((col) => col.filter((s) => s !== slot))
+        .filter((col) => col.length > 0);
+      return out;
+    });
+  }, []);
+  // Append a slot to the bottom of the rightmost (last) column. If
+  // slot already open anywhere else, move it. If no columns yet, opens
+  // as the first one.
+  const stackInLast = useCallback((slot) => {
+    setOpenColumns((prev) => {
+      const without = prev
+        .map((col) => col.filter((s) => s !== slot))
+        .filter((col) => col.length > 0);
+      if (without.length === 0) return [[slot]];
+      const last = without[without.length - 1];
+      const next = [
+        ...without.slice(0, -1),
+        [...last, slot],
+      ];
+      return next;
+    });
   }, []);
 
-  // Split.js manages drag-resize gutters between agent panes. We tear
-  // down + recreate whenever the set of open slots changes, because
-  // Split.js binds to specific DOM elements and can't handle React-y
-  // dynamic children on its own.
+  // Stack a slot below an existing column (used by the pane header's
+  // "+ stack below" action). If slot already open, move it; otherwise add.
+  const stackBelow = useCallback((slot, anchorSlot) => {
+    setOpenColumns((prev) => {
+      const without = prev
+        .map((col) => col.filter((s) => s !== slot))
+        .filter((col) => col.length > 0);
+      const target = without.findIndex((col) => col.includes(anchorSlot));
+      if (target < 0) return [...without, [slot]];
+      const next = without.map((col, i) =>
+        i === target
+          ? [...col.slice(0, col.indexOf(anchorSlot) + 1), slot, ...col.slice(col.indexOf(anchorSlot) + 1)]
+          : col
+      );
+      return next;
+    });
+  }, []);
+
+  // Split.js: horizontal split across columns, vertical split inside each
+  // multi-pane column. Rebind whenever the layout structure changes.
+  // A stable structure signature lets us skip reinit on no-op renders.
+  const layoutSignature = useMemo(
+    () => openColumns.map((c) => c.join("|")).join("//"),
+    [openColumns]
+  );
   useLayoutEffect(() => {
-    if (openSlots.length < 2) return;
-    const selectors = openSlots.map((s) => "#pane-" + s);
-    // Ensure all target elements exist before Split initializes
-    const exist = selectors.every((sel) => document.querySelector(sel));
-    if (!exist) return;
-    let split;
-    try {
-      split = Split(selectors, {
-        sizes: Array(openSlots.length).fill(100 / openSlots.length),
-        minSize: 260,
-        gutterSize: 6,
-        snapOffset: 0,
-        dragInterval: 1,
-      });
-    } catch (e) {
-      console.error("Split init failed", e);
-      return;
+    const cleanups = [];
+    // Outer horizontal split across columns (only if >= 2 columns).
+    if (openColumns.length >= 2) {
+      const selectors = openColumns.map((_, i) => "#col-" + i);
+      const exist = selectors.every((sel) => document.querySelector(sel));
+      if (exist) {
+        try {
+          const h = Split(selectors, {
+            sizes: Array(openColumns.length).fill(100 / openColumns.length),
+            minSize: 260,
+            gutterSize: 6,
+            snapOffset: 0,
+            dragInterval: 1,
+            direction: "horizontal",
+          });
+          cleanups.push(() => { try { h.destroy(); } catch (_) {} });
+        } catch (e) {
+          console.error("Horizontal Split init failed", e);
+        }
+      }
     }
-    return () => {
-      try { split.destroy(); } catch (_) { /* ignore */ }
-    };
-  }, [openSlots]);
+    // Per-column vertical split for stacked panes.
+    openColumns.forEach((col, i) => {
+      if (col.length < 2) return;
+      const selectors = col.map((s) => "#pane-" + s);
+      const exist = selectors.every((sel) => document.querySelector(sel));
+      if (!exist) return;
+      try {
+        const v = Split(selectors, {
+          sizes: Array(col.length).fill(100 / col.length),
+          minSize: 120,
+          gutterSize: 6,
+          snapOffset: 0,
+          dragInterval: 1,
+          direction: "vertical",
+        });
+        cleanups.push(() => { try { v.destroy(); } catch (_) {} });
+      } catch (e) {
+        console.error("Vertical Split init failed", e);
+      }
+    });
+    return () => cleanups.forEach((fn) => fn());
+  }, [layoutSignature]);
 
   return html`
     <div class=${"app" + (envOpen ? " env-open" : "")}>
@@ -300,23 +399,35 @@ function App() {
         agents=${agents}
         openSlots=${openSlots}
         onOpen=${openPane}
+        onStackInLast=${stackInLast}
         wsConnected=${wsConnected}
         envOpen=${envOpen}
         onToggleEnv=${() => setEnvOpen((v) => !v)}
         onOpenSettings=${() => setSettingsOpen(true)}
       />
       <main class="panes">
-        ${openSlots.length === 0
+        ${openColumns.length === 0
           ? html`<div class="empty">Pick a slot on the left to open a pane.</div>`
-          : openSlots.map(
-              (slot) =>
-                html`<${AgentPane}
-                  key=${slot}
-                  slot=${slot}
-                  agent=${agents.find((a) => a.id === slot)}
-                  liveEvents=${conversations.get(slot) || []}
-                  onClose=${() => closePane(slot)}
-                />`
+          : openColumns.map(
+              (col, colIdx) =>
+                html`<div
+                  class=${"pane-col" + (col.length > 1 ? " stacked" : "")}
+                  id=${"col-" + colIdx}
+                  key=${"col-" + col.join("-")}
+                >
+                  ${col.map(
+                    (slot) =>
+                      html`<${AgentPane}
+                        key=${slot}
+                        slot=${slot}
+                        agent=${agents.find((a) => a.id === slot)}
+                        liveEvents=${conversations.get(slot) || []}
+                        openSlots=${openSlots}
+                        onClose=${() => closePane(slot)}
+                        onStackBelow=${(otherSlot) => stackBelow(otherSlot, slot)}
+                      />`
+                  )}
+                </div>`
             )}
       </main>
       ${envOpen
@@ -391,7 +502,7 @@ function TokenGate({ onSubmit }) {
 // left rail
 // ------------------------------------------------------------------
 
-function LeftRail({ agents, openSlots, onOpen, wsConnected, envOpen, onToggleEnv, onOpenSettings }) {
+function LeftRail({ agents, openSlots, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, onOpenSettings }) {
   const grouped = useMemo(() => {
     const coach = agents.find((a) => a.kind === "coach");
     const players = agents
@@ -409,14 +520,14 @@ function LeftRail({ agents, openSlots, onOpen, wsConnected, envOpen, onToggleEnv
       openSlots.includes(a.id) ? "open" : "",
     ].filter(Boolean).join(" ");
     const tooltip = a.name
-      ? `${a.id} — ${a.name}${a.role ? " — " + a.role : ""} (${a.status || "stopped"})`
-      : `${a.id} — unassigned (${a.status || "stopped"})`;
+      ? `${a.id} — ${a.name}${a.role ? " — " + a.role : ""} (${a.status || "stopped"}) — shift-click to stack in last column`
+      : `${a.id} — unassigned (${a.status || "stopped"}) — shift-click to stack in last column`;
     return html`
       <button
         key=${a.id}
         class=${classes}
         title=${tooltip}
-        onClick=${() => onOpen(a.id)}
+        onClick=${(e) => (e.shiftKey ? onStackInLast(a.id) : onOpen(a.id))}
       >
         ${slotShortLabel(a.id)}
       </button>
