@@ -1225,6 +1225,51 @@ body {
   margin-bottom: 20px;
 }
 .drawer-section:last-child { border-bottom: 0; margin-bottom: 0; padding-bottom: 0; }
+
+.drawer-refresh {
+  float: right;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 3px;
+  font-size: 11px;
+  padding: 1px 6px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.drawer-refresh:hover { border-color: var(--accent); color: var(--fg); }
+.drawer-refresh:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.drawer-health-list {
+  list-style: none;
+  padding: 0;
+  margin: 6px 0 0;
+}
+.drawer-health-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12px;
+}
+.drawer-health-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 8px;
+}
+.drawer-health-row.ok .drawer-health-dot { background: var(--ok); }
+.drawer-health-row.fail .drawer-health-dot { background: var(--err); }
+.drawer-health-name {
+  font-weight: 600;
+  min-width: 80px;
+}
+.drawer-health-detail {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .drawer-section h3 {
   margin: 0 0 10px;
   font-size: 12px;

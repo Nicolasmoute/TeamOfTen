@@ -991,7 +991,48 @@ function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsCon
 // settings drawer
 // ------------------------------------------------------------------
 
+// Pick the most informative field from a /api/health check entry.
+// Each subsystem uses different shape (db has 'error', claude_cli
+// has 'version', kdrive has 'reason' or 'cached', etc.), so we walk
+// known keys in priority order.
+function summarizeHealthCheck(c) {
+  if (!c) return "";
+  if (c.skipped) return c.reason ? `skipped — ${c.reason}` : "skipped";
+  if (c.error) return String(c.error);
+  if (c.version) return String(c.version);
+  if (c.exit_code != null) return `exit ${c.exit_code}`;
+  if (c.path) return String(c.path);
+  if (typeof c.slot_count === "number") return `${c.slot_count} slot${c.slot_count === 1 ? "" : "s"}`;
+  if (c.cached != null) return c.ok ? (c.cached ? "ok (cached)" : "ok (fresh probe)") : "probe failed";
+  return c.ok ? "ok" : "not ready";
+}
+
 function SettingsDrawer({ onClose, serverStatus }) {
+  const [health, setHealth] = useState(null);
+  const [healthErr, setHealthErr] = useState("");
+  const [healthLoading, setHealthLoading] = useState(false);
+
+  const loadHealth = useCallback(async () => {
+    setHealthLoading(true);
+    setHealthErr("");
+    try {
+      const res = await authFetch("/api/health");
+      // /api/health returns 503 when a required subsystem fails, but
+      // the body still carries per-subsystem detail; read both.
+      const data = await res.json();
+      setHealth(data);
+      if (!res.ok) setHealthErr("HTTP " + res.status);
+    } catch (e) {
+      setHealthErr(String(e));
+    } finally {
+      setHealthLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadHealth();
+  }, [loadHealth]);
+
   useEffect(() => {
     const onKey = (e) => {
       if (e.key === "Escape") onClose();
@@ -1010,6 +1051,38 @@ function SettingsDrawer({ onClose, serverStatus }) {
           <button class="drawer-close" onClick=${onClose} title="Close (Esc)">×</button>
         </header>
         <div class="drawer-body">
+          <section class="drawer-section">
+            <h3>
+              Health
+              <button
+                class="drawer-refresh"
+                onClick=${loadHealth}
+                disabled=${healthLoading}
+                title="Re-probe subsystems"
+              >${healthLoading ? "…" : "↻"}</button>
+            </h3>
+            ${healthErr
+              ? html`<p class="muted">⚠ ${healthErr}</p>`
+              : null}
+            ${health
+              ? html`<ul class="drawer-health-list">
+                  ${Object.entries(health.checks || {}).map(
+                    ([name, c]) => html`
+                      <li key=${name} class=${"drawer-health-row " + (c.ok ? "ok" : "fail")}>
+                        <span class="drawer-health-dot" />
+                        <span class="drawer-health-name">${name}</span>
+                        <span class="drawer-health-detail">
+                          ${summarizeHealthCheck(c)}
+                        </span>
+                      </li>
+                    `
+                  )}
+                </ul>`
+              : healthLoading
+              ? html`<p class="muted">probing…</p>`
+              : null}
+          </section>
+
           <section class="drawer-section">
             <h3>Authentication</h3>
             <p>
