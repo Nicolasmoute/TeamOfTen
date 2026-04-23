@@ -190,6 +190,8 @@ def _system_prompt_for(agent_id: str) -> str:
             "Coordination tools:\n"
             "  - coord_list_tasks(status?, owner?): see the team board\n"
             "  - coord_create_task(title, description?, priority?): add top-level tasks\n"
+            "  - coord_assign_task(task_id, to): push-assign an open task directly "
+            "to a Player (faster than waiting for them to self-claim)\n"
             "  - coord_update_task(task_id, status, note?): you can cancel any task\n"
             "  - coord_send_message(to, body, subject?, priority?): message a Player "
             "or 'broadcast' to the whole team\n"

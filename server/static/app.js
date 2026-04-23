@@ -246,6 +246,7 @@ function App() {
       if (
         ev.type === "task_created" ||
         ev.type === "task_claimed" ||
+        ev.type === "task_assigned" ||
         ev.type === "task_updated"
       ) {
         loadTasks();
@@ -729,6 +730,7 @@ const TIMELINE_TYPES = new Set([
   "error",
   "task_created",
   "task_claimed",
+  "task_assigned",
   "task_updated",
   "message_sent",
   "memory_updated",
@@ -823,6 +825,13 @@ function EnvTimelineItem({ event }) {
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
       <span class="env-tl-body">◆ claimed ${event.task_id}</span>
+    </div>`;
+  }
+  if (event.type === "task_assigned") {
+    return html`<div class="env-tl-item env-tl-task">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">▶ assigned ${event.task_id} → ${event.to}</span>
     </div>`;
   }
   if (event.type === "task_updated") {

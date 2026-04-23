@@ -383,6 +383,96 @@ def build_coord_server(caller_id: str) -> Any:
         return _ok(f"updated {task_id}: {old_status} → {new_status}{suffix}")
 
     @tool(
+        "coord_assign_task",
+        (
+            "Coach-only. Directly assign an open task to a specific Player — "
+            "sets owner + status='claimed' without waiting for the Player to "
+            "self-claim via coord_claim_task. Useful for push-assignment "
+            "workflows.\n"
+            "Params:\n"
+            "- task_id: the task to assign (required)\n"
+            "- to: target Player slot id ('p1'..'p10'; not 'coach', not 'broadcast')\n"
+            "Fails if: you're a Player (Players report, don't assign), the "
+            "task isn't status=open, the Player already owns another task, "
+            "or the target isn't a valid Player slot."
+        ),
+        {"task_id": str, "to": str},
+    )
+    async def assign_task(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err(
+                "Only Coach can push-assign tasks. Players report and claim "
+                "open tasks themselves via coord_claim_task."
+            )
+        task_id = (args.get("task_id") or "").strip()
+        to = (args.get("to") or "").strip().lower()
+        if not task_id:
+            return _err("task_id is required")
+        if not to:
+            return _err("'to' is required (Player slot id)")
+        if to == "coach" or to == "broadcast":
+            return _err("can only assign to a Player (p1..p10), not coach or broadcast")
+        if to not in VALID_RECIPIENTS:
+            return _err(f"invalid target '{to}' — must be p1..p10")
+
+        c = await configured_conn()
+        try:
+            # Target Player must exist and be free.
+            cur = await c.execute(
+                "SELECT current_task_id FROM agents WHERE id = ?", (to,)
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"Player '{to}' not found")
+            busy_with = dict(row)["current_task_id"]
+            if busy_with:
+                return _err(
+                    f"Player {to} already owns task {busy_with}; cancel or "
+                    f"complete it before reassigning."
+                )
+
+            # Atomic assign — status='open' guard ensures we don't
+            # clobber a task that was claimed between our SELECT and UPDATE.
+            cur = await c.execute(
+                "UPDATE tasks SET owner = ?, status = 'claimed', "
+                "claimed_at = ? WHERE id = ? AND status = 'open' "
+                "RETURNING id",
+                (to, _now_iso(), task_id),
+            )
+            updated = await cur.fetchone()
+            if not updated:
+                cur = await c.execute(
+                    "SELECT status, owner FROM tasks WHERE id = ?", (task_id,)
+                )
+                current = await cur.fetchone()
+                if not current:
+                    return _err(f"task {task_id} not found")
+                d = dict(current)
+                return _err(
+                    f"task {task_id} is not open "
+                    f"(status={d['status']}, owner={d['owner'] or '-'})"
+                )
+
+            await c.execute(
+                "UPDATE agents SET current_task_id = ? WHERE id = ?",
+                (task_id, to),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "task_assigned",
+                "task_id": task_id,
+                "to": to,
+            }
+        )
+        return _ok(f"assigned {task_id} → {to}")
+
+    @tool(
         "coord_send_message",
         (
             "Send a message to another agent or to the whole team.\n"
@@ -775,6 +865,7 @@ def build_coord_server(caller_id: str) -> Any:
             create_task,
             claim_task,
             update_task,
+            assign_task,
             send_message,
             read_inbox,
             list_memory,
@@ -790,6 +881,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_create_task",
     "mcp__coord__coord_claim_task",
     "mcp__coord__coord_update_task",
+    "mcp__coord__coord_assign_task",
     "mcp__coord__coord_send_message",
     "mcp__coord__coord_read_inbox",
     "mcp__coord__coord_list_memory",
