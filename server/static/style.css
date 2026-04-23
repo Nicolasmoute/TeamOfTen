@@ -270,6 +270,8 @@ body {
 .env-tl-mem .env-tl-body { color: var(--ok); }
 .env-tl-capped { border-left-color: var(--err); background: #281417; }
 .env-tl-capped .env-tl-body { color: var(--err); white-space: normal; }
+.env-tl-commit { border-left-color: var(--accent); }
+.env-tl-commit .env-tl-body { color: var(--accent); }
 
 /* cost cap progress bar */
 .env-cap-bar { margin-bottom: 8px; }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -11,6 +12,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 from server.db import configured_conn
 from server.events import bus
 from server.kdrive import kdrive
+from server.workspaces import project_configured, workspace_dir
 
 
 def _now_iso() -> str:
@@ -662,9 +664,112 @@ def build_coord_server(caller_id: str) -> Any:
             + (" · mirrored to kDrive" if kdrive.enabled else "")
         )
 
+    @tool(
+        "coord_commit_push",
+        (
+            "Commit staged+unstaged changes in your worktree and push the "
+            "branch. Players only (Coach never writes code). Runs:\n"
+            "  git add -A\n"
+            "  git commit -m <message>\n"
+            "  git push origin HEAD    (unless push='false')\n"
+            "Params:\n"
+            "- message: commit message (required)\n"
+            "- push: 'true' (default) or 'false' to skip the push.\n"
+            "Returns 'nothing to commit' as a soft-OK if the working tree "
+            "is clean. Requires HARNESS_PROJECT_REPO to be configured; "
+            "push also needs pushable credentials (typically a PAT "
+            "embedded in the project repo URL)."
+        ),
+        {"message": str, "push": str},
+    )
+    async def commit_push(args: dict[str, Any]) -> dict[str, Any]:
+        if caller_is_coach:
+            return _err(
+                "Coach delegates; only Players commit code. If you want "
+                "Coach to trigger a commit, message a Player with the task."
+            )
+        if not project_configured():
+            return _err(
+                "HARNESS_PROJECT_REPO is not set; no git worktree to "
+                "commit into. Ask the operator to configure it and redeploy."
+            )
+
+        message = (args.get("message") or "").strip()
+        if not message:
+            return _err("message is required")
+        if len(message) > 2000:
+            return _err(f"message too long ({len(message)} chars, max 2000)")
+
+        push_raw = str(args.get("push") or "true").strip().lower()
+        do_push = push_raw not in ("false", "0", "no", "off")
+
+        cwd = workspace_dir(caller_id)
+        if not (cwd / ".git").exists():
+            return _err(
+                f"worktree at {cwd} is not a git checkout — something "
+                "went wrong during workspace provisioning. Check "
+                "/api/status workspaces section."
+            )
+
+        async def run(cmd: list[str], timeout: int = 60) -> tuple[int, str, str]:
+            def _do() -> tuple[int, str, str]:
+                p = subprocess.run(
+                    cmd,
+                    cwd=str(cwd),
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+                return p.returncode, p.stdout, p.stderr
+            return await asyncio.to_thread(_do)
+
+        code, _out, err = await run(["git", "add", "-A"])
+        if code != 0:
+            return _err(f"git add failed: {err.strip()[:300]}")
+
+        code, status_out, _ = await run(["git", "status", "--porcelain"])
+        if not status_out.strip():
+            return _ok("nothing to commit (working tree clean)")
+
+        code, out, err = await run(["git", "commit", "-m", message])
+        if code != 0:
+            return _err(
+                f"git commit failed: {(err or out).strip()[:300]}"
+            )
+
+        code, sha_out, _ = await run(["git", "rev-parse", "--short", "HEAD"])
+        sha = sha_out.strip() or "?"
+
+        push_note = ""
+        pushed_ok = False
+        if do_push:
+            code, _out, err = await run(
+                ["git", "push", "origin", "HEAD"], timeout=120
+            )
+            if code != 0:
+                push_note = f" (PUSH FAILED: {err.strip()[:200]})"
+            else:
+                push_note = " (pushed)"
+                pushed_ok = True
+        else:
+            push_note = " (local only)"
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "commit_pushed",
+                "sha": sha,
+                "message": message,
+                "pushed": pushed_ok,
+                "push_requested": do_push,
+            }
+        )
+        return _ok(f"committed {sha}: {message}{push_note}")
+
     return create_sdk_mcp_server(
         name="coord",
-        version="0.5.0",
+        version="0.6.0",
         tools=[
             list_tasks,
             create_task,
@@ -675,6 +780,7 @@ def build_coord_server(caller_id: str) -> Any:
             list_memory,
             read_memory,
             update_memory,
+            commit_push,
         ],
     )
 
@@ -689,6 +795,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_list_memory",
     "mcp__coord__coord_read_memory",
     "mcp__coord__coord_update_memory",
+    "mcp__coord__coord_commit_push",
 ]
 
 MEMORY_TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")

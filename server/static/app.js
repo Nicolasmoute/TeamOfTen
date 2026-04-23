@@ -593,6 +593,7 @@ const TIMELINE_TYPES = new Set([
   "message_sent",
   "memory_updated",
   "cost_capped",
+  "commit_pushed",
 ]);
 
 function EnvTimelineSection({ conversations }) {
@@ -715,6 +716,15 @@ function EnvTimelineItem({ event }) {
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
       <span class="env-tl-body">🚫 spawn blocked — ${reason}</span>
+    </div>`;
+  }
+  if (event.type === "commit_pushed") {
+    const msg = (event.message || "").slice(0, 80);
+    const pushState = event.pushed ? "↑" : event.push_requested ? "✗push" : "local";
+    return html`<div class="env-tl-item env-tl-commit">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">● ${event.sha} ${pushState} — ${msg}</span>
     </div>`;
   }
   return null;
