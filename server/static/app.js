@@ -3231,16 +3231,21 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, onClose, o
       );
   }, [mergedEvents]);
 
-  // auto-scroll to bottom when new events arrive — only if user was already
-  // near the bottom (otherwise leave them reading older history in peace).
-  // Also follows streaming-text length so typing tokens scroll with them.
+  // Auto-scroll to bottom as new content arrives. Two modes:
+  //   - Normal (between turns): respect user scroll position — if they
+  //     scrolled up to read history, leave them there.
+  //   - During streaming (a turn is actively typing tokens): always
+  //     stick to the bottom so the reader sees the latest text. Once
+  //     the turn ends (streamLen drops to 0), normal mode resumes.
   const streamLen =
     (streaming?.text?.length || 0) + (streaming?.thinking?.length || 0);
+  const isStreaming = streamLen > 0;
   useEffect(() => {
-    if (bodyRef.current && stickToBottomRef.current) {
+    if (!bodyRef.current) return;
+    if (isStreaming || stickToBottomRef.current) {
       bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
     }
-  }, [allEvents.length, streamLen]);
+  }, [allEvents.length, streamLen, isStreaming]);
 
   // Last-turn stats: find the most recent 'result' event (the SDK
   // emits one per turn with duration + cost). Surfaces in the pane
@@ -3823,9 +3828,18 @@ function ThinkingItem({ event, ts }) {
   </div>`;
 }
 
+// Event types that are pure audit noise in the pane body — they're
+// useful in the DB / EnvPane timeline for debugging ("did my context
+// get picked up?") but shouldn't clutter the conversation view.
+const _HIDDEN_EVENT_TYPES = new Set([
+  "context_applied",
+]);
+
 function EventItem({ event }) {
   const type = event.type;
   const ts = timeStr(event.ts);
+
+  if (_HIDDEN_EVENT_TYPES.has(type)) return null;
 
   if (type === "tool_use") {
     return html`<div class="event tool_use">
