@@ -286,8 +286,14 @@ async def health() -> JSONResponse:
 
 @app.get("/api/status", dependencies=[Depends(require_token)])
 async def status() -> dict[str, object]:
+    # Import lazily: avoids pulling these private names into the module
+    # surface and keeps the import graph unchanged for non-status paths.
+    from server.agents import _running_tasks
+    from server.events import bus
+
     now = datetime.now(timezone.utc)
     team_today = await _today_spend()
+    running_slots = [aid for aid, t in _running_tasks.items() if not t.done()]
     return {
         "ok": True,
         "version": app.version,
@@ -295,6 +301,9 @@ async def status() -> dict[str, object]:
         "started_at": STARTED_AT.isoformat(),
         "uptime_seconds": int((now - STARTED_AT).total_seconds()),
         "host": os.environ.get("HOSTNAME", "unknown"),
+        "paused": is_paused(),
+        "running_slots": running_slots,
+        "ws_subscribers": bus.subscriber_count,
         "caps": {
             "agent_daily_usd": AGENT_DAILY_CAP_USD,
             "team_daily_usd": TEAM_DAILY_CAP_USD,

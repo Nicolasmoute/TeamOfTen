@@ -83,5 +83,10 @@ class EventBus:
     def unsubscribe(self, q: asyncio.Queue[dict[str, Any]]) -> None:
         self._queues.discard(q)
 
+    @property
+    def subscriber_count(self) -> int:
+        """Number of currently-subscribed WebSocket clients."""
+        return len(self._queues)
+
 
 bus = EventBus()
