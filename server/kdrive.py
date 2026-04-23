@@ -44,7 +44,11 @@ except Exception:  # pragma: no cover — lib missing in dev env
 WEBDAV_URL = os.environ.get("KDRIVE_WEBDAV_URL", "").strip()
 WEBDAV_USER = os.environ.get("KDRIVE_USER", "").strip()
 WEBDAV_PASS = os.environ.get("KDRIVE_APP_PASSWORD", "").strip()
-ROOT_PATH = os.environ.get("KDRIVE_ROOT_PATH", "/harness").strip() or "/harness"
+# ROOT_PATH is a sub-folder *inside* the base URL. KDRIVE_WEBDAV_URL
+# already points at a dedicated app directory on kDrive (e.g. /TOT),
+# so the default is empty — files land directly under the URL. Set
+# the env var explicitly if you want a deeper prefix.
+ROOT_PATH = os.environ.get("KDRIVE_ROOT_PATH", "").strip()
 
 
 class KDriveClient:
