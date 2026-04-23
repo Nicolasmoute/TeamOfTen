@@ -2322,6 +2322,10 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
   // Prompt history for ↑/↓ navigation (Ctrl/Cmd + arrow).
   const [promptHistory, setPromptHistory] = useState(() => loadPromptHistory(slot));
   const [promptHistoryIdx, setPromptHistoryIdx] = useState(null);
+  // In-pane text search. When searchQuery is set, events whose text
+  // doesn't match are hidden from the body render.
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
   const bodyRef = useRef(null);
 
   // HTML5 DnD: the pane header is the drag source; the whole pane is
@@ -2459,6 +2463,30 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
     }
     return null;
   }, [mergedEvents]);
+
+  // Filter allEvents by searchQuery for body render. No-op when the
+  // query is empty; otherwise a case-insensitive substring match
+  // against the most informative fields per type.
+  const visibleEvents = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return allEvents;
+    return allEvents.filter((ev) => {
+      const fields = [
+        ev.content,
+        ev.prompt,
+        ev.text,
+        ev.name,
+        ev.error,
+        ev.subject,
+        ev.body,
+        ev.title,
+        ev.reason,
+        ev.input ? JSON.stringify(ev.input) : null,
+        ev.__result?.content,
+      ];
+      return fields.some((f) => typeof f === "string" && f.toLowerCase().includes(q));
+    });
+  }, [allEvents, searchQuery]);
 
   // paste handler: capture images, upload, add to attachments strip
   const onPaste = useCallback(async (e) => {
@@ -2638,6 +2666,14 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
           ? html`<span class="pane-setting-dot" title="pane overrides active" />`
           : null}
         <button
+          class=${"pane-search-toggle" + (searchOpen ? " active" : "")}
+          onClick=${() => {
+            setSearchOpen((v) => !v);
+            if (searchOpen) setSearchQuery("");
+          }}
+          title="Filter events by text"
+        >⌕</button>
+        <button
           class="pane-export"
           onClick=${exportMarkdown}
           title="Export conversation as markdown"
@@ -2657,6 +2693,29 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
             />`
           : null}
       </header>
+      ${searchOpen
+        ? html`<div class="pane-search">
+            <input
+              type="text"
+              class="pane-search-input"
+              placeholder="filter events…"
+              value=${searchQuery}
+              onInput=${(e) => setSearchQuery(e.target.value)}
+              onKeyDown=${(e) => {
+                if (e.key === "Escape") {
+                  setSearchQuery("");
+                  setSearchOpen(false);
+                }
+              }}
+              autofocus
+            />
+            ${searchQuery
+              ? html`<span class="pane-search-count">
+                  ${visibleEvents.length}/${allEvents.length}
+                </span>`
+              : null}
+          </div>`
+        : null}
       <div class="pane-body" ref=${bodyRef} onScroll=${onBodyScroll}>
         ${!historyLoaded ? html`<div class="loading">loading history…</div>` : null}
         ${historyLoaded && allEvents.length === 0
@@ -2669,7 +2728,10 @@ function AgentPane({ slot, agent, currentTask, liveEvents, onClose, onMoveBefore
                 : html` Type a prompt below to spawn this Player.`}
             </div>`
           : null}
-        ${allEvents.map((ev, i) => html`<${EventItem} key=${(ev.__id ?? "live-" + i)} event=${ev} />`)}
+        ${searchQuery.trim() && visibleEvents.length === 0 && allEvents.length > 0
+          ? html`<div class="pane-empty-hint">No events match "${searchQuery}".</div>`
+          : null}
+        ${visibleEvents.map((ev, i) => html`<${EventItem} key=${(ev.__id ?? "live-" + i)} event=${ev} />`)}
       </div>
       <footer class="pane-input">
         ${attachments.length > 0
