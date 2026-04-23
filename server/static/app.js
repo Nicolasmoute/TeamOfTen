@@ -33,6 +33,37 @@ async function authFetch(url, init) {
 }
 
 // ------------------------------------------------------------------
+// layout persistence: which slots are open + env panel state
+// ------------------------------------------------------------------
+
+const LAYOUT_KEY = "harness_layout_v1";
+
+function loadLayout() {
+  try {
+    const raw = localStorage.getItem(LAYOUT_KEY);
+    if (!raw) return null;
+    const v = JSON.parse(raw);
+    // Defensive validation — corrupted payload falls back to defaults.
+    if (!v || typeof v !== "object") return null;
+    if (!Array.isArray(v.openSlots)) return null;
+    return {
+      openSlots: v.openSlots.filter((s) => typeof s === "string").slice(0, 11),
+      envOpen: typeof v.envOpen === "boolean" ? v.envOpen : true,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function saveLayout(layout) {
+  try {
+    localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
+  } catch (_) {
+    // localStorage may be disabled (private mode); silent no-op.
+  }
+}
+
+// ------------------------------------------------------------------
 // helpers
 // ------------------------------------------------------------------
 
@@ -74,9 +105,14 @@ function unwrapPersisted(row) {
 function App() {
   const [agents, setAgents] = useState([]);
   const [tasks, setTasks] = useState([]);
-  const [openSlots, setOpenSlots] = useState(["coach"]);
+  const _initialLayout = loadLayout();
+  const [openSlots, setOpenSlots] = useState(
+    _initialLayout?.openSlots ?? ["coach"]
+  );
   const [wsConnected, setWsConnected] = useState(false);
-  const [envOpen, setEnvOpen] = useState(true);
+  const [envOpen, setEnvOpen] = useState(
+    _initialLayout?.envOpen ?? true
+  );
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [serverStatus, setServerStatus] = useState(null);
   const [authChallenge, setAuthChallenge] = useState(false);
@@ -152,6 +188,11 @@ function App() {
     const statusTimer = setInterval(loadStatus, 30_000);
     return () => clearInterval(statusTimer);
   }, [loadAgents, loadTasks, loadStatus]);
+
+  // Persist layout (open slots + env panel state) on every change.
+  useEffect(() => {
+    saveLayout({ openSlots, envOpen });
+  }, [openSlots, envOpen]);
 
   // WebSocket: single connection at app root. On close, schedule a
   // re-open by bumping wsAttempt; the effect re-runs, a new socket opens.
