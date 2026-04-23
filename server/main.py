@@ -510,6 +510,52 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
     return {"ok": True, "task_id": task_id}
 
 
+@app.post("/api/tasks/{task_id}/cancel", dependencies=[Depends(require_token)])
+async def cancel_task_from_human(task_id: str) -> dict[str, Any]:
+    """Cancel a task from the UI. Updates the task row + clears the
+    owner's current_task_id so the agent is free to claim the next one.
+
+    Noop (but returns 200) if the task is already done or cancelled —
+    the UI may race against an in-flight update."""
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT id, status, owner FROM tasks WHERE id = ?", (task_id,)
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(404, detail=f"task {task_id} not found")
+        task = dict(row)
+        if task["status"] in ("done", "cancelled"):
+            return {"ok": True, "task_id": task_id, "already": task["status"]}
+        old_status = task["status"]
+        await c.execute(
+            "UPDATE tasks SET status = 'cancelled' WHERE id = ?", (task_id,)
+        )
+        if task["owner"]:
+            await c.execute(
+                "UPDATE agents SET current_task_id = NULL "
+                "WHERE id = ? AND current_task_id = ?",
+                (task["owner"], task_id),
+            )
+        await c.commit()
+    finally:
+        await c.close()
+
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "human",
+            "type": "task_updated",
+            "task_id": task_id,
+            "old_status": old_status,
+            "new_status": "cancelled",
+            "note": "cancelled by human",
+        }
+    )
+    return {"ok": True, "task_id": task_id, "old_status": old_status}
+
+
 # ------------------------------------------------------------------
 # Events (paginated replay for pane restore)
 # ------------------------------------------------------------------

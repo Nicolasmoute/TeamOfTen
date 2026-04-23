@@ -1693,18 +1693,31 @@ function EnvTasksSection({ tasks, onCreate }) {
               ${tasks.length === 0 ? "(no tasks yet)" : `(no ${filter.label} tasks)`}
             </div>`
           : sorted.map(
-              (t) => html`
-                <div class=${"env-task status-" + t.status} key=${t.id}>
-                  <div class="env-task-head">
-                    <span class="env-task-status">${t.status}</span>
-                    <span class="env-task-id">${t.id}</span>
+              (t) => {
+                const active = t.status !== "done" && t.status !== "cancelled";
+                return html`
+                  <div class=${"env-task status-" + t.status} key=${t.id}>
+                    <div class="env-task-head">
+                      <span class="env-task-status">${t.status}</span>
+                      <span class="env-task-id">${t.id}</span>
+                      ${active
+                        ? html`<button
+                            class="env-task-cancel"
+                            onClick=${async () => {
+                              if (!confirm(`Cancel task ${t.id}?\n${t.title}`)) return;
+                              await authFetch("/api/tasks/" + encodeURIComponent(t.id) + "/cancel", { method: "POST" });
+                            }}
+                            title="Cancel this task"
+                          >×</button>`
+                        : null}
+                    </div>
+                    <div class="env-task-title">${t.title}</div>
+                    <div class="env-task-meta">
+                      by ${t.created_by} · owner ${t.owner || "-"} · pri ${t.priority}${t.parent_id ? " · ↳" + t.parent_id : ""}
+                    </div>
                   </div>
-                  <div class="env-task-title">${t.title}</div>
-                  <div class="env-task-meta">
-                    by ${t.created_by} · owner ${t.owner || "-"} · pri ${t.priority}${t.parent_id ? " · ↳" + t.parent_id : ""}
-                  </div>
-                </div>
-              `
+                `;
+              }
             )}
       </div>
       <form class="env-task-form" onSubmit=${submit}>
