@@ -540,6 +540,8 @@ function App() {
   // Global keyboard shortcuts. Kept deliberately small — anything else
   // belongs scoped to the relevant pane/component.
   //   Ctrl/Cmd + B : toggle the Environment side-panel.
+  //   Ctrl/Cmd + . : toggle pause (block new agent runs). Comma/period
+  //                  keys avoid the browser-native ⌘+P (print dialog).
   // We ignore the shortcut when the user is typing in a form field so
   // browser-native Ctrl+B (bold) still works inside textareas that opt
   // in to it, and so it never steals focus mid-sentence.
@@ -553,10 +555,14 @@ function App() {
         e.preventDefault();
         setEnvOpen((v) => !v);
       }
+      if (e.key === "." || e.key === ">") {
+        e.preventDefault();
+        togglePause();
+      }
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [togglePause]);
 
   // WebSocket: single connection at app root. On close, schedule a
   // re-open by bumping wsAttempt; the effect re-runs, a new socket opens.
@@ -1076,7 +1082,7 @@ function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsCon
         : null}
       <button
         class=${"gear pause-toggle" + (paused ? " active" : "")}
-        title=${paused ? "Paused — click to resume" : "Pause harness (blocks new agent runs)"}
+        title=${(paused ? "Paused — click to resume" : "Pause harness (blocks new agent runs)") + " (⌘/Ctrl+.)"}
         onClick=${onTogglePause}
       >${paused ? "▶" : "❚❚"}</button>
       <button
