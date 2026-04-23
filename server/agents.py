@@ -20,6 +20,7 @@ from claude_agent_sdk import (
     query,
 )
 
+from server.context import build_system_prompt_suffix
 from server.db import configured_conn
 from server.events import bus
 from server.tools import ALLOWED_COACH_TOOLS, ALLOWED_PLAYER_TOOLS, build_coord_server
@@ -385,8 +386,15 @@ async def run_agent(
     coord_server = build_coord_server(agent_id)
     allowed = ALLOWED_COACH_TOOLS if agent_id == "coach" else ALLOWED_PLAYER_TOOLS
 
+    # Governance-layer docs (CLAUDE.md / skills / rules) from kDrive/disk.
+    # Appended to the hardcoded role brief so context edits take effect on
+    # the next turn with no restart required. Empty string when no
+    # context is configured — agents behave as before.
+    context_suffix = await build_system_prompt_suffix()
+    system_prompt = _system_prompt_for(agent_id) + context_suffix
+
     options_kwargs: dict[str, Any] = dict(
-        system_prompt=_system_prompt_for(agent_id),
+        system_prompt=system_prompt,
         cwd=str(workspace_dir(agent_id)),
         max_turns=10,
         mcp_servers={"coord": coord_server},

@@ -115,6 +115,21 @@ class KDriveClient:
             logger.exception("kDrive write_bytes failed: %s", full_path)
             return False
 
+    async def read_text(self, relative_path: str) -> str | None:
+        """Download a UTF-8 text file from `{ROOT_PATH}/{relative_path}`.
+        Returns None if missing or on any failure (not distinguished —
+        callers fall back to a local cached copy)."""
+        if not self._enabled:
+            return None
+        full_path = str(PurePosixPath(ROOT_PATH) / relative_path)
+        try:
+            return await asyncio.to_thread(self._read_text_sync, full_path)
+        except Exception as e:
+            if _ResourceNotFound is not None and isinstance(e, _ResourceNotFound):
+                return None
+            logger.exception("kDrive read_text failed: %s", full_path)
+            return None
+
     async def list_dir(self, relative_path: str) -> list[str]:
         """List filenames (basenames, not full paths) under
         `{ROOT_PATH}/{relative_path}`. Returns [] on any failure or if
@@ -161,6 +176,11 @@ class KDriveClient:
             full_path,
             overwrite=True,
         )
+
+    def _read_text_sync(self, full_path: str) -> str:
+        buf = io.BytesIO()
+        self._client.download_fileobj(full_path, buf)
+        return buf.getvalue().decode("utf-8", errors="replace")
 
     def _list_dir_sync(self, full_path: str) -> list[str]:
         # ls(detail=False) returns a list of relative path strings. We

@@ -42,6 +42,7 @@ from server.agents import (
     run_agent,
     set_paused,
 )
+from server import context as ctxmod
 from server.db import configured_conn, init_db
 from server.events import bus
 from server.kdrive import kdrive
@@ -801,6 +802,74 @@ async def get_decision(filename: str) -> dict[str, Any]:
         "content": content,
         "size": len(content),
     }
+
+
+class ContextWrite(BaseModel):
+    kind: str = Field(..., description="root | skills | rules")
+    name: str = Field("", description="file basename without .md; '' or 'CLAUDE' for kind='root'")
+    body: str = Field(..., description="full markdown content")
+
+
+@app.get("/api/context", dependencies=[Depends(require_token)])
+async def list_context() -> dict[str, Any]:
+    """List every available governance-layer context doc (local ∪ kDrive).
+    Shape: {"root": ["CLAUDE"] or [], "skills": [...], "rules": [...]}."""
+    return await ctxmod.list_all()
+
+
+@app.get("/api/context/{kind}/{name}", dependencies=[Depends(require_token)])
+async def get_context(kind: str, name: str) -> dict[str, Any]:
+    err = ctxmod.validate(kind, "CLAUDE" if kind == "root" else name)
+    if err:
+        raise HTTPException(400, detail=err)
+    body = await ctxmod.read(kind, "CLAUDE" if kind == "root" else name)
+    if body is None:
+        raise HTTPException(404, detail="not found")
+    return {"kind": kind, "name": name, "body": body, "size": len(body)}
+
+
+@app.post("/api/context", dependencies=[Depends(require_token)])
+async def write_context_from_human(req: ContextWrite) -> dict[str, Any]:
+    """Upsert a context doc from the human operator. Same write path as
+    `coord_write_context` but attributed to 'human'. Emits context_updated
+    so open UIs re-render and the next agent turn picks up the change."""
+    try:
+        ok = await ctxmod.write(req.kind, req.name or "CLAUDE", req.body)
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
+    if not ok:
+        raise HTTPException(500, detail="write failed — check server logs")
+    effective = "CLAUDE" if req.kind == "root" else req.name
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "human",
+            "type": "context_updated",
+            "kind": req.kind,
+            "name": effective,
+            "size": len(req.body),
+        }
+    )
+    return {"ok": True, "kind": req.kind, "name": effective}
+
+
+@app.delete("/api/context/{kind}/{name}", dependencies=[Depends(require_token)])
+async def delete_context(kind: str, name: str) -> dict[str, Any]:
+    effective = "CLAUDE" if kind == "root" else name
+    try:
+        await ctxmod.delete(kind, effective)
+    except ValueError as e:
+        raise HTTPException(400, detail=str(e))
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "human",
+            "type": "context_deleted",
+            "kind": kind,
+            "name": effective,
+        }
+    )
+    return {"ok": True}
 
 
 @app.get("/api/events", dependencies=[Depends(require_token)])

@@ -11,6 +11,7 @@ from typing import Any
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
+from server import context as ctxmod
 from server.db import configured_conn
 from server.events import bus
 from server.kdrive import kdrive
@@ -954,6 +955,71 @@ def build_coord_server(caller_id: str) -> Any:
         )
 
     @tool(
+        "coord_write_context",
+        (
+            "Coach-only. Write or overwrite a governance-layer context doc "
+            "at kDrive context/<kind>/<name>.md (+ local /data/context cache). "
+            "These docs are concatenated into every agent's system prompt on "
+            "their NEXT turn — no restart needed — so use this to set team-wide "
+            "conventions, skills, and hard rules.\n"
+            "\n"
+            "Kinds:\n"
+            "  - root: the special single CLAUDE.md top-level brief. "
+            "Pass kind='root' and name='' (or 'CLAUDE').\n"
+            "  - skills: reusable how-tos (e.g. 'debug-via-logs', 'commit-style').\n"
+            "  - rules: hard invariants the team must not violate.\n"
+            "\n"
+            "Distinct from memory (free scratchpad, anyone writes) and decisions "
+            "(append-only architectural records). Context is the rules-of-the-game "
+            "layer: editable by Coach + human only, read by everyone.\n"
+            "\n"
+            "Params:\n"
+            "- kind: 'root' | 'skills' | 'rules' (required)\n"
+            "- name: file name without the .md suffix (empty/'CLAUDE' for kind='root')\n"
+            "- body: full markdown content (required)"
+        ),
+        {"kind": str, "name": str, "body": str},
+    )
+    async def write_context(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err(
+                "Only Coach writes context docs. Players read them via their "
+                "system prompt; if you think a rule or skill is missing, send "
+                "Coach a message proposing the edit."
+            )
+        kind = (args.get("kind") or "").strip()
+        name = (args.get("name") or "").strip()
+        body = args.get("body") or ""
+        err = ctxmod.validate(kind, name)
+        if err:
+            return _err(err)
+        if not body.strip():
+            return _err("body is required (empty context docs are not useful)")
+        if len(body) > 40_000:
+            return _err(f"body too long ({len(body)} chars, max 40000)")
+        try:
+            ok = await ctxmod.write(kind, name, body)
+        except ValueError as e:
+            return _err(str(e))
+        if not ok:
+            return _err("context write failed — check server logs")
+        effective_name = "CLAUDE" if kind == "root" else name
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "context_updated",
+                "kind": kind,
+                "name": effective_name,
+                "size": len(body),
+            }
+        )
+        return _ok(
+            f"context saved: {kind}/{effective_name} ({len(body)} chars). "
+            "Takes effect on every agent's next turn."
+        )
+
+    @tool(
         "coord_set_player_role",
         (
             "Coach-only. Assign a Player their human-readable name and "
@@ -1072,6 +1138,7 @@ def build_coord_server(caller_id: str) -> Any:
             update_memory,
             commit_push,
             write_decision,
+            write_context,
             set_player_role,
             request_human,
         ],
@@ -1091,6 +1158,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_update_memory",
     "mcp__coord__coord_commit_push",
     "mcp__coord__coord_write_decision",
+    "mcp__coord__coord_write_context",
     "mcp__coord__coord_set_player_role",
     "mcp__coord__coord_request_human",
 ]
