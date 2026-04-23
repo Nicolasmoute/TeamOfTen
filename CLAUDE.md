@@ -23,15 +23,61 @@ A personal orchestration harness for a **team of 11 Claude Code agents — 1 Coa
 
 ---
 
-## Current state (2026-04-22)
+## Current state (2026-04-23)
 
-- Spec complete, revised to reflect M-1 findings
-- **M-1 spike passed**: 10 concurrent `claude -p` calls work on one Max OAuth both locally (Win ARM64) and on Zeabur EU runtime
-- Repo pushed to `github.com/Nicolasmoute/TeamOfTen`
-- Zeabur service exists with a manual shell (`debian:bookworm-slim` + `sleep infinity`) — used for the spike, will be replaced by the real harness
-- **Next milestone**: M0 — FastAPI hello world, Dockerfile, deploys to Zeabur
+Backend + UI essentially feature-complete for the personal harness. Heavy
+self-paced /loop development with no end-to-end verification yet on the
+deployed Zeabur instance — see "What needs verification" below.
 
-See [Docs/HARNESS_SPEC.md §14](Docs/HARNESS_SPEC.md) for the full M0–M9 build order.
+**Done:**
+- **M-1** ✓ Max OAuth + 10-concurrent feasibility (laptop + Zeabur EU)
+- **M0** ✓ FastAPI skeleton, Dockerfile, Zeabur auto-deploy from main
+- **M1** ✓ One Claude SDK agent streaming to a WebSocket UI
+- **M2a** ✓ SQLite state + 11-agent roster (Coach + p1..p10) + first coord_* tools
+- **M2b** ✓ Task state machine (`coord_claim_task`, `coord_update_task`)
+- **M2c** ✓ Inter-agent chat (`coord_send_message`, `coord_read_inbox`,
+   per-recipient unread tracking via `message_reads` table)
+- **M2d** ✓ Shared memory commons (`coord_list/read/update_memory`)
+- **M2e** ✓ Per-agent + team daily cost caps (env-configurable, enforced
+   pre-spawn, `cost_capped` events)
+- **v2 (a/b/c/d)** ✓ Preact frontend rewrite: slim left rail with status dots,
+   tileable agent panes (Split.js drag-resize), per-tool renderers
+   (Read/Edit/Bash/Grep/Glob/coord_*/generic + Edit diff card + Read-of-image
+   inline preview), tool_use↔tool_result pairing, Image paste via
+   /api/attachments, EnvPane with live tasks/cost/timeline, SettingsDrawer
+- **M3 (1/2/3)** ✓ kDrive persistence:
+   - Memory docs synchronously mirror to `/harness/memory/<topic>.md`
+   - Event log flushed every 5 min to `/harness/events/<date>.jsonl`
+     (with yesterday-replay during 00:00–02:00 UTC for boundary safety)
+   - Hourly `VACUUM INTO` snapshot to `/harness/snapshots/<ts>.db`
+- **M4 (1/2)** ✓ Per-Player git worktrees:
+   - `git` installed in container with default identity
+   - On boot, if `HARNESS_PROJECT_REPO` is set, clone to `/workspaces/.project`
+     and create worktree `/workspaces/<slot>/project` on branch `work/<slot>`
+   - Branch resolution preserves `origin/work/<slot>` history if it exists
+
+**Next likely:**
+- **M4 step 3**: agent commit/push helper (or document credentials.helper
+   for HARNESS_PROJECT_REPO with embedded PAT)
+- **M5**: SDK hooks. Risky one (PreToolUse inbox-inject) likely deferred
+   in favor of the polling pattern that already works. Useful pieces:
+   session_id capture for resume, TaskCompleted hook
+- **Decisions/digests** files on kDrive (need Coach to actively run on a
+   loop to populate them)
+
+## What needs verification (when user is next active)
+
+A lot has shipped without exercise. Before depending on any of this:
+
+1. **Zeabur redeploy succeeds** with the latest commit (heavy git install + worktree boot might surface issues)
+2. **Cost cap blocks spawn** when an agent is over its daily limit
+3. **kDrive mirror** writes a memory doc when env vars are configured
+4. **Git worktrees** materialize for each slot when `HARNESS_PROJECT_REPO` is set
+5. **Image paste** end-to-end: paste in pane → upload → agent Read → describe
+6. **Per-tool renderers** display nicely in the timeline
+7. **Tasks**: human creates → coach assigns via msg → player claims → updates → done
+
+Most likely failure mode: subtle SDK / WebDAV / git-credential issue that needs a small fix.
 
 ---
 
