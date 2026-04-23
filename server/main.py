@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -459,6 +460,44 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
 # ------------------------------------------------------------------
 # Events (paginated replay for pane restore)
 # ------------------------------------------------------------------
+
+
+@app.get("/api/memory", dependencies=[Depends(require_token)])
+async def list_memory() -> dict[str, Any]:
+    """List shared-memory topics (flat table, not paginated — this
+    harness has at most a few dozen memory docs in practice)."""
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT topic, last_updated, last_updated_by, version, "
+            "LENGTH(content) AS size FROM memory_docs "
+            "ORDER BY last_updated DESC"
+        )
+        rows = await cur.fetchall()
+    finally:
+        await c.close()
+    return {"docs": [dict(r) for r in rows]}
+
+
+@app.get("/api/memory/{topic}", dependencies=[Depends(require_token)])
+async def get_memory(topic: str) -> dict[str, Any]:
+    """Full content of a single memory doc."""
+    # Validate with the same regex the MCP tool enforces on write.
+    if not re.fullmatch(r"[a-z0-9][a-z0-9\-]{0,63}", topic):
+        raise HTTPException(400, detail="invalid topic")
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT topic, content, last_updated, last_updated_by, version "
+            "FROM memory_docs WHERE topic = ?",
+            (topic,),
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    if not row:
+        raise HTTPException(404, detail="not found")
+    return dict(row)
 
 
 @app.get("/api/decisions", dependencies=[Depends(require_token)])

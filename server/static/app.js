@@ -958,6 +958,7 @@ function EnvPane({ agents, tasks, conversations, serverStatus, onCreateTask, onC
         <${EnvAttentionSection} conversations=${conversations} />
         <${EnvTasksSection} tasks=${tasks} onCreate=${onCreateTask} />
         <${EnvCostSection} agents=${agents} serverStatus=${serverStatus} />
+        <${EnvMemorySection} conversations=${conversations} />
         <${EnvDecisionsSection} conversations=${conversations} />
         <${EnvTimelineSection} conversations=${conversations} />
       </div>
@@ -1100,6 +1101,88 @@ function EnvAttentionSection({ conversations }) {
           `
         )}
       </div>
+    </section>
+  `;
+}
+
+function EnvMemorySection({ conversations }) {
+  const [docs, setDocs] = useState([]);
+  const [openTopic, setOpenTopic] = useState(null);
+  const [openBody, setOpenBody] = useState("");
+
+  const load = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/memory");
+      if (!res.ok) return;
+      const data = await res.json();
+      setDocs(data.docs || []);
+    } catch (e) {
+      console.error("loadMemory failed", e);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Refresh when any agent mutates memory (memory_updated events cross
+  // all conversations — trigger on any of them).
+  const memoryEventCount = useMemo(() => {
+    let n = 0;
+    for (const list of conversations.values()) {
+      for (const ev of list) if (ev.type === "memory_updated") n++;
+    }
+    return n;
+  }, [conversations]);
+  useEffect(() => {
+    if (memoryEventCount > 0) load();
+  }, [memoryEventCount, load]);
+
+  const toggle = useCallback(async (topic) => {
+    if (openTopic === topic) {
+      setOpenTopic(null);
+      setOpenBody("");
+      return;
+    }
+    setOpenTopic(topic);
+    setOpenBody("loading…");
+    try {
+      const res = await authFetch("/api/memory/" + encodeURIComponent(topic));
+      if (!res.ok) {
+        setOpenBody("(failed to load: HTTP " + res.status + ")");
+        return;
+      }
+      const data = await res.json();
+      setOpenBody(data.content || "");
+    } catch (e) {
+      setOpenBody("(failed to load: " + e + ")");
+    }
+  }, [openTopic]);
+
+  return html`
+    <section class="env-section">
+      <h3 class="env-section-title">
+        Memory <span class="env-count">${docs.length}</span>
+      </h3>
+      ${docs.length === 0
+        ? html`<div class="env-empty">(empty — agents use coord_update_memory)</div>`
+        : html`<div class="env-decision-list">
+            ${docs.map(
+              (d) => html`
+                <div class="env-decision" key=${d.topic}>
+                  <button
+                    class="env-decision-head"
+                    onClick=${() => toggle(d.topic)}
+                  >
+                    <span class="env-decision-arrow">${openTopic === d.topic ? "▾" : "▸"}</span>
+                    <span class="env-decision-title">${d.topic}</span>
+                    <span class="env-decision-meta">v${d.version} · ${d.last_updated_by}</span>
+                  </button>
+                  ${openTopic === d.topic
+                    ? html`<pre class="env-decision-body">${openBody}</pre>`
+                    : null}
+                </div>
+              `
+            )}
+          </div>`}
     </section>
   `;
 }
