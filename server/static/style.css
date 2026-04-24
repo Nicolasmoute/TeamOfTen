@@ -518,16 +518,19 @@ body {
 }
 
 /* Pinned attention section: banner above the other env sections when
-   any undismissed human_attention events are live. */
+   any undismissed human_attention / pending_question / pending_plan
+   events are live. Amber by default — signals "action needed" without
+   the emergency-tone of red, which we reserve for .blocker items
+   below (true urgencies set via coord_request_human urgency='blocker'). */
 .env-section.env-attention {
-  background: #2c1a22;
-  border: 1px solid var(--err);
+  background: #2a1d0e;
+  border: 1px solid #e3a03a;
   border-radius: 6px;
   padding: 8px 10px 10px;
   margin-bottom: 10px;
 }
 .env-section.env-attention .env-section-title {
-  color: var(--err);
+  color: #e3a03a;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -535,27 +538,30 @@ body {
 .env-attention-dismiss-all {
   margin-left: auto;
   background: transparent;
-  border: 1px solid var(--err);
-  color: var(--err);
+  border: 1px solid #e3a03a;
+  color: #e3a03a;
   border-radius: 3px;
   font-size: 10px;
   padding: 1px 6px;
   cursor: pointer;
 }
-.env-attention-dismiss-all:hover { background: rgba(255, 80, 100, 0.1); }
+.env-attention-dismiss-all:hover { background: rgba(227, 160, 58, 0.12); }
 .env-attention-list {
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
 .env-attention-item {
-  background: #1a0f13;
-  border-left: 3px solid var(--err);
+  background: #1a140a;
+  border-left: 3px solid #e3a03a;
   padding: 6px 8px;
   border-radius: 3px;
 }
+/* Blocker urgency keeps the louder red treatment — this is reserved
+   for coord_request_human urgency='blocker', genuine team-stopping
+   issues. Routine questions / plan approvals stay amber above. */
 .env-attention-item.blocker {
-  border-left-width: 5px;
+  border-left: 5px solid var(--err);
   background: #33131c;
 }
 .env-attention-head {
