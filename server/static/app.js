@@ -4001,6 +4001,7 @@ function ActiveLoops({ liveEvents }) {
   const [tick, setTick] = useState({ interval: 0, nextAt: 0 });
   const [repeat, setRepeat] = useState({ interval: 0, prompt: null, nextAt: 0 });
   const [now, setNow] = useState(Date.now());
+  const [err, setErr] = useState(null);
   const [collapsed, setCollapsed] = useState(() => {
     try { return JSON.parse(localStorage.getItem(LOOP_COLLAPSED_KEY) || "{}"); }
     catch (_) { return {}; }
@@ -4082,20 +4083,24 @@ function ActiveLoops({ liveEvents }) {
     return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
   };
 
-  const killTick = () => {
-    authFetch("/api/coach/loop", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ interval_seconds: 0 }),
-    }).catch(() => {});
+  const kill = async (url, body) => {
+    setErr(null);
+    try {
+      const r = await authFetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const text = await r.text().catch(() => "");
+        setErr(`kill failed: HTTP ${r.status}${text ? " — " + text.slice(0, 80) : ""}`);
+      }
+    } catch (e) {
+      setErr("kill failed: " + String(e));
+    }
   };
-  const killRepeat = () => {
-    authFetch("/api/coach/repeat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ interval_seconds: 0, prompt: null }),
-    }).catch(() => {});
-  };
+  const killTick = () => kill("/api/coach/loop", { interval_seconds: 0 });
+  const killRepeat = () => kill("/api/coach/repeat", { interval_seconds: 0, prompt: null });
 
   const row = (key, label, interval, nextAt, promptText, onKill) => {
     const isCollapsed = !!collapsed[key];
@@ -4140,6 +4145,12 @@ function ActiveLoops({ liveEvents }) {
           repeat.prompt || "",
           killRepeat
         )
+      : null}
+    ${err
+      ? html`<div class="active-loop-err">
+          ${err}
+          <button class="active-loop-err-x" onClick=${() => setErr(null)}>×</button>
+        </div>`
       : null}
   </div>`;
 }
@@ -4559,7 +4570,13 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
         const raw = arg.trim();
         if (!raw) {
           authFetch("/api/coach/repeat")
-            .then((r) => r.json())
+            .then(async (r) => {
+              if (!r.ok) {
+                const body = await r.text().catch(() => "");
+                throw new Error(`HTTP ${r.status}${body ? " — " + body.slice(0, 80) : ""}`);
+              }
+              return r.json();
+            })
             .then((d) => {
               setInfoText(
                 d.interval_seconds && d.prompt
@@ -4567,7 +4584,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
                   : "Coach repeat: OFF. '/repeat 120 <prompt>' to start."
               );
             })
-            .catch((e) => setInfoText("repeat query failed: " + String(e)));
+            .catch((e) => setInfoText("repeat query failed: " + String(e.message || e)));
           return true;
         }
         const first = raw.split(/\s+/, 1)[0].toLowerCase();

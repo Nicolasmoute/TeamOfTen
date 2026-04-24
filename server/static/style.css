@@ -1913,6 +1913,27 @@ body {
   text-overflow: ellipsis;
   min-width: 0;
 }
+.active-loop-err {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 1px solid #c55;
+  border-radius: 6px;
+  background: rgba(204, 85, 85, 0.08);
+  color: #e88;
+  font-size: 11px;
+}
+.active-loop-err-x {
+  margin-left: auto;
+  background: transparent;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0 2px;
+  line-height: 1;
+}
 
 /* Compact mode chips shown right above the textarea. Each chip reads
    the current pane setting (model / plan / effort). Active chips pick
