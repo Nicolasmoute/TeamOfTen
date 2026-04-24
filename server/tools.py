@@ -339,7 +339,7 @@ def build_coord_server(caller_id: str) -> Any:
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT owner, status FROM tasks WHERE id = ?",
+                "SELECT owner, status, created_by, title FROM tasks WHERE id = ?",
                 (task_id,),
             )
             row = await cur.fetchone()
@@ -348,6 +348,8 @@ def build_coord_server(caller_id: str) -> Any:
             d = dict(row)
             current_owner: str | None = d["owner"]
             old_status: str = d["status"]
+            created_by: str = d.get("created_by") or ""
+            task_title: str = d.get("title") or ""
 
             # Permission check.
             if current_owner is None:
@@ -411,6 +413,39 @@ def build_coord_server(caller_id: str) -> Any:
                 "owner": current_owner,
             }
         )
+        # Notify the creator when a Player finishes work they didn't
+        # assign to themselves. Without this, Coach has to poll the
+        # board to notice done/blocked/cancelled transitions. Skip the
+        # self-notify case (a Player both creating and completing a
+        # subtask) and the creator-is-caller case. We fire on done,
+        # blocked, and cancelled — all three are moments Coach cares
+        # about since they change the available work pool.
+        if (
+            new_status in ("done", "blocked", "cancelled")
+            and created_by
+            and created_by != caller_id
+            and created_by != "human"
+        ):
+            try:
+                from server.agents import _deliver_system_message
+                verb = {
+                    "done": "finished",
+                    "blocked": "marked blocked",
+                    "cancelled": "cancelled",
+                }[new_status]
+                note_line = f"\nNote: {note}" if note else ""
+                await _deliver_system_message(
+                    from_id=caller_id,
+                    to_id=created_by,
+                    subject=f"{task_id} {verb}",
+                    body=(
+                        f"I {verb} {task_id} \"{task_title[:100]}\"."
+                        f"{note_line}"
+                    ),
+                    priority="normal",
+                )
+            except Exception:
+                pass
         suffix = f" — {note}" if note else ""
         return _ok(f"updated {task_id}: {old_status} → {new_status}{suffix}")
 

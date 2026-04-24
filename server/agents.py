@@ -54,6 +54,67 @@ async def _emit(agent_id: str, event_type: str, **payload: Any) -> None:
     )
 
 
+async def _deliver_system_message(
+    *,
+    from_id: str,
+    to_id: str,
+    subject: str | None,
+    body: str,
+    priority: str = "normal",
+    wake: bool = True,
+) -> None:
+    """Insert a harness-generated message into the inbox, publish a
+    message_sent event, and (optionally) wake the recipient.
+
+    Used by reliability paths (error notifications, task-done pings,
+    stale-task watchdog) that don't route through coord_send_message.
+    Silent on failure — the originating flow should continue even if
+    notification bookkeeping fails."""
+    if not body or not to_id:
+        return
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "INSERT INTO messages (from_id, to_id, subject, body, priority) "
+                "VALUES (?, ?, ?, ?, ?) RETURNING id",
+                (from_id, to_id, subject, body, priority),
+            )
+            row = await cur.fetchone()
+            msg_id = dict(row)["id"] if row else None
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("_deliver_system_message insert failed")
+        return
+    try:
+        await bus.publish({
+            "ts": _now(),
+            "agent_id": from_id,
+            "type": "message_sent",
+            "message_id": msg_id,
+            "to": to_id,
+            "subject": subject,
+            "body_preview": body[:120],
+            "priority": priority,
+        })
+    except Exception:
+        logger.exception("_deliver_system_message publish failed")
+    if wake and to_id != "broadcast":
+        try:
+            preview = body.strip().replace("\n", " ")[:240]
+            subj = f" (subject: {subject})" if subject else ""
+            await maybe_wake_agent(
+                to_id,
+                f"New message from {from_id}{subj}: \"{preview}\"\n\n"
+                f"Call coord_read_inbox to mark it read and see any "
+                f"other queued messages, then respond as appropriate.",
+            )
+        except Exception:
+            logger.exception("_deliver_system_message wake failed")
+
+
 _TOOL_RESULT_CAP = 4000
 
 
@@ -478,6 +539,39 @@ async def _handle_message(
             session_id=session_id,
         )
         await _add_cost(agent_id, cost)
+        # Player soft-error → DM Coach so the workflow doesn't hang on
+        # a silent failure. A ResultMessage with is_error=True came
+        # back fine from the SDK but the turn itself reports failure
+        # (max_turns, max_budget, error_during_execution, etc.) — this
+        # does NOT trigger auto-retry (that path is for hard errors
+        # before ResultMessage), so Coach is the only one who can
+        # react. Skip Coach's own errors (nothing to notify) and
+        # compact turns (internal). Debounced per-agent.
+        if (
+            msg.is_error
+            and agent_id != "coach"
+            and agent_id != "system"
+            and (turn_ctx is None or not turn_ctx.get("compact_mode"))
+        ):
+            now_m = time.monotonic()
+            last = _last_error_dm_to_coach.get(agent_id, 0.0)
+            if now_m - last >= ERROR_DM_DEBOUNCE_SECONDS:
+                _last_error_dm_to_coach[agent_id] = now_m
+                reason = str(stop_reason or "error")
+                await _deliver_system_message(
+                    from_id=agent_id,
+                    to_id="coach",
+                    subject=f"{agent_id} turn errored ({reason})",
+                    body=(
+                        f"My last turn ended with is_error=True "
+                        f"(stop_reason={reason}, duration="
+                        f"{int((duration_ms or 0) / 1000)}s). I won't "
+                        f"auto-retry — soft errors don't trigger the "
+                        f"retry loop. Decide whether to re-prompt me, "
+                        f"reassign, or investigate via /api/events."
+                    ),
+                    priority="normal",
+                )
         # Compact turn completed successfully: commit the assistant's
         # summary as the continuity note and null session_id so the
         # NEXT turn starts on a fresh conversation with the summary
@@ -843,6 +937,14 @@ ERROR_RETRY_DELAY_SECONDS = int(
 )
 ERROR_RETRY_MAX_CONSECUTIVE = int(
     os.environ.get("HARNESS_ERROR_RETRY_MAX_CONSECUTIVE", "3")
+)
+
+# Per-agent debounce for "Player errored → DM Coach" notifications.
+# Without this, a burst of retries spams Coach's inbox with 3×
+# near-identical messages. Map: agent_id → monotonic ts of last DM.
+_last_error_dm_to_coach: dict[str, float] = {}
+ERROR_DM_DEBOUNCE_SECONDS = int(
+    os.environ.get("HARNESS_ERROR_DM_DEBOUNCE", "300")
 )
 
 
@@ -2574,6 +2676,26 @@ async def _schedule_post_error_retry(agent_id: str) -> None:
             })
         except Exception:
             logger.exception("escalation publish failed for %s", agent_id)
+        # Also DM Coach so coordination doesn't hang while waiting for
+        # the human to clear the escalation. Skip when the stuck agent
+        # IS Coach (no one to DM). This is the final notification —
+        # bypass the error-DM debounce so it always lands.
+        if agent_id != "coach":
+            try:
+                await _deliver_system_message(
+                    from_id=agent_id,
+                    to_id="coach",
+                    subject=f"{agent_id}: auto-retry gave up ({attempt} errors)",
+                    body=(
+                        f"I've errored {attempt} turns in a row and the "
+                        f"harness stopped retrying. Any task I own is "
+                        f"stuck until the human investigates or you "
+                        f"reassign it. Treat my slot as unavailable."
+                    ),
+                    priority="interrupt",
+                )
+            except Exception:
+                logger.exception("gave-up Coach DM failed for %s", agent_id)
         return
     _retry_pending.add(agent_id)
 
@@ -2771,3 +2893,128 @@ async def coach_repeat_loop() -> None:
             raise
         except Exception:
             logger.exception("coach repeat loop: tick failed")
+
+
+# Stale-task watchdog config. Env-tunable so the default can be safe
+# (fires rarely) and aggressive setups can dial in tighter.
+#   HARNESS_STALE_TASK_MINUTES: how long an in-progress task must sit
+#     without owner activity before it's flagged. Default 15.
+#   HARNESS_STALE_TASK_NOTIFY_INTERVAL_MINUTES: re-notify cadence for
+#     the same task if it stays stalled. Default 30.
+#   HARNESS_STALE_TASK_CHECK_INTERVAL_SECONDS: how often the loop runs.
+#     Default 60.
+# Setting STALE_TASK_MINUTES to 0 disables the watchdog entirely.
+STALE_TASK_MINUTES = int(os.environ.get("HARNESS_STALE_TASK_MINUTES", "15"))
+STALE_TASK_NOTIFY_INTERVAL_MIN = int(
+    os.environ.get("HARNESS_STALE_TASK_NOTIFY_INTERVAL_MINUTES", "30")
+)
+STALE_TASK_CHECK_INTERVAL_SEC = int(
+    os.environ.get("HARNESS_STALE_TASK_CHECK_INTERVAL_SECONDS", "60")
+)
+# task_id → monotonic ts of the last DM we sent Coach about this task.
+# Keeps the same stuck task from pinging Coach every 60s.
+_stale_task_last_notify: dict[str, float] = {}
+
+
+async def stale_task_watch_loop() -> None:
+    """Background task: find in_progress tasks whose owner hasn't
+    emitted an event in STALE_TASK_MINUTES minutes and DM Coach so
+    the workflow doesn't silently hang. Re-notifies at most every
+    STALE_TASK_NOTIFY_INTERVAL_MIN minutes per task. Also emits a
+    `task_stalled` event for audit.
+
+    Detection query: left-join tasks against the max(events.ts) per
+    owner; filter on (now - last_activity) > cutoff. Excludes tasks
+    where the owner has ZERO events in history (fresh system never
+    been used — avoids firing on an empty DB). Locked or cancelled
+    agents are skipped because they're a known-stall case, not a bug.
+    """
+    if STALE_TASK_MINUTES <= 0:
+        logger.info("stale-task watchdog disabled (HARNESS_STALE_TASK_MINUTES=0)")
+        return
+    logger.info(
+        "stale-task watchdog running (stale after %dm; re-notify every %dm; check every %ds)",
+        STALE_TASK_MINUTES, STALE_TASK_NOTIFY_INTERVAL_MIN, STALE_TASK_CHECK_INTERVAL_SEC,
+    )
+    while True:
+        try:
+            await asyncio.sleep(STALE_TASK_CHECK_INTERVAL_SEC)
+        except asyncio.CancelledError:
+            raise
+        try:
+            if _paused:
+                continue
+            cutoff_minutes = STALE_TASK_MINUTES
+            c = await configured_conn()
+            try:
+                # julianday returns fractional days; × 1440 → minutes.
+                # HAVING filters tasks with NO activity in cutoff min.
+                cur = await c.execute(
+                    """
+                    SELECT t.id, t.title, t.owner, t.created_by,
+                           MAX(e.ts) AS last_activity
+                    FROM tasks t
+                    LEFT JOIN events e ON e.agent_id = t.owner
+                    WHERE t.status = 'in_progress'
+                      AND t.owner IS NOT NULL
+                    GROUP BY t.id
+                    HAVING last_activity IS NOT NULL
+                       AND (julianday('now') - julianday(last_activity)) * 1440 > ?
+                    """,
+                    (cutoff_minutes,),
+                )
+                rows = await cur.fetchall()
+            finally:
+                await c.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("stale-task watchdog: DB query failed")
+            continue
+        if not rows:
+            continue
+        now_m = time.monotonic()
+        notify_interval_sec = STALE_TASK_NOTIFY_INTERVAL_MIN * 60
+        for row in rows:
+            d = dict(row)
+            task_id = d.get("id")
+            if not task_id:
+                continue
+            last = _stale_task_last_notify.get(task_id, 0.0)
+            if last and (now_m - last) < notify_interval_sec:
+                continue
+            _stale_task_last_notify[task_id] = now_m
+            owner = d.get("owner") or "?"
+            title = d.get("title") or "(no title)"
+            last_act = d.get("last_activity") or "unknown"
+            try:
+                await _emit(
+                    "system",
+                    "task_stalled",
+                    task_id=task_id,
+                    owner=owner,
+                    last_activity=last_act,
+                    stale_minutes=cutoff_minutes,
+                )
+            except Exception:
+                logger.exception("stale-task: emit failed for %s", task_id)
+            # Skip the DM if Coach IS the owner of the stalled task —
+            # Coach can't nudge themselves via inbox. The task_stalled
+            # event still lands in the UI timeline for the human.
+            if owner == "coach":
+                continue
+            try:
+                await _deliver_system_message(
+                    from_id="system",
+                    to_id="coach",
+                    subject=f"task {task_id} stalled ({owner})",
+                    body=(
+                        f"Task {task_id} \"{title[:100]}\" has been in_progress "
+                        f"for {cutoff_minutes}+ minutes with no activity from "
+                        f"{owner} (last event: {last_act}). Decide whether to "
+                        f"nudge them, reassign, or mark the task blocked."
+                    ),
+                    priority="normal",
+                )
+            except Exception:
+                logger.exception("stale-task: DM to Coach failed for %s", task_id)

@@ -41,6 +41,7 @@ from server.agents import (
     cancel_all_agents,
     coach_tick_loop,
     coach_repeat_loop,
+    stale_task_watch_loop,
     is_paused,
     run_agent,
     set_paused,
@@ -218,12 +219,13 @@ async def lifespan(app: FastAPI):
     snapshot_task = asyncio.create_task(snapshot_loop())
     coach_task = asyncio.create_task(coach_tick_loop())
     coach_repeat_task = asyncio.create_task(coach_repeat_loop())
+    stale_task_task = asyncio.create_task(stale_task_watch_loop())
     trim_task = asyncio.create_task(events_trim_loop())
     att_trim_task = asyncio.create_task(attachments_trim_loop())
     sessions_trim_task = asyncio.create_task(sessions_trim_loop())
     uploads_task = asyncio.create_task(uploads_pull_loop())
     outputs_task = asyncio.create_task(outputs_push_loop())
-    bg_tasks = (sync_task, snapshot_task, coach_task, coach_repeat_task, trim_task, att_trim_task, sessions_trim_task, uploads_task, outputs_task)
+    bg_tasks = (sync_task, snapshot_task, coach_task, coach_repeat_task, stale_task_task, trim_task, att_trim_task, sessions_trim_task, uploads_task, outputs_task)
     try:
         yield
     finally:
