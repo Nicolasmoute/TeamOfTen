@@ -543,6 +543,35 @@ def set_coach_interval(seconds: int) -> None:
     logger.info("coach autoloop interval set to %ds", _coach_tick_interval)
 
 
+# Independent "repeat" loop: same shape as the tick loop but with an
+# arbitrary caller-supplied prompt. Driven by /repeat slash command
+# (POST /api/coach/repeat). Coach-only. Runs in parallel with the
+# routine tick loop — both can fire independently, coach_is_working
+# guard prevents actual concurrent turns.
+_coach_repeat_interval: int = 0
+_coach_repeat_prompt: str | None = None
+
+
+def get_coach_repeat() -> tuple[int, str | None]:
+    return _coach_repeat_interval, _coach_repeat_prompt
+
+
+def set_coach_repeat(seconds: int, prompt: str | None) -> None:
+    """Set the Coach repeat-loop cadence + prompt at runtime. Passing
+    seconds=0 disables the loop (prompt is cleared). Changes take
+    effect on the next iteration of coach_repeat_loop."""
+    global _coach_repeat_interval, _coach_repeat_prompt
+    _coach_repeat_interval = max(0, int(seconds))
+    _coach_repeat_prompt = (prompt or "").strip() or None
+    if _coach_repeat_interval <= 0:
+        _coach_repeat_prompt = None
+    logger.info(
+        "coach repeat loop set: %ds, prompt=%r",
+        _coach_repeat_interval,
+        (_coach_repeat_prompt or "")[:60],
+    )
+
+
 # Auto-wake: when Coach assigns a task to p3 or messages p3, we start
 # a turn for p3 with a wake prompt so the Player actually engages —
 # without this, assignments just sit in the DB doing nothing. Debounce
@@ -552,6 +581,24 @@ AUTOWAKE_DEBOUNCE_SECONDS = int(
     os.environ.get("HARNESS_AUTOWAKE_DEBOUNCE", "10")
 )
 _last_turn_ended_at: dict[str, float] = {}
+
+# Post-error auto-retry tracking. After a hard error (not the
+# suppressed post-result teardown variety), we schedule a single wake
+# after HARNESS_ERROR_RETRY_DELAY seconds so the agent doesn't sit
+# idle if no external event happens to nudge it. _retry_pending marks
+# agents whose retry task is already queued — prevents stacking
+# multiple retries on a burst of errors. _consecutive_errors counts
+# errors-without-a-successful-turn-in-between; after
+# HARNESS_ERROR_RETRY_MAX_CONSECUTIVE (default 3) we escalate to the
+# human instead of retrying forever and chewing the cost cap.
+_retry_pending: set[str] = set()
+_consecutive_errors: dict[str, int] = {}
+ERROR_RETRY_DELAY_SECONDS = int(
+    os.environ.get("HARNESS_ERROR_RETRY_DELAY", "45")
+)
+ERROR_RETRY_MAX_CONSECUTIVE = int(
+    os.environ.get("HARNESS_ERROR_RETRY_MAX_CONSECUTIVE", "3")
+)
 
 
 def _today_utc_start_iso() -> str:
@@ -1554,6 +1601,11 @@ async def run_agent(
                 type(e).__name__, agent_id, e,
             )
             await _set_status(agent_id, "idle")
+            # Suppressed post-result teardown noise isn't a real
+            # failure — the turn's work completed. Reset the
+            # consecutive-error counter so retries don't falsely
+            # accumulate toward the escalation cap.
+            _consecutive_errors.pop(agent_id, None)
         else:
             # Log the full traceback to stdout so Zeabur captures it;
             # the event only carries a summary so the UI doesn't drown
@@ -1586,8 +1638,18 @@ async def run_agent(
                 cwd=options_kwargs.get("cwd"),
             )
             await _set_status(agent_id, "error")
+            # Auto-retry: bump the consecutive-error counter and
+            # schedule a delayed wake. The scheduler itself handles the
+            # cap (escalates to human after N consecutive errors
+            # without an intervening success) and the no-op-if-
+            # recovered check.
+            _consecutive_errors[agent_id] = _consecutive_errors.get(agent_id, 0) + 1
+            await _schedule_post_error_retry(agent_id)
     else:
         await _set_status(agent_id, "idle")
+        # Success path: reset the consecutive-error counter so a later
+        # transient error isn't immediately treated as "attempt N+1".
+        _consecutive_errors.pop(agent_id, None)
     finally:
         _running_tasks.pop(agent_id, None)
         # Stamp when this turn ended so the auto-wake debounce can see
@@ -1597,6 +1659,102 @@ async def run_agent(
         _last_turn_ended_at[agent_id] = time.monotonic()
 
     await _emit(agent_id, "agent_stopped")
+
+
+async def _get_status_of(agent_id: str) -> str | None:
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT status FROM agents WHERE id = ?", (agent_id,)
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    return dict(row).get("status")
+
+
+async def _schedule_post_error_retry(agent_id: str) -> None:
+    """Schedule a single auto-wake after a hard error so the agent
+    doesn't sit idle indefinitely. Caps consecutive retries and
+    escalates to the human when the cap trips.
+
+    The retry is cancelled (logically — the task still runs but no-ops)
+    if the agent has recovered to idle/working by the time the delay
+    elapses, so user/other-event wakes during the window don't double-
+    fire.
+    """
+    if agent_id in _retry_pending:
+        return
+    attempt = _consecutive_errors.get(agent_id, 0)
+    if attempt >= ERROR_RETRY_MAX_CONSECUTIVE:
+        # Escalate once, then stop retrying. Leaves the agent in error
+        # state so the UI shows something's wrong; human /clear or a
+        # manual prompt is required to resume.
+        await _emit(
+            agent_id,
+            "auto_retry_gave_up",
+            consecutive=attempt,
+            hint="Too many consecutive errors — manually clear the "
+                 "session or investigate logs before retrying.",
+        )
+        try:
+            # coord_request_human emits a human_attention event that
+            # pins a red banner in the EnvPane. Fire it directly here
+            # rather than via a tool call — the agent isn't running.
+            await bus.publish({
+                "ts": _now(),
+                "agent_id": agent_id,
+                "type": "human_attention",
+                "subject": f"{agent_id}: auto-retry gave up after {attempt} errors",
+                "body": "The agent's last several turns all errored. "
+                        "Investigate /api/health, check CLI auth, or "
+                        "clear the session and retry manually.",
+                "urgency": "high",
+            })
+        except Exception:
+            logger.exception("escalation publish failed for %s", agent_id)
+        return
+    _retry_pending.add(agent_id)
+
+    async def _delayed_retry() -> None:
+        try:
+            await asyncio.sleep(ERROR_RETRY_DELAY_SECONDS)
+            # If the agent self-recovered (human intervened, new wake
+            # fired, etc.) skip — we don't want to poke a healthy
+            # agent with a stale "your turn errored" prompt.
+            status = await _get_status_of(agent_id)
+            if status != "error":
+                return
+            if agent_id in _running_tasks:
+                return
+            await _emit(
+                agent_id,
+                "auto_retry_scheduled",
+                attempt=attempt + 1,
+                max_attempts=ERROR_RETRY_MAX_CONSECUTIVE,
+                delay=ERROR_RETRY_DELAY_SECONDS,
+            )
+            await maybe_wake_agent(
+                agent_id,
+                "Your previous turn errored before completing. "
+                "If you had a task in progress, resume it. If the "
+                "error looks persistent, use coord_update_task(..., "
+                "status='blocked') to park the task, or "
+                "coord_request_human to escalate. Otherwise, carry on "
+                "where you left off.",
+                bypass_debounce=True,
+            )
+        except Exception:
+            logger.exception("delayed retry failed for %s", agent_id)
+        finally:
+            _retry_pending.discard(agent_id)
+
+    asyncio.create_task(_delayed_retry())
 
 
 async def maybe_wake_agent(
@@ -1703,8 +1861,57 @@ async def coach_tick_loop() -> None:
             if await _coach_is_working():
                 logger.info("coach autoloop: skipping — coach is working")
                 continue
+            await bus.publish(
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "agent_id": "coach",
+                    "type": "coach_tick_fired",
+                    "interval_seconds": _coach_tick_interval,
+                }
+            )
             await run_agent("coach", COACH_TICK_PROMPT)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("coach autoloop: tick failed")
+
+
+async def coach_repeat_loop() -> None:
+    """Background task: periodically send a user-supplied prompt to
+    Coach. Independent of coach_tick_loop — both can be active at
+    once, each with its own cadence. Idles when interval<=0."""
+    logger.info("coach repeat loop running (disabled until /repeat set)")
+    while True:
+        interval = _coach_repeat_interval
+        try:
+            if interval <= 0:
+                await asyncio.sleep(5)
+                continue
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        try:
+            if _coach_repeat_interval <= 0:
+                continue
+            prompt = _coach_repeat_prompt
+            if not prompt:
+                continue
+            if _paused:
+                logger.info("coach repeat loop: skipping — harness paused")
+                continue
+            if await _coach_is_working():
+                logger.info("coach repeat loop: skipping — coach is working")
+                continue
+            await bus.publish(
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "agent_id": "coach",
+                    "type": "coach_repeat_fired",
+                    "interval_seconds": _coach_repeat_interval,
+                }
+            )
+            await run_agent("coach", prompt)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("coach repeat loop: tick failed")
