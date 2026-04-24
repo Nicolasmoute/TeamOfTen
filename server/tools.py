@@ -1375,6 +1375,165 @@ def build_coord_server(caller_id: str) -> Any:
         return _ok(f"{pid} → {name or '(no name)'} — {role or '(no role)'}")
 
     @tool(
+        "coord_ask_question",
+        (
+            "Ask a structured multiple-choice question, routed to the right "
+            "recipient. Replacement for the CLI's AskUserQuestion tool "
+            "(which expects a terminal UI the harness doesn't have).\n"
+            "\n"
+            "Default routing: Players send to Coach (you work under Coach — "
+            "bother them, not the human, first). Coach sends to the human. "
+            "Override with recipient='coach' | 'human' if you need to.\n"
+            "\n"
+            "Does NOT block the turn — the tool returns immediately with "
+            "'question queued' and you should end the turn. The recipient "
+            "replies through normal channels (Coach via inbox, human via "
+            "UI) and the answer arrives in YOUR inbox on a later turn.\n"
+            "\n"
+            "Params:\n"
+            "- questions: array of {question, options, header?, multi_select?}. "
+            "  Each option is {label, description?}. 1-4 questions per call, "
+            "  2-6 options per question.\n"
+            "- recipient: 'coach' | 'human'. Optional — defaults per role.\n"
+            "- context: short string explaining WHY you're asking (shown with "
+            "  the question so the responder has context). Optional."
+        ),
+        {"questions": list, "recipient": str, "context": str},
+    )
+    async def ask_question(args: dict[str, Any]) -> dict[str, Any]:
+        questions = args.get("questions") or []
+        recipient = (args.get("recipient") or "").strip().lower()
+        context = (args.get("context") or "").strip()
+
+        if not isinstance(questions, list) or not questions:
+            return _err("questions must be a non-empty array")
+        if len(questions) > 4:
+            return _err(f"too many questions ({len(questions)}, max 4 per call)")
+        # Default routing: Players ask Coach, Coach asks human.
+        if not recipient:
+            recipient = "human" if caller_is_coach else "coach"
+        if recipient not in ("coach", "human"):
+            return _err("recipient must be 'coach' or 'human'")
+        if recipient == "coach" and caller_is_coach:
+            return _err(
+                "Coach cannot ask Coach — did you mean recipient='human'?"
+            )
+
+        # Validate + normalize shape. Keep the original structure so the
+        # UI can render a proper form later, but also build a markdown
+        # text version for inbox / event display today.
+        normalized: list[dict[str, Any]] = []
+        md_parts: list[str] = []
+        if context:
+            md_parts.append(f"**Context:** {context}\n")
+        for i, q in enumerate(questions, 1):
+            if not isinstance(q, dict):
+                return _err(f"question {i} must be an object")
+            qtext = (q.get("question") or "").strip()
+            header = (q.get("header") or "").strip()
+            multi = bool(q.get("multi_select") or q.get("multiSelect"))
+            opts = q.get("options") or []
+            if not qtext:
+                return _err(f"question {i}: 'question' text is required")
+            if not isinstance(opts, list) or len(opts) < 2:
+                return _err(f"question {i}: at least 2 options required")
+            if len(opts) > 6:
+                return _err(f"question {i}: at most 6 options (got {len(opts)})")
+            clean_opts: list[dict[str, str]] = []
+            for j, o in enumerate(opts, 1):
+                if not isinstance(o, dict):
+                    return _err(f"question {i} option {j} must be an object")
+                label = (o.get("label") or "").strip()
+                desc = (o.get("description") or "").strip()
+                if not label:
+                    return _err(f"question {i} option {j}: label is required")
+                clean_opts.append({"label": label, "description": desc})
+            normalized.append({
+                "question": qtext,
+                "header": header,
+                "multi_select": multi,
+                "options": clean_opts,
+            })
+            head = f"### {header}\n" if header else ""
+            md_parts.append(
+                f"{head}**Q{i}: {qtext}**"
+                + (" _(multi-select)_" if multi else "")
+                + "\n"
+            )
+            for j, o in enumerate(clean_opts, 1):
+                letter = chr(ord("A") + j - 1)
+                desc_part = f" — {o['description']}" if o["description"] else ""
+                md_parts.append(f"- **{letter}) {o['label']}**{desc_part}")
+            md_parts.append("")
+        md_body = "\n".join(md_parts).strip()
+
+        if recipient == "human":
+            # Surface as a human_attention event with the structured payload
+            # preserved so a future UI form can render it natively. The body
+            # is already human-readable markdown so the existing pinned-
+            # banner UI works today.
+            subject = f"Question from {caller_id}"
+            if len(questions) == 1:
+                q0 = normalized[0]["question"]
+                if len(q0) < 80:
+                    subject = f"{caller_id}: {q0}"
+            await bus.publish(
+                {
+                    "ts": _now_iso(),
+                    "agent_id": caller_id,
+                    "type": "human_attention",
+                    "subject": subject,
+                    "body": md_body,
+                    "urgency": "normal",
+                    "questions": normalized,
+                }
+            )
+            return _ok(
+                "Question queued for the human (human_attention event). "
+                "End this turn; their answer will arrive in your inbox or "
+                "as a new direct prompt."
+            )
+
+        # recipient == "coach"
+        if await _is_locked("coach"):
+            # Coach should never be locked but guard for safety.
+            return _err("coach is locked; cannot route question right now")
+        subject = f"Question from {caller_id}"
+        if len(questions) == 1:
+            q0 = normalized[0]["question"]
+            if len(q0) < 80:
+                subject = q0
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "INSERT INTO messages (from_id, to_id, subject, body, priority) "
+                "VALUES (?, ?, ?, ?, ?) RETURNING id",
+                (caller_id, "coach", subject, md_body, "normal"),
+            )
+            row = await cur.fetchone()
+            msg_id = dict(row)["id"] if row else None
+            await c.commit()
+        finally:
+            await c.close()
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "message_sent",
+                "message_id": msg_id,
+                "to": "coach",
+                "subject": subject,
+                "priority": "normal",
+                "is_question": True,
+                "questions": normalized,
+            }
+        )
+        return _ok(
+            "Question sent to Coach. End this turn; Coach's reply will "
+            "arrive in your inbox on a later turn."
+        )
+
+    @tool(
         "coord_request_human",
         (
             "Escalate to the human operator. Use when stuck, blocked on a "
@@ -1444,6 +1603,7 @@ def build_coord_server(caller_id: str) -> Any:
             list_knowledge,
             list_team,
             set_player_role,
+            ask_question,
             request_human,
         ],
     )
@@ -1469,6 +1629,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_save_output",
     "mcp__coord__coord_list_team",
     "mcp__coord__coord_set_player_role",
+    "mcp__coord__coord_ask_question",
     "mcp__coord__coord_request_human",
 ]
 

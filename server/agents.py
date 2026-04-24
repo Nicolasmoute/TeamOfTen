@@ -1370,6 +1370,12 @@ def _system_prompt_for(agent_id: str) -> str:
             "Player their name + role (e.g. p3 → 'Alice' / 'Frontend developer'). "
             "Do this once per Player when forming the team — the UI labels "
             "their pane from these values.\n"
+            "  - coord_ask_question(questions, recipient?, context?): ask the "
+            "human a structured multiple-choice question (you default to "
+            "recipient='human'). Use this instead of the CLI's "
+            "AskUserQuestion tool, which is disabled — the harness has no "
+            "terminal UI for it. Does NOT block; end the turn, the answer "
+            "arrives later.\n"
             "  - coord_request_human(subject, body, urgency?): escalate to the "
             "human when a decision exceeds your authority or the team is "
             "stuck. urgency='blocker' for whole-team gating.\n"
@@ -1423,6 +1429,12 @@ def _system_prompt_for(agent_id: str) -> str:
         f"  - coord_commit_push(message, push?): when you have code changes "
         f"to ship, use this instead of driving git through Bash — it does "
         f"git add -A + commit + push and emits a commit_pushed event.\n"
+        f"  - coord_ask_question(questions, recipient?, context?): ask a "
+        f"structured multiple-choice question. You default to "
+        f"recipient='coach' — bother Coach first, not the human (Coach "
+        f"can relay to the human if needed). Use this instead of the CLI's "
+        f"AskUserQuestion, which is disabled. Does NOT block; end the turn, "
+        f"the answer arrives in your inbox on a later turn.\n"
         f"  - coord_request_human(subject, body, urgency?): escalate to the "
         f"human when blocked on something only they can decide. Prefer this "
         f"over going silent — say what you tried.\n"
@@ -1727,6 +1739,11 @@ async def run_agent(
         max_turns=10,
         mcp_servers=mcp_servers,
         allowed_tools=allowed,
+        # Block the CLI's interactive AskUserQuestion tool — it expects
+        # a terminal UI to collect answers that the harness doesn't
+        # have, so every call errors. coord_ask_question is the
+        # replacement (same schema, routed to Coach or the human).
+        disallowed_tools=["AskUserQuestion"],
     )
     # Partial-message streaming (token-by-token text + thinking deltas)
     # is off by default: the option is understood by recent SDK
