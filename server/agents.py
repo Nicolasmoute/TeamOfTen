@@ -1484,6 +1484,38 @@ def _system_prompt_for(agent_id: str) -> str:
 _EFFORT_LEVELS = {1: "low", 2: "medium", 3: "high", 4: "max"}
 
 
+async def _wake_after_turn_for_plan_comments(
+    agent_id: str,
+    current_turn_task: asyncio.Task[Any],
+) -> None:
+    """Fire-and-forget: await the currently-running turn, then wake the
+    agent so it reads the freshly-queued plan-comment inbox message.
+    Called from the approve_with_comments path of ExitPlanMode handling.
+
+    Without this, maybe_wake_agent would no-op (slot is busy during the
+    plan-execution turn) and the comments would sit unread until some
+    other external event nudged the agent. Awaiting the current task
+    cleanly defers the wake to post-turn without polling."""
+    try:
+        await current_turn_task
+    except (asyncio.CancelledError, Exception):
+        # Even if the plan-execution turn errored/was cancelled, we
+        # still want the comments surfaced on the next live turn.
+        pass
+    try:
+        await maybe_wake_agent(
+            agent_id,
+            "The operator left notes on the approved plan. Read your "
+            "inbox — the most recent message from 'human' carries "
+            "notes to keep in mind going forward.",
+            bypass_debounce=True,
+        )
+    except Exception:
+        logger.exception(
+            "post-turn wake for plan comments failed for %s", agent_id,
+        )
+
+
 async def _pretool_continue_hook(
     input_data: dict[str, Any],
     tool_use_id: str | None,
@@ -1796,7 +1828,8 @@ async def _handle_exit_plan_mode(
         if decision == "approve_with_comments":
             # Inbox delivery of comments so they land on the next read —
             # the plan executes in-flight on THIS turn, and the notes
-            # become available shortly after via auto-wake.
+            # become available shortly after via the post-turn wake we
+            # schedule below.
             if comments:
                 try:
                     c = await configured_conn()
@@ -1821,6 +1854,20 @@ async def _handle_exit_plan_mode(
                         "plan approve_with_comments: inbox insert failed for %s",
                         agent_id,
                     )
+                else:
+                    # Fire-and-forget post-turn wake: awaits the current
+                    # run_agent task so the wake fires AFTER plan
+                    # execution ends (otherwise maybe_wake_agent no-ops
+                    # because the slot is already busy). Without this,
+                    # the comments sit unread until some other external
+                    # event nudges the agent.
+                    current_turn_task = _running_tasks.get(agent_id)
+                    if current_turn_task is not None:
+                        asyncio.create_task(
+                            _wake_after_turn_for_plan_comments(
+                                agent_id, current_turn_task,
+                            )
+                        )
             return PermissionResultAllow(updated_input={"plan": plan_text})
 
         # Reject path — default. Any non-recognised decision also falls
