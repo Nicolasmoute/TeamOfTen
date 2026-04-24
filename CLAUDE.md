@@ -23,7 +23,7 @@ A personal orchestration harness for a **team of 11 Claude Code agents — 1 Coa
 
 ---
 
-## Current state (2026-04-23)
+## Current state (2026-04-24)
 
 Backend + UI essentially feature-complete for the personal harness. Heavy
 self-paced /loop development with no end-to-end verification yet on the
@@ -165,6 +165,133 @@ deployed Zeabur instance — see "What needs verification" below.
 - **5-min DB snapshots** ✓ down from hourly, keeps 144 (~12 h).
 - **Runtime Coach loop** ✓ `/loop N` / `/loop off` without restart.
 
+**Recent (2026-04-24):**
+
+Data lanes shipped & documented:
+- **attachments** — UI paste-target for images, local-only, 30d trim.
+- **uploads** — human → kDrive → container, pulled every 60s,
+  per-slot `./uploads` symlink. Read-only for agents.
+- **outputs** — agent → binary deliverables (`coord_save_output`,
+  base64) + safety-net push loop every 60s for Write/Bash bypass.
+- **knowledge** — agent → text artifacts (.md/.txt) via
+  `coord_write_knowledge`, synchronous kDrive mirror.
+- All three kDrive-synced lanes documented in CLAUDE.md data paths
+  section that's injected into every system prompt.
+
+UI (Options drawer):
+- **Team tools** ✓ team-wide WebSearch / WebFetch toggles (replaced
+  the per-agent version). Functional state updater so rapid toggles
+  don't race.
+- **Default models** ✓ per-role Coach / Players dropdowns.
+  Precedence: pane override > role default > SDK default.
+- **Project repo** ✓ DB-backed `team_config` (env fallback), masked
+  display, secret-scan on save, `${VAR}` placeholder pattern for
+  GITHUB_TOKEN. `provision now` button runs `ensure_workspaces()`
+  live — no redeploy needed to materialize worktrees.
+- **MCP servers** (Phase 1) ✓ paste-JSON, secret-detect,
+  per-server card with toggle/delete/smoke-test.
+- **Sessions** ✓ batch-clear session_id per agent (tick list + Only
+  active + Clear selected).
+- **kDrive** ✓ probe button, two-step diagnostic, URL-only
+  (dropped KDRIVE_ROOT_PATH). TOT/ folder required on kDrive.
+
+Pane header cleanup:
+- slot short labels (`C` / `1..10` instead of raw ids), role in
+  tooltip only, current-task icon only, lock SVG (green open /
+  red locked, shackle left), `↓` export, `🗑` clear session.
+- Session-clear renders a loud dashed amber `SESSION CLEARED`
+  separator in the timeline.
+- Context-applied / agent_stopped / lock_updated / tools_updated
+  render as compact `.sys` one-line rows (not JSON blobs).
+
+Lock feature:
+- Per-Player `agents.locked` flag (migration). Locked Players get
+  no Coach task assignments, no Coach direct messages, no Coach
+  broadcasts (filtered at `coord_read_inbox`). Human prompts + UI
+  messaging still work. Coach's system prompt gets a "Roster
+  availability" block when any Player is locked so it plans around
+  the constraint.
+
+Security hardening:
+- **`HARNESS_TOKEN` auth** ✓ Bearer token gate on all `/api/*`
+  except `/api/health`. `require_token` dependency; UI paste-modal
+  on 401 saves to localStorage.
+- **Audit actor** ✓ `audit_actor(request)` dependency returns
+  `{source, ip, ua}`; threaded into 11 destructive endpoints
+  (identity / brief / models / tools / repo / provision / MCP
+  save/patch/delete / lock / session-clear single+batch). Every
+  destructive event carries `actor` in its payload.
+- **XSS fix** ✓ `renderInline` runs markdown `[text](url)` URLs
+  through a scheme allow-list (`http/https/mailto` + relative /
+  fragment). `javascript:` / `data:` / `vbscript:` → inert `#`.
+  Closes the "agent-rendered link exfiltrates localStorage token"
+  path. `rel="noreferrer"` added too.
+- **Redacted MCP display** ✓ `_redact_mcp_config` masks env/header
+  values (except `${VAR}` placeholders) and URL userinfo before
+  `GET /api/mcp/servers` returns them.
+- **Repo URL masking** ✓ `_mask_repo_url` hides userinfo in UI.
+
+Workspace resilience:
+- **`workspace_dir(slot)`** ✓ stat-checks `<slot>/project/.git`
+  before returning it. Missing worktree → falls back to plain
+  `/workspaces/<slot>/`. Closes the "repo configured but never
+  provisioned → CLIConnectionError on every spawn" footgun; only
+  code-touching turns and `coord_commit_push` fail loudly now.
+- **`POST /api/team/repo/provision`** ✓ runs `ensure_workspaces()`
+  live with a cache refresh; idempotent across existing worktrees.
+
+Context / compaction:
+- **agents.continuity_note** + **agents.last_exchange_json**
+  columns. On every successful non-compact turn: append
+  `(entry_prompt, accumulated response)` to the rolling exchange
+  log (cap `HARNESS_HANDOFF_EXCHANGES`, default 10, clipped
+  1500/3000 chars).
+- **`/compact` slash command** + `POST /api/agents/{id}/compact`.
+  Queues a compact-mode turn via `run_agent(prompt=COMPACT_PROMPT,
+  compact_mode=True)`. On success, writes summary to
+  `continuity_note`, nulls `session_id`, clears the exchange log.
+  UI shows `session_compact_requested` → compact turn →
+  `session_compacted`.
+- **Auto-compact at 70% context** (`HARNESS_AUTO_COMPACT_THRESHOLD`,
+  default 0.7). Pre-spawn check in `run_agent`: if prior session's
+  estimated token use ≥ threshold × model's window, run a compact
+  turn first (recursive call with `compact_mode=True`), then the
+  user's original prompt on the fresh session. Two turns in the
+  timeline; user's prompt not lost.
+- **Token tracking** ✓ `turns` gains `input_tokens`,
+  `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`.
+  `_extract_usage` pulls from `ResultMessage.usage` defensively.
+  `_session_context_estimate` reads latest row per session.
+- **Structured COMPACT_PROMPT** with required markdown sections
+  (`## Current task`, `## Open questions (verbatim)`,
+  `## Key findings`, `## References (quote verbatim)`,
+  `## Context quirks`). Recent exchanges are injected
+  programmatically verbatim from the rolling log — no paraphrase.
+- **Post-compact system prompt** gets:
+  ```
+  ## Handoff from your prior session (via /compact)
+  <summary>
+  ### Recent exchanges (verbatim, last N turns before compact,
+  oldest first)
+  #### Exchange 1 of N  **User asked:** …  **You replied:** …
+  ```
+  Cleared on first successful non-compact turn.
+
+Reliability:
+- **Post-result exception suppression** widened to any exception
+  type (was `ProcessError` only) — CLI 2.1.12x raises bare
+  `Exception("Command failed with exit code 1")` during teardown
+  after a successful ResultMessage; we now log-and-skip regardless
+  of exception class.
+- **Auto-retry after hard errors** — when a turn errors *before*
+  ResultMessage (real failure), schedule a single wake after
+  `HARNESS_ERROR_RETRY_DELAY` s (default 45) with a "resume or
+  mark blocked" prompt. Cap at
+  `HARNESS_ERROR_RETRY_MAX_CONSECUTIVE` (default 3) — then
+  escalates via `human_attention` and stops retrying. Counter
+  resets on any successful turn (including got_result-but-
+  threw-after suppressions).
+
 **Next likely:**
 - **Mobile UI polish** — touch-drag doesn't work with HTML5 DnD;
    layout breakpoints for < 900 px need a rethink.
@@ -178,23 +305,35 @@ deployed Zeabur instance — see "What needs verification" below.
 
 ## What needs verification (when user is next active)
 
-A lot has shipped without exercise. Hit `/api/health` first — it's the
-fastest single read on subsystem state. Then:
+Verified as of 2026-04-24: HARNESS_TOKEN auth gate, fine-grained
+GITHUB_TOKEN, kDrive mirror (active after TOT/ folder created), live
+repo provisioning (`provision now` button), workspace_dir fallback,
+/compact manual turn, post-error auto-retry (observed working after
+p2's exit-1 incident).
 
-1. **Zeabur redeploy succeeds** with the latest commit (heavy git install + worktree boot might surface issues)
-2. **Cost cap blocks spawn** when an agent is over its daily limit
-3. **kDrive mirror** writes a memory doc when env vars are configured
-4. **Git worktrees** materialize for each slot when `HARNESS_PROJECT_REPO` is set
-5. **Image paste** end-to-end: paste in pane → upload → agent Read → describe
-6. **Per-tool renderers** display nicely in the timeline
-7. **Tasks**: human creates → coach assigns via msg → player claims → updates → done
-8. **Auth gate**: set `HARNESS_TOKEN`, redeploy, confirm UI prompts for token; clear localStorage to retest cold path
-9. **session_id** appears as ● in pane header after a Coach turn completes
-10. **Layout persistence**: open p3, refresh page, p3 still open
-11. **Coach autoloop**: set `HARNESS_COACH_TICK_INTERVAL=120`, redeploy, confirm Coach pane shows a `routine tick` agent_started event ~every 2 min and that ticks skip while a previous turn is still working
-12. **Snapshot retention**: with kDrive enabled, after RETENTION+1 hourly snapshots, confirm only the newest RETENTION remain on kDrive
+Still unverified end-to-end:
 
-Most likely failure mode: subtle SDK / WebDAV / git-credential issue that needs a small fix.
+1. **Auto-compact trigger** — no agent has crossed 70% context yet
+   since the feature shipped. Watch for `auto_compact_triggered`
+   event during a long session (e.g. Coach cycling inbox for hours).
+2. **`auto_retry_gave_up` escalation** — path after 3 consecutive
+   errors has unit-tested the counter but not been exercised live.
+3. **Cost cap blocks spawn** when an agent is over its daily limit.
+4. **Image paste** end-to-end: paste in pane → upload → agent Read
+   → describe.
+5. **Snapshot retention** — with kDrive enabled, after
+   RETENTION+1 snapshots, confirm only the newest RETENTION remain.
+6. **MCP server smoke-test** — has the paste-JSON flow survived an
+   actual GitHub / Notion MCP? Only self-tested with a stub.
+7. **Coach autoloop steady-state** — set
+   `HARNESS_COACH_TICK_INTERVAL=120`, confirm `routine tick` events
+   fire on cadence and skip while a prior turn is working.
+
+Most likely failure mode remaining: subtle SDK version drift where
+our defensive `_extract_usage` / post-result suppression / auto-retry
+interlock misses a newer CLI error shape. Log signature to watch:
+`Exception: Command failed with exit code 1` without `ResultMessage`
+preceding it.
 
 ---
 
@@ -234,6 +373,41 @@ Zeabur's default datacenter returns HTTP 403 for `https://claude.ai/install.sh` 
 ### Line endings on Windows
 
 `.gitattributes` at repo root forces LF on `*.sh` and `Dockerfile*`. If you add new shell scripts or Dockerfiles, existing rules cover them. If not, the script will fail in Linux containers with `$'\r': command not found`.
+
+### `/compact` is hand-rolled; migrate when SDK exposes `context_management`
+
+Anthropic shipped a native compaction feature in the Messages API as
+of 2026-01-12 (`anthropic-beta: compact-2026-01-12` +
+`context_management={"edits":[{"type":"compact_20260112",...}]}`). The
+**Claude Agent SDK does not expose it yet** — `ClaudeAgentOptions`
+has no `context_management` kwarg. Our implementation
+(`agents.continuity_note`, `last_exchange_json`, `COMPACT_PROMPT`,
+`_session_context_estimate`, the auto-compact trip-wire) mirrors the
+native design: summarize older, preserve recent verbatim.
+
+When the Agent SDK adds `context_management`, migrate:
+1. Drop our `agents.continuity_note` + `last_exchange_json` columns.
+2. Drop `_set_continuity_note`, `_append_exchange`,
+   `_extract_usage`, `_session_context_estimate`,
+   `_context_window_for`, the auto-compact block in `run_agent`.
+3. Drop the `/api/agents/{id}/compact` endpoint + `/compact` slash.
+4. Pass `context_management={"edits":[{"type":"compact_20260112",
+   "trigger":{"type":"input_tokens","value":<threshold>}}]}` in
+   every `query()`.
+
+~400 lines deleted, 1 kwarg added. Watch the
+[claude-agent-sdk-python changelog](https://github.com/anthropics/claude-agent-sdk-python/blob/main/CHANGELOG.md).
+
+### Post-ResultMessage teardown noise is SDK-version-sensitive
+
+CLI 2.1.118 raised `ProcessError` after a clean ResultMessage; 2.1.12x
+raises bare `Exception("Command failed with exit code 1")`. Our
+suppression in `run_agent`'s error handler checks
+`turn_ctx.get("got_result")` and ignores **any** exception class
+after that flag is set — don't narrow the check to a specific type
+again. Separate signal: `CLIConnectionError` with "Check stderr
+output for details" IS a real pre-result failure — auto-retry
+handles it.
 
 ---
 
