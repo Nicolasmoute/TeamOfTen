@@ -36,15 +36,58 @@ _key_status: dict[str, Any] = {"ok": False, "reason": "uninitialized"}
 def _load_fernet() -> Any | None:
     """Build a Fernet from HARNESS_SECRETS_KEY; cache the result.
     Returns None when the key is missing or malformed — callers should
-    treat this as 'secrets disabled' and log appropriately."""
+    treat this as 'secrets disabled' and log appropriately.
+
+    Validates the shape explicitly before handing to Fernet so the
+    UI can surface actionable messages like 'expected 44 chars, got
+    32' instead of a bare ValueError."""
     global _fernet, _key_status
     if _fernet is not None:
         return _fernet
     raw = os.environ.get("HARNESS_SECRETS_KEY", "").strip()
+    # Strip accidental wrapping quotes — Zeabur (and shell exports) can
+    # leak these and the user won't see them in the UI.
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ('"', "'"):
+        raw = raw[1:-1]
     if not raw:
         _key_status = {
             "ok": False,
             "reason": "HARNESS_SECRETS_KEY env var not set",
+        }
+        return None
+    # Fernet keys are exactly 44 urlsafe-base64 chars (32 bytes + '=').
+    # Verify before calling Fernet so the error message can be specific.
+    import base64
+    import re as _re
+    if len(raw) != 44:
+        _key_status = {
+            "ok": False,
+            "reason": (
+                f"HARNESS_SECRETS_KEY must be 44 chars of urlsafe-base64 "
+                f"(Fernet format); got {len(raw)} chars. Generate with: "
+                f"python -c \"from cryptography.fernet import Fernet; "
+                f"print(Fernet.generate_key().decode())\""
+            ),
+        }
+        return None
+    if not _re.match(r"^[A-Za-z0-9_\-]{43}=$", raw):
+        _key_status = {
+            "ok": False,
+            "reason": (
+                "HARNESS_SECRETS_KEY must be urlsafe-base64 "
+                "([A-Za-z0-9_-]{43}=). Did you generate with `openssl "
+                "rand -hex` (wrong format) instead of Fernet.generate_key()? "
+                "Regenerate with: python -c \"from cryptography.fernet "
+                "import Fernet; print(Fernet.generate_key().decode())\""
+            ),
+        }
+        return None
+    try:
+        base64.urlsafe_b64decode(raw.encode("ascii"))
+    except Exception as e:
+        _key_status = {
+            "ok": False,
+            "reason": f"HARNESS_SECRETS_KEY failed base64 decode: {e}",
         }
         return None
     try:
@@ -62,7 +105,7 @@ def _load_fernet() -> Any | None:
     except Exception as e:
         _key_status = {
             "ok": False,
-            "reason": f"HARNESS_SECRETS_KEY invalid: {type(e).__name__}",
+            "reason": f"Fernet rejected the key: {type(e).__name__}: {e}",
         }
         logger.exception("secrets: Fernet init failed")
         return None
