@@ -16,6 +16,7 @@ from typing import Any
 
 from fastapi import (
     BackgroundTasks,
+    Body,
     Depends,
     FastAPI,
     File,
@@ -50,7 +51,7 @@ from server import context as ctxmod
 from server import files as filesmod
 from server.db import configured_conn, crash_recover, init_db
 from server.events import bus
-from server.kdrive import kdrive
+from server.webdav import webdav
 from server.sync import (
     attachments_trim_loop,
     sessions_trim_loop,
@@ -131,7 +132,7 @@ ATTACHMENTS_DIR = Path(os.environ.get("HARNESS_ATTACHMENTS_DIR", "/data/attachme
 ALLOWED_EXT = {"png", "jpg", "jpeg", "gif", "webp"}
 
 # Binary deliverables the team ships (docx, pdf, png, zip, …). Written
-# by agents via coord_save_output; mirrored to kDrive under outputs/;
+# by agents via coord_save_output; mirrored to WebDAV under outputs/;
 # also surfaced read-only in the files pane. Lives on /data so it
 # survives restarts.
 OUTPUTS_DIR = Path(os.environ.get("HARNESS_OUTPUTS_DIR", "/data/outputs"))
@@ -298,7 +299,7 @@ _KDRIVE_PROBE_TTL_SECONDS = 60.0
 async def health() -> JSONResponse:
     """Per-subsystem readiness probe. Returns 200 if everything required
     is green, 503 if any subsystem is failing, with a `checks` object
-    detailing each. Skipped subsystems (kdrive/workspaces when unconfigured)
+    detailing each. Skipped subsystems (webdav/workspaces when unconfigured)
     don't fail the overall ok flag.
     """
     checks: dict[str, dict[str, object]] = {}
@@ -382,27 +383,27 @@ async def health() -> JSONResponse:
     # writing a probe file on every health hit. We cache the full
     # detail dict (not just a bool) so the UI can keep rendering the
     # error / URL / root between fresh probes.
-    if kdrive.enabled:
+    if webdav.enabled:
         now = time.monotonic()
         last_ts = float(_KDRIVE_PROBE_CACHE["ts"])
         cached = _KDRIVE_PROBE_CACHE["ok"]
         if isinstance(cached, dict) and (now - last_ts) < _KDRIVE_PROBE_TTL_SECONDS:
-            checks["kdrive"] = {**cached, "cached": True}
+            checks["webdav"] = {**cached, "cached": True}
             if not cached.get("ok"):
                 overall_ok = False
         else:
-            detail = await kdrive.probe()
+            detail = await webdav.probe()
             _KDRIVE_PROBE_CACHE["ts"] = now
             _KDRIVE_PROBE_CACHE["ok"] = detail
-            checks["kdrive"] = {**detail, "cached": False}
+            checks["webdav"] = {**detail, "cached": False}
             if not detail.get("ok"):
                 overall_ok = False
     else:
-        checks["kdrive"] = {
+        checks["webdav"] = {
             "ok": True,
             "skipped": True,
-            "reason": kdrive.reason,
-            "url": kdrive.url,
+            "reason": webdav.reason,
+            "url": webdav.url,
         }
 
     # 5. External MCP servers — reports what HARNESS_MCP_CONFIG yielded
@@ -489,6 +490,93 @@ async def health() -> JSONResponse:
     return JSONResponse(body, status_code=200 if overall_ok else 503)
 
 
+# ------------------------------------------------------------------
+# Claude Code auth — accept a pasted credentials JSON blob so operators
+# don't need shell access to run `claude /login` inside the container.
+# ------------------------------------------------------------------
+@app.post("/api/auth/claude", dependencies=[Depends(require_token)])
+async def set_claude_auth(
+    payload: dict[str, Any] = Body(...),
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    """Write a pasted .credentials.json blob to
+    $CLAUDE_CONFIG_DIR/.credentials.json so the CLI picks it up on the
+    next agent spawn. The caller should run `claude /login` on a device
+    that has the CLI installed, then paste ~/.claude/.credentials.json
+    (macOS) or the equivalent file.
+
+    Body: {"credentials_json": "<raw JSON string>"} OR {"credentials":
+    {...parsed object...}}. We re-serialize either way so the file on
+    disk is well-formed JSON. Minimal validation — we check that it
+    parses and contains `claudeAiOauth` (the OAuth-flow shape). An API
+    key setup goes through the secrets store instead, not this path.
+    """
+    claude_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if not claude_dir:
+        raise HTTPException(
+            400,
+            detail=(
+                "CLAUDE_CONFIG_DIR env var is not set, so credentials have "
+                "nowhere durable to land. Set it to a path on your "
+                "persistent volume (e.g. /data/claude) and redeploy."
+            ),
+        )
+    raw = payload.get("credentials_json")
+    parsed_obj = payload.get("credentials")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed_obj = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise HTTPException(400, detail=f"credentials_json is not valid JSON: {e}")
+    if not isinstance(parsed_obj, dict):
+        raise HTTPException(
+            400,
+            detail=(
+                "Provide either `credentials_json` (string) or "
+                "`credentials` (object)."
+            ),
+        )
+    if "claudeAiOauth" not in parsed_obj:
+        raise HTTPException(
+            400,
+            detail=(
+                "JSON is missing the `claudeAiOauth` key — this doesn't "
+                "look like a Claude CLI credentials file. Run `claude "
+                "/login` on a machine with the CLI, then copy "
+                "~/.claude/.credentials.json verbatim."
+            ),
+        )
+    target_dir = Path(claude_dir)
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(500, detail=f"could not create {claude_dir}: {e}")
+    target_file = target_dir / ".credentials.json"
+    try:
+        tmp = target_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(parsed_obj, indent=2), encoding="utf-8")
+        try:
+            tmp.chmod(0o600)
+        except OSError:
+            pass
+        tmp.replace(target_file)
+    except OSError as e:
+        raise HTTPException(500, detail=f"write failed: {e}")
+    await bus.publish({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": "system",
+        "type": "claude_auth_updated",
+        "path": str(target_file),
+        "actor": actor,
+    })
+    logger.info("claude auth written to %s (actor=%s)", target_file, actor)
+    return {
+        "ok": True,
+        "path": str(target_file),
+        "credentials_present": True,
+    }
+
+
 @app.get("/api/status", dependencies=[Depends(require_token)])
 async def status() -> dict[str, object]:
     # Import lazily: avoids pulling these private names into the module
@@ -513,10 +601,10 @@ async def status() -> dict[str, object]:
             "team_daily_usd": TEAM_DAILY_CAP_USD,
             "team_today_usd": round(team_today, 4),
         },
-        "kdrive": {
-            "enabled": kdrive.enabled,
-            "reason": kdrive.reason,
-            "url": kdrive.url,
+        "webdav": {
+            "enabled": webdav.enabled,
+            "reason": webdav.reason,
+            "url": webdav.url,
         },
         "workspaces": get_workspaces_status(),
     }

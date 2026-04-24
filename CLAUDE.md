@@ -17,7 +17,7 @@ A personal orchestration harness for a **team of 11 Claude Code agents — 1 Coa
 - **Backend**: Python 3.12 + FastAPI + WebSocket, single mono-service
 - **Agent runtime**: Claude Agent SDK (Python), authenticated via Max-plan OAuth
 - **Frontend**: React 18 + TypeScript + Vite + react-mosaic (desktop) / stack+tabs (mobile) + Zustand
-- **State**: SQLite (hot path) + kDrive via WebDAV (durable snapshots + human-readable `.md`)
+- **State**: SQLite (hot path) + a WebDAV-compatible cloud drive (durable snapshots + human-readable `.md`) — works with kDrive, Nextcloud, ownCloud, etc.
 - **Deploy**: Docker container on Zeabur, auto-pulled from this GitHub repo
 - **Reverse proxy**: Zeabur handles TLS/ingress (Caddy from the original spec is not needed on Zeabur)
 
@@ -66,7 +66,7 @@ deployed Zeabur instance — see "What needs verification" below.
    `?token=`. UI shows a paste-modal when 401 returned, saves to localStorage,
    reloads. Backwards compatible: unset env = open API as before.
 - **`/api/health`** ✓ per-subsystem readiness probe (db / static / claude_cli
-   / kdrive / workspaces). Cached: claude_cli once per process, kdrive 60s.
+   / webdav / workspaces). Cached: claude_cli once per process, webdav 60s.
    Returns 503 when any required subsystem fails. Public endpoint.
 - **Layout persistence** ✓ `openSlots` + `envOpen` saved to localStorage
    (`harness_layout_v1`); restored on reload via lazy initializers.

@@ -29,7 +29,7 @@ import sys
 import time
 from pathlib import Path, PurePosixPath
 
-from server.kdrive import kdrive
+from server.webdav import webdav
 
 logger = logging.getLogger("harness.context")
 if not logger.handlers:
@@ -119,8 +119,8 @@ async def write(kind: str, name: str, content: str) -> bool:
     # Fire the kDrive mirror inline — write volume is tiny (< 1/min
     # expected) and we want the remote copy in sync immediately so a
     # crash between local-write and next-flush doesn't lose edits.
-    if kdrive.enabled:
-        await kdrive.write_text(_remote_path(kind, name), content)
+    if webdav.enabled:
+        await webdav.write_text(_remote_path(kind, name), content)
     _invalidate_list_cache()
     return True
 
@@ -136,8 +136,8 @@ async def read(kind: str, name: str) -> str | None:
             return lp.read_text(encoding="utf-8")
         except Exception:
             logger.exception("context read failed locally: %s", lp)
-    if kdrive.enabled:
-        remote = await kdrive.read_text(_remote_path(kind, name))
+    if webdav.enabled:
+        remote = await webdav.read_text(_remote_path(kind, name))
         if remote is not None:
             # Populate the local cache so next read is fast.
             try:
@@ -159,8 +159,8 @@ async def delete(kind: str, name: str) -> bool:
             lp.unlink()
     except Exception:
         logger.exception("context delete failed locally: %s", lp)
-    if kdrive.enabled:
-        await kdrive.remove(_remote_path(kind, name))
+    if webdav.enabled:
+        await webdav.remove(_remote_path(kind, name))
     _invalidate_list_cache()
     return True
 
@@ -215,19 +215,19 @@ async def list_all() -> dict[str, list[str]]:
     # kDrive pass — union in anything we don't have locally yet.
     # Normalize basenames so dir entries with trailing slashes
     # ("skills/", "rules/") don't accidentally match "CLAUDE.md".
-    if kdrive.enabled:
+    if webdav.enabled:
         try:
-            root_entries = await kdrive.list_dir("context")
+            root_entries = await webdav.list_dir("context")
             root_names = {_clean_basename(e) for e in root_entries}
             if "CLAUDE.md" in root_names and "CLAUDE" not in out["root"]:
                 out["root"].append("CLAUDE")
         except Exception:
-            logger.exception("context kdrive root list failed")
+            logger.exception("context webdav root list failed")
         for kind in ("skills", "rules"):
             try:
-                entries = await kdrive.list_dir(f"context/{kind}")
+                entries = await webdav.list_dir(f"context/{kind}")
             except Exception:
-                logger.exception("context kdrive list failed: %s", kind)
+                logger.exception("context webdav list failed: %s", kind)
                 continue
             for raw in entries:
                 n = _clean_basename(raw)

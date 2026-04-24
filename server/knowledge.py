@@ -21,7 +21,7 @@ import re
 import sys
 from pathlib import Path, PurePosixPath
 
-from server.kdrive import kdrive
+from server.webdav import webdav
 
 logger = logging.getLogger("harness.knowledge")
 if not logger.handlers:
@@ -111,8 +111,8 @@ async def write(relative_path: str, content: str, author: str = "agent") -> bool
     except Exception:
         logger.exception("knowledge write failed locally: %s", lp)
         return False
-    if kdrive.enabled:
-        await kdrive.write_text(_remote(relative_path), content)
+    if webdav.enabled:
+        await webdav.write_text(_remote(relative_path), content)
     logger.info("knowledge write: %s by=%s (%d chars)", relative_path, author, len(content))
     return True
 
@@ -127,8 +127,8 @@ async def read(relative_path: str) -> str | None:
             return lp.read_text(encoding="utf-8")
         except Exception:
             logger.exception("knowledge read failed locally: %s", lp)
-    if kdrive.enabled:
-        body = await kdrive.read_text(_remote(relative_path))
+    if webdav.enabled:
+        body = await webdav.read_text(_remote(relative_path))
         if body is not None:
             try:
                 lp.parent.mkdir(parents=True, exist_ok=True)

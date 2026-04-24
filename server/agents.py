@@ -31,7 +31,7 @@ from server import interactions as interactions_registry
 from server.context import build_system_prompt_suffix
 from server.db import configured_conn
 from server.events import bus
-from server.kdrive import kdrive
+from server.webdav import webdav
 from server.mcp_config import load_external_servers
 from server.tools import ALLOWED_COACH_TOOLS, ALLOWED_PLAYER_TOOLS, build_coord_server
 from server.workspaces import workspace_dir
@@ -770,7 +770,7 @@ async def cancel_all_agents() -> list[str]:
 
 # The compact prompt used by both the manual /compact endpoint and the
 # auto-compact trip-wire. The handoff is written to
-# /data/handoffs/<agent>-<ts>.md (and mirrored to kDrive) so a future
+# /data/handoffs/<agent>-<ts>.md (and mirrored to WebDAV) so a future
 # instance of this agent can Read() the full file on demand — the
 # inline continuity note injected into the next system prompt is only
 # a short pointer. That means the handoff itself CAN and SHOULD be
@@ -1182,13 +1182,13 @@ async def _write_handoff_file(agent_id: str, summary: str) -> str | None:
     )
     content = frontmatter + summary.strip() + "\n"
 
-    wrote_kdrive = False
-    if kdrive.enabled:
+    wrote_webdav = False
+    if webdav.enabled:
         try:
-            wrote_kdrive = bool(await kdrive.write_text(f"handoffs/{filename}", content))
+            wrote_webdav = bool(await webdav.write_text(f"handoffs/{filename}", content))
         except Exception:
             logger.exception("handoff kDrive write failed: %s", filename)
-            wrote_kdrive = False
+            wrote_webdav = False
 
     local_dir = Path(os.environ.get("HARNESS_HANDOFFS_DIR", "/data/handoffs"))
     try:
@@ -1197,7 +1197,7 @@ async def _write_handoff_file(agent_id: str, summary: str) -> str | None:
         return filename
     except Exception:
         logger.exception("handoff local write failed: %s", filename)
-        return filename if wrote_kdrive else None
+        return filename if wrote_webdav else None
 
 
 async def _get_recent_exchanges(agent_id: str) -> list[dict[str, str]]:

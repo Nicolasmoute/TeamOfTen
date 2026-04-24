@@ -1538,7 +1538,7 @@ function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsCon
 
 // Pick the most informative field from a /api/health check entry.
 // Each subsystem uses different shape (db has 'error', claude_cli
-// has 'version', kdrive has 'reason' or 'cached', etc.), so we walk
+// has 'version', webdav has 'reason' or 'cached', etc.), so we walk
 // known keys in priority order.
 function summarizeHealthCheck(c) {
   if (!c) return "";
@@ -1565,18 +1565,116 @@ function summarizeHealthCheck(c) {
   return c.ok ? "ok" : "not ready";
 }
 
+// Paste a .credentials.json blob so agents can authenticate to
+// Claude Code without the operator having to shell into the container.
+// Typical flow:
+//   1. On any laptop with `claude` installed: run `claude /login`.
+//   2. Open ~/.claude/.credentials.json (or the platform equivalent).
+//   3. Paste it here, click Save.
+//   4. Agents use the new token on their next turn.
+// Dependent on CLAUDE_CONFIG_DIR being set server-side — without a
+// persistent volume target, the paste would live only in container
+// memory and vanish on redeploy.
+function ClaudeAuthSection({ health, onRefresh }) {
+  const [blob, setBlob] = useState("");
+  const [status, setStatus] = useState(null); // {type: "ok"|"err", msg}
+  const [saving, setSaving] = useState(false);
+  const auth = health?.checks?.claude_auth || {};
+  const present = auth.credentials_present === true;
+  const skipped = auth.skipped === true;
+  const onSave = useCallback(async () => {
+    if (!blob.trim()) {
+      setStatus({ type: "err", msg: "Paste the credentials JSON first." });
+      return;
+    }
+    setSaving(true);
+    setStatus(null);
+    try {
+      const res = await authFetch("/api/auth/claude", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ credentials_json: blob }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setStatus({
+          type: "err",
+          msg: data.detail || `HTTP ${res.status}`,
+        });
+        return;
+      }
+      setStatus({ type: "ok", msg: "Saved. Agents will use this on next turn." });
+      setBlob("");
+      try { await onRefresh?.(); } catch (_) {}
+    } catch (e) {
+      setStatus({ type: "err", msg: String(e) });
+    } finally {
+      setSaving(false);
+    }
+  }, [blob, onRefresh]);
+  return html`<section class="drawer-section">
+    <h3>Claude auth</h3>
+    ${skipped
+      ? html`<p class="muted" style="color: var(--err);">
+          ✗ <code>CLAUDE_CONFIG_DIR</code> is not set — pasted credentials
+          would be lost on redeploy. Set it to a persistent path (e.g.
+          <code>/data/claude</code>) and redeploy first.
+        </p>`
+      : html`<p class="muted" style="margin: 0 0 6px 0;">
+          <strong style=${present ? "color: var(--ok);" : "color: var(--warn);"}>
+            ${present ? "✓ authenticated" : "✗ not yet set"}
+          </strong>
+          ${auth.config_dir
+            ? html` <span class="muted">(${auth.config_dir})</span>`
+            : null}
+        </p>`}
+    <p class="muted" style="font-size: 11px; margin: 0 0 8px 0;">
+      On any machine with Claude Code installed, run <code>claude /login</code>,
+      then paste the contents of <code>~/.claude/.credentials.json</code>
+      below. Tokens refresh automatically from this snapshot — you only
+      do this once per deploy (or after rotating credentials).
+    </p>
+    <textarea
+      rows="6"
+      placeholder='{"claudeAiOauth": {"accessToken": "...", "refreshToken": "...", ...}}'
+      value=${blob}
+      onInput=${(e) => setBlob(e.target.value)}
+      disabled=${saving || skipped}
+      style="width: 100%; font-family: ui-monospace, monospace; font-size: 11px; resize: vertical;"
+    ></textarea>
+    <div style="display: flex; gap: 8px; align-items: center; margin-top: 6px;">
+      <button
+        class="primary"
+        onClick=${onSave}
+        disabled=${saving || skipped || !blob.trim()}
+      >${saving ? "saving…" : "Save credentials"}</button>
+      ${status
+        ? html`<span style=${`font-size: 11px; color: var(--${status.type === "ok" ? "ok" : "err"});`}>
+            ${status.msg}
+          </span>`
+        : null}
+    </div>
+    <p class="muted" style="font-size: 11px; margin: 8px 0 0 0;">
+      Alternative: shell into the container and run <code>claude /login</code>
+      directly — the device-code flow lands tokens in the same file.
+      Prefer an API key instead? Set <code>ANTHROPIC_API_KEY</code> in the
+      Secrets store below; not all features work in API-key mode.
+    </p>
+  </section>`;
+}
+
 // Distinguishes three states so the operator can debug quickly:
 //   - disabled: env not set (expected reason string)
-//   - enabled + probe ok: ✓ + verified path on kDrive
+//   - enabled + probe ok: ✓ + verified path on the cloud drive
 //   - enabled + probe fail: ✗ with full exception text + the URL /
 //     root we actually asked webdav4 to hit (the most common failure
 //     mode is a misconfigured URL that silently writes nowhere the
 //     human expects to look).
-function KDriveSection({ serverStatus, health, onRefresh }) {
+function WebDAVSection({ serverStatus, health, onRefresh }) {
   const [forcing, setForcing] = useState(false);
-  const kd = serverStatus?.kdrive;
-  const probe = health?.checks?.kdrive; // may be undefined until health loads
-  const url = probe?.url ?? kd?.url ?? "";
+  const wd = serverStatus?.webdav;
+  const probe = health?.checks?.webdav; // may be undefined until health loads
+  const url = probe?.url ?? wd?.url ?? "";
   const forceProbe = useCallback(async () => {
     setForcing(true);
     try {
@@ -1585,13 +1683,13 @@ function KDriveSection({ serverStatus, health, onRefresh }) {
       setForcing(false);
     }
   }, [onRefresh]);
-  if (!kd?.enabled) {
+  if (!wd?.enabled) {
     return html`<section class="drawer-section">
-      <h3>kDrive mirror</h3>
+      <h3>WebDAV mirror</h3>
       <p class="muted">
-        ✗ Disabled${kd?.reason ? html` (${kd.reason})` : null}.
-        Set <code>KDRIVE_WEBDAV_URL</code>, <code>KDRIVE_USER</code>,
-        and <code>KDRIVE_APP_PASSWORD</code> env vars and redeploy.
+        ✗ Disabled${wd?.reason ? html` (${wd.reason})` : null}.
+        Set <code>HARNESS_WEBDAV_URL</code>, <code>HARNESS_WEBDAV_USER</code>,
+        and <code>HARNESS_WEBDAV_PASSWORD</code> env vars and redeploy.
         The harness works fine without it — writes go to local SQLite only.
       </p>
     </section>`;
@@ -1599,7 +1697,7 @@ function KDriveSection({ serverStatus, health, onRefresh }) {
   const probeOk = probe?.ok === true;
   const probeErr = probe?.error;
   return html`<section class="drawer-section">
-    <h3>kDrive mirror</h3>
+    <h3>WebDAV mirror</h3>
     <p class="muted" style="margin: 0 0 6px 0;">
       <strong style=${probeOk ? "color: var(--ok);" : probe ? "color: var(--err);" : "color: var(--muted);"}>
         ${probeOk ? "✓ probe ok" : probe ? "✗ probe failed" : "…probing"}
@@ -1617,7 +1715,7 @@ function KDriveSection({ serverStatus, health, onRefresh }) {
       ${probe?.probe_file
         ? html`<li><strong>Test file:</strong>
             <code>${probe.probe_file}</code>
-            ${probeOk ? html` <span class="muted">(look for this on kDrive)</span>` : null}
+            ${probeOk ? html` <span class="muted">(look for this on the drive)</span>` : null}
           </li>`
         : null}
     </ul>
@@ -2662,7 +2760,12 @@ function SettingsDrawer({ onClose, serverStatus }) {
             </div>
           </section>
 
-          <${KDriveSection}
+          <${ClaudeAuthSection}
+            health=${health}
+            onRefresh=${loadHealth}
+          />
+
+          <${WebDAVSection}
             serverStatus=${serverStatus}
             health=${health}
             onRefresh=${loadHealth}
@@ -5387,7 +5490,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
                   : " (no cap)"),
               `ws subscribers: ${d.ws_subscribers ?? "?"}`,
               `uptime: ${Math.round((d.uptime_seconds || 0) / 60)} min`,
-              `kdrive: ${d.kdrive?.enabled ? "on" : "off — " + (d.kdrive?.reason || "?")}`,
+              `webdav: ${d.webdav?.enabled ? "on" : "off — " + (d.webdav?.reason || "?")}`,
             ];
             setInfoText(lines.join("\n"));
           })

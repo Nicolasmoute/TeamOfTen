@@ -24,7 +24,7 @@ import re
 import sys
 from pathlib import Path, PurePosixPath
 
-from server.kdrive import kdrive
+from server.webdav import webdav
 
 logger = logging.getLogger("harness.outputs")
 if not logger.handlers:
@@ -111,8 +111,8 @@ async def save(relative_path: str, data: bytes, author: str = "agent") -> bool:
     except Exception:
         logger.exception("outputs write failed locally: %s", lp)
         return False
-    if kdrive.enabled:
-        await kdrive.write_bytes(_remote(relative_path), data)
+    if webdav.enabled:
+        await webdav.write_bytes(_remote(relative_path), data)
     logger.info(
         "outputs write: %s by=%s (%d bytes)", relative_path, author, len(data),
     )

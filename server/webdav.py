@@ -1,18 +1,27 @@
-"""kDrive WebDAV mirror for durable, human-readable content.
+"""WebDAV mirror for durable, human-readable content.
 
 Design:
 - Hot state lives in the local SQLite on the /data volume.
 - Human-readable content (memory docs, decisions, digests, event log
-  rotations) gets mirrored to Infomaniak kDrive over WebDAV, where you
-  can read/edit it from your phone or browser outside the harness.
+  rotations) gets mirrored to a WebDAV cloud drive, where you can
+  read/edit it from your phone or browser outside the harness.
 - Fire-and-forget semantics: a WebDAV hiccup must never block an agent
   tool call. Failures are logged and the local DB is still authoritative.
 
-Config (all required — kDrive stays disabled unless all are set):
-  KDRIVE_WEBDAV_URL      full path to the folder the app owns on kDrive,
-                         e.g. https://<drive-id>.connect.kdrive.infomaniak.com/TOT
-  KDRIVE_USER            your Infomaniak email
-  KDRIVE_APP_PASSWORD    app-specific password generated in Infomaniak UI
+Works with any WebDAV-compatible service — Infomaniak kDrive,
+Nextcloud, ownCloud, Fastmail Files, etc. Point it at the folder you
+want the harness to own; it works with any provider that speaks plain
+WebDAV. If your provider needs more sophisticated auth (OAuth, S3-
+compatible, etc.), fork and adapt — the interface is ~10 methods.
+
+Config (all three required — WebDAV mirror stays disabled unless all
+are set). Primary env names are `HARNESS_WEBDAV_*`; legacy `KDRIVE_*`
+names are still honored so existing deployments keep working:
+  HARNESS_WEBDAV_URL        full path to the folder the app owns,
+                            e.g. https://<host>/remote.php/dav/files/<user>/TOT
+                            (kDrive: https://<drive-id>.connect.kdrive.infomaniak.com/TOT)
+  HARNESS_WEBDAV_USER       your WebDAV username / email
+  HARNESS_WEBDAV_PASSWORD   app-specific password
 
 All files live directly under the URL — no extra prefix. If you want
 a sub-folder, include it in the URL itself.
@@ -28,7 +37,7 @@ import sys
 from pathlib import PurePosixPath
 from typing import Any
 
-logger = logging.getLogger("harness.kdrive")
+logger = logging.getLogger("harness.webdav")
 if not logger.handlers:
     h = logging.StreamHandler(sys.stdout)
     h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s | %(message)s"))
@@ -44,14 +53,29 @@ except Exception:  # pragma: no cover — lib missing in dev env
     _ResourceNotFound = None  # type: ignore
 
 
-WEBDAV_URL = os.environ.get("KDRIVE_WEBDAV_URL", "").strip()
-WEBDAV_USER = os.environ.get("KDRIVE_USER", "").strip()
-WEBDAV_PASS = os.environ.get("KDRIVE_APP_PASSWORD", "").strip()
+def _env_first(*names: str) -> str:
+    """Return the first non-empty env var from `names`. Lets us ship a
+    new primary name (HARNESS_WEBDAV_URL) while still honoring legacy
+    values (KDRIVE_WEBDAV_URL) already set in user deployments."""
+    for n in names:
+        v = os.environ.get(n, "").strip()
+        if v:
+            return v
+    return ""
 
 
-class KDriveClient:
+WEBDAV_URL = _env_first("HARNESS_WEBDAV_URL", "KDRIVE_WEBDAV_URL")
+WEBDAV_USER = _env_first("HARNESS_WEBDAV_USER", "KDRIVE_USER")
+WEBDAV_PASS = _env_first(
+    "HARNESS_WEBDAV_PASSWORD",
+    "HARNESS_WEBDAV_APP_PASSWORD",
+    "KDRIVE_APP_PASSWORD",
+)
+
+
+class WebDAVClient:
     """Thin WebDAV wrapper. All public methods are async and swallow
-    their own errors — the harness continues if kDrive is down."""
+    their own errors — the harness continues if the mirror is down."""
 
     def __init__(self) -> None:
         self._client: Any = None
@@ -60,18 +84,18 @@ class KDriveClient:
 
         missing: list[str] = []
         if not WEBDAV_URL:
-            missing.append("KDRIVE_WEBDAV_URL")
+            missing.append("HARNESS_WEBDAV_URL")
         if not WEBDAV_USER:
-            missing.append("KDRIVE_USER")
+            missing.append("HARNESS_WEBDAV_USER")
         if not WEBDAV_PASS:
-            missing.append("KDRIVE_APP_PASSWORD")
+            missing.append("HARNESS_WEBDAV_PASSWORD")
         if missing:
             self._reason = f"missing env: {', '.join(missing)}"
-            logger.info("kDrive disabled: %s", self._reason)
+            logger.info("WebDAV mirror disabled: %s", self._reason)
             return
         if _WebDAVClient is None:
             self._reason = "webdav4 not installed"
-            logger.warning("kDrive disabled: %s", self._reason)
+            logger.warning("WebDAV mirror disabled: %s", self._reason)
             return
         # httpx (webdav4's HTTP layer) applies RFC 3986 URL resolution:
         # if the base URL lacks a trailing '/', the last path segment
@@ -84,11 +108,11 @@ class KDriveClient:
             self._client = _WebDAVClient(base_url, auth=(WEBDAV_USER, WEBDAV_PASS))
             self._enabled = True
             logger.info(
-                "kDrive enabled (url=%s user=%s)", base_url, WEBDAV_USER,
+                "WebDAV mirror enabled (url=%s user=%s)", base_url, WEBDAV_USER,
             )
         except Exception:
             self._reason = "client init failed"
-            logger.exception("kDrive init failed")
+            logger.exception("WebDAV init failed")
 
     @property
     def enabled(self) -> bool:
@@ -117,7 +141,7 @@ class KDriveClient:
             return {"ok": False, "error": self._reason, "url": WEBDAV_URL}
         # Step 1: list the configured folder. "" means "the base URL
         # itself". A ResourceNotFound here means the folder path in
-        # the URL doesn't exist on kDrive; a 401/403 means auth; a
+        # the URL doesn't exist on the server; a 401/403 means auth; a
         # connection error means URL hostname / scheme is wrong.
         try:
             entries = await asyncio.to_thread(self._list_dir_sync, "")
@@ -127,10 +151,10 @@ class KDriveClient:
                 "url": WEBDAV_URL,
                 "step": "list",
                 "error": f"{type(e).__name__}: {str(e)[:400]}",
-                "hint": "Auth, URL, or target folder is wrong. Verify KDRIVE_WEBDAV_URL points at an existing kDrive folder and the app-password is for this account.",
+                "hint": "Auth, URL, or target folder is wrong. Verify HARNESS_WEBDAV_URL points at an existing folder on the server and the credentials are for this account.",
             }
         # Step 2: write. If listing worked but PUT fails we're looking
-        # at a share-level permission issue, a filename kDrive rejects,
+        # at a share-level permission issue, a filename the server rejects,
         # or an upload-protocol quirk (some WebDAV servers 409 fresh
         # PUTs sent with chunked transfer-encoding).
         rel = "harness-health-probe.txt"
@@ -195,7 +219,7 @@ class KDriveClient:
             await asyncio.to_thread(self._write_sync, full_path, content)
             return True
         except Exception:
-            logger.exception("kDrive write failed: %s", full_path)
+            logger.exception("WebDAV write failed: %s", full_path)
             return False
 
     async def write_bytes(self, relative_path: str, data: bytes) -> bool:
@@ -207,7 +231,7 @@ class KDriveClient:
             await asyncio.to_thread(self._write_bytes_sync, full_path, data)
             return True
         except Exception:
-            logger.exception("kDrive write_bytes failed: %s", full_path)
+            logger.exception("WebDAV write_bytes failed: %s", full_path)
             return False
 
     async def read_text(self, relative_path: str) -> str | None:
@@ -222,7 +246,7 @@ class KDriveClient:
         except Exception as e:
             if _ResourceNotFound is not None and isinstance(e, _ResourceNotFound):
                 return None
-            logger.exception("kDrive read_text failed: %s", full_path)
+            logger.exception("WebDAV read_text failed: %s", full_path)
             return None
 
     async def read_bytes(self, relative_path: str) -> bytes | None:
@@ -236,7 +260,7 @@ class KDriveClient:
         except Exception as e:
             if _ResourceNotFound is not None and isinstance(e, _ResourceNotFound):
                 return None
-            logger.exception("kDrive read_bytes failed: %s", full_path)
+            logger.exception("WebDAV read_bytes failed: %s", full_path)
             return None
 
     async def list_dir(self, relative_path: str) -> list[str]:
@@ -249,7 +273,7 @@ class KDriveClient:
         try:
             return await asyncio.to_thread(self._list_dir_sync, full_path)
         except Exception:
-            logger.exception("kDrive list_dir failed: %s", full_path)
+            logger.exception("WebDAV list_dir failed: %s", full_path)
             return []
 
     async def remove(self, relative_path: str) -> bool:
@@ -265,7 +289,7 @@ class KDriveClient:
         except Exception as e:
             if _ResourceNotFound is not None and isinstance(e, _ResourceNotFound):
                 return True
-            logger.exception("kDrive remove failed: %s", full_path)
+            logger.exception("WebDAV remove failed: %s", full_path)
             return False
 
     # ---------- sync helpers (run in a thread) ----------
@@ -344,4 +368,4 @@ class KDriveClient:
                 raise
 
 
-kdrive = KDriveClient()
+webdav = WebDAVClient()

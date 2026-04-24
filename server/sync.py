@@ -6,7 +6,7 @@ Snapshots + decisions + digests come in later M3 ticks.
 
 Every HARNESS_KDRIVE_FLUSH_INTERVAL seconds (default 300 = 5 min):
 - pull every event whose ts >= today's UTC-midnight from SQLite
-- write them as JSONL to kdrive events/YYYY-MM-DD.jsonl (overwrite)
+- write them as JSONL to webdav events/YYYY-MM-DD.jsonl (overwrite)
 
 Yesterday's file stops being rewritten once UTC midnight passes —
 it stays as of the last flush before midnight. Acceptable sub-minute
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from server.db import DB_PATH, configured_conn
-from server.kdrive import kdrive
+from server.webdav import webdav
 
 logger = logging.getLogger("harness.sync")
 if not logger.handlers:
@@ -37,19 +37,34 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-FLUSH_INTERVAL_SECONDS = int(
-    os.environ.get("HARNESS_KDRIVE_FLUSH_INTERVAL", "300")
+def _env_int(primary: str, legacy: str, default: str) -> int:
+    """Read an int env var, preferring the primary name but falling
+    back to a legacy alias. Lets us rename KDRIVE_* → WEBDAV_* without
+    breaking existing deployments that still set the old name."""
+    v = os.environ.get(primary, "").strip()
+    if not v:
+        v = os.environ.get(legacy, default).strip() or default
+    return int(v)
+
+
+FLUSH_INTERVAL_SECONDS = _env_int(
+    "HARNESS_WEBDAV_FLUSH_INTERVAL",
+    "HARNESS_KDRIVE_FLUSH_INTERVAL",
+    "300",
 )
-SNAPSHOT_INTERVAL_SECONDS = int(
-    os.environ.get("HARNESS_KDRIVE_SNAPSHOT_INTERVAL", "300")
+SNAPSHOT_INTERVAL_SECONDS = _env_int(
+    "HARNESS_WEBDAV_SNAPSHOT_INTERVAL",
+    "HARNESS_KDRIVE_SNAPSHOT_INTERVAL",
+    "300",
 )
-# How many DB snapshots to keep on kDrive. Older ones are deleted after
-# each successful upload. 144 = ~12 h of 5-min snapshots. Was 48 (~2 days
-# hourly); dropped to 5 min cadence per §5.2 so a crash loses ≤ 5 min of
-# state. Snapshots are single-digit KB at this scale so the bandwidth is
-# trivial.
-SNAPSHOT_RETENTION = int(
-    os.environ.get("HARNESS_KDRIVE_SNAPSHOT_RETENTION", "144")
+# How many DB snapshots to keep on the mirror. Older ones are deleted
+# after each successful upload. 144 = ~12 h of 5-min snapshots. 5 min
+# cadence means a crash loses ≤ 5 min of state. Snapshots are
+# single-digit KB at this scale so the bandwidth is trivial.
+SNAPSHOT_RETENTION = _env_int(
+    "HARNESS_WEBDAV_SNAPSHOT_RETENTION",
+    "HARNESS_KDRIVE_SNAPSHOT_RETENTION",
+    "144",
 )
 
 # How long events stay in the SQLite `events` table. Older rows are
@@ -124,7 +139,7 @@ async def flush_day(date_str: str) -> int:
     Returns count on success, 0 if no events (file not touched),
     -1 on upload failure.
     """
-    if not kdrive.enabled:
+    if not webdav.enabled:
         return 0
 
     # Half-open window [start, next_day_start) so exactly one day's
@@ -167,9 +182,9 @@ async def flush_day(date_str: str) -> int:
 
     content = "\n".join(parts) + "\n"
     remote = f"events/{date_str}.jsonl"
-    ok = await kdrive.write_text(remote, content)
+    ok = await webdav.write_text(remote, content)
     if ok:
-        logger.info("flushed %d event(s) → kdrive %s", len(rows), remote)
+        logger.info("flushed %d event(s) → webdav %s", len(rows), remote)
         return len(rows)
     return -1
 
@@ -178,7 +193,7 @@ async def flush_today_events() -> int:
     """Flush today's events. Also re-flush yesterday for the first two
     hours after UTC midnight, so late events emitted right before the
     boundary don't fall into a file that's already been frozen."""
-    if not kdrive.enabled:
+    if not webdav.enabled:
         return 0
 
     now = datetime.now(timezone.utc)
@@ -228,7 +243,7 @@ async def snapshot_db() -> int:
 
     Returns byte count on success, 0 if kDrive disabled, -1 on failure.
     """
-    if not kdrive.enabled:
+    if not webdav.enabled:
         return 0
     try:
         data = await asyncio.to_thread(_snapshot_db_sync)
@@ -238,9 +253,9 @@ async def snapshot_db() -> int:
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
     remote = f"snapshots/{ts}.db"
-    ok = await kdrive.write_bytes(remote, data)
+    ok = await webdav.write_bytes(remote, data)
     if ok:
-        logger.info("snapshot: %d bytes → kdrive %s", len(data), remote)
+        logger.info("snapshot: %d bytes → webdav %s", len(data), remote)
         await _prune_snapshots()
         return len(data)
     return -1
@@ -255,7 +270,7 @@ async def _prune_snapshots() -> None:
     if SNAPSHOT_RETENTION <= 0:
         return
     try:
-        names = await kdrive.list_dir("snapshots")
+        names = await webdav.list_dir("snapshots")
     except Exception:
         logger.exception("snapshot prune: list failed")
         return
@@ -265,15 +280,15 @@ async def _prune_snapshots() -> None:
         return
     to_delete = snaps[:excess]
     for name in to_delete:
-        ok = await kdrive.remove(f"snapshots/{name}")
+        ok = await webdav.remove(f"snapshots/{name}")
         if ok:
             logger.info("snapshot prune: removed %s", name)
 
 
 async def snapshot_loop() -> None:
     """Background task: periodic DB snapshots to kDrive."""
-    if not kdrive.enabled:
-        logger.info("snapshot loop idle: kdrive disabled")
+    if not webdav.enabled:
+        logger.info("snapshot loop idle: webdav disabled")
     else:
         logger.info(
             "snapshot loop starting: snapshot every %ds",
@@ -281,7 +296,7 @@ async def snapshot_loop() -> None:
         )
     while True:
         try:
-            if kdrive.enabled:
+            if webdav.enabled:
                 await snapshot_db()
         except asyncio.CancelledError:
             raise
@@ -306,10 +321,10 @@ async def pull_uploads_once() -> dict[str, int]:
 
     Returns {added, removed, kept}.
     """
-    if not kdrive.enabled:
+    if not webdav.enabled:
         return {"added": 0, "removed": 0, "kept": 0}
     try:
-        remote_names = await kdrive.list_dir("uploads")
+        remote_names = await webdav.list_dir("uploads")
     except Exception:
         logger.exception("uploads pull: remote list failed")
         return {"added": 0, "removed": 0, "kept": 0}
@@ -339,7 +354,7 @@ async def pull_uploads_once() -> dict[str, int]:
         # text. We don't decode; just stream bytes to disk so agents
         # can Read/Bash the file with the correct byte content.
         try:
-            data = await kdrive.read_bytes(f"uploads/{name}")
+            data = await webdav.read_bytes(f"uploads/{name}")
         except Exception:
             logger.exception("uploads pull: download failed: %s", name)
             continue
@@ -362,8 +377,8 @@ async def pull_uploads_once() -> dict[str, int]:
 async def uploads_pull_loop() -> None:
     """Background task: poll kDrive://uploads/ every
     HARNESS_UPLOADS_PULL_INTERVAL seconds (default 60)."""
-    if not kdrive.enabled:
-        logger.info("uploads pull loop idle: kdrive disabled")
+    if not webdav.enabled:
+        logger.info("uploads pull loop idle: webdav disabled")
     else:
         logger.info(
             "uploads pull loop starting: every %ds → %s",
@@ -371,7 +386,7 @@ async def uploads_pull_loop() -> None:
         )
     while True:
         try:
-            if kdrive.enabled:
+            if webdav.enabled:
                 await pull_uploads_once()
         except asyncio.CancelledError:
             raise
@@ -395,7 +410,7 @@ async def push_outputs_once() -> dict[str, int]:
 
     Returns {pushed, kept, skipped}.
     """
-    if not kdrive.enabled:
+    if not webdav.enabled:
         return {"pushed": 0, "kept": 0, "skipped": 0}
     if not OUTPUTS_LOCAL_DIR.exists():
         return {"pushed": 0, "kept": 0, "skipped": 0}
@@ -410,14 +425,14 @@ async def push_outputs_once() -> dict[str, int]:
         return {"pushed": 0, "kept": 0, "skipped": 0}
 
     # Build a set of relative POSIX strings of what's already on kDrive.
-    # Limitation: kdrive.list_dir is flat; we'd need a recursive walk
+    # Limitation: webdav.list_dir is flat; we'd need a recursive walk
     # to see nested files. For now list the top level + any immediate
     # sub-dirs the local side uses so we don't re-upload flat files.
     # A true recursive diff across deep trees is overkill for
     # personal-scale use — the worst case is we re-upload a 1 MB PDF
     # on every tick, which is still cheap.
     try:
-        top_level = await kdrive.list_dir("outputs")
+        top_level = await webdav.list_dir("outputs")
     except Exception:
         logger.exception("outputs push: kDrive list failed")
         return {"pushed": 0, "kept": 0, "skipped": 0}
@@ -439,7 +454,7 @@ async def push_outputs_once() -> dict[str, int]:
             logger.exception("outputs push: local read failed: %s", lp)
             skipped += 1
             continue
-        ok = await kdrive.write_bytes(f"outputs/{rel}", data)
+        ok = await webdav.write_bytes(f"outputs/{rel}", data)
         if ok:
             pushed += 1
         else:
@@ -454,8 +469,8 @@ async def push_outputs_once() -> dict[str, int]:
 async def outputs_push_loop() -> None:
     """Background task: push /data/outputs → kDrive every
     HARNESS_OUTPUTS_PUSH_INTERVAL seconds (default 60)."""
-    if not kdrive.enabled:
-        logger.info("outputs push loop idle: kdrive disabled")
+    if not webdav.enabled:
+        logger.info("outputs push loop idle: webdav disabled")
     else:
         logger.info(
             "outputs push loop starting: every %ds from %s",
@@ -463,7 +478,7 @@ async def outputs_push_loop() -> None:
         )
     while True:
         try:
-            if kdrive.enabled:
+            if webdav.enabled:
                 await push_outputs_once()
         except asyncio.CancelledError:
             raise
@@ -673,11 +688,11 @@ async def sessions_trim_loop() -> None:
 
 async def flush_loop() -> None:
     """Background task: flush events every FLUSH_INTERVAL_SECONDS."""
-    if not kdrive.enabled:
+    if not webdav.enabled:
         logger.info(
-            "sync loop idle: kdrive disabled (%s). Start loop to retry once "
-            "kdrive config appears.",
-            kdrive.reason,
+            "sync loop idle: webdav disabled (%s). Start loop to retry once "
+            "webdav config appears.",
+            webdav.reason,
         )
     else:
         logger.info(
@@ -685,7 +700,7 @@ async def flush_loop() -> None:
         )
     while True:
         try:
-            if kdrive.enabled:
+            if webdav.enabled:
                 await flush_today_events()
         except asyncio.CancelledError:
             raise

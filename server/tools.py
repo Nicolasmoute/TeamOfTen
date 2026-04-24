@@ -16,7 +16,7 @@ from server import knowledge as knowmod
 from server import outputs as outmod
 from server.db import configured_conn
 from server.events import bus
-from server.kdrive import kdrive
+from server.webdav import webdav
 from server.workspaces import project_configured, workspace_dir
 
 
@@ -878,8 +878,8 @@ def build_coord_server(caller_id: str) -> Any:
 
         # Fire-and-forget mirror to kDrive as a plain .md file under
         # /harness/memory/<topic>.md. Failures are swallowed and logged
-        # inside KDriveClient — they never block the tool call.
-        if kdrive.enabled:
+        # inside WebDAVClient — they never block the tool call.
+        if webdav.enabled:
             header = (
                 f"<!-- auto-mirrored from the harness memory table\n"
                 f"     topic: {topic}\n"
@@ -889,12 +889,12 @@ def build_coord_server(caller_id: str) -> Any:
                 f"-->\n\n"
             )
             asyncio.create_task(
-                kdrive.write_text(f"memory/{topic}.md", header + content)
+                webdav.write_text(f"memory/{topic}.md", header + content)
             )
 
         return _ok(
             f"saved memory[{topic}] v{version} ({len(content)} chars)"
-            + (" · mirrored to kDrive" if kdrive.enabled else "")
+            + (" · mirrored to WebDAV" if webdav.enabled else "")
         )
 
     @tool(
@@ -941,7 +941,7 @@ def build_coord_server(caller_id: str) -> Any:
         )
         return _ok(
             f"saved knowledge[{path}] ({len(body)} chars)"
-            + (" · mirrored to kDrive" if kdrive.enabled else "")
+            + (" · mirrored to WebDAV" if webdav.enabled else "")
         )
 
     @tool(
@@ -1038,7 +1038,7 @@ def build_coord_server(caller_id: str) -> Any:
         )
         return _ok(
             f"saved outputs[{path}] ({len(data)} bytes)"
-            + (" · mirrored to kDrive" if kdrive.enabled else "")
+            + (" · mirrored to WebDAV" if webdav.enabled else "")
         )
 
     @tool(
@@ -1199,8 +1199,8 @@ def build_coord_server(caller_id: str) -> Any:
         # local /data volume so offline agents still get a record.
         location = None
         filename = base_filename
-        if kdrive.enabled:
-            ok = await kdrive.write_text(f"decisions/{filename}", content)
+        if webdav.enabled:
+            ok = await webdav.write_text(f"decisions/{filename}", content)
             if ok:
                 location = f"kDrive:decisions/{filename}"
         if location is None:
