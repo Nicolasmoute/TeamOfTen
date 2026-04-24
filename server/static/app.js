@@ -2874,7 +2874,12 @@ function EnvAttentionSection({ conversations }) {
                   title="Dismiss">×</button>
               </div>
               <div class="env-attention-subject">${ev.subject}</div>
-              <div class="env-attention-body">${ev.body}</div>
+              ${Array.isArray(ev.questions) && ev.questions.length > 0
+                ? html`<${QuestionForm}
+                    event=${ev}
+                    onSubmitted=${() => dismiss(ev.__key)}
+                  />`
+                : html`<div class="env-attention-body">${ev.body}</div>`}
             </div>
           `
         )}
@@ -2882,6 +2887,149 @@ function EnvAttentionSection({ conversations }) {
     </section>
   `;
 }
+
+// Structured-question answer form, rendered inside an attention item
+// when the event carries a `questions` array (from coord_ask_question).
+// Radios for single-select, checkboxes for multi-select, plus an
+// "Other…" free-text per question. On submit, answers are formatted
+// as markdown and POST'd to /api/messages so they land in the asking
+// agent's inbox + auto-wake them to resume work.
+function QuestionForm({ event, onSubmitted }) {
+  const questions = Array.isArray(event.questions) ? event.questions : [];
+  // state[i] = { selected: Set<label> | string | null, other: string }
+  const [state, setState] = useState(() =>
+    questions.map((q) => ({
+      selected: q.multi_select ? new Set() : null,
+      other: "",
+    }))
+  );
+  const [sending, setSending] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const pick = (qi, label, multi) => {
+    setState((prev) => prev.map((s, i) => {
+      if (i !== qi) return s;
+      if (multi) {
+        const next = new Set(s.selected);
+        if (next.has(label)) next.delete(label);
+        else next.add(label);
+        return { ...s, selected: next };
+      }
+      return { ...s, selected: label };
+    }));
+  };
+  const setOther = (qi, value) => {
+    setState((prev) => prev.map((s, i) =>
+      i === qi ? { ...s, other: value } : s
+    ));
+  };
+
+  const canSubmit = questions.every((q, i) => {
+    const s = state[i];
+    if (q.multi_select) {
+      return (s.selected && s.selected.size > 0) || s.other.trim();
+    }
+    return s.selected != null || s.other.trim();
+  });
+
+  const submit = async () => {
+    setSending(true);
+    setErr(null);
+    try {
+      const lines = [];
+      lines.push(`**Human answers** (via question form):`);
+      questions.forEach((q, i) => {
+        const s = state[i];
+        const picks = [];
+        if (q.multi_select) {
+          if (s.selected) for (const label of s.selected) picks.push(label);
+        } else if (s.selected != null) {
+          picks.push(s.selected);
+        }
+        if (s.other.trim()) picks.push(`Other: ${s.other.trim()}`);
+        lines.push("");
+        lines.push(`**Q${i + 1}: ${q.question}**`);
+        lines.push(picks.length ? picks.map((p) => `- ${p}`).join("\n") : "- (no answer)");
+      });
+      const body = lines.join("\n");
+      const subject = `Re: ${event.subject || "your question"}`;
+      const res = await authFetch("/api/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          to: event.agent_id,
+          subject,
+          body,
+          priority: "normal",
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      onSubmitted();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setSending(false);
+    }
+  };
+
+  if (!questions.length) return null;
+  return html`<div class="question-form">
+    ${questions.map((q, qi) => {
+      const s = state[qi];
+      const multi = !!q.multi_select;
+      return html`<div class="question-block" key=${qi}>
+        ${q.header
+          ? html`<div class="question-header">${q.header}</div>`
+          : null}
+        <div class="question-text">
+          ${multi
+            ? html`<span class="question-multi-tag">multi-select</span>`
+            : null}
+          ${q.question}
+        </div>
+        <div class="question-options">
+          ${(q.options || []).map((opt, oi) => {
+            const checked = multi
+              ? (s.selected && s.selected.has(opt.label))
+              : s.selected === opt.label;
+            const optKey = `q${qi}-o${oi}`;
+            return html`<label class="question-option" key=${optKey}>
+              <input
+                type=${multi ? "checkbox" : "radio"}
+                name=${`q${qi}`}
+                checked=${checked}
+                onChange=${() => pick(qi, opt.label, multi)}
+              />
+              <span class="question-option-label">${opt.label}</span>
+              ${opt.description
+                ? html`<span class="question-option-desc">${opt.description}</span>`
+                : null}
+            </label>`;
+          })}
+          <label class="question-option question-other">
+            <span class="question-option-label">Other:</span>
+            <input
+              type="text"
+              class="question-other-input"
+              placeholder="free-text answer"
+              value=${s.other}
+              onInput=${(e) => setOther(qi, e.target.value)}
+            />
+          </label>
+        </div>
+      </div>`;
+    })}
+    <div class="question-form-actions">
+      ${err ? html`<span class="question-form-err">${err}</span>` : null}
+      <button
+        class="primary"
+        disabled=${sending || !canSubmit}
+        onClick=${submit}
+      >${sending ? "sending…" : "Send answers"}</button>
+    </div>
+  </div>`;
+}
+
 
 const MESSAGE_RECIPIENTS = [
   "coach",
