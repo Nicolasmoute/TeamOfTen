@@ -13,20 +13,18 @@ from typing import Any
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    HookMatcher,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ResultMessage,
     StreamEvent,
     TextBlock,
     ThinkingBlock,
+    ToolPermissionContext,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
     query,
-)
-from claude_agent_sdk.types import (
-    HookMatcher,
-    PermissionResultAllow,
-    PermissionResultDeny,
-    ToolPermissionContext,
 )
 
 from server import questions as questions_registry
@@ -1990,8 +1988,12 @@ async def run_agent(
         model = await _get_role_default_model(agent_id)
     if model:
         options_kwargs["model"] = model
-    if plan_mode:
-        options_kwargs["permission_mode"] = "plan"
+    # permission_mode: the SDK api-reference documents that
+    # can_use_tool only fires reliably when permission_mode="default"
+    # is explicitly set. We set that as the baseline so our
+    # AskUserQuestion routing actually triggers, and let plan_mode
+    # override to "plan" when the pane requested it.
+    options_kwargs["permission_mode"] = "plan" if plan_mode else "default"
     if effort and effort in _EFFORT_LEVELS:
         options_kwargs["effort"] = _EFFORT_LEVELS[effort]
 
