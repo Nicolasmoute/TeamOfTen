@@ -4304,6 +4304,74 @@ function ActiveLoops({ liveEvents }) {
 }
 
 // ------------------------------------------------------------------
+// context usage bar — compact horizontal meter next to the effort chip.
+// Green until 50%, amber 50-67%, red >= 67%. Empty when there's no
+// active session. Pulled from /api/agents/<slot>/context on mount and
+// refreshed on every 'result' event for this slot (ResultMessage is
+// the authoritative per-turn usage source). session_cleared and
+// session_compacted reset the bar to zero without a fetch.
+// ------------------------------------------------------------------
+
+function ContextBar({ slot, liveEvents }) {
+  const [data, setData] = useState(null); // {used_tokens, context_window, ratio}
+
+  const refetch = useCallback(async () => {
+    try {
+      const res = await authFetch(`/api/agents/${encodeURIComponent(slot)}/context`);
+      if (res.ok) setData(await res.json());
+    } catch (_) {
+      // silent — bar just stays at last known state
+    }
+  }, [slot]);
+
+  useEffect(() => { refetch(); }, [refetch]);
+
+  // Watch for events that change the meter without a DB round-trip.
+  useEffect(() => {
+    if (!liveEvents || liveEvents.length === 0) return;
+    const last = liveEvents[liveEvents.length - 1];
+    if (!last || last.agent_id !== slot) return;
+    if (last.type === "result") {
+      // Latest turn landed — refetch the authoritative estimate.
+      refetch();
+    } else if (
+      last.type === "session_cleared" ||
+      last.type === "session_compacted" ||
+      last.type === "compact_empty_forced"
+    ) {
+      // Session just got cleared; the bar should drop to 0 immediately.
+      setData((d) => d ? { ...d, used_tokens: 0, ratio: 0 } : d);
+    }
+  }, [liveEvents, refetch]);
+
+  if (!data || !data.context_window) return null;
+  const ratio = Math.max(0, Math.min(1, data.ratio || 0));
+  const pct = Math.round(ratio * 100);
+  const color = ratio >= 0.67
+    ? "var(--err, #ff5a5a)"
+    : ratio >= 0.5
+    ? "#e5a72d"
+    : "var(--ok, #3fb950)";
+  const used = data.used_tokens || 0;
+  const window = data.context_window;
+  const fmtK = (n) => n >= 1000 ? `${(n / 1000).toFixed(0)}k` : `${n}`;
+  const title = `Context: ${fmtK(used)} / ${fmtK(window)} tokens (${pct}%)`;
+  return html`<div
+    class="pane-mode-chip context-bar"
+    title=${title}
+  >
+    <span class="context-bar-label">ctx</span>
+    <span class="context-bar-track">
+      <span
+        class="context-bar-fill"
+        style=${`width: ${pct}%; background: ${color};`}
+      ></span>
+    </span>
+    <span class="context-bar-pct">${pct}%</span>
+  </div>`;
+}
+
+// ------------------------------------------------------------------
 // agent pane
 // ------------------------------------------------------------------
 
@@ -5215,6 +5283,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
               ? EFFORT_LABELS[paneSettings.effort - 1]
               : "effort"}
           </button>
+          <${ContextBar} slot=${slot} liveEvents=${liveEvents} />
           <span class="pane-modes-spacer"></span>
           <button
             class="pane-mode-chip pane-mode-slash"

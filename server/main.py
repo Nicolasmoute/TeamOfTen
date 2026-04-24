@@ -1705,6 +1705,50 @@ async def set_agent_locked(
     return {"ok": True, "agent_id": agent_id, "locked": bool(locked)}
 
 
+@app.get("/api/agents/{agent_id}/context", dependencies=[Depends(require_token)])
+async def get_agent_context(agent_id: str) -> dict[str, object]:
+    """Current context usage estimate for a slot: used tokens (from
+    latest turn on the active session), the model's context window,
+    and the ratio. Used by the pane-level ContextBar to paint fill +
+    colour. Returns zeros when there's no active session."""
+    if not (agent_id == "coach" or (agent_id.startswith("p") and agent_id[1:].isdigit() and 1 <= int(agent_id[1:]) <= 10)):
+        raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
+    from server.agents import (
+        _context_window_for,
+        _get_session_id,
+        _session_context_estimate,
+    )
+    # Resolve effective model: pane-level / role default / SDK default.
+    # _context_window_for handles None → 1M fallback.
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT session_id FROM agents WHERE id = ?", (agent_id,)
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    if row is None:
+        raise HTTPException(404, detail=f"agent {agent_id} not found")
+    session_id = dict(row).get("session_id")
+    used = 0
+    if session_id:
+        used = await _session_context_estimate(session_id)
+    # Model for the window lookup: we don't know the per-pane override
+    # here (it's client-side), but the default fallback already resolves
+    # to 1M on Max plans, which is the right answer unless the user
+    # explicitly downgraded. Close enough for a colour-coded bar.
+    window = _context_window_for(None)
+    ratio = used / window if window > 0 else 0.0
+    return {
+        "agent_id": agent_id,
+        "session_id": session_id,
+        "used_tokens": used,
+        "context_window": window,
+        "ratio": round(ratio, 4),
+    }
+
+
 @app.delete("/api/agents/{agent_id}/session", dependencies=[Depends(require_token)])
 async def clear_session(
     agent_id: str,

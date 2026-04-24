@@ -1977,6 +1977,48 @@ body {
 }
 .pane-mode-slash { font-family: ui-monospace, Menlo, Consolas, monospace; }
 
+/* Context-usage meter: small horizontal bar between the effort chip
+   and the slash-commands spacer. Fill color goes green → amber → red
+   as the session eats its window. Inherits chip styling so it sits
+   cleanly with the rest of the pane-modes row. */
+.pane-mode-chip.context-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px;
+  cursor: default;
+  min-width: 110px;
+}
+.context-bar-label {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.context-bar-track {
+  flex: 1 1 auto;
+  height: 6px;
+  min-width: 40px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+  display: block;
+  position: relative;
+}
+.context-bar-fill {
+  display: block;
+  height: 100%;
+  transition: width 250ms ease-out, background 250ms ease-out;
+}
+.context-bar-pct {
+  color: var(--muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  min-width: 32px;
+  text-align: right;
+}
+
 /* Dismissable info banner — used by /tools and /help to show output
    without pushing anything to the agent. */
 .pane-info {
