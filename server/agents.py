@@ -347,6 +347,10 @@ async def _handle_message(
             if summary:
                 await _set_continuity_note(agent_id, summary)
                 await _set_session_id(agent_id, None)
+                # Freeze the exchange log we just quoted into the
+                # handoff; the next session starts with an empty buffer
+                # so a later compact doesn't re-quote pre-compact turns.
+                await _clear_exchange_log(agent_id)
                 await _emit(
                     agent_id,
                     "session_compacted",
@@ -380,7 +384,7 @@ async def _handle_message(
                 response_text = (turn_ctx.get("response_text") or "").strip()
                 entry_prompt = (turn_ctx.get("entry_prompt") or "").strip()
                 if response_text and entry_prompt:
-                    await _set_last_exchange(agent_id, entry_prompt, response_text)
+                    await _append_exchange(agent_id, entry_prompt, response_text)
         usage = _extract_usage(msg)
         if turn_ctx is not None:
             await _insert_turn_row(
@@ -713,12 +717,16 @@ async def _set_continuity_note(agent_id: str, text: str | None) -> None:
         await c.close()
 
 
-async def _get_last_exchange(agent_id: str) -> dict[str, str] | None:
-    """Read the most recent (prompt, response) pair written for this
-    agent by a successful non-compact turn. Returns None when absent /
-    unparseable so callers can skip gracefully."""
+async def _get_recent_exchanges(agent_id: str) -> list[dict[str, str]]:
+    """Read the rolling list of recent (prompt, response) pairs.
+
+    Stored as a JSON array in agents.last_exchange_json. Returns [] on
+    missing / unparseable. Defensively accepts the legacy single-dict
+    shape that earlier builds wrote, promoting it to a one-element
+    list so a mid-deploy upgrade doesn't lose the last exchange.
+    """
     if agent_id == "system":
-        return None
+        return []
     try:
         c = await configured_conn()
         try:
@@ -729,43 +737,64 @@ async def _get_last_exchange(agent_id: str) -> dict[str, str] | None:
         finally:
             await c.close()
     except Exception:
-        return None
+        return []
     if not row:
-        return None
+        return []
     raw = dict(row).get("last_exchange_json")
     if not raw:
-        return None
+        return []
     try:
         d = json.loads(raw)
     except Exception:
-        return None
-    if not isinstance(d, dict):
-        return None
-    return d
+        return []
+    if isinstance(d, dict):
+        return [d]
+    if isinstance(d, list):
+        return [x for x in d if isinstance(x, dict)]
+    return []
 
 
-async def _set_last_exchange(agent_id: str, prompt: str, response: str) -> None:
-    """Overwrite the agent's last_exchange_json with this turn's pair.
-    Called on every successful non-compact ResultMessage so /compact
-    always has the freshest 'recent exchange' to preserve verbatim."""
+# How many turns to retain in the rolling exchange log. At the default
+# clip budgets (1500 prompt, 3000 response) 10 exchanges cost roughly
+# 45K chars / 11K tokens on the post-compact system prompt — a good
+# trade for CLI-like continuity.
+def _handoff_exchange_count() -> int:
+    try:
+        n = int(os.environ.get("HARNESS_HANDOFF_EXCHANGES", "10"))
+    except ValueError:
+        return 10
+    if n < 1:
+        return 1
+    if n > 40:
+        return 40
+    return n
+
+
+async def _append_exchange(agent_id: str, prompt: str, response: str) -> None:
+    """Push this turn's pair onto the rolling exchange log, trimming
+    the oldest entry beyond HARNESS_HANDOFF_EXCHANGES. Called on every
+    successful non-compact ResultMessage."""
     if agent_id == "system":
         return
-    # Trim aggressively — a multi-thousand-char assistant reply would
-    # bloat the system prompt on the fresh post-compact turn. The point
-    # is *recent memory*, not a full transcript.
+
     def _clip(s: str, n: int) -> str:
         s = s or ""
         if len(s) <= n:
             return s
-        # Keep head + tail so both the original ask and the conclusion
-        # survive a long middle.
         half = (n - 20) // 2
         return s[:half] + "\n…[truncated]…\n" + s[-half:]
-    payload = json.dumps({
-        "prompt": _clip(prompt, 2000),
-        "response": _clip(response, 4000),
+
+    existing = await _get_recent_exchanges(agent_id)
+    existing.append({
+        "prompt": _clip(prompt, 1500),
+        "response": _clip(response, 3000),
         "ts": _now(),
     })
+    # Trim from the head — oldest drops first.
+    cap = _handoff_exchange_count()
+    if len(existing) > cap:
+        existing = existing[-cap:]
+    payload = json.dumps(existing, ensure_ascii=False)
     try:
         c = await configured_conn()
         try:
@@ -777,7 +806,28 @@ async def _set_last_exchange(agent_id: str, prompt: str, response: str) -> None:
         finally:
             await c.close()
     except Exception:
-        logger.exception("set_last_exchange failed: agent=%s", agent_id)
+        logger.exception("append_exchange failed: agent=%s", agent_id)
+
+
+async def _clear_exchange_log(agent_id: str) -> None:
+    """Null the exchange log. Called after compact commit so the FIRST
+    fresh turn's exchange history starts clean — otherwise the second
+    compact would retain exchanges from before the first, which is
+    confusing and bloats the handoff."""
+    if agent_id == "system":
+        return
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE agents SET last_exchange_json = NULL WHERE id = ?",
+                (agent_id,),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        pass
 
 
 async def _locked_players() -> list[str]:
@@ -1306,25 +1356,39 @@ async def run_agent(
             "\n\n## Handoff from your prior session (via /compact)\n\n"
             + handoff_text.strip()
         )
-        # Append the most recent (user, assistant) exchange verbatim —
-        # same behavior as CLI /compact, which keeps recent turns
-        # intact alongside the summary. Fresh-you reads this as "here
-        # is exactly what just happened" rather than relying on the
-        # paraphrased ## Recent exchanges section inside the summary.
-        last = await _get_last_exchange(agent_id)
-        if last and isinstance(last.get("prompt"), str) and isinstance(last.get("response"), str):
+        # Append the last N exchanges verbatim — CLI /compact keeps
+        # recent turns intact, and 1 exchange was too thin (tools
+        # chains span multiple turns). The rolling list is maintained
+        # by _append_exchange on every successful non-compact turn,
+        # capped by HARNESS_HANDOFF_EXCHANGES (default 10).
+        recent = await _get_recent_exchanges(agent_id)
+        # Drop empty/malformed entries defensively.
+        recent = [
+            e for e in recent
+            if isinstance(e, dict)
+            and isinstance(e.get("prompt"), str)
+            and isinstance(e.get("response"), str)
+            and (e.get("prompt") or e.get("response"))
+        ]
+        if recent:
             handoff_suffix += (
-                "\n\n### Most recent exchange (verbatim, immediately "
-                "before compact)\n\n"
-                "**User asked:**\n\n"
-                + (last["prompt"] or "").strip()
-                + "\n\n**You replied:**\n\n"
-                + (last["response"] or "").strip()
+                f"\n\n### Recent exchanges (verbatim, last "
+                f"{len(recent)} turn{'s' if len(recent) != 1 else ''} "
+                "before compact, oldest first)\n"
             )
+            for i, e in enumerate(recent, start=1):
+                handoff_suffix += (
+                    f"\n#### Exchange {i} of {len(recent)}\n\n"
+                    "**User asked:**\n\n"
+                    + (e["prompt"] or "").strip()
+                    + "\n\n**You replied:**\n\n"
+                    + (e["response"] or "").strip()
+                    + "\n"
+                )
         handoff_suffix += (
             "\n\n(Your previous conversation history has been cleared "
-            "to free context. The summary + verbatim exchange above are "
-            "your memory of what came before.)"
+            "to free context. The summary + verbatim exchanges above "
+            "are your memory of what came before.)"
         )
     # Lock-state suffix — Coach-only. Tells Coach up-front which
     # Players are off-limits so they plan around the constraint
