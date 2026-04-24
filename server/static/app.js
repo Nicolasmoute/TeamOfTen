@@ -2774,22 +2774,24 @@ function EnvAttentionSection({ conversations }) {
   const [dismissed, setDismissed] = useState(() => loadDismissedAttention());
   const [persisted, setPersisted] = useState([]);
 
-  // Pending AskUserQuestion prompts — live through can_use_tool and
-  // survive reloads via /api/questions/pending. Different data path
-  // from human_attention (which is fire-and-forget escalations).
+  // Pending AskUserQuestion + ExitPlanMode interactions. Both go
+  // through can_use_tool and survive reloads via /api/questions/pending
+  // and /api/plans/pending. Separate from human_attention (fire-and-
+  // forget escalations).
   const [pendingQuestions, setPendingQuestions] = useState([]);
+  const [pendingPlans, setPendingPlans] = useState([]);
 
-  // Load persisted escalations on mount so page reloads don't lose
-  // undismissed banners. We re-fetch whenever a fresh human_attention
-  // arrives over WS (the live copy lacks __id until the DB write
-  // returns, so the fetch lets us get the canonical id for future
-  // dismissal persistence across reloads).
   const liveCount = useMemo(() => {
     let n = 0;
     for (const list of conversations.values()) {
       for (const ev of list) {
-        if (ev.type === "human_attention" || ev.type === "pending_question"
-            || ev.type === "question_answered" || ev.type === "question_cancelled") {
+        if (ev.type === "human_attention"
+            || ev.type === "pending_question"
+            || ev.type === "question_answered"
+            || ev.type === "question_cancelled"
+            || ev.type === "pending_plan"
+            || ev.type === "plan_decided"
+            || ev.type === "plan_cancelled") {
           n++;
         }
       }
@@ -2820,6 +2822,15 @@ function EnvAttentionSection({ conversations }) {
       } catch (e) {
         console.error("pending questions load failed", e);
       }
+      try {
+        const res3 = await authFetch("/api/plans/pending");
+        if (!res3.ok) return;
+        const data3 = await res3.json();
+        if (cancelled) return;
+        setPendingPlans(Array.isArray(data3.pending) ? data3.pending : []);
+      } catch (e) {
+        console.error("pending plans load failed", e);
+      }
     })();
     return () => { cancelled = true; };
   }, [liveCount]);
@@ -2827,10 +2838,7 @@ function EnvAttentionSection({ conversations }) {
   const open = useMemo(() => {
     const seen = new Set();
     const all = [];
-    // Live pending questions (from server /api/questions/pending +
-    // WS pending_question events). Filter to route='human' only —
-    // Player→Coach questions don't need a form, Coach sees them in
-    // their inbox.
+    // Live pending questions.
     for (const pq of pendingQuestions) {
       if (pq.route !== "human") continue;
       const k = `pq:${pq.correlation_id}`;
@@ -2848,6 +2856,22 @@ function EnvAttentionSection({ conversations }) {
           : "Question",
       });
     }
+    // Live pending plans.
+    for (const pp of pendingPlans) {
+      if (pp.route !== "human") continue;
+      const k = `pp:${pp.correlation_id}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      all.push({
+        __key: k,
+        type: "pending_plan",
+        agent_id: pp.agent_id,
+        correlation_id: pp.correlation_id,
+        plan: pp.plan || "",
+        ts: pp.created_at,
+        subject: "Plan approval — " + (pp.agent_id || ""),
+      });
+    }
     for (const list of conversations.values()) {
       for (const ev of list) {
         if (ev.type === "pending_question" && ev.route === "human") {
@@ -2857,11 +2881,23 @@ function EnvAttentionSection({ conversations }) {
           all.push({ ...ev, __key: k });
           continue;
         }
-        // question_answered / question_cancelled: REMOVE the matching
-        // pending-question entry instead of adding one.
+        if (ev.type === "pending_plan" && ev.route === "human") {
+          const k = `pp:${ev.correlation_id}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          all.push({ ...ev, __key: k, subject: "Plan approval — " + (ev.agent_id || "") });
+          continue;
+        }
         if (ev.type === "question_answered" || ev.type === "question_cancelled") {
           const k = `pq:${ev.correlation_id}`;
-          seen.add(k);  // blocks future re-add
+          seen.add(k);
+          for (let i = all.length - 1; i >= 0; i--) {
+            if (all[i].__key === k) all.splice(i, 1);
+          }
+        }
+        if (ev.type === "plan_decided" || ev.type === "plan_cancelled") {
+          const k = `pp:${ev.correlation_id}`;
+          seen.add(k);
           for (let i = all.length - 1; i >= 0; i--) {
             if (all[i].__key === k) all.splice(i, 1);
           }
@@ -2886,10 +2922,9 @@ function EnvAttentionSection({ conversations }) {
       }
     }
     const out = all.filter((ev) => !dismissed.has(ev.__key));
-    // Newest first — user sees the most urgent escalation at the top.
     out.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
     return out;
-  }, [conversations, persisted, pendingQuestions, dismissed]);
+  }, [conversations, persisted, pendingQuestions, pendingPlans, dismissed]);
 
   const dismiss = useCallback((key) => {
     setDismissed((prev) => {
@@ -2937,6 +2972,11 @@ function EnvAttentionSection({ conversations }) {
               <div class="env-attention-subject">${ev.subject}</div>
               ${ev.type === "pending_question" && Array.isArray(ev.questions) && ev.questions.length > 0
                 ? html`<${QuestionForm}
+                    event=${ev}
+                    onSubmitted=${() => dismiss(ev.__key)}
+                  />`
+                : ev.type === "pending_plan"
+                ? html`<${PlanApprovalForm}
                     event=${ev}
                     onSubmitted=${() => dismiss(ev.__key)}
                   />`
@@ -3091,6 +3131,85 @@ function QuestionForm({ event, onSubmitted }) {
         disabled=${sending || !canSubmit}
         onClick=${submit}
       >${sending ? "sending…" : "Send answers"}</button>
+    </div>
+  </div>`;
+}
+
+
+// Plan-approval form rendered inside an attention item when a
+// pending_plan event arrives (ExitPlanMode via can_use_tool). The
+// plan is rendered in a scrollable pre block; three buttons map to
+// the /api/plans/<id>/decision contract. Reject and Approve-with-
+// comments require a non-empty comments textarea (also enforced
+// server-side). Plain Approve is a single click.
+function PlanApprovalForm({ event, onSubmitted }) {
+  const [comments, setComments] = useState("");
+  const [sending, setSending] = useState(false);
+  const [err, setErr] = useState(null);
+  const planText = event.plan || "";
+
+  const submit = async (decision) => {
+    if (decision !== "approve" && !comments.trim()) {
+      setErr("Comments required for reject and approve-with-comments.");
+      return;
+    }
+    setSending(true);
+    setErr(null);
+    try {
+      const cid = event.correlation_id;
+      if (!cid) throw new Error("no correlation_id on event");
+      const res = await authFetch(
+        "/api/plans/" + encodeURIComponent(cid) + "/decision",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            decision,
+            comments: comments.trim() || null,
+          }),
+        }
+      );
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status}${body ? " — " + body.slice(0, 120) : ""}`);
+      }
+      onSubmitted();
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return html`<div class="plan-form">
+    <pre class="plan-body">${planText}</pre>
+    <textarea
+      class="plan-comments"
+      placeholder="Comments (required for reject / approve-with-comments)"
+      value=${comments}
+      onInput=${(e) => setComments(e.target.value)}
+      rows=${3}
+      disabled=${sending}
+    />
+    <div class="plan-actions">
+      ${err ? html`<span class="plan-form-err">${err}</span>` : null}
+      <button
+        disabled=${sending}
+        onClick=${() => submit("approve")}
+        class="primary"
+        title="Plan executes as-is"
+      >${sending ? "…" : "Approve"}</button>
+      <button
+        disabled=${sending}
+        onClick=${() => submit("approve_with_comments")}
+        title="Plan executes; comments land in the agent's inbox"
+      >${sending ? "…" : "Approve with comments"}</button>
+      <button
+        disabled=${sending}
+        onClick=${() => submit("reject")}
+        class="plan-reject"
+        title="Agent stays in plan mode and revises per your comments"
+      >${sending ? "…" : "Reject (revise)"}</button>
     </div>
   </div>`;
 }
@@ -5846,6 +5965,27 @@ function EventItem({ event }) {
   if (type === "question_cancelled") {
     return html`<div class="event sys">
       <div class="event-meta">${ts} · ⚠ question cancelled: ${event.reason || ""}</div>
+    </div>`;
+  }
+
+  if (type === "pending_plan") {
+    const route = event.route === "coach" ? "→ coach" : "→ human";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ⏸ paused on ExitPlanMode ${route} (id=${(event.correlation_id || "").slice(0, 8)})</div>
+    </div>`;
+  }
+
+  if (type === "plan_decided") {
+    const dec = event.decision || "?";
+    const note = event.has_comments ? " + comments" : "";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ▶ plan ${dec}${note} (id=${(event.correlation_id || "").slice(0, 8)})</div>
+    </div>`;
+  }
+
+  if (type === "plan_cancelled") {
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ⚠ plan review cancelled: ${event.reason || ""}</div>
     </div>`;
   }
 

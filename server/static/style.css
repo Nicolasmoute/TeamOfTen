@@ -690,6 +690,57 @@ body {
   font-size: 11px;
 }
 
+/* Plan-approval form — rendered inside an attention item when a
+   pending_plan event arrives (ExitPlanMode via can_use_tool). */
+.plan-form {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.plan-body {
+  max-height: 280px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #10131a;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 8px 10px;
+  margin: 0;
+  font-size: 12px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  color: var(--fg);
+  line-height: 1.4;
+}
+.plan-comments {
+  width: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 6px;
+  font-size: 12px;
+  font-family: inherit;
+  resize: vertical;
+}
+.plan-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.plan-actions .plan-reject {
+  color: var(--err);
+  border-color: var(--err);
+}
+.plan-form-err {
+  color: var(--err);
+  font-size: 11px;
+  margin-right: auto;
+}
+
 /* cost cap progress bar */
 .env-cap-bar { margin-bottom: 8px; }
 .env-cap-bar-label {

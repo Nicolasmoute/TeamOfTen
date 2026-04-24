@@ -27,7 +27,7 @@ from claude_agent_sdk import (
     query,
 )
 
-from server import questions as questions_registry
+from server import interactions as interactions_registry
 from server.context import build_system_prompt_suffix
 from server.db import configured_conn
 from server.events import bus
@@ -1384,6 +1384,10 @@ def _system_prompt_for(agent_id: str) -> str:
             "Player's paused question. When a Player calls AskUserQuestion "
             "while working for you, the question lands in your inbox with "
             "a correlation_id — call this tool to unblock them.\n"
+            "  - coord_answer_plan(correlation_id, decision, comments?): "
+            "resolve a Player's paused ExitPlanMode. decision is "
+            "'approve' | 'reject' | 'approve_with_comments'. Reject and "
+            "approve_with_comments need a `comments` body.\n"
             "  - coord_request_human(subject, body, urgency?): escalate to the "
             "human when a decision exceeds your authority or the team is "
             "stuck. urgency='blocker' for whole-team gating.\n"
@@ -1554,140 +1558,313 @@ def _build_can_use_tool(agent_id: str):
         input_data: dict[str, Any],
         context: ToolPermissionContext,
     ) -> PermissionResultAllow | PermissionResultDeny:
-        if tool_name != "AskUserQuestion":
-            return PermissionResultAllow(updated_input=input_data)
-
-        questions = _normalize_question_payload(input_data)
-        if not questions:
-            return PermissionResultDeny(
-                message="AskUserQuestion: 'questions' array is required and must be non-empty"
-            )
-
-        route = "human" if caller_is_coach else "coach"
-        entry = questions_registry.register(agent_id, questions, route)
-        correlation_id = entry.correlation_id
-        md_body = _format_questions_md(questions)
-
-        try:
-            if route == "human":
-                # Surface a pending_question event for the UI form.
-                # Structured payload is preserved so the form can render
-                # radios/checkboxes; md_body is a readable fallback.
-                subject = f"Question from {agent_id}"
-                if len(questions) == 1 and len(questions[0]["question"]) < 80:
-                    subject = f"{agent_id}: {questions[0]['question']}"
-                await bus.publish(
-                    {
-                        "ts": _now(),
-                        "agent_id": agent_id,
-                        "type": "pending_question",
-                        "correlation_id": correlation_id,
-                        "route": "human",
-                        "subject": subject,
-                        "questions": questions,
-                        "body": md_body,
-                    }
-                )
-            else:
-                # Route to Coach's inbox as a structured question message.
-                # Coach reads it, picks answers, calls coord_answer_question
-                # with the correlation_id to resolve this pending entry.
-                subject = f"Q from {agent_id}: correlation_id={correlation_id}"
-                body = (
-                    f"Player {agent_id} is paused on AskUserQuestion. "
-                    f"Respond via coord_answer_question with correlation_id "
-                    f"{correlation_id!r} and an 'answers' object mapping each "
-                    f"question text to your chosen label.\n\n"
-                    + md_body
-                )
-                c = await configured_conn()
-                try:
-                    cur = await c.execute(
-                        "INSERT INTO messages (from_id, to_id, subject, body, priority) "
-                        "VALUES (?, ?, ?, ?, ?) RETURNING id",
-                        (agent_id, "coach", subject, body, "interrupt"),
-                    )
-                    row = await cur.fetchone()
-                    msg_id = dict(row)["id"] if row else None
-                    await c.commit()
-                finally:
-                    await c.close()
-                await bus.publish(
-                    {
-                        "ts": _now(),
-                        "agent_id": agent_id,
-                        "type": "pending_question",
-                        "correlation_id": correlation_id,
-                        "route": "coach",
-                        "subject": subject,
-                        "questions": questions,
-                        "message_id": msg_id,
-                    }
-                )
-                # Wake Coach so they process the inbox promptly — the
-                # Player is literally parked waiting on them.
-                await maybe_wake_agent(
-                    "coach",
-                    f"Player {agent_id} is paused on a question. Read your inbox, "
-                    f"pick answers, then call coord_answer_question with "
-                    f"correlation_id={correlation_id!r} to unblock them.",
-                    bypass_debounce=True,
-                )
-
-            # Block until answered, timed out, or explicitly rejected.
-            answers = await questions_registry.wait_for(entry)
-            await bus.publish(
-                {
-                    "ts": _now(),
-                    "agent_id": agent_id,
-                    "type": "question_answered",
-                    "correlation_id": correlation_id,
-                    "route": route,
-                    "answer_count": len(answers),
-                }
-            )
-            # The SDK expects updated_input to carry both the original
-            # questions AND the answers map (answers keyed by question
-            # text → selected label).
-            return PermissionResultAllow(
-                updated_input={
-                    "questions": input_data.get("questions", questions),
-                    "answers": answers,
-                }
-            )
-        except questions_registry.QuestionRejected as e:
-            await bus.publish(
-                {
-                    "ts": _now(),
-                    "agent_id": agent_id,
-                    "type": "question_cancelled",
-                    "correlation_id": correlation_id,
-                    "route": route,
-                    "reason": str(e),
-                }
-            )
-            return PermissionResultDeny(
-                message=f"Question cancelled: {e}. Proceed without the answer "
-                "(reformulate, escalate via coord_request_human, or mark your "
-                "task blocked)."
-            )
-        except asyncio.CancelledError:
-            # Turn was cancelled while we were waiting — clean up then
-            # propagate so the SDK ends the turn.
-            questions_registry.forget(correlation_id)
-            raise
-        except Exception as e:
-            logger.exception("can_use_tool: unexpected failure for %s", correlation_id)
-            questions_registry.forget(correlation_id)
-            return PermissionResultDeny(
-                message=f"Question routing failed: {type(e).__name__}: {e}"
-            )
-        finally:
-            # register() keeps the entry in _pending until forget(); resolve()
-            # doesn't auto-remove. Clean up in every exit path.
-            questions_registry.forget(correlation_id)
+        if tool_name == "AskUserQuestion":
+            return await _handle_ask_user_question(agent_id, caller_is_coach, input_data)
+        if tool_name == "ExitPlanMode":
+            return await _handle_exit_plan_mode(agent_id, caller_is_coach, input_data)
+        return PermissionResultAllow(updated_input=input_data)
 
     return _cb
+
+
+async def _handle_ask_user_question(
+    agent_id: str,
+    caller_is_coach: bool,
+    input_data: dict[str, Any],
+) -> PermissionResultAllow | PermissionResultDeny:
+    questions = _normalize_question_payload(input_data)
+    if not questions:
+        return PermissionResultDeny(
+            message="AskUserQuestion: 'questions' array is required and must be non-empty"
+        )
+
+    route = "human" if caller_is_coach else "coach"
+    entry = interactions_registry.register(
+        agent_id, "question", {"questions": questions}, route,
+    )
+    correlation_id = entry.correlation_id
+    md_body = _format_questions_md(questions)
+
+    try:
+        if route == "human":
+            subject = f"Question from {agent_id}"
+            if len(questions) == 1 and len(questions[0]["question"]) < 80:
+                subject = f"{agent_id}: {questions[0]['question']}"
+            await bus.publish(
+                {
+                    "ts": _now(),
+                    "agent_id": agent_id,
+                    "type": "pending_question",
+                    "correlation_id": correlation_id,
+                    "route": "human",
+                    "subject": subject,
+                    "questions": questions,
+                    "body": md_body,
+                }
+            )
+        else:
+            subject = f"Q from {agent_id}: correlation_id={correlation_id}"
+            body = (
+                f"Player {agent_id} is paused on AskUserQuestion. "
+                f"Respond via coord_answer_question with correlation_id "
+                f"{correlation_id!r} and an 'answers' object mapping each "
+                f"question text to your chosen label.\n\n"
+                + md_body
+            )
+            c = await configured_conn()
+            try:
+                cur = await c.execute(
+                    "INSERT INTO messages (from_id, to_id, subject, body, priority) "
+                    "VALUES (?, ?, ?, ?, ?) RETURNING id",
+                    (agent_id, "coach", subject, body, "interrupt"),
+                )
+                row = await cur.fetchone()
+                msg_id = dict(row)["id"] if row else None
+                await c.commit()
+            finally:
+                await c.close()
+            await bus.publish(
+                {
+                    "ts": _now(),
+                    "agent_id": agent_id,
+                    "type": "pending_question",
+                    "correlation_id": correlation_id,
+                    "route": "coach",
+                    "subject": subject,
+                    "questions": questions,
+                    "message_id": msg_id,
+                }
+            )
+            await maybe_wake_agent(
+                "coach",
+                f"Player {agent_id} is paused on a question. Read your inbox, "
+                f"pick answers, then call coord_answer_question with "
+                f"correlation_id={correlation_id!r} to unblock them.",
+                bypass_debounce=True,
+            )
+
+        answers = await interactions_registry.wait_for(entry)
+        await bus.publish(
+            {
+                "ts": _now(),
+                "agent_id": agent_id,
+                "type": "question_answered",
+                "correlation_id": correlation_id,
+                "route": route,
+                "answer_count": len(answers),
+            }
+        )
+        return PermissionResultAllow(
+            updated_input={
+                "questions": input_data.get("questions", questions),
+                "answers": answers,
+            }
+        )
+    except interactions_registry.InteractionRejected as e:
+        await bus.publish(
+            {
+                "ts": _now(),
+                "agent_id": agent_id,
+                "type": "question_cancelled",
+                "correlation_id": correlation_id,
+                "route": route,
+                "reason": str(e),
+            }
+        )
+        return PermissionResultDeny(
+            message=f"Question cancelled: {e}. Proceed without the answer "
+            "(reformulate, escalate via coord_request_human, or mark your "
+            "task blocked)."
+        )
+    except asyncio.CancelledError:
+        interactions_registry.forget(correlation_id)
+        raise
+    except Exception as e:
+        logger.exception("can_use_tool: unexpected failure for %s", correlation_id)
+        interactions_registry.forget(correlation_id)
+        return PermissionResultDeny(
+            message=f"Question routing failed: {type(e).__name__}: {e}"
+        )
+    finally:
+        interactions_registry.forget(correlation_id)
+
+
+async def _handle_exit_plan_mode(
+    agent_id: str,
+    caller_is_coach: bool,
+    input_data: dict[str, Any],
+) -> PermissionResultAllow | PermissionResultDeny:
+    """ExitPlanMode: agent is requesting to leave plan mode and execute.
+    Three possible human/Coach decisions:
+      - approve       → PermissionResultAllow, plan executes as-is.
+      - reject        → PermissionResultDeny with comments phrased as
+                        "approved, but revise to include: <comments>"
+                        so the agent stays in plan mode and revises.
+      - approve_with_comments → PermissionResultAllow + queue a human
+                        message in the agent's inbox carrying the
+                        comments so they land on the next inbox read.
+    """
+    plan_text = (input_data or {}).get("plan") or ""
+    if not isinstance(plan_text, str) or not plan_text.strip():
+        return PermissionResultDeny(
+            message="ExitPlanMode: 'plan' is required and must be a non-empty string."
+        )
+
+    route = "human" if caller_is_coach else "coach"
+    entry = interactions_registry.register(
+        agent_id, "plan", {"plan": plan_text}, route,
+    )
+    correlation_id = entry.correlation_id
+
+    try:
+        if route == "human":
+            await bus.publish(
+                {
+                    "ts": _now(),
+                    "agent_id": agent_id,
+                    "type": "pending_plan",
+                    "correlation_id": correlation_id,
+                    "route": "human",
+                    "plan": plan_text,
+                }
+            )
+        else:
+            subject = f"Plan approval from {agent_id}: correlation_id={correlation_id}"
+            body = (
+                f"Player {agent_id} is paused on ExitPlanMode. Review the "
+                f"plan below, then call coord_answer_plan with "
+                f"correlation_id={correlation_id!r} and decision "
+                f"'approve' | 'reject' | 'approve_with_comments' "
+                f"(comments optional on approve, required on the other two).\n\n"
+                f"---\n\n"
+                + plan_text
+            )
+            c = await configured_conn()
+            try:
+                cur = await c.execute(
+                    "INSERT INTO messages (from_id, to_id, subject, body, priority) "
+                    "VALUES (?, ?, ?, ?, ?) RETURNING id",
+                    (agent_id, "coach", subject, body, "interrupt"),
+                )
+                row = await cur.fetchone()
+                msg_id = dict(row)["id"] if row else None
+                await c.commit()
+            finally:
+                await c.close()
+            await bus.publish(
+                {
+                    "ts": _now(),
+                    "agent_id": agent_id,
+                    "type": "pending_plan",
+                    "correlation_id": correlation_id,
+                    "route": "coach",
+                    "subject": subject,
+                    "plan": plan_text,
+                    "message_id": msg_id,
+                }
+            )
+            await maybe_wake_agent(
+                "coach",
+                f"Player {agent_id} is paused awaiting plan approval. Read "
+                f"the inbox, then call coord_answer_plan with "
+                f"correlation_id={correlation_id!r} to decide.",
+                bypass_debounce=True,
+            )
+
+        # Wait for decision. Expected shape:
+        #   {"decision": "approve" | "reject" | "approve_with_comments",
+        #    "comments": str | None}
+        decision_result = await interactions_registry.wait_for(entry)
+        decision = (decision_result.get("decision") or "").strip().lower()
+        comments = (decision_result.get("comments") or "").strip()
+
+        await bus.publish(
+            {
+                "ts": _now(),
+                "agent_id": agent_id,
+                "type": "plan_decided",
+                "correlation_id": correlation_id,
+                "route": route,
+                "decision": decision,
+                "has_comments": bool(comments),
+            }
+        )
+
+        if decision == "approve":
+            return PermissionResultAllow(updated_input={"plan": plan_text})
+
+        if decision == "approve_with_comments":
+            # Inbox delivery of comments so they land on the next read —
+            # the plan executes in-flight on THIS turn, and the notes
+            # become available shortly after via auto-wake.
+            if comments:
+                try:
+                    c = await configured_conn()
+                    try:
+                        await c.execute(
+                            "INSERT INTO messages (from_id, to_id, subject, body, priority) "
+                            "VALUES ('human', ?, ?, ?, 'normal')",
+                            (
+                                agent_id,
+                                "Notes on the approved plan",
+                                (
+                                    "Your plan was approved. Operator notes to "
+                                    "keep in mind as you execute:\n\n" + comments
+                                ),
+                            ),
+                        )
+                        await c.commit()
+                    finally:
+                        await c.close()
+                except Exception:
+                    logger.exception(
+                        "plan approve_with_comments: inbox insert failed for %s",
+                        agent_id,
+                    )
+            return PermissionResultAllow(updated_input={"plan": plan_text})
+
+        # Reject path — default. Any non-recognised decision also falls
+        # here so the SDK doesn't silently approve on a bad payload.
+        # Phrasing per user spec: "approved, but revise to include …"
+        # — framed constructively so the agent revises rather than
+        # starts over.
+        reason = comments or "operator did not approve; revise and exit plan mode again."
+        return PermissionResultDeny(
+            message=(
+                "Approved in principle, but please revise the plan to "
+                f"include: {reason} Stay in plan mode, update the plan, "
+                "and call ExitPlanMode again."
+            )
+        )
+
+    except interactions_registry.InteractionRejected as e:
+        await bus.publish(
+            {
+                "ts": _now(),
+                "agent_id": agent_id,
+                "type": "plan_cancelled",
+                "correlation_id": correlation_id,
+                "route": route,
+                "reason": str(e),
+            }
+        )
+        return PermissionResultDeny(
+            message=(
+                f"Plan review cancelled: {e}. Stay in plan mode, revise "
+                "if possible, or escalate via coord_request_human."
+            )
+        )
+    except asyncio.CancelledError:
+        interactions_registry.forget(correlation_id)
+        raise
+    except Exception as e:
+        logger.exception("can_use_tool: ExitPlanMode failure for %s", correlation_id)
+        interactions_registry.forget(correlation_id)
+        return PermissionResultDeny(
+            message=f"Plan routing failed: {type(e).__name__}: {e}"
+        )
+    finally:
+        interactions_registry.forget(correlation_id)
 
 
 async def run_agent(

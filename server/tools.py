@@ -1413,12 +1413,17 @@ def build_coord_server(caller_id: str) -> Any:
             clean[k] = str(v) if v is not None else ""
         if not clean:
             return _err("no valid (question, answer) pairs in answers")
-        from server import questions as qregistry
-        ok = qregistry.resolve(correlation_id, clean)
+        from server import interactions as interactions_registry
+        entry = interactions_registry.get(correlation_id)
+        if entry is None or entry.kind != "question":
+            return _err(
+                f"correlation_id {correlation_id!r} not found, wrong kind, "
+                "or already resolved / timed out"
+            )
+        ok = interactions_registry.resolve(correlation_id, clean)
         if not ok:
             return _err(
-                f"correlation_id {correlation_id!r} not found or already "
-                "resolved / timed out"
+                f"correlation_id {correlation_id!r} already resolved / timed out"
             )
         await bus.publish(
             {
@@ -1433,6 +1438,83 @@ def build_coord_server(caller_id: str) -> Any:
         return _ok(
             f"answered {correlation_id} ({len(clean)} keys). The Player "
             "resumes on their paused turn."
+        )
+
+    @tool(
+        "coord_answer_plan",
+        (
+            "Coach-only. Resolve a pending ExitPlanMode from a Player. "
+            "When a Player in plan mode calls ExitPlanMode, their turn "
+            "pauses and the plan is routed to your inbox with a "
+            "correlation_id; call this tool with that id plus your "
+            "decision to unblock them.\n"
+            "\n"
+            "Params:\n"
+            "- correlation_id: the id from the plan approval message "
+            "(required).\n"
+            "- decision: 'approve' | 'reject' | 'approve_with_comments' "
+            "(required). `approve` lets the plan execute as-is. "
+            "`reject` keeps the Player in plan mode and phrases your "
+            "comments as 'approved, but revise to include X' so they "
+            "revise and exit plan mode again. `approve_with_comments` "
+            "lets the plan execute AND queues your comments as an inbox "
+            "message the Player reads on their next turn.\n"
+            "- comments: required for 'reject' and 'approve_with_comments', "
+            "optional for 'approve'. Max 10k chars."
+        ),
+        {"correlation_id": str, "decision": str, "comments": str},
+    )
+    async def answer_plan(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err(
+                "Only Coach decides on Player plans. Players stay in "
+                "plan mode until Coach resolves."
+            )
+        correlation_id = (args.get("correlation_id") or "").strip()
+        decision = (args.get("decision") or "").strip().lower()
+        comments = (args.get("comments") or "").strip()
+        if not correlation_id:
+            return _err("correlation_id is required")
+        if decision not in ("approve", "reject", "approve_with_comments"):
+            return _err(
+                "decision must be 'approve', 'reject', or 'approve_with_comments'"
+            )
+        if decision in ("reject", "approve_with_comments") and not comments:
+            return _err(
+                f"'{decision}' requires non-empty comments explaining what "
+                "to revise / keep in mind"
+            )
+        if len(comments) > 10_000:
+            return _err(f"comments too long ({len(comments)} chars, max 10000)")
+        from server import interactions as interactions_registry
+        entry = interactions_registry.get(correlation_id)
+        if entry is None or entry.kind != "plan":
+            return _err(
+                f"correlation_id {correlation_id!r} not found, wrong kind, "
+                "or already resolved / timed out"
+            )
+        ok = interactions_registry.resolve(
+            correlation_id,
+            {"decision": decision, "comments": comments},
+        )
+        if not ok:
+            return _err(
+                f"correlation_id {correlation_id!r} already resolved / timed out"
+            )
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "plan_decided",
+                "correlation_id": correlation_id,
+                "route": "coach",
+                "decision": decision,
+                "has_comments": bool(comments),
+            }
+        )
+        return _ok(
+            f"plan {decision} for {correlation_id}. The Player resumes on "
+            "their paused turn."
         )
 
     @tool(
@@ -1506,6 +1588,7 @@ def build_coord_server(caller_id: str) -> Any:
             list_team,
             set_player_role,
             answer_question,
+            answer_plan,
             request_human,
         ],
     )
@@ -1532,6 +1615,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_list_team",
     "mcp__coord__coord_set_player_role",
     "mcp__coord__coord_answer_question",
+    "mcp__coord__coord_answer_plan",
     "mcp__coord__coord_request_human",
 ]
 

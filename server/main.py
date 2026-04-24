@@ -2028,8 +2028,17 @@ async def list_pending_questions() -> dict[str, Any]:
     """Metadata-only view of currently-waiting AskUserQuestion calls.
     Used by the UI form to hydrate on reload (so refreshing the page
     doesn't lose the form state for in-flight questions)."""
-    from server import questions as questions_registry
-    return {"pending": questions_registry.list_pending()}
+    from server import interactions as interactions_registry
+    # Legacy shape: older UI builds expect `questions` flattened onto the
+    # entry rather than nested under `payload`. Unpack here for
+    # backward-compat so clients don't need a coordinated update.
+    items = []
+    for p in interactions_registry.list_pending(kind="question"):
+        item = dict(p)
+        payload = item.pop("payload", {}) or {}
+        item["questions"] = payload.get("questions", [])
+        items.append(item)
+    return {"pending": items}
 
 
 class AnswerQuestionRequest(BaseModel):
@@ -2050,12 +2059,18 @@ async def answer_pending_question(
     """Human submits the question form; resolve the waiting Future so
     the agent's turn resumes. 404 when the id is stale (already
     answered, timed out, or never existed)."""
-    from server import questions as questions_registry
-    ok = questions_registry.resolve(correlation_id, req.answers)
-    if not ok:
+    from server import interactions as interactions_registry
+    entry = interactions_registry.get(correlation_id)
+    if entry is None or entry.kind != "question":
         raise HTTPException(
             404,
             detail=f"question {correlation_id!r} not found or already resolved",
+        )
+    ok = interactions_registry.resolve(correlation_id, req.answers)
+    if not ok:
+        raise HTTPException(
+            404,
+            detail=f"question {correlation_id!r} already resolved",
         )
     await bus.publish(
         {
@@ -2069,6 +2084,77 @@ async def answer_pending_question(
         }
     )
     return {"ok": True, "correlation_id": correlation_id}
+
+
+# --- Plan approval (ExitPlanMode) ------------------------------------------
+
+@app.get("/api/plans/pending", dependencies=[Depends(require_token)])
+async def list_pending_plans() -> dict[str, Any]:
+    """Currently-waiting ExitPlanMode approvals."""
+    from server import interactions as interactions_registry
+    items = []
+    for p in interactions_registry.list_pending(kind="plan"):
+        item = dict(p)
+        payload = item.pop("payload", {}) or {}
+        item["plan"] = payload.get("plan", "")
+        items.append(item)
+    return {"pending": items}
+
+
+class PlanDecisionRequest(BaseModel):
+    decision: str = Field(..., pattern=r"^(approve|reject|approve_with_comments)$")
+    comments: str | None = Field(default=None, max_length=10_000)
+
+
+@app.post(
+    "/api/plans/{correlation_id}/decision",
+    dependencies=[Depends(require_token)],
+)
+async def decide_pending_plan(
+    correlation_id: str,
+    req: PlanDecisionRequest,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, Any]:
+    """Human submits a plan decision; resolve the waiting Future so the
+    agent's turn resumes. Reject and approve_with_comments both
+    require comments (the UI enforces that too, but double-check here
+    so a scripted POST can't smuggle an empty-comment reject into the
+    agent's deny message)."""
+    from server import interactions as interactions_registry
+    entry = interactions_registry.get(correlation_id)
+    if entry is None or entry.kind != "plan":
+        raise HTTPException(
+            404,
+            detail=f"plan {correlation_id!r} not found or already resolved",
+        )
+    comments = (req.comments or "").strip()
+    if req.decision in ("reject", "approve_with_comments") and not comments:
+        raise HTTPException(
+            400,
+            detail=f"'{req.decision}' requires non-empty 'comments'",
+        )
+    ok = interactions_registry.resolve(
+        correlation_id,
+        {"decision": req.decision, "comments": comments},
+    )
+    if not ok:
+        raise HTTPException(
+            404,
+            detail=f"plan {correlation_id!r} already resolved",
+        )
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "human",
+            "type": "plan_decided",
+            "correlation_id": correlation_id,
+            "route": "human",
+            "decision": req.decision,
+            "has_comments": bool(comments),
+            "actor": actor,
+        }
+    )
+    return {"ok": True, "correlation_id": correlation_id, "decision": req.decision}
 
 
 class HumanMessageRequest(BaseModel):
