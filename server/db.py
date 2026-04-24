@@ -282,6 +282,26 @@ async def init_db() -> None:
                 except Exception as e:
                     if "duplicate column" not in str(e).lower():
                         raise
+            # Token-usage columns on the turns ledger. Populated from
+            # ResultMessage.usage on every successful turn; drives the
+            # auto-compact threshold (HARNESS_AUTO_COMPACT_THRESHOLD).
+            # input_tokens = new uncached input; cache_read = cached
+            # prefix re-sent; cache_creation = this turn's tokens being
+            # written to cache; output_tokens = assistant reply. Sum of
+            # all four on the latest turn for a session ≈ conversation
+            # size going into the next turn.
+            for col_name, col_ddl in (
+                ("input_tokens", "ALTER TABLE turns ADD COLUMN input_tokens INTEGER"),
+                ("output_tokens", "ALTER TABLE turns ADD COLUMN output_tokens INTEGER"),
+                ("cache_read_tokens", "ALTER TABLE turns ADD COLUMN cache_read_tokens INTEGER"),
+                ("cache_creation_tokens", "ALTER TABLE turns ADD COLUMN cache_creation_tokens INTEGER"),
+            ):
+                try:
+                    await db.execute(col_ddl)
+                    logger.info("init_db: migration applied: agents.%s", col_name)
+                except Exception as e:
+                    if "duplicate column" not in str(e).lower():
+                        raise
             logger.info("init_db: schema ok, seeding agents")
             await db.executemany(
                 "INSERT OR IGNORE INTO agents "

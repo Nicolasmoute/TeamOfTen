@@ -89,6 +89,10 @@ async def _insert_turn_row(
     model: str | None,
     plan_mode: bool,
     effort: int | None,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    cache_read_tokens: int | None = None,
+    cache_creation_tokens: int | None = None,
 ) -> None:
     """Insert one row into the `turns` ledger — cheap analytics table
     (one row per SDK ResultMessage). Errors are swallowed: losing a
@@ -103,8 +107,9 @@ async def _insert_turn_row(
                 "INSERT INTO turns ("
                 "agent_id, started_at, ended_at, duration_ms, cost_usd, "
                 "session_id, num_turns, stop_reason, is_error, "
-                "model, plan_mode, effort"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "model, plan_mode, effort, "
+                "input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     agent_id,
                     started_at,
@@ -118,6 +123,10 @@ async def _insert_turn_row(
                     model,
                     1 if plan_mode else 0,
                     effort,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
                 ),
             )
             await c.commit()
@@ -125,6 +134,88 @@ async def _insert_turn_row(
             await c.close()
     except Exception:
         logger.exception("insert_turn_row failed: agent=%s", agent_id)
+
+
+def _extract_usage(msg: Any) -> dict[str, int]:
+    """Pull token counts from a ResultMessage's usage block. Defensive
+    against SDK shape drift: `usage` may be a dict, a Pydantic model,
+    or an anthropic.types.Usage. Fields we want may or may not exist
+    depending on whether prompt caching kicked in. Missing fields
+    become 0 so aggregation stays well-defined."""
+    u = getattr(msg, "usage", None)
+    if u is None:
+        return {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+    def _get(name: str) -> int:
+        v = None
+        if isinstance(u, dict):
+            v = u.get(name)
+        else:
+            v = getattr(u, name, None)
+        try:
+            return int(v) if v is not None else 0
+        except (TypeError, ValueError):
+            return 0
+    return {
+        "input": _get("input_tokens"),
+        "output": _get("output_tokens"),
+        "cache_read": _get("cache_read_input_tokens"),
+        "cache_creation": _get("cache_creation_input_tokens"),
+    }
+
+
+# Per-model context window in tokens. Used by the auto-compact check
+# to compute "we're at X% of ceiling, time to compact". Keep this in
+# sync with Anthropic's published windows; default to 200K when a
+# model isn't listed (safer than assuming 1M and missing an overflow).
+_CONTEXT_WINDOWS = {
+    "claude-opus-4-7": 200_000,
+    "claude-opus-4-7[1m]": 1_000_000,
+    "claude-sonnet-4-6": 200_000,
+    "claude-haiku-4-5-20251001": 200_000,
+}
+
+
+def _context_window_for(model: str | None) -> int:
+    if not model:
+        return 200_000
+    return _CONTEXT_WINDOWS.get(model, 200_000)
+
+
+async def _session_context_estimate(session_id: str) -> int:
+    """Approximate current conversation context size for a session.
+
+    For a monotonically-growing session (no compaction), each resumed
+    turn's input_tokens already includes the full conversation
+    history. So the latest turn's (input + cache_read + cache_creation
+    + output) is the best single-turn estimate of "what the next
+    resume will send". Return 0 when no token data is available (old
+    rows pre-migration, or pre-ResultMessage calls).
+    """
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT input_tokens, output_tokens, "
+                "cache_read_tokens, cache_creation_tokens "
+                "FROM turns WHERE session_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("session_context_estimate: DB read failed")
+        return 0
+    if not row:
+        return 0
+    d = dict(row)
+    total = 0
+    for k in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"):
+        v = d.get(k)
+        if isinstance(v, int):
+            total += v
+    return total
 
 
 async def _handle_message(
@@ -266,6 +357,7 @@ async def _handle_message(
                 and turn_ctx.get("had_handoff_on_entry")
             ):
                 await _set_continuity_note(agent_id, None)
+        usage = _extract_usage(msg)
         if turn_ctx is not None:
             await _insert_turn_row(
                 agent_id=agent_id,
@@ -280,6 +372,10 @@ async def _handle_message(
                 model=turn_ctx.get("model"),
                 plan_mode=bool(turn_ctx.get("plan_mode")),
                 effort=turn_ctx.get("effort"),
+                input_tokens=usage["input"],
+                output_tokens=usage["output"],
+                cache_read_tokens=usage["cache_read"],
+                cache_creation_tokens=usage["cache_creation"],
             )
 
 
@@ -352,6 +448,44 @@ async def cancel_all_agents() -> list[str]:
         if await cancel_agent(agent_id):
             cancelled.append(agent_id)
     return cancelled
+
+# The compact prompt used by both the manual /compact endpoint and the
+# auto-compact trip-wire. Structured sections force high-signal
+# retention: open questions and exact quotes (URLs, paths, errors) are
+# the first things paraphrase destroys, so the prompt explicitly
+# instructs the model to keep them verbatim.
+COMPACT_PROMPT = (
+    "Your session context is about to be cleared. Write a handoff note "
+    "for your next fresh turn. The note replaces your conversation "
+    "history — anything you don't capture here is lost.\n\n"
+    "Use exactly these markdown sections, in this order. Omit sections "
+    "that genuinely don't apply (don't write 'N/A'). Target 300-600 "
+    "words total.\n\n"
+    "## Current task\n"
+    "What you're working on right now and its status (e.g. 'investigating "
+    "X, blocked on Y', 'writing Z, 60% through'). One short paragraph.\n\n"
+    "## Open questions\n"
+    "Bullet list. Quote each question VERBATIM as it was asked — do not "
+    "paraphrase. Include enough context that fresh-you can answer it.\n\n"
+    "## Key findings\n"
+    "Facts, decisions, or conclusions you arrived at this session that "
+    "wouldn't be obvious from memory/ or decisions/. Bullet list.\n\n"
+    "## References (quote verbatim)\n"
+    "URLs you fetched, file paths you touched, exact error messages, and "
+    "code snippets under 10 lines that matter. Quote precisely — "
+    "paraphrasing these loses information. Bullet list.\n\n"
+    "## Recent exchanges\n"
+    "The last 2-3 user/assistant exchanges, paraphrased tightly but "
+    "keeping any distinctive user phrasing in quotes. This is the "
+    "'short-term memory' your fresh self will miss most.\n\n"
+    "## Context quirks\n"
+    "Anything peculiar about the current setup — a user preference "
+    "mentioned in passing, a tool that behaved oddly, an assumption we "
+    "agreed to. One line each.\n\n"
+    "Reply with ONLY the markdown — no preamble, no sign-off, no "
+    "'Here's the handoff:'."
+)
+
 
 # Standard prompt the autonomous loop and POST /api/coach/tick both
 # send to Coach. Kept here so callers stay in sync.
@@ -921,6 +1055,54 @@ async def run_agent(
         await _emit(agent_id, "paused", prompt=prompt)
         logger.info("paused: refused to spawn %s", agent_id)
         return
+
+    # Auto-compact trip-wire: if this agent has a prior session and its
+    # estimated context is above HARNESS_AUTO_COMPACT_THRESHOLD of the
+    # model's window, run a compact turn FIRST (which nulls session_id
+    # and writes a continuity note), then fall through to run the
+    # user's original prompt on the fresh session. The original prompt
+    # is not lost — both turns run sequentially and both show up in
+    # the timeline. Skipped when compact_mode is already True (this
+    # call *is* the compact turn, avoid recursion) or when the env
+    # threshold is unset / 0 (feature off).
+    if not compact_mode:
+        threshold_env = os.environ.get("HARNESS_AUTO_COMPACT_THRESHOLD", "0.7")
+        try:
+            threshold = float(threshold_env)
+        except ValueError:
+            threshold = 0.7
+        if 0.0 < threshold < 1.0:
+            prior = await _get_session_id(agent_id)
+            if prior:
+                used = await _session_context_estimate(prior)
+                ctx_max = _context_window_for(model)
+                if ctx_max > 0 and used / ctx_max >= threshold:
+                    await _emit(
+                        agent_id,
+                        "auto_compact_triggered",
+                        used_tokens=used,
+                        context_window=ctx_max,
+                        ratio=round(used / ctx_max, 3),
+                        threshold=threshold,
+                        deferred_prompt=prompt,
+                    )
+                    try:
+                        await run_agent(
+                            agent_id,
+                            COMPACT_PROMPT,
+                            model=model,
+                            compact_mode=True,
+                        )
+                    except Exception:
+                        # Compact failure shouldn't block the user's
+                        # actual work. Log, emit, proceed anyway — the
+                        # worst case is the context-pressure error
+                        # they'd have hit without the feature.
+                        logger.exception(
+                            "auto-compact failed for %s; proceeding on original session",
+                            agent_id,
+                        )
+                        await _emit(agent_id, "auto_compact_failed")
 
     # Concurrent-spawn guard: check + claim the slot atomically under
     # _SPAWN_LOCK so two parallel run_agent coroutines can't both pass

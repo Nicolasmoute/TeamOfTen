@@ -1599,7 +1599,7 @@ async def compact_agent_session(
     409 if the agent is already running (you can't compact an in-
     flight turn).
     """
-    from server.agents import run_agent, is_agent_running
+    from server.agents import run_agent, is_agent_running, COMPACT_PROMPT
     if not _valid_slot(agent_id):
         raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
     if is_agent_running(agent_id):
@@ -1607,24 +1607,7 @@ async def compact_agent_session(
             409,
             detail="agent is currently running — wait for it to finish or cancel first",
         )
-    compact_prompt = (
-        "Time to compact this session. Before your conversation history "
-        "gets cleared, write a handoff summary for your NEXT fresh turn.\n\n"
-        "Cover, concisely (aim for 200-500 words):\n"
-        "1. What task(s) you're currently on, and their status.\n"
-        "2. Key facts, files, decisions, or findings you accumulated "
-        "this session that won't be obvious from memory/ or decisions/.\n"
-        "3. Any open questions, blockers, or things you'd want to "
-        "pick up on next turn.\n"
-        "4. Anything peculiar about the current context (e.g. a user "
-        "preference that came up, a quirk of the task) that your "
-        "fresh self wouldn't otherwise know.\n\n"
-        "Reply with ONLY the summary text — no preamble, no sign-off, "
-        "no 'Here's the handoff:'. The text will be injected verbatim "
-        "into your next turn's system prompt as your memory of what "
-        "came before."
-    )
-    background.add_task(run_agent, agent_id, compact_prompt, compact_mode=True)
+    background.add_task(run_agent, agent_id, COMPACT_PROMPT, compact_mode=True)
     await bus.publish(
         {
             "ts": datetime.now(timezone.utc).isoformat(),
