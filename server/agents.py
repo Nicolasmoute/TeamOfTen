@@ -1097,18 +1097,21 @@ async def _get_recent_exchanges(agent_id: str) -> list[dict[str, str]]:
 
 # Token budget for the rolling exchange log preserved verbatim across
 # a compact. Older exchanges are trimmed from the head until the total
-# fits. Default 50K tokens — a meaningful slice of recent verbatim
-# content without eating an absurd share of the post-compact system
-# prompt. Token counts use a rough chars/4 estimate, which is close
-# enough for planning (tokenizer-exact is overkill for a budget knob).
+# fits. Default 20K tokens — enough for a warm-start on the post-
+# compact turn without hoarding. The full session transcript is kept
+# separately in the CLI's jsonl file (see session retention sweep in
+# sync.py + the "Where to find more" footer in every handoff), so this
+# log doesn't need to double as the long-term record. Token counts use
+# a rough chars/4 estimate; tokenizer-exact would be overkill for a
+# budget knob.
 _CHARS_PER_TOKEN = 4
 
 
 def _handoff_token_budget() -> int:
     try:
-        n = int(os.environ.get("HARNESS_HANDOFF_TOKEN_BUDGET", "50000"))
+        n = int(os.environ.get("HARNESS_HANDOFF_TOKEN_BUDGET", "20000"))
     except ValueError:
-        return 50_000
+        return 20_000
     if n < 1_000:
         return 1_000
     if n > 500_000:
@@ -2181,7 +2184,9 @@ async def run_agent(
         # chains span multiple turns). The rolling list is maintained
         # by _append_exchange on every successful non-compact turn,
         # trimmed from the head so total size stays under
-        # HARNESS_HANDOFF_TOKEN_BUDGET (default 50K tokens).
+        # HARNESS_HANDOFF_TOKEN_BUDGET (default 20K tokens — the full
+        # session transcript lives in the jsonl file, so this injected
+        # log is just a warm-start, not the long-term record).
         recent = await _get_recent_exchanges(agent_id)
         # Drop empty/malformed entries defensively.
         recent = [
