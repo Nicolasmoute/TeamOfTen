@@ -40,6 +40,7 @@ from server.agents import (
     cancel_agent,
     cancel_all_agents,
     coach_tick_loop,
+    coach_repeat_loop,
     is_paused,
     run_agent,
     set_paused,
@@ -203,11 +204,12 @@ async def lifespan(app: FastAPI):
     sync_task = asyncio.create_task(flush_loop())
     snapshot_task = asyncio.create_task(snapshot_loop())
     coach_task = asyncio.create_task(coach_tick_loop())
+    coach_repeat_task = asyncio.create_task(coach_repeat_loop())
     trim_task = asyncio.create_task(events_trim_loop())
     att_trim_task = asyncio.create_task(attachments_trim_loop())
     uploads_task = asyncio.create_task(uploads_pull_loop())
     outputs_task = asyncio.create_task(outputs_push_loop())
-    bg_tasks = (sync_task, snapshot_task, coach_task, trim_task, att_trim_task, uploads_task, outputs_task)
+    bg_tasks = (sync_task, snapshot_task, coach_task, coach_repeat_task, trim_task, att_trim_task, uploads_task, outputs_task)
     try:
         yield
     finally:
@@ -581,6 +583,44 @@ async def set_coach_loop(req: CoachLoopRequest) -> dict[str, object]:
         }
     )
     return {"ok": True, "interval_seconds": req.interval_seconds}
+
+
+class CoachRepeatRequest(BaseModel):
+    interval_seconds: int = Field(..., ge=0, le=86_400)
+    prompt: str | None = None
+
+
+@app.get("/api/coach/repeat", dependencies=[Depends(require_token)])
+async def get_coach_repeat_endpoint() -> dict[str, object]:
+    from server.agents import get_coach_repeat
+    interval, prompt = get_coach_repeat()
+    return {"interval_seconds": interval, "prompt": prompt}
+
+
+@app.post("/api/coach/repeat", dependencies=[Depends(require_token)])
+async def set_coach_repeat_endpoint(req: CoachRepeatRequest) -> dict[str, object]:
+    """Set Coach's repeat loop at runtime. Independent of the tick
+    autoloop. Passing interval_seconds=0 disables + clears the prompt.
+    A non-zero interval requires a non-empty prompt."""
+    from server.agents import set_coach_repeat
+    prompt = (req.prompt or "").strip() or None
+    if req.interval_seconds > 0 and not prompt:
+        raise HTTPException(400, detail="prompt required when interval > 0")
+    set_coach_repeat(req.interval_seconds, prompt)
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "coach",
+            "type": "coach_repeat_changed",
+            "interval_seconds": req.interval_seconds if prompt else 0,
+            "prompt": prompt if req.interval_seconds > 0 else None,
+        }
+    )
+    return {
+        "ok": True,
+        "interval_seconds": req.interval_seconds if prompt else 0,
+        "prompt": prompt if req.interval_seconds > 0 else None,
+    }
 
 
 @app.post("/api/coach/tick", dependencies=[Depends(require_token)])

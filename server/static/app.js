@@ -243,6 +243,7 @@ const SLASH_COMMANDS = [
   { cmd: "/compact", desc: "summarize current session; next turn resumes with summary" },
   { cmd: "/cancel",  desc: "cancel the in-flight turn on this pane" },
   { cmd: "/loop",   desc: "Coach autoloop: /loop 60 → tick every 60s · /loop off" },
+  { cmd: "/repeat", desc: "Coach repeat: /repeat 120 <prompt> · /repeat off" },
   { cmd: "/tick",   desc: "nudge Coach to drain inbox right now" },
   { cmd: "/status", desc: "show server runtime state (paused, running, spend)" },
   { cmd: "/spend",  desc: "per-agent spend over last 24h" },
@@ -3989,6 +3990,161 @@ function renderInline(s) {
 }
 
 // ------------------------------------------------------------------
+// active loops bar (Coach-only): shows the tick loop (/loop) and the
+// repeat loop (/repeat) when active, each with a live countdown to
+// next fire, collapse toggle, and a trash button to kill it.
+// ------------------------------------------------------------------
+
+const LOOP_COLLAPSED_KEY = "harness_active_loops_collapsed_v1";
+
+function ActiveLoops({ liveEvents }) {
+  const [tick, setTick] = useState({ interval: 0, nextAt: 0 });
+  const [repeat, setRepeat] = useState({ interval: 0, prompt: null, nextAt: 0 });
+  const [now, setNow] = useState(Date.now());
+  const [collapsed, setCollapsed] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(LOOP_COLLAPSED_KEY) || "{}"); }
+    catch (_) { return {}; }
+  });
+
+  const saveCollapsed = (next) => {
+    setCollapsed(next);
+    try { localStorage.setItem(LOOP_COLLAPSED_KEY, JSON.stringify(next)); } catch (_) {}
+  };
+
+  // Initial fetch of both loop states.
+  useEffect(() => {
+    authFetch("/api/coach/loop")
+      .then((r) => r.json())
+      .then((d) => {
+        const s = d.interval_seconds || 0;
+        setTick({ interval: s, nextAt: s > 0 ? Date.now() + s * 1000 : 0 });
+      })
+      .catch(() => {});
+    authFetch("/api/coach/repeat")
+      .then((r) => r.json())
+      .then((d) => {
+        const s = d.interval_seconds || 0;
+        setRepeat({
+          interval: s,
+          prompt: d.prompt || null,
+          nextAt: s > 0 ? Date.now() + s * 1000 : 0,
+        });
+      })
+      .catch(() => {});
+  }, []);
+
+  // React to WS events to resync state and countdowns.
+  useEffect(() => {
+    if (!liveEvents || liveEvents.length === 0) return;
+    const last = liveEvents[liveEvents.length - 1];
+    if (!last || last.agent_id !== "coach") return;
+    const t = last.type;
+    if (t === "coach_loop_changed") {
+      const s = last.interval_seconds || 0;
+      setTick({ interval: s, nextAt: s > 0 ? Date.now() + s * 1000 : 0 });
+    } else if (t === "coach_tick_fired") {
+      setTick((prev) =>
+        prev.interval > 0
+          ? { ...prev, nextAt: Date.now() + prev.interval * 1000 }
+          : prev
+      );
+    } else if (t === "coach_repeat_changed") {
+      const s = last.interval_seconds || 0;
+      setRepeat({
+        interval: s,
+        prompt: last.prompt || null,
+        nextAt: s > 0 ? Date.now() + s * 1000 : 0,
+      });
+    } else if (t === "coach_repeat_fired") {
+      setRepeat((prev) =>
+        prev.interval > 0
+          ? { ...prev, nextAt: Date.now() + prev.interval * 1000 }
+          : prev
+      );
+    }
+  }, [liveEvents]);
+
+  const anyActive = tick.interval > 0 || repeat.interval > 0;
+
+  // Tick only when at least one loop is active.
+  useEffect(() => {
+    if (!anyActive) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [anyActive]);
+
+  if (!anyActive) return null;
+
+  const fmt = (ms) => {
+    const s = Math.max(0, Math.ceil(ms / 1000));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
+  };
+
+  const killTick = () => {
+    authFetch("/api/coach/loop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ interval_seconds: 0 }),
+    }).catch(() => {});
+  };
+  const killRepeat = () => {
+    authFetch("/api/coach/repeat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ interval_seconds: 0, prompt: null }),
+    }).catch(() => {});
+  };
+
+  const row = (key, label, interval, nextAt, promptText, onKill) => {
+    const isCollapsed = !!collapsed[key];
+    const remaining = nextAt ? nextAt - now : 0;
+    const toggle = () => saveCollapsed({ ...collapsed, [key]: !isCollapsed });
+    return html`<div class="active-loop" key=${key}>
+      <button
+        class="active-loop-toggle"
+        onClick=${toggle}
+        title=${isCollapsed ? "Expand" : "Collapse"}
+      >${isCollapsed ? "▸" : "▾"}</button>
+      <span class="active-loop-label">${label}</span>
+      <span class="active-loop-countdown" title=${`Every ${interval}s`}>${fmt(remaining)}</span>
+      ${!isCollapsed
+        ? html`<span class="active-loop-prompt" title=${promptText}>${promptText}</span>`
+        : null}
+      <button
+        class="active-loop-kill"
+        onClick=${onKill}
+        title="Stop this loop"
+      >🗑</button>
+    </div>`;
+  };
+
+  return html`<div class="active-loops">
+    ${tick.interval > 0
+      ? row(
+          "tick",
+          "loop",
+          tick.interval,
+          tick.nextAt,
+          "Routine inbox tick",
+          killTick
+        )
+      : null}
+    ${repeat.interval > 0
+      ? row(
+          "repeat",
+          "repeat",
+          repeat.interval,
+          repeat.nextAt,
+          repeat.prompt || "",
+          killRepeat
+        )
+      : null}
+  </div>`;
+}
+
+// ------------------------------------------------------------------
 // agent pane
 // ------------------------------------------------------------------
 
@@ -4389,6 +4545,63 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
             );
           })
           .catch((e) => setInfoText("loop set failed: " + String(e)));
+        return true;
+      }
+      case "/repeat": {
+        // Coach-only independent repeat loop with custom prompt.
+        //   /repeat                  → show current state
+        //   /repeat 120 <prompt...>  → fire <prompt> every 120s
+        //   /repeat off              → disable
+        if (slot !== "coach") {
+          setInfoText("/repeat is Coach-only.");
+          return true;
+        }
+        const raw = arg.trim();
+        if (!raw) {
+          authFetch("/api/coach/repeat")
+            .then((r) => r.json())
+            .then((d) => {
+              setInfoText(
+                d.interval_seconds && d.prompt
+                  ? `Coach repeat: every ${d.interval_seconds}s — ${d.prompt}`
+                  : "Coach repeat: OFF. '/repeat 120 <prompt>' to start."
+              );
+            })
+            .catch((e) => setInfoText("repeat query failed: " + String(e)));
+          return true;
+        }
+        const first = raw.split(/\s+/, 1)[0].toLowerCase();
+        if (first === "off" || first === "0" || first === "stop") {
+          authFetch("/api/coach/repeat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ interval_seconds: 0, prompt: null }),
+          })
+            .then(() => setInfoText("Coach repeat stopped."))
+            .catch((e) => setInfoText("repeat off failed: " + String(e)));
+          return true;
+        }
+        const m = raw.match(/^(\d+)\s+([\s\S]+)$/);
+        if (!m) {
+          setInfoText("usage: /repeat <seconds> <prompt...>  or  /repeat off");
+          return true;
+        }
+        const secs = parseInt(m[1], 10);
+        const prompt = m[2].trim();
+        if (!secs || secs < 1 || !prompt) {
+          setInfoText("usage: /repeat <seconds> <prompt...>  or  /repeat off");
+          return true;
+        }
+        authFetch("/api/coach/repeat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ interval_seconds: secs, prompt }),
+        })
+          .then((r) => {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            setInfoText(`Coach repeat: every ${secs}s. First fire in ~${secs}s.`);
+          })
+          .catch((e) => setInfoText("repeat set failed: " + String(e)));
         return true;
       }
       case "/tick":
@@ -4805,6 +5018,9 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
                 )}
               </div>
             `
+          : null}
+        ${slot === "coach"
+          ? html`<${ActiveLoops} liveEvents=${liveEvents} />`
           : null}
         <!-- Compact mode chips: one-glance view of the pane's current
              model / plan / effort, each clickable to open the full

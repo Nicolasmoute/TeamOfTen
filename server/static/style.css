@@ -1862,6 +1862,58 @@ body {
   padding: 6px 8px;
   font: inherit;
 }
+/* Active Coach loops bar — one row per active loop (/loop, /repeat).
+   Sits above the mode chips so the next-fire countdown is always in
+   view when composing a prompt. */
+.active-loops {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.active-loop {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(88, 166, 255, 0.04);
+  font-size: 12px;
+}
+.active-loop-toggle,
+.active-loop-kill {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 2px;
+  line-height: 1;
+}
+.active-loop-toggle:hover,
+.active-loop-kill:hover { color: var(--fg); }
+.active-loop-label {
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.active-loop-countdown {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  color: var(--fg);
+  min-width: 44px;
+}
+.active-loop-prompt {
+  flex: 1 1 auto;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
 /* Compact mode chips shown right above the textarea. Each chip reads
    the current pane setting (model / plan / effort). Active chips pick
    up the accent color so a non-default setting is visible at a glance. */
