@@ -4,7 +4,7 @@
 
 ![tests](https://github.com/Nicolasmoute/TeamOfTen/actions/workflows/tests.yml/badge.svg)
 
-I couldn't find a multi-agent Claude Code setup that felt right — most were either heavy frameworks or black-box products. This is the opposite: a single-container web app where **1 Coach + 10 Players** all run Claude Code, share a task board, message each other, work on your GitHub project repo via per-Player git worktrees, produce documents at various levels (scratchpad, knowledge, decisions, binary outputs) that sync to a cloud drive, and can plug into third-party MCP tools (Notion, GitHub, Slack, anything that speaks MCP) for the work that lives outside the harness. Everything is visible in a multi-pane UI. Set it up once on a VPS and it runs 24/7.
+I couldn't find a multi-agent Claude Code setup that felt right — most were either heavy frameworks or black-box products. This is the opposite: a single-container web app where **1 Coach + 10 Players** all run Claude Code, share a task board, message each other, work directly on your GitHub project repo via per-Player git worktrees (`git clone` + `git push` from inside the container), produce documents at various levels (scratchpad, knowledge, decisions, binary outputs) that sync to a cloud drive, and can plug into third-party **MCP servers** (Notion, Slack, Linear, Sentry — anything that speaks MCP) for the work that lives outside the codebase. Everything is visible in a multi-pane UI: you can intervene on any agent directly, watch the inter-agent chatter unfold live, or just sit back and steer through Coach. You're part of the team — even though the main idea is to keep Coach as the single entry point. Set it up once on a VPS and it runs 24/7.
 
 The code is intentionally simple. The storage backend assumes a **WebDAV-compatible cloud drive** — kDrive, Nextcloud, ownCloud, Fastmail, whatever — because plain WebDAV was the shortest path from "runs in Docker" to "I can read the agents' output from my phone". People out there can make this more sophisticated; I like the simplicity. If you need something else, swap [server/webdav.py](server/webdav.py) — it's ~10 methods.
 
@@ -16,9 +16,10 @@ Nice little project. Have fun, improve it.
 
 - You send a goal to **Coach** in the UI.
 - Coach decomposes it into tasks on a shared board and push-assigns them to specific **Players** (`p1` through `p10`, auto-named after lacrosse legends by default).
-- The assignee auto-wakes, reads their inbox, claims the task, and works in their **own git worktree** on your project repo.
-- Players can message each other for info, drop notes in **shared memory**, produce durable **knowledge artifacts**, save **binary outputs**, ship **decisions**, and `git commit + push` their work.
-- Agents can use **external MCP servers** you wire in (Notion, GitHub, Slack, Linear, Sentry — anything with an MCP integration), credentials stored in an encrypted on-disk vault.
+- The assignee auto-wakes, reads their inbox, claims the task, and works in their **own git worktree** on your project repo — full direct git access, `git commit + push` straight back to GitHub.
+- Players can message each other for info, drop notes in **shared memory**, produce durable **knowledge artifacts**, save **binary outputs**, and ship **decisions**.
+- Agents can use **external MCP servers** you wire in (Notion, Slack, Linear, Sentry — anything that speaks MCP), credentials stored in an encrypted on-disk vault.
+- You're part of the team: open any agent's pane to read what they're saying, **send them a direct prompt**, watch the live tool-use stream, override their model / effort / plan-mode, or pause/cancel a runaway turn. Coach is the recommended entry point but never the only one.
 - Every agent's session, context usage, and cost is live in its own pane. Drag-to-rearrange, stack, split — it's your workspace.
 - Everything human-readable mirrors to your cloud drive so you can read/edit it from anywhere.
 
