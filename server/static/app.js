@@ -5369,6 +5369,41 @@ function EventItem({ event }) {
     </div>`;
   }
 
+  if (type === "coach_repeat_changed") {
+    const s = event.interval_seconds;
+    const p = event.prompt
+      ? ` — "${String(event.prompt).slice(0, 60)}${event.prompt.length > 60 ? "…" : ""}"`
+      : "";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · coach repeat ${s > 0 ? `every ${s}s` : "OFF"}${p}</div>
+    </div>`;
+  }
+
+  if (type === "auto_compact_triggered") {
+    const r = event.ratio != null ? ` (${Math.round(event.ratio * 100)}% of ${event.context_window || "?"})` : "";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · auto-compact triggered${r}</div>
+    </div>`;
+  }
+
+  if (type === "session_compacted") {
+    const f = event.handoff_file ? ` → handoffs/${event.handoff_file}` : "";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · session compacted (${event.chars || 0} chars)${f}</div>
+    </div>`;
+  }
+
+  if (type === "compact_empty_forced" || type === "auto_compact_failed") {
+    const msg = type === "compact_empty_forced"
+      ? "compact produced no summary — session force-cleared to escape loop"
+      : `auto-compact failed${event.error ? ": " + event.error : ""}`;
+    return html`<div class="event session-break">
+      <span class="session-break-rule" />
+      <span class="session-break-label">${ts} · ${msg}</span>
+      <span class="session-break-rule" />
+    </div>`;
+  }
+
   if (type === "human_attention") {
     return html`<div class="event sys">
       <div class="event-meta">${ts} · ⚠ human attention: ${event.subject || ""}</div>

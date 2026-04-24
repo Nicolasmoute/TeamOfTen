@@ -356,13 +356,21 @@ async def _handle_message(
                 # The continuity_note stored in the DB is a short pointer
                 # that gets injected into the next system prompt.
                 handoff_file = await _write_handoff_file(agent_id, summary)
-                pointer = summary
+                # The summary itself is what gets injected into fresh-you's
+                # system prompt. The file is a durable copy (kDrive-
+                # mirrored) and lets other agents / the human reference
+                # this handoff later via ./handoffs/<file> from any
+                # workspace. No need to re-read it yourself — the text
+                # below is already in-context.
                 if handoff_file:
                     pointer = (
-                        f"Full handoff saved to handoffs/{handoff_file} "
-                        f"(read it with the Read tool on turn 1 if you "
-                        f"need more than the digest below).\n\n"
+                        f"_This handoff is also saved to "
+                        f"handoffs/{handoff_file} for audit + cross-agent "
+                        f"reference; the text below is the full content._"
+                        f"\n\n"
                     ) + summary
+                else:
+                    pointer = summary
                 await _set_continuity_note(agent_id, pointer)
                 await _set_session_id(agent_id, None)
                 # Freeze the exchange log we just quoted into the
@@ -1279,6 +1287,9 @@ def _system_prompt_for(agent_id: str) -> str:
             "Written via coord_save_output. Mirrors to kDrive outputs/.\n"
             "  - memory/<topic>.md: scratchpad (overwritable, versioned).\n"
             "  - decisions/<date>-slug.md: immutable ADRs (Coach-only write).\n"
+            "  - ./handoffs/<agent>-<timestamp>.md: compact-handoff files "
+            "(auto-written when a session is compacted). Read when you "
+            "need context across a compact boundary for any agent.\n"
             "\n"
             "Rules:\n"
             "  - You never write code; you delegate.\n"
@@ -1332,6 +1343,10 @@ def _system_prompt_for(agent_id: str) -> str:
         f"  - outputs/<path>.<ext>: binary deliverables — write via "
         f"coord_save_output (base64-encoded).\n"
         f"  - memory/<topic>.md: team scratchpad via coord_*_memory tools.\n"
+        f"  - ./handoffs/<agent>-<timestamp>.md (symlinked in your "
+        f"workspace): full compact-handoff files. Auto-written when a "
+        f"session is compacted; read them if you need to know what "
+        f"another agent was doing across a compact boundary.\n"
         f"\n"
         f"Rules:\n"
         f"  - You execute and report. You do not assign work to other Players.\n"

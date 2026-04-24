@@ -166,21 +166,29 @@ async def lifespan(app: FastAPI):
     # pre-created symlinks got wiped.
     try:
         ws_root = Path("/workspaces")
+        handoffs_dir = Path(
+            os.environ.get("HARNESS_HANDOFFS_DIR", "/data/handoffs")
+        )
+        handoffs_dir.mkdir(parents=True, exist_ok=True)
         if ws_root.exists():
             for slot_dir in ws_root.iterdir():
                 if not slot_dir.is_dir():
                     continue
-                link = slot_dir / "uploads"
-                if link.exists() or link.is_symlink():
-                    continue
-                try:
-                    link.symlink_to(UPLOADS_DIR)
-                except OSError:
-                    logger.exception(
-                        "failed to symlink uploads for %s", slot_dir.name
-                    )
+                for name, target in (
+                    ("uploads", UPLOADS_DIR),
+                    ("handoffs", handoffs_dir),
+                ):
+                    link = slot_dir / name
+                    if link.exists() or link.is_symlink():
+                        continue
+                    try:
+                        link.symlink_to(target)
+                    except OSError:
+                        logger.exception(
+                            "failed to symlink %s for %s", name, slot_dir.name
+                        )
     except Exception:
-        logger.exception("uploads symlink setup failed (non-fatal)")
+        logger.exception("workspace symlink setup failed (non-fatal)")
     # Claude CLI credential dir. Set via CLAUDE_CONFIG_DIR in the image
     # so OAuth tokens written by `claude /login` land on the /data
     # volume and survive Zeabur redeploys. We mkdir at runtime (not in
