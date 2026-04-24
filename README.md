@@ -4,11 +4,11 @@
 
 ![tests](https://github.com/Nicolasmoute/TeamOfTen/actions/workflows/tests.yml/badge.svg)
 
-I couldn't find a multi-agent Claude Code setup that felt right — most were either heavy frameworks or black-box products. This is the opposite: a single-container web app where **1 Coach + 10 Players** all run Claude Code, share a task board, message each other, produce documents at various levels (scratchpad, knowledge, decisions, binary outputs), and sync everything to a cloud drive. Everything is visible in a multi-pane UI. Set it up once on a VPS and it runs 24/7.
+I couldn't find a multi-agent Claude Code setup that felt right — most were either heavy frameworks or black-box products. This is the opposite: a single-container web app where **1 Coach + 10 Players** all run Claude Code, share a task board, message each other, work on your GitHub project repo via per-Player git worktrees, produce documents at various levels (scratchpad, knowledge, decisions, binary outputs) that sync to a cloud drive, and can plug into third-party MCP tools (Notion, GitHub, Slack, anything that speaks MCP) for the work that lives outside the harness. Everything is visible in a multi-pane UI. Set it up once on a VPS and it runs 24/7.
 
 The code is intentionally simple. The storage backend assumes a **WebDAV-compatible cloud drive** — kDrive, Nextcloud, ownCloud, Fastmail, whatever — because plain WebDAV was the shortest path from "runs in Docker" to "I can read the agents' output from my phone". People out there can make this more sophisticated; I like the simplicity. If you need something else, swap [server/webdav.py](server/webdav.py) — it's ~10 methods.
 
-Nice little project. Have fun, improve it. Life is cool.
+Nice little project. Have fun, improve it. 
 
 ---
 
@@ -18,6 +18,7 @@ Nice little project. Have fun, improve it. Life is cool.
 - Coach decomposes it into tasks on a shared board and push-assigns them to specific **Players** (`p1` through `p10`, auto-named after lacrosse legends by default).
 - The assignee auto-wakes, reads their inbox, claims the task, and works in their **own git worktree** on your project repo.
 - Players can message each other for info, drop notes in **shared memory**, produce durable **knowledge artifacts**, save **binary outputs**, ship **decisions**, and `git commit + push` their work.
+- Agents can use **external MCP servers** you wire in (Notion, GitHub, Slack, Linear, Sentry — anything with an MCP integration), credentials stored in an encrypted on-disk vault.
 - Every agent's session, context usage, and cost is live in its own pane. Drag-to-rearrange, stack, split — it's your workspace.
 - Everything human-readable mirrors to your cloud drive so you can read/edit it from anywhere.
 
@@ -30,7 +31,7 @@ Full details: [TOT-specs.md](TOT-specs.md). Rules agents follow when editing thi
 **Requirements:**
 - Docker
 - ~2 GB RAM free (11 Claude CLI processes + app)
-- A persistent volume mounted at `/data` (SQLite + session files + kDrive cache)
+- A persistent volume mounted at `/data` (SQLite + session files + WebDAV cache)
 - Optional: a WebDAV cloud drive, a GitHub repo for the project the team works on
 
 **Run it:**
@@ -75,7 +76,7 @@ Every knob is an env var. Copy [`.env.example`](.env.example) to `.env` and edit
 | `HARNESS_TOKEN` | Bearer token for the API. Set this before exposing to the internet. |
 | `CLAUDE_CONFIG_DIR` | Where Claude CLI persists OAuth + sessions. Defaults to `/data/claude` in the Dockerfile. |
 | `HARNESS_PROJECT_REPO` | GitHub repo (with PAT in URL) that Players will work on. |
-| `HARNESS_WEBDAV_URL` + `_USER` + `_PASSWORD` | WebDAV mirror. Legacy `KDRIVE_*` names still work. |
+| `HARNESS_WEBDAV_URL` + `_USER` + `_PASSWORD` | WebDAV mirror. |
 | `HARNESS_AGENT_DAILY_CAP` / `_TEAM_DAILY_CAP` | USD/day per-Player and team-wide cost limits. |
 | `HARNESS_MCP_CONFIG` | Path to external MCP server config (see `mcp-servers.example.json`). |
 | `HARNESS_SECRETS_KEY` | Optional Fernet key to enable the encrypted secrets store for MCP credentials. |

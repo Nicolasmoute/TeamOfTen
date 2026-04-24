@@ -291,8 +291,8 @@ async def root() -> str:
 # Health-check caches. Avoid hammering kDrive / spawning subprocesses on
 # every probe (Zeabur or external monitors may poll every 30s).
 _CLAUDE_VERSION_CACHE: dict[str, object] = {}  # populated once per process
-_KDRIVE_PROBE_CACHE: dict[str, object] = {"ts": 0.0, "ok": None}
-_KDRIVE_PROBE_TTL_SECONDS = 60.0
+_WEBDAV_PROBE_CACHE: dict[str, object] = {"ts": 0.0, "ok": None}
+_WEBDAV_PROBE_TTL_SECONDS = 60.0
 
 
 @app.get("/api/health")
@@ -385,16 +385,16 @@ async def health() -> JSONResponse:
     # error / URL / root between fresh probes.
     if webdav.enabled:
         now = time.monotonic()
-        last_ts = float(_KDRIVE_PROBE_CACHE["ts"])
-        cached = _KDRIVE_PROBE_CACHE["ok"]
-        if isinstance(cached, dict) and (now - last_ts) < _KDRIVE_PROBE_TTL_SECONDS:
+        last_ts = float(_WEBDAV_PROBE_CACHE["ts"])
+        cached = _WEBDAV_PROBE_CACHE["ok"]
+        if isinstance(cached, dict) and (now - last_ts) < _WEBDAV_PROBE_TTL_SECONDS:
             checks["webdav"] = {**cached, "cached": True}
             if not cached.get("ok"):
                 overall_ok = False
         else:
             detail = await webdav.probe()
-            _KDRIVE_PROBE_CACHE["ts"] = now
-            _KDRIVE_PROBE_CACHE["ok"] = detail
+            _WEBDAV_PROBE_CACHE["ts"] = now
+            _WEBDAV_PROBE_CACHE["ok"] = detail
             checks["webdav"] = {**detail, "cached": False}
             if not detail.get("ok"):
                 overall_ok = False

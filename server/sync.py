@@ -1,10 +1,10 @@
-"""Background sync: local SQLite → kDrive WebDAV.
+"""Background sync: local SQLite → WebDAV.
 
 v1 of this only does event-log daily rotation. Memory docs mirror
 synchronously from the coord_update_memory tool (server/tools.py).
 Snapshots + decisions + digests come in later M3 ticks.
 
-Every HARNESS_KDRIVE_FLUSH_INTERVAL seconds (default 300 = 5 min):
+Every HARNESS_WEBDAV_FLUSH_INTERVAL seconds (default 300 = 5 min):
 - pull every event whose ts >= today's UTC-midnight from SQLite
 - write them as JSONL to webdav events/YYYY-MM-DD.jsonl (overwrite)
 
@@ -37,38 +37,22 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-def _env_int(primary: str, legacy: str, default: str) -> int:
-    """Read an int env var, preferring the primary name but falling
-    back to a legacy alias. Lets us rename KDRIVE_* → WEBDAV_* without
-    breaking existing deployments that still set the old name."""
-    v = os.environ.get(primary, "").strip()
-    if not v:
-        v = os.environ.get(legacy, default).strip() or default
-    return int(v)
-
-
-FLUSH_INTERVAL_SECONDS = _env_int(
-    "HARNESS_WEBDAV_FLUSH_INTERVAL",
-    "HARNESS_KDRIVE_FLUSH_INTERVAL",
-    "300",
+FLUSH_INTERVAL_SECONDS = int(
+    os.environ.get("HARNESS_WEBDAV_FLUSH_INTERVAL", "300")
 )
-SNAPSHOT_INTERVAL_SECONDS = _env_int(
-    "HARNESS_WEBDAV_SNAPSHOT_INTERVAL",
-    "HARNESS_KDRIVE_SNAPSHOT_INTERVAL",
-    "300",
+SNAPSHOT_INTERVAL_SECONDS = int(
+    os.environ.get("HARNESS_WEBDAV_SNAPSHOT_INTERVAL", "300")
 )
 # How many DB snapshots to keep on the mirror. Older ones are deleted
 # after each successful upload. 144 = ~12 h of 5-min snapshots. 5 min
 # cadence means a crash loses ≤ 5 min of state. Snapshots are
 # single-digit KB at this scale so the bandwidth is trivial.
-SNAPSHOT_RETENTION = _env_int(
-    "HARNESS_WEBDAV_SNAPSHOT_RETENTION",
-    "HARNESS_KDRIVE_SNAPSHOT_RETENTION",
-    "144",
+SNAPSHOT_RETENTION = int(
+    os.environ.get("HARNESS_WEBDAV_SNAPSHOT_RETENTION", "144")
 )
 
 # How long events stay in the SQLite `events` table. Older rows are
-# deleted by events_trim_loop (runs daily). kDrive's daily JSONL
+# deleted by events_trim_loop (runs daily). the WebDAV mirror's daily JSONL
 # mirrors keep the full permanent history, so trimming the hot DB
 # just keeps it performant — it's not data loss. Set to 0 to disable
 # trimming (events grow forever).
@@ -100,8 +84,8 @@ SESSION_RETENTION_DAYS = int(
     os.environ.get("HARNESS_SESSION_RETENTION_DAYS", "30")
 )
 
-# kDrive → local uploads pull. Users drop reference docs at
-# kDrive://uploads/ via the web UI or sync client; we mirror them
+# WebDAV → local uploads pull. Users drop reference docs at
+# <webdav>/uploads/ via the web UI or sync client; we mirror them
 # into /data/uploads (which each agent workspace symlinks as
 # ./uploads) so Players can Read ./uploads/foo.pdf. Default 60s —
 # it's user-driven so a minute is snappy enough.
@@ -112,11 +96,11 @@ UPLOADS_LOCAL_DIR = Path(
     os.environ.get("HARNESS_UPLOADS_DIR", "/data/uploads")
 )
 
-# Local → kDrive outputs push. coord_save_output mirrors synchronously
+# Local → WebDAV outputs push. coord_save_output mirrors synchronously
 # but an agent that drops a file under /data/outputs via the Write /
 # Bash tools (bypassing the coord tool) wouldn't trigger that mirror.
 # This loop catches those writes: every N seconds it walks the local
-# outputs dir and pushes anything not already on kDrive. Upload is
+# outputs dir and pushes anything not already on the mirror. Upload is
 # by basename (not size) — once a file exists upstream we assume it's
 # in sync; rename locally if you overwrite and want the new bytes
 # pushed.
@@ -134,7 +118,7 @@ def _utc_midnight_of(day: datetime) -> datetime:
 
 async def flush_day(date_str: str) -> int:
     """Upload all events whose ts falls on `date_str` (YYYY-MM-DD, UTC)
-    to kDrive events/<date>.jsonl, overwriting any prior version.
+    to webdav events/<date>.jsonl, overwriting any prior version.
 
     Returns count on success, 0 if no events (file not touched),
     -1 on upload failure.
@@ -239,9 +223,9 @@ def _snapshot_db_sync() -> bytes:
 
 
 async def snapshot_db() -> int:
-    """Create a point-in-time DB snapshot and upload to kDrive.
+    """Create a point-in-time DB snapshot and upload to WebDAV.
 
-    Returns byte count on success, 0 if kDrive disabled, -1 on failure.
+    Returns byte count on success, 0 if WebDAV disabled, -1 on failure.
     """
     if not webdav.enabled:
         return 0
@@ -262,7 +246,7 @@ async def snapshot_db() -> int:
 
 
 async def _prune_snapshots() -> None:
-    """Keep at most SNAPSHOT_RETENTION snapshots on kDrive. Filenames
+    """Keep at most SNAPSHOT_RETENTION snapshots on the mirror. Filenames
     sort lexicographically by ISO timestamp, so newest = greatest.
 
     Best-effort; failures are logged and ignored — the next cycle will
@@ -286,7 +270,7 @@ async def _prune_snapshots() -> None:
 
 
 async def snapshot_loop() -> None:
-    """Background task: periodic DB snapshots to kDrive."""
+    """Background task: periodic DB snapshots to the WebDAV mirror."""
     if not webdav.enabled:
         logger.info("snapshot loop idle: webdav disabled")
     else:
@@ -309,14 +293,14 @@ async def snapshot_loop() -> None:
 
 
 async def pull_uploads_once() -> dict[str, int]:
-    """Mirror kDrive://uploads/ → UPLOADS_LOCAL_DIR.
+    """Mirror <webdav>/uploads/ → UPLOADS_LOCAL_DIR.
 
-    - Lists kDrive uploads/ (empty list if disabled or missing).
+    - Lists WebDAV uploads/ (empty list if disabled or missing).
     - Downloads every file not already present locally (size-based
-      heuristic, cheap — kDrive webdav `ls` doesn't give us cheap
+      heuristic, cheap — the WebDAV server's `ls` doesn't give us cheap
       per-file mtime, and re-downloading a 100MB PDF every minute
       would be silly).
-    - Removes local files no longer in kDrive (so deleting a file on
+    - Removes local files no longer on the mirror (so deleting a file on
       your phone removes it from agents' view within 60s).
 
     Returns {added, removed, kept}.
@@ -328,7 +312,7 @@ async def pull_uploads_once() -> dict[str, int]:
     except Exception:
         logger.exception("uploads pull: remote list failed")
         return {"added": 0, "removed": 0, "kept": 0}
-    # Normalize: kDrive may return "uploads/foo.pdf" or "foo.pdf"
+    # Normalize: the WebDAV server may return "uploads/foo.pdf" or "foo.pdf"
     # depending on server — strip to basename.
     remote_set = {Path(n).name for n in remote_names if n}
     UPLOADS_LOCAL_DIR.mkdir(parents=True, exist_ok=True)
@@ -343,7 +327,7 @@ async def pull_uploads_once() -> dict[str, int]:
             except OSError:
                 logger.exception("uploads pull: failed to remove %s", lp)
     # Pull new files (anything we don't already have by name). This
-    # does NOT refresh an edited file — rename on kDrive (e.g. add
+    # does NOT refresh an edited file — rename on the mirror (e.g. add
     # version suffix) if you update a document and want agents to see
     # the new content.
     for name in remote_set:
@@ -375,7 +359,7 @@ async def pull_uploads_once() -> dict[str, int]:
 
 
 async def uploads_pull_loop() -> None:
-    """Background task: poll kDrive://uploads/ every
+    """Background task: poll <webdav>/uploads/ every
     HARNESS_UPLOADS_PULL_INTERVAL seconds (default 60)."""
     if not webdav.enabled:
         logger.info("uploads pull loop idle: webdav disabled")
@@ -399,12 +383,12 @@ async def uploads_pull_loop() -> None:
 
 
 async def push_outputs_once() -> dict[str, int]:
-    """Mirror /data/outputs → kDrive://outputs/ for anything not
+    """Mirror /data/outputs → <webdav>/outputs/ for anything not
     already there. Catches agents that wrote via Write/Bash instead
     of going through coord_save_output (which mirrors synchronously).
 
     Walks the local tree (up to a reasonable depth), diffs against
-    the flat list of basenames on kDrive, and uploads the missing
+    the flat list of basenames on the mirror, and uploads the missing
     ones. We compare by POSIX relative path, so nested outputs
     (reports/2026/foo.pdf) work.
 
@@ -424,7 +408,7 @@ async def push_outputs_once() -> dict[str, int]:
     if not local_paths:
         return {"pushed": 0, "kept": 0, "skipped": 0}
 
-    # Build a set of relative POSIX strings of what's already on kDrive.
+    # Build a set of relative POSIX strings of what's already on the mirror.
     # Limitation: webdav.list_dir is flat; we'd need a recursive walk
     # to see nested files. For now list the top level + any immediate
     # sub-dirs the local side uses so we don't re-upload flat files.
@@ -434,7 +418,7 @@ async def push_outputs_once() -> dict[str, int]:
     try:
         top_level = await webdav.list_dir("outputs")
     except Exception:
-        logger.exception("outputs push: kDrive list failed")
+        logger.exception("outputs push: webdav list failed")
         return {"pushed": 0, "kept": 0, "skipped": 0}
     remote_top = {Path(n).name for n in top_level if n}
 
@@ -467,7 +451,7 @@ async def push_outputs_once() -> dict[str, int]:
 
 
 async def outputs_push_loop() -> None:
-    """Background task: push /data/outputs → kDrive every
+    """Background task: push /data/outputs → mirror every
     HARNESS_OUTPUTS_PUSH_INTERVAL seconds (default 60)."""
     if not webdav.enabled:
         logger.info("outputs push loop idle: webdav disabled")
@@ -497,7 +481,7 @@ async def trim_events_once() -> int:
     / nothing old enough existed. Safe to run concurrently with
     writes — SQLite serializes.
 
-    The kDrive daily JSONL mirror is the source of truth for
+    The WebDAV daily JSONL mirror is the source of truth for
     permanent history; this function just keeps the hot SQLite table
     from growing unbounded.
     """

@@ -15,8 +15,7 @@ WebDAV. If your provider needs more sophisticated auth (OAuth, S3-
 compatible, etc.), fork and adapt — the interface is ~10 methods.
 
 Config (all three required — WebDAV mirror stays disabled unless all
-are set). Primary env names are `HARNESS_WEBDAV_*`; legacy `KDRIVE_*`
-names are still honored so existing deployments keep working:
+are set):
   HARNESS_WEBDAV_URL        full path to the folder the app owns,
                             e.g. https://<host>/remote.php/dav/files/<user>/TOT
                             (kDrive: https://<drive-id>.connect.kdrive.infomaniak.com/TOT)
@@ -53,24 +52,9 @@ except Exception:  # pragma: no cover — lib missing in dev env
     _ResourceNotFound = None  # type: ignore
 
 
-def _env_first(*names: str) -> str:
-    """Return the first non-empty env var from `names`. Lets us ship a
-    new primary name (HARNESS_WEBDAV_URL) while still honoring legacy
-    values (KDRIVE_WEBDAV_URL) already set in user deployments."""
-    for n in names:
-        v = os.environ.get(n, "").strip()
-        if v:
-            return v
-    return ""
-
-
-WEBDAV_URL = _env_first("HARNESS_WEBDAV_URL", "KDRIVE_WEBDAV_URL")
-WEBDAV_USER = _env_first("HARNESS_WEBDAV_USER", "KDRIVE_USER")
-WEBDAV_PASS = _env_first(
-    "HARNESS_WEBDAV_PASSWORD",
-    "HARNESS_WEBDAV_APP_PASSWORD",
-    "KDRIVE_APP_PASSWORD",
-)
+WEBDAV_URL = os.environ.get("HARNESS_WEBDAV_URL", "").strip()
+WEBDAV_USER = os.environ.get("HARNESS_WEBDAV_USER", "").strip()
+WEBDAV_PASS = os.environ.get("HARNESS_WEBDAV_PASSWORD", "").strip()
 
 
 class WebDAVClient:
@@ -207,7 +191,7 @@ class WebDAVClient:
         return relative_path.lstrip("/")
 
     async def write_text(self, relative_path: str, content: str) -> bool:
-        """Upload `content` as UTF-8 text to `{KDRIVE_WEBDAV_URL}/{relative_path}`.
+        """Upload `content` as UTF-8 text to `{HARNESS_WEBDAV_URL}/{relative_path}`.
 
         Returns True on success, False on any failure (error logged).
         Never raises. Safe to call from fire-and-forget create_task().
@@ -235,7 +219,7 @@ class WebDAVClient:
             return False
 
     async def read_text(self, relative_path: str) -> str | None:
-        """Download a UTF-8 text file from `{KDRIVE_WEBDAV_URL}/{relative_path}`.
+        """Download a UTF-8 text file from `{HARNESS_WEBDAV_URL}/{relative_path}`.
         Returns None if missing or on any failure (not distinguished —
         callers fall back to a local cached copy)."""
         if not self._enabled:
@@ -265,7 +249,7 @@ class WebDAVClient:
 
     async def list_dir(self, relative_path: str) -> list[str]:
         """List filenames (basenames, not full paths) under
-        `{KDRIVE_WEBDAV_URL}/{relative_path}`. Returns [] on any failure
+        `{HARNESS_WEBDAV_URL}/{relative_path}`. Returns [] on any failure
         or if the directory is missing — callers shouldn't have to catch."""
         if not self._enabled:
             return []
@@ -277,7 +261,7 @@ class WebDAVClient:
             return []
 
     async def remove(self, relative_path: str) -> bool:
-        """Delete a single file at `{KDRIVE_WEBDAV_URL}/{relative_path}`.
+        """Delete a single file at `{HARNESS_WEBDAV_URL}/{relative_path}`.
 
         Idempotent: a missing file is treated as success."""
         if not self._enabled:
