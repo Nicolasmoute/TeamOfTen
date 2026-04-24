@@ -1,46 +1,17 @@
 :root {
   color-scheme: dark;
-  /* Warm-slate surfaces (was GitHub-dark near-black). Softer and woven
-     rather than harsh. BG is the outer shell, CARD the pane body,
-     BG_ALT the header / composer lane, BG_RAIL the side rails. */
-  --bg: #12131a;
-  --card: #1a1b24;
-  --bg-alt: #1e1f29;
-  --bg-rail: #0f1019;
-  --fg: #d8d8e0;
-  --muted: #8a8b98;
-  --fg-muted: #5e5f6d;             /* deep-dim, for timestamps */
-  --border: #262733;
-  --border-soft: #1f2029;
-  /* Semantic status palette — dots are the saturated "beacon" colors,
-     -fg variants are lighter so pill text still reads on the dark bg,
-     -bg variants are near-black tints for filled chips. */
-  --ok: #22c55e;
-  --warn: #eab308;
-  --err: #ef4444;
-  --accent: #3b82f6;
-  --status-running-fg: #7ee2a8;
-  --status-blocked-fg: #fbcf6b;
-  --status-idle-fg:    #a1a1aa;
-  --status-error-fg:   #fca5a5;
-  --status-done-fg:    #93c5fd;
-  --status-running-bg: #0f2418;
-  --status-blocked-bg: #2a1f08;
-  --status-idle-bg:    #1a1a1d;
-  --status-error-bg:   #2a0e0e;
-  --status-done-bg:    #0e1a2a;
-  /* Legacy role aliases — kept so existing .slot.coach / .slot-type-*
-     rules still resolve. Coach stays amber (owner role), Player blue. */
-  --coach: #eab308;
-  --player: #3b82f6;
-  --tool: #c4b5fd;                 /* purple — edit/update category */
-  /* Tool-call color coding. Bash cyan, web search amber, read/list/check
-     green, edit/update purple. Used by .tool-card.category-* and anywhere
-     a tool-name should pick up category hue. */
-  --tool-bash:   #7dd3fc;
-  --tool-search: #fcd34d;
-  --tool-read:   #86efac;
-  --tool-edit:   #c4b5fd;
+  --bg: #0d1117;
+  --fg: #e6edf3;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --border: #30363d;
+  --card: #161b22;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --err: #f85149;
+  --coach: #d29922;
+  --player: #58a6ff;
+  --tool: #a371f7;
 }
 *, *::before, *::after { box-sizing: border-box; }
 html, body { height: 100%; }
@@ -446,17 +417,17 @@ body {
 .env-tl-mem .env-tl-body { color: var(--ok); }
 .env-tl-decision { border-left-color: var(--coach); }
 .env-tl-decision .env-tl-body { color: var(--coach); font-weight: 600; }
-.env-tl-capped { border-left-color: var(--err); background: var(--status-error-bg); }
+.env-tl-capped { border-left-color: var(--err); background: #281417; }
 .env-tl-capped .env-tl-body { color: var(--err); white-space: normal; }
 .env-tl-commit { border-left-color: var(--accent); }
 .env-tl-commit .env-tl-body { color: var(--accent); }
-.env-tl-attention { border-left-color: var(--err); background: var(--status-error-bg); }
+.env-tl-attention { border-left-color: var(--err); background: #2c1a22; }
 .env-tl-attention .env-tl-body { color: var(--err); font-weight: 600; }
 .env-tl-assigned { border-left-color: var(--coach); }
 .env-tl-assigned .env-tl-body { color: var(--fg); }
 .env-tl-cancelled { border-left-color: var(--warn); }
 .env-tl-cancelled .env-tl-body { color: var(--warn); }
-.env-tl-paused { border-left-color: var(--warn); background: var(--status-blocked-bg); }
+.env-tl-paused { border-left-color: var(--warn); background: #2a2117; }
 .env-tl-paused .env-tl-body { color: var(--warn); font-weight: 600; }
 
 /* Pause toggle in LeftRail — active state uses warn color so the
@@ -800,7 +771,7 @@ body {
   overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-word;
-  background: var(--bg-rail);
+  background: #10131a;
   border: 1px solid var(--border);
   border-radius: 3px;
   padding: 8px 10px;
@@ -1695,7 +1666,7 @@ body {
 }
 .event-body.markdown a:hover { text-decoration: underline; }
 .event-body.markdown code {
-  background: var(--bg-rail);
+  background: #10131a;
   border: 1px solid var(--border);
   border-radius: 3px;
   padding: 0 4px;
@@ -1703,7 +1674,7 @@ body {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 .event-body.markdown pre {
-  background: var(--bg-rail);
+  background: #10131a;
   border: 1px solid var(--border);
   border-radius: 4px;
   padding: 8px 10px;
@@ -1735,7 +1706,7 @@ body {
   padding: 3px 8px;
   text-align: left;
 }
-.event-body.markdown th { background: var(--bg-rail); }
+.event-body.markdown th { background: #10131a; }
 .event-body.markdown hr {
   border: 0;
   border-top: 1px solid var(--border);
@@ -1775,7 +1746,7 @@ body {
    and is capped so runaway thoughts don't blow out the pane. */
 .event.thinking {
   border-color: var(--muted);
-  background: var(--bg-rail);
+  background: #121418;
   color: var(--muted);
   font-size: 12px;
 }
@@ -1804,7 +1775,7 @@ body {
 .event.tool_result {
   border-color: var(--tool);
   margin-left: 16px;
-  background: var(--bg-rail);
+  background: #10131a;
   color: var(--muted);
   font-size: 12px;
 }
@@ -1963,19 +1934,16 @@ body {
   line-height: 1;
   flex-shrink: 0;
 }
-/* Tool-call color coding (Phase 1 design). Each category owns one hue so
-   a scanning eye tells read vs write vs run vs coord at a glance without
-   reading the tool name. Bullet + name share the color; args stay muted. */
-.tool-card.category-read    summary::before { color: var(--tool-read); }
-.tool-card.category-write   summary::before { color: var(--tool-edit); }
-.tool-card.category-run     summary::before { color: var(--tool-bash); }
-.tool-card.category-coord   summary::before { color: var(--accent); }
+.tool-card.category-read    summary::before { color: var(--accent); }
+.tool-card.category-write   summary::before { color: var(--tool); }
+.tool-card.category-run     summary::before { color: var(--warn); }
+.tool-card.category-coord   summary::before { color: var(--ok); }
 
 .tool-card .tool-name { color: var(--fg); font-weight: 600; }
-.tool-card.category-read  .tool-name { color: var(--tool-read); }
-.tool-card.category-write .tool-name { color: var(--tool-edit); }
-.tool-card.category-run   .tool-name { color: var(--tool-bash); }
-.tool-card.category-coord .tool-name { color: var(--accent); }
+.tool-card.category-read  .tool-name { color: var(--accent); }
+.tool-card.category-write .tool-name { color: var(--tool); }
+.tool-card.category-run   .tool-name { color: var(--warn); }
+.tool-card.category-coord .tool-name { color: var(--ok); }
 
 .tool-card .tool-summary { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 /* Friendly verb-phrase variant: reads like a sentence, not a symbol.
