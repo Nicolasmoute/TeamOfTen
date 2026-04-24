@@ -2791,7 +2791,8 @@ function EnvAttentionSection({ conversations }) {
             || ev.type === "question_cancelled"
             || ev.type === "pending_plan"
             || ev.type === "plan_decided"
-            || ev.type === "plan_cancelled") {
+            || ev.type === "plan_cancelled"
+            || ev.type === "interaction_extended") {
           n++;
         }
       }
@@ -6078,6 +6079,15 @@ function EventItem({ event }) {
   if (type === "plan_cancelled") {
     return html`<div class="event sys">
       <div class="event-meta">${ts} · ⚠ plan review cancelled: ${event.reason || ""}</div>
+    </div>`;
+  }
+
+  if (type === "interaction_extended") {
+    const kind = event.interaction_kind || "interaction";
+    const secs = event.seconds_from_now || 0;
+    const mins = Math.round(secs / 60);
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ⏱ ${kind} deadline extended by ${mins} min (id=${(event.correlation_id || "").slice(0, 8)})</div>
     </div>`;
   }
 
