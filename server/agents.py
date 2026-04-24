@@ -166,14 +166,17 @@ def _extract_usage(msg: Any) -> dict[str, int]:
 
 
 # Per-model context window in tokens. Used by the auto-compact check
-# to compute "we're at X% of ceiling, time to compact". Keep this in
-# sync with Anthropic's published windows. Opus 4.7 defaults to 1M
-# because the harness targets Max-plan accounts which have the 1M
-# variant enabled. Unknown models fall back to 200K below.
+# to compute "we're at X% of ceiling, time to compact". The harness
+# targets Max-plan accounts, which have 1M variants of Opus 4.7 AND
+# Sonnet 4.6 available by default on the CLI. Haiku stays at 200K
+# (no 1M variant). Unknown models fall back to 1M below — erring on
+# the side of NOT compacting prematurely, since a premature compact
+# is worse than letting a turn run long.
 _CONTEXT_WINDOWS = {
     "claude-opus-4-7": 1_000_000,
     "claude-opus-4-7[1m]": 1_000_000,
-    "claude-sonnet-4-6": 200_000,
+    "claude-sonnet-4-6": 1_000_000,
+    "claude-sonnet-4-6[1m]": 1_000_000,
     "claude-haiku-4-5-20251001": 200_000,
 }
 
