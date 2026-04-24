@@ -737,6 +737,16 @@ function App() {
       // Heartbeat ping is an implementation detail — don't surface it
       // in conversations or refresh any state based on it.
       if (ev.type === "ping") return;
+      // Pending interactions targeted at the human (AskUserQuestion or
+      // ExitPlanMode with route=human) are blocking the agent right
+      // now; auto-open the env pane so the form is visible without
+      // the operator having to know Ctrl+B. No-op when already open.
+      if (
+        (ev.type === "pending_question" || ev.type === "pending_plan")
+        && ev.route === "human"
+      ) {
+        setEnvOpen((cur) => cur || true);
+      }
       const aid = ev.agent_id || "system";
       // Streaming deltas update a separate ephemeral buffer so the
       // conversations list (persisted / reloaded) stays clean. Text &
