@@ -5122,6 +5122,29 @@ function TurnHeader({ event, ts }) {
   const prompt = event.prompt || "";
   const oneLiner = prompt.replace(/\s+/g, " ").trim();
   const arrow = event.resumed_session ? "↻" : "→";
+  // Compact turns get a condensed one-line renderer — the prompt is a
+  // giant boilerplate instruction that clutters the timeline. A badge
+  // + short label is enough; expand-click still reveals full text.
+  if (event.compact_mode) {
+    const label = event.auto_compact
+      ? "auto-compacting session"
+      : "compacting session";
+    return html`<div class=${"event agent_started turn-header compact" + (open ? " open" : "")}>
+      <div
+        class="turn-header-row"
+        onClick=${() => setOpen((v) => !v)}
+        title=${open ? "collapse" : "show compact instruction"}
+      >
+        <span class="turn-header-arrow" title="compact turn">⤵</span>
+        <span class="turn-header-ts">${ts}</span>
+        <span class="turn-header-compact-badge">${label}</span>
+        <span class="turn-header-chev">${open ? "▾" : "▸"}</span>
+      </div>
+      ${open && prompt
+        ? html`<div class="turn-header-full">${prompt}</div>`
+        : null}
+    </div>`;
+  }
   return html`<div class=${"event agent_started turn-header" + (open ? " open" : "")}>
     <div
       class="turn-header-row"

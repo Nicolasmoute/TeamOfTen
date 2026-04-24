@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import (
@@ -25,6 +26,7 @@ from claude_agent_sdk import (
 from server.context import build_system_prompt_suffix
 from server.db import configured_conn
 from server.events import bus
+from server.kdrive import kdrive
 from server.mcp_config import load_external_servers
 from server.tools import ALLOWED_COACH_TOOLS, ALLOWED_PLAYER_TOOLS, build_coord_server
 from server.workspaces import workspace_dir
@@ -350,7 +352,18 @@ async def _handle_message(
         ):
             summary = (turn_ctx.get("compact_text") or "").strip()
             if summary:
-                await _set_continuity_note(agent_id, summary)
+                # Full long-form handoff lives on disk (kDrive-mirrored).
+                # The continuity_note stored in the DB is a short pointer
+                # that gets injected into the next system prompt.
+                handoff_file = await _write_handoff_file(agent_id, summary)
+                pointer = summary
+                if handoff_file:
+                    pointer = (
+                        f"Full handoff saved to handoffs/{handoff_file} "
+                        f"(read it with the Read tool on turn 1 if you "
+                        f"need more than the digest below).\n\n"
+                    ) + summary
+                await _set_continuity_note(agent_id, pointer)
                 await _set_session_id(agent_id, None)
                 # Freeze the exchange log we just quoted into the
                 # handoff; the next session starts with an empty buffer
@@ -360,11 +373,30 @@ async def _handle_message(
                     agent_id,
                     "session_compacted",
                     chars=len(summary),
+                    handoff_file=handoff_file,
                 )
             else:
-                # Model didn't produce any text — don't wipe the session
-                # just because we asked it to. Same as a compact failure.
-                await _set_session_id(agent_id, session_id)
+                # Model produced no text despite being asked to summarize.
+                # If this was an AUTO-compact (triggered because context
+                # was over threshold), keeping the same session_id means
+                # the very next turn will trip the same threshold and
+                # loop forever. Force-clear and flag it so the next turn
+                # at least starts fresh — lost continuity beats deadlock.
+                # Manual /compact leaves the session intact so the user
+                # can retry without losing state.
+                if turn_ctx.get("auto_compact"):
+                    await _set_session_id(agent_id, None)
+                    await _clear_exchange_log(agent_id)
+                    await _emit(
+                        agent_id,
+                        "compact_empty_forced",
+                        reason=(
+                            "auto-compact turn produced no summary; "
+                            "session cleared to escape threshold loop"
+                        ),
+                    )
+                else:
+                    await _set_session_id(agent_id, session_id)
         else:
             await _set_session_id(agent_id, session_id)
             # First fresh turn AFTER a compact: the handoff has been
@@ -483,37 +515,70 @@ async def cancel_all_agents() -> list[str]:
     return cancelled
 
 # The compact prompt used by both the manual /compact endpoint and the
-# auto-compact trip-wire. Structured sections force high-signal
-# retention: open questions and exact quotes (URLs, paths, errors) are
-# the first things paraphrase destroys, so the prompt explicitly
-# instructs the model to keep them verbatim.
+# auto-compact trip-wire. The handoff is written to
+# /data/handoffs/<agent>-<ts>.md (and mirrored to kDrive) so a future
+# instance of this agent can Read() the full file on demand — the
+# inline continuity note injected into the next system prompt is only
+# a short pointer. That means the handoff itself CAN and SHOULD be
+# long: the cost is one file read, not recurring prompt bloat.
 COMPACT_PROMPT = (
-    "Your session context is about to be cleared. Write a handoff note "
-    "for your next fresh turn — this summarizes the OLDER part of the "
-    "conversation. The most recent exchange will be preserved verbatim "
-    "automatically, so don't duplicate it here.\n\n"
-    "Use exactly these markdown sections, in this order. Omit sections "
-    "that genuinely don't apply (don't write 'N/A'). Target 250-500 "
-    "words total.\n\n"
+    "Your session context is about to be cleared. Write a DETAILED "
+    "handoff document for the fresh-session version of yourself who "
+    "will pick up after this compact. That future-you has NO memory "
+    "of anything we just did — treat them as a well-briefed colleague "
+    "who joined the project today. The most recent exchanges are "
+    "preserved verbatim separately; this document covers EVERYTHING "
+    "ELSE from the session.\n\n"
+    "Target length: 1500-3000 words. Err on the side of MORE detail "
+    "rather than less — this file will be saved to disk, not replayed "
+    "in every prompt, so length is cheap and missing context is "
+    "expensive. Do not abbreviate. Do not write 'see above' or 'as "
+    "discussed' — spell it out.\n\n"
+    "Use exactly these markdown sections, in this order. Within each "
+    "section, use sub-headings, bullet lists, and code blocks freely. "
+    "If a section genuinely doesn't apply, write 'None this session.' "
+    "rather than omitting it — fresh-you needs to know you considered "
+    "it.\n\n"
     "## Current task\n"
-    "What you're working on right now and its status (e.g. 'investigating "
-    "X, blocked on Y', 'writing Z, 60% through'). One short paragraph.\n\n"
+    "What you are actively working on, who asked for it, the state "
+    "right now (investigating / blocked / implementing / reviewing / "
+    "…), and the next 1-3 concrete steps you were about to take. "
+    "Include the original goal as it was stated to you, verbatim if "
+    "possible.\n\n"
+    "## How we got here\n"
+    "Chronological narrative of the session's arc: what was tried, "
+    "what worked, what didn't, dead ends you ruled out and why. "
+    "Fresh-you reading this should understand the path of reasoning, "
+    "not just the final state. 2-5 paragraphs.\n\n"
     "## Open questions\n"
-    "Bullet list. Quote each question VERBATIM as it was asked — do not "
-    "paraphrase. Include enough context that fresh-you can answer it.\n\n"
-    "## Key findings\n"
-    "Facts, decisions, or conclusions you arrived at this session that "
-    "wouldn't be obvious from memory/ or decisions/. Bullet list.\n\n"
+    "Everything still undecided or pending clarification. Quote each "
+    "question VERBATIM as asked (by the human or by you to them). "
+    "Include enough surrounding context that fresh-you can answer "
+    "without asking 'wait, which X?'.\n\n"
+    "## Key findings & decisions\n"
+    "Facts established, decisions made, and conclusions reached this "
+    "session that aren't already in memory/ or decisions/. For each: "
+    "what, why, and who agreed. These are the things that would be "
+    "LOST if this handoff fails.\n\n"
     "## References (quote verbatim)\n"
-    "URLs you fetched, file paths you touched, exact error messages, and "
-    "code snippets under 10 lines that matter. Quote precisely — "
-    "paraphrasing these loses information. Bullet list.\n\n"
-    "## Context quirks\n"
-    "Anything peculiar about the current setup — a user preference "
-    "mentioned in passing, a tool that behaved oddly, an assumption we "
-    "agreed to. One line each.\n\n"
+    "URLs fetched, file paths touched, exact error messages, commit "
+    "hashes, command output snippets under ~30 lines, and any code "
+    "fragments that matter. Paraphrase destroys these — quote them "
+    "precisely inside code blocks or blockquotes.\n\n"
+    "## People & roles\n"
+    "Who participated, what each person (or agent) is responsible "
+    "for, any stated preferences or pet-peeves that came up, and "
+    "anyone fresh-you should reach out to first.\n\n"
+    "## Context quirks & gotchas\n"
+    "Anything peculiar about the current setup — tools that "
+    "misbehaved, assumptions we agreed to, user preferences mentioned "
+    "in passing, environmental weirdness. One paragraph each.\n\n"
+    "## What fresh-you should do first\n"
+    "Concrete first actions: 'read file X', 'check Y', 'resume by "
+    "asking Z'. Write this as if you are leaving voicemail for "
+    "tomorrow-morning-you.\n\n"
     "Reply with ONLY the markdown — no preamble, no sign-off, no "
-    "'Here's the handoff:'."
+    "'Here is the handoff:'."
 )
 
 
@@ -769,6 +834,47 @@ async def _set_continuity_note(agent_id: str, text: str | None) -> None:
         await c.close()
 
 
+async def _write_handoff_file(agent_id: str, summary: str) -> str | None:
+    """Persist the full compact summary as a markdown file under
+    HANDOFFS_DIR (kDrive-mirrored when available) and return the
+    relative filename. The continuity_note stored in the DB is only a
+    pointer — this file is the authoritative, long-form handoff that
+    fresh-you can Read() on demand.
+
+    Filename: <agent_id>-<YYYYMMDD-HHMMSS>.md. Returns None if both
+    kDrive and the local write failed — we log but don't raise,
+    because an empty handoff doesn't justify losing the compact turn
+    itself."""
+    ts_utc = datetime.now(timezone.utc)
+    stamp = ts_utc.strftime("%Y%m%d-%H%M%S")
+    filename = f"{agent_id}-{stamp}.md"
+    frontmatter = (
+        f"---\n"
+        f"agent: {agent_id}\n"
+        f"ts: {ts_utc.isoformat()}\n"
+        f"kind: compact-handoff\n"
+        f"---\n\n"
+    )
+    content = frontmatter + summary.strip() + "\n"
+
+    wrote_kdrive = False
+    if kdrive.enabled:
+        try:
+            wrote_kdrive = bool(await kdrive.write_text(f"handoffs/{filename}", content))
+        except Exception:
+            logger.exception("handoff kDrive write failed: %s", filename)
+            wrote_kdrive = False
+
+    local_dir = Path(os.environ.get("HARNESS_HANDOFFS_DIR", "/data/handoffs"))
+    try:
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / filename).write_text(content, encoding="utf-8")
+        return filename
+    except Exception:
+        logger.exception("handoff local write failed: %s", filename)
+        return filename if wrote_kdrive else None
+
+
 async def _get_recent_exchanges(agent_id: str) -> list[dict[str, str]]:
     """Read the rolling list of recent (prompt, response) pairs.
 
@@ -806,46 +912,65 @@ async def _get_recent_exchanges(agent_id: str) -> list[dict[str, str]]:
     return []
 
 
-# How many turns to retain in the rolling exchange log. At the default
-# clip budgets (1500 prompt, 3000 response) 10 exchanges cost roughly
-# 45K chars / 11K tokens on the post-compact system prompt — a good
-# trade for CLI-like continuity.
-def _handoff_exchange_count() -> int:
+# Token budget for the rolling exchange log preserved verbatim across
+# a compact. Older exchanges are trimmed from the head until the total
+# fits. Default 50K tokens — a meaningful slice of recent verbatim
+# content without eating an absurd share of the post-compact system
+# prompt. Token counts use a rough chars/4 estimate, which is close
+# enough for planning (tokenizer-exact is overkill for a budget knob).
+_CHARS_PER_TOKEN = 4
+
+
+def _handoff_token_budget() -> int:
     try:
-        n = int(os.environ.get("HARNESS_HANDOFF_EXCHANGES", "10"))
+        n = int(os.environ.get("HARNESS_HANDOFF_TOKEN_BUDGET", "50000"))
     except ValueError:
-        return 10
-    if n < 1:
-        return 1
-    if n > 40:
-        return 40
+        return 50_000
+    if n < 1_000:
+        return 1_000
+    if n > 500_000:
+        return 500_000
     return n
+
+
+def _est_tokens(*parts: str) -> int:
+    """Rough token count: sum of chars / 4. Defensive against None."""
+    total = 0
+    for p in parts:
+        if p:
+            total += len(p)
+    return (total + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN
 
 
 async def _append_exchange(agent_id: str, prompt: str, response: str) -> None:
     """Push this turn's pair onto the rolling exchange log, trimming
-    the oldest entry beyond HARNESS_HANDOFF_EXCHANGES. Called on every
-    successful non-compact ResultMessage."""
+    from the head so the total stays under HARNESS_HANDOFF_TOKEN_BUDGET
+    tokens. Unlike the prior count-based cap, exchanges are kept at
+    full length (no per-entry clip) — you get fewer-but-complete
+    recent turns instead of many-but-truncated ones."""
     if agent_id == "system":
         return
 
-    def _clip(s: str, n: int) -> str:
-        s = s or ""
-        if len(s) <= n:
-            return s
-        half = (n - 20) // 2
-        return s[:half] + "\n…[truncated]…\n" + s[-half:]
-
     existing = await _get_recent_exchanges(agent_id)
     existing.append({
-        "prompt": _clip(prompt, 1500),
-        "response": _clip(response, 3000),
+        "prompt": prompt or "",
+        "response": response or "",
         "ts": _now(),
     })
-    # Trim from the head — oldest drops first.
-    cap = _handoff_exchange_count()
-    if len(existing) > cap:
-        existing = existing[-cap:]
+
+    # Trim from the head until we fit the token budget. The newest
+    # exchange is always kept — if a single exchange exceeds the
+    # budget, we keep it alone rather than storing nothing.
+    budget = _handoff_token_budget()
+    while len(existing) > 1:
+        total = sum(
+            _est_tokens(e.get("prompt", ""), e.get("response", ""))
+            for e in existing
+        )
+        if total <= budget:
+            break
+        existing.pop(0)
+
     payload = json.dumps(existing, ensure_ascii=False)
     try:
         c = await configured_conn()
@@ -1230,6 +1355,7 @@ async def run_agent(
     plan_mode: bool = False,
     effort: int | None = None,
     compact_mode: bool = False,
+    auto_compact: bool = False,
 ) -> None:
     """Spawn one SDK query for the given slot and stream its events.
 
@@ -1282,6 +1408,7 @@ async def run_agent(
                             COMPACT_PROMPT,
                             model=model,
                             compact_mode=True,
+                            auto_compact=True,
                         )
                     except Exception:
                         # Compact failure shouldn't block the user's
@@ -1356,6 +1483,8 @@ async def run_agent(
         "agent_started",
         prompt=prompt,
         resumed_session=bool(prior_session),
+        compact_mode=compact_mode,
+        auto_compact=auto_compact,
     )
 
     coord_server = build_coord_server(agent_id)
@@ -1408,11 +1537,12 @@ async def run_agent(
             "\n\n## Handoff from your prior session (via /compact)\n\n"
             + handoff_text.strip()
         )
-        # Append the last N exchanges verbatim — CLI /compact keeps
-        # recent turns intact, and 1 exchange was too thin (tools
+        # Append the recent exchanges verbatim — CLI /compact keeps
+        # recent turns intact, and 1 exchange was too thin (tool
         # chains span multiple turns). The rolling list is maintained
         # by _append_exchange on every successful non-compact turn,
-        # capped by HARNESS_HANDOFF_EXCHANGES (default 10).
+        # trimmed from the head so total size stays under
+        # HARNESS_HANDOFF_TOKEN_BUDGET (default 50K tokens).
         recent = await _get_recent_exchanges(agent_id)
         # Drop empty/malformed entries defensively.
         recent = [
@@ -1531,6 +1661,12 @@ async def run_agent(
         # implementing a CLI-/compact-equivalent: summarize, then drop
         # the history so the next turn starts on a clean context.
         "compact_mode": compact_mode,
+        # True when this compact turn was auto-triggered (context over
+        # threshold) vs invoked manually via /compact. Used by the
+        # stuck-session guard: an empty auto-compact force-clears
+        # session_id to escape the retry loop, whereas an empty manual
+        # /compact leaves state alone so the user can retry.
+        "auto_compact": auto_compact,
         # True when the system prompt we just built embedded a handoff
         # section — the ResultMessage handler uses this to clear the
         # note on the first successful non-compact turn after a
