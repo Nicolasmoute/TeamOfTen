@@ -2774,6 +2774,11 @@ function EnvAttentionSection({ conversations }) {
   const [dismissed, setDismissed] = useState(() => loadDismissedAttention());
   const [persisted, setPersisted] = useState([]);
 
+  // Pending AskUserQuestion prompts — live through can_use_tool and
+  // survive reloads via /api/questions/pending. Different data path
+  // from human_attention (which is fire-and-forget escalations).
+  const [pendingQuestions, setPendingQuestions] = useState([]);
+
   // Load persisted escalations on mount so page reloads don't lose
   // undismissed banners. We re-fetch whenever a fresh human_attention
   // arrives over WS (the live copy lacks __id until the DB write
@@ -2782,7 +2787,12 @@ function EnvAttentionSection({ conversations }) {
   const liveCount = useMemo(() => {
     let n = 0;
     for (const list of conversations.values()) {
-      for (const ev of list) if (ev.type === "human_attention") n++;
+      for (const ev of list) {
+        if (ev.type === "human_attention" || ev.type === "pending_question"
+            || ev.type === "question_answered" || ev.type === "question_cancelled") {
+          n++;
+        }
+      }
     }
     return n;
   }, [conversations]);
@@ -2801,6 +2811,15 @@ function EnvAttentionSection({ conversations }) {
       } catch (e) {
         console.error("attention history load failed", e);
       }
+      try {
+        const res2 = await authFetch("/api/questions/pending");
+        if (!res2.ok) return;
+        const data2 = await res2.json();
+        if (cancelled) return;
+        setPendingQuestions(Array.isArray(data2.pending) ? data2.pending : []);
+      } catch (e) {
+        console.error("pending questions load failed", e);
+      }
     })();
     return () => { cancelled = true; };
   }, [liveCount]);
@@ -2808,9 +2827,51 @@ function EnvAttentionSection({ conversations }) {
   const open = useMemo(() => {
     const seen = new Set();
     const all = [];
-    // Persisted first (canonical ids); live later dedupes by __id.
+    // Live pending questions (from server /api/questions/pending +
+    // WS pending_question events). Filter to route='human' only —
+    // Player→Coach questions don't need a form, Coach sees them in
+    // their inbox.
+    for (const pq of pendingQuestions) {
+      if (pq.route !== "human") continue;
+      const k = `pq:${pq.correlation_id}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      all.push({
+        __key: k,
+        type: "pending_question",
+        agent_id: pq.agent_id,
+        correlation_id: pq.correlation_id,
+        questions: pq.questions || [],
+        ts: pq.created_at,
+        subject: pq.questions && pq.questions[0]
+          ? pq.questions[0].question
+          : "Question",
+      });
+    }
+    for (const list of conversations.values()) {
+      for (const ev of list) {
+        if (ev.type === "pending_question" && ev.route === "human") {
+          const k = `pq:${ev.correlation_id}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          all.push({ ...ev, __key: k });
+          continue;
+        }
+        // question_answered / question_cancelled: REMOVE the matching
+        // pending-question entry instead of adding one.
+        if (ev.type === "question_answered" || ev.type === "question_cancelled") {
+          const k = `pq:${ev.correlation_id}`;
+          seen.add(k);  // blocks future re-add
+          for (let i = all.length - 1; i >= 0; i--) {
+            if (all[i].__key === k) all.splice(i, 1);
+          }
+        }
+      }
+    }
+    // Persisted human_attention next (canonical ids).
     for (const ev of persisted) {
-      const k = ev.__id != null ? String(ev.__id) : `${ev.ts}:${ev.agent_id}`;
+      if (ev.type !== "human_attention") continue;
+      const k = ev.__id != null ? `ha:${ev.__id}` : `ha:${ev.ts}:${ev.agent_id}`;
       if (seen.has(k)) continue;
       seen.add(k);
       all.push({ ...ev, __key: k });
@@ -2818,7 +2879,7 @@ function EnvAttentionSection({ conversations }) {
     for (const list of conversations.values()) {
       for (const ev of list) {
         if (ev.type !== "human_attention") continue;
-        const k = ev.__id != null ? String(ev.__id) : `${ev.ts}:${ev.agent_id}`;
+        const k = ev.__id != null ? `ha:${ev.__id}` : `ha:${ev.ts}:${ev.agent_id}`;
         if (seen.has(k)) continue;
         seen.add(k);
         all.push({ ...ev, __key: k });
@@ -2828,7 +2889,7 @@ function EnvAttentionSection({ conversations }) {
     // Newest first — user sees the most urgent escalation at the top.
     out.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
     return out;
-  }, [conversations, persisted, dismissed]);
+  }, [conversations, persisted, pendingQuestions, dismissed]);
 
   const dismiss = useCallback((key) => {
     setDismissed((prev) => {
@@ -2874,7 +2935,7 @@ function EnvAttentionSection({ conversations }) {
                   title="Dismiss">×</button>
               </div>
               <div class="env-attention-subject">${ev.subject}</div>
-              ${Array.isArray(ev.questions) && ev.questions.length > 0
+              ${ev.type === "pending_question" && Array.isArray(ev.questions) && ev.questions.length > 0
                 ? html`<${QuestionForm}
                     event=${ev}
                     onSubmitted=${() => dismiss(ev.__key)}
@@ -2936,8 +2997,11 @@ function QuestionForm({ event, onSubmitted }) {
     setSending(true);
     setErr(null);
     try {
-      const lines = [];
-      lines.push(`**Human answers** (via question form):`);
+      // Shape answers to the SDK's expected record<string,string> where
+      // keys are exact question text and values are selected label(s).
+      // Multi-select joins with ', ' per docs; free-text uses the
+      // literal string instead of 'Other'.
+      const answers = {};
       questions.forEach((q, i) => {
         const s = state[i];
         const picks = [];
@@ -2946,27 +3010,28 @@ function QuestionForm({ event, onSubmitted }) {
         } else if (s.selected != null) {
           picks.push(s.selected);
         }
-        if (s.other.trim()) picks.push(`Other: ${s.other.trim()}`);
-        lines.push("");
-        lines.push(`**Q${i + 1}: ${q.question}**`);
-        lines.push(picks.length ? picks.map((p) => `- ${p}`).join("\n") : "- (no answer)");
+        if (s.other.trim()) picks.push(s.other.trim());
+        answers[q.question] = picks.join(", ");
       });
-      const body = lines.join("\n");
-      const subject = `Re: ${event.subject || "your question"}`;
-      const res = await authFetch("/api/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          to: event.agent_id,
-          subject,
-          body,
-          priority: "normal",
-        }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const cid = event.correlation_id;
+      if (!cid) {
+        throw new Error("no correlation_id on event (stale page — refresh)");
+      }
+      const res = await authFetch(
+        "/api/questions/" + encodeURIComponent(cid) + "/answer",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ answers }),
+        }
+      );
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status}${body ? " — " + body.slice(0, 120) : ""}`);
+      }
       onSubmitted();
     } catch (e) {
-      setErr(String(e));
+      setErr(String(e.message || e));
     } finally {
       setSending(false);
     }
@@ -5758,6 +5823,29 @@ function EventItem({ event }) {
     const f = event.handoff_file ? ` → handoffs/${event.handoff_file}` : "";
     return html`<div class="event sys">
       <div class="event-meta">${ts} · session compacted (${event.chars || 0} chars)${f}</div>
+    </div>`;
+  }
+
+  if (type === "pending_question") {
+    const route = event.route === "coach" ? "→ coach" : "→ human";
+    const n = (event.questions || []).length;
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ⏸ paused on AskUserQuestion ${route} (${n}Q, id=${(event.correlation_id || "").slice(0, 8)})</div>
+    </div>`;
+  }
+
+  if (type === "question_answered") {
+    const n = event.answer_count != null
+      ? event.answer_count
+      : (event.answer_keys || []).length;
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ▶ question answered (${n} keys, id=${(event.correlation_id || "").slice(0, 8)})</div>
+    </div>`;
+  }
+
+  if (type === "question_cancelled") {
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ⚠ question cancelled: ${event.reason || ""}</div>
     </div>`;
   }
 

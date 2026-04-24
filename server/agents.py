@@ -22,7 +22,14 @@ from claude_agent_sdk import (
     UserMessage,
     query,
 )
+from claude_agent_sdk.types import (
+    HookMatcher,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ToolPermissionContext,
+)
 
+from server import questions as questions_registry
 from server.context import build_system_prompt_suffix
 from server.db import configured_conn
 from server.events import bus
@@ -1370,12 +1377,15 @@ def _system_prompt_for(agent_id: str) -> str:
             "Player their name + role (e.g. p3 → 'Alice' / 'Frontend developer'). "
             "Do this once per Player when forming the team — the UI labels "
             "their pane from these values.\n"
-            "  - coord_ask_question(questions, recipient?, context?): ask the "
-            "human a structured multiple-choice question (you default to "
-            "recipient='human'). Use this instead of the CLI's "
-            "AskUserQuestion tool, which is disabled — the harness has no "
-            "terminal UI for it. Does NOT block; end the turn, the answer "
-            "arrives later.\n"
+            "  - AskUserQuestion (built-in): ask the human a structured "
+            "multiple-choice question. Your turn PAUSES until they submit "
+            "the form in the UI, then resumes with the answers in the tool "
+            "result — same turn continues. Prefer this over free-text asks "
+            "when you have 2-4 concrete options.\n"
+            "  - coord_answer_question(correlation_id, answers): resolve a "
+            "Player's paused question. When a Player calls AskUserQuestion "
+            "while working for you, the question lands in your inbox with "
+            "a correlation_id — call this tool to unblock them.\n"
             "  - coord_request_human(subject, body, urgency?): escalate to the "
             "human when a decision exceeds your authority or the team is "
             "stuck. urgency='blocker' for whole-team gating.\n"
@@ -1429,12 +1439,12 @@ def _system_prompt_for(agent_id: str) -> str:
         f"  - coord_commit_push(message, push?): when you have code changes "
         f"to ship, use this instead of driving git through Bash — it does "
         f"git add -A + commit + push and emits a commit_pushed event.\n"
-        f"  - coord_ask_question(questions, recipient?, context?): ask a "
-        f"structured multiple-choice question. You default to "
-        f"recipient='coach' — bother Coach first, not the human (Coach "
-        f"can relay to the human if needed). Use this instead of the CLI's "
-        f"AskUserQuestion, which is disabled. Does NOT block; end the turn, "
-        f"the answer arrives in your inbox on a later turn.\n"
+        f"  - AskUserQuestion (built-in): ask Coach a structured multiple-"
+        f"choice question (1-4 questions, 2-4 options each). Your turn "
+        f"PAUSES until Coach resolves it via coord_answer_question, then "
+        f"resumes with the answers in the tool result. The harness routes "
+        f"AskUserQuestion to Coach by default — if you need the human "
+        f"directly, escalate via coord_request_human instead.\n"
         f"  - coord_request_human(subject, body, urgency?): escalate to the "
         f"human when blocked on something only they can decide. Prefer this "
         f"over going silent — say what you tried.\n"
@@ -1470,6 +1480,216 @@ def _system_prompt_for(agent_id: str) -> str:
 
 # UI effort levels (1..4) map directly onto the SDK's Literal values.
 _EFFORT_LEVELS = {1: "low", 2: "medium", 3: "high", 4: "max"}
+
+
+async def _pretool_continue_hook(
+    input_data: dict[str, Any],
+    tool_use_id: str | None,
+    context: Any,
+) -> dict[str, Any]:
+    """SDK workaround: can_use_tool needs streaming mode + a PreToolUse
+    hook that returns continue_ to keep the stream open. Without this
+    the stream closes before the permission callback fires. Doesn't
+    modify tool behavior — just keeps the channel alive."""
+    return {"continue_": True}
+
+
+def _normalize_question_payload(input_data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Take AskUserQuestion's input (may be dict[{"questions": [...]}]
+    OR already just a list) and return a list of normalised question
+    dicts. Tolerates minor SDK shape drift."""
+    raw = input_data.get("questions") if isinstance(input_data, dict) else input_data
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for q in raw:
+        if not isinstance(q, dict):
+            continue
+        opts = q.get("options") or []
+        clean_opts: list[dict[str, str]] = []
+        for o in opts:
+            if not isinstance(o, dict):
+                continue
+            label = str(o.get("label") or "").strip()
+            if not label:
+                continue
+            clean_opts.append({
+                "label": label,
+                "description": str(o.get("description") or ""),
+            })
+        out.append({
+            "question": str(q.get("question") or "").strip(),
+            "header": str(q.get("header") or "").strip(),
+            # SDK uses multiSelect, Coach's answer_question uses
+            # multi_select — keep both for forward-compat.
+            "multi_select": bool(q.get("multiSelect") or q.get("multi_select")),
+            "options": clean_opts,
+        })
+    return out
+
+
+def _format_questions_md(questions: list[dict[str, Any]]) -> str:
+    """Human-readable version of the question set, for inbox bodies."""
+    lines: list[str] = []
+    for i, q in enumerate(questions, 1):
+        head = f"### {q['header']}\n" if q.get("header") else ""
+        multi = " _(multi-select)_" if q.get("multi_select") else ""
+        lines.append(f"{head}**Q{i}: {q['question']}**{multi}")
+        for j, o in enumerate(q.get("options") or [], 1):
+            letter = chr(ord("A") + j - 1)
+            desc = f" — {o['description']}" if o.get("description") else ""
+            lines.append(f"- **{letter}) {o['label']}**{desc}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _build_can_use_tool(agent_id: str):
+    """Return a can_use_tool callback closed over the calling agent_id.
+    Intercepts AskUserQuestion and routes by role; everything else is
+    auto-approved (our allowed_tools list is exhaustive, so anything
+    that reaches here via some future SDK change gets a permissive
+    pass rather than a false deny)."""
+    caller_is_coach = agent_id == "coach"
+
+    async def _cb(
+        tool_name: str,
+        input_data: dict[str, Any],
+        context: ToolPermissionContext,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        if tool_name != "AskUserQuestion":
+            return PermissionResultAllow(updated_input=input_data)
+
+        questions = _normalize_question_payload(input_data)
+        if not questions:
+            return PermissionResultDeny(
+                message="AskUserQuestion: 'questions' array is required and must be non-empty"
+            )
+
+        route = "human" if caller_is_coach else "coach"
+        entry = questions_registry.register(agent_id, questions, route)
+        correlation_id = entry.correlation_id
+        md_body = _format_questions_md(questions)
+
+        try:
+            if route == "human":
+                # Surface a pending_question event for the UI form.
+                # Structured payload is preserved so the form can render
+                # radios/checkboxes; md_body is a readable fallback.
+                subject = f"Question from {agent_id}"
+                if len(questions) == 1 and len(questions[0]["question"]) < 80:
+                    subject = f"{agent_id}: {questions[0]['question']}"
+                await bus.publish(
+                    {
+                        "ts": _now(),
+                        "agent_id": agent_id,
+                        "type": "pending_question",
+                        "correlation_id": correlation_id,
+                        "route": "human",
+                        "subject": subject,
+                        "questions": questions,
+                        "body": md_body,
+                    }
+                )
+            else:
+                # Route to Coach's inbox as a structured question message.
+                # Coach reads it, picks answers, calls coord_answer_question
+                # with the correlation_id to resolve this pending entry.
+                subject = f"Q from {agent_id}: correlation_id={correlation_id}"
+                body = (
+                    f"Player {agent_id} is paused on AskUserQuestion. "
+                    f"Respond via coord_answer_question with correlation_id "
+                    f"{correlation_id!r} and an 'answers' object mapping each "
+                    f"question text to your chosen label.\n\n"
+                    + md_body
+                )
+                c = await configured_conn()
+                try:
+                    cur = await c.execute(
+                        "INSERT INTO messages (from_id, to_id, subject, body, priority) "
+                        "VALUES (?, ?, ?, ?, ?) RETURNING id",
+                        (agent_id, "coach", subject, body, "interrupt"),
+                    )
+                    row = await cur.fetchone()
+                    msg_id = dict(row)["id"] if row else None
+                    await c.commit()
+                finally:
+                    await c.close()
+                await bus.publish(
+                    {
+                        "ts": _now(),
+                        "agent_id": agent_id,
+                        "type": "pending_question",
+                        "correlation_id": correlation_id,
+                        "route": "coach",
+                        "subject": subject,
+                        "questions": questions,
+                        "message_id": msg_id,
+                    }
+                )
+                # Wake Coach so they process the inbox promptly — the
+                # Player is literally parked waiting on them.
+                await maybe_wake_agent(
+                    "coach",
+                    f"Player {agent_id} is paused on a question. Read your inbox, "
+                    f"pick answers, then call coord_answer_question with "
+                    f"correlation_id={correlation_id!r} to unblock them.",
+                    bypass_debounce=True,
+                )
+
+            # Block until answered, timed out, or explicitly rejected.
+            answers = await questions_registry.wait_for(entry)
+            await bus.publish(
+                {
+                    "ts": _now(),
+                    "agent_id": agent_id,
+                    "type": "question_answered",
+                    "correlation_id": correlation_id,
+                    "route": route,
+                    "answer_count": len(answers),
+                }
+            )
+            # The SDK expects updated_input to carry both the original
+            # questions AND the answers map (answers keyed by question
+            # text → selected label).
+            return PermissionResultAllow(
+                updated_input={
+                    "questions": input_data.get("questions", questions),
+                    "answers": answers,
+                }
+            )
+        except questions_registry.QuestionRejected as e:
+            await bus.publish(
+                {
+                    "ts": _now(),
+                    "agent_id": agent_id,
+                    "type": "question_cancelled",
+                    "correlation_id": correlation_id,
+                    "route": route,
+                    "reason": str(e),
+                }
+            )
+            return PermissionResultDeny(
+                message=f"Question cancelled: {e}. Proceed without the answer "
+                "(reformulate, escalate via coord_request_human, or mark your "
+                "task blocked)."
+            )
+        except asyncio.CancelledError:
+            # Turn was cancelled while we were waiting — clean up then
+            # propagate so the SDK ends the turn.
+            questions_registry.forget(correlation_id)
+            raise
+        except Exception as e:
+            logger.exception("can_use_tool: unexpected failure for %s", correlation_id)
+            questions_registry.forget(correlation_id)
+            return PermissionResultDeny(
+                message=f"Question routing failed: {type(e).__name__}: {e}"
+            )
+        finally:
+            # register() keeps the entry in _pending until forget(); resolve()
+            # doesn't auto-remove. Clean up in every exit path.
+            questions_registry.forget(correlation_id)
+
+    return _cb
 
 
 async def run_agent(
@@ -1733,17 +1953,24 @@ async def run_agent(
             handoff_chars=len(handoff_suffix),
         )
 
+    # can_use_tool callback: intercepts AskUserQuestion and routes per
+    # agent role. Coach → human form (via pending-question event + POST
+    # /api/questions/<id>/answer). Player → Coach's inbox (via send_message
+    # + coord_answer_question tool). Callback closes over agent_id so each
+    # spawn gets a callback scoped to its caller.
+    can_use_tool_cb = _build_can_use_tool(agent_id)
+
     options_kwargs: dict[str, Any] = dict(
         system_prompt=system_prompt,
         cwd=str(workspace_dir(agent_id)),
         max_turns=10,
         mcp_servers=mcp_servers,
         allowed_tools=allowed,
-        # Block the CLI's interactive AskUserQuestion tool — it expects
-        # a terminal UI to collect answers that the harness doesn't
-        # have, so every call errors. coord_ask_question is the
-        # replacement (same schema, routed to Coach or the human).
-        disallowed_tools=["AskUserQuestion"],
+        # can_use_tool requires streaming mode + a PreToolUse hook that
+        # returns continue_ (documented workaround — without it the
+        # stream closes before the permission callback can fire).
+        can_use_tool=can_use_tool_cb,
+        hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[_pretool_continue_hook])]},
     )
     # Partial-message streaming (token-by-token text + thinking deltas)
     # is off by default: the option is understood by recent SDK
@@ -1809,11 +2036,22 @@ async def run_agent(
         "entry_prompt": prompt,
     }
 
+    async def _prompt_stream():
+        # Streaming-mode prompt required for can_use_tool (Python SDK).
+        # We yield a single user message carrying the turn's prompt —
+        # identical payload the SDK would build internally for a plain
+        # string prompt, just wrapped in the streaming envelope so the
+        # permission callback can fire.
+        yield {
+            "type": "user",
+            "message": {"role": "user", "content": prompt},
+        }
+
     async def _iterate(opts: ClaudeAgentOptions) -> None:
         # Tiny indirection so we can retry the whole iteration once
         # after stale-session cleanup without duplicating the body.
         turn_ctx["started_at"] = _now()
-        async for msg in query(prompt=prompt, options=opts):
+        async for msg in query(prompt=_prompt_stream(), options=opts):
             await _handle_message(agent_id, msg, turn_ctx)
 
     try:

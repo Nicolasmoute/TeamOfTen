@@ -2016,6 +2016,61 @@ async def cancel_task_from_human(task_id: str) -> dict[str, Any]:
 from server.tools import VALID_RECIPIENTS as _HUMAN_MSG_RECIPIENTS  # noqa: E402
 
 
+# ---------------------------------------------------------------------------
+# Pending AskUserQuestion prompts — list for the UI, submit answers back
+# so the agent's paused can_use_tool callback resumes and the turn
+# continues in-place (same turn, not a new one).
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/questions/pending", dependencies=[Depends(require_token)])
+async def list_pending_questions() -> dict[str, Any]:
+    """Metadata-only view of currently-waiting AskUserQuestion calls.
+    Used by the UI form to hydrate on reload (so refreshing the page
+    doesn't lose the form state for in-flight questions)."""
+    from server import questions as questions_registry
+    return {"pending": questions_registry.list_pending()}
+
+
+class AnswerQuestionRequest(BaseModel):
+    # {question_text: selected_label} per the SDK's expected shape.
+    # multi-select answers come in as comma-joined strings per the doc.
+    answers: dict[str, str] = Field(..., min_length=1)
+
+
+@app.post(
+    "/api/questions/{correlation_id}/answer",
+    dependencies=[Depends(require_token)],
+)
+async def answer_pending_question(
+    correlation_id: str,
+    req: AnswerQuestionRequest,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, Any]:
+    """Human submits the question form; resolve the waiting Future so
+    the agent's turn resumes. 404 when the id is stale (already
+    answered, timed out, or never existed)."""
+    from server import questions as questions_registry
+    ok = questions_registry.resolve(correlation_id, req.answers)
+    if not ok:
+        raise HTTPException(
+            404,
+            detail=f"question {correlation_id!r} not found or already resolved",
+        )
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "human",
+            "type": "question_answered",
+            "correlation_id": correlation_id,
+            "route": "human",
+            "answer_keys": list(req.answers.keys()),
+            "actor": actor,
+        }
+    )
+    return {"ok": True, "correlation_id": correlation_id}
+
+
 class HumanMessageRequest(BaseModel):
     to: str
     body: str = Field(min_length=1, max_length=5000)
