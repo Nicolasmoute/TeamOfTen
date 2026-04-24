@@ -226,10 +226,22 @@ async def lifespan(app: FastAPI):
     sessions_trim_task = asyncio.create_task(sessions_trim_loop())
     uploads_task = asyncio.create_task(uploads_pull_loop())
     outputs_task = asyncio.create_task(outputs_push_loop())
+    from server.telegram import start_telegram_bridge, stop_telegram_bridge
+    # Telegram bridge owns its own task handle (so the UI can reload it
+    # live via /api/team/telegram). Lifespan only kicks it off + tears
+    # it down — it isn't tracked in bg_tasks.
+    try:
+        await start_telegram_bridge()
+    except Exception:
+        logger.exception("telegram bridge failed to start (non-fatal)")
     bg_tasks = (sync_task, snapshot_task, coach_task, coach_repeat_task, stale_task_task, trim_task, att_trim_task, sessions_trim_task, uploads_task, outputs_task)
     try:
         yield
     finally:
+        try:
+            await stop_telegram_bridge()
+        except Exception:
+            logger.exception("telegram bridge shutdown failed")
         for t in bg_tasks:
             t.cancel()
         for t in bg_tasks:
@@ -1749,6 +1761,176 @@ async def provision_team_repo(
         }
     )
     return {"ok": "error" not in status, "status": status}
+
+
+# Telegram bridge configuration. Token + chat-id whitelist live in the
+# encrypted secrets store (UI-managed) with env fallback for first-boot.
+# Save / clear here triggers a live bridge reload — no redeploy needed.
+
+class TeamTelegramWrite(BaseModel):
+    # Optional so the user can update one field without re-typing the
+    # other. None = leave existing value untouched. Empty string = clear.
+    token: str | None = Field(default=None, max_length=512)
+    chat_ids: str | None = Field(default=None, max_length=2048)
+
+
+@app.get("/api/team/telegram", dependencies=[Depends(require_token)])
+async def get_team_telegram() -> dict[str, object]:
+    """Return masked status — never the token plaintext. The chat IDs
+    list IS visible (it's a whitelist, not a credential)."""
+    from server import secrets as secrets_store
+    from server.telegram import (
+        SECRET_TOKEN_NAME,
+        SECRET_CHAT_IDS_NAME,
+        _read_token,
+        _read_chat_ids,
+        _read_disabled_flag,
+        is_running,
+    )
+    token, token_source = await _read_token()
+    chat_ids, chat_ids_source = await _read_chat_ids()
+    disabled = await _read_disabled_flag()
+    return {
+        "token_set": bool(token),
+        "token_source": token_source,
+        "chat_ids": sorted(chat_ids),
+        "chat_ids_source": chat_ids_source,
+        "disabled": disabled,
+        "bridge_running": is_running(),
+        "secrets_status": secrets_store.status(),
+        "env_token_set": bool(os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()),
+        "secret_names": {
+            "token": SECRET_TOKEN_NAME,
+            "chat_ids": SECRET_CHAT_IDS_NAME,
+        },
+    }
+
+
+@app.put("/api/team/telegram", dependencies=[Depends(require_token)])
+async def set_team_telegram(
+    req: TeamTelegramWrite,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    """Upsert encrypted token and/or chat_ids, then reload the bridge
+    so changes apply without a restart. 503 when the master key isn't
+    configured (caller can't save into a disabled store).
+
+    Validation:
+      - `token`: when provided, must be non-empty and match the
+        BotFather format `<digits>:<35+ urlsafe chars>`. Use
+        DELETE to wipe the token.
+      - `chat_ids`: when provided non-empty, must parse to ≥1 integer.
+        Empty string clears the saved whitelist (env fallback may
+        re-supply one).
+
+    Saving any field also clears the `telegram_disabled` flag so a
+    prior Clear doesn't keep the bridge off.
+    """
+    from server import secrets as secrets_store
+    from server.telegram import (
+        SECRET_TOKEN_NAME,
+        SECRET_CHAT_IDS_NAME,
+        _parse_chat_ids,
+        _set_disabled_flag,
+        is_valid_token,
+        reload_telegram_bridge,
+    )
+    key_status = secrets_store.status()
+    if not key_status.get("ok"):
+        raise HTTPException(
+            503,
+            detail=f"secrets store unavailable: {key_status.get('reason')}",
+        )
+
+    if req.token is not None:
+        token = req.token.strip()
+        if not token:
+            raise HTTPException(
+                400,
+                detail="token cannot be empty — use DELETE /api/team/telegram to wipe",
+            )
+        if not is_valid_token(token):
+            raise HTTPException(
+                400,
+                detail=(
+                    "token does not match BotFather format "
+                    "(<digits>:<35+ urlsafe chars>) — copy-paste from "
+                    "the bot's HTTP API token line"
+                ),
+            )
+
+    if req.chat_ids is not None and req.chat_ids.strip():
+        parsed = _parse_chat_ids(req.chat_ids)
+        if not parsed:
+            raise HTTPException(
+                400,
+                detail="chat_ids must be a comma-separated list of integers",
+            )
+
+    if req.token is not None:
+        ok = await secrets_store.set_secret(
+            SECRET_TOKEN_NAME, req.token.strip()
+        )
+        if not ok:
+            raise HTTPException(500, detail="token write failed; see server logs")
+
+    if req.chat_ids is not None:
+        ids = req.chat_ids.strip()
+        if ids:
+            ok = await secrets_store.set_secret(SECRET_CHAT_IDS_NAME, ids)
+            if not ok:
+                raise HTTPException(500, detail="chat_ids write failed; see server logs")
+        else:
+            await secrets_store.delete_secret(SECRET_CHAT_IDS_NAME)
+
+    # Saving any value re-enables the bridge — Clear is the only way to
+    # set the disabled flag, and the user just clicked Save.
+    await _set_disabled_flag(False)
+    secrets_store.bump_cache_version()
+    running = await reload_telegram_bridge()
+
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "system",
+            "type": "team_telegram_updated",
+            "bridge_running": running,
+            "actor": actor,
+        }
+    )
+    return {"ok": True, "bridge_running": running}
+
+
+@app.delete("/api/team/telegram", dependencies=[Depends(require_token)])
+async def clear_team_telegram(
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    """Wipe both secrets, set the `telegram_disabled` flag, and stop
+    the bridge. The flag overrides env-var fallback so the bridge
+    stays off until the user explicitly Saves new config (which
+    clears the flag)."""
+    from server import secrets as secrets_store
+    from server.telegram import (
+        SECRET_TOKEN_NAME,
+        SECRET_CHAT_IDS_NAME,
+        _set_disabled_flag,
+        reload_telegram_bridge,
+    )
+    await secrets_store.delete_secret(SECRET_TOKEN_NAME)
+    await secrets_store.delete_secret(SECRET_CHAT_IDS_NAME)
+    await _set_disabled_flag(True)
+    secrets_store.bump_cache_version()
+    running = await reload_telegram_bridge()
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "system",
+            "type": "team_telegram_cleared",
+            "bridge_running": running,
+            "actor": actor,
+        }
+    )
+    return {"ok": True, "bridge_running": running}
 
 
 class AgentLockWrite(BaseModel):

@@ -292,6 +292,67 @@ Reliability:
   resets on any successful turn (including got_result-but-
   threw-after suppressions).
 
+**Recent (2026-04-25):**
+
+Telegram bridge ([server/telegram.py](server/telegram.py)):
+- **Inbound** — long-polls Telegram `getUpdates`. Whitelist-gated by
+  numeric chat_ids; refuses to start if token set without a whitelist
+  (anyone who finds the bot could otherwise pilot Coach). Inbound text
+  → INSERT into `messages` with `from_id='human'`, `to_id='coach'`,
+  `subject='telegram:<chat_id>'` → `bus.publish(message_sent)` →
+  `maybe_wake_agent('coach', …, bypass_debounce=True)` so the existing
+  wake path spawns Coach's turn.
+- **Outbound** — subscribes to `bus`, buffers `agent_id='coach'`
+  `text` events, flushes accumulated text to every whitelisted chat
+  on `agent_stopped`. Empty turns (Coach only used tools) flush
+  nothing. `human_attention` escalations are also forwarded so phone
+  pings on `coord_request_human`. Splits at paragraph/line boundaries
+  to fit Telegram's 4096-char cap (uses 4000 for headroom).
+- **Long-polling chosen over webhook** — works behind Zeabur TLS with
+  no public-URL plumbing; Telegram → bot is outbound HTTP, not blocked.
+- **UI-managed config** — token + chat_ids live in the encrypted
+  `secrets` table (Fernet via `HARNESS_SECRETS_KEY`) under names
+  `telegram_bot_token` and `telegram_allowed_chat_ids`. Edit them in
+  the Options drawer (`Telegram bridge` section) — saving triggers a
+  live `reload_telegram_bridge()` so changes apply without a restart.
+  Env-var fallback (`TELEGRAM_BOT_TOKEN` / `TELEGRAM_ALLOWED_CHAT_IDS`)
+  kicks in only when the secrets aren't set, so a fresh deploy can
+  bootstrap from env if you'd rather. `GET /api/team/telegram` returns
+  masked status (token plaintext is never returned); PUT upserts +
+  validates token format + reloads; DELETE wipes both, sets the
+  `telegram_disabled` flag, and stops the bridge.
+- **`telegram_disabled` flag** (team_config) — Clear sets it; Save
+  unsets it. Resolved before any other config so a Clear truly stops
+  the bridge even when env vars are set. Without this flag, env-var
+  fallback would silently re-enable the bridge right after Clear.
+- **Token format validation** — PUT rejects tokens that don't match
+  `^\d+:[A-Za-z0-9_-]{30,}$` (BotFather shape). Stops users from
+  saving "tg_xxxxx" or other paste mistakes that 401 forever.
+- **Auth-failure escalation** — inbound loop tracks consecutive 401/403
+  responses; after 5 in a row, emits a `human_attention` event
+  ("Telegram bridge stopped — auth failure") and exits the loop.
+  `_run` cancels the outbound task too so nothing keeps running.
+  User has to Save fresh config to retry. Stops log spam from
+  rotated tokens.
+- **User-initiated turn filter** — outbound loop only forwards Coach
+  turns that were triggered by a human message (UI composer or
+  Telegram inbound, identified via `message_sent` event with
+  `agent_id='human'` and `to='coach'`). Coach autoloop ticks and
+  Player→Coach chatter stay silent so the phone doesn't ping every
+  2 minutes. `human_attention` events are always forwarded
+  regardless.
+- **Restartable lifecycle** — the module owns its own task handle in
+  `_current_task`; lifespan calls `start_telegram_bridge()` on boot
+  and `stop_telegram_bridge()` on shutdown. The bridge isn't tracked
+  in `bg_tasks` because the API layer can swap it out mid-run.
+  `_run` uses `asyncio.wait(FIRST_COMPLETED)` so if either inbound
+  or outbound exits, the other is cancelled.
+- `httpx` promoted from dev-extra to runtime dep.
+- Tests in [server/tests/test_telegram.py](server/tests/test_telegram.py)
+  cover `is_valid_token`, `_parse_chat_ids`, `_split_chunks`, the
+  disabled-flag round-trip, and `_resolve_config` precedence
+  (disabled flag > DB secrets > env > unset).
+
 **Next likely:**
 - **Mobile UI polish** — touch-drag doesn't work with HTML5 DnD;
    layout breakpoints for < 900 px need a rethink.
@@ -328,6 +389,14 @@ Still unverified end-to-end:
 7. **Coach autoloop steady-state** — set
    `HARNESS_COACH_TICK_INTERVAL=120`, confirm `routine tick` events
    fire on cadence and skip while a prior turn is working.
+8. **Telegram bridge** — set the bot token + chat IDs via Options
+   drawer → "Telegram bridge" section (or via env on first boot),
+   send a message to the bot, confirm Coach turn fires and reply
+   lands back in the chat. Test long replies (>4000 chars) split
+   correctly. Test `human_attention` forwarding by triggering a
+   `coord_request_human` from a Player. Test live reload: change the
+   chat IDs in the UI and confirm the new whitelist takes effect
+   without a restart.
 
 Most likely failure mode remaining: subtle SDK version drift where
 our defensive `_extract_usage` / post-result suppression / auto-retry

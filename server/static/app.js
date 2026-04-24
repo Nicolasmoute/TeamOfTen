@@ -2096,6 +2096,182 @@ function TeamRepoSection() {
   </section>`;
 }
 
+// Telegram bridge configuration. Token + chat-id whitelist live in the
+// encrypted secrets store (Fernet via HARNESS_SECRETS_KEY). Save here
+// triggers a live bridge reload — no redeploy needed. The token is
+// never returned by the API; the field stays empty unless you want to
+// rotate it. Chat IDs are visible since they're a whitelist, not a
+// credential.
+function TeamTelegramSection() {
+  const [data, setData] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+  const [tokenDraft, setTokenDraft] = useState("");
+  const [chatIdsDraft, setChatIdsDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [msg, setMsg] = useState(null);
+
+  const reload = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/team/telegram");
+      if (res.ok) {
+        const d = await res.json();
+        setData(d);
+        // Pre-fill chat IDs only — the token is write-only.
+        setChatIdsDraft((d.chat_ids || []).join(", "));
+      }
+    } catch (e) {
+      console.error("telegram load failed", e);
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+
+  const save = useCallback(async () => {
+    setSaving(true);
+    setMsg(null);
+    try {
+      const body = {};
+      if (tokenDraft.trim()) body.token = tokenDraft.trim();
+      if (chatIdsDraft !== ((data && data.chat_ids) || []).join(", ")) {
+        body.chat_ids = chatIdsDraft;
+      }
+      if (Object.keys(body).length === 0) {
+        setMsg({ kind: "ok", text: "no changes" });
+        setSaving(false);
+        return;
+      }
+      const res = await authFetch("/api/team/telegram", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) {
+        const d = await res.json();
+        setMsg({
+          kind: "ok",
+          text: d.bridge_running
+            ? "saved · bridge running"
+            : "saved · bridge inactive (token or chat IDs missing)",
+        });
+        setTokenDraft("");  // clear write-only field
+        await reload();
+      } else {
+        let detail;
+        try {
+          const d = await res.json();
+          detail = typeof d.detail === "string" ? d.detail : JSON.stringify(d.detail);
+        } catch (_) {
+          detail = "HTTP " + res.status;
+        }
+        setMsg({ kind: "err", text: detail });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    } finally {
+      setSaving(false);
+    }
+  }, [tokenDraft, chatIdsDraft, data, reload]);
+
+  const clearAll = useCallback(async () => {
+    if (!confirm("Wipe Telegram token + chat IDs and disable the bridge?\n\nThe disabled flag overrides env-var fallback so the bridge stays off until you Save new config.")) return;
+    setClearing(true);
+    setMsg(null);
+    try {
+      const res = await authFetch("/api/team/telegram", { method: "DELETE" });
+      if (res.ok) {
+        setMsg({ kind: "ok", text: "cleared · bridge disabled" });
+        setTokenDraft("");
+        setChatIdsDraft("");
+        await reload();
+      } else {
+        let detail;
+        try { detail = (await res.json()).detail; } catch (_) { detail = "HTTP " + res.status; }
+        setMsg({ kind: "err", text: detail });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    } finally {
+      setClearing(false);
+    }
+  }, [reload]);
+
+  const keyOk = data && data.secrets_status && data.secrets_status.ok;
+  const keyReason = data && data.secrets_status && data.secrets_status.reason;
+
+  return html`<section class="drawer-section">
+    <h3>Telegram bridge</h3>
+    <p class="muted" style="margin: 0 0 6px 0; font-size: 12px;">
+      Talk to Coach from your phone. Create a bot via @BotFather, paste
+      the token, then add your numeric Telegram chat ID(s) to the
+      whitelist (comma-separated). Anyone whose chat ID isn't listed
+      is silently ignored. Saves are encrypted at rest with
+      <code>HARNESS_SECRETS_KEY</code>; changes apply live (no redeploy).
+    </p>
+    ${loaded && data && !keyOk
+      ? html`<div style="font-size: 11px; color: var(--err); border: 1px solid var(--err); background: rgba(248,81,73,0.08); padding: 4px 8px; border-radius: 3px; margin-bottom: 6px;">
+          secrets store unavailable: ${keyReason || "unknown"}
+        </div>`
+      : null}
+    ${loaded && data
+      ? html`<div style="font-size: 11px; color: var(--muted); margin-bottom: 6px;">
+          <div>
+            status:
+            ${data.bridge_running
+              ? html`<span style="color: var(--ok);">● running</span>`
+              : data.disabled
+                ? html`<span style="color: var(--warn);">○ disabled (cleared)</span>`
+                : html`<span style="color: var(--muted);">○ inactive</span>`}
+            <span class="muted"> · token: ${data.token_set ? `set (${data.token_source})` : "unset"}</span>
+            <span class="muted"> · chats: ${(data.chat_ids || []).length} (${data.chat_ids_source})</span>
+          </div>
+          ${data.env_token_set && data.token_source === "db"
+            ? html`<div style="color: var(--warn);">⚠ TELEGRAM_BOT_TOKEN env is also set — DB value wins</div>`
+            : null}
+          ${data.disabled
+            ? html`<div style="color: var(--warn);">flag <code>telegram_disabled</code> is set — Save new config to re-enable</div>`
+            : null}
+        </div>`
+      : null}
+    <input
+      type="password"
+      autocomplete="new-password"
+      placeholder="bot token (leave blank to keep existing)"
+      value=${tokenDraft}
+      onInput=${(e) => setTokenDraft(e.target.value)}
+      disabled=${!keyOk}
+      style="width: 100%; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 4px 8px; font-size: 12px; font-family: ui-monospace, monospace; margin-bottom: 4px;"
+    />
+    <input
+      placeholder="chat IDs (comma-separated integers)"
+      value=${chatIdsDraft}
+      onInput=${(e) => setChatIdsDraft(e.target.value)}
+      disabled=${!keyOk}
+      style="width: 100%; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 4px 8px; font-size: 12px; font-family: ui-monospace, monospace; margin-bottom: 4px;"
+    />
+    <div style="display: flex; gap: 6px; align-items: center;">
+      <button
+        type="button"
+        class="primary"
+        disabled=${!keyOk || saving || clearing}
+        onClick=${save}
+      >${saving ? "saving…" : "save"}</button>
+      <button
+        type="button"
+        disabled=${saving || clearing || !data || (!data.token_set && (data.chat_ids || []).length === 0 && !data.disabled)}
+        onClick=${clearAll}
+        title="Wipe both secrets and set the disabled flag (overrides env)."
+      >${clearing ? "clearing…" : "clear"}</button>
+    </div>
+    ${msg
+      ? html`<div style=${"font-size: 11px; margin: 6px 0 0; padding: 4px 8px; border-radius: 3px; " + (msg.kind === "ok"
+            ? "color: var(--ok); border: 1px solid var(--ok); background: rgba(63,185,80,0.08);"
+            : "color: var(--err); border: 1px solid var(--err); background: rgba(248,81,73,0.08); white-space: pre-wrap;")}>${msg.text}</div>`
+      : null}
+  </section>`;
+}
+
 // MCP server configuration. Paste a Claude-Desktop-style JSON
 // snippet; parse + detect server name(s); save to the DB. Each saved
 // server gets a row with status dot + enable/disable/delete/test. The
@@ -2777,6 +2953,8 @@ function SettingsDrawer({ onClose, serverStatus }) {
           <${TeamModelsSection} />
 
           <${TeamRepoSection} />
+
+          <${TeamTelegramSection} />
 
           <${SecretsSection} />
 
