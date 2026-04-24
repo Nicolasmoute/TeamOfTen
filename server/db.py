@@ -170,6 +170,17 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     last_error       TEXT,
     last_tested_at   TEXT
 );
+
+-- Encrypted secrets. ciphertext is Fernet-encrypted bytes; the master
+-- key lives in env (HARNESS_SECRETS_KEY) and never touches the DB. A
+-- lost master key makes this table unrecoverable, which is the point —
+-- a stolen DB snapshot without the key is useless.
+CREATE TABLE IF NOT EXISTS secrets (
+    name             TEXT PRIMARY KEY,
+    ciphertext       BLOB NOT NULL,
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
 """
 
 # Seed agents — idempotent via INSERT OR IGNORE.

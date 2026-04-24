@@ -443,7 +443,24 @@ async def health() -> JSONResponse:
             "reason": "HARNESS_MCP_CONFIG not set — only the in-process 'coord' server is active",
         }
 
-    # 6. Workspaces — only check if HARNESS_PROJECT_REPO set
+    # 6. Secrets store — reports master-key readiness + current count.
+    # Non-fatal for overall health: an unset HARNESS_SECRETS_KEY is a
+    # valid state (user hasn't opted in yet), just means the UI secrets
+    # feature is disabled and `${VAR}` placeholders fall back to env.
+    from server import secrets as secrets_store
+    key_status = secrets_store.status()
+    secrets_info: dict[str, Any] = {
+        "ok": True,  # informational — see `configured` for actual state
+        "configured": bool(key_status.get("ok")),
+    }
+    if key_status.get("ok"):
+        rows = await secrets_store.list_secrets()
+        secrets_info["count"] = len(rows)
+    else:
+        secrets_info["reason"] = key_status.get("reason")
+    checks["secrets"] = secrets_info
+
+    # 7. Workspaces — only check if HARNESS_PROJECT_REPO set
     ws_status = get_workspaces_status()
     if ws_status.get("configured"):
         slot_states = ws_status.get("slots") or {}
@@ -1310,6 +1327,98 @@ async def delete_mcp_server(
             "ts": datetime.now(timezone.utc).isoformat(),
             "agent_id": "system",
             "type": "mcp_server_deleted",
+            "name": name,
+            "actor": actor,
+        }
+    )
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Encrypted secrets store — UI-managed values that feed into ${VAR}
+# interpolation (MCP configs, provider tokens, etc). Plaintext exits the
+# server only through the runtime interpolator — not through any API
+# response. Master key lives in HARNESS_SECRETS_KEY; see server/secrets.py.
+# ---------------------------------------------------------------------------
+
+_SECRET_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
+def _validate_secret_name(name: str) -> None:
+    if not isinstance(name, str) or not _SECRET_NAME_RE.match(name):
+        raise HTTPException(
+            400,
+            detail=(
+                f"secret name {name!r} must match env-var rules: "
+                "[A-Za-z_][A-Za-z0-9_]*, max 64 chars"
+            ),
+        )
+
+
+class SecretWriteRequest(BaseModel):
+    value: str = Field(..., min_length=1, max_length=32_768)
+
+
+@app.get("/api/secrets", dependencies=[Depends(require_token)])
+async def list_secrets_endpoint() -> dict[str, object]:
+    """List metadata only (no plaintext). Also surfaces master-key
+    status so the UI can show 'store disabled — set HARNESS_SECRETS_KEY'
+    when appropriate."""
+    from server import secrets as secrets_store
+    return {
+        "status": secrets_store.status(),
+        "secrets": await secrets_store.list_secrets(),
+    }
+
+
+@app.put("/api/secrets/{name}", dependencies=[Depends(require_token)])
+async def write_secret(
+    name: str,
+    req: SecretWriteRequest,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    """Upsert an encrypted secret. 503 when the master key isn't
+    configured (caller sees a clear error instead of a silent no-op)."""
+    from server import secrets as secrets_store
+    _validate_secret_name(name)
+    key_status = secrets_store.status()
+    if not key_status.get("ok"):
+        raise HTTPException(
+            503,
+            detail=f"secrets store unavailable: {key_status.get('reason')}",
+        )
+    ok = await secrets_store.set_secret(name, req.value)
+    if not ok:
+        raise HTTPException(500, detail="secret write failed; see server logs")
+    secrets_store.bump_cache_version()
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "system",
+            "type": "secret_written",
+            "name": name,
+            "actor": actor,
+        }
+    )
+    return {"ok": True, "name": name}
+
+
+@app.delete("/api/secrets/{name}", dependencies=[Depends(require_token)])
+async def delete_secret_endpoint(
+    name: str,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    from server import secrets as secrets_store
+    _validate_secret_name(name)
+    ok = await secrets_store.delete_secret(name)
+    if not ok:
+        raise HTTPException(404, detail=f"secret {name!r} not found")
+    secrets_store.bump_cache_version()
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "system",
+            "type": "secret_deleted",
             "name": name,
             "actor": actor,
         }

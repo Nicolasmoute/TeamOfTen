@@ -10,6 +10,7 @@ dependencies = [
     "aiosqlite>=0.20",
     "python-multipart>=0.0.9",
     "webdav4>=0.9",
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]

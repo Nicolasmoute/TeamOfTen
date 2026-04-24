@@ -54,6 +54,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from server import secrets as secrets_store
+
 # Common token patterns we should NEVER let land in the DB as raw
 # strings — users should use ${VAR} placeholders pulling from env. The
 # UI save endpoint runs a paste against these and refuses / warns when
@@ -97,19 +99,32 @@ _ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def _interpolate(value: Any) -> Any:
-    """Recursively replace `${VAR}` placeholders with os.environ values.
-    Unknown vars expand to empty string (logged once)."""
+    """Recursively replace `${VAR}` placeholders. Resolution order:
+    (1) encrypted secrets store (UI-managed, highest priority — the
+    user's active management layer), (2) os.environ fallback,
+    (3) empty string + warning if neither has it. A name defined in
+    BOTH gets a collision warning so the user notices shadowing."""
     if isinstance(value, str):
         def sub(m: re.Match[str]) -> str:
             name = m.group(1)
-            v = os.environ.get(name)
-            if v is None:
+            v_secret = secrets_store.lookup_sync(name)
+            v_env = os.environ.get(name)
+            if v_secret is not None and v_env is not None and v_env != v_secret:
                 logger.warning(
-                    "mcp_config: ${%s} referenced but not in env (expanded to '')",
+                    "mcp_config: ${%s} defined in BOTH secrets store and env; "
+                    "using secrets store (UI-managed wins on collision)",
                     name,
                 )
-                return ""
-            return v
+            if v_secret is not None:
+                return v_secret
+            if v_env is not None:
+                return v_env
+            logger.warning(
+                "mcp_config: ${%s} referenced but not set anywhere "
+                "(expanded to '')",
+                name,
+            )
+            return ""
         return _ENV_VAR_RE.sub(sub, value)
     if isinstance(value, dict):
         return {k: _interpolate(v) for k, v in value.items()}

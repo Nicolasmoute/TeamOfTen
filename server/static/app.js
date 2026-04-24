@@ -2325,6 +2325,152 @@ function MCPServerCard({ server, testing, onToggle, onSaveTools, onDelete, onTes
   </div>`;
 }
 
+function SecretsSection() {
+  // Encrypted UI-managed secrets. These feed ${VAR} interpolation in MCP
+  // configs (and anything else that calls _interpolate) — the store wins
+  // over os.environ on name collision. Plaintext values never round-trip:
+  // once saved you can only replace or delete, not view.
+  const [rows, setRows] = useState([]);
+  const [status, setStatus] = useState(null); // {ok, reason?}
+  const [loaded, setLoaded] = useState(false);
+  const [name, setName] = useState("");
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null); // {kind: "ok"|"err", text}
+
+  const reload = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/secrets");
+      if (res.ok) {
+        const data = await res.json();
+        setRows(Array.isArray(data.secrets) ? data.secrets : []);
+        setStatus(data.status || null);
+      }
+    } catch (e) {
+      console.error("secrets list failed", e);
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+
+  const save = useCallback(async () => {
+    const trimmed = name.trim();
+    if (!trimmed || !value) return;
+    setBusy(true);
+    setMsg(null);
+    try {
+      const res = await authFetch(
+        "/api/secrets/" + encodeURIComponent(trimmed),
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ value }),
+        }
+      );
+      if (res.ok) {
+        setMsg({ kind: "ok", text: `saved ${trimmed}` });
+        setName("");
+        setValue("");
+        await reload();
+      } else {
+        const body = await res.text().catch(() => "");
+        setMsg({ kind: "err", text: `HTTP ${res.status} ${body.slice(0, 120)}` });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    } finally {
+      setBusy(false);
+    }
+  }, [name, value, reload]);
+
+  const del = useCallback(async (n) => {
+    if (!confirm(`Delete secret ${n}?`)) return;
+    try {
+      const res = await authFetch("/api/secrets/" + encodeURIComponent(n), {
+        method: "DELETE",
+      });
+      if (res.ok) {
+        setMsg({ kind: "ok", text: `deleted ${n}` });
+        await reload();
+      } else {
+        setMsg({ kind: "err", text: `HTTP ${res.status}` });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    }
+  }, [reload]);
+
+  const disabled = !status || !status.ok;
+
+  return html`<section class="drawer-section">
+    <h3>Secrets</h3>
+    <p class="muted" style="margin: 0 0 6px 0; font-size: 12px;">
+      Encrypted values referenced by <code>\${NAME}</code> placeholders in
+      MCP configs. On collision with an env var of the same name, the
+      stored secret wins. Values are write-only — you can replace or
+      delete, but never read back.
+    </p>
+    ${disabled
+      ? html`<p style="font-size: 12px; color: var(--err); margin: 0 0 6px 0;">
+          Store disabled: ${status && status.reason
+            ? status.reason
+            : "HARNESS_SECRETS_KEY not set"}.
+          Generate a key with
+          <code>python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"</code>
+          and set it in Zeabur env vars, then redeploy.
+        </p>`
+      : null}
+    <div style="display: flex; gap: 6px; margin-bottom: 6px; flex-wrap: wrap;">
+      <input
+        placeholder="name (e.g. GITHUB_TOKEN)"
+        value=${name}
+        onInput=${(e) => setName(e.target.value)}
+        disabled=${disabled || busy}
+        style="flex: 1; min-width: 140px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 3px 6px; font-size: 12px; font-family: ui-monospace, monospace;"
+      />
+      <input
+        type="password"
+        placeholder="value"
+        value=${value}
+        onInput=${(e) => setValue(e.target.value)}
+        disabled=${disabled || busy}
+        style="flex: 2; min-width: 180px; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 3px 6px; font-size: 12px; font-family: ui-monospace, monospace;"
+      />
+      <button
+        class="primary"
+        type="button"
+        disabled=${disabled || busy || !name.trim() || !value}
+        onClick=${save}
+      >${busy ? "saving…" : "save"}</button>
+    </div>
+    ${msg
+      ? html`<div style=${"font-size: 11px; color: " + (msg.kind === "ok" ? "var(--ok)" : "var(--err)") + "; margin-bottom: 6px;"}>${msg.text}</div>`
+      : null}
+    ${loaded && rows.length === 0
+      ? html`<p class="muted" style="font-size: 11px;">No secrets stored.</p>`
+      : null}
+    ${rows.map((s) => html`
+      <div key=${s.name} style="display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; margin-bottom: 4px; font-size: 12px;">
+        <code style="font-family: ui-monospace, monospace;">\${${s.name}}</code>
+        <span class="muted" style="font-size: 10px; flex: 1;">
+          updated ${s.updated_at ? new Date(s.updated_at).toLocaleString() : "?"}
+        </span>
+        <button
+          onClick=${() => { setName(s.name); setValue(""); }}
+          title="Replace value (name pre-filled)"
+        >replace</button>
+        <button
+          onClick=${() => del(s.name)}
+          style="color: var(--err);"
+          title="Delete this secret"
+        >delete</button>
+      </div>
+    `)}
+  </section>`;
+}
+
+
 function SettingsDrawer({ onClose, serverStatus }) {
   // A compact row summarizing the live server status: paused, running
   // agents, ws subscribers. Rendered above the health checks so the
@@ -2474,6 +2620,8 @@ function SettingsDrawer({ onClose, serverStatus }) {
           <${TeamModelsSection} />
 
           <${TeamRepoSection} />
+
+          <${SecretsSection} />
 
           <${MCPServersSection} />
 
