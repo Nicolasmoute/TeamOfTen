@@ -1061,17 +1061,18 @@ async def run_agent(
     except Exception as e:
         is_process_err = type(e).__name__ == "ProcessError"
         # Noisy-teardown suppression: if the SDK already delivered a
-        # ResultMessage this turn (work completed) and the subsequent
-        # exception is ProcessError (subprocess died during cleanup),
-        # the turn actually succeeded. Log for the operator but don't
-        # emit a red 'error' event — the 'result' event already covers
-        # the UI. Confirmed behavior against CLI 2.1.118 where a
-        # ~10-exchange turn sometimes exits 1 during teardown despite
-        # a normal result having been returned.
-        if is_process_err and turn_ctx.get("got_result"):
+        # ResultMessage this turn, the turn's work completed — any
+        # exception bubbling out of the async iterator afterwards is
+        # subprocess teardown, not a real failure. Suppress regardless
+        # of exception type: earlier CLI builds raised ProcessError
+        # here, newer ones (2.1.12x) raise a bare Exception with
+        # "Command failed with exit code 1". Either way the 'result'
+        # event already carries the is_error flag if the turn genuinely
+        # went sideways, so a second red 'error' event is pure noise.
+        if turn_ctx.get("got_result"):
             logger.warning(
-                "run_agent: suppressed post-result ProcessError for %s (turn completed, subprocess teardown noisy)",
-                agent_id,
+                "run_agent: suppressed post-result exception (%s) for %s: %s",
+                type(e).__name__, agent_id, e,
             )
             await _set_status(agent_id, "idle")
         else:
