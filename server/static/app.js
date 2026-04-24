@@ -4312,17 +4312,20 @@ function ActiveLoops({ liveEvents }) {
 // session_compacted reset the bar to zero without a fetch.
 // ------------------------------------------------------------------
 
-function ContextBar({ slot, liveEvents }) {
+function ContextBar({ slot, liveEvents, model }) {
   const [data, setData] = useState(null); // {used_tokens, context_window, ratio}
 
   const refetch = useCallback(async () => {
     try {
-      const res = await authFetch(`/api/agents/${encodeURIComponent(slot)}/context`);
+      const url = model
+        ? `/api/agents/${encodeURIComponent(slot)}/context?model=${encodeURIComponent(model)}`
+        : `/api/agents/${encodeURIComponent(slot)}/context`;
+      const res = await authFetch(url);
       if (res.ok) setData(await res.json());
     } catch (_) {
       // silent — bar just stays at last known state
     }
-  }, [slot]);
+  }, [slot, model]);
 
   useEffect(() => { refetch(); }, [refetch]);
 
@@ -5283,7 +5286,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
               ? EFFORT_LABELS[paneSettings.effort - 1]
               : "effort"}
           </button>
-          <${ContextBar} slot=${slot} liveEvents=${liveEvents} />
+          <${ContextBar} slot=${slot} liveEvents=${liveEvents} model=${paneSettings.model || ""} />
           <span class="pane-modes-spacer"></span>
           <button
             class="pane-mode-chip pane-mode-slash"

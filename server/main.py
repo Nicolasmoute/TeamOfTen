@@ -1706,20 +1706,27 @@ async def set_agent_locked(
 
 
 @app.get("/api/agents/{agent_id}/context", dependencies=[Depends(require_token)])
-async def get_agent_context(agent_id: str) -> dict[str, object]:
+async def get_agent_context(
+    agent_id: str,
+    model: str | None = None,
+) -> dict[str, object]:
     """Current context usage estimate for a slot: used tokens (from
-    latest turn on the active session), the model's context window,
-    and the ratio. Used by the pane-level ContextBar to paint fill +
-    colour. Returns zeros when there's no active session."""
+    latest turn on the active session), the effective model's context
+    window, and the ratio. Used by the pane-level ContextBar to paint
+    fill + colour. Returns zeros when there's no active session.
+
+    The `model` query param is the pane-level override (kept
+    client-side in localStorage); when provided, the window lookup
+    matches what the SDK will actually use. Omit to get the default
+    (currently 1M on Max). Unknown model ids also resolve to the
+    default — keeps the bar useful when a new model ships before the
+    table is updated."""
     if not (agent_id == "coach" or (agent_id.startswith("p") and agent_id[1:].isdigit() and 1 <= int(agent_id[1:]) <= 10)):
         raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
     from server.agents import (
         _context_window_for,
-        _get_session_id,
         _session_context_estimate,
     )
-    # Resolve effective model: pane-level / role default / SDK default.
-    # _context_window_for handles None → 1M fallback.
     c = await configured_conn()
     try:
         cur = await c.execute(
@@ -1734,17 +1741,15 @@ async def get_agent_context(agent_id: str) -> dict[str, object]:
     used = 0
     if session_id:
         used = await _session_context_estimate(session_id)
-    # Model for the window lookup: we don't know the per-pane override
-    # here (it's client-side), but the default fallback already resolves
-    # to 1M on Max plans, which is the right answer unless the user
-    # explicitly downgraded. Close enough for a colour-coded bar.
-    window = _context_window_for(None)
+    resolved_model = (model or "").strip() or None
+    window = _context_window_for(resolved_model)
     ratio = used / window if window > 0 else 0.0
     return {
         "agent_id": agent_id,
         "session_id": session_id,
         "used_tokens": used,
         "context_window": window,
+        "model": resolved_model,
         "ratio": round(ratio, 4),
     }
 
