@@ -118,6 +118,6 @@ CI runs the tests on every push ([.github/workflows/tests.yml](.github/workflows
 
 Built as a personal tool — a single operator driving a team of Claude agents, visible end-to-end. Not trying to be a product. Not trying to abstract Claude Code. Not trying to be multi-tenant. It's a harness, not a framework.
 
-The code is readable, the surface is small, and the invariants are written down in CLAUDE.md so any agent working on the codebase (including me) stays on the rails. If you fork it and make it better, open a PR — or don't, it's fine either way.
+The code is readable, the surface is small, and the invariants are written down in CLAUDE.md so any agent working on the codebase (including me) stays on the rails.
 
-PRs welcome, issues welcome, bugs expected.
+**Contributions:** this is a personal project. Fork it and make it your own — MIT-licensed, do whatever. I'm not actively reviewing pull requests or triaging issues; think of this repo as a snapshot you can adapt, not a product with a roadmap. Bugs expected.
