@@ -26,6 +26,34 @@ function lineCount(s) {
 }
 
 // ------------------------------------------------------------------
+// agent directory — slot id (p3) → human name (Gait). App.js calls
+// setAgentDirectory() on every agents-state refresh; summarizers
+// read the cache synchronously. Falls back to the slot id if the
+// agent has no name yet (fresh boot before Coach assigns).
+// ------------------------------------------------------------------
+
+let _agentDirectory = {};
+
+export function setAgentDirectory(agents) {
+  const next = {};
+  for (const a of agents || []) {
+    if (a && a.id) next[a.id] = a.name || "";
+  }
+  _agentDirectory = next;
+}
+
+function slotLabel(slot) {
+  if (!slot) return "";
+  const s = String(slot).trim().toLowerCase();
+  if (s === "broadcast") return "team";
+  if (s === "human") return "human";
+  const name = _agentDirectory[s];
+  if (name) return name;
+  if (s === "coach") return "Coach";
+  return s;
+}
+
+// ------------------------------------------------------------------
 // per-tool summarizers
 // each returns a short one-line description of the tool call
 // ------------------------------------------------------------------
@@ -51,21 +79,104 @@ const SUMMARIZERS = {
     return p + scope;
   },
   Glob: (i) => i.pattern || "",
-  ToolSearch: (i) => (i.query ? `"${i.query}"` : ""),
-  WebFetch: (i) => i.url || "",
-  WebSearch: (i) => (i.query ? `"${i.query}"` : ""),
+};
 
-  // coord_* — called as mcp__coord__coord_*; stripMcp leaves "coord_*"
-  coord_create_task: (i) => {
-    const t = i.title ? `"${i.title}"` : "";
-    const p = i.priority && i.priority !== "normal" ? `  pri=${i.priority}` : "";
-    return t + p;
+// ------------------------------------------------------------------
+// Friendly verb-phrase summarizers. When a tool has an entry here,
+// the header shows just the phrase (raw tool name moves to a tooltip
+// + still visible in the expanded JSON). Goal: replace
+//   `coord_list_tasks · status=in_progress owner=null`
+// with
+//   `Checking in-progress tasks`
+// ------------------------------------------------------------------
+
+const FRIENDLY = {
+  // --- built-ins that benefit from a verb ---
+  ToolSearch: (i) => (i.query ? `Searching tools: "${i.query}"` : "Searching tools"),
+  WebFetch: (i) => (i.url ? `Fetching ${i.url}` : "Fetching URL"),
+  WebSearch: (i) => (i.query ? `Searching web: "${i.query}"` : "Searching web"),
+  AskUserQuestion: (i) => {
+    const qs = Array.isArray(i?.questions) ? i.questions : [];
+    if (qs.length === 0) return "Asking user";
+    return `Asking user: "${truncate(qs[0]?.question || qs[0]?.prompt || "", 80)}"${qs.length > 1 ? ` (+${qs.length - 1} more)` : ""}`;
   },
+  ExitPlanMode: () => "Submitting plan for approval",
+
+  // --- tasks ---
   coord_list_tasks: (i) => {
-    const parts = [];
-    if (i.status) parts.push(`status=${i.status}`);
-    if (i.owner) parts.push(`owner=${i.owner}`);
-    return parts.join("  ");
+    const status = (i.status || "").trim().toLowerCase();
+    const owner = (i.owner || "").trim().toLowerCase();
+    const statusPart = status ? `${status} ` : "";
+    if (owner) return `Checking ${statusPart}tasks owned by ${slotLabel(owner)}`;
+    if (status) return `Checking ${status} tasks`;
+    return "Listing all tasks";
+  },
+  coord_create_task: (i) => {
+    const t = i.title ? `"${truncate(i.title, 80)}"` : "(untitled)";
+    const p = i.priority && i.priority !== "normal" ? ` [${i.priority}]` : "";
+    const parent = i.parent_id ? ` under ${i.parent_id}` : "";
+    return `Creating task ${t}${parent}${p}`;
+  },
+  coord_claim_task: (i) => `Claiming task ${i.task_id || ""}`.trim(),
+  coord_update_task: (i) => {
+    const id = i.task_id || "task";
+    if (i.status) return `Updating ${id} → ${i.status}`;
+    return `Noting progress on ${id}`;
+  },
+  coord_assign_task: (i) => `Assigning ${i.task_id || "task"} → ${slotLabel(i.to)}`,
+
+  // --- messaging ---
+  coord_send_message: (i) => {
+    const to = slotLabel(i.to);
+    const snippet =
+      (i.subject && truncate(i.subject, 80)) ||
+      truncate(((i.body || "").trim().replace(/\s+/g, " ")), 80);
+    const urg = (i.priority === "interrupt") ? " [interrupt]" : "";
+    return snippet ? `→ ${to}: "${snippet}"${urg}` : `→ ${to}${urg}`;
+  },
+  coord_read_inbox: () => "Reading inbox",
+
+  // --- memory / knowledge / decisions / context / outputs ---
+  coord_list_memory: () => "Listing memory topics",
+  coord_read_memory: (i) => `Reading memory: ${i.topic || ""}`.trim(),
+  coord_update_memory: (i) => `Updating memory: ${i.topic || ""}`.trim(),
+  coord_list_knowledge: () => "Listing knowledge",
+  coord_read_knowledge: (i) => `Reading knowledge: ${i.path || ""}`.trim(),
+  coord_write_knowledge: (i) => `Saving knowledge: ${i.path || ""}`.trim(),
+  coord_save_output: (i) => `Saving output: ${i.path || ""}`.trim(),
+  coord_write_decision: (i) =>
+    `Writing decision: "${truncate(i.title || "(untitled)", 80)}"`,
+  coord_write_context: (i) => {
+    const kind = i.kind || "root";
+    const name = i.name || (kind === "root" ? "CLAUDE" : "?");
+    return `Writing context: ${kind}/${name}`;
+  },
+
+  // --- team / workflow ---
+  coord_list_team: () => "Listing team roster",
+  coord_set_player_role: (i) =>
+    `Assigning role: ${i.player_id || "?"} → ${i.name || "?"}${i.role ? ` (${truncate(i.role, 40)})` : ""}`,
+  coord_commit_push: (i) => {
+    const msg = i.message ? ` "${truncate(i.message, 80)}"` : "";
+    const pushOff = String(i.push).toLowerCase() === "false" ? " (commit only)" : "";
+    return `Committing${msg}${pushOff}`;
+  },
+
+  // --- interactions / escalation ---
+  coord_answer_question: (i) =>
+    `Answering question ${i.correlation_id ? `(${truncate(i.correlation_id, 8)}…)` : ""}`.trim(),
+  coord_answer_plan: (i) => {
+    const verb =
+      i.decision === "approve" ? "Approving plan" :
+      i.decision === "reject" ? "Rejecting plan" :
+      i.decision === "approve_with_comments" ? "Approving plan with comments" :
+      `Plan decision: ${i.decision || "?"}`;
+    return verb;
+  },
+  coord_request_human: (i) => {
+    const urg = i.urgency === "blocker" ? " [BLOCKER]" : "";
+    const subj = i.subject ? `"${truncate(i.subject, 80)}"` : "";
+    return `Escalating to human${urg}${subj ? ": " + subj : ""}`;
   },
 };
 
@@ -205,12 +316,20 @@ function renderReadImageCard(name, input, result) {
 
 function renderGenericCard(name, input, result) {
   const cat = category(name);
-  const summary = summarize(name, input);
+  const friendlyFn = FRIENDLY[name];
+  let phrase = "";
+  if (friendlyFn) {
+    try { phrase = friendlyFn(input) || ""; } catch (_) { phrase = ""; }
+  }
+  // Friendly phrase replaces the `toolname · key=value` header.
+  // Raw tool name moves to a tooltip + stays in the expanded JSON.
+  const primary = phrase || name;
+  const secondary = phrase ? "" : summarize(name, input);
   return html`
     <details class=${"tool-card category-" + cat}>
-      <summary>
-        <span class="tool-name">${name}</span>
-        <span class="tool-summary">${summary}</span>
+      <summary title=${name}>
+        <span class=${phrase ? "tool-name tool-phrase" : "tool-name"}>${primary}</span>
+        ${secondary ? html`<span class="tool-summary">${secondary}</span>` : null}
       </summary>
       <pre class="tool-input-json">${JSON.stringify(input, null, 2)}</pre>
       ${renderResultBlock(result)}

@@ -2,7 +2,7 @@ import { h, render } from "https://esm.sh/preact@10";
 import { useState, useEffect, useMemo, useRef, useCallback, useLayoutEffect } from "https://esm.sh/preact@10/hooks";
 import htm from "https://esm.sh/htm@3";
 import Split from "https://esm.sh/split.js@1.6.5";
-import { renderToolCall } from "/static/tools.js";
+import { renderToolCall, setAgentDirectory } from "/static/tools.js";
 
 const html = htm.bind(h);
 
@@ -674,6 +674,12 @@ function App() {
   useEffect(() => {
     saveLayout({ openColumns, envOpen, envWidth });
   }, [openColumns, envOpen, envWidth]);
+
+  // Keep tool-renderer name directory (slot → human name) in sync
+  // so coord_send_message etc. can print "→ Gait" instead of "→ p3".
+  useEffect(() => {
+    setAgentDirectory(agents);
+  }, [agents]);
 
   // Global keyboard shortcuts. Kept deliberately small — anything else
   // belongs scoped to the relevant pane/component.
@@ -4835,7 +4841,11 @@ function ContextBar({ slot, liveEvents, model }) {
   const used = data.used_tokens || 0;
   const window = data.context_window;
   const fmtK = (n) => n >= 1000 ? `${(n / 1000).toFixed(0)}k` : `${n}`;
-  const title = `Context: ${fmtK(used)} / ${fmtK(window)} tokens (${pct}%)`;
+  const title =
+    `Context: ~${fmtK(used)} / ${fmtK(window)} tokens (${pct}%)\n` +
+    `Estimated from the session's conversation file on disk — ` +
+    `the actual content the CLI replays on every turn. Excludes ` +
+    `the system prompt (separate per request, ~15-30K).`;
   return html`<div
     class="pane-mode-chip context-bar"
     title=${title}

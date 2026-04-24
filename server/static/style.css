@@ -1946,6 +1946,17 @@ body {
 .tool-card.category-coord .tool-name { color: var(--ok); }
 
 .tool-card .tool-summary { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+/* Friendly verb-phrase variant: reads like a sentence, not a symbol.
+   Normal weight, full-fg color, takes the row's remaining width. */
+.tool-card .tool-name.tool-phrase {
+  color: var(--fg);
+  font-weight: 400;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .tool-card pre {
   margin: 6px 0 0;
   padding: 6px 8px;

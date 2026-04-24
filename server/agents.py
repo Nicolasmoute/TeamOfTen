@@ -287,41 +287,81 @@ def _context_window_for(model: str | None) -> int:
     return resolved if resolved > 0 else 1_000_000
 
 
-async def _session_context_estimate(session_id: str) -> int:
-    """Approximate current conversation context size for a session.
+def _count_message_chars(obj: Any) -> int:
+    """Walk a parsed jsonl message object and sum the length of its
+    text-bearing fields: `text`, `content`, `input`, `result`,
+    `output`, `message`. Recurse into lists / dicts so a nested tool
+    result or assistant content-block list still contributes.
+    Everything else (metadata, timestamps, ids) is ignored."""
+    if obj is None:
+        return 0
+    if isinstance(obj, str):
+        return len(obj)
+    if isinstance(obj, list):
+        return sum(_count_message_chars(x) for x in obj)
+    if isinstance(obj, dict):
+        total = 0
+        for k in ("text", "content", "input", "result", "output", "message"):
+            if k in obj:
+                total += _count_message_chars(obj[k])
+        return total
+    return 0
 
-    For a monotonically-growing session (no compaction), each resumed
-    turn's input_tokens already includes the full conversation
-    history. So the latest turn's (input + cache_read + cache_creation
-    + output) is the best single-turn estimate of "what the next
-    resume will send". Return 0 when no token data is available (old
-    rows pre-migration, or pre-ResultMessage calls).
-    """
+
+async def _session_context_estimate(session_id: str) -> int:
+    """Estimate tokens of conversation content from the CLI's session
+    jsonl — the append-only file the CLI replays on every resume.
+
+    Prior implementation summed `ResultMessage.usage` fields, but
+    those are cumulative BILLING totals across all API calls within
+    a turn (cache_read gets charged once per tool-round, etc.). A
+    turn with many tool rounds reports a big number; the next turn
+    with few rounds reports a small one — so the bar visibly jumps
+    mid-session, which is what the user was seeing.
+
+    The jsonl is the literal context the CLI sends the API. Walking
+    it once and summing content-length of each message, divided by
+    ~4 chars/token, gives a monotonic, non-surprising estimate.
+    System prompt is NOT in the jsonl (it's sent separately each
+    request) so this under-reports by a fixed ~15-30K offset —
+    acceptable because the compact trip-wire is threshold-based and
+    the bar is a relative indicator.
+
+    Returns 0 when the jsonl can't be found (fresh session, compact
+    just ran, CLAUDE_CONFIG_DIR unset in dev)."""
+    if not session_id:
+        return 0
+    claude_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if not claude_dir:
+        return 0
+    projects_root = Path(claude_dir) / "projects"
+    if not projects_root.is_dir():
+        return 0
     try:
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT input_tokens, output_tokens, "
-                "cache_read_tokens, cache_creation_tokens "
-                "FROM turns WHERE session_id = ? "
-                "ORDER BY id DESC LIMIT 1",
-                (session_id,),
-            )
-            row = await cur.fetchone()
-        finally:
-            await c.close()
+        jsonl_path: Path | None = None
+        # Sessions are sharded by encoded-cwd sub-dirs; one session_id
+        # is unique across the tree, so the first match is the file.
+        for p in projects_root.rglob(f"{session_id}.jsonl"):
+            jsonl_path = p
+            break
+        if jsonl_path is None:
+            return 0
+        chars = 0
+        with jsonl_path.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    chars += len(s)
+                    continue
+                chars += _count_message_chars(obj)
+        return chars // 4
     except Exception:
-        logger.exception("session_context_estimate: DB read failed")
+        logger.exception("session_context_estimate: jsonl parse failed")
         return 0
-    if not row:
-        return 0
-    d = dict(row)
-    total = 0
-    for k in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"):
-        v = d.get(k)
-        if isinstance(v, int):
-            total += v
-    return total
 
 
 async def _handle_message(
