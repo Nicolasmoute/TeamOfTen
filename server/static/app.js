@@ -2851,6 +2851,7 @@ function EnvAttentionSection({ conversations }) {
         correlation_id: pq.correlation_id,
         questions: pq.questions || [],
         ts: pq.created_at,
+        deadline_at: pq.deadline_at || null,
         subject: pq.questions && pq.questions[0]
           ? pq.questions[0].question
           : "Question",
@@ -2869,6 +2870,7 @@ function EnvAttentionSection({ conversations }) {
         correlation_id: pp.correlation_id,
         plan: pp.plan || "",
         ts: pp.created_at,
+        deadline_at: pp.deadline_at || null,
         subject: "Plan approval — " + (pp.agent_id || ""),
       });
     }
@@ -2990,6 +2992,81 @@ function EnvAttentionSection({ conversations }) {
 }
 
 // Structured-question answer form, rendered inside an attention item
+// Shared countdown + extend button for pending_question and
+// pending_plan interactions. Renders ⏱ MM:SS with colour shifting
+// amber→red as the deadline approaches, plus a +30 min button that
+// POSTs /api/interactions/<id>/extend. deadline_at comes from the
+// server (authoritative); local `now` ticks every 1s to update the
+// display without another round-trip.
+function InteractionCountdown({ correlationId, deadlineAt, onExtended }) {
+  const deadlineMs = useMemo(() => {
+    if (!deadlineAt) return null;
+    const t = Date.parse(deadlineAt);
+    return isNaN(t) ? null : t;
+  }, [deadlineAt]);
+  const [now, setNow] = useState(() => Date.now());
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    if (!deadlineMs) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [deadlineMs]);
+
+  if (!deadlineMs || !correlationId) return null;
+  const remainingMs = Math.max(0, deadlineMs - now);
+  const remainingS = Math.floor(remainingMs / 1000);
+  const mm = String(Math.floor(remainingS / 60)).padStart(2, "0");
+  const ss = String(remainingS % 60).padStart(2, "0");
+  const cls = remainingS < 30
+    ? "countdown-red"
+    : remainingS < 120
+    ? "countdown-amber"
+    : "countdown-green";
+
+  const extend = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const res = await authFetch(
+        "/api/interactions/" + encodeURIComponent(correlationId) + "/extend",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ seconds: 1800 }),
+        }
+      );
+      if (!res.ok) {
+        const b = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status}${b ? " — " + b.slice(0, 120) : ""}`);
+      }
+      const data = await res.json();
+      if (onExtended && data && data.deadline_at) onExtended(data.deadline_at);
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return html`<div class="interaction-countdown">
+    <span class=${"countdown-clock " + cls} title="Time until this interaction auto-expires">
+      ⏱ ${mm}:${ss}
+    </span>
+    <button
+      class="countdown-extend"
+      disabled=${busy}
+      onClick=${extend}
+      title="Push the deadline out by 30 minutes"
+    >${busy ? "…" : "+30 min"}</button>
+    ${err
+      ? html`<span class="countdown-err" title=${err}>extend failed</span>`
+      : null}
+  </div>`;
+}
+
+
 // when the event carries a `questions` array (from coord_ask_question).
 // Radios for single-select, checkboxes for multi-select, plus an
 // "Other…" free-text per question. On submit, answers are formatted
@@ -3077,8 +3154,17 @@ function QuestionForm({ event, onSubmitted }) {
     }
   };
 
+  // Local override so the countdown reflects extensions without a
+  // full round-trip through the pending-list re-fetch.
+  const [localDeadline, setLocalDeadline] = useState(event.deadline_at || null);
+
   if (!questions.length) return null;
   return html`<div class="question-form">
+    <${InteractionCountdown}
+      correlationId=${event.correlation_id}
+      deadlineAt=${localDeadline}
+      onExtended=${(d) => setLocalDeadline(d)}
+    />
     ${questions.map((q, qi) => {
       const s = state[qi];
       const multi = !!q.multi_select;
@@ -3146,6 +3232,7 @@ function PlanApprovalForm({ event, onSubmitted }) {
   const [comments, setComments] = useState("");
   const [sending, setSending] = useState(false);
   const [err, setErr] = useState(null);
+  const [localDeadline, setLocalDeadline] = useState(event.deadline_at || null);
   const planText = event.plan || "";
 
   const submit = async (decision) => {
@@ -3182,6 +3269,11 @@ function PlanApprovalForm({ event, onSubmitted }) {
   };
 
   return html`<div class="plan-form">
+    <${InteractionCountdown}
+      correlationId=${event.correlation_id}
+      deadlineAt=${localDeadline}
+      onExtended=${(d) => setLocalDeadline(d)}
+    />
     <pre class="plan-body">${planText}</pre>
     <textarea
       class="plan-comments"

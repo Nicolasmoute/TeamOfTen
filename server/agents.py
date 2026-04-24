@@ -1707,6 +1707,7 @@ async def _handle_ask_user_question(
                     "subject": subject,
                     "questions": questions,
                     "body": md_body,
+                    "deadline_at": interactions_registry._iso(entry.deadline_ts),
                 }
             )
         else:
@@ -1740,6 +1741,7 @@ async def _handle_ask_user_question(
                     "subject": subject,
                     "questions": questions,
                     "message_id": msg_id,
+                    "deadline_at": interactions_registry._iso(entry.deadline_ts),
                 }
             )
             await maybe_wake_agent(
@@ -1833,6 +1835,7 @@ async def _handle_exit_plan_mode(
                     "correlation_id": correlation_id,
                     "route": "human",
                     "plan": plan_text,
+                    "deadline_at": interactions_registry._iso(entry.deadline_ts),
                 }
             )
         else:
@@ -1868,6 +1871,7 @@ async def _handle_exit_plan_mode(
                     "subject": subject,
                     "plan": plan_text,
                     "message_id": msg_id,
+                    "deadline_at": interactions_registry._iso(entry.deadline_ts),
                 }
             )
             await maybe_wake_agent(

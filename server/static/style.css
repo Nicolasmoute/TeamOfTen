@@ -690,6 +690,52 @@ body {
   font-size: 11px;
 }
 
+/* Countdown + extend button shared by QuestionForm and
+   PlanApprovalForm. Thin row at the top of the form — clock colour
+   shifts amber→red as the deadline approaches. */
+.interaction-countdown {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  margin-bottom: 6px;
+  padding: 3px 6px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+}
+.countdown-clock {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-weight: 600;
+  min-width: 60px;
+}
+.countdown-green { color: var(--ok, #3fb950); }
+.countdown-amber { color: #e3a03a; }
+.countdown-red {
+  color: var(--err, #ff5a5a);
+  animation: countdown-pulse 1s ease-in-out infinite;
+}
+@keyframes countdown-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.6; }
+}
+.countdown-extend {
+  margin-left: auto;
+  padding: 2px 8px;
+  font-size: 11px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.countdown-extend:hover { border-color: var(--accent); }
+.countdown-extend:disabled { opacity: 0.5; cursor: wait; }
+.countdown-err {
+  color: var(--err);
+  font-size: 10px;
+}
+
 /* Plan-approval form — rendered inside an attention item when a
    pending_plan event arrives (ExitPlanMode via can_use_tool). */
 .plan-form {

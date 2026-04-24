@@ -2159,6 +2159,47 @@ async def decide_pending_plan(
     return {"ok": True, "correlation_id": correlation_id, "decision": req.decision}
 
 
+class ExtendInteractionRequest(BaseModel):
+    # Seconds from NOW for the new deadline. Clamped [30, 86400] in
+    # interactions.extend(). Default 1800 matches the standard window.
+    seconds: int = Field(default=1800, ge=30, le=86_400)
+
+
+@app.post(
+    "/api/interactions/{correlation_id}/extend",
+    dependencies=[Depends(require_token)],
+)
+async def extend_pending_interaction(
+    correlation_id: str,
+    req: ExtendInteractionRequest,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, Any]:
+    """Push a pending question-or-plan's deadline out. Both kinds
+    share this endpoint — routing by correlation_id, not by kind."""
+    from server import interactions as interactions_registry
+    result = interactions_registry.extend(correlation_id, req.seconds)
+    if result is None:
+        raise HTTPException(
+            404,
+            detail=f"interaction {correlation_id!r} not found or already resolved",
+        )
+    entry = interactions_registry.get(correlation_id)
+    kind = entry.kind if entry else "unknown"
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "human",
+            "type": "interaction_extended",
+            "correlation_id": correlation_id,
+            "interaction_kind": kind,
+            "deadline_at": result["deadline_at"],
+            "seconds_from_now": result["seconds_from_now"],
+            "actor": actor,
+        }
+    )
+    return {"ok": True, **result, "kind": kind}
+
+
 class HumanMessageRequest(BaseModel):
     to: str
     body: str = Field(min_length=1, max_length=5000)

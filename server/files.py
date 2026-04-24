@@ -94,6 +94,35 @@ def _roots() -> dict[str, Root]:
             Path(os.environ.get("HARNESS_UPLOADS_DIR", "/data/uploads")),
             writable=False,
         ),
+        # Claude CLI plan-mode artifacts. When an agent is in plan
+        # mode and uses Write to save its plan, the CLI lands it under
+        # CLAUDE_CONFIG_DIR/plans/*.md. These are inputs to the
+        # ExitPlanMode approval flow — operator wants to see them
+        # alongside the inline plan body. Read-only from the UI (the
+        # agent is the author; human-approved plans become decisions
+        # / knowledge if durable).
+        "plans": Root(
+            "plans",
+            Path(
+                os.environ.get(
+                    "HARNESS_PLANS_DIR",
+                    str(
+                        Path(
+                            os.environ.get("CLAUDE_CONFIG_DIR", "/data/claude")
+                        ) / "plans"
+                    ),
+                )
+            ),
+            writable=False,
+        ),
+        # Compact handoff archive. Auto-written by the compact flow
+        # (kDrive-mirrored; local fallback). Useful to revisit past
+        # session summaries without having to read the jsonl.
+        "handoffs": Root(
+            "handoffs",
+            Path(os.environ.get("HARNESS_HANDOFFS_DIR", "/data/handoffs")),
+            writable=False,
+        ),
     }
 
 
