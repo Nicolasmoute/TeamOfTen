@@ -17,7 +17,8 @@ Nice little project. Have fun, improve it.
 - You send a goal to **Coach** in the UI.
 - Coach decomposes it into tasks on a shared board and push-assigns them to specific **Players** (`p1` through `p10`, auto-named after lacrosse legends by default).
 - The assignee auto-wakes, reads their inbox, claims the task, and works in their **own git worktree** on your project repo — full direct git access, `git commit + push` straight back to GitHub.
-- Players can message each other for info, drop notes in **shared memory**, produce durable **knowledge artifacts**, save **binary outputs**, and ship **decisions**.
+- Players can message each other for info, drop notes in **shared memory**, produce durable **knowledge artifacts** (plain markdown), save **binary outputs**, and ship **decisions**.
+- **Ideal backend for a Karpathy/Obsidian-style wiki.** Since knowledge artifacts are plain `.md` files on a folder tree, pointing Obsidian (or Logseq, or any markdown tool) at the synced cloud drive gives you a live second-brain that agents contribute to directly — wikilinks, backlinks, graph view, search, all for free. I've been running this setup and it's worked really well in practice.
 - Agents can use **external MCP servers** you wire in (Notion, Slack, Linear, Sentry — anything that speaks MCP), credentials stored in an encrypted on-disk vault.
 - You're part of the team: open any agent's pane to read what they're saying, **send them a direct prompt**, watch the live tool-use stream, override their model / effort / plan-mode, or pause/cancel a runaway turn. Coach is the recommended entry point but never the only one.
 - Every agent's session, context usage, and cost is live in its own pane. Drag-to-rearrange, stack, split — it's your workspace.
