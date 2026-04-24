@@ -52,6 +52,7 @@ from server.events import bus
 from server.kdrive import kdrive
 from server.sync import (
     attachments_trim_loop,
+    sessions_trim_loop,
     events_trim_loop,
     flush_loop,
     outputs_push_loop,
@@ -219,9 +220,10 @@ async def lifespan(app: FastAPI):
     coach_repeat_task = asyncio.create_task(coach_repeat_loop())
     trim_task = asyncio.create_task(events_trim_loop())
     att_trim_task = asyncio.create_task(attachments_trim_loop())
+    sessions_trim_task = asyncio.create_task(sessions_trim_loop())
     uploads_task = asyncio.create_task(uploads_pull_loop())
     outputs_task = asyncio.create_task(outputs_push_loop())
-    bg_tasks = (sync_task, snapshot_task, coach_task, coach_repeat_task, trim_task, att_trim_task, uploads_task, outputs_task)
+    bg_tasks = (sync_task, snapshot_task, coach_task, coach_repeat_task, trim_task, att_trim_task, sessions_trim_task, uploads_task, outputs_task)
     try:
         yield
     finally:

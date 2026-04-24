@@ -451,10 +451,19 @@ async def _handle_message(
         ):
             summary = (turn_ctx.get("compact_text") or "").strip()
             if summary:
+                # Auto-appended footer pointing at the session jsonl +
+                # the handoff file. The model's summary is lossy by
+                # design; this footer tells fresh-you where to find the
+                # full record if they need exact strings. session_id is
+                # known here (captured off the ResultMessage above).
+                footer = _build_compact_footer(session_id)
+                summary_with_footer = summary.rstrip() + "\n\n" + footer
                 # Full long-form handoff lives on disk (kDrive-mirrored).
                 # The continuity_note stored in the DB is a short pointer
                 # that gets injected into the next system prompt.
-                handoff_file = await _write_handoff_file(agent_id, summary)
+                handoff_file = await _write_handoff_file(
+                    agent_id, summary_with_footer,
+                )
                 # The summary itself is what gets injected into fresh-you's
                 # system prompt. The file is a durable copy (kDrive-
                 # mirrored) and lets other agents / the human reference
@@ -467,9 +476,9 @@ async def _handle_message(
                         f"handoffs/{handoff_file} for audit + cross-agent "
                         f"reference; the text below is the full content._"
                         f"\n\n"
-                    ) + summary
+                    ) + summary_with_footer
                 else:
-                    pointer = summary
+                    pointer = summary_with_footer
                 await _set_continuity_note(agent_id, pointer)
                 await _set_session_id(agent_id, None)
                 # Freeze the exchange log we just quoted into the
@@ -660,7 +669,13 @@ COMPACT_PROMPT = (
     "Chronological narrative of the session's arc: what was tried, "
     "what worked, what didn't, dead ends you ruled out and why. "
     "Fresh-you reading this should understand the path of reasoning, "
-    "not just the final state. 2-5 paragraphs.\n\n"
+    "not just the final state. Include the PURPOSE this session serves "
+    "in the operator's broader work (not just what we did, but WHY "
+    "they need it). If this session has been running inside a recurring "
+    "workflow pattern (stepping through a list, iterating on revisions, "
+    "babysitting a long job), describe that pattern explicitly so "
+    "fresh-you knows whether to resume in the same mode. 2-5 "
+    "paragraphs.\n\n"
     "## Open questions\n"
     "Everything still undecided or pending clarification. Quote each "
     "question VERBATIM as asked (by the human or by you to them). "
@@ -671,11 +686,20 @@ COMPACT_PROMPT = (
     "session that aren't already in memory/ or decisions/. For each: "
     "what, why, and who agreed. These are the things that would be "
     "LOST if this handoff fails.\n\n"
-    "## References (quote verbatim)\n"
-    "URLs fetched, file paths touched, exact error messages, commit "
-    "hashes, command output snippets under ~30 lines, and any code "
-    "fragments that matter. Paraphrase destroys these — quote them "
-    "precisely inside code blocks or blockquotes.\n\n"
+    "## References\n"
+    "URLs fetched, file paths, exact error messages, commit hashes, "
+    "command output snippets, code fragments.\n\n"
+    "**Graduated detail**: the ~5 most-recent / most-relevant items "
+    "get verbatim code blocks or quoted strings (paraphrase destroys "
+    "these). Older references get one line each — just enough that "
+    "fresh-you can locate them. Don't flatten everything to verbatim "
+    "— the goal is that recent work is replayable and old work is "
+    "findable.\n\n"
+    "**Inherited vs. changed**: when listing files, tag each as "
+    "**touched** (you modified it this session) or **read-only** "
+    "(you only read it — pre-existing state you inherited). This "
+    "lets fresh-you tell their own work apart from what was already "
+    "there.\n\n"
     "## People & roles\n"
     "Who participated, what each person (or agent) is responsible "
     "for, any stated preferences or pet-peeves that came up, and "
@@ -943,6 +967,54 @@ async def _set_continuity_note(agent_id: str, text: str | None) -> None:
         await c.commit()
     finally:
         await c.close()
+
+
+def _build_compact_footer(session_id: str | None) -> str:
+    """Render the 'Where to find more' footer appended to every compact
+    summary. The model's summary is lossy by design — this footer
+    points fresh-you at the authoritative record if they need exact
+    strings / code / URLs the summary smoothed over.
+
+    Paths:
+    - The handoff .md file itself (kDrive-mirrored when configured).
+    - The CLI session jsonl under CLAUDE_CONFIG_DIR/projects/, by
+      session id. We name the id explicitly so the operator can find
+      the file without having to replay any cwd-encoding logic.
+    """
+    try:
+        retention = int(os.environ.get("HARNESS_SESSION_RETENTION_DAYS", "30"))
+    except ValueError:
+        retention = 30
+    if retention <= 0:
+        retention_note = "kept indefinitely (retention disabled)"
+    else:
+        retention_note = f"auto-pruned after {retention} days"
+
+    claude_dir = os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")
+    if session_id:
+        jsonl_hint = (
+            f"`{claude_dir}/projects/<encoded-cwd>/{session_id}.jsonl`"
+        )
+    else:
+        jsonl_hint = (
+            f"`{claude_dir}/projects/<encoded-cwd>/<session-id>.jsonl` "
+            "(session id was not captured for this turn)"
+        )
+
+    return (
+        "---\n"
+        "## Where to find more _(auto-appended by the harness)_\n\n"
+        "The summary above is lossy by design. If you need exact "
+        "strings, tool outputs, URLs, or code that isn't preserved "
+        "below, the full record exists:\n\n"
+        f"- **Full session transcript** (every message, tool call, "
+        f"response): {jsonl_hint}. {retention_note.capitalize()}. "
+        "Ask the operator to surface it if you can't read it directly "
+        "from your workspace.\n"
+        "- **This handoff itself** is saved at `handoffs/<agent>-"
+        "<timestamp>.md` (the exact filename is in the one-line "
+        "pointer above, if any)."
+    )
 
 
 async def _write_handoff_file(agent_id: str, summary: str) -> str | None:

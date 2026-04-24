@@ -74,6 +74,17 @@ ATTACHMENTS_RETENTION_DAYS = int(
     os.environ.get("HARNESS_ATTACHMENTS_RETENTION_DAYS", "30")
 )
 
+# Claude CLI session jsonl files under CLAUDE_CONFIG_DIR/projects/
+# hold the full per-session transcript the SDK writes. They pile up
+# over time — each long session is single-digit MB. 30 days is the
+# default, matching events + attachments. 0 disables the sweep (keep
+# forever). The compact handoff footer tells fresh-you these files
+# are auto-pruned at this cadence, so keep this env in sync with the
+# footer copy if you change it.
+SESSION_RETENTION_DAYS = int(
+    os.environ.get("HARNESS_SESSION_RETENTION_DAYS", "30")
+)
+
 # kDrive → local uploads pull. Users drop reference docs at
 # kDrive://uploads/ via the web UI or sync client; we mirror them
 # into /data/uploads (which each agent workspace symlinks as
@@ -589,6 +600,71 @@ async def attachments_trim_loop() -> None:
             raise
         except Exception:
             logger.exception("attachments trim cycle failed")
+        try:
+            await asyncio.sleep(EVENTS_TRIM_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+
+
+async def trim_sessions_once() -> int:
+    """Delete Claude CLI session jsonl files older than
+    SESSION_RETENTION_DAYS under CLAUDE_CONFIG_DIR/projects/. The SDK
+    writes one .jsonl per session here and never prunes them itself.
+    No-op when the directory doesn't exist yet (fresh deploy pre-first-
+    turn). Returns count of files deleted."""
+    if SESSION_RETENTION_DAYS <= 0:
+        return 0
+    claude_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if not claude_dir:
+        return 0
+    projects_root = Path(claude_dir) / "projects"
+    if not projects_root.is_dir():
+        return 0
+    cutoff_ts = (
+        datetime.now(timezone.utc) - timedelta(days=SESSION_RETENTION_DAYS)
+    ).timestamp()
+    deleted = 0
+    # Recurse because sessions are sharded by encoded-cwd sub-dirs.
+    for jsonl in projects_root.rglob("*.jsonl"):
+        if not jsonl.is_file():
+            continue
+        try:
+            if jsonl.stat().st_mtime < cutoff_ts:
+                jsonl.unlink()
+                deleted += 1
+        except OSError:
+            logger.exception("sessions trim: failed on %s", jsonl)
+    if deleted:
+        logger.info(
+            "sessions trim: deleted %d jsonl file(s) older than %dd",
+            deleted, SESSION_RETENTION_DAYS,
+        )
+    return deleted
+
+
+async def sessions_trim_loop() -> None:
+    """Daily sweep of Claude CLI session jsonl files. Same cadence +
+    first-delay convention as the other trim loops."""
+    if SESSION_RETENTION_DAYS <= 0:
+        logger.info(
+            "sessions trim loop disabled (HARNESS_SESSION_RETENTION_DAYS=0)"
+        )
+        return
+    logger.info(
+        "sessions trim loop starting: retention=%dd",
+        SESSION_RETENTION_DAYS,
+    )
+    try:
+        await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        raise
+    while True:
+        try:
+            await trim_sessions_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("sessions trim cycle failed")
         try:
             await asyncio.sleep(EVENTS_TRIM_INTERVAL_SECONDS)
         except asyncio.CancelledError:
