@@ -147,6 +147,14 @@ async def _handle_message(
         for block in msg.content:
             if isinstance(block, TextBlock):
                 await _emit(agent_id, "text", content=block.text)
+                # Compact-mode accumulator: the final assistant text
+                # becomes the continuity note. We keep appending so a
+                # multi-block response still coalesces.
+                if turn_ctx is not None and turn_ctx.get("compact_mode"):
+                    prev = turn_ctx.get("compact_text") or ""
+                    turn_ctx["compact_text"] = (
+                        prev + ("\n\n" if prev else "") + (block.text or "")
+                    )
             elif isinstance(block, ThinkingBlock):
                 # Final consolidated thinking content — surfaces as a
                 # collapsible card in the UI.
@@ -221,7 +229,43 @@ async def _handle_message(
             session_id=session_id,
         )
         await _add_cost(agent_id, cost)
-        await _set_session_id(agent_id, session_id)
+        # Compact turn completed successfully: commit the assistant's
+        # summary as the continuity note and null session_id so the
+        # NEXT turn starts on a fresh conversation with the summary
+        # injected into its system prompt. A compact turn that errored
+        # leaves both fields alone — user retries or falls back to a
+        # plain /clear.
+        if (
+            turn_ctx is not None
+            and turn_ctx.get("compact_mode")
+            and not msg.is_error
+        ):
+            summary = (turn_ctx.get("compact_text") or "").strip()
+            if summary:
+                await _set_continuity_note(agent_id, summary)
+                await _set_session_id(agent_id, None)
+                await _emit(
+                    agent_id,
+                    "session_compacted",
+                    chars=len(summary),
+                )
+            else:
+                # Model didn't produce any text — don't wipe the session
+                # just because we asked it to. Same as a compact failure.
+                await _set_session_id(agent_id, session_id)
+        else:
+            await _set_session_id(agent_id, session_id)
+            # First fresh turn AFTER a compact: the handoff has been
+            # consumed via the system prompt. Clear it so subsequent
+            # turns (now resuming this new session_id) don't keep
+            # re-injecting a stale summary.
+            if (
+                turn_ctx is not None
+                and not turn_ctx.get("compact_mode")
+                and not msg.is_error
+                and turn_ctx.get("had_handoff_on_entry")
+            ):
+                await _set_continuity_note(agent_id, None)
         if turn_ctx is not None:
             await _insert_turn_row(
                 agent_id=agent_id,
@@ -278,6 +322,12 @@ def is_paused() -> bool:
 def set_paused(v: bool) -> None:
     global _paused
     _paused = bool(v)
+
+
+def is_agent_running(agent_id: str) -> bool:
+    """True when there's a live in-flight SDK turn for this slot."""
+    task = _running_tasks.get(agent_id)
+    return task is not None and not task.done()
 
 
 async def cancel_agent(agent_id: str) -> bool:
@@ -469,6 +519,43 @@ async def _get_agent_brief(agent_id: str) -> str | None:
         return None
     v = dict(row).get("brief")
     return v if v else None
+
+
+async def _get_continuity_note(agent_id: str) -> str | None:
+    """Read agent.continuity_note — a compact-generated summary of the
+    prior session, injected into the next fresh turn's system prompt."""
+    if agent_id == "system":
+        return None
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT continuity_note FROM agents WHERE id = ?", (agent_id,)
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("get_continuity_note failed: agent=%s", agent_id)
+        return None
+    if not row:
+        return None
+    v = dict(row).get("continuity_note")
+    return v if v else None
+
+
+async def _set_continuity_note(agent_id: str, text: str | None) -> None:
+    """Write (or clear) the continuity note. Pass None/empty to clear."""
+    payload = (text or "").strip() or None
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE agents SET continuity_note = ? WHERE id = ?",
+            (payload, agent_id),
+        )
+        await c.commit()
+    finally:
+        await c.close()
 
 
 async def _locked_players() -> list[str]:
@@ -818,6 +905,7 @@ async def run_agent(
     model: str | None = None,
     plan_mode: bool = False,
     effort: int | None = None,
+    compact_mode: bool = False,
 ) -> None:
     """Spawn one SDK query for the given slot and stream its events.
 
@@ -933,6 +1021,24 @@ async def run_agent(
             "\n\n## Agent brief (specific to you, set by the human)\n\n"
             + brief_text.strip()
         )
+    # Continuity note — summary written by a prior /compact turn. Only
+    # consumed on the FIRST fresh turn after compact (session_id was
+    # nulled at compact time, so prior_session is None here). We still
+    # inject it whenever present; it stays until the agent is
+    # explicitly compacted again or the human clears it via the API.
+    # Keep this block BEFORE the lock suffix so the handoff reads
+    # naturally — "here's where you left off, here's the current
+    # roster state".
+    handoff_suffix = ""
+    handoff_text = await _get_continuity_note(agent_id)
+    if handoff_text:
+        handoff_suffix = (
+            "\n\n## Handoff from your prior session (via /compact)\n\n"
+            + handoff_text.strip()
+            + "\n\n(Your previous conversation history has been cleared "
+            "to free context. The summary above is your memory of what "
+            "came before.)"
+        )
     # Lock-state suffix — Coach-only. Tells Coach up-front which
     # Players are off-limits so they plan around the constraint
     # instead of wasting turns hitting the tool-layer rejection.
@@ -951,15 +1057,22 @@ async def run_agent(
                 "around this constraint — pick other Players or tell "
                 "the human if no suitable unlocked Player remains."
             )
-    system_prompt = _system_prompt_for(agent_id) + context_suffix + brief_suffix + lock_suffix
-    if context_suffix or brief_suffix:
+    system_prompt = (
+        _system_prompt_for(agent_id)
+        + context_suffix
+        + brief_suffix
+        + handoff_suffix
+        + lock_suffix
+    )
+    if context_suffix or brief_suffix or handoff_suffix:
         # Emit sizes (not content) so the user can see "yes my stuff was
         # picked up" without drowning the timeline in prompt text.
         await _emit(
             agent_id,
             "context_applied",
-            chars=len(context_suffix) + len(brief_suffix),
+            chars=len(context_suffix) + len(brief_suffix) + len(handoff_suffix),
             brief_chars=len(brief_suffix),
+            handoff_chars=len(handoff_suffix),
         )
 
     options_kwargs: dict[str, Any] = dict(
@@ -1010,6 +1123,16 @@ async def run_agent(
         "model": model,
         "plan_mode": plan_mode,
         "effort": effort,
+        # When True, the ResultMessage handler saves the accumulated
+        # assistant text to agents.continuity_note and nulls session_id,
+        # implementing a CLI-/compact-equivalent: summarize, then drop
+        # the history so the next turn starts on a clean context.
+        "compact_mode": compact_mode,
+        # True when the system prompt we just built embedded a handoff
+        # section — the ResultMessage handler uses this to clear the
+        # note on the first successful non-compact turn after a
+        # compact, so stale handoffs don't re-inject forever.
+        "had_handoff_on_entry": bool(handoff_suffix) and not compact_mode,
     }
 
     async def _iterate(opts: ClaudeAgentOptions) -> None:

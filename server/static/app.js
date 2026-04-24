@@ -239,8 +239,9 @@ const SLASH_COMMANDS = [
   { cmd: "/effort", desc: "open the effort slider (low…max)" },
   { cmd: "/brief",  desc: "edit this agent's brief" },
   { cmd: "/tools",  desc: "list the tools this agent can use" },
-  { cmd: "/clear",  desc: "clear session so the next turn starts fresh" },
-  { cmd: "/cancel", desc: "cancel the in-flight turn on this pane" },
+  { cmd: "/clear",   desc: "clear session so the next turn starts fresh" },
+  { cmd: "/compact", desc: "summarize current session; next turn resumes with summary" },
+  { cmd: "/cancel",  desc: "cancel the in-flight turn on this pane" },
   { cmd: "/loop",   desc: "Coach autoloop: /loop 60 → tick every 60s · /loop off" },
   { cmd: "/tick",   desc: "nudge Coach to drain inbox right now" },
   { cmd: "/status", desc: "show server runtime state (paused, running, spend)" },
@@ -4263,6 +4264,20 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
         authFetch("/api/agents/" + slot + "/session", { method: "DELETE" })
           .then(() => setInfoText("Session cleared. Next turn starts fresh."))
           .catch((e) => setInfoText("Session clear failed: " + String(e)));
+        return true;
+      case "/compact":
+        // Asks the agent to summarize its current session into a
+        // continuity note, then nulls session_id. The next turn
+        // starts fresh but with the summary in its system prompt —
+        // equivalent to Claude Code CLI's /compact. Server returns
+        // 409 if the agent is currently running.
+        authFetch("/api/agents/" + slot + "/compact", { method: "POST" })
+          .then((r) => {
+            if (r.ok) setInfoText("Compact queued — watch for session_compacted event.");
+            else if (r.status === 409) setInfoText("Agent is running — finish or /cancel first.");
+            else setInfoText("Compact failed: HTTP " + r.status);
+          })
+          .catch((e) => setInfoText("Compact failed: " + String(e)));
         return true;
       case "/cancel":
         // Cancel the in-flight turn for THIS pane's agent. Server

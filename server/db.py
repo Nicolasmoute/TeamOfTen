@@ -269,6 +269,12 @@ async def init_db() -> None:
                 # reads all shared docs and responds to human prompts.
                 # INTEGER 0/1 (SQLite has no bool); default 0.
                 ("locked", "ALTER TABLE agents ADD COLUMN locked INTEGER NOT NULL DEFAULT 0"),
+                # /compact output. Populated by a compact turn that
+                # summarizes the current session; then session_id is
+                # nulled so the next spawn starts fresh with this note
+                # injected into the system prompt as "prior session
+                # handoff". NULL / empty = no handoff text.
+                ("continuity_note", "ALTER TABLE agents ADD COLUMN continuity_note TEXT"),
             ):
                 try:
                     await db.execute(col_ddl)
