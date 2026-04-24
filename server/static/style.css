@@ -1817,23 +1817,17 @@ body {
   line-height: 1.4;
 }
 .event.result { border-color: var(--ok); color: var(--muted); font-size: 12px; }
-.event.result .event-meta::before {
-  content: "✓ ";
-  color: var(--ok);
-  font-weight: 700;
-}
 .event.error { border-color: var(--err); color: var(--err); }
 .event.task_created { border-color: var(--warn); }
 .event.task_assigned { border-color: var(--warn); color: var(--muted); font-size: 12px; }
 .event.message_sent { border-color: var(--tool); font-size: 12px; }
 .event.message_sent .event-body { color: var(--fg); margin-top: 2px; }
 
-/* System / progress events — purple-tagged single line. Distinct enough
-   from agent prose / tool calls / your input that the eye recognizes
-   "harness telemetry" at a glance. The "sys" prefix is injected via
-   ::before so existing markup doesn't need to carry the label. */
+/* System / progress events — single line, muted so they fade into
+   the background vs. the main assistant text. Same shape as other
+   .event entries but collapsed padding. */
 .event.sys {
-  border-color: var(--tool-edit);
+  border-color: var(--border);
   color: var(--muted);
   font-size: 11px;
   padding: 2px 10px;
@@ -1841,12 +1835,6 @@ body {
 .event.sys .event-meta {
   color: var(--muted);
   margin-bottom: 0;
-}
-.event.sys .event-meta::before {
-  content: "sys ";
-  color: var(--tool-edit);
-  font-weight: 700;
-  margin-right: 2px;
 }
 
 /* Session break — loud horizontal divider. Marks the point where
@@ -1894,11 +1882,7 @@ body {
   position: sticky;
   top: 0;
   z-index: 5;
-  /* Faint blue tint marks "this is your input" — the eye finds the
-     boundary between your prompt and the agent's response without
-     reading the timestamp. Stays subtle so it doesn't overpower
-     agent prose. */
-  background: rgba(59, 130, 246, 0.10);
+  background: var(--bg);
   border-left: 3px solid var(--accent);
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
@@ -1906,8 +1890,6 @@ body {
   padding: 6px 12px;
   border-radius: 0;
 }
-.turn-header-prompt { color: #f0f0f4; }   /* brighter than --fg for the user voice */
-.turn-header-arrow  { color: var(--accent); font-weight: 700; }
 .turn-header-row {
   display: flex;
   align-items: center;
@@ -1985,17 +1967,15 @@ body {
    a scanning eye tells read vs write vs run vs coord at a glance without
    reading the tool name. Bullet + name share the color; args stay muted. */
 .tool-card.category-read    summary::before { color: var(--tool-read); }
-.tool-card.category-search  summary::before { color: var(--tool-search); }
 .tool-card.category-write   summary::before { color: var(--tool-edit); }
 .tool-card.category-run     summary::before { color: var(--tool-bash); }
 .tool-card.category-coord   summary::before { color: var(--accent); }
 
 .tool-card .tool-name { color: var(--fg); font-weight: 600; }
-.tool-card.category-read   .tool-name { color: var(--tool-read); }
-.tool-card.category-search .tool-name { color: var(--tool-search); }
-.tool-card.category-write  .tool-name { color: var(--tool-edit); }
-.tool-card.category-run    .tool-name { color: var(--tool-bash); }
-.tool-card.category-coord  .tool-name { color: var(--accent); }
+.tool-card.category-read  .tool-name { color: var(--tool-read); }
+.tool-card.category-write .tool-name { color: var(--tool-edit); }
+.tool-card.category-run   .tool-name { color: var(--tool-bash); }
+.tool-card.category-coord .tool-name { color: var(--accent); }
 
 .tool-card .tool-summary { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
 /* Friendly verb-phrase variant: reads like a sentence, not a symbol.
