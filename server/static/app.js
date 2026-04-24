@@ -1631,8 +1631,9 @@ function ClaudeAuthSection({ health, onRefresh }) {
     <p class="muted" style="font-size: 11px; margin: 0 0 8px 0;">
       On any machine with Claude Code installed, run <code>claude /login</code>,
       then paste the contents of <code>~/.claude/.credentials.json</code>
-      below. Tokens refresh automatically from this snapshot — you only
-      do this once per deploy (or after rotating credentials).
+      below. Tokens refresh automatically from there on, and they live
+      on the persistent volume — so you only do this once, not on
+      every redeploy. Do it again only if you rotate credentials.
     </p>
     <textarea
       rows="6"
