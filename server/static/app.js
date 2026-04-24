@@ -4549,11 +4549,10 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
           body: JSON.stringify({ interval_seconds: target }),
         })
           .then(() => {
-            setInfoText(
-              target === 0
-                ? "Coach autoloop stopped."
-                : `Coach autoloop: every ${target}s. First tick in ~${target}s.`
-            );
+            // For start (target > 0) the persistent LOOP row shows the
+            // cadence + countdown. For off, give a one-line confirm
+            // since the row disappears.
+            if (target === 0) setInfoText("Coach autoloop stopped.");
           })
           .catch((e) => setInfoText("loop set failed: " + String(e)));
         return true;
@@ -4616,7 +4615,8 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
         })
           .then((r) => {
             if (!r.ok) throw new Error("HTTP " + r.status);
-            setInfoText(`Coach repeat: every ${secs}s. First fire in ~${secs}s.`);
+            // Silent success — the persistent REPEAT row above the
+            // input already shows cadence + countdown + prompt.
           })
           .catch((e) => setInfoText("repeat set failed: " + String(e)));
         return true;
