@@ -275,6 +275,13 @@ async def init_db() -> None:
                 # injected into the system prompt as "prior session
                 # handoff". NULL / empty = no handoff text.
                 ("continuity_note", "ALTER TABLE agents ADD COLUMN continuity_note TEXT"),
+                # Most recent (user prompt, assistant response) pair for
+                # this agent, serialized as JSON. Kept alongside
+                # continuity_note so a compact can preserve the LAST
+                # exchange verbatim — CLI-/compact style — rather than
+                # paraphrasing everything. Overwritten by every
+                # successful non-compact turn.
+                ("last_exchange_json", "ALTER TABLE agents ADD COLUMN last_exchange_json TEXT"),
             ):
                 try:
                     await db.execute(col_ddl)

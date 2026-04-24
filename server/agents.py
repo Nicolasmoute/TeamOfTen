@@ -238,14 +238,26 @@ async def _handle_message(
         for block in msg.content:
             if isinstance(block, TextBlock):
                 await _emit(agent_id, "text", content=block.text)
-                # Compact-mode accumulator: the final assistant text
-                # becomes the continuity note. We keep appending so a
-                # multi-block response still coalesces.
-                if turn_ctx is not None and turn_ctx.get("compact_mode"):
-                    prev = turn_ctx.get("compact_text") or ""
-                    turn_ctx["compact_text"] = (
-                        prev + ("\n\n" if prev else "") + (block.text or "")
-                    )
+                if turn_ctx is not None:
+                    # Compact-mode accumulator: the final assistant text
+                    # becomes the continuity note. Multi-block responses
+                    # coalesce via append.
+                    if turn_ctx.get("compact_mode"):
+                        prev = turn_ctx.get("compact_text") or ""
+                        turn_ctx["compact_text"] = (
+                            prev + ("\n\n" if prev else "") + (block.text or "")
+                        )
+                    else:
+                        # Non-compact: also accumulate so we can
+                        # snapshot this turn's full assistant reply into
+                        # agents.last_exchange_json after the
+                        # ResultMessage lands. Preserves the "most recent
+                        # exchange" verbatim for the NEXT compact to
+                        # quote, CLI-/compact style.
+                        prev = turn_ctx.get("response_text") or ""
+                        turn_ctx["response_text"] = (
+                            prev + ("\n\n" if prev else "") + (block.text or "")
+                        )
             elif isinstance(block, ThinkingBlock):
                 # Final consolidated thinking content — surfaces as a
                 # collapsible card in the UI.
@@ -357,6 +369,18 @@ async def _handle_message(
                 and turn_ctx.get("had_handoff_on_entry")
             ):
                 await _set_continuity_note(agent_id, None)
+            # Snapshot THIS turn's (prompt, response) pair for the next
+            # compact to preserve verbatim. Skipped on error / compact
+            # turns / no text — we only want real user-facing exchanges.
+            if (
+                turn_ctx is not None
+                and not turn_ctx.get("compact_mode")
+                and not msg.is_error
+            ):
+                response_text = (turn_ctx.get("response_text") or "").strip()
+                entry_prompt = (turn_ctx.get("entry_prompt") or "").strip()
+                if response_text and entry_prompt:
+                    await _set_last_exchange(agent_id, entry_prompt, response_text)
         usage = _extract_usage(msg)
         if turn_ctx is not None:
             await _insert_turn_row(
@@ -456,10 +480,11 @@ async def cancel_all_agents() -> list[str]:
 # instructs the model to keep them verbatim.
 COMPACT_PROMPT = (
     "Your session context is about to be cleared. Write a handoff note "
-    "for your next fresh turn. The note replaces your conversation "
-    "history — anything you don't capture here is lost.\n\n"
+    "for your next fresh turn — this summarizes the OLDER part of the "
+    "conversation. The most recent exchange will be preserved verbatim "
+    "automatically, so don't duplicate it here.\n\n"
     "Use exactly these markdown sections, in this order. Omit sections "
-    "that genuinely don't apply (don't write 'N/A'). Target 300-600 "
+    "that genuinely don't apply (don't write 'N/A'). Target 250-500 "
     "words total.\n\n"
     "## Current task\n"
     "What you're working on right now and its status (e.g. 'investigating "
@@ -474,10 +499,6 @@ COMPACT_PROMPT = (
     "URLs you fetched, file paths you touched, exact error messages, and "
     "code snippets under 10 lines that matter. Quote precisely — "
     "paraphrasing these loses information. Bullet list.\n\n"
-    "## Recent exchanges\n"
-    "The last 2-3 user/assistant exchanges, paraphrased tightly but "
-    "keeping any distinctive user phrasing in quotes. This is the "
-    "'short-term memory' your fresh self will miss most.\n\n"
     "## Context quirks\n"
     "Anything peculiar about the current setup — a user preference "
     "mentioned in passing, a tool that behaved oddly, an assumption we "
@@ -690,6 +711,73 @@ async def _set_continuity_note(agent_id: str, text: str | None) -> None:
         await c.commit()
     finally:
         await c.close()
+
+
+async def _get_last_exchange(agent_id: str) -> dict[str, str] | None:
+    """Read the most recent (prompt, response) pair written for this
+    agent by a successful non-compact turn. Returns None when absent /
+    unparseable so callers can skip gracefully."""
+    if agent_id == "system":
+        return None
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT last_exchange_json FROM agents WHERE id = ?", (agent_id,)
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    raw = dict(row).get("last_exchange_json")
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    return d
+
+
+async def _set_last_exchange(agent_id: str, prompt: str, response: str) -> None:
+    """Overwrite the agent's last_exchange_json with this turn's pair.
+    Called on every successful non-compact ResultMessage so /compact
+    always has the freshest 'recent exchange' to preserve verbatim."""
+    if agent_id == "system":
+        return
+    # Trim aggressively — a multi-thousand-char assistant reply would
+    # bloat the system prompt on the fresh post-compact turn. The point
+    # is *recent memory*, not a full transcript.
+    def _clip(s: str, n: int) -> str:
+        s = s or ""
+        if len(s) <= n:
+            return s
+        # Keep head + tail so both the original ask and the conclusion
+        # survive a long middle.
+        half = (n - 20) // 2
+        return s[:half] + "\n…[truncated]…\n" + s[-half:]
+    payload = json.dumps({
+        "prompt": _clip(prompt, 2000),
+        "response": _clip(response, 4000),
+        "ts": _now(),
+    })
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE agents SET last_exchange_json = ? WHERE id = ?",
+                (payload, agent_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("set_last_exchange failed: agent=%s", agent_id)
 
 
 async def _locked_players() -> list[str]:
@@ -1217,9 +1305,26 @@ async def run_agent(
         handoff_suffix = (
             "\n\n## Handoff from your prior session (via /compact)\n\n"
             + handoff_text.strip()
-            + "\n\n(Your previous conversation history has been cleared "
-            "to free context. The summary above is your memory of what "
-            "came before.)"
+        )
+        # Append the most recent (user, assistant) exchange verbatim —
+        # same behavior as CLI /compact, which keeps recent turns
+        # intact alongside the summary. Fresh-you reads this as "here
+        # is exactly what just happened" rather than relying on the
+        # paraphrased ## Recent exchanges section inside the summary.
+        last = await _get_last_exchange(agent_id)
+        if last and isinstance(last.get("prompt"), str) and isinstance(last.get("response"), str):
+            handoff_suffix += (
+                "\n\n### Most recent exchange (verbatim, immediately "
+                "before compact)\n\n"
+                "**User asked:**\n\n"
+                + (last["prompt"] or "").strip()
+                + "\n\n**You replied:**\n\n"
+                + (last["response"] or "").strip()
+            )
+        handoff_suffix += (
+            "\n\n(Your previous conversation history has been cleared "
+            "to free context. The summary + verbatim exchange above are "
+            "your memory of what came before.)"
         )
     # Lock-state suffix — Coach-only. Tells Coach up-front which
     # Players are off-limits so they plan around the constraint
@@ -1315,6 +1420,11 @@ async def run_agent(
         # note on the first successful non-compact turn after a
         # compact, so stale handoffs don't re-inject forever.
         "had_handoff_on_entry": bool(handoff_suffix) and not compact_mode,
+        # User prompt this turn was started with. Snapshot here so a
+        # post-result write to agents.last_exchange_json has the pair
+        # together, even if the SDK later mutates prompt in streaming
+        # mode.
+        "entry_prompt": prompt,
     }
 
     async def _iterate(opts: ClaudeAgentOptions) -> None:
