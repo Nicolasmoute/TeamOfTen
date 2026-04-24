@@ -166,12 +166,11 @@ def _extract_usage(msg: Any) -> dict[str, int]:
 
 
 # Per-model context window in tokens. Used by the auto-compact check
-# to compute "we're at X% of ceiling, time to compact". The harness
-# targets Max-plan accounts, which have 1M variants of Opus 4.7 AND
-# Sonnet 4.6 available by default on the CLI. Haiku stays at 200K
-# (no 1M variant). Unknown models fall back to 1M below — erring on
-# the side of NOT compacting prematurely, since a premature compact
-# is worse than letting a turn run long.
+# and the pane ContextBar. Seeded from known-at-build-time values for
+# current Claude models, but superseded by observed usage when a turn
+# reports tokens > the seeded value — see _observe_context_usage().
+# That means a new model shipping with a bigger window just works:
+# the bar under-reports for one turn, then self-corrects upward.
 _CONTEXT_WINDOWS = {
     "claude-opus-4-7": 1_000_000,
     "claude-opus-4-7[1m]": 1_000_000,
@@ -180,15 +179,107 @@ _CONTEXT_WINDOWS = {
     "claude-haiku-4-5-20251001": 200_000,
 }
 
+# Observed ceilings learned from ResultMessage usage per model id.
+# Ratchets upward only — matches the "we saw tokens > table value"
+# signal. Persisted to team_config on every bump so a restart doesn't
+# lose the learning. In-memory cache mirrors the DB row; refreshed at
+# startup via _load_observed_windows().
+_OBSERVED_CONTEXT_WINDOWS: dict[str, int] = {}
+
+
+async def _load_observed_windows() -> None:
+    """Seed _OBSERVED_CONTEXT_WINDOWS from team_config on startup.
+    Called from the lifespan hook so reloads don't relearn from turn 1."""
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT value FROM team_config WHERE key = 'context_observed'"
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("context: observed-windows load failed")
+        return
+    if not row:
+        return
+    try:
+        parsed = json.loads(dict(row).get("value") or "{}")
+    except Exception:
+        return
+    if isinstance(parsed, dict):
+        for k, v in parsed.items():
+            if isinstance(k, str) and isinstance(v, int) and v > 0:
+                _OBSERVED_CONTEXT_WINDOWS[k] = v
+
+
+async def _persist_observed_windows() -> None:
+    """Write the in-memory observed map to team_config. Called after
+    any bump — small JSON, infrequent writes, no need to batch."""
+    payload = json.dumps(_OBSERVED_CONTEXT_WINDOWS, ensure_ascii=False)
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "INSERT INTO team_config (key, value) VALUES "
+                "('context_observed', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (payload,),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("context: observed-windows persist failed")
+
+
+async def _observe_context_usage(model: str | None, usage: dict[str, int]) -> None:
+    """Ratchet the observed window upward when a turn's actual prompt
+    size (input + cache_read + cache_creation) exceeds what we think
+    the model's window is. Output tokens are NOT counted — they're
+    generation, not context the model read. Skips gracefully when no
+    model is set (nothing to key on)."""
+    if not model:
+        return
+    prompt_tokens = (
+        (usage.get("input") or 0)
+        + (usage.get("cache_read") or 0)
+        + (usage.get("cache_creation") or 0)
+    )
+    if prompt_tokens <= 0:
+        return
+    current = max(
+        _CONTEXT_WINDOWS.get(model, 0),
+        _OBSERVED_CONTEXT_WINDOWS.get(model, 0),
+    )
+    if prompt_tokens > current:
+        _OBSERVED_CONTEXT_WINDOWS[model] = prompt_tokens
+        logger.info(
+            "context: learned %s window >= %d (was %d)",
+            model, prompt_tokens, current,
+        )
+        await _persist_observed_windows()
+
 
 def _context_window_for(model: str | None) -> int:
-    # Harness is Max-plan-only; the SDK default (when model=None) is
-    # an Opus 1M variant, so the unknown-model fallback matches. If an
-    # explicit, smaller model is configured, it shows up in the table
-    # above and gets its correct window.
+    """Resolve the context window for a model id.
+
+    Precedence: observed-max > table > 1M fallback. The observed map
+    ratchets upward, so a new model shipping with a bigger window
+    than we assumed self-corrects after one real turn. For unknown
+    smaller-than-1M models, the fallback over-reports — acceptable
+    because the compact threshold then fires later than ideal rather
+    than prematurely (premature compact is the worse failure)."""
     if not model:
-        return 1_000_000
-    return _CONTEXT_WINDOWS.get(model, 1_000_000)
+        return max(
+            1_000_000,
+            max(_OBSERVED_CONTEXT_WINDOWS.values(), default=0),
+        )
+    observed = _OBSERVED_CONTEXT_WINDOWS.get(model, 0)
+    table = _CONTEXT_WINDOWS.get(model, 0)
+    resolved = max(observed, table)
+    return resolved if resolved > 0 else 1_000_000
 
 
 async def _session_context_estimate(session_id: str) -> int:
@@ -435,6 +526,10 @@ async def _handle_message(
                     await _append_exchange(agent_id, entry_prompt, response_text)
         usage = _extract_usage(msg)
         if turn_ctx is not None:
+            # Self-adapting window estimate: if this turn read more
+            # tokens than our table says the model's window is, bump
+            # our stored value. Persists so restarts keep the learning.
+            await _observe_context_usage(turn_ctx.get("model"), usage)
             await _insert_turn_row(
                 agent_id=agent_id,
                 started_at=turn_ctx.get("started_at") or _now(),

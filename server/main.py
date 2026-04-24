@@ -206,6 +206,10 @@ async def lifespan(app: FastAPI):
     # in plain dirs if worktree setup fails.
     workspaces_status = await ensure_workspaces()
     logger.info("workspaces: %r", workspaces_status)
+    # Restore observed-context-window map from team_config so we don't
+    # relearn from turn 1 on every redeploy.
+    from server.agents import _load_observed_windows
+    await _load_observed_windows()
     # Background tasks: flush event log to kDrive + hourly SQLite
     # snapshot. Both are no-ops when kDrive is disabled so running them
     # unconditionally is safe — picks up activation without restart.
