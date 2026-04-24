@@ -68,9 +68,14 @@ function loadLayout() {
         .map((s) => [s]);
     }
     if (!openColumns) return null;
+    const envWidth =
+      typeof v.envWidth === "number" && v.envWidth >= 260 && v.envWidth <= 900
+        ? v.envWidth
+        : 340;
     return {
       openColumns,
       envOpen: typeof v.envOpen === "boolean" ? v.envOpen : true,
+      envWidth,
     };
   } catch (_) {
     return null;
@@ -545,6 +550,9 @@ function App() {
   const [envOpen, setEnvOpen] = useState(
     () => loadLayout()?.envOpen ?? true
   );
+  const [envWidth, setEnvWidth] = useState(
+    () => loadLayout()?.envWidth ?? 340
+  );
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [serverStatus, setServerStatus] = useState(null);
   const [paused, setPaused] = useState(false);
@@ -664,8 +672,8 @@ function App() {
 
   // Persist layout (open slots + env panel state) on every change.
   useEffect(() => {
-    saveLayout({ openColumns, envOpen });
-  }, [openColumns, envOpen]);
+    saveLayout({ openColumns, envOpen, envWidth });
+  }, [openColumns, envOpen, envWidth]);
 
   // Global keyboard shortcuts. Kept deliberately small — anything else
   // belongs scoped to the relevant pane/component.
@@ -1187,8 +1195,36 @@ function App() {
     return () => cleanups.forEach((fn) => fn());
   }, [layoutSignature]);
 
+  const onEnvResizerDown = useCallback((e) => {
+    e.preventDefault();
+    const handle = e.currentTarget;
+    const move = (ev) => {
+      const next = Math.max(
+        260,
+        Math.min(Math.floor(window.innerWidth * 0.75), window.innerWidth - ev.clientX)
+      );
+      setEnvWidth(next);
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      handle?.classList?.remove("dragging");
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    handle?.classList?.add("dragging");
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }, []);
+
+  const appStyle = envOpen
+    ? `grid-template-columns: 44px 1fr ${envWidth}px`
+    : undefined;
+
   return html`
-    <div class=${"app" + (envOpen ? " env-open" : "")}>
+    <div class=${"app" + (envOpen ? " env-open" : "")} style=${appStyle}>
       <${LeftRail}
         agents=${agents}
         openSlots=${openSlots}
@@ -1281,6 +1317,7 @@ function App() {
             serverStatus=${serverStatus}
             onCreateTask=${createHumanTask}
             onClose=${() => setEnvOpen(false)}
+            onResizerDown=${onEnvResizerDown}
           />`
         : null}
       ${settingsOpen
@@ -2687,7 +2724,7 @@ function SettingsDrawer({ onClose, serverStatus }) {
 // environment pane (right side): tasks + cost + timeline
 // ------------------------------------------------------------------
 
-function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, onCreateTask, onClose }) {
+function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, onCreateTask, onClose, onResizerDown }) {
   const [exporting, setExporting] = useState(false);
 
   const exportTeam = useCallback(async () => {
@@ -2730,6 +2767,11 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, onCrea
 
   return html`
     <aside class="env-pane">
+      <div
+        class="env-resizer"
+        onPointerDown=${onResizerDown}
+        title="Drag to resize"
+      ></div>
       <header class="env-head">
         <span class="env-title">Environment</span>
         <button

@@ -188,6 +188,22 @@ body {
   border-left: 1px solid var(--border);
   background: var(--bg);
   overflow: hidden;
+  position: relative;
+}
+.env-resizer {
+  position: absolute;
+  left: -3px;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 20;
+  background: transparent;
+  transition: background 120ms ease;
+}
+.env-resizer:hover,
+.env-resizer.dragging {
+  background: var(--accent);
 }
 .env-head {
   display: flex;
