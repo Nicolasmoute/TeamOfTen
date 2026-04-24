@@ -4,7 +4,7 @@
 
 ![tests](https://github.com/Nicolasmoute/TeamOfTen/actions/workflows/tests.yml/badge.svg)
 
-I couldn't find a multi-agent Claude Code setup that felt right — most were either heavy frameworks or black-box products. This is the opposite: a single-container web app where **1 Coach + 10 Players** all run Claude Code, share a task board, message each other, work directly on your GitHub project repo via per-Player git worktrees (`git clone` + `git push` from inside the container), produce documents at various levels (scratchpad, knowledge, decisions, binary outputs) that sync to a cloud drive, and can plug into third-party **MCP servers** (Notion, Slack, Linear, Sentry — anything that speaks MCP) for the work that lives outside the codebase. Everything is visible in a multi-pane UI: you can intervene on any agent directly, watch the inter-agent chatter unfold live, or just sit back and steer through Coach. You're part of the team — even though the main idea is to keep Coach as the single entry point. Set it up once on a VPS and it runs 24/7.
+I couldn't find a multi-agent Claude Code setup that felt right — most were either heavy frameworks or black-box products. This is the opposite: a single-container web app where **1 Coach + 10 Players** all run Claude Code, share a task board, message each other, work directly on your GitHub project repo via per-Player git worktrees, produce documents at various levels (scratchpad, knowledge, decisions, binary outputs) that sync to a cloud drive, and can plug into third-party **MCP servers** (Notion, Slack, Linear, Sentry — anything that speaks MCP) for the work that lives outside the codebase. Everything is visible in a multi-pane UI: you can intervene on any agent directly, watch the inter-agent chatter unfold live, or just sit back and steer through Coach. You're part of the team — even though the main idea is to keep Coach as the single entry point. Set it up once on a VPS and it runs 24/7.
 
 The code is intentionally simple. The storage backend assumes a **WebDAV-compatible cloud drive** — kDrive, Nextcloud, ownCloud, Fastmail, whatever — because plain WebDAV was the shortest path from "runs in Docker" to "I can read the agents' output from my phone". People out there can make this more sophisticated; I like the simplicity. If you need something else, swap [server/webdav.py](server/webdav.py) — it's ~10 methods.
 
@@ -63,8 +63,6 @@ Open `http://your-host:8000`. If you set `HARNESS_TOKEN`, paste it when the UI a
 Tokens persist at `$CLAUDE_CONFIG_DIR/.credentials.json` (default `/data/claude/...`) and survive redeploys.
 
 Hit `/api/health` to confirm every subsystem is green.
-
-**Zeabur notes:** works the same — Zeabur auto-pulls from GitHub on push, handles TLS, and provides the persistent volume. Mount it at `/data`. No Caddy/reverse proxy needed — Zeabur does that for you.
 
 ---
 
