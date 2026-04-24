@@ -177,9 +177,13 @@ _CONTEXT_WINDOWS = {
 
 
 def _context_window_for(model: str | None) -> int:
+    # Harness is Max-plan-only; the SDK default (when model=None) is
+    # an Opus 1M variant, so the unknown-model fallback matches. If an
+    # explicit, smaller model is configured, it shows up in the table
+    # above and gets its correct window.
     if not model:
-        return 200_000
-    return _CONTEXT_WINDOWS.get(model, 200_000)
+        return 1_000_000
+    return _CONTEXT_WINDOWS.get(model, 1_000_000)
 
 
 async def _session_context_estimate(session_id: str) -> int:
