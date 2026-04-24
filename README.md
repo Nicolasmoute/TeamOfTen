@@ -110,7 +110,36 @@ uv run uvicorn server.main:app --reload
 
 Or with a plain venv: `pip install -e .[dev]` then `uvicorn server.main:app --reload`.
 
-CI runs the tests on every push ([.github/workflows/tests.yml](.github/workflows/tests.yml)).
+CI runs the tests on every push ([.github/workflows/tests.yml](.github/workflows/tests.yml)). The Dockerfile sets a `HEALTHCHECK` that hits `/api/health` every 30s.
+
+---
+
+## Network & security
+
+What the container talks to:
+
+- **Anthropic API** — via the Claude CLI, on every agent turn. Required.
+- **GitHub** (or your git host) — over HTTPS, only if `HARNESS_PROJECT_REPO` is set. Used for `git clone` + `git push` from within the per-Player worktrees. Credentials live in the PAT embedded in that URL.
+- **Your WebDAV server** — only if `HARNESS_WEBDAV_*` are set. Used to mirror memory/knowledge/decisions/outputs and snapshot the SQLite DB.
+- **External MCP servers** — only the ones you explicitly wire in via `HARNESS_MCP_CONFIG`. See [mcp-servers.example.json](mcp-servers.example.json).
+
+No telemetry, no phone-home, no auto-update of the harness itself (the Claude CLI inside the container does self-update per Anthropic's release channel).
+
+Claude OAuth credentials are stored at `$CLAUDE_CONFIG_DIR/.credentials.json` on the mounted `/data` volume and never leave the container. MCP-tool credentials (if you use the encrypted secrets store) are stored in the SQLite DB, encrypted with Fernet (AES-128-CBC + HMAC-SHA256) keyed by `HARNESS_SECRETS_KEY`.
+
+The harness does **not** use `--dangerously-skip-permissions`. Agents run with the normal Claude Code permission model; tool allowlists are enforced per-agent in [server/tools.py](server/tools.py).
+
+---
+
+## Uninstall
+
+```bash
+docker stop teamoften
+docker rm teamoften
+docker volume rm teamoften_data teamoften_workspaces
+```
+
+That removes the container, the SQLite DB, session history, cached artifacts, and the per-Player worktrees. If you configured a WebDAV mirror, any files already written there stay on your cloud drive — delete them manually if you want a clean slate.
 
 ---
 
