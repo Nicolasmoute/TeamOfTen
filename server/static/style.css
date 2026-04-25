@@ -56,18 +56,17 @@ body {
     grid-template-rows: 1fr auto !important;
   }
   /* Explicit grid-row placement: panes take the flexible top row,
-     rail takes the auto-sized bottom row. Without this, default
-     auto-flow placed the rail (first child in DOM) into row 1
-     and panes into row 2, leaving panes with zero height — i.e.
-     "no pane visible on mobile". */
+     rail takes the auto-sized bottom row. */
   .panes { grid-row: 1; }
-  /* Rail at the bottom, two rows: agents (full-width row 1) +
-     files / controls / env (3 cells in row 2). */
+  /* Rail = vertical flex with two visual rows via flex-wrap.
+     The agents row is given flex-basis: 100% so it fills its own
+     line; the bottom controls (files / controls / env) wrap onto
+     the next line and lay out as one thin row. */
   .rail {
     grid-row: 2;
-    display: grid;
-    grid-template-rows: auto auto;
-    grid-template-columns: auto 1fr auto;
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
     align-items: center;
     border-right: none;
     border-top: 1px solid var(--border);
@@ -75,11 +74,9 @@ body {
     gap: 0;
     overflow: visible;
   }
-  .rail .ws-dot {
-    grid-row: 2;
-    grid-column: 1;
-    margin: 0 8px;
-  }
+  /* WS status dot doesn't need its own row on mobile — hide; the
+     pause / connection state is visible elsewhere when relevant. */
+  .rail .ws-dot { display: none; }
   .rail-group {
     margin-top: 0 !important;
     flex-direction: row !important;
@@ -88,26 +85,25 @@ body {
     padding: 6px 8px;
   }
   .rail-group.rail-agents {
-    grid-row: 1;
-    grid-column: 1 / -1;
+    flex: 0 0 100%;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     border-bottom: 1px solid var(--border);
     justify-content: flex-start;
   }
-  .rail-group.rail-files    { grid-row: 2; grid-column: 1; }
-  .rail-group.rail-controls { grid-row: 2; grid-column: 2; justify-content: center; }
-  .rail-group.rail-env      { grid-row: 2; grid-column: 3; }
+  /* Three bottom groups share one row via wrap. Controls expands
+     to push env/settings to the right edge. */
+  .rail-group.rail-files    { flex: 0 0 auto; }
+  .rail-group.rail-controls { flex: 1 1 auto; justify-content: center; }
+  .rail-group.rail-env      { flex: 0 0 auto; }
   /* Hide controls that don't fit single-pane swipe view. */
   .gear.layout-preset,
   .gear.cancel-all { display: none; }
 
-  /* Panes: full-width horizontal swipe. Each .pane-col snaps to
-     the viewport edge; Split.js gutters and drop-zones get out
-     of the way. */
+  /* Panes: full-width horizontal swipe. */
   .panes {
-    overflow-x: auto;
-    overflow-y: hidden;
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
     scroll-snap-type: x mandatory;
     -webkit-overflow-scrolling: touch;
   }
@@ -119,19 +115,19 @@ body {
     scroll-snap-align: start;
     scroll-snap-stop: always;
   }
-  /* Split.js inserts .gutter siblings; hide them on mobile so
-     the swipe deck reads cleanly. */
-  .panes .gutter,
-  .pane-col .gutter { display: none !important; }
-  /* DropZones (drag-and-drop pane reorganization) are HTML5 DnD
-     which doesn't translate to touch — hide them too. */
+  /* Split.js gutters get in the way of swipe — hide them. The
+     `+ .gutter +` adjacent-sibling combinators target the gutters
+     Split.js injects between cols regardless of where they land. */
+  .panes > .gutter,
+  .pane-col > .gutter,
+  .gutter.gutter-horizontal,
+  .gutter.gutter-vertical { display: none !important; }
+  /* DropZones (HTML5 DnD pane reorganization) don't work on touch. */
   .drop-zone { display: none !important; }
-  /* The maximize button is meaningless when only one pane is
-     visible at a time. Hide it. */
+  /* Maximize button is meaningless in single-pane view. */
   .pane-maximize { display: none; }
 
-  /* EnvPane: full-screen overlay when toggled open. The grid
-     no longer reserves a column for it. */
+  /* EnvPane: full-screen overlay when toggled open. */
   .env-pane {
     position: fixed;
     inset: 0;
@@ -139,6 +135,32 @@ body {
     border-left: none;
   }
   .env-resizer { display: none; }
+
+  /* Pane input area restructure on mobile:
+       - Hide the keyboard-shortcut hint (no keyboard on phones).
+       - Run button moves ABOVE the textarea via CSS `order`.
+       - Modes row stays at top, textarea last.
+     Final visual order (top → bottom):
+       modes (model · plan · effort · ctx · /commands)
+       run button (right-aligned via .primary's margin-left: auto)
+       textarea */
+  .pane-input { display: flex; flex-direction: column; }
+  .pane-input .pane-modes      { order: 1; }
+  .pane-input .pane-input-row  { order: 2; margin-top: 4px; }
+  .pane-input .pane-input-wrap { order: 3; margin-top: 6px; }
+  .pane-input-row .hint { display: none; }
+
+  /* CTX chip: drop the inline track graph; just "ctx X%" text. */
+  .pane-mode-chip.context-bar .context-bar-track { display: none; }
+  .pane-mode-chip.context-bar { gap: 4px; }
+  /* Modes row should fit on a single line on phones. Allow horizontal
+     scroll if it still overflows so model/plan/effort/ctx don't wrap
+     and force the input area to grow. */
+  .pane-modes {
+    flex-wrap: nowrap !important;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
 }
 
 /* ---- left rail ---- */
