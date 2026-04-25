@@ -375,6 +375,42 @@ Display section in Options drawer:
   `localStorage` as `harness_tz_pref`; toggle reloads the page so
   already-rendered timestamps update at once.
 
+LeftRail redesign — borderless slot buttons + grouped layout:
+- Slot buttons no longer use border-as-state. Instead two orthogonal
+  dimensions are encoded:
+    1. **Work state** → background tint + label color.
+       - `unused` (no `session_id` ever): transparent, gray label.
+       - `state-idle` (has session, idle): blue tint, blue label.
+       - `state-working`: amber tint, amber label, slow pulse glow.
+       - `state-problem` (`error` / `cost_capped` / `cancelled` all
+         collapse here): red tint, red label.
+    2. **Comms state** → small dot, top-left, only on activated agents.
+       - `green`: nothing pending.
+       - `blue`: incoming `message_sent` (or `task_assigned`) newer
+         than the agent's last `agent_started` — unread inbox.
+       - `orange`: idle, has a current task, and the most recent
+         direct outgoing `message_sent` (non-broadcast, non-human)
+         is newer than any incoming AND newer than the last
+         `agent_started` — i.e. waiting for a reply. Heuristic
+         computed UI-side over `conversations`; flickers on quick
+         exchanges (accepted trade-off).
+- **Pane-open** marker: 3px accent stripe on the left edge via
+  `::before`, drawn over the state tint so it composes cleanly with
+  any work state.
+- **Locked** agents: `filter: grayscale(0.65) brightness(0.8)` +
+  `opacity: 0.75` + a tiny 🔒 badge at bottom-right. Reads as "off
+  the team" at a glance; hover restores full color.
+- The rail is split into four logical groups (top → bottom):
+  agents → files + project-selector placeholder → layout/pause/
+  cancel controls → env-toggle + settings. Auto-margin on the first
+  bottom group pushes the bottom block down; fixed `margin-top: 14px`
+  between bottom subgroups gives them visible separation.
+- Project-selector is a disabled placeholder button (`P` in a dashed
+  outline) reserving the slot for an upcoming feature.
+- `dotStates` Map computed in `App` and passed to `LeftRail`. The
+  prior `unread` accent (top-right pip) is gone — the new comms-state
+  dot supersedes it.
+
 Edit tool diff card — side-by-side, color-only:
 - Two-column layout in the spirit of the Antigravity / VS Code split
   diff. Old content on the left (red band), new content on the right

@@ -47,7 +47,24 @@ body {
   gap: 4px;
   overflow-y: auto;
 }
-.rail-sep { flex: 1; }
+/* Four logical groups in the rail (top → bottom):
+     rail-agents   the team (Coach + 10 Players)
+     rail-files    files + project-selector placeholder
+     rail-controls layout presets, cancel-all, pause
+     rail-env      env-pane toggle, settings
+   Agents sit at the top; the bottom block is pushed down by an
+   auto-margin on the first non-agent group, with fixed gaps between
+   the bottom subgroups so they read as separate sections. */
+.rail-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+.rail-group.rail-agents { gap: 4px; }
+.rail-group.rail-files { margin-top: auto; }
+.rail-group.rail-controls,
+.rail-group.rail-env { margin-top: 14px; }
 @keyframes ws-disconnected-pulse {
   0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(255, 80, 100, 0.5); }
   50%      { opacity: 0.4; box-shadow: 0 0 0 4px rgba(255, 80, 100, 0); }
@@ -68,103 +85,113 @@ body {
   box-shadow: none;
 }
 /* ---- Slot button design system ----
-   Every slot uses the same shape language: full-color text, full-color
-   1px border, translucent fill in that same color. Only the hue changes
-   per state. No style mixes solid/transparent fills — pick a role color
-   and apply it consistently across text + border + tinted bg.
+   Two orthogonal dimensions encoded in a single button:
 
-     gray    = inactive (no pane open, not running)
-     blue    = active & waiting (pane open, idle)
-     amber   = working (turn in flight, pulses)
-     red     = error (last turn failed)
-     green   = Coach (the Captain — always on, overrides gray/blue)
+   1. Work state → background tint + label color
+        unused      no session_id ever       transparent / gray label
+        state-idle  has session, idle         blue tint / blue label
+        state-working                        amber tint / amber label, pulsing
+        state-problem (error|cost_capped|cancelled)
+                                             red tint / red label
+
+   2. Comms state → small dot indicator (top-left of the button)
+        green   ready, nothing pending
+        blue    has unread inbox to address
+        orange  idle with task, waiting for a reply
+
+   Plus two binary modifiers:
+        .open       3px accent stripe on the LEFT EDGE — primary
+                    "where am I looking right now" signal.
+        .locked     desaturated tint + tiny lock badge bottom-right.
+                    Reads as "off the team" at a glance.
 */
 .slot {
-  /* Default = UNUSED: never spawned, no session. Dashed border reads
-     as "empty seat". Promoted to solid once .has-session is added. */
-  --slot-color: var(--muted);               /* gray */
-  --slot-fill: transparent;
+  position: relative;
   width: 32px;
   height: 32px;
   border-radius: 6px;
-  border: 1px dashed var(--slot-color);
-  background: var(--slot-fill);
-  color: var(--slot-color);
+  border: 0;
+  background: transparent;
+  color: var(--muted);
   font: inherit;
   font-weight: 600;
   cursor: pointer;
   padding: 0;
-  transition: color 80ms, border-color 80ms, background 80ms, box-shadow 80ms;
-  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 80ms, background 80ms, box-shadow 80ms, filter 80ms;
 }
-.slot:hover { filter: brightness(1.3); }
-.slot .slot-unread {
-  position: absolute;
-  top: 2px;
-  right: 2px;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 4px var(--accent);
-  pointer-events: none;
+.slot:hover { filter: brightness(1.25); }
+.slot .slot-label { line-height: 1; }
+/* Inactive — never spawned. No background; just a muted number. */
+.slot.unused {
+  color: var(--muted);
+  background: transparent;
 }
-
-/* OFF — spawned before, now idle. Solid gray frame + faint fill
-   distinguishes from the dashed "unused" default. */
-.slot.has-session {
-  --slot-fill: rgba(139, 148, 158, 0.12);
-  border-style: solid;
+/* Activated, idle. Blue tint + blue number. */
+.slot.state-idle {
+  background: rgba(88, 166, 255, 0.14);
+  color: var(--accent);
 }
-
-/* BLUE — pane is OPEN. The primary "where am I looking" signal. Beats
-   has-session/coach base (same specificity, later wins) but is still
-   overridden by working/error below. */
-.slot.open {
-  --slot-color: var(--accent);              /* #58a6ff */
-  --slot-fill: rgba(88, 166, 255, 0.14);
-  border-style: solid;
-}
-
-/* AMBER — agent is running a turn. Pulses so it reads as "live". */
-.slot.working {
-  --slot-color: var(--warn);                /* #d29922 */
-  --slot-fill: rgba(210, 153, 34, 0.18);
-  border-style: solid;
-  animation: slot-working-pulse 1.8s ease-in-out infinite;
+/* Activated, currently running a turn. Glowing amber pulse. */
+.slot.state-working {
+  background: rgba(210, 153, 34, 0.18);
+  color: var(--warn);
+  animation: slot-working-pulse 2s ease-in-out infinite;
 }
 @keyframes slot-working-pulse {
-  0%, 100% { box-shadow: 0 0 6px rgba(210, 153, 34, 0.4); }
-  50%      { box-shadow: 0 0 14px rgba(210, 153, 34, 0.85); }
+  0%, 100% { box-shadow: 0 0 4px rgba(210, 153, 34, 0.35); }
+  50%      { box-shadow: 0 0 12px rgba(210, 153, 34, 0.75); }
 }
-
-/* RED — last turn errored. Same visual language, just red. */
-.slot.error {
-  --slot-color: var(--err);                 /* #f85149 */
-  --slot-fill: rgba(248, 81, 73, 0.14);
-  border-style: solid;
+/* Activated but in trouble — error / cost-capped / cancelled all
+   collapse to the same red signal so the user clicks in to see why. */
+.slot.state-problem {
+  background: rgba(248, 81, 73, 0.14);
+  color: var(--err);
 }
-
-/* GREEN — Coach base color when the pane is NOT open. .slot.open is
-   declared earlier so it wins on pane-open (blue trumps green). When
-   Coach is running, amber still wins via the more-specific
-   .slot.coach.working rule below. */
-.slot.coach:not(.open) {
-  --slot-color: var(--ok);                  /* #3fb950 */
-  --slot-fill: rgba(63, 185, 80, 0.15);
-  border-style: solid;
+/* Pane currently open — left-edge accent stripe. Sits inside the
+   button via ::before so it doesn't affect content layout, and works
+   alongside any state-* background tint. */
+.slot.open::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 5px;
+  bottom: 5px;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 4px rgba(88, 166, 255, 0.6);
 }
-/* Coach + working: amber wins. */
-.slot.coach.working {
-  --slot-color: var(--warn);
-  --slot-fill: rgba(210, 153, 34, 0.18);
+/* Locked — desaturated and dimmed; small lock badge bottom-right. */
+.slot.locked {
+  filter: grayscale(0.65) brightness(0.8);
+  opacity: 0.75;
 }
-/* Coach + error: green frame with a thin red hint ring. Coach stays "on". */
-.slot.coach.error {
-  --slot-color: var(--ok);
-  --slot-fill: rgba(63, 185, 80, 0.15);
-  box-shadow: inset 0 0 0 2px var(--err);
+.slot.locked:hover { filter: grayscale(0.65) brightness(1); opacity: 1; }
+.slot-lock {
+  position: absolute;
+  bottom: 1px;
+  right: 1px;
+  font-size: 8px;
+  line-height: 1;
+  pointer-events: none;
+  filter: drop-shadow(0 0 2px var(--bg));
 }
+/* Comms-state dot. Top-left, small. Only renders for activated agents. */
+.slot-dot {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  pointer-events: none;
+}
+.slot-dot.dot-green  { background: var(--ok); }
+.slot-dot.dot-blue   { background: var(--accent); box-shadow: 0 0 4px var(--accent); }
+.slot-dot.dot-orange { background: #f0883e; box-shadow: 0 0 4px #f0883e; }
 .gear {
   width: 32px;
   height: 32px;
@@ -179,6 +206,18 @@ body {
 .gear:hover { color: var(--fg); }
 .gear.env-toggle { font-size: 16px; }
 .gear.env-toggle.active { color: var(--accent); }
+/* Project-selector placeholder — visually present but inert until the
+   feature ships. Dashed outline + dim text reads as "reserved seat". */
+.gear.project-placeholder {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.gear.project-placeholder:hover { color: var(--muted); }
 
 /* ---- environment pane ---- */
 .env-pane {

@@ -1189,6 +1189,65 @@ function App() {
     return out;
   }, [conversations, seenTs, openSlots]);
 
+  // Per-agent comms-state dot for the LeftRail. Returns
+  // Map<slotId, "green"|"blue"|"orange">.
+  //
+  //   blue   the agent has unread inbox to address — there's an incoming
+  //          message_sent (to=slot) or task_assigned (to=slot) newer than
+  //          the agent's last agent_started.
+  //   orange the agent is idle, has a current task, and the most recent
+  //          direct (non-broadcast, non-human) outgoing message_sent is
+  //          newer than any incoming message AND newer than the last
+  //          agent_started — i.e. it sent something asking for input
+  //          and is now waiting.
+  //   green  default — nothing pending.
+  //
+  // Computed from the events in `conversations` (WS-driven) plus the
+  // pane-history backfill that runs when a pane is opened. For slots
+  // that have never been opened in this session, only WS-period events
+  // are considered — accepted "ok for flicker" trade-off.
+  const dotStates = useMemo(() => {
+    const out = new Map();
+    for (const a of agents) {
+      const events = conversations.get(a.id) || [];
+      let lastIn = "", lastOut = "", lastStarted = "";
+      for (const e of events) {
+        const t = e.ts || "";
+        if (!t) continue;
+        const type = e.type;
+        if (type === "agent_started" && e.agent_id === a.id) {
+          if (t > lastStarted) lastStarted = t;
+        } else if (type === "message_sent") {
+          if (e.to === a.id) {
+            if (t > lastIn) lastIn = t;
+          } else if (
+            e.agent_id === a.id &&
+            e.to !== "broadcast" &&
+            e.to !== "human"
+          ) {
+            if (t > lastOut) lastOut = t;
+          }
+        } else if (type === "task_assigned" && e.to === a.id) {
+          if (t > lastIn) lastIn = t;
+        }
+      }
+      let dot = "green";
+      if (lastIn && lastIn > lastStarted) {
+        dot = "blue";
+      } else if (
+        lastOut &&
+        lastOut > lastIn &&
+        lastOut > lastStarted &&
+        a.status === "idle" &&
+        a.current_task_id
+      ) {
+        dot = "orange";
+      }
+      out.set(a.id, dot);
+    }
+    return out;
+  }, [agents, conversations]);
+
   // Reflect live state in the tab title so a backgrounded tab still
   // signals:
   //   ⏸          paused (takes precedence over other signals)
@@ -1527,7 +1586,7 @@ function App() {
       <${LeftRail}
         agents=${agents}
         openSlots=${openSlots}
-        unreadSlots=${unreadSlots}
+        dotStates=${dotStates}
         onOpen=${openPane}
         onStackInLast=${stackInLast}
         wsConnected=${wsConnected}
@@ -1725,7 +1784,7 @@ function TokenGate({ onSubmit }) {
 // left rail
 // ------------------------------------------------------------------
 
-function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, onOpenSettings, paused, onTogglePause, onLayoutPreset, onCancelAll }) {
+function LeftRail({ agents, openSlots, dotStates, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, onOpenSettings, paused, onTogglePause, onLayoutPreset, onCancelAll }) {
   const workingCount = agents.filter((a) => a.status === "working").length;
   const grouped = useMemo(() => {
     const coach = agents.find((a) => a.kind === "coach");
@@ -1735,27 +1794,52 @@ function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsCon
     return { coach, players };
   }, [agents]);
 
+  // Slot button. Visual language:
+  //   - Inactive (never spawned, no session_id): gray number, no background.
+  //   - Activated (has session): tinted background + colored number.
+  //       idle    → blue
+  //       working → glowing amber (pulse)
+  //       error / cost_capped / cancelled → red
+  //   - Pane currently open: 3px accent stripe on the left edge.
+  //   - Locked: desaturated + small lock badge bottom-right.
+  //   - Comms dot (top-left, only when activated): green / blue / orange
+  //       per `dotStates` Map computed in App.
   const renderSlot = (a) => {
     if (!a) return null;
-    const unread = unreadSlots && unreadSlots.has(a.id);
-    // has-session = the agent has spawned at least once (session_id
-    // persisted) OR is currently running / waiting. Distinguishes an
-    // "off" agent (dormant, has memory) from an "unused" one (never
-    // spawned) via dashed-vs-solid border. Pane-open is a separate
-    // class (.open → blue); the two compose cleanly.
-    const hasSession = Boolean(a.session_id) || a.status === "working" || a.status === "waiting";
+    const hasSession =
+      Boolean(a.session_id) || a.status === "working" || a.status === "waiting";
+    const status = a.status || "idle";
+    // Map status → visual state class. error / cost_capped / cancelled
+    // all collapse to "problem" so the user can click in for the why.
+    let stateClass = "";
+    if (hasSession) {
+      if (status === "working") stateClass = "state-working";
+      else if (status === "error" || status === "cost_capped" || status === "cancelled") {
+        stateClass = "state-problem";
+      } else {
+        stateClass = "state-idle";
+      }
+    }
+    const isOpen = openSlots.includes(a.id);
+    const dot = hasSession ? (dotStates && dotStates.get(a.id)) || "green" : "";
     const classes = [
       "slot",
       a.kind,
-      a.status || "stopped",
-      hasSession ? "has-session" : "",
-      openSlots.includes(a.id) ? "open" : "",
-      unread ? "unread" : "",
+      hasSession ? "has-session" : "unused",
+      stateClass,
+      isOpen ? "open" : "",
+      a.locked ? "locked" : "",
     ].filter(Boolean).join(" ");
     const baseTip = a.name
-      ? `${a.id} — ${a.name}${a.role ? " — " + a.role : ""} (${a.status || "stopped"})`
-      : `${a.id} — unassigned (${a.status || "stopped"})`;
-    const tooltip = baseTip + " — shift-click to stack in last column" + (unread ? " — NEW activity since last open" : "");
+      ? `${a.id} — ${a.name}${a.role ? " — " + a.role : ""} (${status})`
+      : `${a.id} — unassigned (${status})`;
+    const dotHint = dot === "blue"
+      ? " — has unread inbox"
+      : dot === "orange"
+      ? " — waiting for a reply"
+      : "";
+    const lockHint = a.locked ? " — LOCKED (Coach can't assign / message)" : "";
+    const tooltip = baseTip + dotHint + lockHint + " — shift-click to stack in last column";
     return html`
       <button
         key=${a.id}
@@ -1763,8 +1847,9 @@ function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsCon
         title=${tooltip}
         onClick=${(e) => (e.shiftKey ? onStackInLast(a.id) : onOpen(a.id))}
       >
-        ${slotShortLabel(a.id)}
-        ${unread ? html`<span class="slot-unread" />` : null}
+        ${dot ? html`<span class=${"slot-dot dot-" + dot} /></span>` : null}
+        <span class="slot-label">${slotShortLabel(a.id)}</span>
+        ${a.locked ? html`<span class="slot-lock" aria-hidden="true">🔒</span>` : null}
       </button>
     `;
   };
@@ -1775,60 +1860,71 @@ function LeftRail({ agents, openSlots, unreadSlots, onOpen, onStackInLast, wsCon
         class=${"ws-dot " + (wsConnected ? "ok" : "")}
         title=${wsConnected ? "websocket connected" : "websocket disconnected"}
       ></span>
-      ${renderSlot(grouped.coach)}
-      ${grouped.players.map(renderSlot)}
-      <span class="rail-sep"></span>
-      <!-- File explorer sits right after the roster — it's conceptually
-           the 12th "thing" you might open in a column, not a global
-           setting, so it belongs closer to the agents than the gears. -->
-      <button
-        class=${"gear files-open" + (openSlots.includes("__files") ? " active" : "")}
-        title="Open the file explorer pane (context, knowledge, decisions)"
-        onClick=${() => onOpen("__files")}
-      >
-        <span class="files-icon" aria-hidden="true">
-          <span class="files-icon-tab"></span>
-          <span class="files-icon-body"></span>
-        </span>
-      </button>
-      <span class="rail-sep"></span>
-      ${openSlots.length >= 2
-        ? html`<button
-            class="gear layout-preset"
-            title="Spread: one pane per column"
-            onClick=${() => onLayoutPreset && onLayoutPreset("spread")}
-          ><span class="layout-icon layout-icon-spread">
-            <span></span><span></span><span></span>
-          </span></button>
-          <button
-            class="gear layout-preset"
-            title="Pair stack: two panes per column (odd count → first one is solo)"
-            onClick=${() => onLayoutPreset && onLayoutPreset("pairs")}
-          ><span class="layout-icon layout-icon-pairs">
-            <span><i></i><i></i></span><span><i></i><i></i></span><span><i></i><i></i></span>
-          </span></button>`
-        : null}
-      ${workingCount > 0
-        ? html`<button
-            class="gear cancel-all"
-            title=${"Cancel all " + workingCount + " running agent" + (workingCount === 1 ? "" : "s")}
-            onClick=${onCancelAll}
-          >⏹</button>`
-        : null}
-      <button
-        class=${"gear pause-toggle" + (paused ? " active" : "")}
-        title=${(paused
-          ? "Harness is PAUSED — new agent spawns are blocked. Click to resume."
-          : "Pause the harness — stops new agent spawns (in-flight turns keep running)."
-        ) + " Keyboard: ⌘/Ctrl+."}
-        onClick=${onTogglePause}
-      >${paused ? "▶" : "❚❚"}</button>
-      <button
-        class=${"gear env-toggle" + (envOpen ? " active" : "")}
-        title=${(envOpen ? "Collapse environment panel" : "Open environment panel") + " (⌘/Ctrl+B)"}
-        onClick=${onToggleEnv}
-      >▦</button>
-      <button class="gear" title="Settings" onClick=${onOpenSettings}>⚙</button>
+      <!-- Top group: agents (Coach + 10 Players). -->
+      <div class="rail-group rail-agents">
+        ${renderSlot(grouped.coach)}
+        ${grouped.players.map(renderSlot)}
+      </div>
+      <!-- Bottom block — flex-grow gap above pushes everything down. -->
+      <div class="rail-group rail-files">
+        <button
+          class=${"gear files-open" + (openSlots.includes("__files") ? " active" : "")}
+          title="Open the file explorer pane (context, knowledge, decisions)"
+          onClick=${() => onOpen("__files")}
+        >
+          <span class="files-icon" aria-hidden="true">
+            <span class="files-icon-tab"></span>
+            <span class="files-icon-body"></span>
+          </span>
+        </button>
+        <button
+          class="gear project-placeholder"
+          title="Project selector — coming soon"
+          disabled
+          aria-disabled="true"
+        >P</button>
+      </div>
+      <div class="rail-group rail-controls">
+        ${openSlots.length >= 2
+          ? html`<button
+              class="gear layout-preset"
+              title="Spread: one pane per column"
+              onClick=${() => onLayoutPreset && onLayoutPreset("spread")}
+            ><span class="layout-icon layout-icon-spread">
+              <span></span><span></span><span></span>
+            </span></button>
+            <button
+              class="gear layout-preset"
+              title="Pair stack: two panes per column (odd count → first one is solo)"
+              onClick=${() => onLayoutPreset && onLayoutPreset("pairs")}
+            ><span class="layout-icon layout-icon-pairs">
+              <span><i></i><i></i></span><span><i></i><i></i></span><span><i></i><i></i></span>
+            </span></button>`
+          : null}
+        ${workingCount > 0
+          ? html`<button
+              class="gear cancel-all"
+              title=${"Cancel all " + workingCount + " running agent" + (workingCount === 1 ? "" : "s")}
+              onClick=${onCancelAll}
+            >⏹</button>`
+          : null}
+        <button
+          class=${"gear pause-toggle" + (paused ? " active" : "")}
+          title=${(paused
+            ? "Harness is PAUSED — new agent spawns are blocked. Click to resume."
+            : "Pause the harness — stops new agent spawns (in-flight turns keep running)."
+          ) + " Keyboard: ⌘/Ctrl+."}
+          onClick=${onTogglePause}
+        >${paused ? "▶" : "❚❚"}</button>
+      </div>
+      <div class="rail-group rail-env">
+        <button
+          class=${"gear env-toggle" + (envOpen ? " active" : "")}
+          title=${(envOpen ? "Collapse environment panel" : "Open environment panel") + " (⌘/Ctrl+B)"}
+          onClick=${onToggleEnv}
+        >▦</button>
+        <button class="gear" title="Settings" onClick=${onOpenSettings}>⚙</button>
+      </div>
     </aside>
   `;
 }
