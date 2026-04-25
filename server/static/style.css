@@ -106,30 +106,45 @@ body {
     scrollbar-width: none;
     border-bottom: 1px solid var(--border);
     padding: 1px 5px;
-    gap: 2px;
-    justify-content: center;
+    gap: 0;
+    justify-content: space-between;
   }
   .rail-group.rail-agents::-webkit-scrollbar { display: none; }
   /* All `!important` here because the mobile @media block sits BEFORE
      the desktop `.rail-bottom` rule in source order, so the cascade
      would otherwise let desktop values win on mobile screens. */
   .rail-bottom {
-    display: flex !important;
-    flex-direction: row !important;
+    display: grid !important;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
     align-items: center !important;
-    justify-content: center !important;
+    justify-items: center !important;
     width: 100% !important;
     flex: 0 0 auto !important;
-    padding: 1px 5px !important;
-    gap: 3px !important;
+    padding: 1px 7px !important;
+    gap: 0 !important;
   }
   .rail-bottom .rail-group { padding: 0; }
+  .rail-bottom .mobile-ws-dot { grid-column: 1; justify-self: center; }
   .rail-group.rail-files,
   .rail-group.rail-controls,
   .rail-group.rail-env {
-    flex: 0 0 auto;
+    width: 100%;
+    flex: 1 1 auto;
     margin-left: 0;
     justify-content: center;
+  }
+  .rail-group.rail-files {
+    grid-column: 2 / span 2;
+    display: grid !important;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    justify-items: center;
+  }
+  .rail-group.rail-controls { grid-column: 4; }
+  .rail-group.rail-env {
+    grid-column: 5 / span 2;
+    display: grid !important;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    justify-items: center;
   }
   .rail-group.rail-env .settings-toggle { order: 1; }
   .rail-group.rail-env .env-toggle { order: 2; }
