@@ -58,21 +58,19 @@ body {
   /* Explicit grid-row placement: panes take the flexible top row,
      rail takes the auto-sized bottom row. */
   .panes { grid-row: 1; }
-  /* Rail at the bottom — flexbox with wrap.
-       Row 1: rail-agents (forced full-width via flex-basis: 100%, scrolls horizontally).
-       Row 2: ws-dot, rail-files, rail-controls (flex-grow), rail-env — single inline line.
-     Earlier attempts:
-       - `display: contents` was unreliable on Android Chrome (children
-         didn't pick up the parent flex layout consistently).
-       - Explicit CSS Grid (grid-row/grid-column placement) still
-         intermittently stacked the bottom group on Android Chrome.
-     Flexbox + flex-wrap with `order` is the simplest cross-browser flow
-     that gets the agents row + single-line bottom strip we want. */
+  /* Rail at the bottom — simple stacked flex.
+       Row 1: rail-agents (own block, scrolls horizontally).
+       Row 2: rail-bottom — a single flex-row container that holds
+              ws-dot + rail-files + rail-controls (grow) + rail-env.
+     Wrapping the bottom items in their own DOM container is the only
+     approach that consistently survives Android Chrome (we tried
+     display:contents, then explicit CSS Grid, then flex-wrap; each
+     one reverted to vertical stacking on some Chromium build). */
   .rail {
     grid-row: 2;
     display: flex;
-    flex-wrap: wrap;
-    align-items: center;
+    flex-direction: column;
+    align-items: stretch;
     border-right: none;
     border-top: 1px solid var(--border);
     padding: 0;
@@ -80,11 +78,14 @@ body {
     overflow: visible;
   }
   .rail .ws-dot {
-    order: 2;
-    margin: 0 6px 0 8px;
+    /* Small WS-status indicator — sits at the top of the rail above
+       the agents row in mobile layout (rail is flex-column, so DOM
+       order = visual order). */
+    margin: 4px 0 0;
     width: 8px;
     height: 8px;
     flex: 0 0 auto;
+    align-self: center;
   }
   .rail-group {
     margin-top: 0 !important;
@@ -94,8 +95,6 @@ body {
     padding: 3px 6px;
   }
   .rail-group.rail-agents {
-    order: 1;
-    flex: 1 0 100%;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     border-bottom: 1px solid var(--border);
@@ -103,9 +102,21 @@ body {
     gap: 3px;
     justify-content: flex-start;
   }
-  .rail-group.rail-files    { order: 3; }
-  .rail-group.rail-controls { order: 4; flex: 1 0 auto; justify-content: center; }
-  .rail-group.rail-env      { order: 5; margin-left: auto; }
+  /* All `!important` here because the mobile @media block sits BEFORE
+     the desktop `.rail-bottom` rule in source order, so the cascade
+     would otherwise let desktop values win on mobile screens. */
+  .rail-bottom {
+    display: flex !important;
+    flex-direction: row !important;
+    align-items: center !important;
+    width: 100% !important;
+    flex: 0 0 auto !important;
+    padding: 0 !important;
+    gap: 0 !important;
+  }
+  .rail-group.rail-files    { flex: 0 0 auto; }
+  .rail-group.rail-controls { flex: 1 1 auto; justify-content: center; }
+  .rail-group.rail-env      { flex: 0 0 auto; margin-left: auto; }
   /* Tighter slot buttons on mobile so 11 slots fit without scroll on
      360px-wide phones. */
   .rail-group.rail-agents .slot {
@@ -248,6 +259,18 @@ body {
   gap: 4px;
 }
 .rail-group.rail-agents { gap: 4px; }
+/* Desktop: rail-bottom is a transparent flex column that takes the
+   remaining vertical space below rail-agents. The existing
+   margin-top: auto on rail-files pushes the bottom block down within
+   it. Mobile (< 700px) overrides this to flex-row inline. */
+.rail-bottom {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex: 1 1 auto;
+  width: 100%;
+  gap: 4px;
+}
 .rail-group.rail-files { margin-top: auto; }
 .rail-group.rail-controls,
 .rail-group.rail-env { margin-top: 14px; }

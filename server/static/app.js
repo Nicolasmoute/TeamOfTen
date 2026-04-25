@@ -2031,65 +2031,70 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, onOpen, onStackI
         ${renderSlot(grouped.coach)}
         ${grouped.players.map(renderSlot)}
       </div>
-      <!-- Bottom block — flex-grow gap above pushes everything down. -->
-      <div class="rail-group rail-files">
-        <button
-          class=${"gear files-open" + (openSlots.includes("__files") ? " active" : "")}
-          title="Open the file explorer pane (context, knowledge, decisions)"
-          onClick=${() => onOpen("__files")}
-        >
-          <span class="files-icon" aria-hidden="true">
-            <span class="files-icon-tab"></span>
-            <span class="files-icon-body"></span>
-          </span>
-        </button>
-        <button
-          class="gear project-placeholder"
-          title="Project selector — coming soon"
-          disabled
-          aria-disabled="true"
-        >P</button>
-      </div>
-      <div class="rail-group rail-controls">
-        ${openSlots.length >= 2
-          ? html`<button
-              class="gear layout-preset"
-              title="Spread: one pane per column"
-              onClick=${() => onLayoutPreset && onLayoutPreset("spread")}
-            ><span class="layout-icon layout-icon-spread">
-              <span></span><span></span><span></span>
-            </span></button>
-            <button
-              class="gear layout-preset"
-              title="Pair stack: two panes per column (odd count → first one is solo)"
-              onClick=${() => onLayoutPreset && onLayoutPreset("pairs")}
-            ><span class="layout-icon layout-icon-pairs">
-              <span><i></i><i></i></span><span><i></i><i></i></span><span><i></i><i></i></span>
-            </span></button>`
-          : null}
-        ${workingCount > 0
-          ? html`<button
-              class="gear cancel-all"
-              title=${"Cancel all " + workingCount + " running agent" + (workingCount === 1 ? "" : "s")}
-              onClick=${onCancelAll}
-            >⏹</button>`
-          : null}
-        <button
-          class=${"gear pause-toggle" + (paused ? " active" : "")}
-          title=${(paused
-            ? "Harness is PAUSED — new agent spawns are blocked. Click to resume."
-            : "Pause the harness — stops new agent spawns (in-flight turns keep running)."
-          ) + " Keyboard: ⌘/Ctrl+."}
-          onClick=${onTogglePause}
-        >${paused ? "▶" : "❚❚"}</button>
-      </div>
-      <div class="rail-group rail-env">
-        <button
-          class=${"gear env-toggle" + (envOpen ? " active" : "")}
-          title=${(envOpen ? "Collapse environment panel" : "Open environment panel") + " (⌘/Ctrl+B)"}
-          onClick=${onToggleEnv}
-        >▦</button>
-        <button class="gear" title="Settings" onClick=${onOpenSettings}>⚙</button>
+      <!-- Bottom block — wrapped in .rail-bottom so mobile gets a
+           reliable single-row layout (flex with no wrap). On desktop
+           .rail-bottom takes the remaining vertical space and its
+           flex-column flow restores the prior stacked layout. -->
+      <div class="rail-bottom">
+        <div class="rail-group rail-files">
+          <button
+            class=${"gear files-open" + (openSlots.includes("__files") ? " active" : "")}
+            title="Open the file explorer pane (context, knowledge, decisions)"
+            onClick=${() => onOpen("__files")}
+          >
+            <span class="files-icon" aria-hidden="true">
+              <span class="files-icon-tab"></span>
+              <span class="files-icon-body"></span>
+            </span>
+          </button>
+          <button
+            class="gear project-placeholder"
+            title="Project selector — coming soon"
+            disabled
+            aria-disabled="true"
+          >P</button>
+        </div>
+        <div class="rail-group rail-controls">
+          ${openSlots.length >= 2
+            ? html`<button
+                class="gear layout-preset"
+                title="Spread: one pane per column"
+                onClick=${() => onLayoutPreset && onLayoutPreset("spread")}
+              ><span class="layout-icon layout-icon-spread">
+                <span></span><span></span><span></span>
+              </span></button>
+              <button
+                class="gear layout-preset"
+                title="Pair stack: two panes per column (odd count → first one is solo)"
+                onClick=${() => onLayoutPreset && onLayoutPreset("pairs")}
+              ><span class="layout-icon layout-icon-pairs">
+                <span><i></i><i></i></span><span><i></i><i></i></span><span><i></i><i></i></span>
+              </span></button>`
+            : null}
+          ${workingCount > 0
+            ? html`<button
+                class="gear cancel-all"
+                title=${"Cancel all " + workingCount + " running agent" + (workingCount === 1 ? "" : "s")}
+                onClick=${onCancelAll}
+              >⏹</button>`
+            : null}
+          <button
+            class=${"gear pause-toggle" + (paused ? " active" : "")}
+            title=${(paused
+              ? "Harness is PAUSED — new agent spawns are blocked. Click to resume."
+              : "Pause the harness — stops new agent spawns (in-flight turns keep running)."
+            ) + " Keyboard: ⌘/Ctrl+."}
+            onClick=${onTogglePause}
+          >${paused ? "▶" : "❚❚"}</button>
+        </div>
+        <div class="rail-group rail-env">
+          <button
+            class=${"gear env-toggle" + (envOpen ? " active" : "")}
+            title=${(envOpen ? "Collapse environment panel" : "Open environment panel") + " (⌘/Ctrl+B)"}
+            onClick=${onToggleEnv}
+          >▦</button>
+          <button class="gear" title="Settings" onClick=${onOpenSettings}>⚙</button>
+        </div>
       </div>
     </aside>
   `;
