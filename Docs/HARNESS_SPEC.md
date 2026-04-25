@@ -27,30 +27,28 @@
 
 ## 2. High-Level Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
-│ VPS (disposable)                                            │
+│ Zeabur / VPS Container                                      │
 │                                                             │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │ harness (single Python process, mono-service)         │  │
 │  │                                                       │  │
 │  │  ┌─────────────┐  ┌─────────────┐  ┌──────────────┐   │  │
 │  │  │ Web server  │  │ Coordinator │  │ Agent mgr    │   │  │
-│  │  │ FastAPI     │  │ (state obj) │  │ (SDK spawner)│   │  │
+│  │  │ FastAPI     │  │ (SQLite DB) │  │ (SDK spawner)│   │  │
 │  │  │ + websocket │◄─┤             ├─►│              │   │  │
 │  │  └─────────────┘  └─────────────┘  └──────────────┘   │  │
 │  │         │                │                 │          │  │
 │  │         └────────────────┼─────────────────┘          │  │
 │  │                          ▼                            │  │
 │  │                 ┌──────────────────┐                  │  │
-│  │                 │ Storage (WebDAV) │                  │  │
-│  │                 │ batched flushes  │                  │  │
+│  │                 │ /data/harness.db │                  │  │
+│  │                 │ (Hot state)      │                  │  │
 │  │                 └──────────────────┘                  │  │
 │  └───────────────────────────────────────────────────────┘  │
 │                                                             │
-│  ~/.claude.json (Max plan OAuth, shared by all SDK calls)   │
-│                                                             │
-│  Caddy (HTTPS, reverse proxy)                               │
+│  OS Credential Store (Max plan OAuth via `claude /login`)   │
 └─────────────────────────────────────────────────────────────┘
                │                                    ▲
                │ HTTPS/WebDAV                       │ HTTPS
@@ -58,7 +56,7 @@
     ┌────────────────────┐                ┌─────────┴─────────┐
     │ Infomaniak kDrive  │                │ Your browsers     │
     │  /harness/         │                │  - desktop tiling │
-    │    state/          │                │  - mobile swipe   │
+    │    snapshots/      │                │  - mobile swipe   │
     │    events/         │                │  - PWA notifs     │
     │    memory/         │                └───────────────────┘
     │    decisions/      │
@@ -71,81 +69,49 @@
 |---|---|---|
 | Agent runtime | **Claude Agent SDK (Python)** | Programmatic control, uses Max plan OAuth, native streaming |
 | Web stack | **FastAPI + WebSocket** | Single process, shared state, native async, matches SDK |
-| Frontend | **React + react-mosaic + Vite** | Tiling on desktop, responsive mobile, known-good libs |
-| Storage | **kDrive via WebDAV (direct, `webdav4`)** | Swiss hosting, privacy, clean sync control, no rclone daemon |
-| Auth to Claude | **OAuth from `~/.claude.json`** | Shared Max plan billing, no API keys |
-| Auth to UI | **Bearer token (Tailscale-preferred)** | Personal use, simple, Tailscale removes public exposure |
-| Deploy | **Docker Compose (app + Caddy)** | One command, portable, stateless container |
-| Repo layout | **Monorepo, mono-service** | Backend, frontend, prompts, deploy all in one repo |
+| Frontend | **Preact + htm + Split.js** | Zero build step, fast load from ESM, simpler than React+Vite |
+| Storage | **SQLite (Hot) + kDrive (Durable)** | SQLite prevents race conditions; kDrive for snapshots/human docs |
+| Auth to Claude | **`claude /login` per host** | Shared Max plan billing, OS credential store |
+| Auth to UI | **Bearer token (`HARNESS_TOKEN`)** | Personal use, simple token gate |
+| Deploy | **Single Dockerfile on Zeabur** | Auto-deploy from GitHub, Zeabur handles TLS / ingress |
+| Repo layout | **Monorepo, mono-service** | Backend, frontend (`server/static`), prompts all in one repo |
 
 ---
 
 ## 3. Repository Layout (monorepo, mono-service)
 
-```
+```text
 harness/
 ├── README.md
 ├── HARNESS_SPEC.md                 # this document
 ├── .env.example                    # all required env vars
 ├── .gitignore
-├── docker-compose.yml              # app + Caddy
-├── Dockerfile                      # single-stage, builds front and back
-├── Caddyfile                       # HTTPS, routes /api, /ws, /
-├── pyproject.toml                  # Python deps (uv or poetry)
-├── package.json                    # workspaces root
+├── Dockerfile                      # single-stage
+├── pyproject.toml                  # Python deps (uv)
 │
 ├── server/                         # Python backend
 │   ├── main.py                     # FastAPI app, startup/shutdown
-│   ├── config.py                   # env-driven settings
+│   ├── db.py                       # SQLite interactions
 │   ├── coordinator.py              # in-memory shared state
 │   ├── agents.py                   # SDK spawn + lifecycle
-│   ├── prompts.py                  # system prompt templates
 │   ├── tools.py                    # custom `coord_*` tools for agents
-│   ├── hooks.py                    # SDK hooks (PreToolUse, TaskCompleted, ...)
-│   ├── storage.py                  # WebDAV wrapper
+│   ├── hooks.py                    # SDK hooks
+│   ├── kdrive.py                   # WebDAV wrapper
 │   ├── sync.py                     # background flush/load
-│   ├── api.py                      # REST endpoints
-│   ├── websocket.py                # event stream to UI
-│   ├── auth.py                     # bearer token middleware
-│   ├── models.py                   # pydantic schemas
+│   ├── static/                     # Preact frontend (no build step)
+│   │   ├── index.html
+│   │   ├── app.js
+│   │   ├── tools.js
+│   │   └── style.css
 │   └── tests/
-│
-├── web/                            # React frontend
-│   ├── index.html
-│   ├── vite.config.ts
-│   ├── tsconfig.json
-│   ├── package.json
-│   └── src/
-│       ├── main.tsx
-│       ├── App.tsx                 # picks desktop or mobile shell
-│       ├── shells/
-│       │   ├── DesktopShell.tsx    # react-mosaic tiling
-│       │   └── MobileShell.tsx     # stack + tab bar + swipe
-│       ├── panes/
-│       │   ├── AgentPane.tsx       # chat view for one agent
-│       │   ├── TimelinePane.tsx    # unified event stream
-│       │   ├── TaskBoardPane.tsx
-│       │   ├── MemoryPane.tsx
-│       │   └── BroadcastPane.tsx
-│       ├── state/
-│       │   ├── store.ts            # zustand
-│       │   └── socket.ts           # shared WS client
-│       ├── api/
-│       │   └── client.ts           # REST wrapper
-│       └── styles/
 │
 ├── prompts/                        # prompt templates (also mounted)
 │   ├── coordinator.md
 │   ├── worker.md
 │   └── loop-preamble.md
 │
-├── workspaces/                     # git worktrees (gitignored, ephemeral)
-│   └── .gitkeep
-│
-└── scripts/
-    ├── bootstrap-vps.sh            # one-shot VPS setup
-    ├── copy-claude-auth.sh         # pushes ~/.claude.json to VPS
-    └── dev.sh                      # local dev mode
+└── workspaces/                     # git worktrees (gitignored, ephemeral)
+    └── .gitkeep
 ```
 
 **Monorepo rationale**: one `git pull` gets everything; frontend and backend versions stay in sync; one Dockerfile builds the whole thing; prompts live next to the code that uses them.
@@ -202,108 +168,28 @@ Max plan realistic concurrency is lower than 10 for continuous loops. The roster
 
 ## 5. Data Model
 
-All stored as JSON (state) or Markdown (human-readable notes) on kDrive. In-memory representations are pydantic models.
+All stored in SQLite. In-memory representations are plain dicts. The previous Pydantic models were dropped in favor of raw DB rows.
 
 ### Agent
-
-```python
-class Agent(BaseModel):
-    id: str                          # "coach", "p1", ... "p10" — fixed slot
-    kind: Literal["coach", "player"]
-    name: str | None                 # Coach-assigned display name (e.g. "Alice"); "Coach" is fixed for the coach slot
-    role: str | None                 # Coach-assigned role description (e.g. "Developer — writes code for the project")
-    status: Literal["stopped", "idle", "working", "waiting", "error"]
-    current_task_id: str | None
-    model: str                       # "claude-sonnet-4-6" etc.
-    workspace_path: str              # "/workspaces/p1"
-    system_prompt_path: str          # "prompts/player.md"
-    loop_config: LoopConfig | None   # if set, agent runs on loop
-    started_at: datetime | None
-    last_heartbeat: datetime | None
-    session_id: str | None           # SDK session for resumption
-    cost_estimate_usd: float         # cumulative
-```
+Columns: `id`, `kind ∈ {coach, player}`, `name`, `role`, `brief`, `status ∈ {stopped, idle, working, waiting, error}`, `current_task_id`, `model`, `workspace_path`, `session_id`, `cost_estimate_usd`, `started_at`, `last_heartbeat`.
 
 ### Task
-
-```python
-class Task(BaseModel):
-    id: str                          # "t-2026-04-22-001"
-    title: str
-    description: str                 # markdown
-    status: Literal["open", "claimed", "in_progress", "blocked", "done", "cancelled"]
-    owner: str | None                # agent id
-    created_by: str                  # "human" or agent id
-    created_at: datetime
-    claimed_at: datetime | None
-    completed_at: datetime | None
-    depends_on: list[str]            # other task ids
-    blocks: list[str]                # task ids blocked by this
-    artifacts: list[str]             # paths, URLs, commit SHAs
-    tags: list[str]                  # free-form
-    priority: Literal["low", "normal", "high", "urgent"]
-    estimated_turns: int | None
-    actual_turns: int | None
-```
+Columns: `id`, `title`, `description`, `status ∈ {open, claimed, in_progress, blocked, done, cancelled}`, `owner` (FK agents.id), `created_by`, `created_at`, `claimed_at`, `completed_at`, `parent_id` (FK tasks.id), `priority`, `tags` (JSON array), `artifacts` (JSON array).
 
 ### Message
-
-```python
-class Message(BaseModel):
-    id: str                          # ulid
-    from_id: str                     # "human", "coord", "w3"
-    to_id: str                       # target agent id or "broadcast"
-    subject: str | None
-    body: str                        # markdown
-    sent_at: datetime
-    read_at: datetime | None
-    in_reply_to: str | None          # message id
-    priority: Literal["normal", "interrupt"]  # interrupt = block next tool
-```
+Columns: `id AUTOINC`, `from_id`, `to_id`, `subject`, `body`, `sent_at`, `read_at`, `in_reply_to`, `priority`.
 
 ### Event
 
-```python
-class Event(BaseModel):
-    id: str                          # ulid
-    ts: datetime
-    agent_id: str                    # who emitted
-    type: Literal[
-        "agent_started", "agent_stopped", "heartbeat",
-        "tool_use", "tool_result",
-        "task_claimed", "task_progress", "task_completed", "task_blocked",
-        "message_sent", "message_received",
-        "memory_updated", "lock_acquired", "lock_released",
-        "human_interjection", "error", "cost_update"
-    ]
-    payload: dict                    # type-specific, free-form
-    task_id: str | None
-```
+### Event
+Columns: `id AUTOINC`, `ts`, `agent_id`, `type`, `payload` (JSON blob).
 
 Events are append-only, the source of truth for "what happened."
 
 ### MemoryDoc
 
-```python
-class MemoryDoc(BaseModel):
-    topic: str                       # filename: auth-system, db-schema
-    content: str                     # markdown
-    last_updated: datetime
-    last_updated_by: str             # agent id
-    version: int                     # incremented on each write
-    referenced_by: list[str]         # task ids
-```
-
-### Lock
-
-```python
-class Lock(BaseModel):
-    resource: str                    # file path or logical resource name
-    holder: str                      # agent id
-    acquired_at: datetime
-    expires_at: datetime             # auto-release after N minutes
-    purpose: str
-```
+### MemoryDoc
+Columns: `topic PK`, `content`, `last_updated`, `last_updated_by`, `version`.
 
 ---
 
@@ -319,31 +205,21 @@ The harness keeps **hot state in a local SQLite file** and **durable/human-reada
 
 ### Layout on kDrive
 
-```
+```text
 /harness/
-├── state/
-│   ├── agents.json                 # all 11 agents, current status
-│   ├── tasks.json                  # full task board
-│   ├── locks.json                  # active locks
-│   └── inbox/
-│       ├── coord.json              # pending messages for coord
-│       ├── w1.json
-│       └── ...
 ├── events/
 │   ├── 2026-04-22.jsonl            # today, append-only
-│   ├── 2026-04-21.jsonl            # yesterday
 │   └── ...                         # rotated daily
 ├── memory/                         # scratchpad; overwritten on each write
 │   ├── auth-system.md
-│   ├── db-schema.md
 │   └── ...                         # agents create and update these
 ├── decisions/
 │   └── 2026-04-22-use-redis.md     # architectural decisions, dated
 ├── digests/
 │   ├── daily-2026-04-22.md
 │   └── weekly-2026-W16.md
-└── snapshots/                      # hourly state snapshots, last 24h kept
-    ├── 2026-04-22T14-00-00.tar.gz
+└── snapshots/                      # 5-min state snapshots, last 144 kept
+    ├── 2026-04-22T14-00-00.db
     └── ...
 ```
 
@@ -541,15 +417,15 @@ Prepended when an agent runs on `/loop`. Caps iterations, enforces heartbeats, f
 ## 10. Web UI
 
 ### Shared stack
-- React 18 + TypeScript + Vite
-- Zustand for state
+- Preact 10 + htm + Split.js (no build step, pure ESM)
+- Plain React hooks for state (no Zustand)
 - One websocket connection at app root, events dispatched to subscribers
 - PWA manifest for "add to home screen" + push notifications
 
 ### Desktop shell (`DesktopShell.tsx`)
 
-- `react-mosaic` tiling layout
-- Pane types: AgentPane (×11), TimelinePane, TaskBoardPane, MemoryPane, BroadcastPane
+- `Split.js` for tiling layout
+- Pane types: AgentPane (×11), TimelinePane, TaskBoardPane, MemoryPane, BroadcastPane, FilesPane (`__files`)
 - Drag pane header to split; drag divider to resize; drag out to pop into new window
 - Layout persisted to localStorage
 - 3 preset layouts: "overview", "focus", "debug"
@@ -705,106 +581,32 @@ One connection per browser tab/window; client-side filtering for panes.
 
 ## 13. Deployment
 
-### One-time VPS setup
+### Zeabur Deploy
 
-```bash
-# On a fresh Ubuntu/Debian VPS
-curl -fsSL https://yourhost/harness/scripts/bootstrap-vps.sh | bash
-```
+The app is built to be deployed on Zeabur out of the box, with automatic builds triggered from the `main` branch.
 
-`bootstrap-vps.sh` does:
-1. Installs Docker + docker compose plugin
-2. Creates `/opt/harness` dir
-3. Clones the repo (or you push it)
-4. Prompts for `.env` values
-5. Copies `.env.example` → `.env`
-6. Runs `docker compose up -d`
+1. Deploy the Dockerfile on Zeabur.
+2. Mount a volume at `/data` for SQLite persistence and Claude tokens.
+3. Configure environment variables in the Zeabur dashboard.
+4. Zeabur automatically handles TLS/HTTPS ingress.
 
-### Ongoing
-
-```bash
-ssh vps
-cd /opt/harness
-git pull
-docker compose up -d --build         # rebuild and restart
-```
-
-### Docker Compose
-
-```yaml
-services:
-  harness:
-    build: .
-    restart: unless-stopped
-    env_file: .env
-    volumes:
-      - ./workspaces:/workspaces         # git worktrees (can rebuild)
-      - ./claude-auth:/root/.claude      # OAuth tokens
-    expose:
-      - "8000"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/status"]
-      interval: 30s
-
-  caddy:
-    image: caddy:2-alpine
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
-      - caddy_data:/data
-      - caddy_config:/config
-
-volumes:
-  caddy_data:
-  caddy_config:
-```
-
-### Dockerfile (single-stage, builds front + back)
+### Dockerfile (single-stage)
 
 ```dockerfile
 FROM node:20-slim AS frontend
-WORKDIR /app
-COPY web/ ./
-RUN npm ci && npm run build
-# produces web/dist/
+# (Preact UI is served directly from static folder; no build needed)
 
 FROM python:3.12-slim
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends git curl \
     && rm -rf /var/lib/apt/lists/*
-# Install Claude Code CLI (bundled with SDK but ensure fresh)
-RUN curl -fsSL https://claude.ai/install.sh | bash
+RUN npm install -g @anthropic-ai/claude-code
 COPY pyproject.toml uv.lock ./
 RUN pip install uv && uv sync --frozen
 COPY server/ ./server/
 COPY prompts/ ./prompts/
-COPY --from=frontend /app/dist ./web_static/
 EXPOSE 8000
 CMD ["uv", "run", "uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
-### Caddyfile
-
-```
-{$HARNESS_DOMAIN} {
-    # Static UI
-    root * /app/web_static
-    file_server
-    try_files {path} /index.html
-
-    # API + WebSocket proxy to app
-    @api path /api/*
-    handle @api {
-        reverse_proxy harness:8000
-    }
-    @ws path /ws
-    handle @ws {
-        reverse_proxy harness:8000
-    }
-}
 ```
 
 ### `.env.example`

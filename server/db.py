@@ -67,16 +67,40 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status  ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_owner   ON tasks(owner);
 CREATE INDEX IF NOT EXISTS idx_tasks_parent  ON tasks(parent_id);
 
+-- payload_to / payload_owner: virtual generated columns over the
+-- two JSON fields the pane-history fan-out filter cares about. Lets
+-- us index them — the prior query used json_extract() in the WHERE
+-- clause, which is unindexable and forced a full scan of the events
+-- table on every pane open. Virtual columns aren't stored in the
+-- row, only in the index, so disk overhead is just the index size.
 CREATE TABLE IF NOT EXISTS events (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts         TEXT NOT NULL,
-    agent_id   TEXT NOT NULL,
-    type       TEXT NOT NULL,
-    payload    TEXT NOT NULL                   -- JSON string
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              TEXT NOT NULL,
+    agent_id        TEXT NOT NULL,
+    type            TEXT NOT NULL,
+    payload         TEXT NOT NULL,                   -- JSON string
+    payload_to      TEXT GENERATED ALWAYS AS (json_extract(payload, '$.to')) VIRTUAL,
+    payload_owner   TEXT GENERATED ALWAYS AS (json_extract(payload, '$.owner')) VIRTUAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_type  ON events(type);
+-- (agent_id, type) for fan-out queries that decompose into "events
+-- where I am the actor of any type, OR events of a specific type
+-- targeting me". The OR-branch with type='message_sent' / 'task_*'
+-- benefits from filtering on type first, then narrowing within. With
+-- only the (agent_id, id) index the planner can't use it for the
+-- type-specific OR branches and falls back to a scan.
+CREATE INDEX IF NOT EXISTS idx_events_agent_type ON events(agent_id, type);
+-- (type, id) for type-only queries with id-ordered pagination, e.g.
+-- /api/events?type=human_attention&since_id=N — the existing
+-- idx_events_type covers WHERE type=? but not the ORDER BY id DESC
+-- LIMIT N step, forcing a temp-table sort.
+CREATE INDEX IF NOT EXISTS idx_events_type_id   ON events(type, id);
+-- Indexes on payload_to / payload_owner are NOT in SCHEMA — they
+-- depend on the generated columns existing, which on an existing DB
+-- require the ALTER TABLE migration in init_db() to have run first.
+-- We CREATE them after the ALTER step instead.
 
 CREATE TABLE IF NOT EXISTS messages (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -300,6 +324,67 @@ async def init_db() -> None:
                 except Exception as e:
                     if "duplicate column" not in str(e).lower():
                         raise
+            # Generated columns + indexes on the events table for
+            # pane-history fan-out filtering. Old DBs created before
+            # these columns existed need them ALTERed in; new DBs
+            # picked them up via SCHEMA above and the ALTERs are no-ops.
+            # SQLite supports VIRTUAL generated columns via ALTER TABLE
+            # ADD COLUMN; the expression must be deterministic (which
+            # json_extract is) and the column can't be the rowid.
+            for col_name, col_ddl in (
+                ("payload_to",
+                 "ALTER TABLE events ADD COLUMN payload_to TEXT "
+                 "GENERATED ALWAYS AS (json_extract(payload, '$.to')) VIRTUAL"),
+                ("payload_owner",
+                 "ALTER TABLE events ADD COLUMN payload_owner TEXT "
+                 "GENERATED ALWAYS AS (json_extract(payload, '$.owner')) VIRTUAL"),
+            ):
+                try:
+                    await db.execute(col_ddl)
+                    logger.info("init_db: migration applied: events.%s", col_name)
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "duplicate column" in msg or "already exists" in msg:
+                        continue
+                    # ALTER TABLE GENERATED requires SQLite >= 3.31.
+                    # If the build is older, log + skip — queries fall
+                    # back to json_extract via main.py's defensive code.
+                    if "near \"generated\"" in msg or "syntax error" in msg:
+                        logger.warning(
+                            "init_db: SQLite build does not support generated "
+                            "columns; events.%s skipped, queries will use "
+                            "json_extract fallback", col_name
+                        )
+                        continue
+                    raise
+            # Indexes over the generated columns. Run AFTER the
+            # ALTER TABLE migrations above so the columns exist (on
+            # old DBs) by the time we try to index them. CREATE INDEX
+            # IF NOT EXISTS is a no-op on a fresh / already-indexed
+            # DB. Building over a large events table can take a few
+            # seconds — acceptable on startup. If the SQLite build
+            # didn't support generated columns and we skipped the
+            # migration, these CREATE INDEX statements will fail
+            # ("no such column"); catch and skip.
+            for idx_name, idx_ddl in (
+                ("idx_events_to",
+                 "CREATE INDEX IF NOT EXISTS idx_events_to "
+                 "ON events(type, payload_to, id)"),
+                ("idx_events_owner",
+                 "CREATE INDEX IF NOT EXISTS idx_events_owner "
+                 "ON events(type, payload_owner, id)"),
+            ):
+                try:
+                    await db.execute(idx_ddl)
+                except Exception as e:
+                    if "no such column" in str(e).lower():
+                        logger.warning(
+                            "init_db: %s skipped (generated column missing)",
+                            idx_name,
+                        )
+                        continue
+                    raise
+
             # Token-usage columns on the turns ledger. Populated from
             # ResultMessage.usage on every successful turn; drives the
             # auto-compact threshold (HARNESS_AUTO_COMPACT_THRESHOLD).

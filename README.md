@@ -28,6 +28,20 @@ Full details: [TOT-specs.md](TOT-specs.md). Rules agents follow when editing thi
 
 ---
 
+## The shape of it
+
+A few things this harness does — and deliberately doesn't — that feel worth calling out:
+
+- **Watch all eleven agents work, simultaneously.** A tileable multi-pane web UI streams every agent's tool use live, side by side. Drag panes around, stack them into columns, export a conversation to markdown. Most multi-agent orchestrators abstract agents behind dashboards, tickets, or pipeline logs — you see the org chart, you see the deliverables, but you lose contact with what the agents are actually doing. Here, the agent chatter *is* the interface. Even mostly-autonomous teams benefit from light-touch steering, and that only works if you can see what's happening as it happens. That's the main reason this project exists.
+- **Reach the team from anywhere.** The web UI is the primary workspace. A Telegram bot (being wired in now) lets you send goals to Coach and read replies from your phone when you're away from a screen. Everything human-readable also mirrors to your cloud drive, so the agents' output is reachable even with the harness offline.
+- **One operator, one VPS, one SQLite file.** No distributed control plane, no vector DB, no Redis, no Kubernetes. Everything routes through one Python process that holds the only write handle. The code is small enough to read in an afternoon and the whole thing runs comfortably on a modest VPS.
+- **Straight onto your real repo.** Each Player works in their own git worktree on your GitHub project and `git push`es back. No holding pen, no PR-bot mediator, no abstraction over git. Direct commit access is a feature, not a risk to design around — that's what the worktree isolation is for.
+- **Human-readable by default.** Memory, knowledge, decisions, and binary outputs land as plain files on your WebDAV-compatible cloud drive. Readable on any device, with any editor, with or without the harness running. Point Obsidian at the drive and you have a live second-brain the team writes into.
+- **Coach plans, Players execute.** Coach receives goals, decomposes them into tasks, and assigns work; Players claim tasks, do the work, and report back. Players can message each other peer-to-peer for information they need, but don't issue orders. Plenty of multi-agent frameworks split "planner" from "worker" — this isn't a novel idea. It's just the organizing principle here, and the tool surface enforces it so Coach can never be bypassed by accident.
+- **Not a wrapper.** This is Claude Code — same CLI under the hood, same permission model, same tool allowlists. The harness adds a task board, a message bus, per-agent identity, and cost caps. It doesn't try to abstract Claude Code or swap in a different model provider. Per-agent and team daily cost caps are enforced before spawn so a runaway loop stops itself.
+
+---
+
 ## Quick start (any Linux server)
 
 **Requirements:**
