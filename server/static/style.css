@@ -58,19 +58,20 @@ body {
   /* Explicit grid-row placement: panes take the flexible top row,
      rail takes the auto-sized bottom row. */
   .panes { grid-row: 1; }
-  /* Rail at the bottom. Explicit 2-row × 4-column CSS Grid:
-       Row 1: agents row (spans all 4 cols, horizontally scrollable).
-       Row 2: ws-dot | rail-files | rail-controls (1fr) | rail-env
-              — a single thin bottom line.
-     `display: contents` was unreliable on Android Chrome (children
-     didn't pick up the parent flex layout consistently), so each
-     bottom group keeps its own box and gets explicit
-     grid-row / grid-column placement. */
+  /* Rail at the bottom — flexbox with wrap.
+       Row 1: rail-agents (forced full-width via flex-basis: 100%, scrolls horizontally).
+       Row 2: ws-dot, rail-files, rail-controls (flex-grow), rail-env — single inline line.
+     Earlier attempts:
+       - `display: contents` was unreliable on Android Chrome (children
+         didn't pick up the parent flex layout consistently).
+       - Explicit CSS Grid (grid-row/grid-column placement) still
+         intermittently stacked the bottom group on Android Chrome.
+     Flexbox + flex-wrap with `order` is the simplest cross-browser flow
+     that gets the agents row + single-line bottom strip we want. */
   .rail {
     grid-row: 2;
-    display: grid;
-    grid-template-columns: auto auto 1fr auto;
-    grid-template-rows: auto auto;
+    display: flex;
+    flex-wrap: wrap;
     align-items: center;
     border-right: none;
     border-top: 1px solid var(--border);
@@ -79,32 +80,39 @@ body {
     overflow: visible;
   }
   .rail .ws-dot {
-    grid-row: 2;
-    grid-column: 1;
-    margin: 0 4px 0 8px;
+    order: 2;
+    margin: 0 6px 0 8px;
     width: 8px;
     height: 8px;
+    flex: 0 0 auto;
   }
   .rail-group {
     margin-top: 0 !important;
     flex-direction: row !important;
     align-items: center;
     gap: 6px;
-    padding: 4px 6px;
+    padding: 3px 6px;
   }
   .rail-group.rail-agents {
-    grid-row: 1;
-    grid-column: 1 / -1;
+    order: 1;
+    flex: 1 0 100%;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     border-bottom: 1px solid var(--border);
-    padding: 4px 6px;
-    gap: 4px;
+    padding: 3px 6px;
+    gap: 3px;
     justify-content: flex-start;
   }
-  .rail-group.rail-files    { grid-row: 2; grid-column: 2; }
-  .rail-group.rail-controls { grid-row: 2; grid-column: 3; justify-content: center; }
-  .rail-group.rail-env      { grid-row: 2; grid-column: 4; }
+  .rail-group.rail-files    { order: 3; }
+  .rail-group.rail-controls { order: 4; flex: 1 0 auto; justify-content: center; }
+  .rail-group.rail-env      { order: 5; margin-left: auto; }
+  /* Tighter slot buttons on mobile so 11 slots fit without scroll on
+     360px-wide phones. */
+  .rail-group.rail-agents .slot {
+    width: 28px;
+    height: 28px;
+    border-radius: 5px;
+  }
   /* Hide controls that don't fit single-pane swipe view. */
   .gear.layout-preset,
   .gear.cancel-all { display: none; }
