@@ -55,9 +55,16 @@ body {
     grid-template-columns: 1fr !important;
     grid-template-rows: 1fr auto !important;
   }
+  /* Explicit grid-row placement: panes take the flexible top row,
+     rail takes the auto-sized bottom row. Without this, default
+     auto-flow placed the rail (first child in DOM) into row 1
+     and panes into row 2, leaving panes with zero height — i.e.
+     "no pane visible on mobile". */
+  .panes { grid-row: 1; }
   /* Rail at the bottom, two rows: agents (full-width row 1) +
      files / controls / env (3 cells in row 2). */
   .rail {
+    grid-row: 2;
     display: grid;
     grid-template-rows: auto auto;
     grid-template-columns: auto 1fr auto;
