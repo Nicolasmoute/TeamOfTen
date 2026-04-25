@@ -375,6 +375,24 @@ Display section in Options drawer:
   `localStorage` as `harness_tz_pref`; toggle reloads the page so
   already-rendered timestamps update at once.
 
+Pane maximize / restore:
+- Each pane (AgentPane + FilesPane) header has a `⛶` (maximize) /
+  `❐` (restore) button between the gear and close.
+- `maximizedSlot` lives in App state, persisted alongside
+  `openColumns` in `harness_layout_v1`. While set, `effectiveColumns`
+  collapses to `[[maximizedSlot]]` so the chosen pane fills the
+  panes area; Split.js stands down (no gutters), drop-zones hide.
+- Auto-restore: clicking any LeftRail slot, `stackInLast`, or a
+  layout preset (`spread`/`pairs`) clears the maximize. Closing the
+  maximized pane also clears it.
+- EnvPane stays independent — toggle it with ⌘/Ctrl+B if you also
+  want full-width focus.
+- Known limitation: maximize/restore re-mounts the pane component
+  (column key changes when its slot list changes), so transient
+  per-pane UI state (search filter, settings popover open/closed,
+  scroll position) resets. Conversation history reloads from
+  `/api/events` cache.
+
 **Next likely:**
 - **Mobile UI polish** — touch-drag doesn't work with HTML5 DnD;
    layout breakpoints for < 900 px need a rethink.

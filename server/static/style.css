@@ -1374,7 +1374,7 @@ body {
 }
 .gear.files-open.active { color: var(--fg); }
 
-.pane-gear, .pane-export, .pane-search-toggle, .pane-pop-out {
+.pane-gear, .pane-export, .pane-search-toggle, .pane-pop-out, .pane-maximize {
   background: transparent;
   border: 0;
   color: var(--muted);
@@ -1383,9 +1383,15 @@ body {
   padding: 0 4px;
   line-height: 1;
 }
-.pane-gear:hover, .pane-export:hover, .pane-search-toggle:hover, .pane-pop-out:hover { color: var(--fg); }
+.pane-gear:hover, .pane-export:hover, .pane-search-toggle:hover, .pane-pop-out:hover, .pane-maximize:hover { color: var(--fg); }
 .pane-export:disabled { opacity: 0.3; cursor: not-allowed; }
 .pane-search-toggle.active { color: var(--accent); }
+
+/* When the panes area is in single-pane focus mode, hide drop zones
+   (no multi-pane layout to drop into) and let the lone column fill
+   the area. The .pane-col flex sizing already does the right thing
+   when there's exactly one column. */
+.panes.maximized .pane-col { flex: 1 1 100%; }
 
 .pane-search {
   display: flex;

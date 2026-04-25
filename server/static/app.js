@@ -72,10 +72,16 @@ function loadLayout() {
       typeof v.envWidth === "number" && v.envWidth >= 260 && v.envWidth <= 900
         ? v.envWidth
         : 340;
+    // maximizedSlot: which pane is currently expanded to full panes-area.
+    // Validated on render against actual openColumns — a stale value
+    // (slot no longer open) just falls back to the multi-pane layout.
+    const maximizedSlot =
+      typeof v.maximizedSlot === "string" ? v.maximizedSlot : null;
     return {
       openColumns,
       envOpen: typeof v.envOpen === "boolean" ? v.envOpen : true,
       envWidth,
+      maximizedSlot,
     };
   } catch (_) {
     return null;
@@ -574,6 +580,12 @@ function App() {
   const [envWidth, setEnvWidth] = useState(
     () => loadLayout()?.envWidth ?? 340
   );
+  // Single-pane focus mode: when set to a slot id, only that pane
+  // renders (filling the panes area). Clicking another rail slot, the
+  // current pane's restore button, or closing the pane → clears it.
+  const [maximizedSlot, setMaximizedSlot] = useState(
+    () => loadLayout()?.maximizedSlot ?? null
+  );
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [serverStatus, setServerStatus] = useState(null);
   const [paused, setPaused] = useState(false);
@@ -691,10 +703,10 @@ function App() {
     return () => clearInterval(statusTimer);
   }, [loadAgents, loadTasks, loadStatus, loadPause]);
 
-  // Persist layout (open slots + env panel state) on every change.
+  // Persist layout (open slots + env panel state + maximize) on every change.
   useEffect(() => {
-    saveLayout({ openColumns, envOpen, envWidth });
-  }, [openColumns, envOpen, envWidth]);
+    saveLayout({ openColumns, envOpen, envWidth, maximizedSlot });
+  }, [openColumns, envOpen, envWidth, maximizedSlot]);
 
   // Keep tool-renderer name directory (slot → human name) in sync
   // so coord_send_message etc. can print "→ Gait" instead of "→ p3".
@@ -968,7 +980,8 @@ function App() {
   // Open a slot as a new standalone column on the right. Also marks
   // the slot as seen so any prior unread badge clears. If the slot is
   // already open, scroll its pane into view — user probably clicked
-  // to find it.
+  // to find it. Auto-restores from maximize: clicking any rail slot
+  // means the user wants the multi-pane layout back.
   const openPane = useCallback((slot) => {
     let alreadyOpen = false;
     setOpenColumns((prev) => {
@@ -978,6 +991,7 @@ function App() {
       }
       return [...prev, [slot]];
     });
+    setMaximizedSlot((cur) => (cur && cur !== slot ? null : cur));
     markSeen(slot);
     if (alreadyOpen) {
       // Defer to next tick so layout settles if the state update
@@ -1000,11 +1014,13 @@ function App() {
         .filter((col) => col.length > 0);
       return out;
     });
+    setMaximizedSlot((cur) => (cur === slot ? null : cur));
     markSeen(slot);
   }, [markSeen]);
   // Append a slot to the bottom of the rightmost (last) column. If
   // slot already open anywhere else, move it. If no columns yet, opens
-  // as the first one.
+  // as the first one. Also exits maximize since the user wants the
+  // stack visible.
   const stackInLast = useCallback((slot) => {
     setOpenColumns((prev) => {
       const without = prev
@@ -1018,8 +1034,16 @@ function App() {
       ];
       return next;
     });
+    setMaximizedSlot(null);
     markSeen(slot);
   }, [markSeen]);
+
+  // Toggle a pane between maximized (full panes-area) and the user's
+  // saved layout. Clicking maximize on a different pane while one is
+  // already maximized switches focus to the new one.
+  const toggleMaximize = useCallback((slot) => {
+    setMaximizedSlot((cur) => (cur === slot ? null : slot));
+  }, []);
 
   // Stack a slot below an existing column (used by the pane header's
   // "+ stack below" action). If slot already open, move it; otherwise add.
@@ -1137,14 +1161,30 @@ function App() {
       }
       return prev;
     });
+    // Layout presets imply "show me the multi-pane arrangement" —
+    // staying maximized would defeat the click.
+    setMaximizedSlot(null);
   }, []);
 
+  // While maximized: collapse the layout to a single solo column so
+  // Split.js stands down (no gutters needed) and the chosen pane gets
+  // the full panes-area. If the maximized slot is no longer open
+  // (stale value, race), fall back to the user's saved layout.
+  const effectiveColumns = useMemo(() => {
+    if (maximizedSlot && flatSlots(openColumns).includes(maximizedSlot)) {
+      return [[maximizedSlot]];
+    }
+    return openColumns;
+  }, [openColumns, maximizedSlot]);
+  const isMaximized = effectiveColumns !== openColumns;
   // Split.js: horizontal split across columns, vertical split inside each
   // multi-pane column. Rebind whenever the layout structure changes.
   // A stable structure signature lets us skip reinit on no-op renders.
+  // Signature derived from EFFECTIVE columns so toggling maximize
+  // properly tears down + rebuilds gutters.
   const layoutSignature = useMemo(
-    () => openColumns.map((c) => c.join("|")).join("//"),
-    [openColumns]
+    () => effectiveColumns.map((c) => c.join("|")).join("//"),
+    [effectiveColumns]
   );
   // Persisted drag sizes. We mutate through the ref so changes don't
   // trigger a re-render (Split.js holds the sizes during drag).
@@ -1172,14 +1212,14 @@ function App() {
       "flex-basis": `${gutterSize}px`,
     });
     // Outer horizontal split across columns (only if >= 2 columns).
-    if (openColumns.length >= 2) {
-      const selectors = openColumns.map((_, i) => "#col-" + i);
+    if (effectiveColumns.length >= 2) {
+      const selectors = effectiveColumns.map((_, i) => "#col-" + i);
       const exist = selectors.every((sel) => document.querySelector(sel));
       if (exist) {
         const hKey = "h:" + layoutSignature;
         try {
           const h = Split(selectors, {
-            sizes: resolveSizes(hKey, openColumns.length),
+            sizes: resolveSizes(hKey, effectiveColumns.length),
             minSize: 260,
             gutterSize: 6,
             snapOffset: 0,
@@ -1196,7 +1236,7 @@ function App() {
       }
     }
     // Per-column vertical split for stacked panes.
-    openColumns.forEach((col, i) => {
+    effectiveColumns.forEach((col, i) => {
       if (col.length < 2) return;
       const selectors = col.map((s) => "#pane-" + s);
       const exist = selectors.every((sel) => document.querySelector(sel));
@@ -1272,11 +1312,11 @@ function App() {
           await authedFetch("/api/agents/cancel-all", { method: "POST" });
         }}
       />
-      <main class="panes">
-        ${openColumns.length === 0
+      <main class=${"panes" + (isMaximized ? " maximized" : "")}>
+        ${effectiveColumns.length === 0
           ? html`<div class="empty">Pick a slot on the left to open a pane.</div>`
           : html`
-              ${openColumns.map(
+              ${effectiveColumns.map(
                 (col, colIdx) =>
                   html`<div
                     class=${"pane-col" + (col.length > 1 ? " stacked" : "")}
@@ -1296,6 +1336,8 @@ function App() {
                           onDropEdge=${dropOnPaneEdge}
                           onPopOut=${moveToNewColumn}
                           stacked=${col.length > 1}
+                          isMaximized=${maximizedSlot === slot}
+                          onToggleMaximize=${() => toggleMaximize(slot)}
                         />`;
                       }
                       // wsAttempt bumps on every WS reconnect.
@@ -1319,20 +1361,26 @@ function App() {
                         onDropEdge=${dropOnPaneEdge}
                         onPopOut=${moveToNewColumn}
                         stacked=${col.length > 1}
+                        isMaximized=${maximizedSlot === slot}
+                        onToggleMaximize=${() => toggleMaximize(slot)}
                       />`;
                     })}
-                    <${DropZone}
-                      orientation="horizontal"
-                      label="drop to append"
-                      onDrop=${(slot) => moveToColEnd(slot, colIdx)}
-                    />
+                    ${isMaximized
+                      ? null
+                      : html`<${DropZone}
+                          orientation="horizontal"
+                          label="drop to append"
+                          onDrop=${(slot) => moveToColEnd(slot, colIdx)}
+                        />`}
                   </div>`
               )}
-              <${DropZone}
-                orientation="vertical"
-                label="new column"
-                onDrop=${moveToNewColumn}
-              />
+              ${isMaximized
+                ? null
+                : html`<${DropZone}
+                    orientation="vertical"
+                    label="new column"
+                    onDrop=${moveToNewColumn}
+                  />`}
             `}
       </main>
       ${envOpen
@@ -4544,7 +4592,7 @@ function EnvTimelineItem({ event }) {
 // the normal drag/resize/stack affordances like an agent pane.
 // ------------------------------------------------------------------
 
-function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, stacked }) {
+function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, stacked, isMaximized, onToggleMaximize }) {
   const [roots, setRoots] = useState([]);
   const [activeRoot, setActiveRoot] = useState(null);
   const [tree, setTree] = useState(null);
@@ -4718,6 +4766,13 @@ function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, 
         ${stacked
           ? html`<button class="pane-pop-out" onClick=${() => onPopOut(slot)}
               title="Pop out to its own column">⇱</button>`
+          : null}
+        ${onToggleMaximize
+          ? html`<button
+              class="pane-maximize"
+              onClick=${onToggleMaximize}
+              title=${isMaximized ? "Restore (show all panes)" : "Maximize (full screen)"}
+            >${isMaximized ? "❐" : "⛶"}</button>`
           : null}
         <button class="pane-close" onClick=${onClose} title="Close">×</button>
       </header>
@@ -5214,7 +5269,7 @@ function ContextBar({ slot, liveEvents, model }) {
 // agent pane
 // ------------------------------------------------------------------
 
-function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt, onClose, onDropEdge, onPopOut, stacked }) {
+function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt, onClose, onDropEdge, onPopOut, stacked, isMaximized, onToggleMaximize }) {
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState([]); // {id, url, path, filename}
   const [submitting, setSubmitting] = useState(false);
@@ -6001,6 +6056,13 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
           onClick=${() => setSettingsOpen((v) => !v)}
           title="Pane settings"
         >⚙</button>
+        ${onToggleMaximize
+          ? html`<button
+              class="pane-maximize"
+              onClick=${onToggleMaximize}
+              title=${isMaximized ? "Restore (show all panes)" : "Maximize (full screen)"}
+            >${isMaximized ? "❐" : "⛶"}</button>`
+          : null}
         <button class="pane-close" onClick=${onClose} title="Close pane">×</button>
         ${settingsOpen
           ? html`<${PaneSettingsPopover}
