@@ -2023,7 +2023,7 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, onOpen, onStackI
   return html`
     <aside class="rail">
       <span
-        class=${"ws-dot " + (wsConnected ? "ok" : "")}
+        class=${"ws-dot rail-ws-dot " + (wsConnected ? "ok" : "")}
         title=${wsConnected ? "websocket connected" : "websocket disconnected"}
       ></span>
       <!-- Top group: agents (Coach + 10 Players). -->
@@ -2036,6 +2036,10 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, onOpen, onStackI
            .rail-bottom takes the remaining vertical space and its
            flex-column flow restores the prior stacked layout. -->
       <div class="rail-bottom">
+        <span
+          class=${"ws-dot mobile-ws-dot " + (wsConnected ? "ok" : "")}
+          title=${wsConnected ? "websocket connected" : "websocket disconnected"}
+        ></span>
         <div class="rail-group rail-files">
           <button
             class=${"gear files-open" + (openSlots.includes("__files") ? " active" : "")}
@@ -2092,8 +2096,11 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, onOpen, onStackI
             class=${"gear env-toggle" + (envOpen ? " active" : "")}
             title=${(envOpen ? "Collapse environment panel" : "Open environment panel") + " (⌘/Ctrl+B)"}
             onClick=${onToggleEnv}
-          >▦</button>
-          <button class="gear" title="Settings" onClick=${onOpenSettings}>⚙</button>
+          >
+            <span class="env-icon-desktop">▦</span>
+            <span class="env-icon-mobile">E</span>
+          </button>
+          <button class="gear settings-toggle" title="Settings" onClick=${onOpenSettings}>⚙</button>
         </div>
       </div>
     </aside>
