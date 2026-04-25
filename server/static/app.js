@@ -1847,7 +1847,7 @@ function LeftRail({ agents, openSlots, dotStates, onOpen, onStackInLast, wsConne
         title=${tooltip}
         onClick=${(e) => (e.shiftKey ? onStackInLast(a.id) : onOpen(a.id))}
       >
-        ${dot ? html`<span class=${"slot-dot dot-" + dot} /></span>` : null}
+        ${dot ? html`<span class=${"slot-dot dot-" + dot}></span>` : null}
         <span class="slot-label">${slotShortLabel(a.id)}</span>
         ${a.locked ? html`<span class="slot-lock" aria-hidden="true">🔒</span>` : null}
       </button>
