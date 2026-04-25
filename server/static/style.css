@@ -120,6 +120,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
+  gap: 3px;
   transition: color 80ms, background 80ms, box-shadow 80ms, filter 80ms;
 }
 .slot:hover { filter: brightness(1.25); }
@@ -179,15 +180,15 @@ body {
   pointer-events: none;
   filter: drop-shadow(0 0 2px var(--bg));
 }
-/* Comms-state dot. Top-left, small. Only renders for activated agents. */
+/* Comms-state dot. Sits inline next to the label (right side); a flex
+   gap on .slot keeps a small breathing space. Only renders for
+   activated agents. */
 .slot-dot {
-  position: absolute;
-  top: 3px;
-  left: 3px;
   width: 6px;
   height: 6px;
   border-radius: 50%;
   pointer-events: none;
+  flex: 0 0 auto;
 }
 .slot-dot.dot-green  { background: var(--ok); }
 .slot-dot.dot-blue   { background: var(--accent); box-shadow: 0 0 4px var(--accent); }

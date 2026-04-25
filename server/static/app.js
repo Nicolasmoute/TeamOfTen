@@ -1984,13 +1984,17 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, onOpen, onStackI
     }
     const isOpen = openSlots.includes(a.id);
     const dot = hasSession ? (dotStates && dotStates.get(a.id)) || "green" : "";
+    // Coach is always on by design — locking Coach is a no-op
+    // semantically and the dimmed/locked-badge styling just looks
+    // broken on the captain. Limit it to Players.
+    const showLocked = a.locked && a.kind !== "coach";
     const classes = [
       "slot",
       a.kind,
       hasSession ? "has-session" : "unused",
       stateClass,
       isOpen ? "open" : "",
-      a.locked ? "locked" : "",
+      showLocked ? "locked" : "",
     ].filter(Boolean).join(" ");
     const baseTip = a.name
       ? `${a.id} — ${a.name}${a.role ? " — " + a.role : ""} (${status})`
@@ -2000,7 +2004,7 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, onOpen, onStackI
       : dot === "orange"
       ? " — waiting for a reply"
       : "";
-    const lockHint = a.locked ? " — LOCKED (Coach can't assign / message)" : "";
+    const lockHint = showLocked ? " — LOCKED (Coach can't assign / message)" : "";
     const tooltip = baseTip + dotHint + lockHint + " — shift-click to stack in last column";
     return html`
       <button
@@ -2009,9 +2013,9 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, onOpen, onStackI
         title=${tooltip}
         onClick=${(e) => (e.shiftKey ? onStackInLast(a.id) : onOpen(a.id))}
       >
-        ${dot ? html`<span class=${"slot-dot dot-" + dot}></span>` : null}
         <span class="slot-label">${slotShortLabel(a.id)}</span>
-        ${a.locked ? html`<span class="slot-lock" aria-hidden="true">🔒</span>` : null}
+        ${dot ? html`<span class=${"slot-dot dot-" + dot}></span>` : null}
+        ${showLocked ? html`<span class="slot-lock" aria-hidden="true">🔒</span>` : null}
       </button>
     `;
   };
