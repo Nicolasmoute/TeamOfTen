@@ -375,6 +375,32 @@ Display section in Options drawer:
   `localStorage` as `harness_tz_pref`; toggle reloads the page so
   already-rendered timestamps update at once.
 
+Markdown rendering upgrade — marked + DOMPurify + highlight.js:
+- Replaced the hand-rolled `renderMarkdown` (and its `_safeHref` /
+  `renderInline` helpers) with `marked@12` for parsing + `dompurify@3`
+  for sanitization + `highlight.js@11` for code-block syntax
+  highlighting. All loaded from esm.sh (theme CSS from jsdelivr
+  because esm.sh wraps CSS in JS modules).
+- GFM is on: pipe tables, nested lists with proper indentation, task
+  lists (`- [x]`), strikethrough, autolinks, blockquotes. Tables now
+  render as a real grid with header band + zebra rows instead of a
+  flat run of `|` separators.
+- Highlight.js languages registered: bash/sh/shell, css, go, html/xml,
+  javascript/js, json, markdown/md, python/py, rust/rs, sql,
+  typescript/ts, yaml/yml. Add more via `hljs.registerLanguage(...)`
+  near the top of [server/static/app.js](server/static/app.js).
+  Unregistered languages render as plain code blocks (no error).
+- DOMPurify owns the URL-scheme allowlist (drops `javascript:`,
+  `data:`, `vbscript:` etc.) and adds `target="_blank"`
+  + `rel="noreferrer noopener"` to every `<a>` via an
+  `afterSanitizeAttributes` hook. Replaces the prior manual
+  `_safeHref` regex.
+- CSS in [server/static/style.css](server/static/style.css) targets
+  plain HTML inside `.markdown` and `.files-md-preview` containers
+  (h1..h6, p, ul/ol/li, pre/code, table/th/td, blockquote, hr,
+  task-list checkboxes). The github-dark hljs theme paints the
+  inner `<code>` spans.
+
 Pane maximize / restore:
 - Each pane (AgentPane + FilesPane) header has a `⛶` (maximize) /
   `❐` (restore) button between the gear and close.

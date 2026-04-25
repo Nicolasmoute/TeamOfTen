@@ -2,9 +2,122 @@ import { h, render } from "https://esm.sh/preact@10";
 import { useState, useEffect, useMemo, useRef, useCallback, useLayoutEffect } from "https://esm.sh/preact@10/hooks";
 import htm from "https://esm.sh/htm@3";
 import Split from "https://esm.sh/split.js@1.6.5";
+import { Marked } from "https://esm.sh/marked@12";
+import DOMPurify from "https://esm.sh/dompurify@3";
+import hljs from "https://esm.sh/highlight.js@11/lib/core";
+import hljsBash from "https://esm.sh/highlight.js@11/lib/languages/bash";
+import hljsCss from "https://esm.sh/highlight.js@11/lib/languages/css";
+import hljsGo from "https://esm.sh/highlight.js@11/lib/languages/go";
+import hljsJson from "https://esm.sh/highlight.js@11/lib/languages/json";
+import hljsJs from "https://esm.sh/highlight.js@11/lib/languages/javascript";
+import hljsMd from "https://esm.sh/highlight.js@11/lib/languages/markdown";
+import hljsPython from "https://esm.sh/highlight.js@11/lib/languages/python";
+import hljsRust from "https://esm.sh/highlight.js@11/lib/languages/rust";
+import hljsSql from "https://esm.sh/highlight.js@11/lib/languages/sql";
+import hljsTs from "https://esm.sh/highlight.js@11/lib/languages/typescript";
+import hljsXml from "https://esm.sh/highlight.js@11/lib/languages/xml";
+import hljsYaml from "https://esm.sh/highlight.js@11/lib/languages/yaml";
 import { renderToolCall, setAgentDirectory } from "/static/tools.js";
 
 const html = htm.bind(h);
+
+// ------------------------------------------------------------------
+// markdown rendering: marked (GFM) + highlight.js + DOMPurify
+// ------------------------------------------------------------------
+//
+// English-only language argument doesn't apply here — these are
+// PROGRAMMING-language packs for syntax highlighting. Adding more
+// later is a one-liner: import the pack from
+// https://esm.sh/highlight.js@11/lib/languages/<name> and register it
+// against the aliases agents are likely to use.
+
+hljs.registerLanguage("bash", hljsBash);
+hljs.registerLanguage("sh", hljsBash);
+hljs.registerLanguage("shell", hljsBash);
+hljs.registerLanguage("css", hljsCss);
+hljs.registerLanguage("go", hljsGo);
+hljs.registerLanguage("html", hljsXml);
+hljs.registerLanguage("xml", hljsXml);
+hljs.registerLanguage("javascript", hljsJs);
+hljs.registerLanguage("js", hljsJs);
+hljs.registerLanguage("json", hljsJson);
+hljs.registerLanguage("markdown", hljsMd);
+hljs.registerLanguage("md", hljsMd);
+hljs.registerLanguage("python", hljsPython);
+hljs.registerLanguage("py", hljsPython);
+hljs.registerLanguage("rust", hljsRust);
+hljs.registerLanguage("rs", hljsRust);
+hljs.registerLanguage("sql", hljsSql);
+hljs.registerLanguage("typescript", hljsTs);
+hljs.registerLanguage("ts", hljsTs);
+hljs.registerLanguage("yaml", hljsYaml);
+hljs.registerLanguage("yml", hljsYaml);
+
+// Single Marked instance with GFM (tables, task lists, autolinks,
+// strikethrough). Custom code-block renderer runs hljs when the fence
+// info-string names a registered language; falls back to plain
+// escaped <pre><code> otherwise (keeps unknown langs readable).
+const marked = new Marked({
+  gfm: true,
+  breaks: false,
+  pedantic: false,
+});
+marked.use({
+  renderer: {
+    code(code, infostring) {
+      const text = typeof code === "object" && code ? (code.text || "") : String(code || "");
+      const lang = (typeof infostring === "string"
+        ? infostring
+        : typeof code === "object" && code
+          ? (code.lang || "")
+          : ""
+      ).trim().toLowerCase();
+      if (lang && hljs.getLanguage(lang)) {
+        try {
+          const highlighted = hljs.highlight(text, {
+            language: lang, ignoreIllegals: true,
+          }).value;
+          return `<pre class="md-code"><code class="hljs language-${lang}" data-lang="${lang}">${highlighted}</code></pre>`;
+        } catch (_) {
+          // Fall through to escaped plaintext.
+        }
+      }
+      const esc = text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+      return `<pre class="md-code"><code class="hljs"${lang ? ` data-lang="${lang}"` : ""}>${esc}</code></pre>`;
+    },
+  },
+});
+
+// Add target=_blank + rel=noreferrer to every link DOMPurify lets
+// through. Cheaper than overriding marked's link renderer and lets
+// DOMPurify own the URL-scheme allowlist (drops javascript:, data:,
+// vbscript: by default).
+DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+  if (node.tagName === "A" && node.hasAttribute("href")) {
+    node.setAttribute("target", "_blank");
+    node.setAttribute("rel", "noreferrer noopener");
+  }
+});
+
+function renderMarkdown(md) {
+  if (!md) return "";
+  let raw;
+  try {
+    raw = marked.parse(String(md));
+  } catch (e) {
+    console.error("markdown parse failed", e);
+    // Fall back to escaped plaintext so the user still sees something.
+    return "<pre class=\"md-code\"><code>" +
+      String(md).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") +
+      "</code></pre>";
+  }
+  return DOMPurify.sanitize(raw, {
+    ADD_ATTR: ["target", "rel", "data-lang"],
+  });
+}
 
 // ------------------------------------------------------------------
 // auth: bearer token stored in localStorage
@@ -4905,124 +5018,10 @@ function FileTreeNode({ node, root, path, depth, expanded, setExpanded, selected
   `;
 }
 
-// Minimal markdown renderer — headings, paragraphs, code fences, lists,
-// inline code/bold/italic/links. Deliberately small; if we need real
-// rendering later we can drop in micromark or similar.
-function renderMarkdown(md) {
-  if (!md) return "";
-  const esc = (s) =>
-    String(s)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-  const lines = md.split(/\r?\n/);
-  const out = [];
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    // Fenced code block
-    const fence = /^```(\w*)$/.exec(line);
-    if (fence) {
-      const lang = fence[1];
-      const buf = [];
-      i++;
-      while (i < lines.length && !/^```$/.test(lines[i])) {
-        buf.push(lines[i]);
-        i++;
-      }
-      i++; // skip closing fence
-      out.push(
-        `<pre class="md-code"><code${lang ? ` data-lang="${esc(lang)}"` : ""}>${esc(buf.join("\n"))}</code></pre>`
-      );
-      continue;
-    }
-    // Heading
-    const h = /^(#{1,6})\s+(.*)$/.exec(line);
-    if (h) {
-      const lvl = h[1].length;
-      out.push(`<h${lvl} class="md-h">${renderInline(esc(h[2]))}</h${lvl}>`);
-      i++;
-      continue;
-    }
-    // Unordered list block
-    if (/^[-*]\s+/.test(line)) {
-      const items = [];
-      while (i < lines.length && /^[-*]\s+/.test(lines[i])) {
-        items.push(lines[i].replace(/^[-*]\s+/, ""));
-        i++;
-      }
-      out.push(
-        "<ul class=\"md-ul\">" +
-          items.map((t) => "<li>" + renderInline(esc(t)) + "</li>").join("") +
-          "</ul>"
-      );
-      continue;
-    }
-    // Ordered list block
-    if (/^\d+\.\s+/.test(line)) {
-      const items = [];
-      while (i < lines.length && /^\d+\.\s+/.test(lines[i])) {
-        items.push(lines[i].replace(/^\d+\.\s+/, ""));
-        i++;
-      }
-      out.push(
-        "<ol class=\"md-ol\">" +
-          items.map((t) => "<li>" + renderInline(esc(t)) + "</li>").join("") +
-          "</ol>"
-      );
-      continue;
-    }
-    // Blank line → paragraph break
-    if (!line.trim()) { i++; continue; }
-    // Paragraph (collect until blank)
-    const buf = [line];
-    i++;
-    while (i < lines.length && lines[i].trim() && !/^(#{1,6}\s|[-*]\s|\d+\.\s|```)/.test(lines[i])) {
-      buf.push(lines[i]);
-      i++;
-    }
-    out.push("<p class=\"md-p\">" + renderInline(esc(buf.join(" "))) + "</p>");
-  }
-  return out.join("\n");
-}
-
-// Only allow URL schemes we trust to appear in agent/user-produced
-// markdown. javascript:, data:, vbscript: etc. would let any rendered
-// link fire code on click — exfiltrating the HARNESS_TOKEN from
-// localStorage is a one-liner once you're in-origin. Relative and
-// fragment links pass through unchanged. Everything else becomes a
-// plain-text "#" so the text still renders but the link is inert.
-function _safeHref(raw) {
-  const url = String(raw).trim();
-  if (!url) return "#";
-  if (url.startsWith("#") || url.startsWith("/") || url.startsWith("./") || url.startsWith("../")) {
-    return url;
-  }
-  const m = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(url);
-  if (!m) return url; // no scheme → treat as relative
-  const scheme = m[1].toLowerCase();
-  if (scheme === "http" || scheme === "https" || scheme === "mailto") {
-    return url;
-  }
-  return "#";
-}
-
-function renderInline(s) {
-  return s
-    // links [text](url) — scheme-filtered via _safeHref
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, text, url) => {
-      const href = _safeHref(url)
-        .replace(/"/g, "&quot;")
-        .replace(/</g, "&lt;");
-      return `<a href="${href}" target="_blank" rel="noopener noreferrer">${text}</a>`;
-    })
-    // inline code
-    .replace(/`([^`]+)`/g, '<code class="md-ic">$1</code>')
-    // bold
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    // italic (avoid already-escaped patterns)
-    .replace(/(^|\W)\*([^*]+)\*(\W|$)/g, "$1<em>$2</em>$3");
-}
+// renderMarkdown lives near the top of the file now (with marked +
+// DOMPurify + highlight.js wiring). Deleted the hand-rolled fallback
+// and its private helpers (_safeHref, renderInline) — the marked
+// pipeline supersedes them.
 
 // ------------------------------------------------------------------
 // active loops bar (Coach-only): shows the tick loop (/loop) and the

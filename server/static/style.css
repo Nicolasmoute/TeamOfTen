@@ -1302,13 +1302,52 @@ body {
   line-height: 1.55;
   font-size: 14px;
 }
-.files-md-preview .md-h { margin: 1em 0 0.3em; }
-.files-md-preview h1.md-h { font-size: 1.6em; }
-.files-md-preview h2.md-h { font-size: 1.3em; }
-.files-md-preview h3.md-h { font-size: 1.1em; }
-.files-md-preview .md-p { margin: 0.6em 0; }
-.files-md-preview .md-ul, .files-md-preview .md-ol { margin: 0.4em 0 0.4em 1.6em; }
-.files-md-preview .md-code {
+/* Shared markdown styling for the marked + DOMPurify + hljs pipeline.
+   Used in two contexts: agent text/thinking events (.markdown class)
+   and the files preview (.files-md-preview). The selectors target
+   plain HTML (h1..h6, p, ul, table, …) since marked emits standard
+   tags — the legacy hand-rolled renderer used .md-* classes. */
+.markdown, .files-md-preview { line-height: 1.55; }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4, .markdown h5, .markdown h6,
+.files-md-preview h1, .files-md-preview h2, .files-md-preview h3,
+.files-md-preview h4, .files-md-preview h5, .files-md-preview h6 {
+  margin: 1em 0 0.3em;
+  font-weight: 600;
+}
+.markdown h1, .files-md-preview h1 { font-size: 1.5em; }
+.markdown h2, .files-md-preview h2 { font-size: 1.25em; }
+.markdown h3, .files-md-preview h3 { font-size: 1.1em; }
+.markdown h4, .markdown h5, .markdown h6,
+.files-md-preview h4, .files-md-preview h5, .files-md-preview h6 { font-size: 1em; }
+.markdown p, .files-md-preview p { margin: 0.5em 0; }
+.markdown ul, .markdown ol,
+.files-md-preview ul, .files-md-preview ol {
+  margin: 0.4em 0;
+  padding-left: 1.6em;
+}
+.markdown li > ul, .markdown li > ol,
+.files-md-preview li > ul, .files-md-preview li > ol {
+  margin: 0.2em 0;
+}
+.markdown li, .files-md-preview li { margin: 0.15em 0; }
+.markdown li > p, .files-md-preview li > p { margin: 0.2em 0; }
+.markdown li > input[type="checkbox"],
+.files-md-preview li > input[type="checkbox"] {
+  margin-right: 6px;
+  vertical-align: middle;
+}
+/* Inline code (not inside a <pre>) */
+.markdown :not(pre) > code,
+.files-md-preview :not(pre) > code {
+  background: var(--card);
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-size: 0.9em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+/* Code fences. The github-dark theme paints the inner <code>; keep
+   the <pre> container styled so it merges with the harness UI. */
+.markdown pre, .files-md-preview pre {
   background: var(--card);
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -1316,14 +1355,55 @@ body {
   overflow-x: auto;
   font-size: 12px;
   line-height: 1.4;
+  margin: 0.6em 0;
 }
-.files-md-preview .md-ic {
+.markdown pre code, .files-md-preview pre code {
+  background: transparent !important;
+  padding: 0 !important;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+/* GFM tables — readable grid with header band and zebra body rows. */
+.markdown table, .files-md-preview table {
+  border-collapse: collapse;
+  margin: 0.6em 0;
+  font-size: 0.95em;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+.markdown th, .markdown td,
+.files-md-preview th, .files-md-preview td {
+  border: 1px solid var(--border);
+  padding: 5px 9px;
+  text-align: left;
+  vertical-align: top;
+}
+.markdown th, .files-md-preview th {
   background: var(--card);
-  border-radius: 3px;
-  padding: 1px 4px;
-  font-size: 0.9em;
+  font-weight: 600;
 }
-.files-md-preview a { color: var(--accent); }
+.markdown tr:nth-child(even) td,
+.files-md-preview tr:nth-child(even) td {
+  background: rgba(255, 255, 255, 0.02);
+}
+/* Blockquote — left rail + muted text */
+.markdown blockquote, .files-md-preview blockquote {
+  margin: 0.6em 0;
+  padding: 0.2em 0.9em;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+.markdown hr, .files-md-preview hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 1em 0;
+}
+.markdown a, .files-md-preview a { color: var(--accent); }
+.markdown a:hover, .files-md-preview a:hover { text-decoration: underline; }
+/* Slightly tighten the spacing at top/bottom of an event body so
+   single-paragraph replies don't waste vertical space. */
+.event-body.markdown > :first-child { margin-top: 0; }
+.event-body.markdown > :last-child { margin-bottom: 0; }
 .files-editor-foot {
   display: flex;
   gap: 12px;
