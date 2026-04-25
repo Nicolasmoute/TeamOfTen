@@ -375,6 +375,27 @@ Display section in Options drawer:
   `localStorage` as `harness_tz_pref`; toggle reloads the page so
   already-rendered timestamps update at once.
 
+Edit tool diff card — unified line-by-line view:
+- Replaced the side-by-side "full old / full new" blocks (which
+  showed every shared line twice and used 11px monospace plain text)
+  with a unified IDE-style diff: only changed lines + their context
+  appear, each with a `-` / `+` / ` ` prefix gutter and red/green
+  band background.
+- Uses `diff@7` (~30 KB) via esm.sh for line-based diffing.
+- Each line is syntax-highlighted by `highlight.js` based on file
+  extension. Mapping in [server/static/tools.js](server/static/tools.js):
+  bash/css/go/html/js/json/md/py/rs/sql/ts/yaml. Markdown files
+  highlight `## headings`, `**bold**`, fenced blocks, etc. so a
+  doc-edit reads as well as a code-edit.
+- Header counts are now derived from real diff stats
+  (`(-N +M)` reflects actually changed lines, not the
+  `old_string`/`new_string` line counts which double-count context).
+- A small lang badge (`PYTHON`, `MARKDOWN`, …) appears in the
+  summary row when extension recognition succeeds.
+- Single-line highlighting can lose multi-line state (open string
+  literals etc.) — acceptable trade-off vs the contortion of
+  highlighting full sides and then mapping back to diff rows.
+
 Markdown rendering upgrade — marked + DOMPurify + highlight.js:
 - Replaced the hand-rolled `renderMarkdown` (and its `_safeHref` /
   `renderInline` helpers) with `marked@12` for parsing + `dompurify@3`

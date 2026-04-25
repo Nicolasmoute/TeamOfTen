@@ -2092,39 +2092,77 @@ body {
   object-fit: contain;
 }
 
-/* ---- Edit diff card ---- */
+/* ---- Edit diff card: unified line-by-line view ----
+   Each row is one of three kinds:
+     diff-ctx  unchanged context (muted)
+     diff-add  inserted line   (green band)
+     diff-del  deleted line    (red band)
+   Rows are syntax-highlighted by hljs based on file extension; the
+   .hljs container gives them the github-dark text color so unchanged
+   context blends with the diff bands instead of looking white-on-dark. */
 .tool-card.edit-card .diff {
   margin-top: 6px;
-  border-radius: 3px;
+  border-radius: 4px;
   overflow: hidden;
   border: 1px solid var(--border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  max-height: 400px;
+  overflow-y: auto;
+  background: var(--card);
 }
-.tool-card.edit-card .diff-old,
-.tool-card.edit-card .diff-new {
-  padding: 0;
-  margin: 0;
-}
-.tool-card.edit-card .diff-old pre,
-.tool-card.edit-card .diff-new pre {
-  margin: 0;
-  padding: 6px 10px;
-  font-size: 11px;
+.tool-card.edit-card .diff-line {
+  display: flex;
+  align-items: flex-start;
+  padding: 1px 0;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 200px;
-  overflow-y: auto;
-  border-radius: 0;
-  background: transparent;
 }
-.tool-card.edit-card .diff-old pre {
-  background: #2d1517;
-  color: #ffa198;
-  border-left: 3px solid var(--err);
+.tool-card.edit-card .diff-prefix {
+  flex: 0 0 22px;
+  text-align: center;
+  color: var(--muted);
+  user-select: none;
+  font-weight: 600;
+  opacity: 0.7;
 }
-.tool-card.edit-card .diff-new pre {
-  background: #0f2e1a;
-  color: #7ee787;
-  border-left: 3px solid var(--ok);
+.tool-card.edit-card .diff-content {
+  flex: 1 1 auto;
+  padding-right: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tool-card.edit-card .diff-add {
+  background: rgba(63, 185, 80, 0.14);
+}
+.tool-card.edit-card .diff-add .diff-prefix {
+  color: var(--ok);
+  opacity: 1;
+  background: rgba(63, 185, 80, 0.25);
+}
+.tool-card.edit-card .diff-del {
+  background: rgba(248, 81, 73, 0.14);
+}
+.tool-card.edit-card .diff-del .diff-prefix {
+  color: var(--err);
+  opacity: 1;
+  background: rgba(248, 81, 73, 0.25);
+}
+.tool-card.edit-card .diff-ctx {
+  opacity: 0.65;
+}
+/* Lang badge in the summary line (e.g. "python", "markdown"). */
+.tool-card.edit-card .tool-lang {
+  margin-left: 8px;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 /* ---- input ---- */

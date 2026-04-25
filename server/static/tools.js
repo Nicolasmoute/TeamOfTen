@@ -4,7 +4,58 @@
 
 import { h } from "https://esm.sh/preact@10";
 import htm from "https://esm.sh/htm@3";
+import { diffLines } from "https://esm.sh/diff@7";
+import hljs from "https://esm.sh/highlight.js@11/lib/core";
 const html = htm.bind(h);
+
+// File extension → hljs language alias. Languages are registered in
+// app.js (single source of truth so we don't double-load packs); this
+// map just turns a path's extension into the alias hljs.getLanguage()
+// recognizes. Unknown extensions fall through to plaintext rendering.
+const EXT_TO_LANG = {
+  ".bash": "bash", ".sh": "bash", ".zsh": "bash",
+  ".css": "css",
+  ".go": "go",
+  ".html": "html", ".htm": "html", ".xml": "xml",
+  ".js": "javascript", ".mjs": "javascript", ".jsx": "javascript", ".cjs": "javascript",
+  ".json": "json",
+  ".md": "markdown", ".markdown": "markdown",
+  ".py": "python",
+  ".rs": "rust",
+  ".sql": "sql",
+  ".ts": "typescript", ".tsx": "typescript",
+  ".yaml": "yaml", ".yml": "yaml",
+};
+
+function langForFile(path) {
+  if (typeof path !== "string") return "";
+  const m = /\.[A-Za-z0-9]+$/.exec(path);
+  if (!m) return "";
+  return EXT_TO_LANG[m[0].toLowerCase()] || "";
+}
+
+function escHtml(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// Highlight a single line in isolation. hljs may lose multi-line state
+// (open string literals etc.) but for a per-line diff that's fine —
+// the alternative is to highlight whole sides and re-split, which gets
+// ugly when added/removed regions interleave with context. Returns
+// HTML; falls back to escaped plaintext if the language isn't loaded.
+function highlightLine(line, lang) {
+  if (!lang || !hljs.getLanguage(lang)) return escHtml(line);
+  try {
+    return hljs.highlight(line, {
+      language: lang, ignoreIllegals: true,
+    }).value;
+  } catch (_) {
+    return escHtml(line);
+  }
+}
 
 // ------------------------------------------------------------------
 // helpers
@@ -267,22 +318,62 @@ function renderResultBlock(result) {
 // Edit diff card — renders input.old_string → input.new_string as red/green blocks
 // ------------------------------------------------------------------
 
+// Build a unified diff view as an array of {kind, text} rows.
+// kind ∈ {"ctx", "add", "del"}. diffLines returns parts with a value
+// containing one or more newline-terminated lines; we split each part
+// so every row is exactly one line. Trailing empty line from the
+// final \n is dropped.
+function buildDiffRows(oldStr, newStr) {
+  const parts = diffLines(oldStr || "", newStr || "");
+  const rows = [];
+  for (const part of parts) {
+    const kind = part.added ? "add" : part.removed ? "del" : "ctx";
+    const lines = part.value.split("\n");
+    if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+    for (const line of lines) rows.push({ kind, text: line });
+  }
+  return rows;
+}
+
+// Real changed-line counts (not the input.old_string / input.new_string
+// length, which double-counts shared context). Sums add/del rows from
+// the diff so the header reflects what actually changed.
+function diffStats(rows) {
+  let add = 0, del = 0;
+  for (const r of rows) {
+    if (r.kind === "add") add++;
+    else if (r.kind === "del") del++;
+  }
+  return { add, del };
+}
+
 function renderEditCard(name, input, result) {
   const filePath = input.file_path || input.path || "";
   const oldStr = typeof input.old_string === "string" ? input.old_string : "";
   const newStr = typeof input.new_string === "string" ? input.new_string : "";
-  const oldLines = lineCount(oldStr);
-  const newLines = lineCount(newStr);
-  const delta = ` (-${oldLines} +${newLines})`;
+  const rows = buildDiffRows(oldStr, newStr);
+  const { add, del } = diffStats(rows);
+  const delta = ` (-${del} +${add})`;
+  const lang = langForFile(filePath);
+  const langClass = lang ? " language-" + lang : "";
   return html`
     <details class="tool-card category-write edit-card" open>
       <summary>
         <span class="tool-name">${name}</span>
         <span class="tool-summary">${filePath}${delta}</span>
+        ${lang ? html`<span class="tool-lang">${lang}</span>` : null}
       </summary>
-      <div class="diff">
-        <div class="diff-old"><pre>${oldStr || "(empty)"}</pre></div>
-        <div class="diff-new"><pre>${newStr || "(empty)"}</pre></div>
+      <div class=${"diff hljs" + langClass}>
+        ${rows.length === 0
+          ? html`<div class="diff-line diff-ctx"><span class="diff-prefix"> </span><span class="diff-content">(no change)</span></div>`
+          : rows.map((r, i) => html`
+              <div key=${i} class=${"diff-line diff-" + r.kind}>
+                <span class="diff-prefix">${r.kind === "add" ? "+" : r.kind === "del" ? "-" : " "}</span>
+                <span
+                  class="diff-content"
+                  dangerouslySetInnerHTML=${{ __html: highlightLine(r.text, lang) || "&nbsp;" }}
+                />
+              </div>`)}
       </div>
       ${result && result.is_error ? renderResultBlock(result) : null}
     </details>
