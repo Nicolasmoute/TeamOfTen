@@ -392,17 +392,28 @@ function diffStats(rows) {
   return { add, del };
 }
 
-function _renderHalf(side, lang) {
+function _renderHalf(side, lang, full) {
   const kind = side ? side.kind : "blank";
   const html_ = side ? (highlightLine(side.text, lang) || "&nbsp;") : "&nbsp;";
   // No prefix gutter — the band color carries the add/del signal.
   // Antigravity-style: text starts at the left edge of the half with
-  // just a few pixels of breathing room.
+  // just a few pixels of breathing room. `full` makes the cell span
+  // both columns (used for unchanged context that's identical on
+  // both sides — no point duplicating it).
+  const cls = "diff-half diff-" + kind + (full ? " diff-full" : "");
   return html`
     <div
-      class=${"diff-half diff-" + kind}
+      class=${cls}
       dangerouslySetInnerHTML=${{ __html: html_ }}
     />`;
+}
+
+function _isCtxRow(r) {
+  return (
+    r.left && r.right &&
+    r.left.kind === "ctx" && r.right.kind === "ctx" &&
+    r.left.text === r.right.text
+  );
 }
 
 function renderEditCard(name, input, result) {
@@ -424,14 +435,16 @@ function renderEditCard(name, input, result) {
       <div class=${"diff diff-split hljs" + langClass}>
         ${rows.length === 0
           ? html`<div class="diff-row">
-              ${_renderHalf({ kind: "ctx", text: "(no change)" }, "")}
-              ${_renderHalf({ kind: "ctx", text: "(no change)" }, "")}
+              ${_renderHalf({ kind: "ctx", text: "(no change)" }, "", true)}
             </div>`
-          : rows.map((r, i) => html`
-              <div key=${i} class="diff-row">
-                ${_renderHalf(r.left, lang)}
-                ${_renderHalf(r.right, lang)}
-              </div>`)}
+          : rows.map((r, i) => _isCtxRow(r)
+              ? html`<div key=${i} class="diff-row diff-row-full">
+                  ${_renderHalf(r.left, lang, true)}
+                </div>`
+              : html`<div key=${i} class="diff-row">
+                  ${_renderHalf(r.left, lang)}
+                  ${_renderHalf(r.right, lang)}
+                </div>`)}
       </div>
       ${result && result.is_error ? renderResultBlock(result) : null}
     </details>

@@ -2210,6 +2210,13 @@ body {
   word-break: break-word;
 }
 .tool-card.edit-card .diff-half:last-child { border-right: 0; }
+/* Unchanged context rows span the full width — identical text on both
+   sides was wasted real estate. Only changed rows (add/del/blank)
+   keep the side-by-side split. */
+.tool-card.edit-card .diff-half.diff-full {
+  flex: 1 1 100%;
+  border-right: 0;
+}
 .tool-card.edit-card .diff-add {
   background: rgba(63, 185, 80, 0.14);
 }
