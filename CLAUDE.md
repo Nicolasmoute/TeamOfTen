@@ -375,12 +375,16 @@ Display section in Options drawer:
   `localStorage` as `harness_tz_pref`; toggle reloads the page so
   already-rendered timestamps update at once.
 
-Edit tool diff card — unified line-by-line view:
-- Replaced the side-by-side "full old / full new" blocks (which
-  showed every shared line twice and used 11px monospace plain text)
-  with a unified IDE-style diff: only changed lines + their context
-  appear, each with a `-` / `+` / ` ` prefix gutter and red/green
-  band background.
+Edit tool diff card — side-by-side ("before" | "after") view:
+- Two-column layout in the spirit of the Antigravity / VS Code split
+  diff. Old content on the left (red band), new content on the right
+  (green band), unchanged context identical on both sides at the same
+  y-position so the reader can scan horizontally. Pure additions get
+  a hatched blank-left placeholder; pure removals get blank-right.
+  A removed-then-added pair is zipped line-by-line so a modification
+  reads as old → new across the row.
+- Sticky `before` / `after` header band at the top of the diff
+  scroll area.
 - Uses `diff@7` (~30 KB) via esm.sh for line-based diffing.
 - Each line is syntax-highlighted by `highlight.js` based on file
   extension. Mapping in [server/static/tools.js](server/static/tools.js):

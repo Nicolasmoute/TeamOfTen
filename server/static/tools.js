@@ -318,40 +318,94 @@ function renderResultBlock(result) {
 // Edit diff card — renders input.old_string → input.new_string as red/green blocks
 // ------------------------------------------------------------------
 
-// Build a unified diff view as an array of {kind, text} rows.
-// kind ∈ {"ctx", "add", "del"}. diffLines returns parts with a value
-// containing one or more newline-terminated lines; we split each part
-// so every row is exactly one line. Trailing empty line from the
-// final \n is dropped.
-function buildDiffRows(oldStr, newStr) {
+// Split `value` from a diffLines part into individual lines, dropping
+// the trailing empty entry that comes from a terminal '\n'.
+function _splitLines(s) {
+  const lines = (s || "").split("\n");
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+// Build aligned diff rows for a side-by-side viewer. Each row is
+// {left, right} where each side is either null (blank placeholder
+// keeping the row aligned) or {kind, text}. kind ∈ {ctx, del, add}.
+//
+// Pairing strategy: when a `removed` part is immediately followed by
+// an `added` part, treat them as a modification and zip line-by-line
+// so each old line lines up with its corresponding new line. Pure
+// adds (no preceding remove) get blank-left rows; pure removes get
+// blank-right rows. Context appears identically on both sides so the
+// reader can scan horizontally.
+function buildSideBySideRows(oldStr, newStr) {
   const parts = diffLines(oldStr || "", newStr || "");
   const rows = [];
-  for (const part of parts) {
-    const kind = part.added ? "add" : part.removed ? "del" : "ctx";
-    const lines = part.value.split("\n");
-    if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
-    for (const line of lines) rows.push({ kind, text: line });
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    if (!p.added && !p.removed) {
+      for (const line of _splitLines(p.value)) {
+        rows.push({
+          left: { kind: "ctx", text: line },
+          right: { kind: "ctx", text: line },
+        });
+      }
+      continue;
+    }
+    if (p.removed) {
+      const next = parts[i + 1];
+      const oldLines = _splitLines(p.value);
+      if (next && next.added) {
+        const newLines = _splitLines(next.value);
+        const maxLen = Math.max(oldLines.length, newLines.length);
+        for (let j = 0; j < maxLen; j++) {
+          rows.push({
+            left: j < oldLines.length ? { kind: "del", text: oldLines[j] } : null,
+            right: j < newLines.length ? { kind: "add", text: newLines[j] } : null,
+          });
+        }
+        i++; // consumed the paired add
+      } else {
+        for (const line of oldLines) {
+          rows.push({ left: { kind: "del", text: line }, right: null });
+        }
+      }
+      continue;
+    }
+    // Pure addition (no preceding removal).
+    for (const line of _splitLines(p.value)) {
+      rows.push({ left: null, right: { kind: "add", text: line } });
+    }
   }
   return rows;
 }
 
-// Real changed-line counts (not the input.old_string / input.new_string
-// length, which double-counts shared context). Sums add/del rows from
-// the diff so the header reflects what actually changed.
+// Real changed-line counts so the header (-N +M) reflects what
+// actually changed (not the raw old_string / new_string line counts
+// which double-count shared context).
 function diffStats(rows) {
   let add = 0, del = 0;
   for (const r of rows) {
-    if (r.kind === "add") add++;
-    else if (r.kind === "del") del++;
+    if (r.left && r.left.kind === "del") del++;
+    if (r.right && r.right.kind === "add") add++;
   }
   return { add, del };
+}
+
+function _renderHalf(side, lang) {
+  const kind = side ? side.kind : "blank";
+  const prefix = kind === "add" ? "+" : kind === "del" ? "-" : kind === "ctx" ? " " : "";
+  const html_ = side ? (highlightLine(side.text, lang) || "&nbsp;") : "&nbsp;";
+  return html`
+    <div class=${"diff-half diff-" + kind}>
+      <span class="diff-prefix">${prefix}</span>
+      <span class="diff-content" dangerouslySetInnerHTML=${{ __html: html_ }} />
+    </div>`;
 }
 
 function renderEditCard(name, input, result) {
   const filePath = input.file_path || input.path || "";
   const oldStr = typeof input.old_string === "string" ? input.old_string : "";
   const newStr = typeof input.new_string === "string" ? input.new_string : "";
-  const rows = buildDiffRows(oldStr, newStr);
+  const rows = buildSideBySideRows(oldStr, newStr);
   const { add, del } = diffStats(rows);
   const delta = ` (-${del} +${add})`;
   const lang = langForFile(filePath);
@@ -363,16 +417,20 @@ function renderEditCard(name, input, result) {
         <span class="tool-summary">${filePath}${delta}</span>
         ${lang ? html`<span class="tool-lang">${lang}</span>` : null}
       </summary>
-      <div class=${"diff hljs" + langClass}>
+      <div class=${"diff diff-split hljs" + langClass}>
+        <div class="diff-headers">
+          <div class="diff-header diff-header-old">before</div>
+          <div class="diff-header diff-header-new">after</div>
+        </div>
         ${rows.length === 0
-          ? html`<div class="diff-line diff-ctx"><span class="diff-prefix"> </span><span class="diff-content">(no change)</span></div>`
+          ? html`<div class="diff-row">
+              ${_renderHalf({ kind: "ctx", text: "(no change)" }, "")}
+              ${_renderHalf({ kind: "ctx", text: "(no change)" }, "")}
+            </div>`
           : rows.map((r, i) => html`
-              <div key=${i} class=${"diff-line diff-" + r.kind}>
-                <span class="diff-prefix">${r.kind === "add" ? "+" : r.kind === "del" ? "-" : " "}</span>
-                <span
-                  class="diff-content"
-                  dangerouslySetInnerHTML=${{ __html: highlightLine(r.text, lang) || "&nbsp;" }}
-                />
+              <div key=${i} class="diff-row">
+                ${_renderHalf(r.left, lang)}
+                ${_renderHalf(r.right, lang)}
               </div>`)}
       </div>
       ${result && result.is_error ? renderResultBlock(result) : null}

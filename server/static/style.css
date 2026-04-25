@@ -2092,14 +2092,18 @@ body {
   object-fit: contain;
 }
 
-/* ---- Edit diff card: unified line-by-line view ----
-   Each row is one of three kinds:
-     diff-ctx  unchanged context (muted)
-     diff-add  inserted line   (green band)
-     diff-del  deleted line    (red band)
-   Rows are syntax-highlighted by hljs based on file extension; the
-   .hljs container gives them the github-dark text color so unchanged
-   context blends with the diff bands instead of looking white-on-dark. */
+/* ---- Edit diff card: side-by-side ("before" | "after") ----
+   Each row contains two halves; matching context lines sit at the
+   same y-position on both sides so the reader can scan horizontally.
+   Pure additions get a blank "before" placeholder; pure removals get
+   a blank "after" placeholder. A removed-then-added pair is zipped
+   line-by-line so a modification reads as old → new across the row.
+
+   Half kinds:
+     diff-ctx    unchanged context (muted, both sides identical)
+     diff-add    inserted line   (green band, right side)
+     diff-del    deleted line    (red band, left side)
+     diff-blank  alignment placeholder (no content) */
 .tool-card.edit-card .diff {
   margin-top: 6px;
   border-radius: 4px;
@@ -2108,19 +2112,44 @@ body {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   line-height: 1.45;
-  max-height: 400px;
+  max-height: 480px;
   overflow-y: auto;
   background: var(--card);
 }
-.tool-card.edit-card .diff-line {
+.tool-card.edit-card .diff-headers {
+  display: flex;
+  position: sticky;
+  top: 0;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+  z-index: 1;
+}
+.tool-card.edit-card .diff-header {
+  flex: 1 1 50%;
+  padding: 3px 10px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+.tool-card.edit-card .diff-header-old {
+  border-right: 1px solid var(--border);
+}
+.tool-card.edit-card .diff-row {
+  display: flex;
+  align-items: stretch;
+}
+.tool-card.edit-card .diff-half {
+  flex: 1 1 50%;
   display: flex;
   align-items: flex-start;
+  min-width: 0;
   padding: 1px 0;
-  white-space: pre-wrap;
-  word-break: break-word;
+  border-right: 1px solid var(--border);
 }
+.tool-card.edit-card .diff-half:last-child { border-right: 0; }
 .tool-card.edit-card .diff-prefix {
-  flex: 0 0 22px;
+  flex: 0 0 20px;
   text-align: center;
   color: var(--muted);
   user-select: none;
@@ -2129,6 +2158,7 @@ body {
 }
 .tool-card.edit-card .diff-content {
   flex: 1 1 auto;
+  min-width: 0;
   padding-right: 10px;
   white-space: pre-wrap;
   word-break: break-word;
@@ -2152,7 +2182,16 @@ body {
 .tool-card.edit-card .diff-ctx {
   opacity: 0.65;
 }
-/* Lang badge in the summary line (e.g. "python", "markdown"). */
+.tool-card.edit-card .diff-blank {
+  background: repeating-linear-gradient(
+    -45deg,
+    transparent,
+    transparent 6px,
+    rgba(255, 255, 255, 0.025) 6px,
+    rgba(255, 255, 255, 0.025) 12px
+  );
+}
+/* Lang badge in the summary line (e.g. "PYTHON", "MARKDOWN"). */
 .tool-card.edit-card .tool-lang {
   margin-left: 8px;
   font-size: 10px;
