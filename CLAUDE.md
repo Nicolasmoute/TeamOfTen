@@ -375,6 +375,29 @@ Display section in Options drawer:
   `localStorage` as `harness_tz_pref`; toggle reloads the page so
   already-rendered timestamps update at once.
 
+Mobile / phone layout (CSS-only, < 700px viewport):
+- `@media (max-width: 700px)` block in
+  [server/static/style.css](server/static/style.css) reflows the
+  whole app for phones.
+- The left rail moves to the bottom and splits into two rows via
+  CSS Grid: agents on top (horizontally scrollable), then a single
+  row with files / project placeholder / pause / env-toggle /
+  settings beneath. Layout-preset buttons + cancel-all are hidden
+  (don't fit single-pane swipe).
+- The panes area becomes a horizontal swipe deck:
+  `scroll-snap-type: x mandatory` on `.panes` + `min-width: 100%
+  + scroll-snap-align: start` on each `.pane-col`. One pane fills
+  the screen; native touch swipe moves to the next open pane.
+  Split.js gutters (`.gutter`) and drop-zones are hidden — they
+  don't fit the model and HTML5 DnD doesn't work on touch anyway.
+  The `⛶` maximize button is also hidden (single-pane already).
+- EnvPane becomes a full-screen overlay (`position: fixed; inset:
+  0`) when toggled open. The `×` button in its header dismisses
+  back to the panes view.
+- Inline `grid-template-columns` set by App's `appStyle` is
+  overridden via `!important` in the media query so the desktop-only
+  3-column grid doesn't apply on phones.
+
 Audit fixes (post-LeftRail / file-links):
 - **Cost-cap + recent-cancellation now surface as red.** `agents.status`
   stays `idle` when capped or cancelled (the cap blocks the *next*
