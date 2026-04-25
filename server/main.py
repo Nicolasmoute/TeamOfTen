@@ -110,8 +110,26 @@ def audit_actor(request: Request) -> dict[str, str]:
 # If package-data shipped /static correctly, INDEX_HTML is the real page.
 # If not, we want a visible error page, not an import crash that makes
 # the container restart-loop with zero logs.
+#
+# Cache-busting: stamp app.js + style.css with a mtime-derived `?v=`
+# query string so every redeploy invalidates mobile-browser caches.
+# Without this, Chrome on Android holds onto the old asset for hours
+# even after a hard reload of the HTML, because the asset URL itself
+# never changes.
 try:
-    INDEX_HTML = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    _index_raw = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    def _stamp(filename: str) -> str:
+        try:
+            return f"{int((STATIC_DIR / filename).stat().st_mtime)}"
+        except Exception:
+            return "1"
+    _v_app = _stamp("app.js")
+    _v_css = _stamp("style.css")
+    INDEX_HTML = (
+        _index_raw
+        .replace('"/static/app.js"', f'"/static/app.js?v={_v_app}"')
+        .replace('"/static/style.css"', f'"/static/style.css?v={_v_css}"')
+    )
 except Exception as e:
     logger.error("static/index.html missing (%s): UI will show a fallback page", e)
     INDEX_HTML = (
@@ -213,6 +231,12 @@ async def lifespan(app: FastAPI):
     # relearn from turn 1 on every redeploy.
     from server.agents import _load_observed_windows
     await _load_observed_windows()
+    # Batched event-table writer. Single long-lived task that drains
+    # events.bus.publish() into batched executemany INSERTs. Replaces
+    # the prior model where every non-transient publish spawned its
+    # own one-off task that opened/closed a connection per event.
+    from server.events import start_event_writer
+    await start_event_writer()
     # Background tasks: flush event log to kDrive + hourly SQLite
     # snapshot. Both are no-ops when kDrive is disabled so running them
     # unconditionally is safe — picks up activation without restart.
@@ -249,6 +273,13 @@ async def lifespan(app: FastAPI):
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
+        # Drain any events still queued and stop the writer last so the
+        # final batch from background-task teardown lands on disk.
+        try:
+            from server.events import stop_event_writer
+            await stop_event_writer()
+        except Exception:
+            logger.exception("event writer shutdown failed")
 
 
 app = FastAPI(
@@ -2912,6 +2943,7 @@ async def list_events(
     agent: str | None = None,
     type: str | None = None,
     since_id: int = 0,
+    before_id: int | None = None,
     limit: int = 200,
 ) -> dict[str, Any]:
     """Return event history for a pane to restore when it opens.
@@ -2921,6 +2953,10 @@ async def list_events(
     the tail of the log; pass the largest id you've seen to poll for new
     rows (used in future polling/paginating flows).
 
+    Pass `before_id` to walk backwards through history one page at a
+    time — returns events with id < before_id, still ordered oldest →
+    newest in the response. The pane's "load older" button uses this.
+
     Optional `type` narrows to a single event type (e.g.
     'human_attention') — useful when the UI wants to surface historical
     escalations across page reloads.
@@ -2928,6 +2964,9 @@ async def list_events(
     limit = max(1, min(limit, 1000))
     where_parts: list[str] = ["id > ?"]
     params: list[Any] = [since_id]
+    if before_id is not None and before_id > 0:
+        where_parts.append("id < ?")
+        params.append(before_id)
     if agent:
         # Fan-out: include events where this agent is the recipient,
         # not only the actor. Mirrors the WS-side fan-out so opening a
@@ -2936,15 +2975,20 @@ async def list_events(
         #   - type=task_assigned & .to matches
         #   - type=task_updated & .owner matches (Coach cancelling a
         #     Player's task should show in the Player's history too)
+        # We filter against the indexed payload_to / payload_owner
+        # generated columns rather than json_extract() so the planner
+        # can use idx_events_to / idx_events_owner. Old DBs that
+        # haven't migrated the columns will still work — the columns
+        # are just NULL there and the OR-branches contribute nothing,
+        # which is the behaviour we want until init_db catches up.
         where_parts.append(
             "("
             "agent_id = ?"
             " OR (type = 'message_sent' AND ("
-            "     json_extract(payload, '$.to') = ?"
-            "     OR json_extract(payload, '$.to') = 'broadcast'"
+            "     payload_to = ? OR payload_to = 'broadcast'"
             "))"
-            " OR (type = 'task_assigned' AND json_extract(payload, '$.to') = ?)"
-            " OR (type = 'task_updated' AND json_extract(payload, '$.owner') = ?)"
+            " OR (type = 'task_assigned' AND payload_to = ?)"
+            " OR (type = 'task_updated' AND payload_owner = ?)"
             ")"
         )
         params.extend([agent, agent, agent, agent])
