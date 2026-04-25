@@ -375,6 +375,33 @@ Display section in Options drawer:
   `localStorage` as `harness_tz_pref`; toggle reloads the page so
   already-rendered timestamps update at once.
 
+In-app file links (markdown `[text](/data/...)` opens Files pane):
+- DOMPurify `afterSanitizeAttributes` hook in
+  [server/static/app.js](server/static/app.js) inspects every `<a>`:
+  external URLs get `target=_blank` + `rel=noreferrer noopener`;
+  hrefs that start with `/` are tagged `data-harness-path` +
+  `class="harness-file-link"` and the href is neutralized to `#`.
+- Document-level click listener in `App` catches clicks on
+  `[data-harness-path]`, opens the `__files` pane if not already
+  open (also exits `maximizedSlot`), and stashes
+  `{ path, ts }` in `pendingFileOpen` state.
+- `FilesPane` reads a new `rootsFromApp` prop (App fetches roots
+  once on mount via `loadFileRoots` and caches in `fileRoots`)
+  alongside its own self-fetch — whichever lands first wins. On
+  every `pendingFileOpen` change, FilesPane longest-prefix-matches
+  the absolute path against the roots' `path` field, switches to
+  that root, expands every parent folder via the existing
+  `expanded` Set, opens the file, and calls `clearPendingFileOpen`.
+- `/api/files/roots` now returns `path` (the absolute on-disk path
+  of each root) so the resolver works under env-overridden layouts
+  (e.g. `HARNESS_OUTPUTS_DIR`) instead of a hardcoded `/data/...`
+  prefix table.
+- File-link styling: amber color + leading `📄` so it reads as
+  "opens Files pane, not a tab" at a glance.
+- Phase-2 idea (not shipped): auto-linkify bare paths in plain
+  text (e.g. `the report at /data/outputs/wiki/foo.md`) via a
+  `marked` extension or post-render text scan.
+
 LeftRail redesign — borderless slot buttons + grouped layout:
 - Slot buttons no longer use border-as-state. Instead two orthogonal
   dimensions are encoded:

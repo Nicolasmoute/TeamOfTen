@@ -98,15 +98,27 @@ marked.use({
   },
 });
 
-// Add target=_blank + rel=noreferrer to every link DOMPurify lets
-// through. Cheaper than overriding marked's link renderer and lets
-// DOMPurify own the URL-scheme allowlist (drops javascript:, data:,
-// vbscript: by default).
+// Link handling for sanitized markdown:
+//   - external URL (http/https/mailto) → open in new tab
+//   - file path (anything starting with `/`) → marked as a harness
+//     file-link; the global click handler in App intercepts it,
+//     opens the Files pane, and selects the file. href is neutralized
+//     to "#" so a stray middle-click doesn't 404.
 DOMPurify.addHook("afterSanitizeAttributes", (node) => {
-  if (node.tagName === "A" && node.hasAttribute("href")) {
-    node.setAttribute("target", "_blank");
-    node.setAttribute("rel", "noreferrer noopener");
+  if (node.tagName !== "A" || !node.hasAttribute("href")) return;
+  const href = node.getAttribute("href") || "";
+  if (href.startsWith("/") && !href.startsWith("//")) {
+    node.setAttribute("data-harness-path", href);
+    node.setAttribute("href", "#");
+    node.classList.add("harness-file-link");
+    // No target — we're handling navigation in-app, not opening a tab.
+    node.removeAttribute("target");
+    node.setAttribute("rel", "noopener");
+    return;
   }
+  // External — open in new tab + opaque referrer.
+  node.setAttribute("target", "_blank");
+  node.setAttribute("rel", "noreferrer noopener");
 });
 
 function renderMarkdown(md) {
@@ -722,6 +734,17 @@ function App() {
   const [envWidth, setEnvWidth] = useState(
     () => loadLayout()?.envWidth ?? 340
   );
+  // Roots metadata for the file-link resolver. Loaded once on mount;
+  // FilesPane reads this via prop instead of self-fetching, so a click
+  // on a `[data-harness-path]` link can resolve and open the file
+  // even before the Files pane has mounted for the first time. Each
+  // entry: { key, path, label, writable, exists }.
+  const [fileRoots, setFileRoots] = useState([]);
+  // Set when the user clicks an in-app file link. FilesPane reads this
+  // and (once roots are loaded) selects the right root + opens the
+  // file. Cleared by FilesPane via clearPendingFileOpen.
+  const [pendingFileOpen, setPendingFileOpen] = useState(null);
+
   // Single-pane focus mode: when set to a slot id, only that pane
   // renders (filling the panes area). Clicking another rail slot, the
   // current pane's restore button, or closing the pane → clears it.
@@ -779,6 +802,17 @@ function App() {
       setTasks(data.tasks || []);
     } catch (e) {
       console.error("loadTasks failed", e);
+    }
+  }, [authedFetch]);
+
+  const loadFileRoots = useCallback(async () => {
+    try {
+      const res = await authedFetch("/api/files/roots");
+      if (!res.ok) return;
+      const data = await res.json();
+      setFileRoots(Array.isArray(data) ? data : []);
+    } catch (e) {
+      console.error("loadFileRoots failed", e);
     }
   }, [authedFetch]);
 
@@ -930,9 +964,37 @@ function App() {
     loadTasks();
     loadStatus();
     loadPause();
+    loadFileRoots();
     const statusTimer = setInterval(loadStatus, 30_000);
     return () => clearInterval(statusTimer);
-  }, [loadAgents, loadTasks, loadStatus, loadPause]);
+  }, [loadAgents, loadTasks, loadStatus, loadPause, loadFileRoots]);
+
+  // Click-handler for in-app file links. Marked + DOMPurify tag any
+  // markdown link whose href is an absolute path (`/data/...`,
+  // `/workspaces/...`, etc.) with `data-harness-path`. We intercept
+  // those clicks here, open the Files pane if needed, and remember
+  // the path so FilesPane can resolve + select it.
+  useEffect(() => {
+    const onClick = (e) => {
+      const link = e.target?.closest?.("[data-harness-path]");
+      if (!link) return;
+      const path = link.getAttribute("data-harness-path");
+      if (!path) return;
+      e.preventDefault();
+      setOpenColumns((prev) => {
+        if (flatSlots(prev).includes("__files")) return prev;
+        return [...prev, ["__files"]];
+      });
+      setMaximizedSlot((cur) => (cur && cur !== "__files" ? null : cur));
+      setPendingFileOpen({ path, ts: Date.now() });
+    };
+    document.addEventListener("click", onClick);
+    return () => document.removeEventListener("click", onClick);
+  }, []);
+
+  const clearPendingFileOpen = useCallback(() => {
+    setPendingFileOpen(null);
+  }, []);
 
   // Persist layout (open slots + env panel state + maximize) on every change.
   useEffect(() => {
@@ -1629,6 +1691,9 @@ function App() {
                           stacked=${col.length > 1}
                           isMaximized=${maximizedSlot === slot}
                           onToggleMaximize=${() => toggleMaximize(slot)}
+                          rootsFromApp=${fileRoots}
+                          pendingFileOpen=${pendingFileOpen}
+                          clearPendingFileOpen=${clearPendingFileOpen}
                         />`;
                       }
                       // wsAttempt bumps on every WS reconnect.
@@ -4938,8 +5003,13 @@ function EnvTimelineItem({ event }) {
 // the normal drag/resize/stack affordances like an agent pane.
 // ------------------------------------------------------------------
 
-function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, stacked, isMaximized, onToggleMaximize }) {
-  const [roots, setRoots] = useState([]);
+function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, stacked, isMaximized, onToggleMaximize, rootsFromApp, pendingFileOpen, clearPendingFileOpen }) {
+  // Seed `roots` from the App-level cache if it's already loaded so a
+  // file-link click that opens this pane for the first time can resolve
+  // immediately instead of waiting for our own self-fetch.
+  const [roots, setRoots] = useState(() =>
+    Array.isArray(rootsFromApp) && rootsFromApp.length > 0 ? rootsFromApp : []
+  );
   const [activeRoot, setActiveRoot] = useState(null);
   const [tree, setTree] = useState(null);
   const [selected, setSelected] = useState(null); // {root, path}
@@ -5053,6 +5123,54 @@ function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, 
       setLoading(false);
     }
   }, [authedFetch]);
+
+  // React to file-link clicks that landed before this pane mounted
+  // (App stashes the absolute path in `pendingFileOpen`). Resolve to
+  // (root, relative) via longest-prefix match against either our
+  // self-fetched `roots` or the App-level cache, switch to that root,
+  // expand parent folders, open the file, then clear the pending state.
+  useEffect(() => {
+    if (!pendingFileOpen?.path) return;
+    const available = roots.length > 0
+      ? roots
+      : (Array.isArray(rootsFromApp) ? rootsFromApp : []);
+    if (available.length === 0) return; // wait for roots to land
+    const target = pendingFileOpen.path;
+    let best = null;
+    for (const r of available) {
+      const rp = r.path || "";
+      if (!rp) continue;
+      if (target === rp || target.startsWith(rp + "/")) {
+        if (!best || rp.length > (best.path?.length || 0)) {
+          best = r;
+        }
+      }
+    }
+    if (!best) {
+      setErr("file-link: no root matches " + target);
+      if (clearPendingFileOpen) clearPendingFileOpen();
+      return;
+    }
+    const relative = target === best.path ? "" : target.slice(best.path.length + 1);
+    setActiveRoot(best.key);
+    if (relative) {
+      // Expand each parent folder so the user lands with the file
+      // already visible in the tree.
+      const parents = new Set([best.key + ":"]);
+      let cur = relative;
+      while (cur && cur.includes("/")) {
+        cur = cur.slice(0, cur.lastIndexOf("/"));
+        parents.add(best.key + ":" + cur);
+      }
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        for (const p of parents) next.add(p);
+        return next;
+      });
+      openFile(best.key, relative);
+    }
+    if (clearPendingFileOpen) clearPendingFileOpen();
+  }, [pendingFileOpen, roots, rootsFromApp, openFile, clearPendingFileOpen]);
 
   const save = useCallback(async () => {
     if (!selected || !activeRootMeta?.writable) return;

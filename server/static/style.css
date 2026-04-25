@@ -1439,6 +1439,21 @@ body {
 }
 .markdown a, .files-md-preview a { color: var(--accent); }
 .markdown a:hover, .files-md-preview a:hover { text-decoration: underline; }
+/* In-app file-link (DOMPurify hook tags any href starting with `/`).
+   Distinct color + a small leading "📄" so the user can tell at a
+   glance that clicking will open the Files pane, not a new tab. */
+.markdown a.harness-file-link,
+.files-md-preview a.harness-file-link {
+  color: var(--warn);
+  cursor: pointer;
+}
+.markdown a.harness-file-link::before,
+.files-md-preview a.harness-file-link::before {
+  content: "📄";
+  margin-right: 4px;
+  font-size: 0.85em;
+  opacity: 0.8;
+}
 /* Slightly tighten the spacing at top/bottom of an event body so
    single-paragraph replies don't waste vertical space. */
 .event-body.markdown > :first-child { margin-top: 0; }

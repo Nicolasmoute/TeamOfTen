@@ -127,7 +127,11 @@ def _roots() -> dict[str, Root]:
 
 
 def list_roots() -> list[dict[str, Any]]:
-    """Lightweight metadata for the UI to render the top level."""
+    """Lightweight metadata for the UI to render the top level. The
+    `path` field exposes each root's absolute on-disk path so the UI's
+    file-link resolver (markdown links → "open in Files pane") can do
+    longest-prefix matching against agent-produced absolute paths
+    without hardcoding the default `/data/...` layout."""
     out: list[dict[str, Any]] = []
     for r in _roots().values():
         exists = r.path.exists()
@@ -137,6 +141,7 @@ def list_roots() -> list[dict[str, Any]]:
                 "writable": r.writable,
                 "exists": exists,
                 "label": r.key,
+                "path": str(r.path),
             }
         )
     return out
