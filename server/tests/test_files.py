@@ -57,6 +57,17 @@ def test_resolve_empty_returns_root(tmp_roots) -> None:
     assert filesmod._resolve("knowledge", "") == tmp_roots["knowledge"].resolve()
 
 
+def test_list_roots_includes_absolute_path(tmp_roots) -> None:
+    """The UI's file-link resolver does longest-prefix matching against
+    the on-disk root path, so list_roots() must expose it."""
+    rows = filesmod.list_roots()
+    by_key = {r["key"]: r for r in rows}
+    for key in ("context", "knowledge", "decisions"):
+        assert key in by_key, f"missing root: {key}"
+        assert "path" in by_key[key], f"root {key} missing 'path' field"
+        assert by_key[key]["path"] == str(tmp_roots[key])
+
+
 # ---------- tree ----------
 
 

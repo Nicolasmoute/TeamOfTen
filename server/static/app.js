@@ -128,8 +128,11 @@ function renderMarkdown(md) {
     raw = marked.parse(String(md));
   } catch (e) {
     console.error("markdown parse failed", e);
-    // Fall back to escaped plaintext so the user still sees something.
-    return "<pre class=\"md-code\"><code>" +
+    // Fall back to escaped plaintext wrapped in a code block so the
+    // user still sees something. Routed through DOMPurify just like
+    // the happy path so the file-link / external-link hooks fire
+    // consistently and we never bypass the sanitizer.
+    raw = "<pre class=\"md-code\"><code>" +
       String(md).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") +
       "</code></pre>";
   }
@@ -816,6 +819,46 @@ function App() {
     }
   }, [authedFetch]);
 
+  // Seed `conversations` with a recent slice of events for every slot
+  // at app mount so the LeftRail dot computation has data to chew on
+  // even when no panes have been opened yet. Without this, dots for
+  // closed panes default to green until the user opens the pane (which
+  // triggers AgentPane's per-slot history loader). 11 small parallel
+  // fetches; deduped by __id when merged with any live events that
+  // landed during the round-trip. Re-runs on every WS reconnect via
+  // `wsAttempt` so a long disconnect's gap fills in too.
+  const seedConversationsFromHistory = useCallback(async () => {
+    const slots = ["coach", ...Array.from({ length: 10 }, (_, i) => "p" + (i + 1))];
+    const SEED_LIMIT = 50;
+    const results = await Promise.all(slots.map(async (slot) => {
+      try {
+        const res = await authedFetch(
+          `/api/events?agent=${encodeURIComponent(slot)}&limit=${SEED_LIMIT}`
+        );
+        if (!res.ok) return [slot, []];
+        const data = await res.json();
+        return [slot, (data.events || []).map(unwrapPersisted)];
+      } catch (_) {
+        return [slot, []];
+      }
+    }));
+    setConversations((prev) => {
+      const next = new Map(prev);
+      for (const [slot, events] of results) {
+        const existing = next.get(slot) || [];
+        const seen = new Set(
+          existing.map((e) => e.__id).filter((id) => id != null)
+        );
+        const fresh = events.filter((e) => e.__id == null || !seen.has(e.__id));
+        if (fresh.length === 0) continue;
+        const merged = [...fresh, ...existing];
+        merged.sort((a, b) => (a.ts || "").localeCompare(b.ts || ""));
+        next.set(slot, merged);
+      }
+      return next;
+    });
+  }, [authedFetch]);
+
   const createHumanTask = useCallback(
     async ({ title, description, priority }) => {
       const res = await authedFetch("/api/tasks", {
@@ -965,9 +1008,10 @@ function App() {
     loadStatus();
     loadPause();
     loadFileRoots();
+    seedConversationsFromHistory();
     const statusTimer = setInterval(loadStatus, 30_000);
     return () => clearInterval(statusTimer);
-  }, [loadAgents, loadTasks, loadStatus, loadPause, loadFileRoots]);
+  }, [loadAgents, loadTasks, loadStatus, loadPause, loadFileRoots, seedConversationsFromHistory]);
 
   // Click-handler for in-app file links. Marked + DOMPurify tag any
   // markdown link whose href is an absolute path (`/data/...`,
@@ -1250,6 +1294,57 @@ function App() {
     }
     return out;
   }, [conversations, seenTs, openSlots]);
+
+  // Slots in a "problem" state — surfaced as a red box in the rail.
+  // Three sources:
+  //   1. agents.status === "error" (last turn errored hard).
+  //   2. Cost-cap exhausted: agent's cost ≥ agent_daily_cap, OR the
+  //      whole team is over team_daily_cap. The agent's literal
+  //      `status` field stays "idle" when capped (the cap blocks the
+  //      *next* spawn but doesn't change current state) so we have
+  //      to derive this from /api/status.caps + agent.cost_estimate_usd.
+  //   3. Most recent decisive event in the pane timeline is
+  //      `agent_cancelled` (no `result` or `agent_started` after it).
+  //      Cancellation also resets status → "idle" on the backend.
+  // Cleared on the next successful turn (status=working/idle with new
+  // result), on cap reset (next day), or by closing/reopening the pane
+  // for cancelled state (a fresh agent_started overwrites it).
+  const problemSlots = useMemo(() => {
+    const out = new Set();
+    const caps = serverStatus?.caps;
+    const agentCap = caps?.agent_daily_usd || 0;
+    const teamCap = caps?.team_daily_usd || 0;
+    const teamToday = caps?.team_today_usd || 0;
+    const teamCapped = teamCap > 0 && teamToday >= teamCap;
+    for (const a of agents) {
+      if (a.status === "error") {
+        out.add(a.id);
+        continue;
+      }
+      if (
+        teamCapped ||
+        (agentCap > 0 && (a.cost_estimate_usd || 0) >= agentCap)
+      ) {
+        out.add(a.id);
+        continue;
+      }
+      const events = conversations.get(a.id) || [];
+      // Walk backwards for the last decisive event. agent_cancelled
+      // wins if it's the most recent; result / agent_started further
+      // back means the cancellation was already superseded.
+      for (let i = events.length - 1; i >= 0; i--) {
+        const e = events[i];
+        if (e.type === "agent_cancelled") {
+          out.add(a.id);
+          break;
+        }
+        if (e.type === "result" || e.type === "agent_started") {
+          break;
+        }
+      }
+    }
+    return out;
+  }, [agents, conversations, serverStatus]);
 
   // Per-agent comms-state dot for the LeftRail. Returns
   // Map<slotId, "green"|"blue"|"orange">.
@@ -1649,6 +1744,7 @@ function App() {
         agents=${agents}
         openSlots=${openSlots}
         dotStates=${dotStates}
+        problemSlots=${problemSlots}
         onOpen=${openPane}
         onStackInLast=${stackInLast}
         wsConnected=${wsConnected}
@@ -1849,7 +1945,7 @@ function TokenGate({ onSubmit }) {
 // left rail
 // ------------------------------------------------------------------
 
-function LeftRail({ agents, openSlots, dotStates, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, onOpenSettings, paused, onTogglePause, onLayoutPreset, onCancelAll }) {
+function LeftRail({ agents, openSlots, dotStates, problemSlots, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, onOpenSettings, paused, onTogglePause, onLayoutPreset, onCancelAll }) {
   const workingCount = agents.filter((a) => a.status === "working").length;
   const grouped = useMemo(() => {
     const coach = agents.find((a) => a.kind === "coach");
@@ -1874,16 +1970,17 @@ function LeftRail({ agents, openSlots, dotStates, onOpen, onStackInLast, wsConne
     const hasSession =
       Boolean(a.session_id) || a.status === "working" || a.status === "waiting";
     const status = a.status || "idle";
-    // Map status → visual state class. error / cost_capped / cancelled
-    // all collapse to "problem" so the user can click in for the why.
+    // Visual work-state class. `state-problem` collects three things
+    // surfaced via the problemSlots Set computed in App: hard errors
+    // (status === "error"), cost-cap exhaustion (derived from caps +
+    // cost), and recent cancellations (last decisive event was
+    // agent_cancelled). Working still wins so a freshly-resumed turn
+    // doesn't read as a problem.
     let stateClass = "";
     if (hasSession) {
       if (status === "working") stateClass = "state-working";
-      else if (status === "error" || status === "cost_capped" || status === "cancelled") {
-        stateClass = "state-problem";
-      } else {
-        stateClass = "state-idle";
-      }
+      else if (problemSlots && problemSlots.has(a.id)) stateClass = "state-problem";
+      else stateClass = "state-idle";
     }
     const isOpen = openSlots.includes(a.id);
     const dot = hasSession ? (dotStates && dotStates.get(a.id)) || "green" : "";

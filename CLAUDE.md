@@ -375,6 +375,33 @@ Display section in Options drawer:
   `localStorage` as `harness_tz_pref`; toggle reloads the page so
   already-rendered timestamps update at once.
 
+Audit fixes (post-LeftRail / file-links):
+- **Cost-cap + recent-cancellation now surface as red.** `agents.status`
+  stays `idle` when capped or cancelled (the cap blocks the *next*
+  spawn, the cancel resets status), so a literal status check missed
+  both. `App` now derives a `problemSlots: Set<slotId>` from
+  `agents.status === "error"`, plus a cap check against
+  `serverStatus.caps` (`agent_daily_usd`, `team_daily_usd`,
+  `team_today_usd`), plus a backwards walk of each slot's events for
+  a most-recent `agent_cancelled` not superseded by a later `result`
+  / `agent_started`. LeftRail's `state-problem` class consults the
+  Set instead of the dead status check.
+- **renderMarkdown fallback now goes through DOMPurify.** When
+  `marked.parse` throws, the fallback escaped-text-in-`<pre>` block
+  was previously returned raw — bypassing the sanitizer + the
+  file-link / external-link hooks. Now the fallback string is
+  sanitized just like the happy path so behavior stays consistent.
+- **dotStates cold-start populated.** `seedConversationsFromHistory`
+  fires on App mount (and on every WS reconnect via `wsAttempt`):
+  fetches `/api/events?agent=<slot>&limit=50` for all 11 slots in
+  parallel, dedupes by `__id`, and merges into `conversations`. The
+  rail dots are now accurate before any panes have been opened in
+  the session — fixes the "everything reads green on first paint"
+  cold-start gap I documented.
+- **`/api/files/roots` test coverage** for the new `path` field
+  (test_list_roots_includes_absolute_path in
+  [server/tests/test_files.py](server/tests/test_files.py)).
+
 In-app file links (markdown `[text](/data/...)` opens Files pane):
 - DOMPurify `afterSanitizeAttributes` hook in
   [server/static/app.js](server/static/app.js) inspects every `<a>`:
