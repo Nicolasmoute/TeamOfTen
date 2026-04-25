@@ -145,21 +145,25 @@ body {
   }
   .env-resizer { display: none; }
 
-  /* Pane input area on mobile — compact two-row layout:
-       Row 1: [modes (model · plan · effort · ctx)]   [run]
-       Row 2: textarea
-     Implemented as a 2-row × 2-col grid: modes spans col 1 of row
-     1; the input-row (containing the run button, hint hidden) sits
-     in col 2 of row 1; textarea spans both cols on row 2. */
+  /* Pane input area on mobile — compact grid layout that survives
+     the conditionally-rendered items at the top (pane-info,
+     attachments, ActiveLoops on Coach).
+       implicit row(s): conditional items, each spans both cols.
+       row N:           [modes (model · plan · effort · ctx)] [run]
+       row N+1:         textarea (spans both cols)
+     `grid-auto-flow: dense` backtracks to fill empty col 2 of the
+     modes row with the input-row (which is later in DOM order).
+     `> *` defaults every direct child to span both columns; only
+     pane-modes and pane-input-row override to single columns. */
   .pane-input {
     display: grid !important;
-    grid-template-rows: auto 1fr;
     grid-template-columns: 1fr auto;
+    grid-auto-flow: dense;
     gap: 4px 6px;
     padding: 6px 8px;
   }
-  .pane-input .pane-modes {
-    grid-row: 1;
+  .pane-input > * { grid-column: 1 / -1; }
+  .pane-input > .pane-modes {
     grid-column: 1;
     margin: 0;
     flex-wrap: nowrap !important;
@@ -168,22 +172,22 @@ body {
     align-items: center;
     gap: 4px;
   }
-  .pane-input .pane-input-row {
-    grid-row: 1;
+  .pane-input > .pane-input-row {
     grid-column: 2;
     margin: 0;
     align-self: center;
   }
-  .pane-input .pane-input-wrap {
-    grid-row: 2;
-    grid-column: 1 / -1;
+  .pane-input > .pane-input-wrap {
     margin-top: 0;
   }
   .pane-input-row .hint { display: none; }
-  /* Run button: small, ~text-size, fits on the modes row. */
+  /* Run button: visually compact (matches text size) but the touch
+     target stays comfortable via min-height. Apple/Material guidance
+     calls for 36-44 px; 32 px is the minimum I'll accept. */
   .pane-input-row .primary {
-    padding: 3px 12px;
+    padding: 6px 14px;
     font-size: 12px;
+    min-height: 32px;
   }
   /* Slash-commands chip — redundant on mobile; user can just type "/"
      in the prompt, the SlashMenu opens the same way. */
