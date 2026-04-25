@@ -2,10 +2,12 @@
 // v2c step 2: per-tool summarizers, category indicator dots, Edit diff card.
 // The LLM can emit any tool name; generic fallback always produces a VNode.
 
+// Preact stays on esm.sh (shared with app.js — see comment at top of
+// app.js for why). Other deps are vendored under /static/vendor/.
 import { h } from "https://esm.sh/preact@10";
-import htm from "https://esm.sh/htm@3";
-import { diffLines } from "https://esm.sh/diff@7";
-import hljs from "https://esm.sh/highlight.js@11/lib/core";
+import htm from "/static/vendor/htm.js";
+import { diffLines } from "/static/vendor/diff.js";
+import hljs from "/static/vendor/hljs-core.js";
 const html = htm.bind(h);
 
 // File extension → hljs language alias. Languages are registered in
@@ -392,13 +394,15 @@ function diffStats(rows) {
 
 function _renderHalf(side, lang) {
   const kind = side ? side.kind : "blank";
-  const prefix = kind === "add" ? "+" : kind === "del" ? "-" : kind === "ctx" ? " " : "";
   const html_ = side ? (highlightLine(side.text, lang) || "&nbsp;") : "&nbsp;";
+  // No prefix gutter — the band color carries the add/del signal.
+  // Antigravity-style: text starts at the left edge of the half with
+  // just a few pixels of breathing room.
   return html`
-    <div class=${"diff-half diff-" + kind}>
-      <span class="diff-prefix">${prefix}</span>
-      <span class="diff-content" dangerouslySetInnerHTML=${{ __html: html_ }} />
-    </div>`;
+    <div
+      class=${"diff-half diff-" + kind}
+      dangerouslySetInnerHTML=${{ __html: html_ }}
+    />`;
 }
 
 function renderEditCard(name, input, result) {
@@ -418,10 +422,6 @@ function renderEditCard(name, input, result) {
         ${lang ? html`<span class="tool-lang">${lang}</span>` : null}
       </summary>
       <div class=${"diff diff-split hljs" + langClass}>
-        <div class="diff-headers">
-          <div class="diff-header diff-header-old">before</div>
-          <div class="diff-header diff-header-new">after</div>
-        </div>
         ${rows.length === 0
           ? html`<div class="diff-row">
               ${_renderHalf({ kind: "ctx", text: "(no change)" }, "")}

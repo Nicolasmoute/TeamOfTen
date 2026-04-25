@@ -13,12 +13,9 @@
       href="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='10' fill='%23141414'/%3E%3Cg fill='%23c9a227'%3E%3Ccircle cx='16' cy='18' r='4'/%3E%3Ccircle cx='32' cy='18' r='4'/%3E%3Ccircle cx='48' cy='18' r='4'/%3E%3Ccircle cx='16' cy='34' r='4'/%3E%3Ccircle cx='32' cy='34' r='4'/%3E%3Ccircle cx='48' cy='34' r='4'/%3E%3Ccircle cx='16' cy='50' r='4'/%3E%3Ccircle cx='32' cy='50' r='4'/%3E%3Ccircle cx='48' cy='50' r='4'/%3E%3C/g%3E%3Cg fill='%2363b3ed'%3E%3Ccircle cx='24' cy='18' r='4'/%3E%3Ccircle cx='40' cy='18' r='4'/%3E%3C/g%3E%3C/svg%3E"
     />
     <!-- highlight.js theme — dark variant to match the harness UI.
-         Loaded from jsdelivr because esm.sh wraps CSS in JS modules
-         (incompatible with <link>). Cached forever once fetched. -->
-    <link
-      rel="stylesheet"
-      href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github-dark.min.css"
-    />
+         Vendored under /static/vendor/ (see scripts/vendor_deps.py)
+         so cold loads don't depend on jsdelivr. -->
+    <link rel="stylesheet" href="/static/vendor/hljs-github-dark.css" />
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>

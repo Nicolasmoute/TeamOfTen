@@ -1,22 +1,29 @@
+// Preact + preact/hooks intentionally stay on esm.sh: hooks rely on
+// shared component-instance state with the preact module, and esm.sh
+// dedupes them across imports on the same origin. Vendoring each as a
+// `?bundle` would produce two separate Preact instances and useState
+// silently breaks. All other deps are vendored under /static/vendor/
+// (see scripts/vendor_deps.py) so cold loads don't fan out 17 cross-
+// origin module requests.
 import { h, render } from "https://esm.sh/preact@10";
 import { useState, useEffect, useMemo, useRef, useCallback, useLayoutEffect } from "https://esm.sh/preact@10/hooks";
-import htm from "https://esm.sh/htm@3";
-import Split from "https://esm.sh/split.js@1.6.5";
-import { Marked } from "https://esm.sh/marked@12";
-import DOMPurify from "https://esm.sh/dompurify@3";
-import hljs from "https://esm.sh/highlight.js@11/lib/core";
-import hljsBash from "https://esm.sh/highlight.js@11/lib/languages/bash";
-import hljsCss from "https://esm.sh/highlight.js@11/lib/languages/css";
-import hljsGo from "https://esm.sh/highlight.js@11/lib/languages/go";
-import hljsJson from "https://esm.sh/highlight.js@11/lib/languages/json";
-import hljsJs from "https://esm.sh/highlight.js@11/lib/languages/javascript";
-import hljsMd from "https://esm.sh/highlight.js@11/lib/languages/markdown";
-import hljsPython from "https://esm.sh/highlight.js@11/lib/languages/python";
-import hljsRust from "https://esm.sh/highlight.js@11/lib/languages/rust";
-import hljsSql from "https://esm.sh/highlight.js@11/lib/languages/sql";
-import hljsTs from "https://esm.sh/highlight.js@11/lib/languages/typescript";
-import hljsXml from "https://esm.sh/highlight.js@11/lib/languages/xml";
-import hljsYaml from "https://esm.sh/highlight.js@11/lib/languages/yaml";
+import htm from "/static/vendor/htm.js";
+import Split from "/static/vendor/split.js";
+import { Marked } from "/static/vendor/marked.js";
+import DOMPurify from "/static/vendor/dompurify.js";
+import hljs from "/static/vendor/hljs-core.js";
+import hljsBash from "/static/vendor/hljs-bash.js";
+import hljsCss from "/static/vendor/hljs-css.js";
+import hljsGo from "/static/vendor/hljs-go.js";
+import hljsJson from "/static/vendor/hljs-json.js";
+import hljsJs from "/static/vendor/hljs-javascript.js";
+import hljsMd from "/static/vendor/hljs-markdown.js";
+import hljsPython from "/static/vendor/hljs-python.js";
+import hljsRust from "/static/vendor/hljs-rust.js";
+import hljsSql from "/static/vendor/hljs-sql.js";
+import hljsTs from "/static/vendor/hljs-typescript.js";
+import hljsXml from "/static/vendor/hljs-xml.js";
+import hljsYaml from "/static/vendor/hljs-yaml.js";
 import { renderToolCall, setAgentDirectory } from "/static/tools.js";
 
 const html = htm.bind(h);
@@ -117,6 +124,28 @@ function renderMarkdown(md) {
   return DOMPurify.sanitize(raw, {
     ADD_ATTR: ["target", "rel", "data-lang"],
   });
+}
+
+// Per-event memo for renderMarkdown. Long panes re-render the App
+// tree on every WS event (new event arrives, conversations Map
+// updates, every pane's EventItem list maps anew). Without memo, each
+// re-render re-parses every markdown event from scratch — quadratic
+// behaviour as session length grows. WeakMap auto-evicts entries
+// when an event object is dropped (e.g. closed pane or paginated out
+// of history), so the cache can't leak. Content-string check guards
+// against the rare case where an event mutates in place.
+const _markdownCache = new WeakMap();
+function renderMarkdownFor(event) {
+  const content = event && event.content ? event.content : "";
+  if (!content) return "";
+  if (event && typeof event === "object") {
+    const cached = _markdownCache.get(event);
+    if (cached && cached.content === content) return cached.html;
+    const html = renderMarkdown(content);
+    _markdownCache.set(event, { content, html });
+    return html;
+  }
+  return renderMarkdown(content);
 }
 
 // ------------------------------------------------------------------
@@ -781,6 +810,95 @@ function App() {
     }
   }, [authedFetch]);
 
+  // Debounced loaders for use in the WS event handler. A burst of
+  // related events (e.g. task_created → task_assigned → task_claimed
+  // arriving in <100 ms) was firing one HTTP request per loader per
+  // event — three fast events could mean ~6 redundant /api/agents +
+  // /api/tasks + /api/status round-trips. We coalesce to a single
+  // trailing-edge call per ~150 ms window. Direct (non-debounced)
+  // loaders are still used for mount, reconnect, and explicit awaits.
+  const refreshTimersRef = useRef({ agents: null, tasks: null, status: null });
+  const debouncedRefresh = useCallback((key, fn, delay = 150) => {
+    const timers = refreshTimersRef.current;
+    if (timers[key]) clearTimeout(timers[key]);
+    timers[key] = setTimeout(() => {
+      timers[key] = null;
+      fn();
+    }, delay);
+  }, []);
+  const refreshAgents = useCallback(
+    () => debouncedRefresh("agents", loadAgents),
+    [debouncedRefresh, loadAgents]
+  );
+  const refreshTasks = useCallback(
+    () => debouncedRefresh("tasks", loadTasks),
+    [debouncedRefresh, loadTasks]
+  );
+  const refreshStatus = useCallback(
+    () => debouncedRefresh("status", loadStatus),
+    [debouncedRefresh, loadStatus]
+  );
+  // Clear any pending refresh timers on unmount so we don't fire after
+  // the component is gone (matters for HMR / dev reloads).
+  useEffect(() => {
+    return () => {
+      const timers = refreshTimersRef.current;
+      for (const k of Object.keys(timers)) {
+        if (timers[k]) clearTimeout(timers[k]);
+        timers[k] = null;
+      }
+    };
+  }, []);
+
+  // Streaming-delta batching. text_delta / thinking_delta land at
+  // 10–50 events/sec per active agent. With several agents streaming
+  // at once, calling setStreamingText synchronously on every delta
+  // re-renders the App tree faster than the display can paint and
+  // shows up as input lag. We accumulate the deltas in a ref and
+  // flush them once per animation frame, so React work is capped at
+  // ~60 Hz regardless of network rate. Tabbed-out browsers throttle
+  // rAF down further automatically — that's fine; deltas batch
+  // larger and flush when the tab becomes visible again.
+  const streamingPendingRef = useRef(new Map());
+  const streamingRafRef = useRef(0);
+  const flushStreamingPending = useCallback(() => {
+    streamingRafRef.current = 0;
+    const pending = streamingPendingRef.current;
+    if (pending.size === 0) return;
+    const snapshot = pending;
+    streamingPendingRef.current = new Map();
+    setStreamingText((prev) => {
+      const next = new Map(prev);
+      for (const [aid, delta] of snapshot) {
+        const cur = next.get(aid) || { text: "", thinking: "" };
+        next.set(aid, {
+          text: cur.text + (delta.text || ""),
+          thinking: cur.thinking + (delta.thinking || ""),
+        });
+      }
+      return next;
+    });
+  }, []);
+  const enqueueStreamingDelta = useCallback((aid, key, delta) => {
+    if (!delta) return;
+    const pending = streamingPendingRef.current;
+    const cur = pending.get(aid) || { text: "", thinking: "" };
+    pending.set(aid, { ...cur, [key]: cur[key] + delta });
+    if (!streamingRafRef.current) {
+      streamingRafRef.current = requestAnimationFrame(flushStreamingPending);
+    }
+  }, [flushStreamingPending]);
+  // Cancel any pending rAF on unmount.
+  useEffect(() => {
+    return () => {
+      if (streamingRafRef.current) {
+        cancelAnimationFrame(streamingRafRef.current);
+        streamingRafRef.current = 0;
+      }
+      streamingPendingRef.current = new Map();
+    };
+  }, []);
+
   const loadPause = useCallback(async () => {
     try {
       const res = await authedFetch("/api/pause");
@@ -913,13 +1031,8 @@ function App() {
       // thinking are kept in distinct slots per agent; either can be
       // active independently.
       if (ev.type === "text_delta" || ev.type === "thinking_delta") {
-        setStreamingText((prev) => {
-          const next = new Map(prev);
-          const cur = next.get(aid) || { text: "", thinking: "" };
-          const key = ev.type === "text_delta" ? "text" : "thinking";
-          next.set(aid, { ...cur, [key]: cur[key] + (ev.delta || "") });
-          return next;
-        });
+        const key = ev.type === "text_delta" ? "text" : "thinking";
+        enqueueStreamingDelta(aid, key, ev.delta || "");
         return;
       }
       // Cross-pane fan-out: inter-agent events land in BOTH the actor's
@@ -961,13 +1074,18 @@ function App() {
       });
       // Clear the matching streaming buffer when the authoritative final
       // block arrives, or the turn ends. Prevents the partial bubble
-      // lingering after the real text/thinking event renders.
+      // lingering after the real text/thinking event renders. We also
+      // drop any pending (un-flushed) deltas so a rAF fire after this
+      // point can't re-introduce stale content.
       if (ev.type === "text" || ev.type === "thinking") {
+        const key = ev.type === "text" ? "text" : "thinking";
+        const pending = streamingPendingRef.current;
+        const p = pending.get(aid);
+        if (p && p[key]) pending.set(aid, { ...p, [key]: "" });
         setStreamingText((prev) => {
           const cur = prev.get(aid);
           if (!cur) return prev;
           const next = new Map(prev);
-          const key = ev.type === "text" ? "text" : "thinking";
           next.set(aid, { ...cur, [key]: "" });
           return next;
         });
@@ -978,6 +1096,7 @@ function App() {
         ev.type === "agent_cancelled" ||
         ev.type === "error"
       ) {
+        streamingPendingRef.current.delete(aid);
         setStreamingText((prev) => {
           if (!prev.has(aid)) return prev;
           const next = new Map(prev);
@@ -996,13 +1115,13 @@ function App() {
         ev.type === "lock_updated" ||
         ev.type === "agent_cancelled"
       ) {
-        loadAgents();
+        refreshAgents();
       }
       if (ev.type === "pause_toggled") {
         setPaused(Boolean(ev.paused));
       }
       if (ev.type === "result" || ev.type === "cost_capped") {
-        loadStatus();
+        refreshStatus();
       }
       if (
         ev.type === "task_created" ||
@@ -1010,8 +1129,8 @@ function App() {
         ev.type === "task_assigned" ||
         ev.type === "task_updated"
       ) {
-        loadTasks();
-        loadAgents();
+        refreshTasks();
+        refreshAgents();
       }
       // Filesystem-changing events — bump fsEpoch so FilesPane reloads
       // its tree. Covers agents writing via coord_write_* MCP tools,
@@ -1033,7 +1152,7 @@ function App() {
       clearInterval(watchdog);
       try { ws.close(); } catch (_) { /* ignore */ }
     };
-  }, [loadAgents, loadTasks, loadStatus, wsAttempt]);
+  }, [loadAgents, loadTasks, loadStatus, refreshAgents, refreshTasks, refreshStatus, enqueueStreamingDelta, wsAttempt]);
 
   const openSlots = useMemo(() => flatSlots(openColumns), [openColumns]);
 
@@ -3247,23 +3366,41 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, onCrea
     if (exporting || !openSlots || openSlots.length === 0) return;
     setExporting(true);
     try {
-      // Fetch each pane's events in parallel — server handles them
-      // concurrently and a full-team export used to be 11× sequential.
-      const results = await Promise.all(
-        openSlots.map(async (slot) => {
+      // Fetch each pane's events with bounded concurrency. Promise.all
+      // over all 11 open panes used to fire 11×500-event queries
+      // simultaneously, hammering the events table (each query
+      // includes JSON-extract filtering for fan-out semantics) and
+      // momentarily blocking the WS event writer behind the read
+      // bursts. Three workers in flight is enough to overlap network
+      // I/O without saturating the DB.
+      const TEAM_EXPORT_CONCURRENCY = 3;
+      const results = new Array(openSlots.length);
+      let idx = 0;
+      async function worker() {
+        while (idx < openSlots.length) {
+          const i = idx++;
+          const slot = openSlots[i];
           try {
             const res = await authFetch(
               `/api/events?agent=${encodeURIComponent(slot)}&limit=500`
             );
-            if (!res.ok) return { slot, events: [] };
+            if (!res.ok) {
+              results[i] = { slot, events: [] };
+              continue;
+            }
             const data = await res.json();
-            return { slot, events: (data.events || []).map(unwrapPersisted) };
+            results[i] = { slot, events: (data.events || []).map(unwrapPersisted) };
           } catch (e) {
             console.error("team export: pane fetch failed", slot, e);
-            return { slot, events: [] };
+            results[i] = { slot, events: [] };
           }
-        })
-      );
+        }
+      }
+      const workers = [];
+      for (let w = 0; w < Math.min(TEAM_EXPORT_CONCURRENCY, openSlots.length); w++) {
+        workers.push(worker());
+      }
+      await Promise.all(workers);
       const sections = results.map(({ slot, events }) => {
         const agent = agents.find((a) => a.id === slot);
         return formatEventsAsMarkdown(events, { slot, agent, headingLevel: 2 });
@@ -5274,6 +5411,12 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
   const [submitting, setSubmitting] = useState(false);
   const [history, setHistory] = useState([]);
   const [historyLoaded, setHistoryLoaded] = useState(false);
+  // Pagination: initial fetch is the most-recent HISTORY_PAGE events.
+  // historyExhausted flips to true when a fetch returns fewer rows
+  // than requested (no more to walk back to). loadingOlder gates the
+  // load-older button so a slow fetch doesn't fire a second request.
+  const [historyExhausted, setHistoryExhausted] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [paneSettings, setPaneSettings] = useState(() => loadPaneSettings(slot));
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [dropEdge, setDropEdge] = useState(null); // 'top' | 'bottom' | 'left' | 'right' | null
@@ -5354,6 +5497,12 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
     stickToBottomRef.current = distFromBottom < 80;
   }, []);
 
+  // Page size for both initial history load and the "load older"
+  // button. 200 is enough to fill several screens on a desktop pane;
+  // dropping from the previous 500 cuts pane-open payload by ~60% for
+  // the common case while letting users walk back through old turns
+  // on demand. Tune via this constant — the API caps at 1000.
+  const HISTORY_PAGE = 200;
   // Load persisted history once per slot. We guard so switching panes
   // doesn't refetch constantly.
   useEffect(() => {
@@ -5361,7 +5510,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
     async function load() {
       try {
         const res = await authFetch(
-          `/api/events?agent=${encodeURIComponent(slot)}&limit=500`
+          `/api/events?agent=${encodeURIComponent(slot)}&limit=${HISTORY_PAGE}`
         );
         if (!res.ok) {
           if (!cancelled) setHistoryLoaded(true);
@@ -5369,7 +5518,9 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
         }
         const data = await res.json();
         if (cancelled) return;
-        setHistory((data.events || []).map(unwrapPersisted));
+        const events = (data.events || []).map(unwrapPersisted);
+        setHistory(events);
+        setHistoryExhausted(events.length < HISTORY_PAGE);
       } catch (e) {
         console.error("history load failed", e);
       } finally {
@@ -5385,6 +5536,68 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
     // landed during the gap show up in the pane via the DB re-fetch
     // instead of being silently missed.
   }, [slot, wsAttempt]);
+
+  // Walk further back into history. Anchored at the smallest id we
+  // currently hold; the API's `before_id` returns events strictly
+  // older than that, so consecutive clicks paginate without overlap.
+  const loadOlder = useCallback(async () => {
+    if (loadingOlder || historyExhausted) return;
+    if (history.length === 0) return;
+    // Find oldest id we already have. Persisted events carry a
+    // server-assigned __id; if for some reason we don't have one
+    // (e.g. this slot's history is purely live), bail rather than
+    // refetching the same page.
+    let oldestId = Infinity;
+    for (const e of history) {
+      if (typeof e.__id === "number" && e.__id < oldestId) oldestId = e.__id;
+    }
+    if (!isFinite(oldestId)) {
+      setHistoryExhausted(true);
+      return;
+    }
+    setLoadingOlder(true);
+    // Preserve scroll position: when we prepend N events the body's
+    // scrollHeight grows and the user's view jumps to the top. We
+    // record scrollTop relative to scrollHeight before the prepend,
+    // then restore it after.
+    const body = bodyRef.current;
+    const beforeScrollHeight = body ? body.scrollHeight : 0;
+    const beforeScrollTop = body ? body.scrollTop : 0;
+    try {
+      const res = await authFetch(
+        `/api/events?agent=${encodeURIComponent(slot)}&before_id=${oldestId}&limit=${HISTORY_PAGE}`
+      );
+      if (!res.ok) return;
+      const data = await res.json();
+      const older = (data.events || []).map(unwrapPersisted);
+      if (older.length === 0) {
+        setHistoryExhausted(true);
+        return;
+      }
+      setHistory((prev) => {
+        // Defensive dedupe in case the same id appears twice.
+        const seen = new Set();
+        for (const e of prev) if (e.__id != null) seen.add(e.__id);
+        const dedupedOlder = older.filter((e) => e.__id == null || !seen.has(e.__id));
+        return [...dedupedOlder, ...prev];
+      });
+      if (older.length < HISTORY_PAGE) setHistoryExhausted(true);
+      // After paint, restore scroll: new content is above us, so we
+      // shift scrollTop by the amount the body grew.
+      requestAnimationFrame(() => {
+        if (!body) return;
+        const grew = body.scrollHeight - beforeScrollHeight;
+        body.scrollTop = beforeScrollTop + grew;
+        // Don't snap to bottom on this paint — user explicitly chose
+        // to read older content.
+        stickToBottomRef.current = false;
+      });
+    } catch (e) {
+      console.error("loadOlder failed", e);
+    } finally {
+      setLoadingOlder(false);
+    }
+  }, [history, historyExhausted, loadingOlder, slot]);
 
   // Merge history + live events. Live events don't carry __id (that's
   // assigned by the server's DB INSERT, which happens AFTER WS fan-out),
@@ -6100,6 +6313,15 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
         : null}
       <div class="pane-body" ref=${bodyRef} onScroll=${onBodyScroll}>
         ${!historyLoaded ? html`<div class="loading">loading history…</div>` : null}
+        ${historyLoaded && history.length > 0 && !historyExhausted
+          ? html`<button
+              type="button"
+              class="pane-load-older"
+              disabled=${loadingOlder}
+              onClick=${loadOlder}
+              title="Fetch the previous ${HISTORY_PAGE} events from this pane's history"
+            >${loadingOlder ? "loading…" : `↑ load older (${HISTORY_PAGE} more)`}</button>`
+          : null}
         ${historyLoaded && allEvents.length === 0
           ? html`<div class="pane-empty-hint">
               No conversation yet for ${slot}.
@@ -6297,7 +6519,7 @@ function ThinkingItem({ event, ts }) {
     ${open
       ? html`<div
           class="event-body thinking-body markdown"
-          dangerouslySetInnerHTML=${{ __html: renderMarkdown(content) }}
+          dangerouslySetInnerHTML=${{ __html: renderMarkdownFor(event) }}
         />`
       : null}
   </div>`;
@@ -6343,7 +6565,7 @@ function EventItem({ event }) {
       <div class="event-meta">${ts}</div>
       <div
         class="event-body markdown"
-        dangerouslySetInnerHTML=${{ __html: renderMarkdown(event.content || "") }}
+        dangerouslySetInnerHTML=${{ __html: renderMarkdownFor(event) }}
       />
     </div>`;
   }

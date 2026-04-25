@@ -375,7 +375,7 @@ Display section in Options drawer:
   `localStorage` as `harness_tz_pref`; toggle reloads the page so
   already-rendered timestamps update at once.
 
-Edit tool diff card — side-by-side ("before" | "after") view:
+Edit tool diff card — side-by-side, color-only:
 - Two-column layout in the spirit of the Antigravity / VS Code split
   diff. Old content on the left (red band), new content on the right
   (green band), unchanged context identical on both sides at the same
@@ -383,9 +383,11 @@ Edit tool diff card — side-by-side ("before" | "after") view:
   a hatched blank-left placeholder; pure removals get blank-right.
   A removed-then-added pair is zipped line-by-line so a modification
   reads as old → new across the row.
-- Sticky `before` / `after` header band at the top of the diff
-  scroll area.
-- Uses `diff@7` (~30 KB) via esm.sh for line-based diffing.
+- No `+` / `-` prefix gutter and no `before` / `after` header band —
+  the band color carries all the signal. Saves the horizontal width
+  for the actual content.
+- Uses `diff@7` (vendored under `/static/vendor/`) for line-based
+  diffing.
 - Each line is syntax-highlighted by `highlight.js` based on file
   extension. Mapping in [server/static/tools.js](server/static/tools.js):
   bash/css/go/html/js/json/md/py/rs/sql/ts/yaml. Markdown files
@@ -557,6 +559,22 @@ When the Agent SDK adds `context_management`, migrate:
 
 ~400 lines deleted, 1 kwarg added. Watch the
 [claude-agent-sdk-python changelog](https://github.com/anthropics/claude-agent-sdk-python/blob/main/CHANGELOG.md).
+
+### Frontend deps are vendored — refresh via `scripts/vendor_deps.py`
+
+Most ESM deps the UI uses (htm, split.js, marked, dompurify, diff,
+highlight.js core + 12 language packs, the github-dark theme CSS) live
+under `server/static/vendor/`, not on esm.sh. Cold first load drops
+from ~17 cross-origin module requests to 2 (preact + preact/hooks,
+which stay on esm.sh because they share component-instance state with
+each other and `?bundle`-ing them produces two separate Preact
+instances that break useState).
+
+To bump versions: edit `DEPS` in `scripts/vendor_deps.py`, run
+`python scripts/vendor_deps.py`, commit the regenerated files.
+The script chases esm.sh's `?bundle` re-export wrapper to grab the
+real self-contained bundle. CI does NOT regenerate vendor files —
+they ship as committed artifacts.
 
 ### Post-ResultMessage teardown noise is SDK-version-sensitive
 

@@ -1672,6 +1672,27 @@ body {
   font-style: italic;
   padding: 4px 0;
 }
+.pane-load-older {
+  display: block;
+  width: 100%;
+  margin: 0 0 8px 0;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  text-align: center;
+}
+.pane-load-older:hover:not(:disabled) {
+  color: var(--fg);
+  border-style: solid;
+}
+.pane-load-older:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
 .pane-empty-hint {
   color: var(--muted);
   font-size: 12px;
@@ -1700,6 +1721,28 @@ body {
   background: var(--card);
   border-radius: 0 4px 4px 0;
   word-break: break-word;
+  /* Cheap virtualization: lets the browser skip layout/paint for
+     event rows that are fully offscreen. The estimated intrinsic
+     size lets it size the scroll track correctly even when most
+     rows are unrendered — pick a value that's roughly the median
+     row height so scroll position stays stable. Real measurement
+     happens once the row scrolls into view.
+
+     This pairs with the markdown-event memoization (so when a row
+     does need to render we don't re-parse its content) to make
+     long sessions cheap to scroll through. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 80px;
+}
+/* Streaming bubble + sticky turn header opt out — they need to
+   stay laid out so the cursor + sticky-positioning behave
+   correctly. content-visibility: auto can interact badly with
+   `position: sticky` (the sticky header may not stick when its
+   container is content-visibility-skipped). */
+.event.streaming,
+.event.turn-header {
+  content-visibility: visible;
+  contain-intrinsic-size: auto;
 }
 .event-meta {
   color: var(--muted);
@@ -2092,18 +2135,17 @@ body {
   object-fit: contain;
 }
 
-/* ---- Edit diff card: side-by-side ("before" | "after") ----
-   Each row contains two halves; matching context lines sit at the
-   same y-position on both sides so the reader can scan horizontally.
-   Pure additions get a blank "before" placeholder; pure removals get
-   a blank "after" placeholder. A removed-then-added pair is zipped
-   line-by-line so a modification reads as old → new across the row.
+/* ---- Edit diff card: side-by-side, color-only ----
+   Two halves per row; matching context lines sit at the same y on
+   both sides so the reader scans horizontally. Pure additions get a
+   blank-left placeholder; pure removals get blank-right; a removed-
+   then-added pair is zipped line-by-line so a modification reads as
+   old → new across the row. No prefix gutter and no header band —
+   the band color (red left / green right / hatched blank) carries
+   all the signal.
 
-   Half kinds:
-     diff-ctx    unchanged context (muted, both sides identical)
-     diff-add    inserted line   (green band, right side)
-     diff-del    deleted line    (red band, left side)
-     diff-blank  alignment placeholder (no content) */
+   Half kinds: diff-ctx (muted, both sides identical), diff-add (green
+   band, right), diff-del (red band, left), diff-blank (placeholder). */
 .tool-card.edit-card .diff {
   margin-top: 6px;
   border-radius: 4px;
@@ -2116,68 +2158,24 @@ body {
   overflow-y: auto;
   background: var(--card);
 }
-.tool-card.edit-card .diff-headers {
-  display: flex;
-  position: sticky;
-  top: 0;
-  background: var(--card);
-  border-bottom: 1px solid var(--border);
-  z-index: 1;
-}
-.tool-card.edit-card .diff-header {
-  flex: 1 1 50%;
-  padding: 3px 10px;
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--muted);
-}
-.tool-card.edit-card .diff-header-old {
-  border-right: 1px solid var(--border);
-}
 .tool-card.edit-card .diff-row {
   display: flex;
   align-items: stretch;
 }
 .tool-card.edit-card .diff-half {
   flex: 1 1 50%;
-  display: flex;
-  align-items: flex-start;
   min-width: 0;
-  padding: 1px 0;
+  padding: 1px 10px;
   border-right: 1px solid var(--border);
-}
-.tool-card.edit-card .diff-half:last-child { border-right: 0; }
-.tool-card.edit-card .diff-prefix {
-  flex: 0 0 20px;
-  text-align: center;
-  color: var(--muted);
-  user-select: none;
-  font-weight: 600;
-  opacity: 0.7;
-}
-.tool-card.edit-card .diff-content {
-  flex: 1 1 auto;
-  min-width: 0;
-  padding-right: 10px;
   white-space: pre-wrap;
   word-break: break-word;
 }
+.tool-card.edit-card .diff-half:last-child { border-right: 0; }
 .tool-card.edit-card .diff-add {
   background: rgba(63, 185, 80, 0.14);
 }
-.tool-card.edit-card .diff-add .diff-prefix {
-  color: var(--ok);
-  opacity: 1;
-  background: rgba(63, 185, 80, 0.25);
-}
 .tool-card.edit-card .diff-del {
   background: rgba(248, 81, 73, 0.14);
-}
-.tool-card.edit-card .diff-del .diff-prefix {
-  color: var(--err);
-  opacity: 1;
-  background: rgba(248, 81, 73, 0.25);
 }
 .tool-card.edit-card .diff-ctx {
   opacity: 0.65;
