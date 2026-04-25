@@ -353,6 +353,28 @@ Telegram bridge ([server/telegram.py](server/telegram.py)):
   disabled-flag round-trip, and `_resolve_config` precedence
   (disabled flag > DB secrets > env > unset).
 
+Stale-task watchdog post-redeploy fix:
+- `crash_recover()` on every container boot demotes
+  `tasks.status='in_progress'` → `'claimed'` (so the harness doesn't
+  carry zombie running-state across restarts). The previous watchdog
+  query in [server/agents.py](server/agents.py) only looked at
+  `in_progress`, so every Zeabur redeploy silently blinded the
+  watchdog to all active tasks.
+- Fix: `WHERE t.status IN ('in_progress', 'claimed')`. A `claimed`
+  task with no recent owner activity is also a stall — either the
+  owner never started, or the boot reset wiped state. The DM to
+  Coach now mentions the actual status so the right remediation
+  ("nudge them to start" vs "they're stuck mid-work") is obvious.
+
+Display section in Options drawer:
+- New `DisplaySection` toggles timezone rendering between local time
+  (default) and UTC. Server stamps everything in UTC; this only
+  affects how `timeStr()` renders ISO timestamps in the timeline.
+  `Intl.DateTimeFormat().resolvedOptions().timeZone` is shown so the
+  user knows what "local" means on their device. Persisted in
+  `localStorage` as `harness_tz_pref`; toggle reloads the page so
+  already-rendered timestamps update at once.
+
 **Next likely:**
 - **Mobile UI polish** — touch-drag doesn't work with HTML5 DnD;
    layout breakpoints for < 900 px need a rethink.

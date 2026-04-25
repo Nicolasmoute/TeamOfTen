@@ -2917,9 +2917,9 @@ _stale_task_last_notify: dict[str, float] = {}
 
 
 async def stale_task_watch_loop() -> None:
-    """Background task: find in_progress tasks whose owner hasn't
-    emitted an event in STALE_TASK_MINUTES minutes and DM Coach so
-    the workflow doesn't silently hang. Re-notifies at most every
+    """Background task: find tasks claimed/in_progress whose owner
+    hasn't emitted an event in STALE_TASK_MINUTES minutes and DM Coach
+    so the workflow doesn't silently hang. Re-notifies at most every
     STALE_TASK_NOTIFY_INTERVAL_MIN minutes per task. Also emits a
     `task_stalled` event for audit.
 
@@ -2928,6 +2928,13 @@ async def stale_task_watch_loop() -> None:
     where the owner has ZERO events in history (fresh system never
     been used — avoids firing on an empty DB). Locked or cancelled
     agents are skipped because they're a known-stall case, not a bug.
+
+    Includes `claimed` AND `in_progress` because crash_recover() on
+    every container boot demotes in_progress → claimed; without
+    this the watchdog would go blind to every active task across a
+    redeploy. A `claimed` task with no recent activity is also a
+    stall worth surfacing — either the owner never started, or the
+    boot reset wiped state.
     """
     if STALE_TASK_MINUTES <= 0:
         logger.info("stale-task watchdog disabled (HARNESS_STALE_TASK_MINUTES=0)")
@@ -2951,11 +2958,11 @@ async def stale_task_watch_loop() -> None:
                 # HAVING filters tasks with NO activity in cutoff min.
                 cur = await c.execute(
                     """
-                    SELECT t.id, t.title, t.owner, t.created_by,
+                    SELECT t.id, t.title, t.owner, t.created_by, t.status,
                            MAX(e.ts) AS last_activity
                     FROM tasks t
                     LEFT JOIN events e ON e.agent_id = t.owner
-                    WHERE t.status = 'in_progress'
+                    WHERE t.status IN ('in_progress', 'claimed')
                       AND t.owner IS NOT NULL
                     GROUP BY t.id
                     HAVING last_activity IS NOT NULL
@@ -2987,6 +2994,7 @@ async def stale_task_watch_loop() -> None:
             owner = d.get("owner") or "?"
             title = d.get("title") or "(no title)"
             last_act = d.get("last_activity") or "unknown"
+            status = d.get("status") or "in_progress"
             try:
                 await _emit(
                     "system",
@@ -2995,6 +3003,7 @@ async def stale_task_watch_loop() -> None:
                     owner=owner,
                     last_activity=last_act,
                     stale_minutes=cutoff_minutes,
+                    task_status=status,
                 )
             except Exception:
                 logger.exception("stale-task: emit failed for %s", task_id)
@@ -3009,10 +3018,11 @@ async def stale_task_watch_loop() -> None:
                     to_id="coach",
                     subject=f"task {task_id} stalled ({owner})",
                     body=(
-                        f"Task {task_id} \"{title[:100]}\" has been in_progress "
-                        f"for {cutoff_minutes}+ minutes with no activity from "
-                        f"{owner} (last event: {last_act}). Decide whether to "
-                        f"nudge them, reassign, or mark the task blocked."
+                        f"Task {task_id} \"{title[:100]}\" has been "
+                        f"{status} for {cutoff_minutes}+ minutes with no "
+                        f"activity from {owner} (last event: {last_act}). "
+                        f"Decide whether to nudge them, reassign, or mark "
+                        f"the task blocked."
                     ),
                     priority="normal",
                 )

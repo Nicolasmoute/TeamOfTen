@@ -485,8 +485,29 @@ function slotShortLabel(slotId) {
   return slotId.slice(0, 2);
 }
 
+// Timezone preference for timestamp rendering. Server stamps events
+// in UTC; reading the raw ISO is fine when many users collaborate, but
+// for a solo deploy the wall clock you actually live in is more
+// useful. Toggle lives in the Options drawer ("Display") section,
+// persisted in localStorage. Default 'local'.
+function getTzPref() {
+  try { return localStorage.getItem("harness_tz_pref") || "local"; }
+  catch (_) { return "local"; }
+}
+
 function timeStr(iso) {
-  return (iso || "").slice(11, 19);
+  if (!iso) return "";
+  if (getTzPref() === "utc") {
+    return iso.slice(11, 19);
+  }
+  const d = new Date(iso);
+  if (!Number.isFinite(d.getTime())) return iso.slice(11, 19);
+  return d.toLocaleTimeString([], {
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }
 
 
@@ -2799,6 +2820,50 @@ function SecretsSection() {
 }
 
 
+// Display preferences: timezone for timestamp rendering. Server stamps
+// in UTC; users typically want to see their local clock. The toggle
+// reloads the page so all already-rendered timestamps update at once
+// (timeStr() reads localStorage on every call but old DOM nodes don't
+// re-render on their own).
+function DisplaySection() {
+  const [pref, setPref] = useState(() => {
+    try { return localStorage.getItem("harness_tz_pref") || "local"; }
+    catch (_) { return "local"; }
+  });
+  const tzName = (() => {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().timeZone || "(unknown)";
+    } catch (_) { return "(unknown)"; }
+  })();
+  const apply = (next) => {
+    if (next === pref) return;
+    try { localStorage.setItem("harness_tz_pref", next); } catch (_) {}
+    setPref(next);
+    location.reload();
+  };
+  return html`<section class="drawer-section">
+    <h3>Display</h3>
+    <p class="muted" style="font-size: 12px; margin: 0 0 6px 0;">
+      Timestamps in event timelines and tool cards. Server stores UTC;
+      this only affects how they're rendered. Detected zone:
+      <code>${tzName}</code>.
+    </p>
+    <div style="display: flex; gap: 6px;">
+      <button
+        type="button"
+        class=${pref === "local" ? "primary" : ""}
+        onClick=${() => apply("local")}
+      >local time</button>
+      <button
+        type="button"
+        class=${pref === "utc" ? "primary" : ""}
+        onClick=${() => apply("utc")}
+      >UTC</button>
+    </div>
+  </section>`;
+}
+
+
 function SettingsDrawer({ onClose, serverStatus }) {
   // A compact row summarizing the live server status: paused, running
   // agents, ws subscribers. Rendered above the health checks so the
@@ -2961,6 +3026,8 @@ function SettingsDrawer({ onClose, serverStatus }) {
           <${MCPServersSection} />
 
           <${SessionsSection} />
+
+          <${DisplaySection} />
 
           <section class="drawer-section">
             <h3>Layout</h3>
