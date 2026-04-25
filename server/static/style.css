@@ -54,6 +54,12 @@ body {
     /* Override the inline-style grid-template-columns set by App. */
     grid-template-columns: 1fr !important;
     grid-template-rows: 1fr auto !important;
+    /* Mobile browser chrome can make 100vh extend below the visible
+       screen. Keep the bottom rail inside the live viewport. */
+    height: 100svh;
+    height: 100dvh;
+    max-height: 100dvh;
+    overflow: hidden;
   }
   /* Explicit grid-row placement: panes take the flexible top row,
      rail takes the auto-sized bottom row. */
@@ -73,9 +79,10 @@ body {
     align-items: stretch;
     border-right: none;
     border-top: 1px solid var(--border);
-    padding: 0;
+    padding: 0 0 max(2px, env(safe-area-inset-bottom));
     gap: 0;
     overflow: visible;
+    background: var(--bg);
   }
   .rail > .rail-ws-dot { display: none; }
   .rail .mobile-ws-dot {
