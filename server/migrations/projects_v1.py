@@ -222,32 +222,6 @@ async def _wipe_local_dirs() -> None:
         logger.exception("projects_v1: wipe failed for %s", ws)
 
 
-async def _wipe_kdrive_tot() -> None:
-    """Recursively delete the TOT/ root on kDrive. Best-effort: when
-    kDrive isn't configured we just log + skip so a fresh deploy
-    without WebDAV creds still migrates cleanly."""
-    try:
-        from server.webdav import webdav  # local import — avoids cycles
-    except Exception:
-        logger.warning("projects_v1: webdav import failed; skipping kDrive wipe")
-        return
-    if not getattr(webdav, "enabled", False):
-        logger.warning("projects_v1: kDrive disabled; skipping kDrive wipe")
-        return
-    try:
-        # webdav.remove handles both files and directories on most
-        # WebDAV servers (Infomaniak/kDrive supports recursive DELETE).
-        # If the helper doesn't exist, try webdav.rmtree as a fallback.
-        rm = getattr(webdav, "remove", None) or getattr(webdav, "rmtree", None)
-        if not rm:
-            logger.warning("projects_v1: webdav has no remove/rmtree; skipping")
-            return
-        logger.warning("projects_v1: wiping kDrive TOT/ recursively")
-        await rm("")  # the webdav client roots itself at TOT/
-    except Exception:
-        logger.exception("projects_v1: kDrive wipe failed; continuing")
-
-
 async def run(db: aiosqlite.Connection) -> bool:
     """Execute the destructive migration on the given connection.
 
@@ -329,10 +303,16 @@ async def run(db: aiosqlite.Connection) -> bool:
     finally:
         await db.execute("PRAGMA foreign_keys = ON")
 
-    # Step 5–7: filesystem wipes + scaffold. Outside the txn — fs
-    # has no rollback, but the operations are idempotent on retry.
+    # Step 5–6: local filesystem wipe + scaffold. Outside the txn —
+    # fs has no rollback, but the operations are idempotent on retry.
+    # The kDrive root (`TOT/`) is intentionally NOT wiped: that wipe
+    # used to live here for the original legacy migration but caused
+    # data loss on any boot where `schema_version` wasn't persisted
+    # (fresh DB, broken volume mount, etc.). Stale legacy paths on
+    # kDrive are harmless — new code writes under `TOT/projects/<slug>/`
+    # and never touches the old layout. Operators on legacy installs
+    # can clean orphan kDrive folders manually.
     await _wipe_local_dirs()
-    await _wipe_kdrive_tot()
     try:
         paths.ensure_global_scaffold()
         paths.ensure_project_scaffold("misc")
