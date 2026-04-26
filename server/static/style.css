@@ -486,12 +486,13 @@ body {
   position: relative;
 }
 .gear.project-pill {
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--fg);
+  color: var(--muted);
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--panel, #1c1f26);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 .gear.project-pill:hover { border-color: var(--accent, #e3a03a); color: var(--accent, #e3a03a); }
 .gear.project-pill.open { border-color: var(--accent, #e3a03a); color: var(--accent, #e3a03a); }
@@ -499,16 +500,94 @@ body {
   cursor: wait;
   opacity: 0.6;
 }
-.project-menu {
+.project-pill-spinner {
+  display: inline-block;
+  font-size: 14px;
+  font-weight: 700;
+  animation: project-pill-spin 0.9s linear infinite;
+}
+@keyframes project-pill-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+/* Multi-folder glyph: three stacked folder rectangles offset slightly,
+   drawn in pure CSS (currentColor inherits the .gear hover/open
+   accent), so it reads as "Projects" not "a folder". The back folder
+   is the dimmest, the front the brightest, giving a quick depth cue
+   without adding an SVG asset. */
+.projects-icon {
+  display: inline-block;
+  position: relative;
+  width: 18px;
+  height: 14px;
+}
+.projects-icon-back,
+.projects-icon-mid,
+.projects-icon-front {
   position: absolute;
-  left: calc(100% + 6px);
-  bottom: 0;
-  min-width: 220px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  background: var(--panel, #1c1f26);
+  box-sizing: border-box;
+}
+.projects-icon-back {
+  left: 0; top: 0;
+  width: 12px; height: 9px;
+  opacity: 0.45;
+}
+.projects-icon-back::before {
+  /* Folder tab on the back-most folder */
+  content: "";
+  position: absolute;
+  left: 1px; top: -3px;
+  width: 5px; height: 3px;
+  border: 1px solid currentColor;
+  border-bottom: 0;
+  border-radius: 2px 2px 0 0;
+  background: var(--panel, #1c1f26);
+}
+.projects-icon-mid {
+  left: 3px; top: 2px;
+  width: 12px; height: 9px;
+  opacity: 0.7;
+}
+.projects-icon-mid::before {
+  content: "";
+  position: absolute;
+  left: 1px; top: -3px;
+  width: 5px; height: 3px;
+  border: 1px solid currentColor;
+  border-bottom: 0;
+  border-radius: 2px 2px 0 0;
+  background: var(--panel, #1c1f26);
+}
+.projects-icon-front {
+  left: 6px; top: 4px;
+  width: 12px; height: 9px;
+}
+.projects-icon-front::before {
+  content: "";
+  position: absolute;
+  left: 1px; top: -3px;
+  width: 5px; height: 3px;
+  border: 1px solid currentColor;
+  border-bottom: 0;
+  border-radius: 2px 2px 0 0;
+  background: var(--panel, #1c1f26);
+}
+.project-menu {
+  /* Fixed positioning so the menu escapes the rail's overflow-y:auto
+     scroll container. Coordinates are computed in JS from the
+     button's bounding rect and passed via inline style. */
+  position: fixed;
+  min-width: 240px;
+  max-height: 70vh;
+  overflow-y: auto;
   background: var(--panel, #1c1f26);
   border: 1px solid var(--border);
   border-radius: 6px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
-  z-index: 50;
+  z-index: 1000;
   padding: 4px 0;
   font-size: 12px;
 }
@@ -1956,31 +2035,53 @@ body {
 }
 .pane-files-save:disabled { opacity: 0.5; cursor: wait; }
 
-/* Files icon in LeftRail — simple folder-with-tab glyph drawn in CSS
-   so it matches the palette without needing an asset. */
+/* Files icon in LeftRail — file-tree glyph (a vertical trunk with
+   three small horizontal "rows" branching off it). Drawn in pure CSS
+   from currentColor so it picks up the gear hover/active accent.
+   Reads as "tree of files" rather than "a folder", which the project
+   switcher's multi-folder glyph already covers. */
 .files-icon {
   display: inline-block;
   position: relative;
   width: 18px;
   height: 14px;
 }
-.files-icon-tab {
+.files-icon-trunk {
   position: absolute;
-  left: 0; top: 0;
-  width: 7px;
-  height: 4px;
+  left: 3px; top: 1px; bottom: 1px;
+  width: 1px;
+  background: currentColor;
+  opacity: 0.85;
+}
+.files-icon-row {
+  position: absolute;
+  height: 1px;
+  background: currentColor;
+  opacity: 0.85;
+}
+.files-icon-row::before {
+  /* Branch line from the trunk to the row marker */
+  content: "";
+  position: absolute;
+  left: -3px; top: 0;
+  width: 3px;
+  height: 1px;
+  background: currentColor;
+}
+.files-icon-row::after {
+  /* Small "file" rectangle at the end of the branch */
+  content: "";
+  position: absolute;
+  right: 0; top: -2px;
+  width: 8px;
+  height: 5px;
   border: 1px solid currentColor;
-  border-bottom: 0;
-  border-radius: 2px 2px 0 0;
+  border-radius: 1px;
   background: transparent;
 }
-.files-icon-body {
-  position: absolute;
-  left: 0; right: 0; top: 3px; bottom: 0;
-  border: 1px solid currentColor;
-  border-radius: 2px;
-  background: transparent;
-}
+.files-icon-row-1 { left: 7px; top: 2px; right: 0; }
+.files-icon-row-2 { left: 7px; top: 7px; right: 0; }
+.files-icon-row-3 { left: 7px; top: 12px; right: 0; }
 .gear.files-open.active { color: var(--fg); }
 
 .pane-gear, .pane-export, .pane-search-toggle, .pane-pop-out, .pane-maximize {

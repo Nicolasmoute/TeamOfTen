@@ -814,14 +814,30 @@ def build_router(*, require_token, audit_actor):
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT repo_url FROM projects WHERE id = ?", (project_id,)
+                "SELECT repo_url, archived FROM projects WHERE id = ?",
+                (project_id,),
             )
             row = await cur.fetchone()
             if not row:
                 raise HTTPException(404, detail=f"project '{project_id}' not found")
-            repo = dict(row).get("repo_url")
+            d = dict(row)
+            repo = d.get("repo_url")
+            archived = bool(d.get("archived") or 0)
         finally:
             await c.close()
+        if archived:
+            # Phase 8 audit polish (PROJECTS_SPEC.md §2 — archived
+            # projects skip sync). Provisioning a repo for an archived
+            # project would clone code that the sync loop won't touch
+            # until un-archived; refuse loudly so the user un-archives
+            # first instead of ending up with phantom worktrees.
+            raise HTTPException(
+                409,
+                detail=(
+                    f"project '{project_id}' is archived; un-archive it "
+                    "before provisioning"
+                ),
+            )
         if not repo:
             raise HTTPException(
                 400, detail=f"project '{project_id}' has no repo_url configured"

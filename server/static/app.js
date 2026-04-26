@@ -2325,40 +2325,73 @@ function TokenGate({ onSubmit }) {
 // switch projects from the rail.
 function ProjectSwitcher({ projects, activeProjectId, switchingProject, onActivate, onCreate }) {
   const [open, setOpen] = useState(false);
+  const [menuPos, setMenuPos] = useState(null); // {left, bottom} in viewport coords
   const ref = useRef(null);
+  const buttonRef = useRef(null);
+
+  // Position the menu in viewport coordinates so it escapes the rail's
+  // overflow-y: auto clipping. Computed once on open and on resize.
+  const reposition = useCallback(() => {
+    const btn = buttonRef.current;
+    if (!btn) return;
+    const r = btn.getBoundingClientRect();
+    setMenuPos({
+      left: Math.round(r.right + 6),
+      // Anchor menu's bottom to button's bottom edge so it grows
+      // upward (we're at the bottom of the rail).
+      bottom: Math.round(window.innerHeight - r.bottom),
+    });
+  }, []);
 
   useEffect(() => {
     if (!open) return;
+    reposition();
     function handleClickOutside(e) {
       if (ref.current && !ref.current.contains(e.target)) {
         setOpen(false);
       }
     }
+    function handleScrollOrResize() { reposition(); }
     document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [open]);
+    window.addEventListener("resize", handleScrollOrResize);
+    window.addEventListener("scroll", handleScrollOrResize, true);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      window.removeEventListener("resize", handleScrollOrResize);
+      window.removeEventListener("scroll", handleScrollOrResize, true);
+    };
+  }, [open, reposition]);
 
   const active = projects.find((p) => p.id === activeProjectId);
   const visible = projects.filter((p) => !p.archived);
-  const label = switchingProject
-    ? "↻"
-    : active
-    ? active.name.slice(0, 2).toUpperCase()
-    : "P";
   const tooltip = active
-    ? `Active: ${active.name}` + (switchingProject ? ` (switching to ${switchingProject}…)` : "")
-    : "No project active — click to pick";
+    ? `Projects — active: ${active.name}` + (switchingProject ? ` (switching to ${switchingProject}…)` : "")
+    : "Projects — no project active, click to pick";
 
   return html`
     <div class="project-switcher" ref=${ref}>
       <button
+        ref=${buttonRef}
         class=${"gear project-pill" + (open ? " open" : "") + (switchingProject ? " switching" : "")}
         title=${tooltip}
+        aria-label=${tooltip}
         onClick=${() => setOpen((v) => !v)}
         disabled=${Boolean(switchingProject)}
-      >${label}</button>
-      ${open ? html`
-        <div class="project-menu" role="menu">
+      >
+        ${switchingProject
+          ? html`<span class="project-pill-spinner" aria-hidden="true">↻</span>`
+          : html`<span class="projects-icon" aria-hidden="true">
+              <span class="projects-icon-back"></span>
+              <span class="projects-icon-mid"></span>
+              <span class="projects-icon-front"></span>
+            </span>`}
+      </button>
+      ${open && menuPos ? html`
+        <div
+          class="project-menu"
+          role="menu"
+          style=${`left: ${menuPos.left}px; bottom: ${menuPos.bottom}px;`}
+        >
           <div class="project-menu-head">Switch project</div>
           ${visible.length === 0
             ? html`<div class="project-menu-empty">No projects yet</div>`
@@ -2698,12 +2731,14 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
         <div class="rail-group rail-files">
           <button
             class=${"gear files-open" + (openSlots.includes("__files") ? " active" : "")}
-            title="Open the file explorer pane (context, knowledge, decisions)"
+            title="Open the file explorer pane (global + active project)"
             onClick=${() => onOpen("__files")}
           >
             <span class="files-icon" aria-hidden="true">
-              <span class="files-icon-tab"></span>
-              <span class="files-icon-body"></span>
+              <span class="files-icon-trunk"></span>
+              <span class="files-icon-row files-icon-row-1"></span>
+              <span class="files-icon-row files-icon-row-2"></span>
+              <span class="files-icon-row files-icon-row-3"></span>
             </span>
           </button>
           <${ProjectSwitcher}
@@ -3325,6 +3360,23 @@ function ProjectsSection() {
     .replace(/^-|-$/g, "")
     .slice(0, 48);
 
+  // Mirror server-side validators in projects_api.py so the user sees
+  // the failure live instead of after a round-trip 400. Audit polish
+  // from PROJECTS_SPEC.md §14 Q1.
+  const SLUG_RE = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
+  const RESERVED_SLUGS = new Set([
+    "skills", "wiki", "mcp", "projects", "snapshots", "harness", "data", "claude",
+  ]);
+  const validateSlugLive = (slug) => {
+    const s = (slug || "").trim();
+    if (!s) return null;
+    if (s.length < 2 || s.length > 48) return "Slug must be 2–48 characters.";
+    if (!SLUG_RE.test(s)) return "Slug must be lowercase letters/digits/dashes; start with a letter; no leading/trailing/consecutive dashes.";
+    if (RESERVED_SLUGS.has(s)) return `Slug "${s}" is reserved (collides with a global folder).`;
+    return null;
+  };
+  const slugError = validateSlugLive(createForm.slug);
+
   const updateCreateName = (name) => {
     setCreateForm((f) => {
       const next = { ...f, name };
@@ -3339,6 +3391,11 @@ function ProjectsSection() {
     const name = (createForm.name || "").trim();
     if (!slug || !name) {
       setMsg({ kind: "err", text: "Slug and name are both required." });
+      return;
+    }
+    const err = validateSlugLive(slug);
+    if (err) {
+      setMsg({ kind: "err", text: err });
       return;
     }
     setBusy(true); setMsg(null);
@@ -3451,9 +3508,13 @@ function ProjectsSection() {
                   <div style="margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap;">
                     <button disabled=${busy} onClick=${() => startEdit(p)} style="font-size: 11px;">edit</button>
                     <button
-                      disabled=${busy || !p.repo_url}
+                      disabled=${busy || !p.repo_url || p.archived}
                       onClick=${() => provision(p)}
-                      title="Clone + create worktrees for this project"
+                      title=${p.archived
+                        ? "Project is archived — un-archive before provisioning"
+                        : !p.repo_url
+                        ? "Set a repo URL first"
+                        : "Clone + create worktrees for this project"}
                       style="font-size: 11px;"
                     >provision now</button>
                     <button
@@ -3517,8 +3578,13 @@ function ProjectsSection() {
               placeholder="slug (auto-derived from name)"
               value=${createForm.slug}
               onInput=${(e) => { setCreateForm((f) => ({ ...f, slug: e.target.value })); setSlugManuallyEdited(true); }}
-              style="background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 4px 8px; font-size: 12px; font-family: ui-monospace, monospace;"
+              style=${"background: var(--bg); color: var(--fg); border: 1px solid "
+                + (slugError ? "var(--err)" : "var(--border)")
+                + "; border-radius: 3px; padding: 4px 8px; font-size: 12px; font-family: ui-monospace, monospace;"}
             />
+            ${slugError
+              ? html`<div style="font-size: 10px; color: var(--err); margin-top: -2px;">${slugError}</div>`
+              : null}
             <input
               placeholder="description (optional)"
               value=${createForm.description}
@@ -3532,7 +3598,11 @@ function ProjectsSection() {
               style="background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 4px 8px; font-size: 12px; font-family: ui-monospace, monospace;"
             />
             <div style="display: flex; gap: 6px;">
-              <button class="primary" disabled=${busy} onClick=${submitCreate}>create</button>
+              <button
+                class="primary"
+                disabled=${busy || Boolean(slugError) || !createForm.slug.trim() || !createForm.name.trim()}
+                onClick=${submitCreate}
+              >create</button>
               <button disabled=${busy} onClick=${() => { setShowCreate(false); setSlugManuallyEdited(false); }}>cancel</button>
             </div>
           </div>`
