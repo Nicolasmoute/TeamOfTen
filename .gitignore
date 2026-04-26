@@ -19,3 +19,6 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Retired specs — kept locally for reference, not tracked
+Docs/Deprecated/
