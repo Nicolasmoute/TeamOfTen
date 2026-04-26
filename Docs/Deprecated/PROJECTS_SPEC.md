@@ -905,10 +905,12 @@ Recommend doing these in order — each is independently testable.
 
 ### Implementation status (2026-04-26)
 
-- **Phases 1–7** — complete and audited (see per-phase headers above).
-- **Phase 8** — complete; awaiting audit pass.
+- **Phases 1–8** — complete and audited (see per-phase headers above).
+- **projects_v2 layout migration** shipped as a follow-up cleanup
+  (clean root, `.claude/skills/`, working/{knowledge,memory},
+  inputs→uploads). See [server/migrations/projects_v2.py](server/migrations/projects_v2.py).
 
-### Phase 8 — Options drawer Projects section + per-project brief edit (completed)
+### Phase 8 — Options drawer Projects section + per-project brief edit (completed and audited)
 - Projects section: project cards with create / edit (name, repo_url, description) / archive toggle / delete (Misc undeletable). Expand a card to view the project's `agent_project_roles` (read-only).
 - Pane settings popover update: `brief` field reads/writes `agent_project_roles.brief` for the active project (was `agents.brief`).
 - API update: existing `PUT /api/agents/{slot}/brief` re-targets to `agent_project_roles` for the active project; existing `coord_set_player_role` likewise. Both gain implicit `WHERE project_id = active`.
