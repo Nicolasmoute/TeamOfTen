@@ -47,7 +47,6 @@ from server.agents import (
     run_agent,
     set_paused,
 )
-from server import context as ctxmod
 from server import files as filesmod
 from server.paths import project_paths
 from server.db import configured_conn, crash_recover, init_db, resolve_active_project
@@ -163,13 +162,19 @@ def _attachments_dir_for(project_id: str) -> Path:
 # by agents via coord_save_output; mirrored to WebDAV under outputs/;
 # also surfaced read-only in the files pane. Lives on /data so it
 # survives restarts.
+#
+# Note: per PROJECTS_SPEC.md §4 outputs are per-project at
+# `/data/projects/<slug>/outputs/`. The legacy global `/data/outputs/`
+# is still here to back the legacy coord_save_output writer; a future
+# cleanup will route that through `project_paths(active).outputs`
+# the same way we did for knowledge in projects_v2.
 OUTPUTS_DIR = Path(os.environ.get("HARNESS_OUTPUTS_DIR", "/data/outputs"))
 
-# Human-uploaded reference material the team reads. Humans drop files
-# on kDrive under uploads/; a background loop pulls them into this
-# directory, and per-slot workspaces get a `uploads` symlink so
-# Players can Read ./uploads/foo.pdf from their cwd.
-UPLOADS_DIR = Path(os.environ.get("HARNESS_UPLOADS_DIR", "/data/uploads"))
+# (UPLOADS_DIR / HANDOFFS_DIR removed in projects_v2 — uploads and
+# handoffs are per-project under /data/projects/<active>/uploads/ and
+# /data/projects/<active>/working/handoffs/. The /api/attachments
+# handler resolves the active project at request time; agents reach
+# uploads/handoffs via absolute paths documented in CLAUDE.md.)
 
 
 @asynccontextmanager
@@ -213,37 +218,15 @@ async def lifespan(app: FastAPI):
     if _att_override:
         Path(_att_override).mkdir(parents=True, exist_ok=True)
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    # Per-slot symlinks so agents can say "Read ./uploads/foo.pdf"
-    # from their workspace cwd instead of hardcoding /data paths. Same
-    # pattern the Dockerfile uses for attachments — we do it at runtime
-    # because /workspaces may be a fresh volume where the Dockerfile's
-    # pre-created symlinks got wiped.
-    try:
-        ws_root = Path("/workspaces")
-        handoffs_dir = Path(
-            os.environ.get("HARNESS_HANDOFFS_DIR", "/data/handoffs")
-        )
-        handoffs_dir.mkdir(parents=True, exist_ok=True)
-        if ws_root.exists():
-            for slot_dir in ws_root.iterdir():
-                if not slot_dir.is_dir():
-                    continue
-                for name, target in (
-                    ("uploads", UPLOADS_DIR),
-                    ("handoffs", handoffs_dir),
-                ):
-                    link = slot_dir / name
-                    if link.exists() or link.is_symlink():
-                        continue
-                    try:
-                        link.symlink_to(target)
-                    except OSError:
-                        logger.exception(
-                            "failed to symlink %s for %s", name, slot_dir.name
-                        )
-    except Exception:
-        logger.exception("workspace symlink setup failed (non-fatal)")
+    # uploads/ and handoffs/ are per-project under
+    # `/data/projects/<active>/uploads/` and
+    # `/data/projects/<active>/working/handoffs/` (PROJECTS_SPEC.md §4).
+    # The legacy boot-time symlinks at /workspaces/<slot>/{uploads,handoffs}
+    # → /data/uploads + /data/handoffs were retired with projects_v2:
+    # the legacy flat dirs no longer exist on disk. Agents reach their
+    # project's uploads/handoffs via the absolute paths documented in
+    # the global CLAUDE.md template. A future workspaces.py refactor
+    # to per-project worktrees can re-introduce relative symlinks.
     # Claude CLI credential dir. Set via CLAUDE_CONFIG_DIR in the image
     # so OAuth tokens written by `claude /login` land on the /data
     # volume and survive Zeabur redeploys. We mkdir at runtime (not in
@@ -2863,72 +2846,13 @@ async def get_decision(filename: str) -> dict[str, Any]:
     }
 
 
-class ContextWrite(BaseModel):
-    kind: str = Field(..., description="root | skills | rules")
-    name: str = Field("", description="file basename without .md; '' or 'CLAUDE' for kind='root'")
-    body: str = Field(..., description="full markdown content")
-
-
-@app.get("/api/context", dependencies=[Depends(require_token)])
-async def list_context() -> dict[str, Any]:
-    """List every available governance-layer context doc (local ∪ kDrive).
-    Shape: {"root": ["CLAUDE"] or [], "skills": [...], "rules": [...]}."""
-    return await ctxmod.list_all()
-
-
-@app.get("/api/context/{kind}/{name}", dependencies=[Depends(require_token)])
-async def get_context(kind: str, name: str) -> dict[str, Any]:
-    err = ctxmod.validate(kind, "CLAUDE" if kind == "root" else name)
-    if err:
-        raise HTTPException(400, detail=err)
-    body = await ctxmod.read(kind, "CLAUDE" if kind == "root" else name)
-    if body is None:
-        raise HTTPException(404, detail="not found")
-    return {"kind": kind, "name": name, "body": body, "size": len(body)}
-
-
-@app.post("/api/context", dependencies=[Depends(require_token)])
-async def write_context_from_human(req: ContextWrite) -> dict[str, Any]:
-    """Upsert a context doc from the human operator. Same write path as
-    `coord_write_context` but attributed to 'human'. Emits context_updated
-    so open UIs re-render and the next agent turn picks up the change."""
-    try:
-        ok = await ctxmod.write(req.kind, req.name or "CLAUDE", req.body)
-    except ValueError as e:
-        raise HTTPException(400, detail=str(e))
-    if not ok:
-        raise HTTPException(500, detail="write failed — check server logs")
-    effective = "CLAUDE" if req.kind == "root" else req.name
-    await bus.publish(
-        {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "agent_id": "human",
-            "type": "context_updated",
-            "kind": req.kind,
-            "name": effective,
-            "size": len(req.body),
-        }
-    )
-    return {"ok": True, "kind": req.kind, "name": effective}
-
-
-@app.delete("/api/context/{kind}/{name}", dependencies=[Depends(require_token)])
-async def delete_context(kind: str, name: str) -> dict[str, Any]:
-    effective = "CLAUDE" if kind == "root" else name
-    try:
-        await ctxmod.delete(kind, effective)
-    except ValueError as e:
-        raise HTTPException(400, detail=str(e))
-    await bus.publish(
-        {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "agent_id": "human",
-            "type": "context_deleted",
-            "kind": kind,
-            "name": effective,
-        }
-    )
-    return {"ok": True}
+# /api/context/* endpoints removed in projects_v2 — the legacy
+# context store (root/skills/rules with its own write API) is gone;
+# the global CLAUDE.md and per-project CLAUDE.md files are edited via
+# the standard file-browser write endpoint (`POST /api/files/write/global`
+# / `.../project`) by the human, and via the standard Write tool by
+# Coach. The remaining `build_system_prompt_suffix()` reads them on
+# every turn (PROJECTS_SPEC.md §8/§10).
 
 
 class FileWrite(BaseModel):

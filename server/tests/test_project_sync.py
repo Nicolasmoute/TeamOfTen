@@ -243,8 +243,13 @@ async def test_retry_propagates_cancellation(
 
 
 async def test_remote_path_mapping(fresh_db: str) -> None:
-    assert ps._project_remote_for("misc", "project", "memory/a.md") == \
-        "projects/misc/memory/a.md"
+    # _project_remote_for is a pure path concat — pass any project-tree
+    # relative path and confirm the prefix. The path argument here is
+    # just illustrative, not a layout statement.
+    assert ps._project_remote_for("misc", "project", "working/memory/a.md") == \
+        "projects/misc/working/memory/a.md"
+    assert ps._project_remote_for("misc", "project", "decisions/x.md") == \
+        "projects/misc/decisions/x.md"
     assert ps._project_remote_for("misc", "wiki", "concept.md") == \
         "wiki/misc/concept.md"
     assert ps._project_remote_for("misc", "global", "CLAUDE.md") == "CLAUDE.md"
@@ -325,8 +330,8 @@ async def test_push_project_tree_pushes_changed_files(
     out = await ps.push_project_tree("misc")
     assert out["project"]["pushed"] == 2
     assert out["project"]["unchanged"] == 0
-    assert "projects/misc/memory/a.md" in stub.writes
-    assert "projects/misc/memory/b.md" in stub.writes
+    assert "projects/misc/working/memory/a.md" in stub.writes
+    assert "projects/misc/working/memory/b.md" in stub.writes
 
     # Second push: nothing changed.
     out = await ps.push_project_tree("misc")
@@ -339,7 +344,7 @@ async def test_push_project_tree_pushes_changed_files(
     out = await ps.push_project_tree("misc")
     assert out["project"]["pushed"] == 1
     assert out["project"]["unchanged"] == 1
-    assert list(stub.writes) == ["projects/misc/memory/a.md"]
+    assert list(stub.writes) == ["projects/misc/working/memory/a.md"]
 
     # Delete b.md locally; next push should remove + drop sync_state.
     (pp.memory / "b.md").unlink()
@@ -348,7 +353,7 @@ async def test_push_project_tree_pushes_changed_files(
     out = await ps.push_project_tree("misc")
     assert out["project"]["deleted"] == 1
     assert out["project"]["pushed"] == 0
-    assert "projects/misc/memory/b.md" in stub.removes
+    assert "projects/misc/working/memory/b.md" in stub.removes
 
 
 async def test_push_project_tree_skips_repo_and_attachments(
@@ -374,7 +379,7 @@ async def test_push_project_tree_skips_repo_and_attachments(
     monkeypatch.setattr(ps, "KDRIVE_RETRY_INITIAL_S", 0.0)
     out = await ps.push_project_tree("misc")
     # Only memory/ok.md should land remote.
-    assert list(stub.writes) == ["projects/misc/memory/ok.md"]
+    assert list(stub.writes) == ["projects/misc/working/memory/ok.md"]
     assert out["project"]["pushed"] == 1
 
 
@@ -596,5 +601,5 @@ async def test_push_uses_atomic_write(
     monkeypatch.setattr(ps, "KDRIVE_RETRY_INITIAL_S", 0.0)
     out = await ps.push_project_tree("misc")
     assert out["project"]["pushed"] == 1
-    assert "projects/misc/memory/a.md" in stub.atomic_writes
+    assert "projects/misc/working/memory/a.md" in stub.atomic_writes
     assert stub.plain_writes == {}

@@ -17,13 +17,11 @@ drive prefixes.
 from __future__ import annotations
 
 import logging
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from server import context as ctxmod
 from server import knowledge as knowmod
 from server.paths import DATA_ROOT, project_paths
 
@@ -135,59 +133,11 @@ def _roots() -> dict[str, Root]:
             project_id=active,
             label=_project_label(active),
         ),
-        # Legacy roots — kept for backward compat with existing edit
-        # call sites (ctxmod write path, /api/files/write/<key>=context,
-        # tests). The new UI only renders `global` and `project`; the
-        # legacy keys are not surfaced in list_roots() output.
-        "context": Root(
-            "context",
-            Path(os.environ.get("HARNESS_CONTEXT_DIR", "/data/context")),
-            writable=True,
-        ),
-        "knowledge": Root(
-            "knowledge",
-            Path(os.environ.get("HARNESS_KNOWLEDGE_DIR", "/data/knowledge")),
-            writable=True,
-        ),
-        "decisions": Root(
-            "decisions",
-            Path(os.environ.get("HARNESS_DECISIONS_DIR", "/data/decisions")),
-            writable=False,
-        ),
-        "workspaces": Root(
-            "workspaces",
-            Path(os.environ.get("HARNESS_WORKSPACES_DIR", "/workspaces")),
-            writable=False,
-        ),
-        "outputs": Root(
-            "outputs",
-            Path(os.environ.get("HARNESS_OUTPUTS_DIR", "/data/outputs")),
-            writable=False,
-        ),
-        "uploads": Root(
-            "uploads",
-            Path(os.environ.get("HARNESS_UPLOADS_DIR", "/data/uploads")),
-            writable=False,
-        ),
-        "plans": Root(
-            "plans",
-            Path(
-                os.environ.get(
-                    "HARNESS_PLANS_DIR",
-                    str(
-                        Path(
-                            os.environ.get("CLAUDE_CONFIG_DIR", "/data/claude")
-                        ) / "plans"
-                    ),
-                )
-            ),
-            writable=False,
-        ),
-        "handoffs": Root(
-            "handoffs",
-            Path(os.environ.get("HARNESS_HANDOFFS_DIR", "/data/handoffs")),
-            writable=False,
-        ),
+        # Legacy flat roots (context/knowledge/decisions/workspaces/
+        # outputs/uploads/plans/handoffs) were retired in projects_v2:
+        # the corresponding /data/<flat>/ dirs were wiped, the writers
+        # now route through `project_paths(active)`, and the UI only
+        # renders the two scoped roots above.
     }
     return roots
 
@@ -348,32 +298,23 @@ def read_text(root_key: str, relative: str) -> dict[str, Any]:
 
 
 async def write_text(root_key: str, relative: str, content: str) -> dict[str, Any]:
-    """Save `content` to the target file. Routes through owning modules
-    when the root has special side effects (context → ctxmod.write for
-    kDrive mirror + cache bust); raw disk write for plain roots."""
+    """Save `content` to the target file under `root_key`.
+
+    All writes are now plain disk writes — the legacy ctxmod routing
+    (which validated + mirrored to kDrive on its own) is gone with
+    projects_v2. The two surviving roots (`global`, `project`) cover
+    every editable path; per-project sync handles the kDrive mirror.
+    """
     roots = _roots()
     if root_key not in roots or not roots[root_key].writable:
         raise PermissionError(f"root not writable: {root_key}")
 
     target = _resolve(root_key, relative)
 
-    if root_key == "context":
-        # Route through ctxmod so we get validation, kDrive mirror, and
-        # list-cache invalidation. We just need to reconstruct (kind,
-        # name) from the relative path.
-        kind, name = _context_kind_name(relative)
-        await ctxmod.write(kind, name, content)
-        return {
-            "root": root_key,
-            "path": relative,
-            "size": len(content.encode("utf-8")),
-            "routed_through": "ctxmod",
-        }
-
-    # Generic writable root — ensure parent dir, refuse non-.md for now
-    # (binary writes through a textarea would corrupt). Size cap aligns
-    # with knowmod.MAX_BODY_CHARS so an agent writing via the MCP tool
-    # and a human writing via the file browser hit the same ceiling.
+    # Refuse non-text writes — binary through a textarea would corrupt.
+    # Size cap aligns with knowmod.MAX_BODY_CHARS so an agent writing
+    # via the MCP tool and a human writing via the file browser hit the
+    # same ceiling.
     if target.suffix.lower() not in {".md", ".txt"}:
         raise ValueError("only .md and .txt files are editable through this endpoint")
     if len(content) > knowmod.MAX_BODY_CHARS:
@@ -388,25 +329,3 @@ async def write_text(root_key: str, relative: str, content: str) -> dict[str, An
         "size": len(content.encode("utf-8")),
         "routed_through": "disk",
     }
-
-
-def _context_kind_name(relative: str) -> tuple[str, str]:
-    """Map a path inside the context root to ctxmod's (kind, name) tuple.
-
-    Examples:
-      "CLAUDE.md"                → ("root",   "CLAUDE")
-      "skills/debug.md"          → ("skills", "debug")
-      "rules/no-mocks.md"        → ("rules",  "no-mocks")
-    """
-    p = Path(relative.replace("\\", "/"))
-    parts = p.parts
-    if len(parts) == 1:
-        # Top-level file — only CLAUDE.md is valid today.
-        if parts[0] != "CLAUDE.md":
-            raise ValueError(
-                "only CLAUDE.md is allowed at the root of the context tree"
-            )
-        return "root", "CLAUDE"
-    if len(parts) == 2 and parts[0] in ("skills", "rules") and parts[1].endswith(".md"):
-        return parts[0], parts[1][:-3]
-    raise ValueError(f"unsupported context path: {relative}")

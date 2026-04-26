@@ -1,26 +1,31 @@
-"""Knowledge bucket — agent-produced durable artifacts.
+"""Knowledge bucket — agent-produced durable text artifacts.
 
-Where context is the "rules of the team" layer (fixed shape:
-CLAUDE.md + skills/* + rules/*), knowledge is free-form: reports,
-research notes, specs, design docs, anything an agent decides is
-worth keeping. Paths are agent-chosen within sane limits.
+Where decisions/ is append-only ADRs ("we chose X because Y") and
+memory/ is overwrite-on-update scratchpad, knowledge is free-form
+text that lives longer than scratchpad but doesn't need ADR-style
+formality: reports, research notes, specs, design docs, references,
+anything an agent decides is worth keeping.
 
-Source of truth: local `/data/knowledge/` (HARNESS_KNOWLEDGE_DIR).
-Mirror: kDrive `knowledge/<path>`, synchronous on write.
+**Project-scoped.** Per PROJECTS_SPEC.md §4, knowledge lives at
+`/data/projects/<active_project>/knowledge/` and mirrors to kDrive at
+`TOT/projects/<active_project>/knowledge/`. The active project is
+resolved at write/read time, so a project switch routes new entries
+to the new project automatically.
 
 Write is fan-in: both Coach and Players can call coord_write_knowledge.
-Read/list is anybody. The file explorer pane shows the tree and lets
-the human edit too.
+Read/list is anybody. The file explorer pane shows the tree under the
+active project's `knowledge/` and lets the human edit too.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import re
 import sys
 from pathlib import Path, PurePosixPath
 
+from server.db import resolve_active_project
+from server.paths import project_paths
 from server.webdav import webdav
 
 logger = logging.getLogger("harness.knowledge")
@@ -31,10 +36,7 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-KNOWLEDGE_DIR = Path(os.environ.get("HARNESS_KNOWLEDGE_DIR", "/data/knowledge"))
-
-# Per-component name rule: same safe alphabet as context, plus the .md/.txt
-# extension on the leaf. Rejects traversal, shell specials, whitespace,
+# Per-component name rule: rejects traversal, shell specials, whitespace,
 # and anything longer than 64 chars per segment.
 COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
@@ -42,12 +44,12 @@ COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 # is fine; deeper than that is almost certainly a mistake.
 MAX_DEPTH = 4
 
-# Bigger than context — reports and research can legitimately be long,
-# but we still need a ceiling to prevent UI freezes / kDrive pain.
+# Reports and research can legitimately be long; ceiling prevents UI
+# freezes / kDrive pain.
 MAX_BODY_CHARS = 100_000
 
-# Only text for now. Binaries (images, pdfs) should use the attachments
-# endpoint, not knowledge.
+# Only text. Binaries (images, pdfs) should use the attachments
+# endpoint or coord_save_output, not knowledge.
 ALLOWED_SUFFIXES = {".md", ".txt"}
 
 
@@ -55,15 +57,9 @@ def validate(relative_path: str) -> str | None:
     """Return None if the path is acceptable, else a human-readable error."""
     if not relative_path:
         return "path is required"
-    # Check raw segments BEFORE handing to PurePosixPath: that class
-    # silently strips '.' and normalizes, so './foo.md' would otherwise
-    # pass validation and land at knowledge/foo.md (harmless but
-    # surprising — reject explicitly so paths are always taken at face
-    # value). Leading '/' also split into an empty first segment.
     raw_parts = relative_path.replace("\\", "/").split("/")
     if any(seg in ("", ".", "..") for seg in raw_parts):
         return "path must not contain empty, '.' or '..' segments"
-    # Normalize separators.
     p = PurePosixPath(relative_path.replace("\\", "/"))
     parts = p.parts
     if any(seg in ("", ".", "..") for seg in parts):
@@ -84,18 +80,27 @@ def validate(relative_path: str) -> str | None:
     return None
 
 
-def _local(relative_path: str) -> Path:
-    return KNOWLEDGE_DIR / PurePosixPath(relative_path.replace("\\", "/"))
+async def _local(relative_path: str) -> Path:
+    """Resolve to the active project's knowledge dir + relative path."""
+    project_id = await resolve_active_project()
+    pp = project_paths(project_id)
+    return pp.knowledge / PurePosixPath(relative_path.replace("\\", "/"))
 
 
-def _remote(relative_path: str) -> str:
-    return str(PurePosixPath("knowledge") / relative_path.replace("\\", "/"))
+async def _remote(relative_path: str) -> str:
+    """kDrive remote path under the active project's knowledge tree."""
+    project_id = await resolve_active_project()
+    return str(
+        PurePosixPath("projects") / project_id / "knowledge"
+        / relative_path.replace("\\", "/")
+    )
 
 
 async def write(relative_path: str, content: str, author: str = "agent") -> bool:
     """Write to local + mirror to kDrive. Returns True on local success.
 
     Raises ValueError on invalid path, empty body, or oversize body.
+    Routes to the active project's `knowledge/` (PROJECTS_SPEC.md §4).
     """
     err = validate(relative_path)
     if err:
@@ -104,7 +109,7 @@ async def write(relative_path: str, content: str, author: str = "agent") -> bool
         raise ValueError("body is required (empty knowledge docs are not useful)")
     if len(content) > MAX_BODY_CHARS:
         raise ValueError(f"body too long ({len(content)} chars, max {MAX_BODY_CHARS})")
-    lp = _local(relative_path)
+    lp = await _local(relative_path)
     lp.parent.mkdir(parents=True, exist_ok=True)
     try:
         lp.write_text(content, encoding="utf-8")
@@ -112,7 +117,7 @@ async def write(relative_path: str, content: str, author: str = "agent") -> bool
         logger.exception("knowledge write failed locally: %s", lp)
         return False
     if webdav.enabled:
-        await webdav.write_text(_remote(relative_path), content)
+        await webdav.write_text(await _remote(relative_path), content)
     logger.info("knowledge write: %s by=%s (%d chars)", relative_path, author, len(content))
     return True
 
@@ -121,14 +126,14 @@ async def read(relative_path: str) -> str | None:
     err = validate(relative_path)
     if err:
         raise ValueError(err)
-    lp = _local(relative_path)
+    lp = await _local(relative_path)
     if lp.exists():
         try:
             return lp.read_text(encoding="utf-8")
         except Exception:
             logger.exception("knowledge read failed locally: %s", lp)
     if webdav.enabled:
-        body = await webdav.read_text(_remote(relative_path))
+        body = await webdav.read_text(await _remote(relative_path))
         if body is not None:
             try:
                 lp.parent.mkdir(parents=True, exist_ok=True)
@@ -139,18 +144,19 @@ async def read(relative_path: str) -> str | None:
     return None
 
 
-def list_paths() -> list[str]:
-    """Flat list of every knowledge doc, POSIX-relative paths, sorted.
-    Tree view in the UI reads this via the /api/files endpoints instead
-    — this helper is for the MCP coord_list_knowledge tool so agents
-    can discover what's already been written without reaching for the
-    Glob tool (which is scoped to their worktree cwd, not /data).
+async def list_paths() -> list[str]:
+    """Flat list of every knowledge doc in the active project,
+    POSIX-relative paths, sorted. Used by the coord_list_knowledge tool
+    so agents can discover what's already been written. The file
+    explorer pane reads this via /api/files endpoints instead.
     """
-    if not KNOWLEDGE_DIR.exists():
+    project_id = await resolve_active_project()
+    pp = project_paths(project_id)
+    if not pp.knowledge.exists():
         return []
     out: list[str] = []
-    for p in KNOWLEDGE_DIR.rglob("*"):
+    for p in pp.knowledge.rglob("*"):
         if p.is_file() and p.suffix.lower() in ALLOWED_SUFFIXES:
-            out.append(str(p.relative_to(KNOWLEDGE_DIR)).replace("\\", "/"))
+            out.append(str(p.relative_to(pp.knowledge)).replace("\\", "/"))
     out.sort()
     return out

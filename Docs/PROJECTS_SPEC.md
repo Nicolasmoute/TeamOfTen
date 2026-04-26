@@ -224,33 +224,42 @@ patterns referenced from multiple projects' entries via
 ```
 /data/
 ├── CLAUDE.md                  # global house rules (harness behavior, project/wiki principles)
-├── skills/                    # global skills, including the LLM-Wiki skill (see §9)
-├── mcp/                       # global MCP server JSON files (mirror of DB-stored configs, for portability)
+├── .claude/                   # canonical Claude Code project layout
+│   └── skills/                # global skills, including the LLM-Wiki skill (see §9)
+├── mcp/                       # global MCP server JSON files (mirror of DB-stored configs, for portability; v2)
 ├── wiki/                      # Karpathy LLM-Wiki, global root
 │   ├── INDEX.md               # links every project's sub-wiki + cross-project entries
 │   └── <project_slug>/        # one folder per project; created on project creation
 ├── projects/
 │   └── <project_slug>/
 │       ├── CLAUDE.md          # project-specific rules, stakeholders, glossary, repo notes
-│       ├── memory/            # mutable scratchpad — project-scoped (was /data/memory/)
-│       ├── decisions/         # append-only durable record (was /data/decisions/)
-│       ├── knowledge/         # text artifacts written via coord_write_knowledge (was /data/knowledge/)
+│       ├── decisions/         # append-only durable record (immutable ADRs)
 │       ├── working/
 │       │   ├── conversations/ # per-agent conversation snapshots; tagged `live` when synced mid-session
 │       │   ├── handoffs/      # inter-agent context handoffs
+│       │   ├── knowledge/     # text artifacts via coord_write_knowledge (specs, research, design drafts)
+│       │   ├── memory/        # shared scratchpad (overwrite-on-update by topic via coord_*_memory)
 │       │   ├── plans/         # task breakdowns, drafts
 │       │   └── workspace/     # generic scratch
-│       ├── outputs/           # binary deliverables (was /data/outputs/)
-│       ├── inputs/            # cloud → server uploads (was /data/uploads/)
-│       ├── attachments/       # UI paste-target images (was /data/attachments/); local-only, not synced, 30-day trim
-│       └── repo/              # git worktrees per Player (was /workspaces/<slot>/project)
+│       ├── outputs/           # binary deliverables
+│       ├── uploads/           # user-uploaded files (read-only, pulled from kDrive); renamed from inputs/ in projects_v2
+│       ├── attachments/       # UI paste-target images; local-only, not synced, 30-day trim
+│       └── repo/              # git worktrees per Player
 │           ├── .project/      # bare clone, shared across this project's worktrees
 │           ├── p1/            # one worktree per Player slot; Coach has no worktree
 │           ├── p2/
 │           └── ...
 ├── harness.db                 # SQLite hot-state DB; rotations flush to kDrive snapshots/
-└── claude/                    # CLAUDE_CONFIG_DIR — OAuth tokens, persisted across redeploys
+└── claude/                    # CLAUDE_CONFIG_DIR — OAuth tokens, persisted across redeploys (NOT the Claude Code .claude/ above)
 ```
+
+**projects_v2 layout migration** (post-Phase-8 cleanup): brought the on-disk layout
+in line with the spec by (a) wiping legacy flat dirs at the data root left over from
+pre-refactor — `handoffs/`, `uploads/`, `context/`, `knowledge/`, plus typo orphans
+`output/`, `upload/`, `uplods/` — (b) moving `/data/skills/` to `/data/.claude/skills/`
+to match Claude Code's canonical project layout, and (c) renaming per-project
+`inputs/` to `uploads/` to match the user-visible mental model. See
+[server/migrations/projects_v2.py](server/migrations/projects_v2.py).
 
 ### On kDrive (`TOT/`)
 
@@ -260,7 +269,8 @@ kDrive sync** below for what stays local-only):
 ```
 TOT/
 ├── CLAUDE.md
-├── skills/
+├── .claude/
+│   └── skills/
 ├── mcp/
 ├── wiki/
 │   ├── INDEX.md
@@ -269,12 +279,10 @@ TOT/
 └── projects/
     └── <project_slug>/
         ├── CLAUDE.md
-        ├── memory/
         ├── decisions/
-        ├── knowledge/
-        ├── working/
+        ├── working/        # includes knowledge/ + memory/ alongside conversations/handoffs/plans/workspace
         ├── outputs/
-        └── inputs/
+        └── uploads/
 ```
 
 **Excluded from kDrive sync**:
@@ -288,7 +296,7 @@ TOT/
 [server/paths.py](server/paths.py) (standalone module — keeps main.py from growing further; importers should treat it as the single source of truth and never hardcode `/data/...` strings):
 
 - `global_paths()` → frozen `GlobalPaths` dataclass: `root`, `claude_md`, `skills`, `mcp`, `wiki`, `wiki_index`.
-- `project_paths(project_id)` → frozen `ProjectPaths` dataclass: `project_id`, `root`, `claude_md`, `memory`, `decisions`, `knowledge`, `working`, `working_conversations`, `working_handoffs`, `working_plans`, `working_workspace`, `outputs`, `inputs`, `attachments`, `repo`, `bare_clone`, plus method `worktree(slot)` returning the per-slot worktree path under `repo/`.
+- `project_paths(project_id)` → frozen `ProjectPaths` dataclass: `project_id`, `root`, `claude_md`, `memory`, `decisions`, `knowledge` (resolves under `working/`), `working`, `working_conversations`, `working_handoffs`, `working_plans`, `working_workspace`, `outputs`, `uploads`, `attachments`, `repo`, `bare_clone`, plus method `worktree(slot)` returning the per-slot worktree path under `repo/`.
 - `ensure_global_scaffold()` and `ensure_project_scaffold(project_id)` — idempotent boot/create-time directory provisioning. The wiki sub-folder is created via `global_paths().wiki / project_id` (lives in the global wiki tree, not under `projects/<slug>/`). Neither writes `CLAUDE.md` (Phase 6/7 owns the templates) nor clones the repo (activation does that).
 
 All call sites switch from hardcoded `/data/memory/` etc. to the helper:
@@ -339,11 +347,11 @@ Inactive projects do not sync continuously. They sync only on open / close. This
 ### Coverage
 
 **Synced** by the per-project file loop (push every 5 min for active, on open/close for inactive):
-- Project tree: `CLAUDE.md`, `memory/**`, `decisions/**`, `knowledge/**`, `working/**`, `outputs/**`, `inputs/**`.
+- Project tree: `CLAUDE.md`, `decisions/**`, `working/**` (covers `working/{knowledge,memory,conversations,handoffs,plans,workspace}/**`), `outputs/**`, `uploads/**`.
 - Wiki tree: `wiki/<slug>/**.md`.
 
 **Synced** by a separate global-tree loop (slower cadence — `HARNESS_GLOBAL_SYNC_INTERVAL`, default 30 min):
-- `/data/CLAUDE.md`, `/data/skills/**`, `/data/mcp/**`, `/data/wiki/INDEX.md`, plus any cross-project `wiki/*.md` entries at the wiki root.
+- `/data/CLAUDE.md`, `/data/.claude/skills/**`, `/data/mcp/**`, `/data/wiki/INDEX.md`, plus any cross-project `wiki/*.md` entries at the wiki root.
 
 **Synced** by the DB snapshot loop (already exists, 5-min cadence to `TOT/snapshots/`):
 - The whole `harness.db`. **Per-project agent identity** (`agent_project_roles`), `agent_sessions`, every project_id-keyed domain row, and the `projects` table itself ride along with these snapshots — no separate file mirror. To restore a project's identity after disaster, restore `harness.db` from snapshot.
@@ -464,15 +472,16 @@ Two roots, both visible at top level. The bottom root is the **active** project 
 
 📁 Simaero Rebrand                  # bottom root — swaps when active project changes
   ├── CLAUDE.md
-  ├── memory/
   ├── decisions/
   ├── working/
   │   ├── conversations/
   │   ├── handoffs/
+  │   ├── knowledge/
+  │   ├── memory/
   │   ├── plans/
   │   └── workspace/
   ├── outputs/
-  ├── inputs/
+  ├── uploads/
   ├── attachments/                  # local-only per §4; visible for review/cleanup
   └── repo/                         # git worktrees — potentially large; collapsed by default
       ├── .project/                 # bare clone; hidden by default (dot-prefix)
@@ -528,24 +537,24 @@ project's `agent_project_roles` rows.
 ## Project file structure — under /data/projects/<active>/
 
 - `CLAUDE.md`              — project-specific rules, stakeholders, glossary
-- `memory/`                — mutable scratchpad (overwrite-on-update; event log keeps history)
 - `decisions/`             — append-only durable record of "we chose X because Y"
-- `knowledge/`             — text artifacts written via `coord_write_knowledge` (specs, references)
 - `working/conversations/` — agent conversation snapshots; `live: true` when persisted mid-session
 - `working/handoffs/`      — inter-agent context handoffs
+- `working/knowledge/`     — text artifacts via `coord_write_knowledge` (specs, research, design drafts that evolve)
+- `working/memory/`        — shared scratchpad via `coord_*_memory` (overwrite-on-update by topic; event log keeps history)
 - `working/plans/`         — task breakdowns, drafts
 - `working/workspace/`     — generic scratch
 - `outputs/`               — binary deliverables; prefer `coord_save_output` for canonical writes
-- `inputs/`                — user-uploaded files (read-only, pulled from kDrive)
+- `uploads/`               — user-uploaded files (read-only, pulled from kDrive); renamed from `inputs/` in projects_v2
 - `attachments/`           — UI paste-target images (read via `Read`; local-only, not synced)
 - `repo/<your-slot>/`      — your git worktree (Players only; Coach has none)
 
 ## Global resources (cross-project)
 
 - `/data/CLAUDE.md`        — these rules
-- `/data/skills/`          — custom skills (including `llm-wiki/`)
-- `/data/mcp/`             — global MCP server configs (mirror of DB)
-- `/data/wiki/INDEX.md`    — master wiki index
+- `/data/.claude/skills/`  — custom skills (including `llm-wiki/`); canonical Claude Code location
+- `/data/mcp/`             — global MCP server configs (mirror of DB; v2)
+- `/data/wiki/INDEX.md`    — master wiki index (auto-maintained)
 - `/data/wiki/<slug>/`     — per-project wiki entries
 - `/data/wiki/*.md`        — cross-project shared concepts at wiki root (alongside INDEX.md)
 
@@ -556,7 +565,7 @@ project's `agent_project_roles` rows.
 - Granularity: one concept per file, hyperlinked with `[[wikilinks]]`.
 - Project-specific learnings → `/data/wiki/<active>/`.
 - Cross-project shared concepts → `/data/wiki/` root.
-- Format and trigger rules: `/data/skills/llm-wiki/SKILL.md`.
+- Format and trigger rules: `/data/.claude/skills/llm-wiki/SKILL.md`.
 
 ## Per-project agent identity
 
@@ -578,7 +587,7 @@ The two-layer injection (dynamic identity block + static CLAUDE.md) is what lets
 - `llm-wiki/` — bootstrapped from Karpathy's gist (see §9).
 - Any custom harness-wide skills the user adds belong here too.
 
-Note: Claude Code built-in skills (`security-review`, `init`, `simplify`, etc.) ship with the CLI itself and are **not** in `/data/skills/`. The harness only owns custom skills in this folder.
+Note: Claude Code built-in skills (`security-review`, `init`, `simplify`, etc.) ship with the CLI itself and are **not** in `/data/.claude/skills/`. The harness only owns custom skills in this folder.
 
 ### Global MCP
 
@@ -617,7 +626,7 @@ reconstruct why each Player was named what they were named>
 ---
 
 ## 9. Wiki bootstrap (revised — no auto-populate)
-The harness ensures the **LLM-Wiki skill** is present in `/data/skills/llm-wiki/`. It does **not** auto-populate wiki entries.
+The harness ensures the **LLM-Wiki skill** is present in `/data/.claude/skills/llm-wiki/`. It does **not** auto-populate wiki entries.
 
 ### Bootstrap behavior
 
@@ -636,8 +645,8 @@ On boot, in order:
    ## Per-project entries
    ```
 
-3. Ensure `/data/skills/llm-wiki/` exists; create if missing.
-4. Check `/data/skills/llm-wiki/SKILL.md`. If missing, copy from the checked-in template at `server/templates/llm_wiki_skill.md` (sourced from Karpathy's gist; tracked in the repo, regenerated by hand when Karpathy updates the gist).
+3. Ensure `/data/.claude/skills/llm-wiki/` exists; create if missing.
+4. Check `/data/.claude/skills/llm-wiki/SKILL.md`. If missing, copy from the checked-in template at `server/templates/llm_wiki_skill.md` (sourced from Karpathy's gist; tracked in the repo, regenerated by hand when Karpathy updates the gist).
 5. Surface in `/api/health` under `wiki`:
    - `"present"` — files were already there before boot.
    - `"bootstrapped"` — step 2 or 4 wrote them this boot.
@@ -648,7 +657,7 @@ On boot, in order:
 The bootstrap is a *first-write-only* operation — once `SKILL.md` exists, the harness leaves it alone (users can edit it, and we don't want boot to revert their edits). To roll out a new version of the skill:
 
 1. Update `server/templates/llm_wiki_skill.md` in the repo and deploy.
-2. Delete `/data/skills/llm-wiki/SKILL.md` on the live container (or use the **Re-bootstrap LLM-Wiki skill** button in Options drawer, deferred to v2).
+2. Delete `/data/.claude/skills/llm-wiki/SKILL.md` on the live container (or use the **Re-bootstrap LLM-Wiki skill** button in Options drawer, deferred to v2).
 3. Restart — bootstrap step 4 sees the absence and rewrites from the new template.
 
 ### Skill content (template)
@@ -850,7 +859,7 @@ Recommend doing these in order — each is independently testable.
 
 ### Phase 2 — Sync rework (completed and audited)
 - Per-project file sync loop (active project, 5 min cadence) — push + pull semantics per §5, walking both `projects/<slug>/` (excl. `repo/`, `attachments/`) and `wiki/<slug>/`.
-- Global tree sync loop (`HARNESS_GLOBAL_SYNC_INTERVAL`, default 30 min) — covers `/data/CLAUDE.md`, `/data/skills/`, `/data/mcp/`, `/data/wiki/INDEX.md`, cross-project wiki entries at `/data/wiki/*.md`.
+- Global tree sync loop (`HARNESS_GLOBAL_SYNC_INTERVAL`, default 30 min) — covers `/data/CLAUDE.md`, `/data/.claude/skills/`, `/data/mcp/`, `/data/wiki/INDEX.md`, cross-project wiki entries at `/data/wiki/*.md`.
 - `sync_state(project_id, tree, path, mtime, size_bytes, sha256, last_synced_at)` populated; retry with 1s→2s→4s exponential backoff capped at 30s, up to `HARNESS_KDRIVE_RETRY_MAX` (default 3).
 - Pull-on-open / force-push-on-close primitives (`HARNESS_KDRIVE_CLOSE_TIMEOUT_S`, default 60s).
 - `kdrive_sync_failed` event + EnvPane banner. Skip-and-continue on individual file failures, never abort whole run.
@@ -886,7 +895,7 @@ Recommend doing these in order — each is independently testable.
 ### Phase 6 — Global CLAUDE.md + LLM-Wiki skill + INDEX.md bootstrap (completed and audited)
 - `server/templates/global_claude_md.md` — full text per §8 excerpt (project/wiki principles + per-project agent identity block).
 - `server/templates/llm_wiki_skill.md` — from Karpathy's gist, adapted to standard markdown links instead of wikilinks (§9).
-- Boot sequence (§9 bootstrap behavior): ensure `/data/wiki/`, write `INDEX.md` stub if missing, ensure `/data/skills/llm-wiki/`, write `SKILL.md` if missing, ensure `/data/CLAUDE.md`, write from template if missing.
+- Boot sequence (§9 bootstrap behavior): ensure `/data/wiki/`, write `INDEX.md` stub if missing, ensure `/data/.claude/skills/llm-wiki/`, write `SKILL.md` if missing, ensure `/data/CLAUDE.md`, write from template if missing.
 - `/api/health` adds `wiki: "present" | "bootstrapped" | "missing"`.
 
 ### Phase 7 — Coach coordination block + per-project CLAUDE.md stub (completed and audited)

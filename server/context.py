@@ -1,35 +1,31 @@
-"""Context docs — governance layer above the shared scratchpad.
+"""System-prompt suffix — reads the global + per-project CLAUDE.md.
 
-Three buckets of markdown files that shape how every agent behaves:
+Pre-refactor this module owned a `/data/context/` store with three
+buckets (root/skills/rules) and a write API. The projects refactor
+(PROJECTS_SPEC.md §8) replaced that with:
 
-    context/CLAUDE.md          — single top-level doc, always injected
-    context/skills/<name>.md   — reusable how-tos, all always injected
-    context/rules/<name>.md    — hard rules, all always injected
+  - `/data/CLAUDE.md`              — global rules, written by Phase 6
+                                     bootstrap + edited by Coach via
+                                     the standard Write tool.
+  - `/data/projects/<active>/CLAUDE.md`
+                                   — per-project rules, written by
+                                     Phase 7 stub on project creation
+                                     + edited by Coach.
+  - `/data/.claude/skills/`        — Claude Code skills, loaded by the
+                                     SDK directly (we don't inject).
 
-Source of truth: kDrive (so a volume loss doesn't erase governance).
-Local cache: `/data/context/` (subject to `HARNESS_CONTEXT_DIR`) so
-agent spawns don't hit the network every turn and so the app still
-works when kDrive is unreachable.
-
-Write ACL:
-    - Coach writes via `coord_write_context` MCP tool (see tools.py).
-    - Human writes via `POST /api/context/{kind}/{name}` (see main.py).
-    - Players CANNOT write — they have read-only access via the loader.
-
-On any successful write we refresh the local cache synchronously and
-emit a `context_updated` event so open UIs re-render live.
+This module's only remaining job is to concatenate the two CLAUDE.md
+files into the per-turn system-prompt suffix so any edit takes effect
+on every agent's next turn without a restart.
 """
 
 from __future__ import annotations
 
 import logging
-import os
-import re
 import sys
-import time
-from pathlib import Path, PurePosixPath
 
-from server.webdav import webdav
+from server.db import resolve_active_project
+from server.paths import global_paths, project_paths
 
 logger = logging.getLogger("harness.context")
 if not logger.handlers:
@@ -39,233 +35,60 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-CONTEXT_DIR = Path(os.environ.get("HARNESS_CONTEXT_DIR", "/data/context"))
-
-# Only names matching this pattern are allowed — keeps the path safe
-# against traversal and keeps filenames readable on kDrive's WebDAV.
-NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-
-# The three kinds we support. Anything else is rejected at the API edge.
-VALID_KINDS: tuple[str, ...] = ("root", "skills", "rules")
-
-# Size cap — same as decisions. A single context doc over 40 KB is
-# almost certainly a mistake and would bloat every agent's system
-# prompt for the rest of its life.
-MAX_BODY_CHARS = 40_000
-
-# TTL cache for list_all(). build_system_prompt_suffix() is called on
-# every agent spawn; without this the WebDAV round trips would
-# dominate turn latency. Cache is busted on every write/delete from
-# this process. External edits (e.g. via the Infomaniak web UI) get
-# picked up within the TTL window.
-_LIST_TTL_SECONDS = 60.0
-_list_cache: dict[str, list[str]] | None = None
-_list_cache_at: float = 0.0
+# Sanity ceiling — a CLAUDE.md over 200 KB would dominate every turn's
+# system prompt. Keep the read but truncate with a warning so a
+# runaway doc doesn't silently bloat costs.
+_MAX_CLAUDE_MD_CHARS = 200_000
 
 
-def _local_path(kind: str, name: str) -> Path:
-    """Resolve a kind+name pair to a disk path under CONTEXT_DIR.
-
-    kind=='root' is the special single-file case for CLAUDE.md.
-    """
-    if kind == "root":
-        return CONTEXT_DIR / "CLAUDE.md"
-    return CONTEXT_DIR / kind / (name + ".md")
-
-
-def _remote_path(kind: str, name: str) -> str:
-    """Same as _local_path but as a POSIX path relative to kDrive root."""
-    if kind == "root":
-        return "context/CLAUDE.md"
-    return str(PurePosixPath("context") / kind / (name + ".md"))
-
-
-def validate(kind: str, name: str) -> str | None:
-    """Return None if kind+name is valid, else a human-readable error."""
-    if kind not in VALID_KINDS:
-        return f"invalid kind: {kind}"
-    if kind == "root":
-        if name and name != "CLAUDE":
-            return "root kind only accepts name='CLAUDE' or empty"
-        return None
-    if not NAME_RE.match(name or ""):
-        return f"invalid name: {name}"
-    return None
-
-
-async def write(kind: str, name: str, content: str) -> bool:
-    """Write to both local cache and kDrive mirror. Returns True if the
-    local write succeeds (kDrive is best-effort per our usual model —
-    failures there are logged, not raised).
-
-    Raises ValueError for invalid kind/name, empty body, or oversize
-    body — so every caller (MCP tool, HTTP endpoint) is protected
-    without each one having to re-validate.
-    """
-    err = validate(kind, name)
-    if err:
-        raise ValueError(err)
-    if not content or not content.strip():
-        raise ValueError("body is required (empty context docs are not useful)")
-    if len(content) > MAX_BODY_CHARS:
-        raise ValueError(f"body too long ({len(content)} chars, max {MAX_BODY_CHARS})")
-    lp = _local_path(kind, name)
-    lp.parent.mkdir(parents=True, exist_ok=True)
+def _read_text_safe(path) -> str:
     try:
-        lp.write_text(content, encoding="utf-8")
-    except Exception:
-        logger.exception("context write failed locally: %s", lp)
-        return False
-    # Fire the kDrive mirror inline — write volume is tiny (< 1/min
-    # expected) and we want the remote copy in sync immediately so a
-    # crash between local-write and next-flush doesn't lose edits.
-    if webdav.enabled:
-        await webdav.write_text(_remote_path(kind, name), content)
-    _invalidate_list_cache()
-    return True
-
-
-async def read(kind: str, name: str) -> str | None:
-    """Local first, kDrive fallback. Returns None if missing everywhere."""
-    err = validate(kind, name)
-    if err:
-        raise ValueError(err)
-    lp = _local_path(kind, name)
-    if lp.exists():
-        try:
-            return lp.read_text(encoding="utf-8")
-        except Exception:
-            logger.exception("context read failed locally: %s", lp)
-    if webdav.enabled:
-        remote = await webdav.read_text(_remote_path(kind, name))
-        if remote is not None:
-            # Populate the local cache so next read is fast.
-            try:
-                lp.parent.mkdir(parents=True, exist_ok=True)
-                lp.write_text(remote, encoding="utf-8")
-            except Exception:
-                logger.exception("context cache write failed: %s", lp)
-            return remote
-    return None
-
-
-async def delete(kind: str, name: str) -> bool:
-    err = validate(kind, name)
-    if err:
-        raise ValueError(err)
-    lp = _local_path(kind, name)
-    try:
-        if lp.exists():
-            lp.unlink()
-    except Exception:
-        logger.exception("context delete failed locally: %s", lp)
-    if webdav.enabled:
-        await webdav.remove(_remote_path(kind, name))
-    _invalidate_list_cache()
-    return True
-
-
-def _invalidate_list_cache() -> None:
-    """Clear the list_all() TTL cache. Called after every successful
-    write/delete from this process. External kDrive edits still have
-    to wait out the TTL."""
-    global _list_cache, _list_cache_at
-    _list_cache = None
-    _list_cache_at = 0.0
-
-
-def _clean_basename(entry: str) -> str:
-    """Normalize a kDrive ls() entry to a bare filename.
-
-    webdav4's ls() returns basenames already in most cases, but some
-    servers include trailing slashes for directories or whole paths —
-    so strip both to be safe.
-    """
-    s = str(entry).rstrip("/")
-    return PurePosixPath(s).name
-
-
-async def list_all() -> dict[str, list[str]]:
-    """Enumerate every context doc currently available (local union kDrive).
-
-    Shape: {"root": ["CLAUDE"] or [], "skills": [...], "rules": [...]}.
-    Names are returned without the .md suffix.
-
-    Result cached for _LIST_TTL_SECONDS so build_system_prompt_suffix()
-    (called once per agent spawn) doesn't repeat three WebDAV round
-    trips per turn. Cache is busted by any write/delete in this process.
-    """
-    global _list_cache, _list_cache_at
-    now = time.monotonic()
-    if _list_cache is not None and (now - _list_cache_at) < _LIST_TTL_SECONDS:
-        # Return a defensive copy so callers can't mutate the cached value.
-        return {k: list(v) for k, v in _list_cache.items()}
-
-    out: dict[str, list[str]] = {"root": [], "skills": [], "rules": []}
-    # Local pass
-    root = CONTEXT_DIR / "CLAUDE.md"
-    if root.exists():
-        out["root"] = ["CLAUDE"]
-    for kind in ("skills", "rules"):
-        d = CONTEXT_DIR / kind
-        if d.exists():
-            for f in d.iterdir():
-                if f.is_file() and f.suffix == ".md":
-                    out[kind].append(f.stem)
-    # kDrive pass — union in anything we don't have locally yet.
-    # Normalize basenames so dir entries with trailing slashes
-    # ("skills/", "rules/") don't accidentally match "CLAUDE.md".
-    if webdav.enabled:
-        try:
-            root_entries = await webdav.list_dir("context")
-            root_names = {_clean_basename(e) for e in root_entries}
-            if "CLAUDE.md" in root_names and "CLAUDE" not in out["root"]:
-                out["root"].append("CLAUDE")
-        except Exception:
-            logger.exception("context webdav root list failed")
-        for kind in ("skills", "rules"):
-            try:
-                entries = await webdav.list_dir(f"context/{kind}")
-            except Exception:
-                logger.exception("context webdav list failed: %s", kind)
-                continue
-            for raw in entries:
-                n = _clean_basename(raw)
-                if n.endswith(".md") and len(n) > 3:
-                    stem = n[:-3]
-                    if stem not in out[kind]:
-                        out[kind].append(stem)
-    for k in out:
-        out[k].sort()
-    _list_cache = out
-    _list_cache_at = now
-    return {k: list(v) for k, v in out.items()}
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    if len(text) > _MAX_CLAUDE_MD_CHARS:
+        logger.warning(
+            "CLAUDE.md at %s exceeds %d chars; truncating",
+            path, _MAX_CLAUDE_MD_CHARS,
+        )
+        text = text[:_MAX_CLAUDE_MD_CHARS] + "\n\n…[truncated]"
+    return text.strip()
 
 
 async def build_system_prompt_suffix() -> str:
-    """Concatenate every context doc into a block suitable for appending
-    to an agent's system prompt. Called on every turn spawn so changes
-    propagate without any agent restart.
+    """Concatenate global + per-project CLAUDE.md into a system-prompt
+    suffix. Re-read on every turn so edits take effect without a
+    restart. Returns "" when both files are empty / missing.
 
-    Returns an empty string when no context is configured — this is the
-    harness's pre-§5.2 behavior, so agents keep working unchanged.
+    Layout matches PROJECTS_SPEC.md §10:
+      [identity]            ← prepended in agents.py
+      [coordination block]  ← prepended in agents.py (Coach only)
+      [role prompt]         ← role baseline in agents.py
+      [global CLAUDE.md]    ← from this function
+      [project CLAUDE.md]   ← from this function (active project)
     """
     parts: list[str] = []
-    listing = await list_all()
-    # CLAUDE.md first — top-level harness direction.
-    if "CLAUDE" in listing["root"]:
-        body = await read("root", "CLAUDE")
-        if body:
-            parts.append("## Project conventions (CLAUDE.md)\n\n" + body.strip())
-    # Then rules (hard) so agents read them before skills (soft).
-    for name in listing["rules"]:
-        body = await read("rules", name)
-        if body:
-            parts.append(f"## Rule — {name}\n\n" + body.strip())
-    for name in listing["skills"]:
-        body = await read("skills", name)
-        if body:
-            parts.append(f"## Skill — {name}\n\n" + body.strip())
+
+    gp = global_paths()
+    global_body = _read_text_safe(gp.claude_md)
+    if global_body:
+        parts.append("## Global rules (CLAUDE.md)\n\n" + global_body)
+
+    try:
+        active = await resolve_active_project()
+    except Exception:
+        active = None
+    if active:
+        try:
+            pp = project_paths(active)
+            proj_body = _read_text_safe(pp.claude_md)
+        except Exception:
+            proj_body = ""
+        if proj_body:
+            parts.append(
+                f"## Project rules ({active}/CLAUDE.md)\n\n" + proj_body
+            )
+
     if not parts:
         return ""
     return "\n\n" + "\n\n---\n\n".join(parts)

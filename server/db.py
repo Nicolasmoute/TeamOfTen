@@ -522,6 +522,18 @@ async def init_db() -> None:
                 logger.exception("init_db: sync_state evolution failed")
                 raise
 
+            # projects_v2 layout migration (PROJECTS_SPEC.md §4): wipe
+            # legacy flat root dirs left over from before projects_v1,
+            # move /data/skills/ -> /data/.claude/skills/, and rename
+            # per-project inputs/ -> uploads/. Idempotent; only runs
+            # once schema_version is stamped 'projects_v1'.
+            try:
+                from server.migrations.projects_v2 import run as _run_projects_v2
+                await _run_projects_v2(db)
+            except Exception:
+                logger.exception("init_db: projects_v2 migration failed")
+                raise
+
             # Phase 1 deploy hot-fix: the project_id indexes used to live
             # in SCHEMA, but on a legacy DB (events/tasks/messages/etc.
             # exist from before the refactor without project_id) the

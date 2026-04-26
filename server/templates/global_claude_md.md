@@ -14,24 +14,26 @@ project's `agent_project_roles` rows.
 ## Project file structure — under /data/projects/<active>/
 
 - `CLAUDE.md`              — project-specific rules, stakeholders, glossary
-- `memory/`                — mutable scratchpad (overwrite-on-update; event log keeps history)
-- `decisions/`             — append-only durable record of "we chose X because Y"
-- `knowledge/`             — text artifacts written via `coord_write_knowledge` (specs, references)
+- `decisions/`             — append-only durable record of "we chose X because Y" (immutable ADRs)
 - `working/conversations/` — agent conversation snapshots; `live: true` when persisted mid-session
 - `working/handoffs/`      — inter-agent context handoffs
+- `working/knowledge/`     — text artifacts written via `coord_write_knowledge` (specs, research, design drafts that evolve)
+- `working/memory/`        — shared scratchpad via `coord_*_memory` (overwrite-on-update by topic; event log keeps history)
 - `working/plans/`         — task breakdowns, drafts
 - `working/workspace/`     — generic scratch
 - `outputs/`               — binary deliverables; prefer `coord_save_output` for canonical writes
-- `inputs/`                — user-uploaded files (read-only, pulled from kDrive)
+- `uploads/`               — user-uploaded files (read-only, pulled from kDrive)
 - `attachments/`           — UI paste-target images (read via `Read`; local-only, not synced)
 - `repo/<your-slot>/`      — your git worktree (Players only; Coach has none)
+
+The split: `decisions/`, `outputs/`, `uploads/` are the "permanent / canonical" lanes. Everything that evolves (memory, knowledge, conversations, handoffs, plans, workspace) lives under `working/`.
 
 ## Global resources (cross-project)
 
 - `/data/CLAUDE.md`        — these rules
-- `/data/skills/`          — custom skills (including `llm-wiki/`)
-- `/data/mcp/`             — global MCP server configs (mirror of DB; v2)
-- `/data/wiki/INDEX.md`    — master wiki index
+- `/data/.claude/skills/`  — custom skills (including `llm-wiki/`); canonical Claude Code location
+- `/data/mcp/`             — global MCP server configs (mirror of DB; deferred to v2)
+- `/data/wiki/INDEX.md`    — master wiki index (auto-maintained by the harness)
 - `/data/wiki/<slug>/`     — per-project wiki entries
 - `/data/wiki/*.md`        — cross-project shared concepts at wiki root (alongside INDEX.md)
 

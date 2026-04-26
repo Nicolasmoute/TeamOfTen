@@ -1,27 +1,21 @@
 """Tests for server/knowledge.py — the durable artifact bucket.
 
-Mirror of test_context.py: isolate KNOWLEDGE_DIR to a tempdir per test,
-leave kDrive disabled so only the local-cache path is exercised.
+projects_v2 update: knowledge is project-scoped (active project's
+`working/knowledge/`) and `list_paths` is async. Tests use the
+`fresh_db` fixture so `resolve_active_project()` returns 'misc' and
+the per-project tree exists under the sandboxed DATA_ROOT.
 """
 
 from __future__ import annotations
 
-import tempfile
-from pathlib import Path
-
 import pytest
 
 import server.knowledge as knowmod
+from server.db import init_db
+from server.paths import project_paths
 
 
-@pytest.fixture
-def tmp_know(monkeypatch: pytest.MonkeyPatch) -> Path:
-    d = Path(tempfile.mkdtemp(prefix="harness-know-"))
-    monkeypatch.setattr(knowmod, "KNOWLEDGE_DIR", d)
-    return d
-
-
-# ---------- validate ----------
+# ---------- validate (sync, no DB needed) ----------
 
 
 def test_validate_rejects_empty() -> None:
@@ -62,65 +56,83 @@ def test_validate_rejects_bad_segment_start() -> None:
     assert knowmod.validate("foo/-bad/baz.md") is not None
 
 
-# ---------- write / read / delete ----------
+# ---------- write / read / list_paths (DB-backed) ----------
 
 
-async def test_write_then_read_roundtrip(tmp_know: Path) -> None:
+async def test_write_routes_to_active_project_knowledge(fresh_db) -> None:
+    """projects_v2: writes land at /data/projects/<active>/working/knowledge/."""
+    await init_db()
     await knowmod.write("reports/weekly.md", "# Weekly\n\nhi\n")
-    assert (tmp_know / "reports" / "weekly.md").read_text() == "# Weekly\n\nhi\n"
-    assert await knowmod.read("reports/weekly.md") == "# Weekly\n\nhi\n"
+    pp = project_paths("misc")
+    target = pp.knowledge / "reports" / "weekly.md"
+    assert target.exists()
+    assert target.read_text(encoding="utf-8") == "# Weekly\n\nhi\n"
+    # And the active project's knowledge dir really IS under working/.
+    assert pp.knowledge == pp.working / "knowledge"
 
 
-async def test_write_rejects_empty_body(tmp_know: Path) -> None:
+async def test_read_returns_what_was_written(fresh_db) -> None:
+    await init_db()
+    await knowmod.write("notes.md", "body")
+    assert await knowmod.read("notes.md") == "body"
+
+
+async def test_write_rejects_empty_body(fresh_db) -> None:
+    await init_db()
     with pytest.raises(ValueError):
         await knowmod.write("x.md", "")
     with pytest.raises(ValueError):
         await knowmod.write("x.md", "   \n  ")
 
 
-async def test_write_rejects_oversize_body(tmp_know: Path) -> None:
+async def test_write_rejects_oversize_body(fresh_db) -> None:
+    await init_db()
     huge = "x" * (knowmod.MAX_BODY_CHARS + 1)
     with pytest.raises(ValueError):
         await knowmod.write("x.md", huge)
 
 
-async def test_write_rejects_bad_path(tmp_know: Path) -> None:
+async def test_write_rejects_bad_path(fresh_db) -> None:
+    await init_db()
     with pytest.raises(ValueError):
         await knowmod.write("../escape.md", "body")
 
 
-async def test_write_creates_intermediate_dirs(tmp_know: Path) -> None:
+async def test_write_creates_intermediate_dirs(fresh_db) -> None:
+    await init_db()
     await knowmod.write("deep/nested/path/file.md", "body")
-    assert (tmp_know / "deep" / "nested" / "path" / "file.md").exists()
+    pp = project_paths("misc")
+    assert (pp.knowledge / "deep" / "nested" / "path" / "file.md").exists()
 
 
-async def test_read_missing_returns_none(tmp_know: Path) -> None:
+async def test_read_missing_returns_none(fresh_db) -> None:
+    await init_db()
     assert await knowmod.read("does/not/exist.md") is None
 
 
-# ---------- list_paths ----------
+async def test_list_paths_empty_when_dir_missing(fresh_db) -> None:
+    await init_db()
+    assert await knowmod.list_paths() == []
 
 
-async def test_list_paths_empty_when_dir_missing(tmp_know: Path) -> None:
-    # Fresh tempdir exists but is empty — list_paths should return [].
-    assert knowmod.list_paths() == []
-
-
-async def test_list_paths_sorted_posix(tmp_know: Path) -> None:
+async def test_list_paths_sorted_posix(fresh_db) -> None:
+    await init_db()
     await knowmod.write("b.md", "b")
     await knowmod.write("a/nested.md", "n")
     await knowmod.write("a.md", "a")
-    paths = knowmod.list_paths()
+    paths = await knowmod.list_paths()
     assert paths == ["a.md", "a/nested.md", "b.md"]
 
 
-async def test_list_paths_ignores_non_md(tmp_know: Path) -> None:
+async def test_list_paths_ignores_non_md(fresh_db) -> None:
+    await init_db()
     await knowmod.write("kept.md", "md")
     await knowmod.write("also.txt", "txt")
     # Write a non-allowed file directly to disk (simulating an agent
     # dropping an artifact the normal tool wouldn't accept).
-    (tmp_know / "binary.dat").write_bytes(b"junk")
-    paths = knowmod.list_paths()
+    pp = project_paths("misc")
+    (pp.knowledge / "binary.dat").write_bytes(b"junk")
+    paths = await knowmod.list_paths()
     assert "kept.md" in paths
     assert "also.txt" in paths
     assert "binary.dat" not in paths

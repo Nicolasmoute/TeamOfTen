@@ -52,7 +52,7 @@ class ProjectPaths:
     working_plans: Path
     working_workspace: Path
     outputs: Path
-    inputs: Path
+    uploads: Path
     attachments: Path
     repo: Path
     bare_clone: Path
@@ -64,10 +64,14 @@ class ProjectPaths:
 def global_paths() -> GlobalPaths:
     root = DATA_ROOT
     wiki = root / "wiki"
+    # projects_v2 (PROJECTS_SPEC.md §4): skills live under /data/.claude/
+    # to match Claude Code's canonical project layout. The dotted prefix
+    # also keeps them grouped with anything else CC-managed in the
+    # future (settings.json, agents/, commands/).
     return GlobalPaths(
         root=root,
         claude_md=root / "CLAUDE.md",
-        skills=root / "skills",
+        skills=root / ".claude" / "skills",
         mcp=root / "mcp",
         wiki=wiki,
         wiki_index=wiki / "INDEX.md",
@@ -82,16 +86,26 @@ def project_paths(project_id: str) -> ProjectPaths:
         project_id=project_id,
         root=root,
         claude_md=root / "CLAUDE.md",
-        memory=root / "memory",
+        # projects_v2 (PROJECTS_SPEC.md §4): memory/ moved under
+        # working/ alongside knowledge — both are mutable in-progress
+        # state. The two non-working "permanent" lanes at the project
+        # root are decisions/ (immutable ADRs) and outputs/ (binary
+        # deliverables); uploads/ is the inbound peer (read-only).
+        memory=working / "memory",
         decisions=root / "decisions",
-        knowledge=root / "knowledge",
+        # projects_v2: knowledge/ moved under working/ — text artifacts
+        # (specs, research notes, design docs) are working material
+        # that evolves, not final deliverables.
+        knowledge=working / "knowledge",
         working=working,
         working_conversations=working / "conversations",
         working_handoffs=working / "handoffs",
         working_plans=working / "plans",
         working_workspace=working / "workspace",
         outputs=root / "outputs",
-        inputs=root / "inputs",
+        # projects_v2: renamed from `inputs/`. "uploads" matches the
+        # user-visible "they uploaded a file" mental model better.
+        uploads=root / "uploads",
         attachments=root / "attachments",
         repo=repo,
         bare_clone=repo / ".project",
@@ -104,15 +118,15 @@ def project_paths(project_id: str) -> ProjectPaths:
 # outside projects/ on purpose (cross-project hyperlinks resolve from
 # one shared root).
 _PROJECT_SUBDIRS = (
-    "memory",
     "decisions",
-    "knowledge",
     "working/conversations",
     "working/handoffs",
+    "working/knowledge",
+    "working/memory",
     "working/plans",
     "working/workspace",
     "outputs",
-    "inputs",
+    "uploads",
     "attachments",
     "repo",
 )
@@ -135,7 +149,11 @@ def ensure_project_scaffold(project_id: str) -> ProjectPaths:
 
 
 def ensure_global_scaffold() -> GlobalPaths:
-    """Create the global folder tree on boot. Idempotent."""
+    """Create the global folder tree on boot. Idempotent.
+
+    Creates `.claude/` (parent of `skills/`) implicitly via
+    `mkdir(parents=True)` — the dotted dir is intentional, matches
+    Claude Code's canonical layout for project-local skills."""
     gp = global_paths()
     for d in (gp.root, gp.skills, gp.mcp, gp.wiki):
         d.mkdir(parents=True, exist_ok=True)
