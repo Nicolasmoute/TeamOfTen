@@ -28,18 +28,26 @@ DB_PATH = os.environ.get("HARNESS_DB_PATH", "/data/harness.db")
 
 # Schema is idempotent — safe to run every startup.
 SCHEMA = """
+-- Projects backbone — declared first so the FK references on the
+-- domain tables below resolve at create time. SQLite is lazy on FK
+-- target validation but reordering keeps the dependency graph obvious.
+CREATE TABLE IF NOT EXISTS projects (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    repo_url     TEXT,
+    description  TEXT,
+    archived     INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS agents (
     id                    TEXT PRIMARY KEY,
     kind                  TEXT NOT NULL CHECK (kind IN ('coach', 'player')),
-    name                  TEXT,
-    role                  TEXT,
-    brief                 TEXT,
     status                TEXT NOT NULL DEFAULT 'stopped'
                           CHECK (status IN ('stopped', 'idle', 'working', 'waiting', 'error')),
     current_task_id       TEXT,
     model                 TEXT NOT NULL DEFAULT 'claude-sonnet-4-6',
     workspace_path        TEXT NOT NULL,
-    session_id            TEXT,
     cost_estimate_usd     REAL NOT NULL DEFAULT 0.0,
     started_at            TEXT,
     last_heartbeat        TEXT
@@ -47,6 +55,7 @@ CREATE TABLE IF NOT EXISTS agents (
 
 CREATE TABLE IF NOT EXISTS tasks (
     id            TEXT PRIMARY KEY,
+    project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     title         TEXT NOT NULL,
     description   TEXT NOT NULL DEFAULT '',
     status        TEXT NOT NULL DEFAULT 'open'
@@ -66,6 +75,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_status  ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_owner   ON tasks(owner);
 CREATE INDEX IF NOT EXISTS idx_tasks_parent  ON tasks(parent_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 
 -- payload_to / payload_owner: virtual generated columns over the
 -- two JSON fields the pane-history fan-out filter cares about. Lets
@@ -77,6 +87,7 @@ CREATE TABLE IF NOT EXISTS events (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     ts              TEXT NOT NULL,
     agent_id        TEXT NOT NULL,
+    project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     type            TEXT NOT NULL,
     payload         TEXT NOT NULL,                   -- JSON string
     payload_to      TEXT GENERATED ALWAYS AS (json_extract(payload, '$.to')) VIRTUAL,
@@ -85,6 +96,7 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_type  ON events(type);
+CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id);
 -- (agent_id, type) for fan-out queries that decompose into "events
 -- where I am the actor of any type, OR events of a specific type
 -- targeting me". The OR-branch with type='message_sent' / 'task_*'
@@ -104,6 +116,7 @@ CREATE INDEX IF NOT EXISTS idx_events_type_id   ON events(type, id);
 
 CREATE TABLE IF NOT EXISTS messages (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id   TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     from_id      TEXT NOT NULL,          -- 'human', 'coach', 'p1'..'p10'
     to_id        TEXT NOT NULL,          -- agent id or 'broadcast'
     subject      TEXT,
@@ -117,6 +130,7 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_id);
 CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(from_id);
+CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id);
 
 -- Per-recipient read tracking. Necessary for broadcasts: the first
 -- recipient to drain must NOT mark the message read for everyone else.
@@ -131,12 +145,16 @@ CREATE INDEX IF NOT EXISTS idx_msgreads_agent ON message_reads(agent_id);
 
 -- Shared scratchpad. Overwrite-on-update; event log is the history.
 CREATE TABLE IF NOT EXISTS memory_docs (
-    topic            TEXT PRIMARY KEY,
+    project_id       TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    topic            TEXT NOT NULL,
     content          TEXT NOT NULL,
     last_updated     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     last_updated_by  TEXT NOT NULL,
-    version          INTEGER NOT NULL DEFAULT 1
+    version          INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (project_id, topic)
 );
+
+CREATE INDEX IF NOT EXISTS idx_memory_project ON memory_docs(project_id);
 
 -- Per-turn analytics ledger. One row per SDK ResultMessage — cheap
 -- indexed queries for 'how much did p3 spend this week'. Parallel to
@@ -146,6 +164,7 @@ CREATE TABLE IF NOT EXISTS memory_docs (
 CREATE TABLE IF NOT EXISTS turns (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id       TEXT NOT NULL,
+    project_id     TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     started_at     TEXT NOT NULL,
     ended_at       TEXT NOT NULL,
     duration_ms    INTEGER,
@@ -161,6 +180,7 @@ CREATE TABLE IF NOT EXISTS turns (
 
 CREATE INDEX IF NOT EXISTS idx_turns_agent      ON turns(agent_id, id);
 CREATE INDEX IF NOT EXISTS idx_turns_ended_at   ON turns(ended_at);
+CREATE INDEX IF NOT EXISTS idx_turns_project    ON turns(project_id);
 
 -- Team-wide settings (applies to every agent). Simple key/value store
 -- so we can grow without schema churn. Value is a JSON string — the
@@ -205,15 +225,101 @@ CREATE TABLE IF NOT EXISTS secrets (
     created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- Projects refactor (PROJECTS_SPEC.md §3). The `projects` table is
+-- declared at the top of the schema; the per-(slot, project) tables
+-- below are additive.
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    slot                TEXT NOT NULL,
+    project_id          TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    session_id          TEXT,
+    last_active         TEXT,
+    continuity_note     TEXT,
+    last_exchange_json  TEXT,
+    PRIMARY KEY (slot, project_id)
+);
+
+CREATE TABLE IF NOT EXISTS agent_project_roles (
+    slot         TEXT NOT NULL,
+    project_id   TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name         TEXT,
+    role         TEXT,
+    brief        TEXT,
+    PRIMARY KEY (slot, project_id)
+);
+
+CREATE TABLE IF NOT EXISTS sync_state (
+    project_id       TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    -- 'global' added in Phase 2 to track the global tree (CLAUDE.md,
+    -- skills/, mcp/, wiki/INDEX.md, cross-project wiki/*.md). Existing
+    -- pre-Phase-2 DBs are evolved in-place by init_db via
+    -- _evolve_sync_state_check below.
+    tree             TEXT NOT NULL CHECK (tree IN ('project', 'wiki', 'global')),
+    path             TEXT NOT NULL,
+    mtime            REAL NOT NULL,
+    size_bytes       INTEGER NOT NULL,
+    sha256           TEXT NOT NULL,
+    last_synced_at   TEXT NOT NULL,
+    PRIMARY KEY (project_id, tree, path)
+);
 """
 
-# Seed agents — idempotent via INSERT OR IGNORE.
-SEED_AGENTS: list[tuple[str, str, str | None, str | None, str]] = [
-    ("coach", "coach", "Coach", "Team captain", "/workspaces/coach"),
+# Seed agents — idempotent via INSERT OR IGNORE. After the projects
+# refactor (§3) name/role/brief moved to agent_project_roles; the
+# seed only writes id/kind/workspace_path. Identity rows for the
+# misc project are seeded in init_db after the projects row exists.
+SEED_AGENTS: list[tuple[str, str, str]] = [
+    ("coach", "coach", "/workspaces/coach"),
 ] + [
-    (f"p{i}", "player", None, None, f"/workspaces/p{i}")
+    (f"p{i}", "player", f"/workspaces/p{i}")
     for i in range(1, 11)
 ]
+
+# The fallback active project. Created on every fresh DB so
+# resolve_active_project() never returns None and project-scoped
+# inserts never violate the FK. The destructive Phase-1 migration
+# also creates it (idempotent).
+MISC_PROJECT_ID = "misc"
+MISC_PROJECT_NAME = "Misc"
+
+
+async def _evolve_sync_state_check(db: aiosqlite.Connection) -> None:
+    """If the existing `sync_state.tree` CHECK constraint doesn't allow
+    'global' (pre-Phase-2 DBs), recreate the table in-place with the
+    expanded CHECK while preserving any rows. Idempotent."""
+    cur = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sync_state'"
+    )
+    row = await cur.fetchone()
+    if not row:
+        return
+    sql_stmt = ""
+    try:
+        sql_stmt = row[0] or ""
+    except Exception:
+        return
+    if "'global'" in sql_stmt:
+        return  # already evolved
+    logger.info("evolving sync_state CHECK constraint to allow tree='global'")
+    await db.executescript(
+        """
+        CREATE TABLE sync_state__new (
+            project_id       TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            tree             TEXT NOT NULL CHECK (tree IN ('project', 'wiki', 'global')),
+            path             TEXT NOT NULL,
+            mtime            REAL NOT NULL,
+            size_bytes       INTEGER NOT NULL,
+            sha256           TEXT NOT NULL,
+            last_synced_at   TEXT NOT NULL,
+            PRIMARY KEY (project_id, tree, path)
+        );
+        INSERT INTO sync_state__new
+          SELECT project_id, tree, path, mtime, size_bytes, sha256, last_synced_at
+          FROM sync_state;
+        DROP TABLE sync_state;
+        ALTER TABLE sync_state__new RENAME TO sync_state;
+        """
+    )
 
 
 async def crash_recover() -> dict[str, int]:
@@ -292,31 +398,12 @@ async def init_db() -> None:
             # column' in that case. Keep entries append-only; never
             # remove or re-order.
             for col_name, col_ddl in (
-                ("brief", "ALTER TABLE agents ADD COLUMN brief TEXT"),
                 # JSON array of SDK tool names the human granted this
-                # slot in addition to the role baseline (e.g.
-                # ["WebSearch", "WebFetch"]). NULL / empty = baseline
-                # only. Merged in server.agents.run_agent at spawn.
+                # slot in addition to the role baseline. Survives the
+                # Phase 1 projects refactor (still per-agent, global).
                 ("allowed_extra_tools", "ALTER TABLE agents ADD COLUMN allowed_extra_tools TEXT"),
-                # Per-Player lock flag. When set, Coach cannot assign
-                # tasks to or direct-message this agent, and the agent
-                # skips Coach-originated broadcasts. The agent still
-                # reads all shared docs and responds to human prompts.
-                # INTEGER 0/1 (SQLite has no bool); default 0.
+                # Per-Player lock flag. Same.
                 ("locked", "ALTER TABLE agents ADD COLUMN locked INTEGER NOT NULL DEFAULT 0"),
-                # /compact output. Populated by a compact turn that
-                # summarizes the current session; then session_id is
-                # nulled so the next spawn starts fresh with this note
-                # injected into the system prompt as "prior session
-                # handoff". NULL / empty = no handoff text.
-                ("continuity_note", "ALTER TABLE agents ADD COLUMN continuity_note TEXT"),
-                # Most recent (user prompt, assistant response) pair for
-                # this agent, serialized as JSON. Kept alongside
-                # continuity_note so a compact can preserve the LAST
-                # exchange verbatim — CLI-/compact style — rather than
-                # paraphrasing everything. Overwritten by every
-                # successful non-compact turn.
-                ("last_exchange_json", "ALTER TABLE agents ADD COLUMN last_exchange_json TEXT"),
             ):
                 try:
                     await db.execute(col_ddl)
@@ -405,17 +492,164 @@ async def init_db() -> None:
                 except Exception as e:
                     if "duplicate column" not in str(e).lower():
                         raise
-            logger.info("init_db: schema ok, seeding agents")
+            # Run the destructive Phase-1 projects migration BEFORE
+            # the agent seed. The migration drops legacy columns from
+            # agents (name/role/brief/session_id/continuity_note/
+            # last_exchange_json) and recreates the project-scoped
+            # domain tables; the seed must then run against the
+            # migrated shape.
+            try:
+                from server.migrations.projects_v1 import run as _run_projects_v1
+                await _run_projects_v1(db)
+            except Exception:
+                logger.exception("init_db: projects_v1 migration failed")
+                raise
+
+            # Phase 2 follow-up: extend sync_state.tree CHECK to allow
+            # 'global'. Pre-Phase-2 DBs were stamped with the old CHECK
+            # in projects_v1.py; recreate the table in place when the
+            # constraint is missing the new value. Idempotent — a no-op
+            # once the new constraint is present.
+            try:
+                await _evolve_sync_state_check(db)
+            except Exception:
+                logger.exception("init_db: sync_state evolution failed")
+                raise
+
+            logger.info("init_db: schema ok, ensuring misc project")
+            # Ensure the fallback project + active-project pointer
+            # exist on every fresh boot (idempotent — the migration
+            # also creates these on existing DBs).
+            await db.execute(
+                "INSERT OR IGNORE INTO projects (id, name) VALUES (?, ?)",
+                (MISC_PROJECT_ID, MISC_PROJECT_NAME),
+            )
+            await db.execute(
+                "INSERT OR IGNORE INTO team_config (key, value) VALUES "
+                "('active_project_id', ?)",
+                (MISC_PROJECT_ID,),
+            )
+
+            logger.info("init_db: seeding agents")
             await db.executemany(
                 "INSERT OR IGNORE INTO agents "
-                "(id, kind, name, role, workspace_path) VALUES (?, ?, ?, ?, ?)",
+                "(id, kind, workspace_path) VALUES (?, ?, ?)",
                 SEED_AGENTS,
             )
+
+            # Seed identity for the misc project so Coach has a name
+            # on first spawn. Players start nameless (lacrosse
+            # autonamer fills them in on first spawn).
+            await db.execute(
+                "INSERT OR IGNORE INTO agent_project_roles "
+                "(slot, project_id, name, role) VALUES "
+                "('coach', ?, 'Coach', 'Team captain')",
+                (MISC_PROJECT_ID,),
+            )
+
             await db.commit()
+
+            # Phase 7 (PROJECTS_SPEC.md §8): write per-project CLAUDE.md
+            # stub for misc on first boot. First-write-only — preserves
+            # any user / Coach edits across restarts. Best-effort: a
+            # disk failure here doesn't crash init_db.
+            try:
+                from server.paths import write_project_claude_md_stub
+                write_project_claude_md_stub(
+                    MISC_PROJECT_ID, MISC_PROJECT_NAME
+                )
+            except Exception:
+                logger.exception(
+                    "init_db: write_project_claude_md_stub failed for misc"
+                )
             logger.info("init_db: complete")
     except Exception:
         logger.exception("init_db: sqlite operations failed")
         raise
+
+
+# Phase 3 TOCTOU mitigation (PROJECTS_SPEC.md §13 Phase 3 follow-up).
+# The activate handler in server.projects_api pins the new project via
+# pin_active_project() during the swap so any tool call / event publish
+# that begins mid-switch sees a coherent view. Outside the pinned
+# context resolve_active_project reads team_config as before.
+import contextvars as _ctx
+
+_pinned_project: _ctx.ContextVar[str | None] = _ctx.ContextVar(
+    "harness_pinned_project", default=None
+)
+
+
+class pin_active_project:
+    """Context manager: while active, resolve_active_project() returns
+    the pinned slug regardless of team_config. Stack-safe via
+    contextvars — nested pins restore the outer one on exit."""
+
+    def __init__(self, project_id: str) -> None:
+        self._project_id = project_id
+        self._token: _ctx.Token[str | None] | None = None
+
+    def __enter__(self) -> str:
+        self._token = _pinned_project.set(self._project_id)
+        return self._project_id
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._token is not None:
+            _pinned_project.reset(self._token)
+            self._token = None
+
+
+async def resolve_active_project(db: aiosqlite.Connection | None = None) -> str:
+    """Return the active project_id.
+
+    Order of precedence:
+      1. The slug pinned via `pin_active_project(...)` if any.
+      2. `team_config.active_project_id`.
+      3. Fallback to the `misc` project.
+
+    The pin path is the TOCTOU mitigation — the activate handler holds
+    a pin while it swaps the team_config row + reloads context, so
+    coord_* tools and bus.publish observe a single coherent project
+    across the whole switch.
+    """
+    pinned = _pinned_project.get()
+    if pinned:
+        return pinned
+    own = False
+    if db is None:
+        db = await configured_conn()
+        own = True
+    try:
+        cur = await db.execute(
+            "SELECT value FROM team_config WHERE key = 'active_project_id'"
+        )
+        row = await cur.fetchone()
+    finally:
+        if own:
+            await db.close()
+    if not row:
+        return MISC_PROJECT_ID
+    try:
+        v = row[0]
+    except Exception:
+        v = None
+    return v or MISC_PROJECT_ID
+
+
+async def set_active_project(project_id: str) -> None:
+    """Update team_config.active_project_id. Caller is responsible for
+    holding any concurrency lock (the activate handler in
+    server.projects_api uses an asyncio.Lock)."""
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT OR REPLACE INTO team_config (key, value) "
+            "VALUES ('active_project_id', ?)",
+            (project_id,),
+        )
+        await c.commit()
+    finally:
+        await c.close()
 
 
 def open_conn() -> aiosqlite.Connection:

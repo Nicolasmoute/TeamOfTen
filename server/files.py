@@ -25,6 +25,7 @@ from typing import Any
 
 from server import context as ctxmod
 from server import knowledge as knowmod
+from server.paths import DATA_ROOT, project_paths
 
 logger = logging.getLogger("harness.files")
 if not logger.handlers:
@@ -48,12 +49,96 @@ class Root:
     key: str
     path: Path
     writable: bool  # True = we have a safe write path for this root
+    scope: str = "legacy"  # 'global' | 'project' | 'legacy'
+    project_id: str | None = None
+    label: str | None = None
+
+
+def _resolve_active_sync() -> str:
+    """Synchronous active-project read so _roots() (called from sync
+    code paths like /api/files/tree) doesn't need to await."""
+    import sqlite3
+
+    from server.db import DB_PATH, MISC_PROJECT_ID
+
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5.0)
+        try:
+            cur = conn.execute(
+                "SELECT value FROM team_config WHERE key = 'active_project_id'"
+            )
+            row = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return MISC_PROJECT_ID
+    if not row or not row[0]:
+        return MISC_PROJECT_ID
+    return str(row[0])
+
+
+def _project_label(project_id: str) -> str:
+    """Look up a project's display name. Falls back to the slug on
+    any DB hiccup so the files pane never shows an empty label."""
+    import sqlite3
+
+    from server.db import DB_PATH
+
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5.0)
+        try:
+            cur = conn.execute(
+                "SELECT name FROM projects WHERE id = ?", (project_id,)
+            )
+            row = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return project_id
+    if not row:
+        return project_id
+    return str(row[0]) or project_id
 
 
 def _roots() -> dict[str, Root]:
-    """Whitelist of roots, computed each call so env-var changes are
-    picked up without a restart (useful in tests)."""
-    return {
+    """Whitelist of roots, computed each call so env-var changes and
+    project switches are picked up without a restart.
+
+    Phase 5 (PROJECTS_SPEC.md §7) reshapes the legacy 8-root flat list
+    into two scoped roots:
+      - `global` → /data (parent of projects/, holds CLAUDE.md, skills/,
+                  mcp/, wiki/, snapshots/, etc.)
+      - `project` → /data/projects/<active>/ for the active project.
+
+    Legacy roots (context/knowledge/decisions/workspaces/outputs/
+    uploads/plans/handoffs) stay registered so existing read/write
+    callers and tests keep working — they overlap with the new scoped
+    roots at the path level, which is fine because every root just
+    sandboxes accesses to its sub-tree.
+    """
+    active = _resolve_active_sync()
+    pp = project_paths(active)
+    roots: dict[str, Root] = {
+        # Phase 5: top-level scoped roots.
+        "global": Root(
+            "global",
+            DATA_ROOT,
+            writable=True,
+            scope="global",
+            label="Root (global)",
+        ),
+        "project": Root(
+            "project",
+            pp.root,
+            writable=True,
+            scope="project",
+            project_id=active,
+            label=_project_label(active),
+        ),
+        # Legacy roots — kept for backward compat with existing edit
+        # call sites (ctxmod write path, /api/files/write/<key>=context,
+        # tests). The new UI only renders `global` and `project`; the
+        # legacy keys are not surfaced in list_roots() output.
         "context": Root(
             "context",
             Path(os.environ.get("HARNESS_CONTEXT_DIR", "/data/context")),
@@ -67,40 +152,23 @@ def _roots() -> dict[str, Root]:
         "decisions": Root(
             "decisions",
             Path(os.environ.get("HARNESS_DECISIONS_DIR", "/data/decisions")),
-            writable=False,  # decisions are append-only records, not editable
+            writable=False,
         ),
         "workspaces": Root(
             "workspaces",
             Path(os.environ.get("HARNESS_WORKSPACES_DIR", "/workspaces")),
-            # Read-only from the UI. Each Player has a git worktree at
-            # /workspaces/<slot>/project/ on branch work/<slot>; edits
-            # from the browser would fight the agent's git operations
-            # (auto-commit, pull, etc). Use coord_commit_push or git
-            # CLI to change files, then reload the tree here.
             writable=False,
         ),
-        # Binary deliverables the team ships. Written via
-        # coord_save_output; mirrored to kDrive under outputs/.
         "outputs": Root(
             "outputs",
             Path(os.environ.get("HARNESS_OUTPUTS_DIR", "/data/outputs")),
             writable=False,
         ),
-        # Human-uploaded reference material. Pulled from kDrive://uploads/
-        # every ~60s by sync.uploads_pull_loop; each Player has a
-        # `uploads` symlink pointing here so they can Read ./uploads/foo.
         "uploads": Root(
             "uploads",
             Path(os.environ.get("HARNESS_UPLOADS_DIR", "/data/uploads")),
             writable=False,
         ),
-        # Claude CLI plan-mode artifacts. When an agent is in plan
-        # mode and uses Write to save its plan, the CLI lands it under
-        # CLAUDE_CONFIG_DIR/plans/*.md. These are inputs to the
-        # ExitPlanMode approval flow — operator wants to see them
-        # alongside the inline plan body. Read-only from the UI (the
-        # agent is the author; human-approved plans become decisions
-        # / knowledge if durable).
         "plans": Root(
             "plans",
             Path(
@@ -115,33 +183,44 @@ def _roots() -> dict[str, Root]:
             ),
             writable=False,
         ),
-        # Compact handoff archive. Auto-written by the compact flow
-        # (kDrive-mirrored; local fallback). Useful to revisit past
-        # session summaries without having to read the jsonl.
         "handoffs": Root(
             "handoffs",
             Path(os.environ.get("HARNESS_HANDOFFS_DIR", "/data/handoffs")),
             writable=False,
         ),
     }
+    return roots
 
 
 def list_roots() -> list[dict[str, Any]]:
-    """Lightweight metadata for the UI to render the top level. The
-    `path` field exposes each root's absolute on-disk path so the UI's
-    file-link resolver (markdown links → "open in Files pane") can do
-    longest-prefix matching against agent-produced absolute paths
-    without hardcoding the default `/data/...` layout."""
+    """Phase 5 (PROJECTS_SPEC.md §7) payload — only the two scoped
+    roots are surfaced to the UI. Legacy roots are accessible via the
+    other endpoints (tree/read/write) by key but not enumerated here.
+
+    Each entry carries:
+      - `id` — unique handle the UI uses for tree/read/write calls.
+      - `key` — alias of `id` for older clients still keying off `key`.
+      - `label` — human-readable header text.
+      - `path` — absolute on-disk path (for the file-link resolver).
+      - `scope` — 'global' | 'project'.
+      - `project_id` — set on `scope='project'` only.
+      - `writable` / `exists` — UI permission + missing-dir hints.
+    """
     out: list[dict[str, Any]] = []
     for r in _roots().values():
+        if r.scope == "legacy":
+            continue
         exists = r.path.exists()
         out.append(
             {
+                "id": r.key,
                 "key": r.key,
                 "writable": r.writable,
                 "exists": exists,
-                "label": r.key,
+                "label": r.label or r.key,
                 "path": str(r.path),
+                "scope": r.scope,
+                "project_id": r.project_id,
             }
         )
     return out
@@ -174,30 +253,52 @@ def tree(root_key: str) -> dict[str, Any]:
     root = _resolve(root_key, "")
     if not root.exists():
         return {"name": root_key, "type": "dir", "children": []}
-    return _walk(root, root)
+    # Phase 5 (§7): the `global` root is /data itself, which contains
+    # `projects/` (other projects' trees — only the active one surfaces
+    # under the `project` root, not via `global`), `harness.db` (and
+    # its WAL sidecars), `claude/` (OAuth tokens), and `attachments/`
+    # for legacy deploys. Skip these so the global tree shows what
+    # the spec lists: CLAUDE.md, skills/, mcp/, wiki/, plus snapshots/
+    # if present.
+    extra_skip: set[str] = set()
+    if root_key == "global":
+        extra_skip = {
+            "projects",       # active project enumerated via the `project` root
+            "claude",          # OAuth tokens
+            "attachments",     # legacy flat dir; per-project is under project tree
+            "harness.db",      # SQLite (binary)
+            "harness.db-journal",
+            "harness.db-wal",
+            "harness.db-shm",
+        }
+    return _walk(root, root, extra_skip=extra_skip)
 
 
-def _walk(base: Path, current: Path) -> dict[str, Any]:
+def _walk(base: Path, current: Path, *, extra_skip: set[str] | None = None) -> dict[str, Any]:
     try:
         entries = list(current.iterdir())
     except OSError:
         return {"name": current.name, "type": "dir", "children": []}
 
     children: list[dict[str, Any]] = []
+    skip = SKIP_DIRNAMES | (extra_skip or set())
     # Skip symlinks entirely. The workspaces tree has per-slot
     # `attachments/` symlinks pointing at /data/attachments which is
     # cross-root; following them would leak upload content into every
     # Player's tree. Regular files + real directories only.
     dirs = sorted(
         (e for e in entries
-         if e.is_dir() and not e.is_symlink() and e.name not in SKIP_DIRNAMES),
+         if e.is_dir() and not e.is_symlink() and e.name not in skip),
         key=lambda e: e.name.lower(),
     )
     files = sorted(
-        (e for e in entries if e.is_file() and not e.is_symlink()),
+        (e for e in entries
+         if e.is_file() and not e.is_symlink() and e.name not in skip),
         key=lambda e: e.name.lower(),
     )
     for d in dirs:
+        # The extra_skip set only applies at the top level — once we
+        # descend into a child dir, normal SKIP_DIRNAMES rules govern.
         children.append(_walk(base, d))
     for f in files:
         try:

@@ -8,7 +8,7 @@ import sys
 from collections import deque
 from typing import Any
 
-from server.db import configured_conn
+from server.db import MISC_PROJECT_ID, configured_conn, resolve_active_project
 
 BACKLOG_SIZE = 500
 QUEUE_SIZE = 500
@@ -43,14 +43,21 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-def _row_for(event: dict[str, Any]) -> tuple[str, str, str, str]:
+def _row_for(event: dict[str, Any]) -> tuple[str, str, str, str, str]:
     """Project a publish() event dict into the events-table column tuple.
     Centralized so the single-event _persist() and the batched writer
     use exactly the same shape — no risk of column-order drift.
+
+    `project_id` is taken off the event when present, otherwise falls
+    back to MISC_PROJECT_ID. The events row schema requires NOT NULL
+    project_id; callers that already know the active project should
+    set it explicitly via _emit so the event lands in the right
+    project tree.
     """
     return (
         event.get("ts", ""),
         event.get("agent_id", "system"),
+        event.get("project_id") or MISC_PROJECT_ID,
         event.get("type", "unknown"),
         json.dumps(event),
     )
@@ -67,8 +74,8 @@ async def _persist(event: dict[str, Any]) -> None:
         c = await configured_conn()
         try:
             await c.execute(
-                "INSERT INTO events (ts, agent_id, type, payload) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO events (ts, agent_id, project_id, type, payload) "
+                "VALUES (?, ?, ?, ?, ?)",
                 _row_for(event),
             )
             await c.commit()
@@ -137,8 +144,8 @@ async def _flush_batch(batch: list[dict[str, Any]]) -> None:
         c = await configured_conn()
         try:
             await c.executemany(
-                "INSERT INTO events (ts, agent_id, type, payload) "
-                "VALUES (?, ?, ?, ?)",
+                "INSERT INTO events (ts, agent_id, project_id, type, payload) "
+                "VALUES (?, ?, ?, ?, ?)",
                 [_row_for(ev) for ev in batch],
             )
             await c.commit()
@@ -242,6 +249,13 @@ class EventBus:
         self._backlog: deque[dict[str, Any]] = deque(maxlen=backlog)
 
     async def publish(self, event: dict[str, Any]) -> None:
+        # Stamp project_id if the caller didn't. Tolerated DB error →
+        # falls back to misc, matching resolve_active_project's contract.
+        if "project_id" not in event:
+            try:
+                event["project_id"] = await resolve_active_project()
+            except Exception:
+                event["project_id"] = MISC_PROJECT_ID
         transient = event.get("type") in _TRANSIENT_EVENT_TYPES
         if not transient:
             self._backlog.append(event)

@@ -1,8 +1,7 @@
 """Tests for server.agents._autoname_player.
 
-Can run in CI because the Dockerless `uv sync --extra dev` pulls
-claude-agent-sdk as a dep — importing server.agents then works. The
-tests only exercise DB paths; no subprocess spawn.
+Per the projects refactor (PROJECTS_SPEC.md §3) names live in
+agent_project_roles per (slot, project), not on the agents row.
 """
 
 from __future__ import annotations
@@ -11,7 +10,7 @@ import asyncio
 
 import pytest
 
-from server.db import configured_conn, init_db
+from server.db import configured_conn, init_db, resolve_active_project
 
 
 @pytest.fixture(autouse=True)
@@ -21,9 +20,14 @@ async def _init(fresh_db: str) -> None:
 
 
 async def _name_of(agent_id: str) -> str | None:
+    pid = await resolve_active_project()
     c = await configured_conn()
     try:
-        cur = await c.execute("SELECT name FROM agents WHERE id = ?", (agent_id,))
+        cur = await c.execute(
+            "SELECT name FROM agent_project_roles "
+            "WHERE slot = ? AND project_id = ?",
+            (agent_id, pid),
+        )
         row = await cur.fetchone()
     finally:
         await c.close()
@@ -49,8 +53,8 @@ async def test_autoname_is_noop_if_already_named() -> None:
 
 async def test_autoname_skips_coach() -> None:
     from server.agents import _autoname_player
-    # Coach is seeded with kind='coach' and name='Coach'. _autoname_player
-    # only assigns to kind='player' slots with no current name.
+    # Coach is seeded with kind='coach'. _autoname_player only assigns
+    # to kind='player' slots.
     result = await _autoname_player("coach")
     assert result is None
 
@@ -68,10 +72,6 @@ async def test_autoname_produces_distinct_names_serially() -> None:
 
 async def test_autoname_is_race_safe_concurrent() -> None:
     from server.agents import _autoname_player
-    # Fire all 10 auto-names at once. Without the asyncio.Lock this
-    # regressed to duplicates because each SELECT saw the same
-    # 'taken' snapshot before any UPDATE committed. Lock serializes
-    # the read-pick-commit window.
     results = await asyncio.gather(*[_autoname_player(f"p{i}") for i in range(1, 11)])
     assert all(r is not None for r in results), "every slot should get a name"
     assert len(set(results)) == 10, f"names must be distinct, got {results!r}"

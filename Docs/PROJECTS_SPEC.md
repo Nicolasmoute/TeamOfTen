@@ -139,10 +139,12 @@ CREATE TABLE sync_state (
 -- Indexes for the constant `WHERE project_id = ?` scan on every domain read.
 CREATE INDEX idx_tasks_project       ON tasks(project_id);
 CREATE INDEX idx_messages_project    ON messages(project_id);
-CREATE INDEX idx_memory_project      ON memory(project_id);
+CREATE INDEX idx_memory_project      ON memory_docs(project_id);
 CREATE INDEX idx_events_project      ON events(project_id);
 CREATE INDEX idx_turns_project       ON turns(project_id);
-CREATE INDEX idx_attachments_project ON attachments(project_id);
+-- Note: attachments are filesystem files (under /data/attachments/),
+-- not DB rows. No `attachments` table exists; project scoping for
+-- attachments is achieved by the per-project folder layout in §4.
 ```
 
 ### Columns added
@@ -151,10 +153,11 @@ CREATE INDEX idx_attachments_project ON attachments(project_id);
 
 - `tasks`
 - `messages`
-- `memory`
+- `memory_docs`
 - `events`
 - `turns`
-- `attachments`
+
+(The `attachments` lane is filesystem-only — no DB table — so it gets project scoping via the per-project folder layout in §4, not via a `project_id` column.)
 
 **Tables that stay global** (no `project_id`):
 
@@ -180,7 +183,7 @@ CREATE INDEX idx_attachments_project ON attachments(project_id);
 
 Steps:
 
-1. **Drop and recreate** every table that gains `project_id` (`tasks`, `messages`, `memory`, `events`, `turns`, `attachments`). No `ALTER TABLE ADD COLUMN`-with-default dance — drop is simpler and we're not preserving data anyway. Drop these columns from `agents` (`ALTER TABLE agents DROP COLUMN <col>` × 6): `session_id`, `continuity_note`, `last_exchange_json` (→ `agent_sessions`), `name`, `role`, `brief` (→ `agent_project_roles`). Drop any `team_config.repo_url` entries.
+1. **Drop and recreate** every table that gains `project_id` (`tasks`, `messages`, `memory_docs`, `events`, `turns`). No `ALTER TABLE ADD COLUMN`-with-default dance — drop is simpler and we're not preserving data anyway. Drop these columns from `agents` (`ALTER TABLE agents DROP COLUMN <col>` × 6): `session_id`, `continuity_note`, `last_exchange_json` (→ `agent_sessions`), `name`, `role`, `brief` (→ `agent_project_roles`). Drop any `team_config.repo_url` entries.
 2. **Create** `projects`, `agent_sessions`, `agent_project_roles`, `sync_state` at the new schema.
 3. **Insert** the `misc` project row, and set the active-project pointer: `INSERT OR REPLACE INTO team_config(key, value) VALUES ('active_project_id', 'misc')`. Without this, `resolve_active_project()` returns NULL on first request and every project-scoped query fails.
 4. **Repo URL inheritance**: if `HARNESS_PROJECT_REPO` is set, copy it into `projects.repo_url` for `misc`.
@@ -282,10 +285,11 @@ TOT/
 
 ### Path constants
 
-[server/main.py](server/main.py) gains two helpers:
+[server/paths.py](server/paths.py) (standalone module — keeps main.py from growing further; importers should treat it as the single source of truth and never hardcode `/data/...` strings):
 
-- `global_paths()` → dataclass of global-tree paths (`claude_md`, `skills`, `mcp`, `wiki`, `wiki_index`).
-- `project_paths(project_id)` → dataclass with fields `root`, `claude_md`, `memory`, `decisions`, `knowledge`, `working`, `working_conversations`, `working_handoffs`, `working_plans`, `working_workspace`, `outputs`, `inputs`, `attachments`, `repo`, `bare_clone`, plus a method `worktree(slot)` that returns the per-slot worktree path under `repo/`.
+- `global_paths()` → frozen `GlobalPaths` dataclass: `root`, `claude_md`, `skills`, `mcp`, `wiki`, `wiki_index`.
+- `project_paths(project_id)` → frozen `ProjectPaths` dataclass: `project_id`, `root`, `claude_md`, `memory`, `decisions`, `knowledge`, `working`, `working_conversations`, `working_handoffs`, `working_plans`, `working_workspace`, `outputs`, `inputs`, `attachments`, `repo`, `bare_clone`, plus method `worktree(slot)` returning the per-slot worktree path under `repo/`.
+- `ensure_global_scaffold()` and `ensure_project_scaffold(project_id)` — idempotent boot/create-time directory provisioning. The wiki sub-folder is created via `global_paths().wiki / project_id` (lives in the global wiki tree, not under `projects/<slug>/`). Neither writes `CLAUDE.md` (Phase 6/7 owns the templates) nor clones the repo (activation does that).
 
 All call sites switch from hardcoded `/data/memory/` etc. to the helper:
 - `project_paths(active).memory` for project-scoped data
@@ -830,10 +834,10 @@ The upstream remote (github.com / wherever) is untouched — only local copies d
 
 ---
 
-## 13. Implementation phases
+## 13. Implementation phases (roadmap; phase work is the real backlog — see status note at end of §13)
 Recommend doing these in order — each is independently testable.
 
-### Phase 1 — Schema, filesystem, and identity foundation
+### Phase 1 — Schema, filesystem, and identity foundation (completed and audited)
 - Add tables (§3): `projects`, `agent_sessions`, `agent_project_roles`, `sync_state`.
 - Add `project_id` columns + indexes (`idx_*_project`) to: `tasks`, `messages`, `memory`, `events`, `turns`, `attachments`. Drop & recreate, no migration.
 - Drop columns from `agents`: `session_id`, `continuity_note`, `last_exchange_json` (→ `agent_sessions`); `name`, `role`, `brief` (→ `agent_project_roles`). Six columns total.
@@ -844,43 +848,58 @@ Recommend doing these in order — each is independently testable.
 - `coord_*` tools gain implicit project scoping (read/write to active project rows only). `coord_set_player_role` writes to `agent_project_roles`.
 - **Isolation test** (gates Phase 1 done): integration test that creates two projects, writes domain rows under project A, switches to project B, asserts every project-scoped query returns 0 rows from A. This is the §16 risk mitigation made executable.
 
-### Phase 2 — Sync rework
+### Phase 2 — Sync rework (completed and audited)
 - Per-project file sync loop (active project, 5 min cadence) — push + pull semantics per §5, walking both `projects/<slug>/` (excl. `repo/`, `attachments/`) and `wiki/<slug>/`.
 - Global tree sync loop (`HARNESS_GLOBAL_SYNC_INTERVAL`, default 30 min) — covers `/data/CLAUDE.md`, `/data/skills/`, `/data/mcp/`, `/data/wiki/INDEX.md`, cross-project wiki entries at `/data/wiki/*.md`.
 - `sync_state(project_id, tree, path, mtime, size_bytes, sha256, last_synced_at)` populated; retry with 1s→2s→4s exponential backoff capped at 30s, up to `HARNESS_KDRIVE_RETRY_MAX` (default 3).
 - Pull-on-open / force-push-on-close primitives (`HARNESS_KDRIVE_CLOSE_TIMEOUT_S`, default 60s).
 - `kdrive_sync_failed` event + EnvPane banner. Skip-and-continue on individual file failures, never abort whole run.
 
-### Phase 3 — Project switch API + minimal UI
+### Phase 3 — Project switch API + minimal UI (completed and audited)
 - API endpoints: `POST /api/projects` (create), `GET /api/projects` (list, includes archived), `POST /api/projects/{id}/activate`, `PATCH /api/projects/{id}` (name/description/repo_url), `DELETE /api/projects/{id}`, `POST /api/projects/{id}/repo/provision`.
 - Slug validator: `^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`, 2–48 chars, plus reserved-name list (§2).
 - Status codes per §6: `202 Accepted` (switch started, returns job_id), `400` (slug invalid), `404` (unknown project), `409` (another switch in progress), `423` (agent turn in flight), `502` (kDrive unreachable on pre-pull).
 - `project_switch_step` event type for UI streaming; final `project_switched` event closes any subscriber.
 - LeftRail dropdown (functional, plain styling — polish in Phase 4).
 
-### Phase 4 — Switch UX polish
+**Phase 1 audit follow-ups** (2026-04-25 — risks deferred from Phase 1, must land here so the switch endpoint is safe):
+
+- **TOCTOU on `resolve_active_project()`.** Every `coord_*` tool, every API endpoint, and `bus.publish` resolves the active project by opening its own connection at the start of the call. A switch mid-tool-call could split a logical operation across two projects (e.g. `update_memory` SELECT against project A, INSERT into B). Mitigation: hold an in-process `asyncio.Lock` for the duration of the activate handler that blocks all writes via a `_active_project_pinned` context var; tool calls and event publishes that begin while the lock is held use the pinned id.
+- **Stale-task watchdog isn't project-scoped.** The query in [server/agents.py](server/agents.py) `stale_task_watch_loop` joins `tasks` against `events` with no `project_id` filter, so it reports stalls across every project to the active project's Coach. Add `WHERE t.project_id = ?` against the active project; the watchdog only nags Coach about the project he's currently coordinating.
+- **`crash_recover()` resets task status across all projects.** Status reset is harmless cross-project (every project's stale `in_progress` rows demote to `claimed`), but the count surfaced in logs conflates projects. Acceptable as-is; just note it. No fix required unless it surprises a user.
+- **Isolation test should cover `agent_sessions`, `agent_project_roles`, and `sync_state`.** Phase 1's gate exercised only the 5 §3 domain tables. Extend the test in this phase to seed (slot, project) rows in those three tables and assert per-project visibility.
+- **Isolation test bypasses production write paths.** It seeds rows via raw SQL, so it would not have caught the four bare `INSERT INTO messages` callers fixed in the Phase 1 audit. Add a smoke test that exercises `coord_send_message` + the AskUserQuestion / ExitPlanMode / Telegram inbound paths against a non-default active project.
+
+### Phase 4 — Switch UX polish (completed and audited)
 - Confirmation modal with dynamic counts (files to push, live conversations to snapshot).
 - Busy modal with stepper animation, subscribed to `project_switch_step` events for the in-flight job_id.
 - Error states / retry / cancel-and-stay paths per §6.
 - In-flight turn handling: if `423` returned, show sub-modal "Coach is mid-turn — wait or cancel?" with **Wait** / **Cancel turns and switch** (final policy in §14 Q2).
 
-### Phase 5 — Files pane two-root layout
+### Phase 5 — Files pane two-root layout (completed and audited)
 - `/api/files/roots` returns both roots with `id`, `label`, `path`, `scope`, `project_id` (§7).
 - Tree component renders global + active project trees side-by-side; collapse state per node persisted to `localStorage`.
 - File-link resolver longest-prefix-matches against both roots; opened files tagged with originating scope.
 - Live fs-event reload re-targets to the new project's tree on switch (rebind without full refetch).
 - Archived projects suppressed from the bottom root.
 
-### Phase 6 — Global CLAUDE.md + LLM-Wiki skill + INDEX.md bootstrap
+### Phase 6 — Global CLAUDE.md + LLM-Wiki skill + INDEX.md bootstrap (completed and audited)
 - `server/templates/global_claude_md.md` — full text per §8 excerpt (project/wiki principles + per-project agent identity block).
 - `server/templates/llm_wiki_skill.md` — from Karpathy's gist, adapted to standard markdown links instead of wikilinks (§9).
 - Boot sequence (§9 bootstrap behavior): ensure `/data/wiki/`, write `INDEX.md` stub if missing, ensure `/data/skills/llm-wiki/`, write `SKILL.md` if missing, ensure `/data/CLAUDE.md`, write from template if missing.
 - `/api/health` adds `wiki: "present" | "bootstrapped" | "missing"`.
 
-### Phase 7 — Coach coordination block + per-project CLAUDE.md stub
+### Phase 7 — Coach coordination block + per-project CLAUDE.md stub (completed and audited)
 - Coach's per-turn coordination block (§10) — built from `projects`, `agent_project_roles`, `tasks`, `messages`, and the latest entry in `decisions/`; injected as the second sub-block of the dynamic prompt layer.
 - Per-project CLAUDE.md stub auto-written on project creation (§8) with Goal + Repo pre-filled from creation modal; rest blank for Coach to fill.
 - INDEX.md auto-update on every wiki write event (per §14 Resolved: INDEX.md maintenance — append a link line, sort grouped by project / cross-project).
+
+### Implementation status (2026-04-25)
+
+- **Phase 1** — complete. Migration script `server/migrations/projects_v1.py` shipped; `project_id NOT NULL FK ON DELETE CASCADE` added to `tasks`/`messages`/`memory_docs`/`events`/`turns` plus `idx_*_project` indexes; six legacy columns dropped from `agents`; `agent_project_roles` / `agent_sessions` / `sync_state` populated; identity injection prepended to every system prompt with a Coach-only coordination block placeholder; `coord_*` tools, every domain API endpoint, and `bus.publish` scope to the active project; attachments and decisions paths route through `project_paths(active)`; isolation gate test passes. Known follow-ups land in Phase 3 (TOCTOU, watchdog scoping, isolation-test breadth).
+- **Phases 2–8** — not started.
+
+The phase work is the real refactor backlog and is not appropriate for 1-min /loop iterations. Each phase is hours-to-days of code. Drive these via dedicated working sessions.
 
 ### Phase 8 — Options drawer Projects section + per-project brief edit
 - Projects section: project cards with create / edit (name, repo_url, description) / archive toggle / delete (Misc undeletable). Expand a card to view the project's `agent_project_roles` (read-only).

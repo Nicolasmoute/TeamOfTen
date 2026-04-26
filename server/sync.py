@@ -539,8 +539,14 @@ async def events_trim_loop() -> None:
 
 
 async def trim_attachments_once() -> int:
-    """Delete files under /data/attachments older than
-    ATTACHMENTS_RETENTION_DAYS. Returns number deleted.
+    """Delete files under each project's attachments dir older than
+    ATTACHMENTS_RETENTION_DAYS. Returns total number deleted across
+    every project.
+
+    Per PROJECTS_SPEC.md §4 attachments live at
+    `/data/projects/<slug>/attachments/` (Phase 1). The legacy
+    `HARNESS_ATTACHMENTS_DIR` env override still pins the trim sweep
+    to one directory when set — used by tests + pinned deploys.
 
     Safe to run concurrently with uploads — we stat each file and only
     unlink if its mtime is old enough. A file being written right now
@@ -548,26 +554,40 @@ async def trim_attachments_once() -> int:
     """
     if ATTACHMENTS_RETENTION_DAYS <= 0:
         return 0
-    # ATTACHMENTS_DIR lives in server.main; re-resolve from env rather
-    # than importing to avoid a circular dep.
-    attachments_dir = Path(
-        os.environ.get("HARNESS_ATTACHMENTS_DIR", "/data/attachments")
-    )
-    if not attachments_dir.is_dir():
-        return 0
     cutoff_ts = (
         datetime.now(timezone.utc) - timedelta(days=ATTACHMENTS_RETENTION_DAYS)
     ).timestamp()
     deleted = 0
-    for entry in attachments_dir.iterdir():
-        if not entry.is_file():
-            continue
+
+    def _sweep(d: Path) -> int:
+        n = 0
+        if not d.is_dir():
+            return 0
+        for entry in d.iterdir():
+            if not entry.is_file():
+                continue
+            try:
+                if entry.stat().st_mtime < cutoff_ts:
+                    entry.unlink()
+                    n += 1
+            except OSError:
+                logger.exception("attachments trim: failed on %s", entry)
+        return n
+
+    override = os.environ.get("HARNESS_ATTACHMENTS_DIR")
+    if override:
+        deleted = _sweep(Path(override))
+    else:
+        # Walk every project's attachments dir.
+        from server.paths import project_paths
+        c = await configured_conn()
         try:
-            if entry.stat().st_mtime < cutoff_ts:
-                entry.unlink()
-                deleted += 1
-        except OSError:
-            logger.exception("attachments trim: failed on %s", entry)
+            cur = await c.execute("SELECT id FROM projects")
+            project_ids = [dict(r)["id"] for r in await cur.fetchall()]
+        finally:
+            await c.close()
+        for pid in project_ids:
+            deleted += _sweep(project_paths(pid).attachments)
     if deleted:
         logger.info(
             "attachments trim: deleted %d file(s) older than %dd",

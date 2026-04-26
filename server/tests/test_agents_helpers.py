@@ -1,16 +1,15 @@
 """Tests for pure-DB helpers in server/agents.py.
 
-Each helper is a thin wrapper around a SQL statement, but they're
-load-bearing: _today_spend is the cost-cap engine, _*_session_id is
-used by stale-session auto-heal, _get_agent_brief feeds every
-turn's system prompt.
+After the projects refactor (PROJECTS_SPEC.md §3) brief / session_id
+moved out of the agents row — the tests verify the new
+agent_project_roles + agent_sessions tables instead.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from server.db import configured_conn, init_db
+from server.db import configured_conn, init_db, resolve_active_project
 
 
 @pytest.fixture(autouse=True)
@@ -24,12 +23,13 @@ async def _init(fresh_db: str) -> None:
 async def _insert_turn(
     agent_id: str, ended_at: str, cost_usd: float
 ) -> None:
+    project_id = await resolve_active_project()
     c = await configured_conn()
     try:
         await c.execute(
-            "INSERT INTO turns (agent_id, started_at, ended_at, cost_usd) "
-            "VALUES (?, ?, ?, ?)",
-            (agent_id, ended_at, ended_at, cost_usd),
+            "INSERT INTO turns (agent_id, project_id, started_at, ended_at, cost_usd) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (agent_id, project_id, ended_at, ended_at, cost_usd),
         )
         await c.commit()
     finally:
@@ -68,14 +68,24 @@ async def test_today_spend_empty_returns_zero() -> None:
 # ---------- _get_agent_brief / _clear_session_id ----------
 
 
-async def test_get_brief_returns_column_value() -> None:
-    from server.agents import _get_agent_brief
+async def _set_brief(slot: str, brief: str | None) -> None:
+    pid = await resolve_active_project()
     c = await configured_conn()
     try:
-        await c.execute("UPDATE agents SET brief = ? WHERE id = 'p3'", ("hello\nworld",))
+        await c.execute(
+            "INSERT INTO agent_project_roles (slot, project_id, brief) "
+            "VALUES (?, ?, ?) ON CONFLICT(slot, project_id) DO UPDATE SET "
+            "brief = excluded.brief",
+            (slot, pid, brief),
+        )
         await c.commit()
     finally:
         await c.close()
+
+
+async def test_get_brief_returns_column_value() -> None:
+    from server.agents import _get_agent_brief
+    await _set_brief("p3", "hello\nworld")
     assert await _get_agent_brief("p3") == "hello\nworld"
 
 
@@ -89,12 +99,15 @@ async def test_get_brief_system_agent_returns_none() -> None:
     assert await _get_agent_brief("system") is None
 
 
-async def test_clear_session_id_wipes_the_column() -> None:
+async def test_clear_session_id_wipes_the_row() -> None:
     from server.agents import _clear_session_id
+    pid = await resolve_active_project()
     c = await configured_conn()
     try:
         await c.execute(
-            "UPDATE agents SET session_id = 'sess-xyz' WHERE id = 'p5'"
+            "INSERT INTO agent_sessions (slot, project_id, session_id) "
+            "VALUES ('p5', ?, 'sess-xyz')",
+            (pid,),
         )
         await c.commit()
     finally:
@@ -102,16 +115,21 @@ async def test_clear_session_id_wipes_the_column() -> None:
     await _clear_session_id("p5")
     c = await configured_conn()
     try:
-        cur = await c.execute("SELECT session_id FROM agents WHERE id = 'p5'")
-        row = dict(await cur.fetchone())
+        cur = await c.execute(
+            "SELECT session_id FROM agent_sessions "
+            "WHERE slot = 'p5' AND project_id = ?",
+            (pid,),
+        )
+        row = await cur.fetchone()
     finally:
         await c.close()
-    assert row["session_id"] is None
+    # Either no row, or row with NULL session_id — both indicate cleared.
+    if row is not None:
+        assert dict(row)["session_id"] is None
 
 
 async def test_clear_session_id_idempotent() -> None:
     from server.agents import _clear_session_id
-    # Running against an agent that already has NULL session_id must
-    # not raise.
+    # Running against an agent that already has no session row must not raise.
     await _clear_session_id("p7")
     await _clear_session_id("p7")

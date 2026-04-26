@@ -49,17 +49,19 @@ from server.agents import (
 )
 from server import context as ctxmod
 from server import files as filesmod
-from server.db import configured_conn, crash_recover, init_db
+from server.paths import project_paths
+from server.db import configured_conn, crash_recover, init_db, resolve_active_project
 from server.events import bus
 from server.webdav import webdav
 from server.sync import (
     attachments_trim_loop,
     sessions_trim_loop,
     events_trim_loop,
-    flush_loop,
-    outputs_push_loop,
     snapshot_loop,
-    uploads_pull_loop,
+)
+from server.project_sync import (
+    global_sync_loop,
+    project_sync_loop,
 )
 from server.workspaces import ensure_workspaces, get_status as get_workspaces_status
 
@@ -142,12 +144,20 @@ except Exception as e:
         "</body>"
     )
 
-# Central attachment store. Sits on the same /data volume as the SQLite DB,
-# so images persist across redeploys. Lives outside any agent's workspace
-# on purpose — a Player must not be able to mutate another Player's
-# attachments via a git-worktree edit.
-ATTACHMENTS_DIR = Path(os.environ.get("HARNESS_ATTACHMENTS_DIR", "/data/attachments"))
+# Per-project attachment store (PROJECTS_SPEC.md §4). Resolved at
+# request time from the active project so a fresh project switch
+# routes pastes into the new project's tree. The
+# `HARNESS_ATTACHMENTS_DIR` env override stays for tests + legacy
+# deploys; when set it pins ALL projects to one directory (used in
+# server/sync.py's retention loop too — kept for compatibility).
 ALLOWED_EXT = {"png", "jpg", "jpeg", "gif", "webp"}
+
+
+def _attachments_dir_for(project_id: str) -> Path:
+    override = os.environ.get("HARNESS_ATTACHMENTS_DIR")
+    if override:
+        return Path(override)
+    return project_paths(project_id).attachments
 
 # Binary deliverables the team ships (docx, pdf, png, zip, …). Written
 # by agents via coord_save_output; mirrored to WebDAV under outputs/;
@@ -165,6 +175,24 @@ UPLOADS_DIR = Path(os.environ.get("HARNESS_UPLOADS_DIR", "/data/uploads"))
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    # Phase 6 (PROJECTS_SPEC.md §9): wiki + LLM-Wiki skill + global
+    # CLAUDE.md bootstrap. First-write-only — once a file exists the
+    # harness leaves it alone so user / Coach edits aren't reverted.
+    # Surfaces in /api/health under `wiki`.
+    try:
+        from server.paths import bootstrap_global_resources
+        status = bootstrap_global_resources()
+        logger.info("global bootstrap: %s", status)
+    except Exception:
+        logger.exception("bootstrap_global_resources failed (non-fatal)")
+    # Phase 7: rebuild wiki/INDEX.md from the current tree so any
+    # out-of-band wiki edits since last boot (manual file copy, sync
+    # from kDrive) are reflected on the first /api/files/tree hit.
+    try:
+        from server.paths import update_wiki_index
+        update_wiki_index()
+    except Exception:
+        logger.exception("update_wiki_index failed (non-fatal)")
     # Crash recovery — reset orphaned state left over from an unclean
     # shutdown. Happens right after init_db so subsequent reads see
     # consistent status. Cheap no-op on a clean DB.
@@ -177,7 +205,13 @@ async def lifespan(app: FastAPI):
             )
     except Exception:
         logger.exception("crash_recover failed (non-fatal)")
-    ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    # Attachments are per-project (PROJECTS_SPEC.md §4); the upload
+    # handler lazily creates the directory under the active project.
+    # Honor the legacy env override at boot if set so tests + pinned
+    # deploys see an existing directory.
+    _att_override = os.environ.get("HARNESS_ATTACHMENTS_DIR")
+    if _att_override:
+        Path(_att_override).mkdir(parents=True, exist_ok=True)
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     # Per-slot symlinks so agents can say "Read ./uploads/foo.pdf"
@@ -237,19 +271,19 @@ async def lifespan(app: FastAPI):
     # own one-off task that opened/closed a connection per event.
     from server.events import start_event_writer
     await start_event_writer()
-    # Background tasks: flush event log to kDrive + hourly SQLite
-    # snapshot. Both are no-ops when kDrive is disabled so running them
-    # unconditionally is safe — picks up activation without restart.
-    sync_task = asyncio.create_task(flush_loop())
+    # Background tasks: kDrive snapshot + project / global file sync
+    # (PROJECTS_SPEC.md §5). The legacy flush_loop / uploads_pull_loop /
+    # outputs_push_loop are retired — per-project sync covers the same
+    # surface under the spec's TOT/projects/<slug>/ layout.
     snapshot_task = asyncio.create_task(snapshot_loop())
+    project_sync_task = asyncio.create_task(project_sync_loop())
+    global_sync_task = asyncio.create_task(global_sync_loop())
     coach_task = asyncio.create_task(coach_tick_loop())
     coach_repeat_task = asyncio.create_task(coach_repeat_loop())
     stale_task_task = asyncio.create_task(stale_task_watch_loop())
     trim_task = asyncio.create_task(events_trim_loop())
     att_trim_task = asyncio.create_task(attachments_trim_loop())
     sessions_trim_task = asyncio.create_task(sessions_trim_loop())
-    uploads_task = asyncio.create_task(uploads_pull_loop())
-    outputs_task = asyncio.create_task(outputs_push_loop())
     from server.telegram import start_telegram_bridge, stop_telegram_bridge
     # Telegram bridge owns its own task handle (so the UI can reload it
     # live via /api/team/telegram). Lifespan only kicks it off + tears
@@ -258,7 +292,7 @@ async def lifespan(app: FastAPI):
         await start_telegram_bridge()
     except Exception:
         logger.exception("telegram bridge failed to start (non-fatal)")
-    bg_tasks = (sync_task, snapshot_task, coach_task, coach_repeat_task, stale_task_task, trim_task, att_trim_task, sessions_trim_task, uploads_task, outputs_task)
+    bg_tasks = (snapshot_task, project_sync_task, global_sync_task, coach_task, coach_repeat_task, stale_task_task, trim_task, att_trim_task, sessions_trim_task)
     try:
         yield
     finally:
@@ -297,6 +331,14 @@ if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 else:
     logger.error("static dir not found at %s — /static routes will 404", STATIC_DIR)
+
+# Phase 3 — Project CRUD + activation API. The router is built lazily
+# from server.projects_api so we can pass the auth dependencies defined
+# above (avoids circular imports).
+from server.projects_api import build_router as _build_projects_router
+app.include_router(_build_projects_router(
+    require_token=require_token, audit_actor=audit_actor,
+))
 
 
 # ------------------------------------------------------------------
@@ -525,6 +567,30 @@ async def health() -> JSONResponse:
     else:
         checks["workspaces"] = {"ok": True, "skipped": True}
 
+    # 8. Wiki + LLM-Wiki skill + global CLAUDE.md (Phase 6, §9). Status
+    # is set on every boot by `bootstrap_global_resources()`. We re-stat
+    # the three sentinel files here so an out-of-band rm shows as
+    # "missing" without requiring a restart. Cheap (3 stats).
+    from server.paths import bootstrap_status, global_paths
+    gp = global_paths()
+    skill_md = gp.skills / "llm-wiki" / "SKILL.md"
+    sentinels = [gp.wiki_index, skill_md, gp.claude_md]
+    if all(p.exists() for p in sentinels):
+        # Either present-from-prior-boot or bootstrapped this boot —
+        # both are operationally fine; UI distinguishes via the verb.
+        wiki_status = bootstrap_status() or "present"
+        if wiki_status == "missing":
+            wiki_status = "present"  # files appeared after boot fail
+        checks["wiki"] = {"ok": True, "status": wiki_status}
+    else:
+        missing = [str(p) for p in sentinels if not p.exists()]
+        checks["wiki"] = {
+            "ok": False,
+            "status": "missing",
+            "missing_files": missing,
+        }
+        overall_ok = False
+
     body: dict[str, object] = {
         "ok": overall_ok,
         "auth_required": bool(HARNESS_TOKEN),
@@ -660,14 +726,24 @@ async def status() -> dict[str, object]:
 
 @app.get("/api/agents", dependencies=[Depends(require_token)])
 async def list_agents() -> dict[str, list[dict[str, Any]]]:
+    project_id = await resolve_active_project()
     c = await configured_conn()
     try:
+        # JOIN agents with the active-project identity + session rows
+        # so the UI sees this project's name/role/brief/session_id.
         cur = await c.execute(
-            "SELECT id, kind, name, role, brief, status, current_task_id, "
-            "model, workspace_path, session_id, cost_estimate_usd, "
-            "started_at, last_heartbeat, locked "
-            "FROM agents ORDER BY "
-            "CASE kind WHEN 'coach' THEN 0 ELSE 1 END, id"
+            "SELECT a.id, a.kind, "
+            "       r.name AS name, r.role AS role, r.brief AS brief, "
+            "       a.status, a.current_task_id, a.model, a.workspace_path, "
+            "       s.session_id AS session_id, "
+            "       a.cost_estimate_usd, a.started_at, a.last_heartbeat, a.locked "
+            "FROM agents a "
+            "LEFT JOIN agent_project_roles r "
+            "  ON r.slot = a.id AND r.project_id = ? "
+            "LEFT JOIN agent_sessions s "
+            "  ON s.slot = a.id AND s.project_id = ? "
+            "ORDER BY CASE a.kind WHEN 'coach' THEN 0 ELSE 1 END, a.id",
+            (project_id, project_id),
         )
         rows = await cur.fetchall()
     finally:
@@ -855,34 +931,50 @@ async def set_agent_identity(
     # fields render inline in the pane header, any newlines break layout.
     def _single_line(s: str | None) -> str | None:
         return " ".join(s.split()).strip() if s else (None if s is None else "")
-    sets = []
-    vals: list[object] = []
+    name_arg: str | None = None
+    role_arg: str | None = None
+    update_name = False
+    update_role = False
     if req.name is not None:
         name = _single_line(req.name) or ""
         if len(name) > 60:
             raise HTTPException(400, detail="name too long (max 60 chars)")
-        sets.append("name = ?")
-        vals.append(name if name else None)
+        name_arg = name if name else None
+        update_name = True
     if req.role is not None:
         role = _single_line(req.role) or ""
         if len(role) > 120:
             raise HTTPException(400, detail="role too long (max 120 chars)")
-        sets.append("role = ?")
-        vals.append(role if role else None)
-    if not sets:
+        role_arg = role if role else None
+        update_role = True
+    if not (update_name or update_role):
         return {"ok": True, "agent_id": agent_id, "changed": 0}
+    project_id = await resolve_active_project()
     c = await configured_conn()
     try:
-        vals.append(agent_id)
-        cur = await c.execute(
-            f"UPDATE agents SET {', '.join(sets)} WHERE id = ?", tuple(vals)
+        cur = await c.execute("SELECT 1 FROM agents WHERE id = ?", (agent_id,))
+        if not await cur.fetchone():
+            raise HTTPException(404, detail=f"agent {agent_id} not found")
+        # Upsert per-project identity. INSERT covers fields the caller
+        # provided; ON CONFLICT updates only those fields, leaving
+        # untouched ones intact so a partial PUT (just name, just role)
+        # behaves correctly.
+        await c.execute(
+            "INSERT INTO agent_project_roles (slot, project_id, name, role) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(slot, project_id) DO UPDATE SET "
+            + ", ".join(
+                clause for clause, keep in (
+                    ("name = excluded.name", update_name),
+                    ("role = excluded.role", update_role),
+                ) if keep
+            ),
+            (agent_id, project_id, name_arg, role_arg),
         )
-        changed = cur.rowcount
+        changed = 1
         await c.commit()
     finally:
         await c.close()
-    if changed == 0:
-        raise HTTPException(404, detail=f"agent {agent_id} not found")
     await bus.publish(
         {
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -919,18 +1011,23 @@ async def set_agent_brief(
     body = req.brief or ""
     if len(body) > 8000:
         raise HTTPException(400, detail=f"brief too long ({len(body)} chars, max 8000)")
+    project_id = await resolve_active_project()
     c = await configured_conn()
     try:
-        cur = await c.execute(
-            "UPDATE agents SET brief = ? WHERE id = ?",
-            (body if body else None, agent_id),
+        # Verify slot exists in the global agents roster.
+        cur = await c.execute("SELECT 1 FROM agents WHERE id = ?", (agent_id,))
+        if not await cur.fetchone():
+            raise HTTPException(404, detail=f"agent {agent_id} not found")
+        # Upsert the per-project brief.
+        await c.execute(
+            "INSERT INTO agent_project_roles (slot, project_id, brief) "
+            "VALUES (?, ?, ?) "
+            "ON CONFLICT(slot, project_id) DO UPDATE SET brief = excluded.brief",
+            (agent_id, project_id, body if body else None),
         )
-        changed = cur.rowcount
         await c.commit()
     finally:
         await c.close()
-    if changed == 0:
-        raise HTTPException(404, detail=f"agent {agent_id} not found")
     await bus.publish(
         {
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -2036,17 +2133,22 @@ async def get_agent_context(
         _context_window_for,
         _session_context_estimate,
     )
+    project_id = await resolve_active_project()
     c = await configured_conn()
     try:
+        # Verify the slot exists, then read the per-(slot, project) session.
+        cur = await c.execute("SELECT 1 FROM agents WHERE id = ?", (agent_id,))
+        if not await cur.fetchone():
+            raise HTTPException(404, detail=f"agent {agent_id} not found")
         cur = await c.execute(
-            "SELECT session_id FROM agents WHERE id = ?", (agent_id,)
+            "SELECT session_id FROM agent_sessions "
+            "WHERE slot = ? AND project_id = ?",
+            (agent_id, project_id),
         )
         row = await cur.fetchone()
     finally:
         await c.close()
-    if row is None:
-        raise HTTPException(404, detail=f"agent {agent_id} not found")
-    session_id = dict(row).get("session_id")
+    session_id = dict(row).get("session_id") if row else None
     used = 0
     if session_id:
         used = await _session_context_estimate(session_id)
@@ -2075,17 +2177,21 @@ async def clear_session(
     """
     if not (agent_id == "coach" or (agent_id.startswith("p") and agent_id[1:].isdigit() and 1 <= int(agent_id[1:]) <= 10)):
         raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
+    project_id = await resolve_active_project()
     c = await configured_conn()
     try:
-        cur = await c.execute(
-            "UPDATE agents SET session_id = NULL WHERE id = ?", (agent_id,)
+        # Verify slot exists in the global agents roster.
+        cur = await c.execute("SELECT 1 FROM agents WHERE id = ?", (agent_id,))
+        if not await cur.fetchone():
+            raise HTTPException(404, detail=f"agent {agent_id} not found")
+        # Drop the per-(slot, project) session row entirely.
+        await c.execute(
+            "DELETE FROM agent_sessions WHERE slot = ? AND project_id = ?",
+            (agent_id, project_id),
         )
-        changed = cur.rowcount
         await c.commit()
     finally:
         await c.close()
-    if changed == 0:
-        raise HTTPException(404, detail=f"agent {agent_id} not found")
     await bus.publish(
         {
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -2174,12 +2280,13 @@ async def clear_sessions_batch(
                 targets.append(sid)
     if not targets:
         return {"ok": True, "cleared": []}
+    project_id = await resolve_active_project()
     c = await configured_conn()
     try:
         placeholders = ",".join("?" * len(targets))
         cur = await c.execute(
-            f"UPDATE agents SET session_id = NULL WHERE id IN ({placeholders})",
-            targets,
+            f"DELETE FROM agent_sessions WHERE project_id = ? AND slot IN ({placeholders})",
+            [project_id, *targets],
         )
         updated = cur.rowcount if cur.rowcount is not None else 0
         await c.commit()
@@ -2205,8 +2312,9 @@ async def clear_sessions_batch(
 
 @app.get("/api/tasks", dependencies=[Depends(require_token)])
 async def list_tasks(status: str | None = None, owner: str | None = None) -> dict[str, Any]:
-    where_parts: list[str] = []
-    params: list[Any] = []
+    project_id = await resolve_active_project()
+    where_parts: list[str] = ["project_id = ?"]
+    params: list[Any] = [project_id]
     if status:
         where_parts.append("status = ?")
         params.append(status)
@@ -2216,7 +2324,7 @@ async def list_tasks(status: str | None = None, owner: str | None = None) -> dic
         else:
             where_parts.append("owner = ?")
             params.append(owner)
-    clause = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+    clause = " WHERE " + " AND ".join(where_parts)
 
     c = await configured_conn()
     try:
@@ -2234,17 +2342,21 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
     """Create a top-level task from the UI (attributed to 'human')."""
     task_id = f"t-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:8]}"
     parent_id = req.parent_id or None
+    project_id = await resolve_active_project()
 
     c = await configured_conn()
     try:
         if parent_id:
-            cur = await c.execute("SELECT id FROM tasks WHERE id = ?", (parent_id,))
+            cur = await c.execute(
+                "SELECT id FROM tasks WHERE id = ? AND project_id = ?",
+                (parent_id, project_id),
+            )
             if (await cur.fetchone()) is None:
                 raise HTTPException(404, detail=f"parent_id {parent_id} not found")
         await c.execute(
-            "INSERT INTO tasks (id, title, description, parent_id, priority, created_by) "
-            "VALUES (?, ?, ?, ?, ?, 'human')",
-            (task_id, req.title, req.description, parent_id, req.priority),
+            "INSERT INTO tasks (id, project_id, title, description, parent_id, priority, created_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'human')",
+            (task_id, project_id, req.title, req.description, parent_id, req.priority),
         )
         await c.commit()
     finally:
@@ -2271,10 +2383,12 @@ async def cancel_task_from_human(task_id: str) -> dict[str, Any]:
 
     Noop (but returns 200) if the task is already done or cancelled —
     the UI may race against an in-flight update."""
+    project_id = await resolve_active_project()
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT id, status, owner FROM tasks WHERE id = ?", (task_id,)
+            "SELECT id, status, owner FROM tasks WHERE id = ? AND project_id = ?",
+            (task_id, project_id),
         )
         row = await cur.fetchone()
         if row is None:
@@ -2284,7 +2398,8 @@ async def cancel_task_from_human(task_id: str) -> dict[str, Any]:
             return {"ok": True, "task_id": task_id, "already": task["status"]}
         old_status = task["status"]
         await c.execute(
-            "UPDATE tasks SET status = 'cancelled' WHERE id = ?", (task_id,)
+            "UPDATE tasks SET status = 'cancelled' WHERE id = ? AND project_id = ?",
+            (task_id, project_id),
         )
         if task["owner"]:
             await c.execute(
@@ -2521,12 +2636,13 @@ async def send_human_message(req: HumanMessageRequest) -> dict[str, Any]:
         raise HTTPException(
             400, detail=f"invalid recipient '{to}'"
         )
+    project_id = await resolve_active_project()
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "INSERT INTO messages (from_id, to_id, subject, body, priority) "
-            "VALUES ('human', ?, ?, ?, ?) RETURNING id",
-            (to, req.subject, req.body, req.priority),
+            "INSERT INTO messages (project_id, from_id, to_id, subject, body, priority) "
+            "VALUES (?, 'human', ?, ?, ?, ?) RETURNING id",
+            (project_id, to, req.subject, req.body, req.priority),
         )
         row = await cur.fetchone()
         msg_id = dict(row)["id"] if row else None
@@ -2570,13 +2686,15 @@ async def list_messages(limit: int = 50) -> dict[str, Any]:
     """Recent messages (newest first, capped). Full body included —
     the UI decides how much to show."""
     limit = max(1, min(limit, 200))
+    project_id = await resolve_active_project()
     c = await configured_conn()
     try:
         cur = await c.execute(
             "SELECT id, from_id, to_id, subject, body, sent_at, "
             "in_reply_to, priority "
-            "FROM messages ORDER BY id DESC LIMIT ?",
-            (limit,),
+            "FROM messages WHERE project_id = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (project_id, limit),
         )
         rows = await cur.fetchall()
     finally:
@@ -2588,12 +2706,15 @@ async def list_messages(limit: int = 50) -> dict[str, Any]:
 async def list_memory() -> dict[str, Any]:
     """List shared-memory topics (flat table, not paginated — this
     harness has at most a few dozen memory docs in practice)."""
+    project_id = await resolve_active_project()
     c = await configured_conn()
     try:
         cur = await c.execute(
             "SELECT topic, last_updated, last_updated_by, version, "
             "LENGTH(content) AS size FROM memory_docs "
-            "ORDER BY last_updated DESC"
+            "WHERE project_id = ? "
+            "ORDER BY last_updated DESC",
+            (project_id,),
         )
         rows = await cur.fetchall()
     finally:
@@ -2614,25 +2735,28 @@ async def write_memory_from_human(req: HumanMemoryWrite) -> dict[str, Any]:
     append). last_updated_by is 'human'. Emits 'memory_updated' so
     open agents pick up the change on their next read_memory."""
     now = datetime.now(timezone.utc).isoformat()
+    project_id = await resolve_active_project()
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT version FROM memory_docs WHERE topic = ?", (req.topic,)
+            "SELECT version FROM memory_docs WHERE topic = ? AND project_id = ?",
+            (req.topic, project_id),
         )
         row = await cur.fetchone()
         if row:
             new_version = int(dict(row)["version"]) + 1
             await c.execute(
                 "UPDATE memory_docs SET content = ?, last_updated = ?, "
-                "last_updated_by = 'human', version = ? WHERE topic = ?",
-                (req.content, now, new_version, req.topic),
+                "last_updated_by = 'human', version = ? "
+                "WHERE topic = ? AND project_id = ?",
+                (req.content, now, new_version, req.topic, project_id),
             )
         else:
             new_version = 1
             await c.execute(
-                "INSERT INTO memory_docs (topic, content, last_updated, "
-                "last_updated_by, version) VALUES (?, ?, ?, 'human', ?)",
-                (req.topic, req.content, now, new_version),
+                "INSERT INTO memory_docs (project_id, topic, content, last_updated, "
+                "last_updated_by, version) VALUES (?, ?, ?, ?, 'human', ?)",
+                (project_id, req.topic, req.content, now, new_version),
             )
         await c.commit()
     finally:
@@ -2657,12 +2781,13 @@ async def get_memory(topic: str) -> dict[str, Any]:
     # Validate with the same regex the MCP tool enforces on write.
     if not re.fullmatch(r"[a-z0-9][a-z0-9\-]{0,63}", topic):
         raise HTTPException(400, detail="invalid topic")
+    project_id = await resolve_active_project()
     c = await configured_conn()
     try:
         cur = await c.execute(
             "SELECT topic, content, last_updated, last_updated_by, version "
-            "FROM memory_docs WHERE topic = ?",
-            (topic,),
+            "FROM memory_docs WHERE topic = ? AND project_id = ?",
+            (topic, project_id),
         )
         row = await cur.fetchone()
     finally:
@@ -2676,13 +2801,13 @@ async def get_memory(topic: str) -> dict[str, Any]:
 async def list_decisions() -> dict[str, Any]:
     """List local decision records (recent first, capped at 50).
 
-    Decisions live primarily on kDrive at /harness/decisions/<file>.md
-    with a /data/decisions/ local fallback. This endpoint reads the
-    LOCAL store only — it's the fast path. The kDrive copy is the
-    durable / human-readable mirror; browse it directly from
-    Infomaniak's web UI to see everything ever written.
+    Decisions live primarily on kDrive at
+    `TOT/projects/<active>/decisions/<file>.md` with a local fallback
+    under `/data/projects/<active>/decisions/`. This endpoint reads
+    the local store for the active project only.
     """
-    local_dir = Path(os.environ.get("HARNESS_DECISIONS_DIR", "/data/decisions"))
+    project_id = await resolve_active_project()
+    local_dir = project_paths(project_id).decisions
     if not local_dir.is_dir():
         return {"decisions": [], "dir": str(local_dir), "exists": False}
 
@@ -2722,7 +2847,8 @@ async def get_decision(filename: str) -> dict[str, Any]:
     """
     if "/" in filename or ".." in filename or not filename.endswith(".md"):
         raise HTTPException(400, detail="invalid filename")
-    local_dir = Path(os.environ.get("HARNESS_DECISIONS_DIR", "/data/decisions"))
+    project_id = await resolve_active_project()
+    local_dir = project_paths(project_id).decisions
     target = local_dir / filename
     if not target.is_file():
         raise HTTPException(404, detail="not found")
@@ -2859,6 +2985,19 @@ async def files_write(
             "size": result["size"],
         }
     )
+    # Phase 7 (PROJECTS_SPEC.md §14 Resolved: INDEX.md maintenance):
+    # rebuild wiki/INDEX.md when a write lands under the wiki tree
+    # (either via the global root + "wiki/..." or — once the wiki
+    # gets per-project sub-roots — via project-sub roots resolving
+    # under /data/wiki/). Skip when the write IS the index itself
+    # to avoid a feedback loop. Best-effort: a rebuild failure
+    # doesn't fail the user's write call.
+    if root == "global" and path.startswith("wiki/") and not path.endswith("INDEX.md"):
+        try:
+            from server.paths import update_wiki_index
+            update_wiki_index()
+        except Exception:
+            logger.exception("update_wiki_index failed (non-fatal)")
     return {"ok": True, **result}
 
 
@@ -2875,8 +3014,9 @@ async def list_turns(
     a simple LIMIT without ordering server-side).
     """
     limit = max(1, min(limit, 1000))
-    where: list[str] = ["id > ?"]
-    params: list[Any] = [since_id]
+    project_id = await resolve_active_project()
+    where: list[str] = ["id > ?", "project_id = ?"]
+    params: list[Any] = [since_id, project_id]
     if agent:
         where.append("agent_id = ?")
         params.append(agent)
@@ -2909,6 +3049,7 @@ async def turns_summary(hours: int = 24) -> dict[str, Any]:
     """
     hours = max(1, min(hours, 24 * 30))  # 1h..30d
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    project_id = await resolve_active_project()
     c = await configured_conn()
     try:
         cur = await c.execute(
@@ -2916,15 +3057,15 @@ async def turns_summary(hours: int = 24) -> dict[str, Any]:
             "COALESCE(SUM(cost_usd), 0) AS cost_usd, "
             "COALESCE(AVG(duration_ms), 0) AS avg_duration_ms, "
             "SUM(is_error) AS error_count "
-            "FROM turns WHERE ended_at >= ? "
+            "FROM turns WHERE ended_at >= ? AND project_id = ? "
             "GROUP BY agent_id ORDER BY cost_usd DESC",
-            (cutoff,),
+            (cutoff, project_id),
         )
         per_agent = [dict(r) for r in await cur.fetchall()]
         cur = await c.execute(
             "SELECT COUNT(*) AS count, COALESCE(SUM(cost_usd), 0) AS cost_usd "
-            "FROM turns WHERE ended_at >= ?",
-            (cutoff,),
+            "FROM turns WHERE ended_at >= ? AND project_id = ?",
+            (cutoff, project_id),
         )
         total_row = dict(await cur.fetchone())
     finally:
@@ -2962,8 +3103,11 @@ async def list_events(
     escalations across page reloads.
     """
     limit = max(1, min(limit, 1000))
-    where_parts: list[str] = ["id > ?"]
-    params: list[Any] = [since_id]
+    project_id = await resolve_active_project()
+    # Scope to the active project so opening a pane after a project
+    # switch doesn't surface another project's history (§16).
+    where_parts: list[str] = ["project_id = ?", "id > ?"]
+    params: list[Any] = [project_id, since_id]
     if before_id is not None and before_id > 0:
         where_parts.append("id < ?")
         params.append(before_id)
@@ -3035,10 +3179,13 @@ async def list_events(
 
 @app.post("/api/attachments", dependencies=[Depends(require_token)])
 async def upload_attachment(file: UploadFile = File(...)) -> dict[str, Any]:
-    """Accept an image upload, store under /data/attachments/<id>.<ext>.
+    """Accept an image upload, store under the active project's
+    `/data/projects/<slug>/attachments/<id>.<ext>` (PROJECTS_SPEC.md §4).
 
     Returns a stable id + filesystem path. The caller (frontend) includes
-    the path in the prompt text so the agent can Read the image.
+    the path in the prompt text so the agent can Read the image. Pastes
+    in conversations from a different project will not resolve after a
+    project switch — same trade-off as cross-project file links per §7.
     """
     filename = file.filename or "upload"
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -3048,9 +3195,11 @@ async def upload_attachment(file: UploadFile = File(...)) -> dict[str, Any]:
             detail=f"unsupported extension '{ext}'. Allowed: {sorted(ALLOWED_EXT)}",
         )
 
+    project_id = await resolve_active_project()
+    attachments_dir = _attachments_dir_for(project_id)
     att_id = uuid.uuid4().hex[:12]
-    target = ATTACHMENTS_DIR / f"{att_id}.{ext}"
-    ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    target = attachments_dir / f"{att_id}.{ext}"
+    attachments_dir.mkdir(parents=True, exist_ok=True)
 
     with target.open("wb") as fp:
         shutil.copyfileobj(file.file, fp)
@@ -3070,7 +3219,8 @@ async def get_attachment(filename: str):
     # Reject path traversal attempts
     if "/" in filename or ".." in filename:
         raise HTTPException(400, detail="invalid filename")
-    target = ATTACHMENTS_DIR / filename
+    project_id = await resolve_active_project()
+    target = _attachments_dir_for(project_id) / filename
     if not target.exists() or not target.is_file():
         raise HTTPException(404)
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""

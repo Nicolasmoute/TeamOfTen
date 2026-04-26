@@ -28,7 +28,8 @@ async def _insert_event(ts_iso: str, agent_id: str = "p1", type_: str = "text") 
     c = await configured_conn()
     try:
         await c.execute(
-            "INSERT INTO events (ts, agent_id, type, payload) VALUES (?, ?, ?, '{}')",
+            "INSERT INTO events (ts, agent_id, project_id, type, payload) "
+            "VALUES (?, ?, 'misc', ?, '{}')",
             (ts_iso, agent_id, type_),
         )
         await c.commit()

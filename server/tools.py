@@ -14,7 +14,7 @@ from claude_agent_sdk import create_sdk_mcp_server, tool
 from server import context as ctxmod
 from server import knowledge as knowmod
 from server import outputs as outmod
-from server.db import configured_conn
+from server.db import configured_conn, resolve_active_project
 from server.events import bus
 from server.webdav import webdav
 from server.workspaces import project_configured, workspace_dir
@@ -112,7 +112,10 @@ def build_coord_server(caller_id: str) -> Any:
             else:
                 where_parts.append("owner = ?")
                 params.append(owner)
-        clause = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        project_id = await resolve_active_project()
+        where_parts.insert(0, "project_id = ?")
+        params.insert(0, project_id)
+        clause = " WHERE " + " AND ".join(where_parts)
 
         c = await configured_conn()
         try:
@@ -168,6 +171,7 @@ def build_coord_server(caller_id: str) -> Any:
                 "(must be low, normal, high, or urgent)"
             )
 
+        project_id = await resolve_active_project()
         c = await configured_conn()
         try:
             if not caller_is_coach:
@@ -190,7 +194,8 @@ def build_coord_server(caller_id: str) -> Any:
                     parent_id = current_task
                 else:
                     cur = await c.execute(
-                        "SELECT owner FROM tasks WHERE id = ?", (parent_id,)
+                        "SELECT owner FROM tasks WHERE id = ? AND project_id = ?",
+                        (parent_id, project_id),
                     )
                     prow = await cur.fetchone()
                     if prow is None:
@@ -206,9 +211,9 @@ def build_coord_server(caller_id: str) -> Any:
 
             task_id = _new_task_id()
             await c.execute(
-                "INSERT INTO tasks (id, title, description, parent_id, "
-                "priority, created_by) VALUES (?, ?, ?, ?, ?, ?)",
-                (task_id, title, description, parent_id, priority, caller_id),
+                "INSERT INTO tasks (id, project_id, title, description, parent_id, "
+                "priority, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (task_id, project_id, title, description, parent_id, priority, caller_id),
             )
             await c.commit()
         finally:
@@ -268,18 +273,19 @@ def build_coord_server(caller_id: str) -> Any:
                     f"complete or cancel it first."
                 )
 
+            project_id = await resolve_active_project()
             # Atomic claim — race-safe via status='open' guard.
             cur = await c.execute(
                 "UPDATE tasks SET owner = ?, status = 'claimed', "
                 "claimed_at = ? WHERE id = ? AND status = 'open' "
-                "RETURNING id",
-                (caller_id, _now_iso(), task_id),
+                "AND project_id = ? RETURNING id",
+                (caller_id, _now_iso(), task_id, project_id),
             )
             updated = await cur.fetchone()
             if not updated:
                 cur = await c.execute(
-                    "SELECT status, owner FROM tasks WHERE id = ?",
-                    (task_id,),
+                    "SELECT status, owner FROM tasks WHERE id = ? AND project_id = ?",
+                    (task_id, project_id),
                 )
                 current = await cur.fetchone()
                 if not current:
@@ -336,11 +342,13 @@ def build_coord_server(caller_id: str) -> Any:
                 "in_progress, blocked, done, or cancelled)"
             )
 
+        project_id = await resolve_active_project()
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT owner, status, created_by, title FROM tasks WHERE id = ?",
-                (task_id,),
+                "SELECT owner, status, created_by, title FROM tasks "
+                "WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
             )
             row = await cur.fetchone()
             if not row:
@@ -378,8 +386,8 @@ def build_coord_server(caller_id: str) -> Any:
             if new_status in ("done", "cancelled"):
                 await c.execute(
                     "UPDATE tasks SET status = ?, completed_at = ? "
-                    "WHERE id = ?",
-                    (new_status, now, task_id),
+                    "WHERE id = ? AND project_id = ?",
+                    (new_status, now, task_id, project_id),
                 )
                 # Free up the player who was on this task.
                 if current_owner is not None:
@@ -390,8 +398,8 @@ def build_coord_server(caller_id: str) -> Any:
                     )
             else:
                 await c.execute(
-                    "UPDATE tasks SET status = ? WHERE id = ?",
-                    (new_status, task_id),
+                    "UPDATE tasks SET status = ? WHERE id = ? AND project_id = ?",
+                    (new_status, task_id, project_id),
                 )
             await c.commit()
         finally:
@@ -509,18 +517,20 @@ def build_coord_server(caller_id: str) -> Any:
                     f"complete it before reassigning."
                 )
 
+            project_id = await resolve_active_project()
             # Atomic assign — status='open' guard ensures we don't
             # clobber a task that was claimed between our SELECT and UPDATE.
             cur = await c.execute(
                 "UPDATE tasks SET owner = ?, status = 'claimed', "
                 "claimed_at = ? WHERE id = ? AND status = 'open' "
-                "RETURNING id",
-                (to, _now_iso(), task_id),
+                "AND project_id = ? RETURNING id",
+                (to, _now_iso(), task_id, project_id),
             )
             updated = await cur.fetchone()
             if not updated:
                 cur = await c.execute(
-                    "SELECT status, owner FROM tasks WHERE id = ?", (task_id,)
+                    "SELECT status, owner FROM tasks WHERE id = ? AND project_id = ?",
+                    (task_id, project_id),
                 )
                 current = await cur.fetchone()
                 if not current:
@@ -626,12 +636,13 @@ def build_coord_server(caller_id: str) -> Any:
                 f"Message not sent."
             )
 
+        project_id = await resolve_active_project()
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "INSERT INTO messages (from_id, to_id, subject, body, priority) "
-                "VALUES (?, ?, ?, ?, ?) RETURNING id",
-                (caller_id, to, subject, body, priority),
+                "INSERT INTO messages (project_id, from_id, to_id, subject, body, priority) "
+                "VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+                (project_id, caller_id, to, subject, body, priority),
             )
             row = await cur.fetchone()
             msg_id = dict(row)["id"] if row else None
@@ -696,6 +707,7 @@ def build_coord_server(caller_id: str) -> Any:
         # it's queued but invisible while locked. Human and peer-Player
         # messages pass through unaffected.
         reader_locked = await _is_locked(caller_id)
+        project_id = await resolve_active_project()
 
         c = await configured_conn()
         try:
@@ -706,13 +718,14 @@ def build_coord_server(caller_id: str) -> Any:
                 "SELECT m.id, m.from_id, m.to_id, m.subject, m.body, "
                 "       m.sent_at, m.priority "
                 "FROM messages m "
-                "WHERE (m.to_id = ? OR m.to_id = 'broadcast') "
+                "WHERE m.project_id = ? "
+                "  AND (m.to_id = ? OR m.to_id = 'broadcast') "
                 "  AND NOT EXISTS ("
                 "    SELECT 1 FROM message_reads r "
                 "    WHERE r.message_id = m.id AND r.agent_id = ?"
                 "  ) "
             )
-            params: tuple[Any, ...] = (caller_id, caller_id)
+            params: tuple[Any, ...] = (project_id, caller_id, caller_id)
             if reader_locked:
                 sql += "  AND m.from_id != 'coach' "
             sql += "ORDER BY m.sent_at ASC"
@@ -755,12 +768,15 @@ def build_coord_server(caller_id: str) -> Any:
         {},
     )
     async def list_memory(args: dict[str, Any]) -> dict[str, Any]:
+        project_id = await resolve_active_project()
         c = await configured_conn()
         try:
             cur = await c.execute(
                 "SELECT topic, version, last_updated, last_updated_by, "
                 "length(content) AS size FROM memory_docs "
-                "ORDER BY last_updated DESC LIMIT 200"
+                "WHERE project_id = ? "
+                "ORDER BY last_updated DESC LIMIT 200",
+                (project_id,),
             )
             rows = await cur.fetchall()
         finally:
@@ -794,12 +810,13 @@ def build_coord_server(caller_id: str) -> Any:
                 f"invalid topic '{topic}' — must be lowercase alphanumeric "
                 "with dashes, 1-64 chars, starting with a letter or digit"
             )
+        project_id = await resolve_active_project()
         c = await configured_conn()
         try:
             cur = await c.execute(
                 "SELECT content, version, last_updated, last_updated_by "
-                "FROM memory_docs WHERE topic = ?",
-                (topic,),
+                "FROM memory_docs WHERE topic = ? AND project_id = ?",
+                (topic, project_id),
             )
             row = await cur.fetchone()
         finally:
@@ -844,20 +861,21 @@ def build_coord_server(caller_id: str) -> Any:
                 f"content too long ({len(content)} chars, max {MEMORY_CONTENT_MAX})"
             )
         now = _now_iso()
+        project_id = await resolve_active_project()
         c = await configured_conn()
         try:
             # UPSERT: insert with version=1, or increment on conflict.
             cur = await c.execute(
                 "INSERT INTO memory_docs "
-                "(topic, content, last_updated, last_updated_by, version) "
-                "VALUES (?, ?, ?, ?, 1) "
-                "ON CONFLICT(topic) DO UPDATE SET "
+                "(project_id, topic, content, last_updated, last_updated_by, version) "
+                "VALUES (?, ?, ?, ?, ?, 1) "
+                "ON CONFLICT(project_id, topic) DO UPDATE SET "
                 "  content = excluded.content, "
                 "  last_updated = excluded.last_updated, "
                 "  last_updated_by = excluded.last_updated_by, "
                 "  version = memory_docs.version + 1 "
                 "RETURNING version",
-                (topic, content, now, caller_id),
+                (project_id, topic, content, now, caller_id),
             )
             row = await cur.fetchone()
             version = dict(row)["version"] if row else 1
@@ -889,7 +907,9 @@ def build_coord_server(caller_id: str) -> Any:
                 f"-->\n\n"
             )
             asyncio.create_task(
-                webdav.write_text(f"memory/{topic}.md", header + content)
+                webdav.write_text(
+                    f"projects/{project_id}/memory/{topic}.md", header + content
+                )
             )
 
         return _ok(
@@ -1197,17 +1217,19 @@ def build_coord_server(caller_id: str) -> Any:
 
         # Prefer kDrive (the human-readable durable store). Fall back to the
         # local /data volume so offline agents still get a record.
+        project_id = await resolve_active_project()
+        from server.paths import project_paths
         location = None
         filename = base_filename
         if webdav.enabled:
-            ok = await webdav.write_text(f"decisions/{filename}", content)
+            ok = await webdav.write_text(
+                f"projects/{project_id}/decisions/{filename}", content
+            )
             if ok:
-                location = f"kDrive:decisions/{filename}"
+                location = f"kDrive:projects/{project_id}/decisions/{filename}"
         if location is None:
             # Local fallback when kDrive disabled or write failed.
-            local_dir = Path(
-                os.environ.get("HARNESS_DECISIONS_DIR", "/data/decisions")
-            )
+            local_dir = project_paths(project_id).decisions
             try:
                 local_dir.mkdir(parents=True, exist_ok=True)
                 # Collision check: append a numeric suffix if needed
@@ -1310,12 +1332,19 @@ def build_coord_server(caller_id: str) -> Any:
         {},
     )
     async def list_team(args: dict[str, Any]) -> dict[str, Any]:
+        project_id = await resolve_active_project()
         c = await configured_conn()
         try:
+            # JOIN agents with agent_project_roles for the active project
+            # so the response carries this project's name/role/brief.
             cur = await c.execute(
-                "SELECT id, kind, name, role, brief, status, current_task_id, locked "
-                "FROM agents ORDER BY "
-                "CASE kind WHEN 'coach' THEN 0 ELSE 1 END, id"
+                "SELECT a.id, a.kind, r.name AS name, r.role AS role, "
+                "       r.brief AS brief, a.status, a.current_task_id, a.locked "
+                "FROM agents a "
+                "LEFT JOIN agent_project_roles r "
+                "  ON r.slot = a.id AND r.project_id = ? "
+                "ORDER BY CASE a.kind WHEN 'coach' THEN 0 ELSE 1 END, a.id",
+                (project_id,),
             )
             rows = await cur.fetchall()
         finally:
@@ -1385,14 +1414,22 @@ def build_coord_server(caller_id: str) -> Any:
         if len(role) > 300:
             return _err(f"role too long ({len(role)} chars, max 300)")
 
+        # Verify the player slot exists in the global agents roster
+        # before writing per-project identity.
+        project_id = await resolve_active_project()
         c = await configured_conn()
         try:
-            cur = await c.execute(
-                "UPDATE agents SET name = ?, role = ? WHERE id = ?",
-                (name or None, role or None, pid),
-            )
-            if cur.rowcount == 0:
+            cur = await c.execute("SELECT 1 FROM agents WHERE id = ?", (pid,))
+            if not await cur.fetchone():
                 return _err(f"player '{pid}' not found")
+            # Upsert into agent_project_roles for the active project.
+            await c.execute(
+                "INSERT INTO agent_project_roles (slot, project_id, name, role) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(slot, project_id) DO UPDATE SET "
+                "  name = excluded.name, role = excluded.role",
+                (pid, project_id, name or None, role or None),
+            )
             await c.commit()
         finally:
             await c.close()

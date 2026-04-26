@@ -40,7 +40,7 @@ from typing import Any
 
 import httpx
 
-from server.db import configured_conn
+from server.db import configured_conn, resolve_active_project
 from server.events import bus
 
 logger = logging.getLogger("harness.telegram")
@@ -194,12 +194,13 @@ async def _post_human_message(chat_id: int, body: str) -> None:
     body = body.strip()[:_INBOUND_BODY_MAX]
     if not body:
         return
+    project_id = await resolve_active_project()
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "INSERT INTO messages (from_id, to_id, subject, body, priority) "
-            "VALUES ('human', 'coach', ?, ?, 'normal') RETURNING id",
-            (f"telegram:{chat_id}", body),
+            "INSERT INTO messages (project_id, from_id, to_id, subject, body, priority) "
+            "VALUES (?, 'human', 'coach', ?, ?, 'normal') RETURNING id",
+            (project_id, f"telegram:{chat_id}", body),
         )
         row = await cur.fetchone()
         msg_id = dict(row)["id"] if row else None

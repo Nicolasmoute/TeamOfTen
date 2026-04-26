@@ -32,12 +32,13 @@ async def test_turns_insert_roundtrip(fresh_db: str) -> None:
     try:
         await c.execute(
             "INSERT INTO turns ("
-            "agent_id, started_at, ended_at, duration_ms, cost_usd, "
+            "agent_id, project_id, started_at, ended_at, duration_ms, cost_usd, "
             "session_id, num_turns, stop_reason, is_error, "
             "model, plan_mode, effort"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 "p3",
+                "misc",
                 "2026-04-23T17:00:00Z",
                 "2026-04-23T17:00:05Z",
                 5000,
@@ -79,8 +80,9 @@ async def test_turns_defaults(fresh_db: str) -> None:
     c = await configured_conn()
     try:
         await c.execute(
-            "INSERT INTO turns (agent_id, started_at, ended_at) VALUES (?, ?, ?)",
-            ("coach", "2026-04-23T17:00:00Z", "2026-04-23T17:00:01Z"),
+            "INSERT INTO turns (agent_id, project_id, started_at, ended_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("coach", "misc", "2026-04-23T17:00:00Z", "2026-04-23T17:00:01Z"),
         )
         await c.commit()
         cur = await c.execute(

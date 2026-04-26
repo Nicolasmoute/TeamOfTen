@@ -218,6 +218,36 @@ class WebDAVClient:
             logger.exception("WebDAV write_bytes failed: %s", full_path)
             return False
 
+    async def write_bytes_atomic(self, relative_path: str, data: bytes) -> bool:
+        """Atomic remote write per PROJECTS_SPEC.md §5: upload to a
+        sibling temp file, then MOVE it onto the final path so a
+        partial write is never visible to readers / cloud clients.
+
+        Falls back to a non-atomic PUT if the underlying webdav4 client
+        doesn't expose a `move` (older versions / alternate libs).
+        Never raises — returns False on any failure.
+        """
+        if not self._enabled:
+            return False
+        full_path = self._resolve(relative_path)
+        try:
+            await asyncio.to_thread(self._write_bytes_atomic_sync, full_path, data)
+            return True
+        except Exception:
+            logger.exception("WebDAV write_bytes_atomic failed: %s", full_path)
+            # Best-effort fallback to a non-atomic write so a single bad
+            # MOVE doesn't strand the file. The caller's retry wrapper
+            # still gates the call so a flaky kDrive eventually surfaces
+            # via kdrive_sync_failed.
+            try:
+                await asyncio.to_thread(self._write_bytes_sync, full_path, data)
+                return True
+            except Exception:
+                logger.exception(
+                    "WebDAV atomic-write fallback PUT also failed: %s", full_path
+                )
+                return False
+
     async def read_text(self, relative_path: str) -> str | None:
         """Download a UTF-8 text file from `{HARNESS_WEBDAV_URL}/{relative_path}`.
         Returns None if missing or on any failure (not distinguished —
@@ -260,6 +290,26 @@ class WebDAVClient:
             logger.exception("WebDAV list_dir failed: %s", full_path)
             return []
 
+    async def walk_files(self, relative_path: str) -> list[str]:
+        """Recursive PROPFIND of `{HARNESS_WEBDAV_URL}/{relative_path}`
+        returning every file path beneath it as a posix-style relative
+        path (relative to `relative_path` itself).
+
+        Uses webdav4's `detail=True` so we know which entries are files
+        vs directories — no extension heuristic. Returns `[]` on missing
+        directory or any error. Used by the Phase 3 pull-on-open flow to
+        enumerate remote files reliably regardless of whether sub-folders
+        contain dots or files lack extensions.
+        """
+        if not self._enabled:
+            return []
+        full_path = self._resolve(relative_path)
+        try:
+            return await asyncio.to_thread(self._walk_files_sync, full_path)
+        except Exception:
+            logger.exception("WebDAV walk_files failed: %s", full_path)
+            return []
+
     async def remove(self, relative_path: str) -> bool:
         """Delete a single file at `{HARNESS_WEBDAV_URL}/{relative_path}`.
 
@@ -298,6 +348,39 @@ class WebDAVClient:
             overwrite=True,
         )
 
+    def _write_bytes_atomic_sync(self, full_path: str, data: bytes) -> None:
+        """Spec §5: PUT to `<path>.tmp.<uuid>`, then MOVE onto `<path>`.
+        webdav4 exposes `move(from, to)` — if missing, raise so the
+        async wrapper falls back to a non-atomic write."""
+        import uuid as _uuid
+
+        move = getattr(self._client, "move", None)
+        if not callable(move):
+            raise RuntimeError("webdav client has no move(); fallback to PUT")
+        parent = str(PurePosixPath(full_path).parent).lstrip("/")
+        if parent and parent != ".":
+            self._ensure_dir_sync(parent)
+        leaf = PurePosixPath(full_path).name
+        tmp_full = (
+            f"{parent}/{leaf}.tmp.{_uuid.uuid4().hex[:8]}"
+            if parent and parent != "."
+            else f"{leaf}.tmp.{_uuid.uuid4().hex[:8]}"
+        )
+        self._client.upload_fileobj(
+            io.BytesIO(data),
+            tmp_full,
+            overwrite=True,
+        )
+        try:
+            move(tmp_full, full_path, overwrite=True)
+        except Exception:
+            # Best-effort cleanup of the orphan temp.
+            try:
+                self._client.remove(tmp_full)
+            except Exception:
+                pass
+            raise
+
     def _read_text_sync(self, full_path: str) -> str:
         buf = io.BytesIO()
         self._client.download_fileobj(full_path, buf)
@@ -324,6 +407,53 @@ class WebDAVClient:
             name = PurePosixPath(str(entry)).name
             if name:
                 out.append(name)
+        return out
+
+    def _walk_files_sync(self, full_path: str) -> list[str]:
+        """Recursive walk via repeated `ls(detail=True)` calls.
+        webdav4 returns dicts with `name` + `type` (file|directory).
+        Returns posix-style paths relative to `full_path`.
+        """
+        out: list[str] = []
+        # Stack holds (full_remote_dir, prefix_relative_to_root).
+        stack: list[tuple[str, str]] = [(full_path.rstrip("/"), "")]
+        while stack:
+            sub_full, sub_rel = stack.pop()
+            try:
+                entries = self._client.ls(sub_full, detail=True)
+            except Exception as e:
+                if _ResourceNotFound is not None and isinstance(e, _ResourceNotFound):
+                    continue
+                # Non-fatal: log and keep walking siblings.
+                logger.warning("walk_files: ls failed at %s: %s", sub_full, e)
+                continue
+            for entry in entries:
+                # webdav4 yields dicts with at least `name` (full path
+                # on the server, e.g. `/TOT/projects/misc/foo.md`) and
+                # `type` ('file' | 'directory'). Some servers return
+                # the path with the host stripped already; either way
+                # the basename is the leaf.
+                if not isinstance(entry, dict):
+                    continue
+                etype = entry.get("type") or entry.get("kind") or ""
+                ename = entry.get("name") or entry.get("href") or ""
+                leaf = PurePosixPath(str(ename)).name
+                if not leaf:
+                    continue
+                # Skip the directory's self-entry (PROPFIND returns the
+                # collection itself when depth=1).
+                child_full = (
+                    f"{sub_full}/{leaf}" if sub_full else leaf
+                )
+                if child_full.rstrip("/") == sub_full.rstrip("/"):
+                    continue
+                child_rel = (
+                    f"{sub_rel}/{leaf}" if sub_rel else leaf
+                )
+                if etype == "directory" or etype == "collection":
+                    stack.append((child_full, child_rel))
+                else:
+                    out.append(child_rel)
         return out
 
     def _ensure_dir_sync(self, path: str) -> None:

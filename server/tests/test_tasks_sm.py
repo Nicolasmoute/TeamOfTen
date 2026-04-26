@@ -17,8 +17,8 @@ async def test_task_insert_with_valid_status(fresh_db: str) -> None:
     c = await configured_conn()
     try:
         await c.execute(
-            "INSERT INTO tasks (id, title, created_by) "
-            "VALUES ('t-1', 'test task', 'human')"
+            "INSERT INTO tasks (id, project_id, title, created_by) "
+            "VALUES ('t-1', 'misc', 'test task', 'human')"
         )
         await c.commit()
         cur = await c.execute("SELECT status FROM tasks WHERE id = 't-1'")
@@ -35,8 +35,8 @@ async def test_task_status_check_rejects_invalid(fresh_db: str) -> None:
     try:
         try:
             await c.execute(
-                "INSERT INTO tasks (id, title, created_by, status) "
-                "VALUES ('t-1', 'x', 'human', 'bogus')"
+                "INSERT INTO tasks (id, project_id, title, created_by, status) "
+                "VALUES ('t-1', 'misc', 'x', 'human', 'bogus')"
             )
             raise AssertionError("insert should have failed the CHECK")
         except Exception as e:
@@ -56,8 +56,8 @@ async def test_cancel_clears_owner_current_task(fresh_db: str) -> None:
     c = await configured_conn()
     try:
         await c.execute(
-            "INSERT INTO tasks (id, title, created_by, status, owner) "
-            "VALUES ('t-42', 'demo', 'coach', 'in_progress', 'p1')"
+            "INSERT INTO tasks (id, project_id, title, created_by, status, owner) "
+            "VALUES ('t-42', 'misc', 'demo', 'coach', 'in_progress', 'p1')"
         )
         await c.execute(
             "UPDATE agents SET current_task_id = 't-42' WHERE id = 'p1'"

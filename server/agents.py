@@ -29,7 +29,7 @@ from claude_agent_sdk import (
 
 from server import interactions as interactions_registry
 from server.context import build_system_prompt_suffix
-from server.db import configured_conn
+from server.db import configured_conn, resolve_active_project
 from server.events import bus
 from server.webdav import webdav
 from server.mcp_config import load_external_servers
@@ -72,13 +72,14 @@ async def _deliver_system_message(
     notification bookkeeping fails."""
     if not body or not to_id:
         return
+    project_id = await resolve_active_project()
     try:
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "INSERT INTO messages (from_id, to_id, subject, body, priority) "
-                "VALUES (?, ?, ?, ?, ?) RETURNING id",
-                (from_id, to_id, subject, body, priority),
+                "INSERT INTO messages (project_id, from_id, to_id, subject, body, priority) "
+                "VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+                (project_id, from_id, to_id, subject, body, priority),
             )
             row = await cur.fetchone()
             msg_id = dict(row)["id"] if row else None
@@ -168,18 +169,20 @@ async def _insert_turn_row(
     still the source of truth for audit."""
     if agent_id == "system":
         return
+    project_id = await resolve_active_project()
     try:
         c = await configured_conn()
         try:
             await c.execute(
                 "INSERT INTO turns ("
-                "agent_id, started_at, ended_at, duration_ms, cost_usd, "
+                "agent_id, project_id, started_at, ended_at, duration_ms, cost_usd, "
                 "session_id, num_turns, stop_reason, is_error, "
                 "model, plan_mode, effort, "
                 "input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     agent_id,
+                    project_id,
                     started_at,
                     ended_at,
                     duration_ms,
@@ -1024,17 +1027,56 @@ async def _add_cost(agent_id: str, cost_usd: float | None) -> None:
         logger.exception("add_cost failed: agent=%s cost=%s", agent_id, cost_usd)
 
 
+async def _get_agent_identity(agent_id: str) -> dict[str, str | None]:
+    """Read (name, role, brief) from agent_project_roles for the
+    active project. Returns {} for system. Missing row → all None.
+    """
+    if agent_id == "system":
+        return {}
+    project_id = await resolve_active_project()
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT name, role, brief FROM agent_project_roles "
+                "WHERE slot = ? AND project_id = ?",
+                (agent_id, project_id),
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("get_agent_identity failed: agent=%s", agent_id)
+        return {}
+    if not row:
+        return {"name": None, "role": None, "brief": None}
+    d = dict(row)
+    return {"name": d.get("name"), "role": d.get("role"), "brief": d.get("brief")}
+
+
+async def _ensure_session_row(c: Any, agent_id: str, project_id: str) -> None:
+    """INSERT OR IGNORE a row in agent_sessions so subsequent UPDATEs
+    have a target. Cheap — primary key is (slot, project_id)."""
+    await c.execute(
+        "INSERT OR IGNORE INTO agent_sessions (slot, project_id) VALUES (?, ?)",
+        (agent_id, project_id),
+    )
+
+
 async def _get_session_id(agent_id: str) -> str | None:
     """Read agent.session_id (from the last turn's ResultMessage).
     None when the agent has never run, or DELETE /api/agents/<id>/session
     has cleared it for a fresh-context restart."""
     if agent_id == "system":
         return None
+    project_id = await resolve_active_project()
     try:
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT session_id FROM agents WHERE id = ?", (agent_id,)
+                "SELECT session_id FROM agent_sessions "
+                "WHERE slot = ? AND project_id = ?",
+                (agent_id, project_id),
             )
             row = await cur.fetchone()
         finally:
@@ -1049,41 +1091,24 @@ async def _get_session_id(agent_id: str) -> str | None:
 
 
 async def _get_agent_brief(agent_id: str) -> str | None:
-    """Read agent.brief — the human-authored context string for this
-    specific slot, injected into the system prompt on every turn.
-
-    Returns None if the column is NULL / empty or the read failed.
-    """
-    if agent_id == "system":
-        return None
-    try:
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT brief FROM agents WHERE id = ?", (agent_id,)
-            )
-            row = await cur.fetchone()
-        finally:
-            await c.close()
-    except Exception:
-        logger.exception("get_agent_brief failed: agent=%s", agent_id)
-        return None
-    if not row:
-        return None
-    v = dict(row).get("brief")
+    """Read brief from agent_project_roles for the active project."""
+    ident = await _get_agent_identity(agent_id)
+    v = ident.get("brief") if ident else None
     return v if v else None
 
 
 async def _get_continuity_note(agent_id: str) -> str | None:
-    """Read agent.continuity_note — a compact-generated summary of the
-    prior session, injected into the next fresh turn's system prompt."""
+    """Read agent_sessions.continuity_note for the active (slot, project)."""
     if agent_id == "system":
         return None
+    project_id = await resolve_active_project()
     try:
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT continuity_note FROM agents WHERE id = ?", (agent_id,)
+                "SELECT continuity_note FROM agent_sessions "
+                "WHERE slot = ? AND project_id = ?",
+                (agent_id, project_id),
             )
             row = await cur.fetchone()
         finally:
@@ -1098,13 +1123,18 @@ async def _get_continuity_note(agent_id: str) -> str | None:
 
 
 async def _set_continuity_note(agent_id: str, text: str | None) -> None:
-    """Write (or clear) the continuity note. Pass None/empty to clear."""
+    """Write (or clear) the continuity note for the active project."""
+    if agent_id == "system":
+        return
     payload = (text or "").strip() or None
+    project_id = await resolve_active_project()
     c = await configured_conn()
     try:
+        await _ensure_session_row(c, agent_id, project_id)
         await c.execute(
-            "UPDATE agents SET continuity_note = ? WHERE id = ?",
-            (payload, agent_id),
+            "UPDATE agent_sessions SET continuity_note = ? "
+            "WHERE slot = ? AND project_id = ?",
+            (payload, agent_id, project_id),
         )
         await c.commit()
     finally:
@@ -1182,15 +1212,19 @@ async def _write_handoff_file(agent_id: str, summary: str) -> str | None:
     )
     content = frontmatter + summary.strip() + "\n"
 
+    project_id = await resolve_active_project()
     wrote_webdav = False
     if webdav.enabled:
         try:
-            wrote_webdav = bool(await webdav.write_text(f"handoffs/{filename}", content))
+            wrote_webdav = bool(await webdav.write_text(
+                f"projects/{project_id}/working/handoffs/{filename}", content
+            ))
         except Exception:
             logger.exception("handoff kDrive write failed: %s", filename)
             wrote_webdav = False
 
-    local_dir = Path(os.environ.get("HARNESS_HANDOFFS_DIR", "/data/handoffs"))
+    from server.paths import project_paths
+    local_dir = project_paths(project_id).working_handoffs
     try:
         local_dir.mkdir(parents=True, exist_ok=True)
         (local_dir / filename).write_text(content, encoding="utf-8")
@@ -1210,11 +1244,14 @@ async def _get_recent_exchanges(agent_id: str) -> list[dict[str, str]]:
     """
     if agent_id == "system":
         return []
+    project_id = await resolve_active_project()
     try:
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT last_exchange_json FROM agents WHERE id = ?", (agent_id,)
+                "SELECT last_exchange_json FROM agent_sessions "
+                "WHERE slot = ? AND project_id = ?",
+                (agent_id, project_id),
             )
             row = await cur.fetchone()
         finally:
@@ -1300,12 +1337,15 @@ async def _append_exchange(agent_id: str, prompt: str, response: str) -> None:
         existing.pop(0)
 
     payload = json.dumps(existing, ensure_ascii=False)
+    project_id = await resolve_active_project()
     try:
         c = await configured_conn()
         try:
+            await _ensure_session_row(c, agent_id, project_id)
             await c.execute(
-                "UPDATE agents SET last_exchange_json = ? WHERE id = ?",
-                (payload, agent_id),
+                "UPDATE agent_sessions SET last_exchange_json = ? "
+                "WHERE slot = ? AND project_id = ?",
+                (payload, agent_id, project_id),
             )
             await c.commit()
         finally:
@@ -1321,12 +1361,14 @@ async def _clear_exchange_log(agent_id: str) -> None:
     confusing and bloats the handoff."""
     if agent_id == "system":
         return
+    project_id = await resolve_active_project()
     try:
         c = await configured_conn()
         try:
             await c.execute(
-                "UPDATE agents SET last_exchange_json = NULL WHERE id = ?",
-                (agent_id,),
+                "UPDATE agent_sessions SET last_exchange_json = NULL "
+                "WHERE slot = ? AND project_id = ?",
+                (agent_id, project_id),
             )
             await c.commit()
         finally:
@@ -1355,6 +1397,232 @@ async def _locked_players() -> list[str]:
     except Exception:
         return []
     return [dict(r)["id"] for r in rows]
+
+
+async def _build_coach_coordination_block() -> str:
+    """Phase 7 (PROJECTS_SPEC.md §10): Coach-only per-turn coordination
+    block. Built fresh on every Coach turn from `projects`,
+    `agent_project_roles`, `agents.locked`, `tasks`, `messages`, and
+    the latest entry in `decisions/`.
+
+    Returns the rendered markdown block, or "" on any read failure
+    (Coach's turn is more valuable than getting this perfectly — fall
+    back to a quieter prompt rather than crash the whole spawn).
+
+    Layout matches the spec excerpt:
+      ## Coordinating: <Project Name>
+      Goal: ...
+      ## Team composition (this project)
+      ## Current state
+        Open tasks, Inbox count, Last decision, Wiki paths
+    """
+    from server.paths import project_paths
+
+    try:
+        active = await resolve_active_project()
+    except Exception:
+        return ""
+
+    # ---- Project name + goal ---------------------------------------
+    project_name = active
+    project_goal = ""
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT name, description FROM projects WHERE id = ?",
+                (active,),
+            )
+            row = await cur.fetchone()
+            if row:
+                d = dict(row)
+                project_name = d.get("name") or active
+                project_goal = (d.get("description") or "").strip()
+
+            # ---- Team composition (active project) -----------------
+            cur = await c.execute(
+                "SELECT id, locked FROM agents WHERE kind = 'player' "
+                "ORDER BY id"
+            )
+            player_rows = [dict(r) for r in await cur.fetchall()]
+            cur = await c.execute(
+                "SELECT slot, name, role FROM agent_project_roles "
+                "WHERE project_id = ?",
+                (active,),
+            )
+            role_map = {dict(r)["slot"]: dict(r) for r in await cur.fetchall()}
+
+            # ---- Open tasks ----------------------------------------
+            cur = await c.execute(
+                "SELECT id, title, status, owner "
+                "FROM tasks WHERE project_id = ? "
+                "AND status IN ('claimed', 'in_progress', 'open') "
+                "ORDER BY CASE status "
+                "  WHEN 'in_progress' THEN 0 "
+                "  WHEN 'claimed' THEN 1 "
+                "  ELSE 2 END, id ASC LIMIT 20",
+                (active,),
+            )
+            open_tasks = [dict(r) for r in await cur.fetchall()]
+
+            # ---- Coach inbox unread count --------------------------
+            # Schema convention: messages have a `to_id` and the harness
+            # tracks per-recipient reads in `message_reads`. Unread =
+            # messages targeted at coach (not by coach) without a read
+            # row, scoped to the active project.
+            cur = await c.execute(
+                """
+                SELECT COUNT(*) AS n FROM messages m
+                WHERE m.project_id = ?
+                  AND m.to_id = 'coach'
+                  AND m.from_id != 'coach'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM message_reads r
+                      WHERE r.message_id = m.id AND r.agent_id = 'coach'
+                  )
+                """,
+                (active,),
+            )
+            row = await cur.fetchone()
+            unread = int(dict(row)["n"]) if row else 0
+        finally:
+            await c.close()
+    except Exception:
+        return ""
+
+    # ---- Last decision ---------------------------------------------
+    last_decision_line = "(none yet)"
+    try:
+        pp = project_paths(active)
+        dec_dir = pp.decisions
+        if dec_dir.is_dir():
+            files = sorted(
+                dec_dir.glob("*.md"), key=lambda p: p.name, reverse=True
+            )
+            if files:
+                latest = files[0]
+                title = latest.stem
+                try:
+                    text = latest.read_text(encoding="utf-8")
+                    if text.startswith("---\n"):
+                        end = text.find("\n---\n", 4)
+                        if end > 0:
+                            for line in text[4:end].splitlines():
+                                if line.startswith("title:"):
+                                    title = line[len("title:"):].strip()
+                                    break
+                except OSError:
+                    pass
+                # Pull the date prefix from the filename if present
+                # ("2026-04-23-foo.md" → "2026-04-23"); fall back to
+                # the bare stem otherwise.
+                date_part = latest.stem.split("-", 3)
+                if (
+                    len(date_part) >= 3
+                    and date_part[0].isdigit()
+                    and date_part[1].isdigit()
+                    and date_part[2].isdigit()
+                ):
+                    date_str = "-".join(date_part[:3])
+                else:
+                    date_str = ""
+                if date_str:
+                    last_decision_line = (
+                        f"{date_str} — {title}\n  ({latest})"
+                    )
+                else:
+                    last_decision_line = f"{title}\n  ({latest})"
+    except Exception:
+        pass
+
+    # ---- Render -----------------------------------------------------
+    lines: list[str] = []
+    lines.append(f"## Coordinating: {project_name}")
+    lines.append("")
+    if project_goal:
+        lines.append(f"Goal: {project_goal}")
+    else:
+        lines.append("Goal: (not set — edit projects.description to fill)")
+    pp = project_paths(active)
+    lines.append(
+        f"(For full project context, read {pp.claude_md} and update "
+        "it as the project evolves.)"
+    )
+    lines.append("")
+
+    lines.append("## Team composition (this project)")
+    lines.append("")
+    lines.append("- coach   — you")
+    unassigned: list[str] = []
+    locked_named: list[str] = []
+    for prow in player_rows:
+        slot = prow["id"]
+        rec = role_map.get(slot)
+        is_locked = bool(prow.get("locked"))
+        if rec and (rec.get("name") or rec.get("role")):
+            name = (rec.get("name") or "").strip() or "(unnamed)"
+            role = (rec.get("role") or "").strip() or "(no role)"
+            tag = " (LOCKED — unavailable)" if is_locked else ""
+            lines.append(f"- {slot:<7} — {name:<14} | role: {role}{tag}")
+            if is_locked:
+                locked_named.append(slot)
+        else:
+            unassigned.append(slot)
+            if is_locked:
+                locked_named.append(slot)
+    if unassigned:
+        if len(unassigned) > 1:
+            label = f"{unassigned[0]}..{unassigned[-1]}"
+        else:
+            label = unassigned[0]
+        lines.append(
+            f"- {label:<7} — unassigned (auto-name on first activation; "
+            "assign via coord_set_player_role)"
+        )
+    lines.append("")
+
+    # Phase 7 audit: "Roster availability" prose folded in as a
+    # sub-section per spec §10. Inline LOCKED tags carry the fact;
+    # this carries the explicit "do NOT assign / do NOT message /
+    # broadcasts skip them" rule so Coach plans around it instead
+    # of hitting the tool-layer rejection.
+    if locked_named:
+        lines.append("### Roster availability (right now)")
+        lines.append("")
+        lines.append(
+            "The human has LOCKED the following Player(s): "
+            + ", ".join(locked_named)
+            + ". Do NOT assign tasks to them, do NOT direct-message "
+            "them, and remember broadcasts also skip them. Work "
+            "around this constraint — pick other Players or tell "
+            "the human if no suitable unlocked Player remains."
+        )
+        lines.append("")
+
+    lines.append("## Current state")
+    lines.append("")
+    if open_tasks:
+        lines.append(f"Open tasks ({len(open_tasks)}):")
+        for t in open_tasks:
+            tid = t["id"]
+            title = (t.get("title") or "").strip()[:80]
+            status = t.get("status") or "?"
+            owner = t.get("owner") or "—"
+            lines.append(f"- {tid} ({status}) — {owner} — {title}")
+    else:
+        lines.append("Open tasks: (none)")
+    lines.append("")
+    lines.append(f"Inbox: {unread} unread message{'s' if unread != 1 else ''}")
+    lines.append("")
+    lines.append(f"Last decision: {last_decision_line}")
+    lines.append("")
+    from server.paths import global_paths
+    gp = global_paths()
+    lines.append(
+        f"Wiki: {gp.wiki / active}/  (master index: {gp.wiki_index})"
+    )
+
+    return "\n".join(lines) + "\n"
 
 
 async def _get_role_default_model(agent_id: str) -> str | None:
@@ -1435,12 +1703,15 @@ async def _set_session_id(agent_id: str, session_id: str | None) -> None:
     a later M5 step once we confirm the SDK API surface."""
     if not session_id or agent_id == "system":
         return
+    project_id = await resolve_active_project()
     try:
         c = await configured_conn()
         try:
+            await _ensure_session_row(c, agent_id, project_id)
             await c.execute(
-                "UPDATE agents SET session_id = ? WHERE id = ?",
-                (session_id, agent_id),
+                "UPDATE agent_sessions SET session_id = ?, last_active = ? "
+                "WHERE slot = ? AND project_id = ?",
+                (session_id, _now(), agent_id, project_id),
             )
             await c.commit()
         finally:
@@ -1458,11 +1729,14 @@ async def _clear_session_id(agent_id: str) -> None:
     """
     if agent_id == "system":
         return
+    project_id = await resolve_active_project()
     try:
         c = await configured_conn()
         try:
             await c.execute(
-                "UPDATE agents SET session_id = NULL WHERE id = ?", (agent_id,)
+                "UPDATE agent_sessions SET session_id = NULL "
+                "WHERE slot = ? AND project_id = ?",
+                (agent_id, project_id),
             )
             await c.commit()
         finally:
@@ -1514,28 +1788,43 @@ async def _autoname_player(agent_id: str) -> str | None:
     """
     import random
 
+    project_id = await resolve_active_project()
     async with _AUTONAME_LOCK:
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT kind, name FROM agents WHERE id = ?", (agent_id,)
+                "SELECT kind FROM agents WHERE id = ?", (agent_id,)
             )
             row = await cur.fetchone()
             if not row:
                 return None
             d = dict(row)
-            if d["kind"] != "player" or d["name"]:
+            if d["kind"] != "player":
                 return None
             cur = await c.execute(
-                "SELECT name FROM agents WHERE kind = 'player' AND name IS NOT NULL"
+                "SELECT name FROM agent_project_roles "
+                "WHERE slot = ? AND project_id = ?",
+                (agent_id, project_id),
+            )
+            cur_row = await cur.fetchone()
+            if cur_row and dict(cur_row).get("name"):
+                return None
+            cur = await c.execute(
+                "SELECT name FROM agent_project_roles "
+                "WHERE project_id = ? AND name IS NOT NULL",
+                (project_id,),
             )
             taken = {dict(r)["name"] for r in await cur.fetchall()}
             candidates = [n for n in _LACROSSE_SURNAMES if n not in taken]
             if not candidates:
                 return None
             pick = random.choice(candidates)
+            # Upsert into agent_project_roles for the active project.
             await c.execute(
-                "UPDATE agents SET name = ? WHERE id = ?", (pick, agent_id)
+                "INSERT INTO agent_project_roles (slot, project_id, name) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(slot, project_id) DO UPDATE SET name = excluded.name",
+                (agent_id, project_id, pick),
             )
             await c.commit()
         finally:
@@ -1861,12 +2150,13 @@ async def _handle_ask_user_question(
                 f"question text to your chosen label.\n\n"
                 + md_body
             )
+            project_id = await resolve_active_project()
             c = await configured_conn()
             try:
                 cur = await c.execute(
-                    "INSERT INTO messages (from_id, to_id, subject, body, priority) "
-                    "VALUES (?, ?, ?, ?, ?) RETURNING id",
-                    (agent_id, "coach", subject, body, "interrupt"),
+                    "INSERT INTO messages (project_id, from_id, to_id, subject, body, priority) "
+                    "VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+                    (project_id, agent_id, "coach", subject, body, "interrupt"),
                 )
                 row = await cur.fetchone()
                 msg_id = dict(row)["id"] if row else None
@@ -1991,12 +2281,13 @@ async def _handle_exit_plan_mode(
                 f"---\n\n"
                 + plan_text
             )
+            project_id = await resolve_active_project()
             c = await configured_conn()
             try:
                 cur = await c.execute(
-                    "INSERT INTO messages (from_id, to_id, subject, body, priority) "
-                    "VALUES (?, ?, ?, ?, ?) RETURNING id",
-                    (agent_id, "coach", subject, body, "interrupt"),
+                    "INSERT INTO messages (project_id, from_id, to_id, subject, body, priority) "
+                    "VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+                    (project_id, agent_id, "coach", subject, body, "interrupt"),
                 )
                 row = await cur.fetchone()
                 msg_id = dict(row)["id"] if row else None
@@ -2053,12 +2344,14 @@ async def _handle_exit_plan_mode(
             # schedule below.
             if comments:
                 try:
+                    project_id = await resolve_active_project()
                     c = await configured_conn()
                     try:
                         await c.execute(
-                            "INSERT INTO messages (from_id, to_id, subject, body, priority) "
-                            "VALUES ('human', ?, ?, ?, 'normal')",
+                            "INSERT INTO messages (project_id, from_id, to_id, subject, body, priority) "
+                            "VALUES (?, 'human', ?, ?, ?, 'normal')",
                             (
+                                project_id,
                                 agent_id,
                                 "Notes on the approved plan",
                                 (
@@ -2362,26 +2655,60 @@ async def run_agent(
             "to free context. The summary + verbatim exchanges above "
             "are your memory of what came before.)"
         )
-    # Lock-state suffix — Coach-only. Tells Coach up-front which
-    # Players are off-limits so they plan around the constraint
-    # instead of wasting turns hitting the tool-layer rejection.
-    # Only injected when at least one Player is locked; a fully-
-    # unlocked team gets no extra text.
+    # Phase 7 audit (PROJECTS_SPEC.md §10): "Roster availability"
+    # used to be a standalone Coach-only suffix; the spec folds it
+    # into the coordination block as a sub-section. The block now
+    # owns both the inline LOCKED tag and the prose reminder — no
+    # standalone lock_suffix is appended for Coach. Players never
+    # had this suffix in the first place, so there's nothing to
+    # preserve there either.
     lock_suffix = ""
+    # Identity injection (PROJECTS_SPEC.md §8). Built from
+    # agent_project_roles for the active project + the agent's slot.
+    # Prepended so the agent reads "who am I in this project" before
+    # anything else.
+    identity_prefix = ""
+    try:
+        ident = await _get_agent_identity(agent_id)
+    except Exception:
+        ident = {}
+    if ident:
+        active_pid = await resolve_active_project()
+        ident_lines = [f"## Your identity (active project: {active_pid})", ""]
+        ident_lines.append(f"- Slot: `{agent_id}`")
+        if ident.get("name"):
+            ident_lines.append(f"- Name: {ident['name']}")
+        if ident.get("role"):
+            ident_lines.append(f"- Role: {ident['role']}")
+        if ident.get("brief"):
+            ident_lines.append("")
+            ident_lines.append("### Brief (project-specific)")
+            ident_lines.append("")
+            ident_lines.append(ident["brief"].strip())
+        identity_prefix = "\n".join(ident_lines) + "\n\n"
+
+    # Coach coordination block (PROJECTS_SPEC.md §10). Distinct from
+    # identity so the on-the-wire layout matches spec:
+    #   [identity] + [coordination block] + [role prompt + global CLAUDE.md]
+    # Phase 7: built fresh on every Coach turn from `projects`,
+    # `agent_project_roles`, `agents.locked`, `tasks`, `messages`,
+    # and the latest entry in `decisions/` so a project switch, a
+    # `coord_set_player_role` update, a new task, or a fresh decision
+    # all show up immediately on Coach's next turn.
+    coordination_block = ""
     if agent_id == "coach":
-        locked_list = await _locked_players()
-        if locked_list:
-            lock_suffix = (
-                "\n\n## Roster availability (right now)\n\n"
-                "The human has LOCKED the following Player(s): "
-                + ", ".join(locked_list)
-                + ". Do NOT assign tasks to them, do NOT direct-message "
-                "them, and remember broadcasts also skip them. Work "
-                "around this constraint — pick other Players or tell "
-                "the human if no suitable unlocked Player remains."
-            )
+        try:
+            body = await _build_coach_coordination_block()
+        except Exception:
+            logger.exception("coach coordination block build failed")
+            body = ""
+        if body:
+            coordination_block = body + "\n"
+
     system_prompt = (
-        _system_prompt_for(agent_id)
+        identity_prefix
+        + coordination_block
+        + _system_prompt_for(agent_id)
         + context_suffix
         + brief_suffix
         + handoff_suffix
@@ -2952,6 +3279,11 @@ async def stale_task_watch_loop() -> None:
             if _paused:
                 continue
             cutoff_minutes = STALE_TASK_MINUTES
+            # Phase 3 audit follow-up: scope the watchdog to the
+            # active project. Without this filter Coach gets DM'd
+            # about every project's stale tasks regardless of which
+            # one is currently active — confusing.
+            active_project_id = await resolve_active_project()
             c = await configured_conn()
             try:
                 # julianday returns fractional days; × 1440 → minutes.
@@ -2961,14 +3293,16 @@ async def stale_task_watch_loop() -> None:
                     SELECT t.id, t.title, t.owner, t.created_by, t.status,
                            MAX(e.ts) AS last_activity
                     FROM tasks t
-                    LEFT JOIN events e ON e.agent_id = t.owner
-                    WHERE t.status IN ('in_progress', 'claimed')
+                    LEFT JOIN events e
+                      ON e.agent_id = t.owner AND e.project_id = t.project_id
+                    WHERE t.project_id = ?
+                      AND t.status IN ('in_progress', 'claimed')
                       AND t.owner IS NOT NULL
                     GROUP BY t.id
                     HAVING last_activity IS NOT NULL
                        AND (julianday('now') - julianday(last_activity)) * 1440 > ?
                     """,
-                    (cutoff_minutes,),
+                    (active_project_id, cutoff_minutes),
                 )
                 rows = await cur.fetchall()
             finally:

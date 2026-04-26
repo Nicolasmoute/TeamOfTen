@@ -776,6 +776,30 @@ function App() {
   // bumping this re-runs the WS effect, which re-opens a new connection
   const [wsAttempt, setWsAttempt] = useState(0);
 
+  // Phase 3 (PROJECTS_SPEC.md §13): the project list + active id are
+  // hydrated from /api/projects on mount and re-fetched whenever a
+  // `project_switched` / `project_created` / `project_deleted` event
+  // arrives over the WS.
+  const [projects, setProjects] = useState([]);
+  const [activeProjectId, setActiveProjectId] = useState(null);
+  const [switchingProject, setSwitchingProject] = useState(null);
+  // Phase 4 — switch UX polish state.
+  // confirm: pre-flight modal showing counts + Cancel/Switch.
+  //   { to: 'slug', preview: {...}, error: null } | null
+  // inFlight: 423 sub-modal { to, agent_id }
+  // busy: stepper modal { to, fromName, toName, jobId, steps[], terminal? }
+  const [switchConfirm, setSwitchConfirm] = useState(null);
+  const [switchInFlight, setSwitchInFlight] = useState(null);
+  const [switchBusy, setSwitchBusy] = useState(null);
+  // Phase 4 audit fix #1: race-safe step delivery. The activate
+  // handler returns 202 + job_id, but the server's task may emit
+  // `project_switch_step started` BEFORE the response reaches the
+  // client. The WS dispatcher buffers all step events here keyed by
+  // job_id; whenever switchBusy.jobId is assigned, the busy modal
+  // drains the buffer and merges any pre-jobId steps. Buffer entries
+  // are cleared on terminal `project_switched` for that job_id.
+  const switchStepBuffer = useRef(new Map());
+
   // Wrap authFetch so a 401 anywhere flips the global gate.
   const authedFetch = useCallback(async (url, init) => {
     const res = await authFetch(url, init);
@@ -807,6 +831,24 @@ function App() {
       console.error("loadTasks failed", e);
     }
   }, [authedFetch]);
+
+  // Phase 3: project list + active id. Refreshed via refreshProjects()
+  // on mount + on every project_* WS event.
+  const loadProjects = useCallback(async () => {
+    try {
+      const res = await authedFetch("/api/projects");
+      if (!res.ok) return;
+      const data = await res.json();
+      setProjects(data.projects || []);
+      setActiveProjectId(data.active || null);
+    } catch (e) {
+      console.error("loadProjects failed", e);
+    }
+  }, [authedFetch]);
+  const refreshProjects = useCallback(
+    () => loadProjects(),
+    [loadProjects]
+  );
 
   const loadFileRoots = useCallback(async () => {
     try {
@@ -1008,10 +1050,11 @@ function App() {
     loadStatus();
     loadPause();
     loadFileRoots();
+    loadProjects();
     seedConversationsFromHistory();
     const statusTimer = setInterval(loadStatus, 30_000);
     return () => clearInterval(statusTimer);
-  }, [loadAgents, loadTasks, loadStatus, loadPause, loadFileRoots, seedConversationsFromHistory]);
+  }, [loadAgents, loadTasks, loadStatus, loadPause, loadFileRoots, loadProjects, seedConversationsFromHistory]);
 
   // Click-handler for in-app file links. Marked + DOMPurify tag any
   // markdown link whose href is an absolute path (`/data/...`,
@@ -1225,6 +1268,85 @@ function App() {
       }
       if (ev.type === "pause_toggled") {
         setPaused(Boolean(ev.paused));
+      }
+      // Phase 3 — project lifecycle events trigger a list refresh so
+      // the LeftRail dropdown and active-project pill stay current.
+      // The switch flow also surfaces project_switch_step events but
+      // we don't act on them here (Phase 4 busy modal will).
+      if (
+        ev.type === "project_created" ||
+        ev.type === "project_deleted" ||
+        ev.type === "project_updated" ||
+        ev.type === "project_switched"
+      ) {
+        refreshProjects();
+        if (ev.type === "project_switched") {
+          // Audit fix: terminal events carry `terminal:true`; non-
+          // terminal `project_switch_step` events go through their own
+          // (Phase 4) channel. Clear UI in-flight state on terminal.
+          setSwitchingProject(null);
+          // Phase 4 — promote the busy modal's terminal state so it
+          // shows ✓ / ✗ and lets the user dismiss / retry.
+          setSwitchBusy((prev) => {
+            if (!prev || prev.jobId !== ev.job_id) return prev;
+            return {
+              ...prev,
+              terminal: true,
+              ok: ev.ok !== false,
+              failedStep: ev.failed_step || null,
+              error: ev.error || null,
+            };
+          });
+          // Drain any straggler buffered steps on terminal so the
+          // map doesn't grow unbounded across multiple switches.
+          if (ev.job_id) switchStepBuffer.current.delete(ev.job_id);
+          if (ev.ok !== false) {
+            // Phase 3 audit fix #7+#11: clear the conversations Map
+            // BEFORE re-fetching, then seed from /api/events for the
+            // new project. The clear+reseed is bracketed so any
+            // post-switch events that fire WHILE we're seeding are
+            // appended onto the fresh history.
+            setConversations(new Map());
+            refreshAgents();
+            // Re-seed conversations from /api/events scoped to the
+            // new active project. Without this, panes go blank until
+            // the next live event arrives — spec §6 wants seamless
+            // reload.
+            seedConversationsFromHistory();
+            // Phase 5 (PROJECTS_SPEC.md §7): the active project's
+            // path changed, so the bottom root in /api/files/roots
+            // is now pointing at /data/projects/<new-slug>/. Bump
+            // fsEpoch + refetch roots so FilesPane rebinds in place.
+            loadFileRoots();
+            setFsEpoch((n) => n + 1);
+          }
+        }
+      }
+      // Phase 4 busy modal: stepper feeds off project_switch_step.
+      // Audit fix #1: every step is buffered by job_id so the modal
+      // can drain late-set jobIds. When the modal already has the
+      // matching job_id, we update its `steps` directly too.
+      if (ev.type === "project_switch_step" && ev.job_id) {
+        const buf = switchStepBuffer.current;
+        const list = buf.get(ev.job_id) || [];
+        const row = {
+          step: ev.step,
+          status: ev.status,
+          detail: ev.detail || null,
+          ts: ev.ts,
+        };
+        const idx = list.findIndex((s) => s.step === ev.step);
+        if (idx >= 0) list[idx] = row;
+        else list.push(row);
+        buf.set(ev.job_id, list);
+        setSwitchBusy((prev) => {
+          if (!prev || prev.jobId !== ev.job_id) return prev;
+          const nextSteps = prev.steps.slice();
+          const sIdx = nextSteps.findIndex((s) => s.step === ev.step);
+          if (sIdx >= 0) nextSteps[sIdx] = row;
+          else nextSteps.push(row);
+          return { ...prev, steps: nextSteps };
+        });
       }
       if (ev.type === "result" || ev.type === "cost_capped") {
         refreshStatus();
@@ -1738,6 +1860,221 @@ function App() {
     ? `grid-template-columns: 44px 1fr ${envWidth}px`
     : undefined;
 
+  // Phase 4: multi-stage switch flow.
+  //   1. onActivateProject(slug) → fetch /switch-preview → open
+  //      ProjectSwitchConfirmModal.
+  //   2. User clicks Switch → POST /activate.
+  //      - 202: open ProjectSwitchBusyModal, listen for steps via WS.
+  //      - 423: open ProjectSwitchInFlightModal sub-prompt.
+  //      - 409: surface error in the confirm modal.
+  //   3. project_switched event arrives → busy modal flips to terminal
+  //      (ok/error). User dismisses; success path also re-seeds
+  //      conversations (Phase 3 audit fix).
+  const _doActivate = useCallback(async (slug, fromName, toName, preview) => {
+    setSwitchingProject(slug);
+    setSwitchBusy({
+      to: slug,
+      fromName,
+      toName,
+      jobId: null,
+      steps: [],
+      terminal: false,
+      ok: null,
+      // Audit fix #6: surface the live-conversation count from the
+      // preview onto the push_current step so the busy modal mirrors
+      // spec §6's "Snapshotting Misc live conversations (3 files)".
+      liveConversations: preview ? preview.live_conversations : 0,
+    });
+    try {
+      const res = await authedFetch(
+        `/api/projects/${encodeURIComponent(slug)}/activate`,
+        { method: "POST" },
+      );
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 202) {
+        // Subscribe by job_id and drain any pre-arrival steps that
+        // landed in the buffer before this assignment (audit fix #1).
+        const jobId = data.job_id;
+        setSwitchBusy((prev) => {
+          if (!prev) return prev;
+          const buffered = switchStepBuffer.current.get(jobId) || [];
+          // Merge buffered into prev.steps (replace by step name).
+          const merged = prev.steps.slice();
+          for (const row of buffered) {
+            const idx = merged.findIndex((s) => s.step === row.step);
+            if (idx >= 0) merged[idx] = row;
+            else merged.push(row);
+          }
+          return { ...prev, jobId, steps: merged };
+        });
+        return { ok: true };
+      }
+      if (res.status === 200 && data.noop) {
+        setSwitchBusy(null);
+        setSwitchingProject(null);
+        return { ok: true, noop: true };
+      }
+      if (res.status === 423) {
+        setSwitchBusy(null);
+        setSwitchingProject(null);
+        setSwitchInFlight({
+          to: slug,
+          fromName,
+          toName,
+          agentId: data.detail
+            ? (data.detail.match(/agent '(\w+)'/) || [])[1] || "an agent"
+            : "an agent",
+        });
+        return { ok: false, code: 423 };
+      }
+      if (res.status === 409) {
+        // Keep the busy modal open with a terminal failure so the
+        // user can dismiss / retry instead of silently losing context.
+        setSwitchingProject(null);
+        setSwitchBusy((prev) => prev ? {
+          ...prev,
+          terminal: true,
+          ok: false,
+          failedStep: "preflight",
+          error: data.detail || "Another switch is already in progress.",
+        } : prev);
+        return { ok: false, code: 409, detail: data.detail };
+      }
+      // Audit fix #3: surface every other 4xx/5xx as a terminal-failure
+      // busy modal so the user gets feedback instead of a silent
+      // dismissal. 502 (kDrive unreachable on pre-pull, spec §6) lands
+      // here too — the Retry button gives the spec-required affordance.
+      setSwitchingProject(null);
+      setSwitchBusy((prev) => prev ? {
+        ...prev,
+        terminal: true,
+        ok: false,
+        failedStep: `http_${res.status}`,
+        error: data.detail || res.statusText || `HTTP ${res.status}`,
+      } : prev);
+      return {
+        ok: false,
+        code: res.status,
+        detail: data.detail || res.statusText,
+      };
+    } catch (e) {
+      console.error("activate failed", e);
+      setSwitchingProject(null);
+      setSwitchBusy((prev) => prev ? {
+        ...prev,
+        terminal: true,
+        ok: false,
+        failedStep: "network",
+        error: String(e).slice(0, 200),
+      } : prev);
+      return { ok: false, detail: String(e) };
+    }
+  }, [authedFetch]);
+
+  const onActivateProject = useCallback(async (slug) => {
+    if (!slug || slug === activeProjectId) return;
+    // Phase 4: hit /switch-preview first, then open the confirm modal.
+    let preview = null;
+    try {
+      const res = await authedFetch(
+        `/api/projects/switch-preview?to=${encodeURIComponent(slug)}`,
+      );
+      if (res.ok) preview = await res.json();
+    } catch (e) {
+      console.warn("switch preview failed (continuing without counts):", e);
+    }
+    setSwitchConfirm({
+      to: slug,
+      preview,
+      error: null,
+    });
+  }, [authedFetch, activeProjectId]);
+
+  // Phase 4: confirm modal "Switch" button. Closes the confirm modal
+  // and dispatches the actual activate POST.
+  const onConfirmSwitch = useCallback(async () => {
+    const sc = switchConfirm;
+    if (!sc) return;
+    setSwitchConfirm(null);
+    const fromName = sc.preview ? sc.preview.from_name : "current project";
+    const toName = sc.preview ? sc.preview.to_name : sc.to;
+    await _doActivate(sc.to, fromName, toName, sc.preview);
+  }, [switchConfirm, _doActivate]);
+
+  // Phase 4: in-flight sub-modal "Cancel turns and switch" button.
+  // Hard-cancel via the existing /api/agents/cancel-all endpoint
+  // (spec §14 Q2 recommendation: hard cancel), then re-attempt the
+  // switch. Audit fix #2 — fixed 600ms delay was too short for SDK
+  // teardown (1-2s typical); poll /api/agents until every agent is
+  // out of `working`/`waiting`, with a hard timeout cap.
+  const onCancelTurnsAndSwitch = useCallback(async () => {
+    const sif = switchInFlight;
+    if (!sif) return;
+    setSwitchInFlight(null);
+    try {
+      await authedFetch("/api/agents/cancel-all", { method: "POST" });
+    } catch (e) {
+      console.error("cancel-all failed:", e);
+    }
+    // Poll /api/agents up to 8s. Most cancellations resolve within
+    // ~1s; the cap protects against a wedged SDK process.
+    const POLL_INTERVAL_MS = 250;
+    const POLL_TIMEOUT_MS = 8000;
+    const deadline = Date.now() + POLL_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      try {
+        const res = await authedFetch("/api/agents");
+        if (res.ok) {
+          const data = await res.json();
+          const busy = (data.agents || []).find(
+            (a) => a.status === "working" || a.status === "waiting"
+          );
+          if (!busy) break;
+        }
+      } catch (e) {
+        // Treat fetch failure as "still busy" — keep polling until
+        // the deadline.
+      }
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    }
+    await _doActivate(sif.to, sif.fromName, sif.toName, null);
+  }, [switchInFlight, _doActivate, authedFetch]);
+
+  // Phase 3: create a new project via prompt. Phase 4 will replace
+  // this with a proper modal. Slug is auto-derived from name; user
+  // can override via a second prompt.
+  const onCreateProject = useCallback(async () => {
+    const name = prompt("New project name:");
+    if (!name || !name.trim()) return;
+    // Derive a slug client-side; server re-validates.
+    let slug = name.trim().toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .replace(/-{2,}/g, "-");
+    if (!slug || slug.length < 2) {
+      alert("Could not derive a valid slug from that name. Try a name with at least one letter.");
+      return;
+    }
+    const overridden = prompt(`Slug (URL-safe id) [default: ${slug}]:`, slug);
+    if (overridden === null) return;
+    if (overridden.trim()) slug = overridden.trim();
+    try {
+      const res = await authedFetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug, name: name.trim() }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        alert(`Create failed: ${data.detail || res.statusText}`);
+        return;
+      }
+      // Success: refreshProjects via WS event_received project_created.
+    } catch (e) {
+      console.error("create project failed", e);
+    }
+  }, [authedFetch]);
+
   return html`
     <div class=${"app" + (envOpen ? " env-open" : "")} style=${appStyle}>
       <${LeftRail}
@@ -1745,6 +2082,11 @@ function App() {
         openSlots=${openSlots}
         dotStates=${dotStates}
         problemSlots=${problemSlots}
+        projects=${projects}
+        activeProjectId=${activeProjectId}
+        switchingProject=${switchingProject}
+        onActivateProject=${onActivateProject}
+        onCreateProject=${onCreateProject}
         onOpen=${openPane}
         onStackInLast=${stackInLast}
         wsConnected=${wsConnected}
@@ -1861,6 +2203,38 @@ function App() {
             }}
           />`
         : null}
+      ${switchConfirm
+        ? html`<${ProjectSwitchConfirmModal}
+            confirm=${switchConfirm}
+            onCancel=${() => setSwitchConfirm(null)}
+            onSwitch=${onConfirmSwitch}
+          />`
+        : null}
+      ${switchInFlight
+        ? html`<${ProjectSwitchInFlightModal}
+            inFlight=${switchInFlight}
+            onWait=${() => setSwitchInFlight(null)}
+            onCancelAndSwitch=${onCancelTurnsAndSwitch}
+          />`
+        : null}
+      ${switchBusy
+        ? html`<${ProjectSwitchBusyModal}
+            busy=${switchBusy}
+            onDismiss=${() => setSwitchBusy(null)}
+            onRetry=${async () => {
+              const target = switchBusy.to;
+              const fromName = switchBusy.fromName;
+              const toName = switchBusy.toName;
+              const liveCount = switchBusy.liveConversations;
+              setSwitchBusy(null);
+              // Pass a synthetic preview so live-conversation count
+              // survives the retry.
+              await _doActivate(target, fromName, toName, {
+                live_conversations: liveCount,
+              });
+            }}
+          />`
+        : null}
     </div>
   `;
 }
@@ -1945,7 +2319,288 @@ function TokenGate({ onSubmit }) {
 // left rail
 // ------------------------------------------------------------------
 
-function LeftRail({ agents, openSlots, dotStates, problemSlots, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, onOpenSettings, paused, onTogglePause, onLayoutPreset, onCancelAll }) {
+// Phase 3 (PROJECTS_SPEC.md §13): minimal functional dropdown that
+// replaces the disabled `P` placeholder. Polish (animation, modal,
+// busy stepper) lands in Phase 4 — for now we just need a way to
+// switch projects from the rail.
+function ProjectSwitcher({ projects, activeProjectId, switchingProject, onActivate, onCreate }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function handleClickOutside(e) {
+      if (ref.current && !ref.current.contains(e.target)) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [open]);
+
+  const active = projects.find((p) => p.id === activeProjectId);
+  const visible = projects.filter((p) => !p.archived);
+  const label = switchingProject
+    ? "↻"
+    : active
+    ? active.name.slice(0, 2).toUpperCase()
+    : "P";
+  const tooltip = active
+    ? `Active: ${active.name}` + (switchingProject ? ` (switching to ${switchingProject}…)` : "")
+    : "No project active — click to pick";
+
+  return html`
+    <div class="project-switcher" ref=${ref}>
+      <button
+        class=${"gear project-pill" + (open ? " open" : "") + (switchingProject ? " switching" : "")}
+        title=${tooltip}
+        onClick=${() => setOpen((v) => !v)}
+        disabled=${Boolean(switchingProject)}
+      >${label}</button>
+      ${open ? html`
+        <div class="project-menu" role="menu">
+          <div class="project-menu-head">Switch project</div>
+          ${visible.length === 0
+            ? html`<div class="project-menu-empty">No projects yet</div>`
+            : visible.map((p) => html`
+              <button
+                key=${p.id}
+                class=${"project-menu-item" + (p.id === activeProjectId ? " active" : "")}
+                onClick=${() => {
+                  setOpen(false);
+                  if (p.id !== activeProjectId) onActivate(p.id);
+                }}
+                disabled=${Boolean(switchingProject)}
+              >
+                <span class="project-menu-check">${p.id === activeProjectId ? "✓" : ""}</span>
+                <span class="project-menu-name">${p.name}</span>
+                <span class="project-menu-slug">${p.id}</span>
+              </button>
+            `)}
+          <div class="project-menu-sep"></div>
+          <button
+            class="project-menu-item project-menu-new"
+            onClick=${() => {
+              setOpen(false);
+              onCreate();
+            }}
+          >+ New project…</button>
+        </div>
+      ` : null}
+    </div>
+  `;
+}
+
+// Phase 4 (PROJECTS_SPEC.md §6): pre-flight confirmation modal.
+// Shows the user what's about to happen before any kDrive sync runs.
+// Counts come from GET /api/projects/switch-preview; the modal
+// degrades gracefully when /switch-preview failed (preview is null).
+// Audit fix #5: format bytes as human-readable size for the confirm
+// modal. Spec §6 example: "(12 files, ~340 KB)".
+function formatBytes(n) {
+  if (!n || n < 0) return "0 B";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function ProjectSwitchConfirmModal({ confirm, onCancel, onSwitch }) {
+  const p = confirm.preview;
+  const fromLabel = p ? p.from_name : "current project";
+  const toLabel = p ? p.to_name : confirm.to;
+  // Audit fix #7: when sync_state is empty (first run), the file
+  // count is the entire project tree, which reads as alarming. The
+  // server flags this as `initial_sync` so we can render a friendlier
+  // string.
+  const renderPushLine = () => {
+    if (!p) return `Push current ${fromLabel} working files to kDrive`;
+    if (p.initial_sync) {
+      return `Push current ${fromLabel} working files to kDrive (initial sync, ${p.files_to_push} files, ~${formatBytes(p.bytes_to_push)})`;
+    }
+    if (p.files_to_push === 0) {
+      return `Push current ${fromLabel} working files to kDrive (no changes)`;
+    }
+    return `Push current ${fromLabel} working files to kDrive (${p.files_to_push} file${p.files_to_push === 1 ? "" : "s"}, ~${formatBytes(p.bytes_to_push)})`;
+  };
+  return html`
+    <div class="modal-backdrop" onClick=${onCancel}>
+      <div
+        class="modal switch-confirm"
+        role="dialog"
+        aria-modal="true"
+        onClick=${(e) => e.stopPropagation()}
+      >
+        <header class="modal-head">
+          <h2>Switch from "${fromLabel}" to "${toLabel}"?</h2>
+        </header>
+        <div class="modal-body">
+          <p>This will:</p>
+          <ul class="switch-confirm-steps">
+            <li>
+              ${p && p.live_conversations > 0
+                ? `Snapshot ${p.live_conversations} in-progress conversation${p.live_conversations === 1 ? "" : "s"} (tagged \`live: true\`) and push to kDrive`
+                : "Snapshot any in-progress conversations and push to kDrive"}
+            </li>
+            <li>${renderPushLine()}</li>
+            <li>
+              ${p && p.target_exists
+                ? `Pull ${toLabel} working files from kDrive`
+                : `Initialize ${toLabel} workspace from kDrive`}
+            </li>
+            <li>Reload UI with ${toLabel}: team identity, sessions, conversations</li>
+          </ul>
+          ${p && p.in_flight_agent
+            ? html`<p class="switch-confirm-warn">
+                Heads-up: agent <code>${p.in_flight_agent}</code> has a turn in flight.
+                You'll be asked whether to wait or cancel.
+              </p>`
+            : null}
+          ${confirm.error
+            ? html`<p class="switch-confirm-err">${confirm.error}</p>`
+            : null}
+        </div>
+        <footer class="modal-foot">
+          <button class="modal-btn ghost" onClick=${onCancel}>Cancel</button>
+          <button class="modal-btn primary" onClick=${onSwitch}>Switch</button>
+        </footer>
+      </div>
+    </div>
+  `;
+}
+
+// Phase 4 (§6 in-flight caveat): user clicked Switch but an agent is
+// mid-turn. Spec §14 Q2 settled on hard-cancel as the recommended
+// semantic; we offer Wait or "Cancel turns and switch".
+function ProjectSwitchInFlightModal({ inFlight, onWait, onCancelAndSwitch }) {
+  return html`
+    <div class="modal-backdrop">
+      <div class="modal switch-inflight" role="dialog" aria-modal="true">
+        <header class="modal-head">
+          <h2>${inFlight.agentId} is mid-turn</h2>
+        </header>
+        <div class="modal-body">
+          <p>
+            Switching to "${inFlight.toName}" requires every agent to be idle.
+            <code>${inFlight.agentId}</code> has a turn in flight.
+          </p>
+          <p>
+            Choose <strong>Wait</strong> to let the turn finish (you can re-click
+            Switch when it's done), or <strong>Cancel turns and switch</strong> to
+            hard-cancel every running agent and switch immediately. Hard-cancel
+            discards the in-flight tool calls.
+          </p>
+        </div>
+        <footer class="modal-foot">
+          <button class="modal-btn ghost" onClick=${onWait}>Wait</button>
+          <button class="modal-btn primary" onClick=${onCancelAndSwitch}>
+            Cancel turns and switch
+          </button>
+        </footer>
+      </div>
+    </div>
+  `;
+}
+
+// Phase 4 (§6): busy modal with stepper animation. Listens for
+// `project_switch_step` events emitted by the activate flow + the
+// terminal `project_switched` event. The state is fed by the WS
+// dispatcher in App; this component renders.
+// Spec §6 lists 6 sub-steps; the activate flow consolidates them into
+// 4 + a `started` marker (snapshot folds into push_current; reload
+// covers both context load + pane re-render). Keep the spec wording
+// where possible so the modal reads the same as the doc.
+const SWITCH_STEP_LABELS = {
+  started: "Starting switch",
+  push_current: "Pushing current project to kDrive",
+  pull_new: "Pulling new project from kDrive",
+  swap_pointer: "Switching active project pointer",
+  reload: "Loading new project context",
+};
+
+function ProjectSwitchBusyModal({ busy, onDismiss, onRetry }) {
+  const stepRows = busy.steps;
+  const renderIcon = (status) => {
+    if (status === "ok") return html`<span class="step-icon ok">✓</span>`;
+    if (status === "running") return html`<span class="step-icon running">⟳</span>`;
+    if (status === "failed" || status === "timed_out") return html`<span class="step-icon err">✗</span>`;
+    return html`<span class="step-icon pending">○</span>`;
+  };
+  const fmtCounts = (step, detail) => {
+    // Audit fix #6: surface the pre-flight live-conversation count
+    // on the push_current step so the modal mirrors spec §6 wording
+    // ("Snapshotting Misc live conversations (3 files)").
+    const liveSuffix =
+      step === "push_current" && busy.liveConversations
+        ? ` · ${busy.liveConversations} live conversation${busy.liveConversations === 1 ? "" : "s"}`
+        : "";
+    if (!detail) return liveSuffix;
+    if (detail.counts) {
+      const c = detail.counts;
+      // pull_new: {project: {pulled, ...}, wiki: {...}}
+      if (c.project && typeof c.project === "object" && "pulled" in c.project) {
+        return ` (${c.project.pulled || 0} files)${liveSuffix}`;
+      }
+      // push_current: {project: {pushed, ...}, wiki: {...}}
+      if (c.project && typeof c.project === "object" && "pushed" in c.project) {
+        return ` (${c.project.pushed || 0} pushed)${liveSuffix}`;
+      }
+    }
+    if (detail.error) return ` — ${String(detail.error).slice(0, 100)}`;
+    return liveSuffix;
+  };
+  return html`
+    <div class="modal-backdrop">
+      <div class="modal switch-busy" role="dialog" aria-modal="true">
+        <header class="modal-head">
+          <h2>
+            ${busy.terminal
+              ? busy.ok
+                ? `Switched to "${busy.toName}"`
+                : `Switch failed`
+              : `Switching to "${busy.toName}"…`}
+          </h2>
+        </header>
+        <div class="modal-body">
+          <ol class="switch-step-list">
+            ${stepRows.length === 0
+              ? html`<li class="switch-step pending">
+                  ${renderIcon("pending")}
+                  <span class="step-label">Waiting for server…</span>
+                </li>`
+              : stepRows.map((s) => html`
+                <li class=${"switch-step " + s.status} key=${s.step}>
+                  ${renderIcon(s.status)}
+                  <span class="step-label">
+                    ${SWITCH_STEP_LABELS[s.step] || s.step}${fmtCounts(s.step, s.detail)}
+                  </span>
+                </li>
+              `)}
+          </ol>
+          ${!busy.terminal
+            ? html`<div class="switch-shimmer"></div>`
+            : null}
+          ${busy.terminal && !busy.ok
+            ? html`<p class="switch-busy-err">
+                ${busy.error || "Switch could not complete."}
+                ${busy.failedStep ? html` (failed at: <code>${busy.failedStep}</code>)` : null}
+              </p>`
+            : null}
+        </div>
+        <footer class="modal-foot">
+          ${busy.terminal && !busy.ok
+            ? html`<button class="modal-btn ghost" onClick=${onDismiss}>Cancel and stay</button>
+                   <button class="modal-btn primary" onClick=${onRetry}>Retry</button>`
+            : busy.terminal
+            ? html`<button class="modal-btn primary" onClick=${onDismiss}>Done</button>`
+            : html`<span class="modal-foot-note">Modal cannot be dismissed during the switch.</span>`}
+        </footer>
+      </div>
+    </div>
+  `;
+}
+
+function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, activeProjectId, switchingProject, onActivateProject, onCreateProject, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, onOpenSettings, paused, onTogglePause, onLayoutPreset, onCancelAll }) {
   const workingCount = agents.filter((a) => a.status === "working").length;
   const grouped = useMemo(() => {
     const coach = agents.find((a) => a.kind === "coach");
@@ -2051,12 +2706,13 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, onOpen, onStackI
               <span class="files-icon-body"></span>
             </span>
           </button>
-          <button
-            class="gear project-placeholder"
-            title="Project selector — coming soon"
-            disabled
-            aria-disabled="true"
-          >P</button>
+          <${ProjectSwitcher}
+            projects=${projects}
+            activeProjectId=${activeProjectId}
+            switchingProject=${switchingProject}
+            onActivate=${onActivateProject}
+            onCreate=${onCreateProject}
+          />
         </div>
         <div class="rail-group rail-controls">
           ${openSlots.length >= 2
@@ -3712,6 +4368,7 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, onCrea
       </header>
       <div class="env-body">
         <${EnvAttentionSection} conversations=${conversations} />
+        <${EnvKDriveStatusSection} conversations=${conversations} />
         <${EnvTasksSection} tasks=${tasks} onCreate=${onCreateTask} />
         <${EnvCostSection} agents=${agents} serverStatus=${serverStatus} />
         <${EnvInboxSection} conversations=${conversations} />
@@ -4437,6 +5094,58 @@ function EnvInboxSection({ conversations }) {
   `;
 }
 
+// kDrive sync banner — surfaces the most recent kdrive_sync_failed
+// events emitted by server/project_sync.py when retries exhaust.
+// Auto-clears when a fresh successful sync overrides the row's
+// sync_state; we render last 5 minutes of failures only so a stale
+// red banner disappears without user action.
+const KDRIVE_FAILURE_TTL_MS = 5 * 60 * 1000;
+
+function EnvKDriveStatusSection({ conversations }) {
+  const failures = useMemo(() => {
+    const now = Date.now();
+    const out = [];
+    const seen = new Set();
+    for (const list of conversations.values()) {
+      for (const ev of list) {
+        if (ev.type !== "kdrive_sync_failed") continue;
+        // Dedup by (op, project_id, tree, path) — multiple files can
+        // fail in one cycle but we want the user to see one row per
+        // recurring path.
+        const key = `${ev.op || "?"}::${ev.project_id || ""}::${ev.tree || ""}::${ev.path || ""}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const t = Date.parse(ev.ts || "");
+        if (isFinite(t) && now - t < KDRIVE_FAILURE_TTL_MS) {
+          out.push(ev);
+        }
+      }
+    }
+    return out.slice(-10).reverse();
+  }, [conversations]);
+
+  if (failures.length === 0) return null;
+  return html`
+    <section class="env-section env-kdrive-failed">
+      <h2>kDrive sync errors (${failures.length})</h2>
+      <div class="env-kdrive-list">
+        ${failures.map((ev) => html`
+          <div class="env-kdrive-row" key=${ev.__id || (ev.ts + ev.path)}>
+            <span class="env-kdrive-op">${ev.op || "sync"}</span>
+            <span class="env-kdrive-path">
+              ${ev.tree === "wiki" ? "wiki/" : (ev.project_id ? ev.project_id + "/" : "")}${ev.path || "?"}
+            </span>
+            <span class="env-kdrive-err" title=${ev.error || ""}>${(ev.error || "").slice(0, 80)}</span>
+          </div>
+        `)}
+      </div>
+      <div class="env-kdrive-hint">
+        Files left local-only; next push cycle will retry. Check kDrive auth or disk space if this persists.
+      </div>
+    </section>
+  `;
+}
+
 function EnvMemorySection({ conversations }) {
   const [docs, setDocs] = useState([]);
   const [openTopic, setOpenTopic] = useState(null);
@@ -5126,7 +5835,30 @@ function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, 
   const [activeRoot, setActiveRoot] = useState(null);
   const [tree, setTree] = useState(null);
   const [selected, setSelected] = useState(null); // {root, path}
-  const [expanded, setExpanded] = useState(new Set()); // "root:relpath" strings
+  // Phase 5: tree collapse state persisted to localStorage so a page
+  // reload doesn't lose the user's expanded folders. Key format:
+  // "root:relpath" — same as before; new entries land in the Set
+  // and the Set is serialized as an array on every change.
+  const [expanded, setExpanded] = useState(() => {
+    try {
+      const raw = localStorage.getItem("harness_files_expanded_v1");
+      if (!raw) return new Set();
+      const arr = JSON.parse(raw);
+      return Array.isArray(arr) ? new Set(arr) : new Set();
+    } catch (_) {
+      return new Set();
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "harness_files_expanded_v1",
+        JSON.stringify(Array.from(expanded)),
+      );
+    } catch (_) {
+      /* localStorage disabled — silent no-op */
+    }
+  }, [expanded]);
   const [content, setContent] = useState(null); // authoritative loaded text
   const [draft, setDraft] = useState(""); // textarea buffer
   const [meta, setMeta] = useState(null); // {size, mtime}
@@ -5172,47 +5904,78 @@ function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, 
       const res = await authedFetch("/api/files/roots");
       const data = await res.json();
       setRoots(Array.isArray(data) ? data : []);
+      // Phase 5 (PROJECTS_SPEC.md §7): the new payload always has
+      // exactly two roots — global + active project. Don't auto-pin
+      // the activeRoot; both are rendered top-level and the user
+      // expands either tree directly. Keep the picker as a fallback
+      // for legacy clients still toggling activeRoot.
       if (!activeRoot && Array.isArray(data) && data.length > 0) {
-        setActiveRoot(data[0].key);
+        // Default to the project root since that's where most user
+        // work happens — global is read-mostly (CLAUDE.md, skills/).
+        const proj = data.find((r) => (r.scope || r.key) === "project");
+        setActiveRoot((proj || data[0]).id || (proj || data[0]).key);
       }
     } catch (e) {
       setErr("roots load failed: " + String(e));
     }
   }, [authedFetch, activeRoot]);
 
+  // Phase 5: tree state per-root so both panels render without
+  // tearing each other's state down on a re-fetch.
+  const [trees, setTrees] = useState({});  // {global: {...}, project: {...}}
+
   const loadTree = useCallback(async (rootKey) => {
     if (!rootKey) return;
     try {
       const res = await authedFetch("/api/files/tree/" + rootKey);
       const data = await res.json();
-      setTree(data);
+      setTrees((prev) => ({ ...prev, [rootKey]: data }));
+      setTree(data);  // back-compat for code paths still reading `tree`
     } catch (e) {
       setErr("tree load failed: " + String(e));
     }
   }, [authedFetch]);
 
-  useEffect(() => { loadRoots(); }, [loadRoots]);
-  useEffect(() => { if (activeRoot) loadTree(activeRoot); }, [activeRoot, loadTree]);
-  // Live-refresh: when a file-system-changing event lands on the WS,
-  // App bumps fsEpoch. Reload the tree so agent-written files appear
-  // without a manual root-click, AND reload the currently-open file
-  // if it exists (e.g. Coach edited CLAUDE.md while the user had it
-  // open — previously the tree refreshed but the editor kept showing
-  // the pre-edit content). Skip either reload while the user is
-  // mid-edit (dirty draft) so we don't yank their typing.
+  // Phase 5: load BOTH trees on mount + after every roots refresh.
+  // Reloads when activeProjectId changes via the WS dispatcher
+  // (project_switched bumps the rootsFromApp prop with the new
+  // `project` root path; we re-fetch both trees so the bottom panel
+  // rebinds in place).
   useEffect(() => {
-    if (fsEpoch == null || !activeRoot) return;
+    loadRoots();
+  }, [loadRoots]);
+  // Phase 5 audit fix: when App's `fileRoots` cache refreshes (e.g.
+  // after a `project_switched` event triggers `loadFileRoots()`), the
+  // `rootsFromApp` prop reference changes. Re-sync our local `roots`
+  // state so labels/paths/project_id reflect the new active project
+  // without needing a self-fetch round-trip.
+  useEffect(() => {
+    if (!Array.isArray(rootsFromApp) || rootsFromApp.length === 0) return;
+    setRoots(rootsFromApp);
+  }, [rootsFromApp]);
+  useEffect(() => {
+    if (!Array.isArray(roots)) return;
+    for (const r of roots) {
+      const id = r.id || r.key;
+      if (id) loadTree(id);
+    }
+  }, [roots, loadTree]);
+  // Live-refresh: when a file-system-changing event lands on the WS,
+  // App bumps fsEpoch. Reload BOTH trees (agent edits could land in
+  // either scope). Skip either reload while the user is mid-edit
+  // (dirty draft) so we don't yank their typing.
+  useEffect(() => {
+    if (fsEpoch == null) return;
     const dirty = content !== null && draft !== content;
     if (dirty) return;
-    loadTree(activeRoot);
-    // Also re-fetch the open file if any. No-ops if the underlying
-    // file didn't change (we accept the extra HTTP round trip for
-    // the simplicity of not having to correlate which path actually
-    // moved — events are rare at human scale).
+    for (const r of roots) {
+      const id = r.id || r.key;
+      if (id) loadTree(id);
+    }
     if (selected) openFile(selected.root, selected.path);
   }, [fsEpoch]);
 
-  const activeRootMeta = roots.find((r) => r.key === activeRoot);
+  const activeRootMeta = roots.find((r) => (r.id || r.key) === activeRoot);
 
   const openFile = useCallback(async (root, path) => {
     setLoading(true);
@@ -5356,28 +6119,49 @@ function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, 
 
       <div class="files-body">
         <nav class="files-tree">
-          <div class="files-tree-roots">
-            ${roots.map((r) => html`
-              <button
-                key=${r.key}
-                class=${"files-root" + (r.key === activeRoot ? " active" : "")}
-                onClick=${() => setActiveRoot(r.key)}
-                title=${r.writable ? "editable" : "read-only"}
-              >${r.key}${r.writable ? "" : " 🔒"}</button>
-            `)}
-          </div>
-          ${tree
-            ? html`<${FileTreeNode}
-                node=${tree}
-                root=${activeRoot}
-                path=""
-                depth=${0}
-                expanded=${expanded}
-                setExpanded=${setExpanded}
-                selected=${selected}
-                onPick=${openFile}
-              />`
-            : html`<div class="files-empty">loading…</div>`}
+          ${roots.map((r) => {
+            const id = r.id || r.key;
+            const headerIcon = r.scope === "global" ? "🌐" : "📁";
+            const subtree = trees[id];
+            const sectionExpKey = "__section:" + id;
+            const sectionOpen = !expanded.has(sectionExpKey);  // open by default
+            const onToggleSection = () => {
+              setExpanded((prev) => {
+                const next = new Set(prev);
+                if (next.has(sectionExpKey)) next.delete(sectionExpKey);
+                else next.add(sectionExpKey);
+                return next;
+              });
+            };
+            return html`
+              <div class=${"files-root-section" + (id === activeRoot ? " active" : "")} key=${id}>
+                <button
+                  class="files-root-header"
+                  onClick=${() => { setActiveRoot(id); onToggleSection(); }}
+                  title=${(r.label || id) + " — " + (r.path || "") + (r.writable ? "" : " (read-only)")}
+                >
+                  <span class="files-root-icon">${headerIcon}</span>
+                  <span class="files-root-label">${r.label || id}</span>
+                  ${r.writable ? null : html`<span class="files-root-lock"> 🔒</span>`}
+                  <span class="files-root-caret">${sectionOpen ? "▾" : "▸"}</span>
+                </button>
+                ${sectionOpen
+                  ? subtree
+                    ? html`<${FileTreeNode}
+                        node=${subtree}
+                        root=${id}
+                        path=""
+                        depth=${0}
+                        expanded=${expanded}
+                        setExpanded=${setExpanded}
+                        selected=${selected}
+                        onPick=${openFile}
+                      />`
+                    : html`<div class="files-empty">loading…</div>`
+                  : null}
+              </div>
+            `;
+          })}
         </nav>
 
         <section class="files-editor">
@@ -5387,6 +6171,23 @@ function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, 
             : loading
             ? html`<div class="files-empty">loading…</div>`
             : html`
+              ${(() => {
+                // Phase 5 (PROJECTS_SPEC.md §7): tag opened files with
+                // originating scope so a "global" CLAUDE.md edit reads
+                // differently from a "project" repo edit. Looked up
+                // from the loaded roots payload by `selected.root`.
+                const sel = roots.find((r) => (r.id || r.key) === selected.root);
+                const scope = sel?.scope;
+                if (!scope) return null;
+                const cls = scope === "global"
+                  ? "files-scope-badge files-scope-global"
+                  : "files-scope-badge files-scope-project";
+                const icon = scope === "global" ? "🌐" : "📁";
+                const label = scope === "global"
+                  ? "GLOBAL"
+                  : ("PROJECT" + (sel?.label ? ` — ${sel.label}` : ""));
+                return html`<div class=${cls} title=${selected.path}>${icon} ${label}</div>`;
+              })()}
               ${isMd
                 ? html`<div class="files-md-toolbar">
                     <button

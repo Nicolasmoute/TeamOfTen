@@ -38,16 +38,16 @@ async def test_resets_in_progress_tasks_to_claimed(fresh_db: str) -> None:
     c = await configured_conn()
     try:
         await c.execute(
-            "INSERT INTO tasks (id, title, status, owner, created_by) "
-            "VALUES ('t-live', 't', 'in_progress', 'p5', 'coach')"
+            "INSERT INTO tasks (id, project_id, title, status, owner, created_by) "
+            "VALUES ('t-live', 'misc', 't', 'in_progress', 'p5', 'coach')"
         )
         await c.execute(
-            "INSERT INTO tasks (id, title, status, owner, created_by) "
-            "VALUES ('t-done', 'd', 'done', 'p5', 'coach')"
+            "INSERT INTO tasks (id, project_id, title, status, owner, created_by) "
+            "VALUES ('t-done', 'misc', 'd', 'done', 'p5', 'coach')"
         )
         await c.execute(
-            "INSERT INTO tasks (id, title, status, created_by) "
-            "VALUES ('t-open', 'o', 'open', 'coach')"
+            "INSERT INTO tasks (id, project_id, title, status, created_by) "
+            "VALUES ('t-open', 'misc', 'o', 'open', 'coach')"
         )
         await c.commit()
     finally:
