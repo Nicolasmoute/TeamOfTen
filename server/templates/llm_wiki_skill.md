@@ -11,6 +11,46 @@ from Andrej Karpathy's LLM-wiki gist, with one deliberate deviation:
 renderer is CommonMark/GFM via `marked`, which doesn't parse double
 brackets).
 
+## Why a wiki (not just RAG)
+
+Knowledge should **compound** over time. Instead of every agent
+re-deriving the same insight from raw sources or chat history, the
+wiki is a structured, interlinked collection of markdown that grows
+turn after turn. New learnings get *integrated* into existing pages
+(cross-references updated, contradictions flagged) rather than piled
+into a flat search index.
+
+The pattern solves the maintenance burden that kills human-maintained
+wikis: agents handle the tedious bookkeeping (updating references,
+keeping consistency, noting contradictions); humans focus on curation
+and strategic questions.
+
+## Three-layer architecture
+
+1. **Raw sources** — immutable inputs you curate: project files,
+   uploads, decisions, repo code, external articles. Live under
+   `/data/projects/<slug>/{uploads,decisions,repo}/` and
+   `/data/projects/<slug>/working/knowledge/`. Never overwritten by
+   the wiki.
+2. **The wiki itself** — agent-maintained markdown pages: concept
+   pages, entity pages, summaries. Lives under `/data/wiki/`.
+3. **The schema** — this file (the skill). Defines structure,
+   conventions, and the three operations below.
+
+## Three operations
+
+- **Ingest** — when a new source arrives (a decision, a research note,
+  a debugging insight): read it, identify what's worth keeping,
+  write or update the relevant wiki page(s), and link from related
+  pages. One concept per file.
+- **Query** — when answering a question, search the wiki first
+  (`/data/wiki/INDEX.md` is the entry point). Synthesize an answer
+  from existing pages; if the synthesis itself is valuable, file it
+  back as a new page.
+- **Lint** — periodically (or when you notice drift) audit for
+  contradictions, orphaned pages, missing cross-references, and
+  stale entries. Fix in place.
+
 ## When to create an entry
 
 Create a wiki entry when you encounter something that:
@@ -80,14 +120,19 @@ Absolute paths starting with `/data/` are clickable in the harness
 UI's Files pane (the file-link resolver opens the matching root
 + relative path). Relative paths work too.
 
-## Updating INDEX.md
+## Navigation files
 
-INDEX.md is **auto-maintained by the harness** on every wiki write
-event. Do NOT edit it directly. Just write your entry — the harness
-appends a link line, sorted by project / cross-project group.
+Two special files assist navigation at the wiki root:
 
-If INDEX.md ever gets out of sync (manual edits, file copy, etc.),
-it'll self-heal on the next wiki write.
+- **`/data/wiki/INDEX.md`** — auto-maintained content catalog,
+  organized by project / cross-project group. **Do NOT edit
+  directly.** Just write your entry; the harness appends a link line
+  on every wiki write event. If it gets out of sync (manual edits,
+  file copy, restore from snapshot), it self-heals on the next wiki
+  write.
+- **`/data/wiki/log.md`** — append-only chronological record of
+  wiki activity (entries created/updated, lint passes, contradictions
+  noted). Useful for "what changed lately?" queries.
 
 ## Don't
 
@@ -97,3 +142,4 @@ it'll self-heal on the next wiki write.
   (this is the deliberate deviation from Karpathy's gist).
 - Don't create entries for tasks-in-flight; use `coord_send_message`
   or task notes for those.
+- Don't edit `INDEX.md` by hand — it's auto-maintained.

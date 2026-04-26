@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -95,6 +96,62 @@ def _project_branch() -> str:
     env_val = os.environ.get("HARNESS_PROJECT_BRANCH", "").strip()
     _CACHED_BRANCH = db_val or env_val or "main"
     return _CACHED_BRANCH
+
+
+_ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _expand_placeholders(value: str) -> str:
+    """Expand `${VAR}` placeholders in a string. Resolution order
+    matches mcp_config: encrypted secrets store first, os.environ
+    fallback, empty string + warning if neither has it. Used to
+    interpolate PATs into the project repo URL before handing it
+    to git, so the DB never stores the raw token."""
+    if not value or "${" not in value:
+        return value
+    try:
+        from server import secrets as secrets_store
+    except Exception:
+        secrets_store = None  # type: ignore[assignment]
+
+    def sub(m: re.Match[str]) -> str:
+        name = m.group(1)
+        v_secret = None
+        if secrets_store is not None:
+            try:
+                v_secret = secrets_store.lookup_sync(name)
+            except Exception:
+                v_secret = None
+        v_env = os.environ.get(name)
+        if v_secret is not None:
+            return v_secret
+        if v_env is not None:
+            return v_env
+        logger.warning(
+            "workspaces: ${%s} referenced but not set anywhere "
+            "(expanded to empty)",
+            name,
+        )
+        return ""
+
+    return _ENV_VAR_RE.sub(sub, value)
+
+
+def _mask_userinfo(text: str, *expanded_urls: str) -> str:
+    """Scrub the userinfo portion of any expanded URL from `text` so
+    raw tokens don't leak into logs / API error responses. Called on
+    every string we surface after a git invocation."""
+    out = text
+    for url in expanded_urls:
+        if not url:
+            continue
+        m = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://([^@/\s]+)@", url)
+        if not m:
+            continue
+        userinfo = m.group(1)
+        if userinfo and userinfo not in ("***",):
+            out = out.replace(userinfo, "***")
+    return out
 
 
 def project_configured() -> bool:
@@ -228,16 +285,19 @@ async def _ensure_base_clone() -> None:
         logger.info("base repo already present at %s", BASE_REPO_PATH)
         return
     BASE_REPO_PATH.parent.mkdir(parents=True, exist_ok=True)
-    repo = _project_repo()
-    branch = _project_branch()
-    logger.info("cloning %s (branch %s) → %s", repo, branch, BASE_REPO_PATH)
+    repo_raw = _project_repo()
+    repo = _expand_placeholders(repo_raw)
+    branch = _expand_placeholders(_project_branch())
+    # Log the unexpanded form so PATs don't hit the logs.
+    logger.info("cloning %s (branch %s) → %s", repo_raw, branch, BASE_REPO_PATH)
     code, out, err = await _run(
         ["git", "clone", "--branch", branch, repo, str(BASE_REPO_PATH)],
         timeout=300,
     )
     if code != 0:
+        msg = (err.strip() or out.strip())
         raise RuntimeError(
-            f"git clone exited {code}: {err.strip() or out.strip()}"
+            f"git clone exited {code}: {_mask_userinfo(msg, repo)}"
         )
     logger.info("clone ok")
 

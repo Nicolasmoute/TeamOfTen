@@ -624,6 +624,8 @@ preceding it.
 
 5. **Cost caps baked in from the start.** Per-agent daily turn/cost caps are enforced before spawn, not added later. 11 Sonnet sessions × 50-turn loops can chew through a weekly Max allowance fast.
 
+6. **No emoji in the UI.** Never put emoji or emoticons (⚠️ ✅ ❌ 📄 🔒 ⚑ ↻ → etc.) in JSX/HTML/CSS strings. Use small CSS-drawn divs with `currentColor` backgrounds, or inline SVG. The codebase already has the patterns: status dots, lock SVG, `.projects-icon-*` (multi-folder), `.files-icon-*` (file-tree). Grep `server/static/style.css` for `-icon-` to follow precedent. Emoji render inconsistently across OS/font stacks and clash with the harness's clean icon-driven design. Applies equally to warnings, badges, status indicators, and tool-result renderers.
+
 ---
 
 ## Known gotchas
