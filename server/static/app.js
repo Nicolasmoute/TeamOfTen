@@ -3152,6 +3152,396 @@ function TeamModelsSection() {
 
 // Project repo configuration. DB-backed (team_config) with env
 // fallback. Edits take effect on the next container restart — live
+// Phase 8 (PROJECTS_SPEC.md §12, §13): Projects section. Lists every
+// project (active marked, archived dimmed) with inline edit (name /
+// description / repo_url) + archive toggle + delete button (Misc
+// disabled) + Provision now button (per-project — calls the §11
+// per-project repo provision endpoint). Expand a card to view that
+// project's `agent_project_roles` (read-only — name/role/brief per
+// slot are edited via Coach's `coord_set_player_role` for
+// name/role, or each pane's settings popover for brief).
+function ProjectsSection() {
+  const [data, setData] = useState({ projects: [], active: null });
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState(null);
+  const [expanded, setExpanded] = useState({});  // {projectId: bool}
+  const [rolesByProject, setRolesByProject] = useState({});  // {projectId: rolesArr}
+  const [editing, setEditing] = useState({});  // {projectId: {name,description,repo_url}}
+  const [showCreate, setShowCreate] = useState(false);
+  const [createForm, setCreateForm] = useState({ slug: "", name: "", description: "", repo_url: "" });
+  const [slugManuallyEdited, setSlugManuallyEdited] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/projects");
+      if (!res.ok) return;
+      const json = await res.json();
+      setData(json);
+    } catch (e) {
+      console.error("projects load failed", e);
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const fetchRoles = useCallback(async (projectId) => {
+    try {
+      const res = await authFetch(`/api/projects/${encodeURIComponent(projectId)}/roles`);
+      if (!res.ok) return;
+      const json = await res.json();
+      setRolesByProject((m) => ({ ...m, [projectId]: json.roles || [] }));
+    } catch (e) {
+      console.error("roles fetch failed", e);
+    }
+  }, []);
+
+  const toggleExpand = (projectId) => {
+    setExpanded((m) => {
+      const next = { ...m, [projectId]: !m[projectId] };
+      if (next[projectId] && !rolesByProject[projectId]) fetchRoles(projectId);
+      return next;
+    });
+  };
+
+  const startEdit = (p) => setEditing((m) => ({
+    ...m,
+    [p.id]: { name: p.name, description: p.description || "", repo_url: p.repo_url || "" },
+  }));
+  const cancelEdit = (id) => setEditing((m) => { const n = { ...m }; delete n[id]; return n; });
+  const updateEdit = (id, field, value) => setEditing((m) => ({
+    ...m,
+    [id]: { ...m[id], [field]: value },
+  }));
+
+  const saveEdit = async (id) => {
+    const draft = editing[id];
+    if (!draft || busy) return;
+    setBusy(true); setMsg(null);
+    try {
+      const body = {};
+      if (draft.name !== undefined) body.name = draft.name;
+      if (draft.description !== undefined) body.description = draft.description;
+      if (draft.repo_url !== undefined) body.repo_url = draft.repo_url;
+      const res = await authFetch(`/api/projects/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) {
+        setMsg({ kind: "ok", text: `Saved ${id}.` });
+        cancelEdit(id);
+        await load();
+      } else {
+        const t = await res.text().catch(() => "");
+        setMsg({ kind: "err", text: `HTTP ${res.status}: ${t || "save failed"}` });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    } finally { setBusy(false); }
+  };
+
+  const toggleArchive = async (p) => {
+    if (busy) return;
+    if (p.is_active && !p.archived) {
+      setMsg({ kind: "err", text: "Switch away from this project before archiving." });
+      return;
+    }
+    setBusy(true); setMsg(null);
+    try {
+      const res = await authFetch(`/api/projects/${encodeURIComponent(p.id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ archived: !p.archived }),
+      });
+      if (res.ok) {
+        setMsg({ kind: "ok", text: `${p.archived ? "Un-archived" : "Archived"} ${p.id}.` });
+        await load();
+      } else {
+        const t = await res.text().catch(() => "");
+        setMsg({ kind: "err", text: `HTTP ${res.status}: ${t}` });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    } finally { setBusy(false); }
+  };
+
+  const deleteProject = async (p) => {
+    if (busy || p.id === "misc") return;
+    const confirmed = window.confirm(
+      `Delete project "${p.name}" (${p.id})?\n\n`
+      + `This wipes the entire /data/projects/${p.id}/ tree, drops all `
+      + `tasks, messages, memory, decisions, conversations, events, and `
+      + `agent_project_roles for this project, and removes the kDrive `
+      + `mirror. This cannot be undone.`
+    );
+    if (!confirmed) return;
+    setBusy(true); setMsg(null);
+    try {
+      const res = await authFetch(`/api/projects/${encodeURIComponent(p.id)}`, {
+        method: "DELETE",
+      });
+      if (res.ok) {
+        setMsg({ kind: "ok", text: `Deleted ${p.id}.` });
+        await load();
+      } else {
+        const t = await res.text().catch(() => "");
+        setMsg({ kind: "err", text: `HTTP ${res.status}: ${t}` });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    } finally { setBusy(false); }
+  };
+
+  const provision = async (p) => {
+    if (busy) return;
+    if (!p.repo_url) {
+      setMsg({ kind: "err", text: `${p.id} has no repo URL set — save one first.` });
+      return;
+    }
+    setBusy(true); setMsg(null);
+    try {
+      const res = await authFetch(`/api/projects/${encodeURIComponent(p.id)}/repo/provision`, {
+        method: "POST",
+      });
+      if (res.ok) {
+        setMsg({ kind: "ok", text: `Provisioned ${p.id} repo + worktrees.` });
+      } else {
+        const t = await res.text().catch(() => "");
+        setMsg({ kind: "err", text: `HTTP ${res.status}: ${t}` });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    } finally { setBusy(false); }
+  };
+
+  // Auto-derive slug from name (lowercase, dashes, drop bad chars).
+  // §14 Q1 resolution: auto-derive with override.
+  const deriveSlug = (name) => (name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 48);
+
+  const updateCreateName = (name) => {
+    setCreateForm((f) => {
+      const next = { ...f, name };
+      if (!slugManuallyEdited) next.slug = deriveSlug(name);
+      return next;
+    });
+  };
+
+  const submitCreate = async () => {
+    if (busy) return;
+    const slug = (createForm.slug || "").trim();
+    const name = (createForm.name || "").trim();
+    if (!slug || !name) {
+      setMsg({ kind: "err", text: "Slug and name are both required." });
+      return;
+    }
+    setBusy(true); setMsg(null);
+    try {
+      const body = { slug, name };
+      const desc = (createForm.description || "").trim();
+      if (desc) body.description = desc;
+      const repo = (createForm.repo_url || "").trim();
+      if (repo) body.repo_url = repo;
+      const res = await authFetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) {
+        setMsg({ kind: "ok", text: `Created ${slug}.` });
+        setCreateForm({ slug: "", name: "", description: "", repo_url: "" });
+        setSlugManuallyEdited(false);
+        setShowCreate(false);
+        await load();
+      } else {
+        const t = await res.text().catch(() => "");
+        setMsg({ kind: "err", text: `HTTP ${res.status}: ${t}` });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    } finally { setBusy(false); }
+  };
+
+  const projects = Array.isArray(data.projects) ? data.projects : [];
+
+  return html`<section class="drawer-section">
+    <h3>
+      Projects
+      <button
+        class="drawer-refresh"
+        onClick=${load}
+        title="Refresh project list"
+      >↻</button>
+    </h3>
+    <p class="muted" style="margin: 0 0 8px 0; font-size: 12px;">
+      One row per project. Active is marked ✓; archived is dimmed (not
+      visible in the LeftRail switcher). Slug is the primary key — it
+      cannot be edited (see PROJECTS_SPEC.md §2). Misc is the fallback
+      project and cannot be deleted.
+    </p>
+    ${msg
+      ? html`<div style=${"font-size: 11px; margin: 0 0 8px; padding: 4px 8px; border-radius: 3px; "
+            + (msg.kind === "ok"
+              ? "color: var(--ok); border: 1px solid var(--ok); background: rgba(63,185,80,0.08);"
+              : "color: var(--err); border: 1px solid var(--err); background: rgba(248,81,73,0.08); white-space: pre-wrap;")}>${msg.text}</div>`
+      : null}
+
+    ${loaded
+      ? html`<div style="display: flex; flex-direction: column; gap: 6px;">
+          ${projects.map((p) => {
+            const isEditing = !!editing[p.id];
+            const isExpanded = !!expanded[p.id];
+            const roles = rolesByProject[p.id] || [];
+            return html`<div
+              key=${p.id}
+              style=${"border: 1px solid var(--border); border-radius: 4px; padding: 8px; "
+                + (p.archived ? "opacity: 0.6;" : "")
+                + (p.is_active ? " border-color: var(--accent);" : "")}
+            >
+              <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">
+                <strong style="font-size: 13px;">
+                  ${p.is_active ? "✓ " : ""}${p.name}
+                </strong>
+                <code style="font-size: 11px; color: var(--muted);">${p.id}</code>
+                ${p.archived ? html`<span style="font-size: 10px; color: var(--warn); border: 1px solid var(--warn); padding: 1px 5px; border-radius: 2px;">ARCHIVED</span>` : null}
+                <span style="flex: 1 1 auto;"></span>
+                <button
+                  onClick=${() => toggleExpand(p.id)}
+                  title="Show team identity for this project"
+                  style="font-size: 11px;"
+                >${isExpanded ? "▾ team" : "▸ team"}</button>
+              </div>
+
+              ${isEditing
+                ? html`<div style="margin-top: 6px; display: grid; gap: 4px;">
+                    <input
+                      placeholder="display name"
+                      value=${editing[p.id].name}
+                      onInput=${(e) => updateEdit(p.id, "name", e.target.value)}
+                      style="background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 4px 8px; font-size: 12px;"
+                    />
+                    <input
+                      placeholder="description (optional)"
+                      value=${editing[p.id].description}
+                      onInput=${(e) => updateEdit(p.id, "description", e.target.value)}
+                      style="background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 4px 8px; font-size: 12px;"
+                    />
+                    <input
+                      placeholder="repo URL (optional)"
+                      value=${editing[p.id].repo_url}
+                      onInput=${(e) => updateEdit(p.id, "repo_url", e.target.value)}
+                      style="background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 4px 8px; font-size: 12px; font-family: ui-monospace, monospace;"
+                    />
+                    <div style="display: flex; gap: 6px;">
+                      <button class="primary" disabled=${busy} onClick=${() => saveEdit(p.id)}>save</button>
+                      <button disabled=${busy} onClick=${() => cancelEdit(p.id)}>cancel</button>
+                    </div>
+                  </div>`
+                : html`<div style="margin-top: 4px; font-size: 11px; color: var(--muted);">
+                    ${p.description ? html`<div>${p.description}</div>` : null}
+                    <div>repo: ${p.repo_url || html`<em>(unset)</em>`}</div>
+                    <div>created: ${p.created_at || "?"}</div>
+                  </div>
+                  <div style="margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap;">
+                    <button disabled=${busy} onClick=${() => startEdit(p)} style="font-size: 11px;">edit</button>
+                    <button
+                      disabled=${busy || !p.repo_url}
+                      onClick=${() => provision(p)}
+                      title="Clone + create worktrees for this project"
+                      style="font-size: 11px;"
+                    >provision now</button>
+                    <button
+                      disabled=${busy || (p.is_active && !p.archived)}
+                      onClick=${() => toggleArchive(p)}
+                      title=${p.archived ? "Un-archive (show in switcher)" : "Archive (hide from switcher; not deleted)"}
+                      style="font-size: 11px;"
+                    >${p.archived ? "un-archive" : "archive"}</button>
+                    <button
+                      disabled=${busy || p.id === "misc"}
+                      onClick=${() => deleteProject(p)}
+                      title=${p.id === "misc" ? "Misc cannot be deleted" : "Delete project + on-disk tree + kDrive mirror"}
+                      style=${"font-size: 11px;" + (p.id !== "misc" ? " color: var(--err);" : "")}
+                    >delete</button>
+                  </div>`}
+
+              ${isExpanded
+                ? html`<div style="margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--border);">
+                    <div style="font-size: 11px; color: var(--muted); margin-bottom: 4px;">
+                      Read-only. Edit name/role via Coach (<code>coord_set_player_role</code>);
+                      brief via the slot's pane settings popover.
+                    </div>
+                    ${roles.length === 0
+                      ? html`<div class="muted" style="font-size: 11px;">No agent_project_roles rows yet.</div>`
+                      : html`<table style="width: 100%; font-size: 11px; border-collapse: collapse;">
+                          <thead>
+                            <tr style="text-align: left; color: var(--muted);">
+                              <th style="padding: 2px 4px;">slot</th>
+                              <th style="padding: 2px 4px;">name</th>
+                              <th style="padding: 2px 4px;">role</th>
+                              <th style="padding: 2px 4px;">brief</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            ${roles.map((r) => html`<tr key=${r.slot} style="border-top: 1px solid var(--border);">
+                              <td style="padding: 2px 4px;"><code>${r.slot}</code></td>
+                              <td style="padding: 2px 4px;">${r.name || html`<em>—</em>`}</td>
+                              <td style="padding: 2px 4px;">${r.role || html`<em>—</em>`}</td>
+                              <td style="padding: 2px 4px; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title=${r.brief || ""}>${r.brief ? r.brief.slice(0, 80) : html`<em>—</em>`}</td>
+                            </tr>`)}
+                          </tbody>
+                        </table>`}
+                  </div>`
+                : null}
+            </div>`;
+          })}
+        </div>`
+      : html`<p class="muted">loading…</p>`}
+
+    <div style="margin-top: 8px;">
+      ${showCreate
+        ? html`<div style="border: 1px solid var(--border); border-radius: 4px; padding: 8px; display: grid; gap: 4px;">
+            <strong style="font-size: 12px;">New project</strong>
+            <input
+              placeholder="display name"
+              value=${createForm.name}
+              onInput=${(e) => updateCreateName(e.target.value)}
+              style="background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 4px 8px; font-size: 12px;"
+            />
+            <input
+              placeholder="slug (auto-derived from name)"
+              value=${createForm.slug}
+              onInput=${(e) => { setCreateForm((f) => ({ ...f, slug: e.target.value })); setSlugManuallyEdited(true); }}
+              style="background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 4px 8px; font-size: 12px; font-family: ui-monospace, monospace;"
+            />
+            <input
+              placeholder="description (optional)"
+              value=${createForm.description}
+              onInput=${(e) => setCreateForm((f) => ({ ...f, description: e.target.value }))}
+              style="background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 4px 8px; font-size: 12px;"
+            />
+            <input
+              placeholder="repo URL (optional, e.g. https://\${GITHUB_TOKEN}@github.com/you/repo.git)"
+              value=${createForm.repo_url}
+              onInput=${(e) => setCreateForm((f) => ({ ...f, repo_url: e.target.value }))}
+              style="background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 4px 8px; font-size: 12px; font-family: ui-monospace, monospace;"
+            />
+            <div style="display: flex; gap: 6px;">
+              <button class="primary" disabled=${busy} onClick=${submitCreate}>create</button>
+              <button disabled=${busy} onClick=${() => { setShowCreate(false); setSlugManuallyEdited(false); }}>cancel</button>
+            </div>
+          </div>`
+        : html`<button onClick=${() => setShowCreate(true)}>+ new project</button>`}
+    </div>
+  </section>`;
+}
+
+
 // worktrees keep their old `git remote`, so changing the URL
 // mid-session doesn't affect in-flight Players.
 function TeamRepoSection() {
@@ -4211,6 +4601,8 @@ function SettingsDrawer({ onClose, serverStatus }) {
               />
             </div>
           </section>
+
+          <${ProjectsSection} />
 
           <${ClaudeAuthSection}
             health=${health}

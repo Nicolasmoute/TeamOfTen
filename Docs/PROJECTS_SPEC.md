@@ -894,14 +894,12 @@ Recommend doing these in order — each is independently testable.
 - Per-project CLAUDE.md stub auto-written on project creation (§8) with Goal + Repo pre-filled from creation modal; rest blank for Coach to fill.
 - INDEX.md auto-update on every wiki write event (per §14 Resolved: INDEX.md maintenance — append a link line, sort grouped by project / cross-project).
 
-### Implementation status (2026-04-25)
+### Implementation status (2026-04-26)
 
-- **Phase 1** — complete. Migration script `server/migrations/projects_v1.py` shipped; `project_id NOT NULL FK ON DELETE CASCADE` added to `tasks`/`messages`/`memory_docs`/`events`/`turns` plus `idx_*_project` indexes; six legacy columns dropped from `agents`; `agent_project_roles` / `agent_sessions` / `sync_state` populated; identity injection prepended to every system prompt with a Coach-only coordination block placeholder; `coord_*` tools, every domain API endpoint, and `bus.publish` scope to the active project; attachments and decisions paths route through `project_paths(active)`; isolation gate test passes. Known follow-ups land in Phase 3 (TOCTOU, watchdog scoping, isolation-test breadth).
-- **Phases 2–8** — not started.
+- **Phases 1–7** — complete and audited (see per-phase headers above).
+- **Phase 8** — complete; awaiting audit pass.
 
-The phase work is the real refactor backlog and is not appropriate for 1-min /loop iterations. Each phase is hours-to-days of code. Drive these via dedicated working sessions.
-
-### Phase 8 — Options drawer Projects section + per-project brief edit
+### Phase 8 — Options drawer Projects section + per-project brief edit (completed)
 - Projects section: project cards with create / edit (name, repo_url, description) / archive toggle / delete (Misc undeletable). Expand a card to view the project's `agent_project_roles` (read-only).
 - Pane settings popover update: `brief` field reads/writes `agent_project_roles.brief` for the active project (was `agents.brief`).
 - API update: existing `PUT /api/agents/{slot}/brief` re-targets to `agent_project_roles` for the active project; existing `coord_set_player_role` likewise. Both gain implicit `WHERE project_id = active`.

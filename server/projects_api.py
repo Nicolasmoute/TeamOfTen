@@ -369,6 +369,37 @@ def build_router(*, require_token, audit_actor):
             )
         return {"projects": items, "active": active}
 
+    @router.get(
+        "/api/projects/{project_id}/roles",
+        dependencies=[Depends(require_token)],
+    )
+    async def list_project_roles(project_id: str) -> dict[str, Any]:
+        """Phase 8 (PROJECTS_SPEC.md §12): read-only view of a project's
+        `agent_project_roles` rows, used by the Options drawer Projects
+        section to expand a card and show team identity per slot. The
+        field is editable via Coach (`coord_set_player_role`) or via
+        each pane's settings popover (brief), not from this endpoint."""
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT 1 FROM projects WHERE id = ?", (project_id,)
+            )
+            if not await cur.fetchone():
+                raise HTTPException(404, detail=f"project '{project_id}' not found")
+            cur = await c.execute(
+                "SELECT slot, name, role, brief FROM agent_project_roles "
+                "WHERE project_id = ? ORDER BY "
+                "  CASE slot WHEN 'coach' THEN 0 ELSE 1 END, slot",
+                (project_id,),
+            )
+            rows = await cur.fetchall()
+        finally:
+            await c.close()
+        return {
+            "project_id": project_id,
+            "roles": [dict(r) for r in rows],
+        }
+
     @router.post(
         "/api/projects",
         status_code=201,

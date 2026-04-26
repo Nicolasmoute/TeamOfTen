@@ -75,7 +75,12 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_status  ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_owner   ON tasks(owner);
 CREATE INDEX IF NOT EXISTS idx_tasks_parent  ON tasks(parent_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+-- Note: idx_tasks_project deliberately NOT in SCHEMA. The
+-- project_id column is added by the projects_v1 migration which
+-- drops + recreates this table; on a legacy DB (pre-refactor)
+-- the column doesn't exist when executescript() runs and the
+-- CREATE INDEX would fail the whole script. The index is created
+-- in init_db's post-migration loop instead.
 
 -- payload_to / payload_owner: virtual generated columns over the
 -- two JSON fields the pane-history fan-out filter cares about. Lets
@@ -96,7 +101,8 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_type  ON events(type);
-CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id);
+-- Note: idx_events_project deferred to post-migration loop (same
+-- reason as idx_tasks_project — column doesn't exist on legacy DBs).
 -- (agent_id, type) for fan-out queries that decompose into "events
 -- where I am the actor of any type, OR events of a specific type
 -- targeting me". The OR-branch with type='message_sent' / 'task_*'
@@ -130,7 +136,7 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_id);
 CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(from_id);
-CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id);
+-- Note: idx_messages_project deferred to post-migration loop.
 
 -- Per-recipient read tracking. Necessary for broadcasts: the first
 -- recipient to drain must NOT mark the message read for everyone else.
@@ -154,7 +160,7 @@ CREATE TABLE IF NOT EXISTS memory_docs (
     PRIMARY KEY (project_id, topic)
 );
 
-CREATE INDEX IF NOT EXISTS idx_memory_project ON memory_docs(project_id);
+-- Note: idx_memory_project deferred to post-migration loop.
 
 -- Per-turn analytics ledger. One row per SDK ResultMessage — cheap
 -- indexed queries for 'how much did p3 spend this week'. Parallel to
@@ -180,7 +186,7 @@ CREATE TABLE IF NOT EXISTS turns (
 
 CREATE INDEX IF NOT EXISTS idx_turns_agent      ON turns(agent_id, id);
 CREATE INDEX IF NOT EXISTS idx_turns_ended_at   ON turns(ended_at);
-CREATE INDEX IF NOT EXISTS idx_turns_project    ON turns(project_id);
+-- Note: idx_turns_project deferred to post-migration loop.
 
 -- Team-wide settings (applies to every agent). Simple key/value store
 -- so we can grow without schema churn. Value is a JSON string — the
@@ -515,6 +521,39 @@ async def init_db() -> None:
             except Exception:
                 logger.exception("init_db: sync_state evolution failed")
                 raise
+
+            # Phase 1 deploy hot-fix: the project_id indexes used to live
+            # in SCHEMA, but on a legacy DB (events/tasks/messages/etc.
+            # exist from before the refactor without project_id) the
+            # `CREATE INDEX … ON tasks(project_id)` would fail the whole
+            # executescript() before projects_v1 could drop+recreate the
+            # tables. Now we create them here, AFTER projects_v1 has
+            # installed the new shape. Each is wrapped in try/except so
+            # an oddball state (column still missing for some reason)
+            # logs + skips instead of crashing boot.
+            for idx_name, idx_ddl in (
+                ("idx_tasks_project",
+                 "CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id)"),
+                ("idx_events_project",
+                 "CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id)"),
+                ("idx_messages_project",
+                 "CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id)"),
+                ("idx_memory_project",
+                 "CREATE INDEX IF NOT EXISTS idx_memory_project ON memory_docs(project_id)"),
+                ("idx_turns_project",
+                 "CREATE INDEX IF NOT EXISTS idx_turns_project ON turns(project_id)"),
+            ):
+                try:
+                    await db.execute(idx_ddl)
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "no such column" in msg or "no such table" in msg:
+                        logger.warning(
+                            "init_db: %s skipped (%s) — projects_v1 may not "
+                            "have run; investigate", idx_name, e,
+                        )
+                        continue
+                    raise
 
             logger.info("init_db: schema ok, ensuring misc project")
             # Ensure the fallback project + active-project pointer
