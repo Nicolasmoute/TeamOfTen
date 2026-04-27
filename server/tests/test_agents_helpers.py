@@ -7,6 +7,8 @@ agent_project_roles + agent_sessions tables instead.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from server.db import configured_conn, init_db, resolve_active_project
@@ -63,6 +65,115 @@ async def test_today_spend_empty_returns_zero() -> None:
     from server.agents import _today_spend
     assert await _today_spend("p1") == 0.0
     assert await _today_spend() == 0.0
+
+
+# ---------- context usage estimation ----------
+
+
+def _jsonl_line(obj: dict) -> str:
+    return json.dumps(obj) + "\n"
+
+
+def test_session_context_metrics_prefers_latest_assistant_usage(tmp_path) -> None:
+    from server.agents import _session_context_metrics_from_jsonl
+
+    p = tmp_path / "sess.jsonl"
+    p.write_text(
+        _jsonl_line({
+            "type": "user",
+            "message": {"role": "user", "content": "x" * 20_000},
+        })
+        + _jsonl_line({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "old"}],
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_read_input_tokens": 90,
+                    "cache_creation_input_tokens": 5,
+                    "output_tokens": 7,
+                },
+            },
+        })
+        + _jsonl_line({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "new"}],
+                "usage": {
+                    "input_tokens": 1,
+                    "cache_read_input_tokens": 200,
+                    "cache_creation_input_tokens": 9,
+                    "output_tokens": 11,
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    used, latest_prompt = _session_context_metrics_from_jsonl(p)
+    assert latest_prompt == 210
+    assert used == 221
+
+
+def test_session_context_metrics_adds_tail_after_latest_usage(tmp_path) -> None:
+    from server.agents import _session_context_metrics_from_jsonl
+
+    p = tmp_path / "sess.jsonl"
+    p.write_text(
+        _jsonl_line({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": "done",
+                "usage": {
+                    "input_tokens": 80,
+                    "cache_read_input_tokens": 20,
+                    "output_tokens": 5,
+                },
+            },
+        })
+        + _jsonl_line({
+            "type": "user",
+            "message": {"role": "user", "content": "z" * 40},
+        }),
+        encoding="utf-8",
+    )
+
+    used, latest_prompt = _session_context_metrics_from_jsonl(p)
+    assert latest_prompt == 100
+    assert used == 115
+
+
+async def test_session_context_estimate_finds_claude_project_jsonl(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.agents import _session_context_estimate
+
+    session_id = "sess-abc"
+    session_dir = tmp_path / "projects" / "encoded-cwd"
+    session_dir.mkdir(parents=True)
+    (session_dir / f"{session_id}.jsonl").write_text(
+        _jsonl_line({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": "ok",
+                "usage": {
+                    "input_tokens": 3,
+                    "cache_read_input_tokens": 40,
+                    "cache_creation_input_tokens": 7,
+                    "output_tokens": 6,
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+
+    assert await _session_context_estimate(session_id) == 56
 
 
 # ---------- _get_agent_brief / _clear_session_id ----------

@@ -2096,9 +2096,10 @@ async def get_agent_context(
     model: str | None = None,
 ) -> dict[str, object]:
     """Current context usage estimate for a slot: used tokens (from
-    latest turn on the active session), the effective model's context
-    window, and the ratio. Used by the pane-level ContextBar to paint
-    fill + colour. Returns zeros when there's no active session.
+    the latest per-assistant usage row in the active session jsonl),
+    the effective model's context window, and the ratio. Used by the
+    pane-level ContextBar to paint fill + colour. Returns zeros when
+    there's no active session.
 
     The `model` query param is the pane-level override (kept
     client-side in localStorage); when provided, the window lookup

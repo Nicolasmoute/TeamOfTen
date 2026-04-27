@@ -164,10 +164,11 @@ CREATE INDEX IF NOT EXISTS idx_memory_project ON memory_docs(project_id);
 -- the events table but narrower: just the numbers, no free text. The
 -- events table still has the full turn trail for audit; this is for
 -- charts.
--- Per-turn analytics ledger. Token columns track usage from
--- ResultMessage.usage on every successful turn; sum of all four on
--- the latest turn for a session ≈ conversation size going into the
--- next turn (drives HARNESS_AUTO_COMPACT_THRESHOLD).
+-- Per-turn analytics ledger. Token columns track billing usage from
+-- ResultMessage.usage on every successful turn. Context pressure is
+-- estimated separately from the latest per-assistant usage row in
+-- Claude Code's session jsonl because ResultMessage.usage aggregates
+-- every tool round in the turn.
 CREATE TABLE IF NOT EXISTS turns (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id              TEXT NOT NULL,

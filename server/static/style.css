@@ -272,9 +272,7 @@ body {
      in the prompt, the SlashMenu opens the same way. */
   .pane-mode-chip.pane-mode-slash { display: none; }
   .pane-modes-spacer { display: none; }
-  /* CTX chip: tight pill, no track graph. Mobile shows just
-     "CTX 23%" with minimal padding/gap. */
-  .pane-mode-chip.context-bar .context-bar-track { display: none; }
+  /* CTX chip: tight pill, no track graph. */
   .pane-mode-chip.context-bar {
     gap: 3px;
     min-width: 0;

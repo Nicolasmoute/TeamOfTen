@@ -236,10 +236,10 @@ def _extract_usage(msg: Any) -> dict[str, int]:
 
 # Per-model context window in tokens. Used by the auto-compact check
 # and the pane ContextBar. Seeded from known-at-build-time values for
-# current Claude models, but superseded by observed usage when a turn
-# reports tokens > the seeded value — see _observe_context_usage().
-# That means a new model shipping with a bigger window just works:
-# the bar under-reports for one turn, then self-corrects upward.
+# current Claude models, with a conservative observed fallback for
+# unknown future model ids. Do not infer windows from ResultMessage
+# usage: that usage is aggregated across all API calls in a turn and
+# can exceed the real model window during tool-heavy turns.
 _CONTEXT_WINDOWS = {
     "claude-opus-4-7": 1_000_000,
     "claude-opus-4-7[1m]": 1_000_000,
@@ -248,11 +248,10 @@ _CONTEXT_WINDOWS = {
     "claude-haiku-4-5-20251001": 200_000,
 }
 
-# Observed ceilings learned from ResultMessage usage per model id.
-# Ratchets upward only — matches the "we saw tokens > table value"
-# signal. Persisted to team_config on every bump so a restart doesn't
-# lose the learning. In-memory cache mirrors the DB row; refreshed at
-# startup via _load_observed_windows().
+# Observed ceilings learned from one assistant API call's prompt usage.
+# Ratchets upward only. Persisted to team_config on every bump so a
+# restart doesn't lose the learning. In-memory cache mirrors the DB
+# row; refreshed at startup via _load_observed_windows().
 _OBSERVED_CONTEXT_WINDOWS: dict[str, int] = {}
 
 
@@ -280,6 +279,17 @@ async def _load_observed_windows() -> None:
     if isinstance(parsed, dict):
         for k, v in parsed.items():
             if isinstance(k, str) and isinstance(v, int) and v > 0:
+                table = _CONTEXT_WINDOWS.get(k, 0)
+                # Older builds learned this value from ResultMessage.usage,
+                # which is cumulative billing usage for the whole turn, not
+                # a single prompt size. Discard obviously impossible legacy
+                # values so one long tool turn doesn't permanently shrink the
+                # pane percentage by pretending a model has a multi-million
+                # token context window.
+                if table and v > int(table * 1.05):
+                    continue
+                if not table and v > 2_000_000:
+                    continue
                 _OBSERVED_CONTEXT_WINDOWS[k] = v
 
 
@@ -303,19 +313,23 @@ async def _persist_observed_windows() -> None:
         logger.exception("context: observed-windows persist failed")
 
 
-async def _observe_context_usage(model: str | None, usage: dict[str, int]) -> None:
-    """Ratchet the observed window upward when a turn's actual prompt
-    size (input + cache_read + cache_creation) exceeds what we think
-    the model's window is. Output tokens are NOT counted — they're
-    generation, not context the model read. Skips gracefully when no
-    model is set (nothing to key on)."""
-    if not model:
+async def _observe_context_usage(
+    model: str | None,
+    latest_prompt_tokens: int | None,
+) -> None:
+    """Ratchet the observed window upward from one API call's prompt.
+
+    The caller must pass the latest per-assistant usage from the
+    session jsonl, not ResultMessage.usage. ResultMessage.usage is a
+    billing aggregate over every tool round in the turn and is not a
+    valid context-window observation.
+    """
+    if not model or not latest_prompt_tokens:
         return
-    prompt_tokens = (
-        (usage.get("input") or 0)
-        + (usage.get("cache_read") or 0)
-        + (usage.get("cache_creation") or 0)
-    )
+    try:
+        prompt_tokens = int(latest_prompt_tokens)
+    except (TypeError, ValueError):
+        return
     if prompt_tokens <= 0:
         return
     current = max(
@@ -351,6 +365,29 @@ def _context_window_for(model: str | None) -> int:
     return resolved if resolved > 0 else 1_000_000
 
 
+def _usage_int(usage: Any, name: str) -> int:
+    """Read one token field from a dict/Pydantic-ish usage object."""
+    if usage is None:
+        return 0
+    if isinstance(usage, dict):
+        v = usage.get(name)
+    else:
+        v = getattr(usage, name, None)
+    try:
+        return int(v) if v is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _prompt_tokens_from_usage(usage: Any) -> int:
+    """Tokens in one API request's input context."""
+    return (
+        _usage_int(usage, "input_tokens")
+        + _usage_int(usage, "cache_read_input_tokens")
+        + _usage_int(usage, "cache_creation_input_tokens")
+    )
+
+
 def _count_message_chars(obj: Any) -> int:
     """Walk a parsed jsonl message object and sum the length of its
     text-bearing fields: `text`, `content`, `input`, `result`,
@@ -372,35 +409,84 @@ def _count_message_chars(obj: Any) -> int:
     return 0
 
 
-async def _session_context_estimate(session_id: str) -> int:
-    """Estimate tokens of conversation content from the CLI's session
-    jsonl — the append-only file the CLI replays on every resume.
+def _session_context_metrics_from_jsonl(jsonl_path: Path) -> tuple[int, int | None]:
+    """Return (current_context_tokens, latest_prompt_tokens).
 
-    Prior implementation summed `ResultMessage.usage` fields, but
-    those are cumulative BILLING totals across all API calls within
-    a turn (cache_read gets charged once per tool-round, etc.). A
-    turn with many tool rounds reports a big number; the next turn
-    with few rounds reports a small one — so the bar visibly jumps
-    mid-session, which is what the user was seeing.
+    The latest assistant `message.usage` row is the best signal we
+    have: it is one API request's prompt size, split across uncached
+    input + cache read + cache creation tokens. That avoids both bad
+    approximations:
+      - ResultMessage.usage overcounts by aggregating every tool round.
+      - chars/4 undercounts cached prompts and tool definitions badly.
 
-    The jsonl is the literal context the CLI sends the API. Walking
-    it once and summing content-length of each message, divided by
-    ~4 chars/token, gives a monotonic, non-surprising estimate.
-    System prompt is NOT in the jsonl (it's sent separately each
-    request) so this under-reports by a fixed ~15-30K offset —
-    acceptable because the compact trip-wire is threshold-based and
-    the bar is a relative indicator.
+    We add the latest assistant output tokens because those tokens will
+    be part of the next resumed prompt. If a turn stopped after a tool
+    result without a follow-up assistant message, add a small chars/4
+    tail fallback for messages after the latest usage row.
+    """
+    fallback_chars = 0
+    latest_prompt_tokens: int | None = None
+    latest_context_tokens: int | None = None
+    tail_chars_after_latest_usage = 0
+    have_latest_usage = False
 
-    Returns 0 when the jsonl can't be found (fresh session, compact
-    just ran, CLAUDE_CONFIG_DIR unset in dev)."""
+    with jsonl_path.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except Exception:
+                line_chars = len(s)
+                fallback_chars += line_chars
+                if have_latest_usage:
+                    tail_chars_after_latest_usage += line_chars
+                continue
+
+            line_chars = _count_message_chars(obj)
+            fallback_chars += line_chars
+            if have_latest_usage:
+                tail_chars_after_latest_usage += line_chars
+
+            msg = obj.get("message") if isinstance(obj, dict) else None
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            usage = msg.get("usage")
+            prompt_tokens = _prompt_tokens_from_usage(usage)
+            if prompt_tokens <= 0:
+                continue
+
+            latest_prompt_tokens = prompt_tokens
+            latest_context_tokens = prompt_tokens + _usage_int(
+                usage, "output_tokens"
+            )
+            tail_chars_after_latest_usage = 0
+            have_latest_usage = True
+
+    if latest_context_tokens is not None:
+        return (
+            latest_context_tokens + (tail_chars_after_latest_usage // 4),
+            latest_prompt_tokens,
+        )
+    return fallback_chars // 4, None
+
+
+async def _session_context_metrics(session_id: str) -> tuple[int, int | None]:
+    """Estimate current context from Claude Code's session jsonl.
+
+    Returns (used_tokens, latest_prompt_tokens). Both are 0/None when
+    the jsonl can't be found (fresh session, compact just ran,
+    CLAUDE_CONFIG_DIR unset in dev).
+    """
     if not session_id:
-        return 0
+        return 0, None
     claude_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
     if not claude_dir:
-        return 0
+        return 0, None
     projects_root = Path(claude_dir) / "projects"
     if not projects_root.is_dir():
-        return 0
+        return 0, None
     try:
         jsonl_path: Path | None = None
         # Sessions are sharded by encoded-cwd sub-dirs; one session_id
@@ -409,23 +495,17 @@ async def _session_context_estimate(session_id: str) -> int:
             jsonl_path = p
             break
         if jsonl_path is None:
-            return 0
-        chars = 0
-        with jsonl_path.open(encoding="utf-8", errors="replace") as f:
-            for line in f:
-                s = line.strip()
-                if not s:
-                    continue
-                try:
-                    obj = json.loads(s)
-                except Exception:
-                    chars += len(s)
-                    continue
-                chars += _count_message_chars(obj)
-        return chars // 4
+            return 0, None
+        return _session_context_metrics_from_jsonl(jsonl_path)
     except Exception:
         logger.exception("session_context_estimate: jsonl parse failed")
-        return 0
+        return 0, None
+
+
+async def _session_context_estimate(session_id: str) -> int:
+    """Return estimated tokens already occupied by a resumed session."""
+    used, _latest_prompt = await _session_context_metrics(session_id)
+    return used
 
 
 async def _handle_message(
@@ -738,9 +818,20 @@ async def _handle_message(
         usage = _extract_usage(msg)
         if turn_ctx is not None:
             # Self-adapting window estimate: if this turn read more
-            # tokens than our table says the model's window is, bump
-            # our stored value. Persists so restarts keep the learning.
-            await _observe_context_usage(turn_ctx.get("model"), usage)
+            # tokens in one API call than our table says the model's
+            # window is, bump our stored value. ResultMessage.usage is
+            # aggregate billing usage, so the observation comes from
+            # the latest assistant usage row in the session jsonl.
+            if session_id:
+                _, latest_prompt_tokens = await _session_context_metrics(
+                    session_id
+                )
+            else:
+                latest_prompt_tokens = None
+            await _observe_context_usage(
+                turn_ctx.get("model"),
+                latest_prompt_tokens,
+            )
             await _insert_turn_row(
                 agent_id=agent_id,
                 started_at=turn_ctx.get("started_at") or _now(),

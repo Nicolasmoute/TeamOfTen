@@ -6963,9 +6963,10 @@ function ActiveLoops({ liveEvents }) {
 // context usage bar — compact horizontal meter next to the effort chip.
 // Green until 50%, amber 50-67%, red >= 67%. Empty when there's no
 // active session. Pulled from /api/agents/<slot>/context on mount and
-// refreshed on every 'result' event for this slot (ResultMessage is
-// the authoritative per-turn usage source). session_cleared and
-// session_compacted reset the bar to zero without a fetch.
+// refreshed on every 'result' event for this slot. The server reads
+// the latest per-assistant usage row from Claude Code's session jsonl,
+// so cached prompt tokens count once toward the 1M window instead of
+// being summed across every tool round.
 // ------------------------------------------------------------------
 
 function ContextBar({ slot, liveEvents, model }) {
@@ -6991,8 +6992,12 @@ function ContextBar({ slot, liveEvents, model }) {
     const last = liveEvents[liveEvents.length - 1];
     if (!last || last.agent_id !== slot) return;
     if (last.type === "result") {
-      // Latest turn landed — refetch the authoritative estimate.
+      // Latest turn landed — refetch the authoritative estimate. The
+      // result event can hit the browser just before the server commits
+      // the new session_id, so do one short follow-up fetch too.
       refetch();
+      const t = setTimeout(refetch, 350);
+      return () => clearTimeout(t);
     } else if (
       last.type === "session_cleared" ||
       last.type === "session_compacted" ||
@@ -7016,9 +7021,8 @@ function ContextBar({ slot, liveEvents, model }) {
   const fmtK = (n) => n >= 1000 ? `${(n / 1000).toFixed(0)}k` : `${n}`;
   const title =
     `Context: ~${fmtK(used)} / ${fmtK(window)} tokens (${pct}%)\n` +
-    `Estimated from the session's conversation file on disk — ` +
-    `the actual content the CLI replays on every turn. Excludes ` +
-    `the system prompt (separate per request, ~15-30K).`;
+    `Estimated from the latest assistant usage row in the session file: ` +
+    `input + cache read + cache creation, counted once for the current prompt.`;
   return html`<div
     class="pane-mode-chip context-bar"
     title=${title}
