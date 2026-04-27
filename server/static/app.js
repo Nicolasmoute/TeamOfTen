@@ -479,6 +479,36 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
   const [identitySaving, setIdentitySaving] = useState(false);
   const identityDirty =
     nameDraft !== (initialName || "") || roleDraft !== (initialRole || "");
+  // Resolve the team-wide default model so the "default" option in the
+  // dropdown can show what it'll actually fall through to (e.g.
+  // "default (Sonnet 4.6)"). Avoids the trap where users set a team
+  // default in the Settings drawer and then see "default" in the gear
+  // popover and assume the agent is running the SDK default.
+  const [roleDefaultModel, setRoleDefaultModel] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await authFetch("/api/team/models");
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (cancelled) return;
+        const id = slot === "coach" ? data.coach : data.players;
+        setRoleDefaultModel(id || "");
+      } catch (_e) {
+        // Silent — the popover still works without the resolved label.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [slot]);
+  const modelOptions = useMemo(() => {
+    if (!roleDefaultModel) return MODEL_OPTIONS;
+    const match = MODEL_OPTIONS.find((m) => m.value === roleDefaultModel);
+    const suffix = match ? match.label : roleDefaultModel;
+    return MODEL_OPTIONS.map((m) =>
+      m.value === "" ? { ...m, label: `default (${suffix})` } : m
+    );
+  }, [roleDefaultModel]);
   const saveIdentity = useCallback(async () => {
     if (!slot) return;
     setIdentitySaving(true);
@@ -564,7 +594,7 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
           value=${settings.model || ""}
           onChange=${(e) => onChange({ ...settings, model: e.target.value || undefined })}
         >
-          ${MODEL_OPTIONS.map(
+          ${modelOptions.map(
             (m) => html`<option value=${m.value}>${m.label}</option>`
           )}
         </select>
@@ -768,6 +798,13 @@ function App() {
   // Bumped every time a file-system-changing event lands on the WS.
   // FilesPane watches this to reload the tree without manual refresh.
   const [fsEpoch, setFsEpoch] = useState(0);
+  // Bumped on every successful project switch. Each AgentPane uses this
+  // as a dependency in its history useEffect so the pane re-fetches
+  // /api/events scoped to the new active project — without it, the
+  // pane keeps rendering the old project's saved conversation
+  // (App-level conversations Map clears + re-seeds, but each pane
+  // also caches its own `history` from a separate fetch).
+  const [projectEpoch, setProjectEpoch] = useState(0);
   // Per-slot latest ts the user has "acknowledged" by opening that
   // pane. Slots currently in openColumns are always considered seen.
   // Lives in React state only (session-scoped) — a page reload
@@ -1307,6 +1344,10 @@ function App() {
             // post-switch events that fire WHILE we're seeding are
             // appended onto the fresh history.
             setConversations(new Map());
+            // Drop any partial streaming buffers from the prior project
+            // so the new pane render doesn't show old in-flight tokens.
+            setStreamingText(new Map());
+            streamingPendingRef.current = new Map();
             refreshAgents();
             // Re-seed conversations from /api/events scoped to the
             // new active project. Without this, panes go blank until
@@ -1319,6 +1360,7 @@ function App() {
             // fsEpoch + refetch roots so FilesPane rebinds in place.
             loadFileRoots();
             setFsEpoch((n) => n + 1);
+            setProjectEpoch((n) => n + 1);
           }
         }
       }
@@ -2150,6 +2192,7 @@ function App() {
                         liveEvents=${conversations.get(slot) || []}
                         streaming=${streamingText.get(slot)}
                         wsAttempt=${wsAttempt}
+                        projectEpoch=${projectEpoch}
                         openSlots=${openSlots}
                         onClose=${() => closePane(slot)}
                         onDropEdge=${dropOnPaneEdge}
@@ -6995,7 +7038,7 @@ function ContextBar({ slot, liveEvents, model }) {
 // agent pane
 // ------------------------------------------------------------------
 
-function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt, onClose, onDropEdge, onPopOut, stacked, isMaximized, onToggleMaximize }) {
+function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt, projectEpoch, onClose, onDropEdge, onPopOut, stacked, isMaximized, onToggleMaximize }) {
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState([]); // {id, url, path, filename}
   const [submitting, setSubmitting] = useState(false);
@@ -7117,6 +7160,13 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
         if (!cancelled) setHistoryLoaded(true);
       }
     }
+    // Reset paginator state when the dependencies fire — otherwise
+    // a project switch with fewer events than HISTORY_PAGE leaves
+    // historyExhausted from the prior project pinned to true/false
+    // until the user reloads.
+    setHistory([]);
+    setHistoryLoaded(false);
+    setHistoryExhausted(false);
     load();
     return () => {
       cancelled = true;
@@ -7125,7 +7175,9 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
     // Long disconnects > 60s watchdog trigger this path, so events that
     // landed during the gap show up in the pane via the DB re-fetch
     // instead of being silently missed.
-  }, [slot, wsAttempt]);
+    // projectEpoch bumps on every successful project switch so the
+    // pane re-fetches /api/events against the new active project.
+  }, [slot, wsAttempt, projectEpoch]);
 
   // Walk further back into history. Anchored at the smallest id we
   // currently hold; the API's `before_id` returns events strictly
