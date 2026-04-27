@@ -633,6 +633,28 @@ def build_router(*, require_token, audit_actor):
             # phases) because the active project just disappeared — its
             # files are gone. Just swap the pointer + emit an event.
             await set_active_project(MISC_PROJECT_ID)
+            # Clear Coach's /repeat — same reasoning as in _run_switch:
+            # the configured prompt was scoped to the deleted project
+            # and would re-fire against misc.
+            try:
+                from server.agents import get_coach_repeat, set_coach_repeat
+                prev_interval, _prev_prompt = get_coach_repeat()
+                if prev_interval > 0:
+                    set_coach_repeat(0, None)
+                    await bus.publish(
+                        {
+                            "ts": _now_iso(),
+                            "agent_id": "coach",
+                            "type": "coach_repeat_changed",
+                            "interval_seconds": 0,
+                            "prompt": None,
+                            "reason": "project_switched",
+                        }
+                    )
+            except Exception:
+                logger.exception(
+                    "delete_project: failed to clear coach_repeat (non-fatal)"
+                )
             await bus.publish(
                 {
                     "ts": _now_iso(),
@@ -1044,6 +1066,32 @@ async def _run_switch(
                 job_id=job_id, step="reload", status="ok",
                 from_project=from_project, to_project=to_project,
             )
+            # Clear Coach's /repeat: the prompt was set in the prior
+            # project's context (e.g. "you are a free agent on the
+            # TOT repo…") and re-firing it under a different project
+            # is confusing. /loop's tick prompt is generic, so we
+            # leave it alone. Emit coach_repeat_changed so the
+            # loops-bar UI clears in lockstep with the switch.
+            try:
+                from server.agents import get_coach_repeat, set_coach_repeat
+                prev_interval, _prev_prompt = get_coach_repeat()
+                if prev_interval > 0:
+                    set_coach_repeat(0, None)
+                    await bus.publish(
+                        {
+                            "ts": _now_iso(),
+                            "agent_id": "coach",
+                            "type": "coach_repeat_changed",
+                            "interval_seconds": 0,
+                            "prompt": None,
+                            "reason": "project_switched",
+                        }
+                    )
+            except Exception:
+                logger.exception(
+                    "_run_switch: failed to clear coach_repeat "
+                    "(non-fatal, switch already succeeded)"
+                )
             await bus.publish(
                 {
                     "ts": _now_iso(),

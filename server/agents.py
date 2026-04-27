@@ -526,6 +526,24 @@ async def _handle_message(
         duration_ms = getattr(msg, "duration_ms", None)
         num_turns = getattr(msg, "num_turns", None)
         stop_reason = getattr(msg, "stop_reason", None)
+        subtype = getattr(msg, "subtype", None)
+        # SDK exposes a structured `errors` list on ResultMessage (one
+        # entry per per-step failure). Stringify defensively — shape
+        # varies across SDK versions and we never want a render crash
+        # to hide the result line.
+        errors_raw = getattr(msg, "errors", None) or []
+        errors_summary: list[str] = []
+        try:
+            for err in errors_raw[:3]:  # cap noise — first 3 is plenty.
+                if isinstance(err, str):
+                    errors_summary.append(err[:300])
+                elif isinstance(err, dict):
+                    msg_field = err.get("message") or err.get("error") or str(err)
+                    errors_summary.append(str(msg_field)[:300])
+                else:
+                    errors_summary.append(str(err)[:300])
+        except Exception:
+            errors_summary = []
         # Mark the turn as having emitted a terminal result. The SDK
         # occasionally raises a ProcessError during subprocess teardown
         # (exit=1 with empty stderr) AFTER delivering ResultMessage —
@@ -540,7 +558,30 @@ async def _handle_message(
             cost_usd=cost,
             is_error=msg.is_error,
             session_id=session_id,
+            stop_reason=str(stop_reason) if stop_reason is not None else None,
+            subtype=str(subtype) if subtype is not None else None,
+            num_turns=num_turns,
+            errors=errors_summary or None,
         )
+        # Stash the error info so the NEXT spawn can prepend a system-
+        # prompt note and the agent stops confabulating reasons for
+        # the prior failure ("the harness paused me", etc.). Compact
+        # turns are internal — leaking their error into the user-
+        # facing turn would confuse the user, so skip them. Cleared
+        # on the next spawn that consumes it (one-shot).
+        if msg.is_error and not (turn_ctx and turn_ctx.get("compact_mode")):
+            _last_turn_error_info[agent_id] = {
+                "stop_reason": str(stop_reason) if stop_reason else None,
+                "subtype": str(subtype) if subtype else None,
+                "num_turns": num_turns,
+                "duration_ms": duration_ms,
+                "errors": errors_summary or [],
+            }
+        elif not msg.is_error:
+            # Clean turn — clear any stale entry so the next prompt
+            # doesn't see an obsolete "your prior turn errored" note.
+            _last_turn_error_info.pop(agent_id, None)
+            _consecutive_auto_continues.pop(agent_id, None)
         await _add_cost(agent_id, cost)
         # Player soft-error → DM Coach so the workflow doesn't hang on
         # a silent failure. A ResultMessage with is_error=True came
@@ -575,6 +616,25 @@ async def _handle_message(
                     ),
                     priority="normal",
                 )
+        # Auto-continue on max-turns hit. Distinct from the soft-error
+        # DM-to-Coach above (which routes a Player's hard failure
+        # through Coach) — this fires for *any* agent (Coach included)
+        # when the SDK cut the turn off mid-task instead of letting
+        # it finish. Capped via _consecutive_auto_continues so a
+        # genuinely stuck workflow escalates to the human rather than
+        # looping forever and chewing the cost cap. Skip compact
+        # turns (internal).
+        if (
+            msg.is_error
+            and (turn_ctx is None or not turn_ctx.get("compact_mode"))
+            and _looks_like_max_turns(subtype, stop_reason)
+        ):
+            await _maybe_schedule_auto_continue(
+                agent_id=agent_id,
+                subtype=str(subtype) if subtype else None,
+                stop_reason=str(stop_reason) if stop_reason else None,
+                num_turns=num_turns,
+            )
         # Compact turn completed successfully: commit the assistant's
         # summary as the continuity note and null session_id so the
         # NEXT turn starts on a fresh conversation with the summary
@@ -941,6 +1001,47 @@ ERROR_RETRY_DELAY_SECONDS = int(
 ERROR_RETRY_MAX_CONSECUTIVE = int(
     os.environ.get("HARNESS_ERROR_RETRY_MAX_CONSECUTIVE", "3")
 )
+
+# SDK ClaudeAgentOptions.max_turns — the per-spawn ceiling on the
+# model's tool-use roundtrips. The SDK terminates with is_error=True
+# / subtype="error_max_turns" when this trips, even if the agent
+# would otherwise have finished cleanly. The previous default of 10
+# was too tight for an autonomous Coach (read inbox + list tasks +
+# plan + write a TodoWrite already burns most of it). 50 leaves
+# plenty of headroom for ordinary workflows; the daily cost cap
+# remains the brake against a runaway turn.
+MAX_TURNS_PER_SPAWN = int(os.environ.get("HARNESS_MAX_TURNS", "50"))
+
+# Soft-error tracking — last-turn diagnostics surfaced into the next
+# spawn's system prompt so a follow-up turn knows why the previous
+# one ended with is_error=True. Cleared after the next successful
+# spawn consumes it (one-shot — we don't want the note to haunt
+# every future turn). In-memory only: a process restart wipes it,
+# which is fine because a restart implies a fresh CLI session anyway.
+_last_turn_error_info: dict[str, dict[str, Any]] = {}
+
+# Max-turns auto-continue. When a turn ends with is_error=True AND
+# the SDK indicates the cause was max_turns (subtype="error_max_turns"
+# or stop_reason in {"max_turns", "max_tokens"}), the agent was very
+# likely cut off mid-task rather than failing — schedule a follow-up
+# turn that prompts it to continue. Capped per-agent so a genuinely
+# stuck task (every continuation also hits the limit) escalates to
+# the human via human_attention instead of looping forever.
+AUTO_CONTINUE_DELAY_SECONDS = int(
+    os.environ.get("HARNESS_AUTO_CONTINUE_DELAY", "5")
+)
+AUTO_CONTINUE_MAX_CONSECUTIVE = int(
+    os.environ.get("HARNESS_AUTO_CONTINUE_MAX_CONSECUTIVE", "2")
+)
+# Per-agent counter — number of consecutive max-turns auto-continues
+# without an intervening clean turn. Reset to 0 by any non-error
+# result; bumped on each auto-continue trigger.
+_consecutive_auto_continues: dict[str, int] = {}
+# Per-agent set: agents with a pending auto-continue task already
+# queued. Prevents stacking multiple continuations on a burst of
+# events (the result event fires once but other code might also try
+# to react).
+_auto_continue_pending: set[str] = set()
 
 # Per-agent debounce for "Player errored → DM Coach" notifications.
 # Without this, a burst of retries spams Coach's inbox with 3×
@@ -2612,6 +2713,61 @@ async def run_agent(
     # Keep this block BEFORE the lock suffix so the handoff reads
     # naturally — "here's where you left off, here's the current
     # roster state".
+    # Prior-turn-error suffix — one-shot context so the agent doesn't
+    # confabulate a reason for the previous failure. Captured by the
+    # ResultMessage handler when is_error=True; popped + cleared here
+    # so it appears in exactly one follow-up turn. Lives between brief
+    # and handoff so the agent reads "here's your role, here's how
+    # last turn ended, here's the long-term continuity".
+    #
+    # Compact-mode turns must NOT consume the entry — auto-compact can
+    # fire between the failed turn and the user's actual follow-up,
+    # and we want the note to reach the user-facing turn that comes
+    # after the compaction, not the internal compact summarizer.
+    prior_error_suffix = ""
+    prior_err = (
+        _last_turn_error_info.pop(agent_id, None)
+        if not compact_mode
+        else None
+    )
+    if prior_err:
+        bits: list[str] = []
+        sub = prior_err.get("subtype")
+        sr = prior_err.get("stop_reason")
+        nt = prior_err.get("num_turns")
+        if sub:
+            bits.append(f"subtype={sub}")
+        if sr:
+            bits.append(f"stop_reason={sr}")
+        if isinstance(nt, int) and nt > 0:
+            bits.append(f"num_turns={nt}")
+        meta = ", ".join(bits) if bits else "no further details available"
+        was_max = _looks_like_max_turns(sub, sr)
+        if was_max:
+            guidance = (
+                "The SDK cut your previous turn off because it ran out "
+                "of internal turns (max_turns), not because the harness "
+                "paused you. If the work isn't complete, continue from "
+                "where you left off."
+            )
+        else:
+            guidance = (
+                "If the failure looks recoverable, retry the failing "
+                "step. If it doesn't, mark the task blocked or escalate "
+                "via coord_request_human."
+            )
+        prior_error_suffix = (
+            "\n\n## Prior turn note\n\n"
+            f"Your previous turn ended with `is_error=True` ({meta}). "
+            "The harness did NOT pause you. "
+            + guidance
+        )
+        errs = prior_err.get("errors") or []
+        if errs:
+            prior_error_suffix += "\n\nReported errors (truncated):\n"
+            for e in errs[:3]:
+                prior_error_suffix += f"- {str(e)[:240]}\n"
+
     handoff_suffix = ""
     handoff_text = await _get_continuity_note(agent_id)
     if handoff_text:
@@ -2712,10 +2868,11 @@ async def run_agent(
         + _system_prompt_for(agent_id)
         + context_suffix
         + brief_suffix
+        + prior_error_suffix
         + handoff_suffix
         + lock_suffix
     )
-    if context_suffix or brief_suffix or handoff_suffix:
+    if context_suffix or brief_suffix or handoff_suffix or prior_error_suffix:
         # Emit sizes (not content) so the user can see "yes my stuff was
         # picked up" without drowning the timeline in prompt text.
         await _emit(
@@ -2736,7 +2893,7 @@ async def run_agent(
     options_kwargs: dict[str, Any] = dict(
         system_prompt=system_prompt,
         cwd=str(workspace_dir(agent_id)),
-        max_turns=10,
+        max_turns=MAX_TURNS_PER_SPAWN,
         mcp_servers=mcp_servers,
         allowed_tools=allowed,
         # can_use_tool requires streaming mode + a PreToolUse hook that
@@ -2964,6 +3121,147 @@ async def _get_status_of(agent_id: str) -> str | None:
     return dict(row).get("status")
 
 
+def _looks_like_max_turns(subtype: Any, stop_reason: Any) -> bool:
+    """True iff the SDK's terminal flags indicate the turn was cut
+    off because it ran out of internal turns (vs. a real error).
+
+    SDK shape varies across versions:
+      - `subtype` = "error_max_turns" on recent builds.
+      - `stop_reason` = "max_turns" / "max_tokens" on the underlying
+        Anthropic API result.
+
+    We match either, case-insensitive substring on the canonical name,
+    so a near-rename in a future SDK release still trips us.
+    """
+    s = str(subtype or "").lower()
+    if "max_turn" in s:  # 'error_max_turns', 'max_turns', etc.
+        return True
+    r = str(stop_reason or "").lower()
+    if r in ("max_turns", "max_tokens"):
+        return True
+    return False
+
+
+async def _maybe_schedule_auto_continue(
+    *,
+    agent_id: str,
+    subtype: str | None,
+    stop_reason: str | None,
+    num_turns: int | None,
+) -> None:
+    """Schedule a follow-up turn that prompts the agent to resume
+    from where it was cut off. Only fired when _looks_like_max_turns
+    returned True — soft errors (error_during_execution etc.) take
+    the existing Player→Coach DM path instead.
+
+    Cap behavior: each consecutive max-turns hit bumps the counter.
+    At the cap (HARNESS_AUTO_CONTINUE_MAX_CONSECUTIVE) we publish a
+    human_attention event and stop continuing — the workflow has
+    plausibly diverged into a loop and only the human can decide
+    whether to re-scope or kill the task. Counter resets on any
+    clean ResultMessage (handled in the result branch above).
+    """
+    if agent_id in _auto_continue_pending:
+        return
+    if _paused:
+        logger.info(
+            "auto-continue: skipping %s — harness paused",
+            agent_id,
+        )
+        return
+    attempt = _consecutive_auto_continues.get(agent_id, 0)
+    if attempt >= AUTO_CONTINUE_MAX_CONSECUTIVE:
+        # Cap reached — escalate and stop. Don't reset the counter
+        # here; a clean turn (any non-error result) clears it.
+        await _emit(
+            agent_id,
+            "auto_continue_gave_up",
+            consecutive=attempt,
+            cap=AUTO_CONTINUE_MAX_CONSECUTIVE,
+            subtype=subtype,
+            stop_reason=stop_reason,
+        )
+        try:
+            await bus.publish({
+                "ts": _now(),
+                "agent_id": agent_id,
+                "type": "human_attention",
+                "subject": (
+                    f"{agent_id}: hit max_turns "
+                    f"{attempt} turns in a row — auto-continue stopped"
+                ),
+                "body": (
+                    f"Each of the last {attempt} continuations also ran "
+                    "out of internal turns before finishing. The task "
+                    "is plausibly looping or under-scoped. Investigate, "
+                    "re-prompt with a smaller chunk, or cancel the task "
+                    "via the UI."
+                ),
+                "urgency": "high",
+            })
+        except Exception:
+            logger.exception(
+                "auto-continue: human_attention publish failed for %s",
+                agent_id,
+            )
+        return
+
+    _consecutive_auto_continues[agent_id] = attempt + 1
+    _auto_continue_pending.add(agent_id)
+    reason_label = subtype or stop_reason or "max_turns"
+    nturns = num_turns if num_turns is not None else "?"
+
+    async def _delayed_continue() -> None:
+        try:
+            await asyncio.sleep(AUTO_CONTINUE_DELAY_SECONDS)
+            # If a clean turn arrived during the delay, the
+            # ResultMessage handler cleared _last_turn_error_info
+            # (and the auto-continue counter). Firing the wake now
+            # would inject a stale "your previous turn was cut off"
+            # prompt into a fresh conversation. Bail out instead.
+            if agent_id not in _last_turn_error_info:
+                return
+            # If the human (or another wake path) already kicked off a
+            # fresh turn during the delay, skip — we don't want to
+            # double-fire and confuse the agent with a stale "continue"
+            # prompt landing mid-conversation.
+            if agent_id in _running_tasks:
+                return
+            if _paused:
+                logger.info(
+                    "auto-continue: skipping %s — paused during delay",
+                    agent_id,
+                )
+                return
+            await _emit(
+                agent_id,
+                "auto_continue_scheduled",
+                attempt=attempt + 1,
+                cap=AUTO_CONTINUE_MAX_CONSECUTIVE,
+                delay=AUTO_CONTINUE_DELAY_SECONDS,
+                subtype=subtype,
+                stop_reason=stop_reason,
+            )
+            await maybe_wake_agent(
+                agent_id,
+                (
+                    f"Your previous turn was cut off by the SDK "
+                    f"({reason_label} after {nturns} internal turns) "
+                    "before you could finish. The harness did NOT "
+                    "pause you. Continue from where you left off — "
+                    "no need to re-explain context. If you actually "
+                    "completed the work, just confirm so."
+                ),
+                bypass_debounce=True,
+            )
+        except Exception:
+            logger.exception("auto-continue delayed task failed for %s", agent_id)
+        finally:
+            _auto_continue_pending.discard(agent_id)
+
+    asyncio.create_task(_delayed_continue())
+
+
 async def _schedule_post_error_retry(agent_id: str) -> None:
     """Schedule a single auto-wake after a hard error so the agent
     doesn't sit idle indefinitely. Caps consecutive retries and
@@ -3120,8 +3418,25 @@ async def maybe_wake_agent(
 
 
 async def _coach_is_working() -> bool:
-    """Read coach.status. Treat any error or missing row as 'not working'
-    so a transient DB hiccup doesn't permanently silence the loop."""
+    """True if Coach is mid-turn — checked from two angles to cover
+    every part of the spawn lifecycle:
+
+      1. ``_running_tasks['coach']`` is the in-process asyncio task
+         registered before any DB write. Catches the brief window
+         between slot-claim under ``_SPAWN_LOCK`` and the
+         ``_set_status('working')`` that follows it (see run_agent).
+         Also catches a queued spawn whose DB status flip is still
+         pending behind another awaitable.
+      2. ``agents.status == 'working'`` is the persistent flag —
+         survives module reloads and cross-process visibility.
+
+    Either signal is enough to skip the next /loop or /repeat fire.
+    A transient DB hiccup falls back to the in-memory check, so a
+    DB outage doesn't silently let the loops stack turns.
+    """
+    task = _running_tasks.get("coach")
+    if task is not None and not task.done():
+        return True
     try:
         c = await configured_conn()
         try:

@@ -8234,7 +8234,23 @@ function EventItem({ event }) {
   if (type === "result") {
     const dur = event.duration_ms ?? "?";
     const cost = typeof event.cost_usd === "number" ? `$${event.cost_usd.toFixed(4)}` : "$?";
-    const suffix = event.is_error ? "  (error)" : "";
+    // On is_error=true, surface whichever of subtype / stop_reason / errors
+    // the SDK populated so the user sees the actual cause instead of a
+    // bare "(error)". `subtype` is the most specific (e.g.
+    // "error_max_turns" / "error_during_execution"); `stop_reason` is
+    // the Anthropic-API-level reason ("max_turns" / "max_tokens"...);
+    // `errors[0]` is the first per-step failure string when present.
+    let suffix = "";
+    if (event.is_error) {
+      const parts = [];
+      const reason = event.subtype || event.stop_reason;
+      if (reason) parts.push(String(reason));
+      if (typeof event.num_turns === "number") parts.push(`${event.num_turns} turns`);
+      if (Array.isArray(event.errors) && event.errors.length) {
+        parts.push(String(event.errors[0]).slice(0, 80));
+      }
+      suffix = parts.length ? `  (error: ${parts.join(", ")})` : "  (error)";
+    }
     return html`<div class="event result">
       <div class="event-meta">${ts}  result  ${dur}ms  ${cost}${suffix}</div>
     </div>`;
