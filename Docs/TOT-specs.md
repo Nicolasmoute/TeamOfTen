@@ -96,9 +96,6 @@ TeamOfTen/
     mcp_config.py
     secrets.py
     telegram.py
-    migrations/
-      projects_v1.py
-      projects_v2.py
     static/
       index.html
       app.js
@@ -121,8 +118,7 @@ Main implementation responsibilities:
   compacting, autowake, Coach loops, stale-task watchdog.
 - `server/tools.py`: in-process MCP coordination server and all `coord_*`
   tools.
-- `server/db.py`: SQLite schema, migrations, DB helpers, active-project
-  resolution.
+- `server/db.py`: SQLite schema, DB helpers, active-project resolution.
 - `server/projects_api.py`: project CRUD, switch preview, project activation,
   per-project role view, per-project repo provision endpoint.
 - `server/paths.py`: canonical `/data` global/project filesystem layout,
@@ -494,8 +490,10 @@ Seed rows:
 - `coach`, kind `coach`, workspace `/workspaces/coach`
 - `p1` to `p10`, kind `player`, workspace `/workspaces/pN`
 
-`name`, `role`, `brief`, `session_id`, `continuity_note`, and
-`last_exchange_json` used to live here and were moved out by `projects_v1`.
+Per-(slot, project) identity (`name`, `role`, `brief`) lives in
+`agent_project_roles`; per-(slot, project) session state
+(`session_id`, `continuity_note`, `last_exchange_json`) lives in
+`agent_sessions`.
 
 ### 6.3 `agent_project_roles`
 
@@ -772,7 +770,6 @@ CREATE TABLE team_config (
 
 Known keys:
 
-- `schema_version`: currently `projects_v2` after migrations.
 - `active_project_id`: current project slug.
 - `extra_tools`: JSON array, team-wide SDK extras such as `WebSearch`.
 - `coach_default_model`: JSON string.
@@ -846,52 +843,21 @@ Global rows use `misc` as the FK target.
 
 ---
 
-## 7. Migrations
+## 7. Schema Bootstrap
 
-Migrations run from `init_db()`.
+`init_db()` is the only schema setup. It runs `executescript(SCHEMA)`
+(idempotent — every statement is `CREATE TABLE IF NOT EXISTS` /
+`CREATE INDEX IF NOT EXISTS`), then seeds the `misc` project, the
+11 agents, and Coach's misc-project identity row. All inserts use
+`INSERT OR IGNORE` so a re-run never overwrites user state — in
+particular `active_project_id` is only set when the row is missing.
 
-### 7.1 `projects_v1`
-
-Destructive migration from the original single-project schema:
-
-- Drops/recreates `tasks`, `events`, `messages`, `memory_docs`, `turns`.
-- Adds `project_id` to project-scoped domain tables.
-- Drops or ignores legacy `agents` columns:
-  - `session_id`
-  - `continuity_note`
-  - `last_exchange_json`
-  - `name`
-  - `role`
-  - `brief`
-- Creates `projects`, `agent_sessions`, `agent_project_roles`, `sync_state`.
-- Inserts `misc` project.
-- Sets `team_config.active_project_id = misc`.
-- Seeds misc Coach role.
-- Copies `HARNESS_PROJECT_REPO` into `projects.repo_url` for misc if set.
-- Wipes legacy flat local dirs.
-- Best-effort wipes WebDAV root.
-- Scaffolds global and misc trees.
-- Stamps `schema_version = projects_v1`.
-
-### 7.2 `projects_v2`
-
-Layout cleanup migration:
-
-- Wipes legacy flat root dirs:
-  - `handoffs`
-  - `context`
-  - `knowledge`
-  - `uploads`
-  - `memory`
-  - `decisions`
-  - `outputs`
-  - `attachments`
-  - typo orphans `output`, `upload`, `uplods`
-- Moves `/data/skills/` to `/data/.claude/skills/`.
-- Renames per-project `inputs/` to `uploads/`.
-- Moves per-project `knowledge/` to `working/knowledge/`.
-- Moves per-project `memory/` to `working/memory/`.
-- Stamps `schema_version = projects_v2`.
+There are no version-stamped migrations. Schema changes go directly
+into `SCHEMA` in `server/db.py`; existing deploys pick up new tables
+and indexes via `IF NOT EXISTS`. New columns on existing tables
+require an explicit upgrade (an `ALTER TABLE` run against the
+deployed DB), since `IF NOT EXISTS` does not reach inside an
+already-created table.
 
 ---
 
@@ -1591,9 +1557,10 @@ Current implementation gap:
 - Does not block the tool caller.
 - Urgency: `normal` or `blocker`.
 
-### 12.10 Removed Tool
+### 12.10 Context editing
 
-`coord_write_context` was removed with `projects_v2`.
+There is no `coord_write_context` tool. Agents edit context files
+with the standard `Write` tool.
 
 Current rule:
 
@@ -2467,8 +2434,7 @@ Representative env vars from `.env.example` and implementation:
 | `TELEGRAM_ALLOWED_CHAT_IDS` | unset | Telegram env fallback |
 | `PORT` | `8000` | Uvicorn port |
 
-Legacy vars still present in `.env.example` but mostly retired by
-`projects_v2`:
+Legacy vars still present in `.env.example` but no longer wired:
 
 - `HARNESS_CONTEXT_DIR`
 - `HARNESS_KNOWLEDGE_DIR`
@@ -2515,7 +2481,7 @@ As of the audit, the repo contains 21 test files and 182 test functions.
 
 Test areas include:
 
-- DB init/schema/migrations.
+- DB init and schema.
 - Task state machine.
 - Event bus and batched persistence behavior.
 - Turn ledger.
@@ -2623,7 +2589,9 @@ and the desired architecture are still not perfectly aligned.
   into app.
 - Direct WebDAV JSON state as source of truth: replaced by SQLite hot state.
 - Lock tools as primary concurrency control: worktrees are the main isolation.
-- `/data/context` root and `coord_write_context`: removed by `projects_v2`.
+- `/data/context` root and `coord_write_context`: dropped — context
+  lives in `/data/CLAUDE.md` + `/data/projects/<active>/CLAUDE.md`,
+  edited via the Files pane or the standard `Write` tool.
 - Multiple layout presets and command palette: not implemented.
 - PWA push notifications: not implemented.
 - Record/replay tooling for events: event log supports it, UI tooling does not.

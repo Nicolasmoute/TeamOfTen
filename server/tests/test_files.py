@@ -1,9 +1,8 @@
 """Tests for server/files.py — the browsable-file backend.
 
-projects_v2 update: the legacy `context`/`knowledge`/`decisions`/...
-roots are gone. Only `global` and `project` remain. All tests now
-exercise those two roots; the per-test data root is sandboxed by
-the `fresh_db` fixture in conftest.
+Only `global` and `project` roots are exposed; everything else is
+reached by drilling into `project`. The per-test data root is
+sandboxed by the `fresh_db` fixture in conftest.
 """
 
 from __future__ import annotations
@@ -81,8 +80,10 @@ def test_list_roots_phase5_two_root_payload(fresh_db) -> None:
 
 
 def test_list_roots_omits_legacy_keys(fresh_db) -> None:
-    """projects_v2 retired the legacy roots — they should not appear
-    in list_roots() AND should no longer exist in `_roots()` either."""
+    """Only `global` and `project` are exposed — the per-project
+    subtrees (context/knowledge/decisions/workspaces/outputs/uploads/
+    plans/handoffs) are reached by drilling into `project`, not as
+    top-level roots."""
     asyncio.get_event_loop().run_until_complete(init_db())
 
     rows = filesmod.list_roots()
@@ -92,10 +93,9 @@ def test_list_roots_omits_legacy_keys(fresh_db) -> None:
         "outputs", "uploads", "plans", "handoffs",
     ):
         assert legacy not in ids, (
-            f"legacy root {legacy!r} should not surface in list_roots()"
+            f"root {legacy!r} should not surface in list_roots()"
         )
 
-    # And they're gone from the internal map too (projects_v2 dropped them).
     internal = filesmod._roots()
     for legacy in ("context", "knowledge", "decisions"):
         assert legacy not in internal
@@ -241,9 +241,8 @@ async def test_write_to_project_writes_to_disk(fresh_db) -> None:
 
 
 async def test_write_to_global_writes_to_disk(fresh_db) -> None:
-    """projects_v2 — `global` is writable too (the file-browser can edit
-    the global CLAUDE.md). All writes go through plain disk now; no
-    ctxmod routing."""
+    """`global` is writable (the file-browser can edit the global
+    CLAUDE.md). All writes go through plain disk."""
     await init_db()
     r = await filesmod.write_text("global", "CLAUDE.md", "global body\n")
     assert r["routed_through"] == "disk"

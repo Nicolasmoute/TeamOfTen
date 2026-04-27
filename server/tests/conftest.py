@@ -6,10 +6,10 @@ concurrent test runs don't stomp each other. We monkey-patch
 under test is identical to production — ``configured_conn`` just
 happens to point at our tempfile.
 
-Also sandbox ``server.paths.DATA_ROOT`` to a tempdir so the Phase 1
-projects_v1 migration (which wipes legacy /data subdirs and scaffolds
-/data/projects/misc + /data/wiki/misc) never touches the real /data
-on a developer's machine.
+Also sandbox ``server.paths.DATA_ROOT`` and ``HARNESS_WORKSPACES_DIR``
+to tempdirs so anything init_db / Phase 6 bootstrap writes (project
+scaffolds, CLAUDE.md stubs, worktree setup) lands in the sandbox
+rather than scribbling on a developer's real /data.
 """
 
 from __future__ import annotations
@@ -41,11 +41,11 @@ def fresh_db(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     os.unlink(path)
     monkeypatch.setattr(dbmod, "DB_PATH", path)
 
-    # Sandbox the data root for the projects_v1 migration. Both the
-    # wipe step (`shutil.rmtree(DATA_ROOT/<sub>)`) and the scaffold
-    # step (`ensure_global_scaffold` / `ensure_project_scaffold`) read
+    # Sandbox the data root for any code that writes under it
+    # (project scaffolds, CLAUDE.md stubs, knowledge/decisions, etc).
+    # `paths.ensure_global_scaffold` / `ensure_project_scaffold` read
     # `paths.DATA_ROOT` directly, so a test run on a dev machine would
-    # otherwise nuke or scribble in real /data. Same for /workspaces.
+    # otherwise scribble in real /data. Same for /workspaces.
     data_root = Path(tempfile.mkdtemp(prefix="harness-data-"))
     workspaces = Path(tempfile.mkdtemp(prefix="harness-ws-"))
     monkeypatch.setattr(pathsmod, "DATA_ROOT", data_root)

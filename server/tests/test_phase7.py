@@ -333,11 +333,10 @@ def test_update_wiki_index_atomic_overwrite(fresh_db) -> None:
 
 
 async def test_audit_init_db_writes_misc_claude_md_stub(fresh_db) -> None:
-    """Audit fix: init_db's misc-project seed should also write the
-    per-project CLAUDE.md stub on first boot. The fresh_db fixture
-    is a freshly-mkdtemp'd DATA_ROOT with no pre-existing files —
-    init_db (called via the migration in projects_v1) should leave
-    misc with its stub present."""
+    """init_db's misc-project seed should also write the per-project
+    CLAUDE.md stub on first boot. The fresh_db fixture is a freshly-
+    mkdtemp'd DATA_ROOT with no pre-existing files — init_db should
+    leave misc with its stub present."""
     await init_db()
     pp = project_paths(MISC_PROJECT_ID)
     assert pp.claude_md.is_file(), (

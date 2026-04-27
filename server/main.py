@@ -163,18 +163,17 @@ def _attachments_dir_for(project_id: str) -> Path:
 # also surfaced read-only in the files pane. Lives on /data so it
 # survives restarts.
 #
-# Note: per PROJECTS_SPEC.md §4 outputs are per-project at
-# `/data/projects/<slug>/outputs/`. The legacy global `/data/outputs/`
-# is still here to back the legacy coord_save_output writer; a future
-# cleanup will route that through `project_paths(active).outputs`
-# the same way we did for knowledge in projects_v2.
+# Note: outputs are per-project at `/data/projects/<slug>/outputs/`.
+# The legacy global `/data/outputs/` is still here to back the legacy
+# coord_save_output writer; a future cleanup will route that through
+# `project_paths(active).outputs`.
 OUTPUTS_DIR = Path(os.environ.get("HARNESS_OUTPUTS_DIR", "/data/outputs"))
 
-# (UPLOADS_DIR / HANDOFFS_DIR removed in projects_v2 — uploads and
-# handoffs are per-project under /data/projects/<active>/uploads/ and
-# /data/projects/<active>/working/handoffs/. The /api/attachments
+# Uploads + handoffs are per-project under
+# `/data/projects/<active>/uploads/` and
+# `/data/projects/<active>/working/handoffs/`. The /api/attachments
 # handler resolves the active project at request time; agents reach
-# uploads/handoffs via absolute paths documented in CLAUDE.md.)
+# uploads/handoffs via absolute paths documented in CLAUDE.md.
 
 
 @asynccontextmanager
@@ -220,13 +219,10 @@ async def lifespan(app: FastAPI):
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     # uploads/ and handoffs/ are per-project under
     # `/data/projects/<active>/uploads/` and
-    # `/data/projects/<active>/working/handoffs/` (PROJECTS_SPEC.md §4).
-    # The legacy boot-time symlinks at /workspaces/<slot>/{uploads,handoffs}
-    # → /data/uploads + /data/handoffs were retired with projects_v2:
-    # the legacy flat dirs no longer exist on disk. Agents reach their
-    # project's uploads/handoffs via the absolute paths documented in
-    # the global CLAUDE.md template. A future workspaces.py refactor
-    # to per-project worktrees can re-introduce relative symlinks.
+    # `/data/projects/<active>/working/handoffs/`. Agents reach
+    # them via the absolute paths documented in the global CLAUDE.md
+    # template. A future workspaces.py refactor to per-project
+    # worktrees can re-introduce relative symlinks.
     # Claude CLI credential dir. Set via CLAUDE_CONFIG_DIR in the image
     # so OAuth tokens written by `claude /login` land on the /data
     # volume and survive Zeabur redeploys. We mkdir at runtime (not in
@@ -2846,13 +2842,10 @@ async def get_decision(filename: str) -> dict[str, Any]:
     }
 
 
-# /api/context/* endpoints removed in projects_v2 — the legacy
-# context store (root/skills/rules with its own write API) is gone;
-# the global CLAUDE.md and per-project CLAUDE.md files are edited via
-# the standard file-browser write endpoint (`POST /api/files/write/global`
-# / `.../project`) by the human, and via the standard Write tool by
-# Coach. The remaining `build_system_prompt_suffix()` reads them on
-# every turn (PROJECTS_SPEC.md §8/§10).
+# Global + per-project CLAUDE.md files are edited via the standard
+# file-browser write endpoint (`POST /api/files/write/global` /
+# `.../project`) by the human, and via the standard Write tool by
+# Coach. `build_system_prompt_suffix()` reads them on every turn.
 
 
 class FileWrite(BaseModel):

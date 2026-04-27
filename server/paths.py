@@ -64,10 +64,9 @@ class ProjectPaths:
 def global_paths() -> GlobalPaths:
     root = DATA_ROOT
     wiki = root / "wiki"
-    # projects_v2 (PROJECTS_SPEC.md §4): skills live under /data/.claude/
-    # to match Claude Code's canonical project layout. The dotted prefix
-    # also keeps them grouped with anything else CC-managed in the
-    # future (settings.json, agents/, commands/).
+    # Skills live under /data/.claude/ to match Claude Code's canonical
+    # project layout. The dotted prefix also keeps them grouped with
+    # anything else CC-managed (settings.json, agents/, commands/).
     return GlobalPaths(
         root=root,
         claude_md=root / "CLAUDE.md",
@@ -86,16 +85,14 @@ def project_paths(project_id: str) -> ProjectPaths:
         project_id=project_id,
         root=root,
         claude_md=root / "CLAUDE.md",
-        # projects_v2 (PROJECTS_SPEC.md §4): memory/ moved under
-        # working/ alongside knowledge — both are mutable in-progress
-        # state. The two non-working "permanent" lanes at the project
-        # root are decisions/ (immutable ADRs) and outputs/ (binary
-        # deliverables); uploads/ is the inbound peer (read-only).
+        # working/ holds mutable in-progress state — memory and
+        # knowledge sit alongside conversations/handoffs/plans/
+        # workspace. The two non-working "permanent" lanes at the
+        # project root are decisions/ (immutable ADRs) and outputs/
+        # (binary deliverables); uploads/ is the inbound peer
+        # (read-only).
         memory=working / "memory",
         decisions=root / "decisions",
-        # projects_v2: knowledge/ moved under working/ — text artifacts
-        # (specs, research notes, design docs) are working material
-        # that evolves, not final deliverables.
         knowledge=working / "knowledge",
         working=working,
         working_conversations=working / "conversations",
@@ -103,8 +100,6 @@ def project_paths(project_id: str) -> ProjectPaths:
         working_plans=working / "plans",
         working_workspace=working / "workspace",
         outputs=root / "outputs",
-        # projects_v2: renamed from `inputs/`. "uploads" matches the
-        # user-visible "they uploaded a file" mental model better.
         uploads=root / "uploads",
         attachments=root / "attachments",
         repo=repo,

@@ -133,11 +133,10 @@ def _roots() -> dict[str, Root]:
             project_id=active,
             label=_project_label(active),
         ),
-        # Legacy flat roots (context/knowledge/decisions/workspaces/
-        # outputs/uploads/plans/handoffs) were retired in projects_v2:
-        # the corresponding /data/<flat>/ dirs were wiped, the writers
-        # now route through `project_paths(active)`, and the UI only
-        # renders the two scoped roots above.
+        # The two scoped roots above (`global` + `project`) are the
+        # only ones the UI exposes. Per-project subtrees (knowledge,
+        # decisions, outputs, uploads, plans, handoffs, workspace)
+        # are reached by drilling into `project`.
     }
     return roots
 
@@ -300,10 +299,8 @@ def read_text(root_key: str, relative: str) -> dict[str, Any]:
 async def write_text(root_key: str, relative: str, content: str) -> dict[str, Any]:
     """Save `content` to the target file under `root_key`.
 
-    All writes are now plain disk writes — the legacy ctxmod routing
-    (which validated + mirrored to kDrive on its own) is gone with
-    projects_v2. The two surviving roots (`global`, `project`) cover
-    every editable path; per-project sync handles the kDrive mirror.
+    Plain disk write — the two roots (`global`, `project`) cover every
+    editable path; per-project sync handles the kDrive mirror.
     """
     roots = _roots()
     if root_key not in roots or not roots[root_key].writable:

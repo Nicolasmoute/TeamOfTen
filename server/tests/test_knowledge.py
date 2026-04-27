@@ -1,9 +1,9 @@
 """Tests for server/knowledge.py — the durable artifact bucket.
 
-projects_v2 update: knowledge is project-scoped (active project's
-`working/knowledge/`) and `list_paths` is async. Tests use the
-`fresh_db` fixture so `resolve_active_project()` returns 'misc' and
-the per-project tree exists under the sandboxed DATA_ROOT.
+Knowledge is project-scoped (active project's `working/knowledge/`)
+and `list_paths` is async. Tests use the `fresh_db` fixture so
+`resolve_active_project()` returns 'misc' and the per-project tree
+exists under the sandboxed DATA_ROOT.
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ def test_validate_rejects_bad_segment_start() -> None:
 
 
 async def test_write_routes_to_active_project_knowledge(fresh_db) -> None:
-    """projects_v2: writes land at /data/projects/<active>/working/knowledge/."""
+    """Writes land at /data/projects/<active>/working/knowledge/."""
     await init_db()
     await knowmod.write("reports/weekly.md", "# Weekly\n\nhi\n")
     pp = project_paths("misc")

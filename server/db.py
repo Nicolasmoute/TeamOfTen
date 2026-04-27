@@ -50,7 +50,9 @@ CREATE TABLE IF NOT EXISTS agents (
     workspace_path        TEXT NOT NULL,
     cost_estimate_usd     REAL NOT NULL DEFAULT 0.0,
     started_at            TEXT,
-    last_heartbeat        TEXT
+    last_heartbeat        TEXT,
+    allowed_extra_tools   TEXT,
+    locked                INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -75,12 +77,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS idx_tasks_status  ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_owner   ON tasks(owner);
 CREATE INDEX IF NOT EXISTS idx_tasks_parent  ON tasks(parent_id);
--- Note: idx_tasks_project deliberately NOT in SCHEMA. The
--- project_id column is added by the projects_v1 migration which
--- drops + recreates this table; on a legacy DB (pre-refactor)
--- the column doesn't exist when executescript() runs and the
--- CREATE INDEX would fail the whole script. The index is created
--- in init_db's post-migration loop instead.
+CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 
 -- payload_to / payload_owner: virtual generated columns over the
 -- two JSON fields the pane-history fan-out filter cares about. Lets
@@ -101,8 +98,7 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_id, id);
 CREATE INDEX IF NOT EXISTS idx_events_type  ON events(type);
--- Note: idx_events_project deferred to post-migration loop (same
--- reason as idx_tasks_project — column doesn't exist on legacy DBs).
+CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id);
 -- (agent_id, type) for fan-out queries that decompose into "events
 -- where I am the actor of any type, OR events of a specific type
 -- targeting me". The OR-branch with type='message_sent' / 'task_*'
@@ -114,11 +110,12 @@ CREATE INDEX IF NOT EXISTS idx_events_agent_type ON events(agent_id, type);
 -- /api/events?type=human_attention&since_id=N — the existing
 -- idx_events_type covers WHERE type=? but not the ORDER BY id DESC
 -- LIMIT N step, forcing a temp-table sort.
-CREATE INDEX IF NOT EXISTS idx_events_type_id   ON events(type, id);
--- Indexes on payload_to / payload_owner are NOT in SCHEMA — they
--- depend on the generated columns existing, which on an existing DB
--- require the ALTER TABLE migration in init_db() to have run first.
--- We CREATE them after the ALTER step instead.
+CREATE INDEX IF NOT EXISTS idx_events_type_id ON events(type, id);
+-- Indexes over the virtual generated columns for pane-history
+-- fan-out filtering ("events targeting me by type", "events I own
+-- by type"). They sit alongside payload_to / payload_owner above.
+CREATE INDEX IF NOT EXISTS idx_events_to    ON events(type, payload_to, id);
+CREATE INDEX IF NOT EXISTS idx_events_owner ON events(type, payload_owner, id);
 
 CREATE TABLE IF NOT EXISTS messages (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,7 +133,7 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_id);
 CREATE INDEX IF NOT EXISTS idx_messages_from ON messages(from_id);
--- Note: idx_messages_project deferred to post-migration loop.
+CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id);
 
 -- Per-recipient read tracking. Necessary for broadcasts: the first
 -- recipient to drain must NOT mark the message read for everyone else.
@@ -160,33 +157,41 @@ CREATE TABLE IF NOT EXISTS memory_docs (
     PRIMARY KEY (project_id, topic)
 );
 
--- Note: idx_memory_project deferred to post-migration loop.
+CREATE INDEX IF NOT EXISTS idx_memory_project ON memory_docs(project_id);
 
 -- Per-turn analytics ledger. One row per SDK ResultMessage — cheap
 -- indexed queries for 'how much did p3 spend this week'. Parallel to
 -- the events table but narrower: just the numbers, no free text. The
 -- events table still has the full turn trail for audit; this is for
 -- charts.
+-- Per-turn analytics ledger. Token columns track usage from
+-- ResultMessage.usage on every successful turn; sum of all four on
+-- the latest turn for a session ≈ conversation size going into the
+-- next turn (drives HARNESS_AUTO_COMPACT_THRESHOLD).
 CREATE TABLE IF NOT EXISTS turns (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id       TEXT NOT NULL,
-    project_id     TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    started_at     TEXT NOT NULL,
-    ended_at       TEXT NOT NULL,
-    duration_ms    INTEGER,
-    cost_usd       REAL,
-    session_id     TEXT,
-    num_turns      INTEGER,     -- SDK's own internal turn counter (tool roundtrips)
-    stop_reason    TEXT,
-    is_error       INTEGER NOT NULL DEFAULT 0,
-    model          TEXT,
-    plan_mode      INTEGER NOT NULL DEFAULT 0,
-    effort         INTEGER
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id              TEXT NOT NULL,
+    project_id            TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    started_at            TEXT NOT NULL,
+    ended_at              TEXT NOT NULL,
+    duration_ms           INTEGER,
+    cost_usd              REAL,
+    session_id            TEXT,
+    num_turns             INTEGER,     -- SDK's own internal turn counter (tool roundtrips)
+    stop_reason           TEXT,
+    is_error              INTEGER NOT NULL DEFAULT 0,
+    model                 TEXT,
+    plan_mode             INTEGER NOT NULL DEFAULT 0,
+    effort                INTEGER,
+    input_tokens          INTEGER,
+    output_tokens         INTEGER,
+    cache_read_tokens     INTEGER,
+    cache_creation_tokens INTEGER
 );
 
-CREATE INDEX IF NOT EXISTS idx_turns_agent      ON turns(agent_id, id);
-CREATE INDEX IF NOT EXISTS idx_turns_ended_at   ON turns(ended_at);
--- Note: idx_turns_project deferred to post-migration loop.
+CREATE INDEX IF NOT EXISTS idx_turns_agent    ON turns(agent_id, id);
+CREATE INDEX IF NOT EXISTS idx_turns_ended_at ON turns(ended_at);
+CREATE INDEX IF NOT EXISTS idx_turns_project  ON turns(project_id);
 
 -- Team-wide settings (applies to every agent). Simple key/value store
 -- so we can grow without schema churn. Value is a JSON string — the
@@ -256,10 +261,9 @@ CREATE TABLE IF NOT EXISTS agent_project_roles (
 
 CREATE TABLE IF NOT EXISTS sync_state (
     project_id       TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    -- 'global' added in Phase 2 to track the global tree (CLAUDE.md,
-    -- skills/, mcp/, wiki/INDEX.md, cross-project wiki/*.md). Existing
-    -- pre-Phase-2 DBs are evolved in-place by init_db via
-    -- _evolve_sync_state_check below.
+    -- 'project': per-project files under /data/projects/<slug>/
+    -- 'wiki':    cross-project wiki entries under /data/wiki/
+    -- 'global':  shared root (CLAUDE.md, skills/, mcp/, wiki/INDEX.md)
     tree             TEXT NOT NULL CHECK (tree IN ('project', 'wiki', 'global')),
     path             TEXT NOT NULL,
     mtime            REAL NOT NULL,
@@ -270,10 +274,10 @@ CREATE TABLE IF NOT EXISTS sync_state (
 );
 """
 
-# Seed agents — idempotent via INSERT OR IGNORE. After the projects
-# refactor (§3) name/role/brief moved to agent_project_roles; the
-# seed only writes id/kind/workspace_path. Identity rows for the
-# misc project are seeded in init_db after the projects row exists.
+# Seed agents — idempotent via INSERT OR IGNORE. Per-(slot, project)
+# identity rows (name/role/brief) live in agent_project_roles; the
+# seed only writes id/kind/workspace_path. The misc-project Coach
+# identity is seeded in init_db after the projects row exists.
 SEED_AGENTS: list[tuple[str, str, str]] = [
     ("coach", "coach", "/workspaces/coach"),
 ] + [
@@ -283,49 +287,9 @@ SEED_AGENTS: list[tuple[str, str, str]] = [
 
 # The fallback active project. Created on every fresh DB so
 # resolve_active_project() never returns None and project-scoped
-# inserts never violate the FK. The destructive Phase-1 migration
-# also creates it (idempotent).
+# inserts never violate the FK.
 MISC_PROJECT_ID = "misc"
 MISC_PROJECT_NAME = "Misc"
-
-
-async def _evolve_sync_state_check(db: aiosqlite.Connection) -> None:
-    """If the existing `sync_state.tree` CHECK constraint doesn't allow
-    'global' (pre-Phase-2 DBs), recreate the table in-place with the
-    expanded CHECK while preserving any rows. Idempotent."""
-    cur = await db.execute(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sync_state'"
-    )
-    row = await cur.fetchone()
-    if not row:
-        return
-    sql_stmt = ""
-    try:
-        sql_stmt = row[0] or ""
-    except Exception:
-        return
-    if "'global'" in sql_stmt:
-        return  # already evolved
-    logger.info("evolving sync_state CHECK constraint to allow tree='global'")
-    await db.executescript(
-        """
-        CREATE TABLE sync_state__new (
-            project_id       TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-            tree             TEXT NOT NULL CHECK (tree IN ('project', 'wiki', 'global')),
-            path             TEXT NOT NULL,
-            mtime            REAL NOT NULL,
-            size_bytes       INTEGER NOT NULL,
-            sha256           TEXT NOT NULL,
-            last_synced_at   TEXT NOT NULL,
-            PRIMARY KEY (project_id, tree, path)
-        );
-        INSERT INTO sync_state__new
-          SELECT project_id, tree, path, mtime, size_bytes, sha256, last_synced_at
-          FROM sync_state;
-        DROP TABLE sync_state;
-        ALTER TABLE sync_state__new RENAME TO sync_state;
-        """
-    )
 
 
 async def crash_recover() -> dict[str, int]:
@@ -397,180 +361,11 @@ async def init_db() -> None:
             await db.execute("PRAGMA foreign_keys = ON")
             logger.info("init_db: pragmas set, running schema")
             await db.executescript(SCHEMA)
-            # Lightweight manual migrations for columns added after the
-            # original schema shipped. Each ALTER is wrapped so an
-            # already-migrated DB (column already exists) is silently
-            # skipped — SQLite raises OperationalError with 'duplicate
-            # column' in that case. Keep entries append-only; never
-            # remove or re-order.
-            for col_name, col_ddl in (
-                # JSON array of SDK tool names the human granted this
-                # slot in addition to the role baseline. Survives the
-                # Phase 1 projects refactor (still per-agent, global).
-                ("allowed_extra_tools", "ALTER TABLE agents ADD COLUMN allowed_extra_tools TEXT"),
-                # Per-Player lock flag. Same.
-                ("locked", "ALTER TABLE agents ADD COLUMN locked INTEGER NOT NULL DEFAULT 0"),
-            ):
-                try:
-                    await db.execute(col_ddl)
-                    logger.info("init_db: migration applied: agents.%s", col_name)
-                except Exception as e:
-                    if "duplicate column" not in str(e).lower():
-                        raise
-            # Generated columns + indexes on the events table for
-            # pane-history fan-out filtering. Old DBs created before
-            # these columns existed need them ALTERed in; new DBs
-            # picked them up via SCHEMA above and the ALTERs are no-ops.
-            # SQLite supports VIRTUAL generated columns via ALTER TABLE
-            # ADD COLUMN; the expression must be deterministic (which
-            # json_extract is) and the column can't be the rowid.
-            for col_name, col_ddl in (
-                ("payload_to",
-                 "ALTER TABLE events ADD COLUMN payload_to TEXT "
-                 "GENERATED ALWAYS AS (json_extract(payload, '$.to')) VIRTUAL"),
-                ("payload_owner",
-                 "ALTER TABLE events ADD COLUMN payload_owner TEXT "
-                 "GENERATED ALWAYS AS (json_extract(payload, '$.owner')) VIRTUAL"),
-            ):
-                try:
-                    await db.execute(col_ddl)
-                    logger.info("init_db: migration applied: events.%s", col_name)
-                except Exception as e:
-                    msg = str(e).lower()
-                    if "duplicate column" in msg or "already exists" in msg:
-                        continue
-                    # ALTER TABLE GENERATED requires SQLite >= 3.31.
-                    # If the build is older, log + skip — queries fall
-                    # back to json_extract via main.py's defensive code.
-                    if "near \"generated\"" in msg or "syntax error" in msg:
-                        logger.warning(
-                            "init_db: SQLite build does not support generated "
-                            "columns; events.%s skipped, queries will use "
-                            "json_extract fallback", col_name
-                        )
-                        continue
-                    raise
-            # Indexes over the generated columns. Run AFTER the
-            # ALTER TABLE migrations above so the columns exist (on
-            # old DBs) by the time we try to index them. CREATE INDEX
-            # IF NOT EXISTS is a no-op on a fresh / already-indexed
-            # DB. Building over a large events table can take a few
-            # seconds — acceptable on startup. If the SQLite build
-            # didn't support generated columns and we skipped the
-            # migration, these CREATE INDEX statements will fail
-            # ("no such column"); catch and skip.
-            for idx_name, idx_ddl in (
-                ("idx_events_to",
-                 "CREATE INDEX IF NOT EXISTS idx_events_to "
-                 "ON events(type, payload_to, id)"),
-                ("idx_events_owner",
-                 "CREATE INDEX IF NOT EXISTS idx_events_owner "
-                 "ON events(type, payload_owner, id)"),
-            ):
-                try:
-                    await db.execute(idx_ddl)
-                except Exception as e:
-                    if "no such column" in str(e).lower():
-                        logger.warning(
-                            "init_db: %s skipped (generated column missing)",
-                            idx_name,
-                        )
-                        continue
-                    raise
-
-            # Token-usage columns on the turns ledger. Populated from
-            # ResultMessage.usage on every successful turn; drives the
-            # auto-compact threshold (HARNESS_AUTO_COMPACT_THRESHOLD).
-            # input_tokens = new uncached input; cache_read = cached
-            # prefix re-sent; cache_creation = this turn's tokens being
-            # written to cache; output_tokens = assistant reply. Sum of
-            # all four on the latest turn for a session ≈ conversation
-            # size going into the next turn.
-            for col_name, col_ddl in (
-                ("input_tokens", "ALTER TABLE turns ADD COLUMN input_tokens INTEGER"),
-                ("output_tokens", "ALTER TABLE turns ADD COLUMN output_tokens INTEGER"),
-                ("cache_read_tokens", "ALTER TABLE turns ADD COLUMN cache_read_tokens INTEGER"),
-                ("cache_creation_tokens", "ALTER TABLE turns ADD COLUMN cache_creation_tokens INTEGER"),
-            ):
-                try:
-                    await db.execute(col_ddl)
-                    logger.info("init_db: migration applied: agents.%s", col_name)
-                except Exception as e:
-                    if "duplicate column" not in str(e).lower():
-                        raise
-            # Run the destructive Phase-1 projects migration BEFORE
-            # the agent seed. The migration drops legacy columns from
-            # agents (name/role/brief/session_id/continuity_note/
-            # last_exchange_json) and recreates the project-scoped
-            # domain tables; the seed must then run against the
-            # migrated shape.
-            try:
-                from server.migrations.projects_v1 import run as _run_projects_v1
-                await _run_projects_v1(db)
-            except Exception:
-                logger.exception("init_db: projects_v1 migration failed")
-                raise
-
-            # Phase 2 follow-up: extend sync_state.tree CHECK to allow
-            # 'global'. Pre-Phase-2 DBs were stamped with the old CHECK
-            # in projects_v1.py; recreate the table in place when the
-            # constraint is missing the new value. Idempotent — a no-op
-            # once the new constraint is present.
-            try:
-                await _evolve_sync_state_check(db)
-            except Exception:
-                logger.exception("init_db: sync_state evolution failed")
-                raise
-
-            # projects_v2 layout migration (PROJECTS_SPEC.md §4): wipe
-            # legacy flat root dirs left over from before projects_v1,
-            # move /data/skills/ -> /data/.claude/skills/, and rename
-            # per-project inputs/ -> uploads/. Idempotent; only runs
-            # once schema_version is stamped 'projects_v1'.
-            try:
-                from server.migrations.projects_v2 import run as _run_projects_v2
-                await _run_projects_v2(db)
-            except Exception:
-                logger.exception("init_db: projects_v2 migration failed")
-                raise
-
-            # Phase 1 deploy hot-fix: the project_id indexes used to live
-            # in SCHEMA, but on a legacy DB (events/tasks/messages/etc.
-            # exist from before the refactor without project_id) the
-            # `CREATE INDEX … ON tasks(project_id)` would fail the whole
-            # executescript() before projects_v1 could drop+recreate the
-            # tables. Now we create them here, AFTER projects_v1 has
-            # installed the new shape. Each is wrapped in try/except so
-            # an oddball state (column still missing for some reason)
-            # logs + skips instead of crashing boot.
-            for idx_name, idx_ddl in (
-                ("idx_tasks_project",
-                 "CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id)"),
-                ("idx_events_project",
-                 "CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id)"),
-                ("idx_messages_project",
-                 "CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_id)"),
-                ("idx_memory_project",
-                 "CREATE INDEX IF NOT EXISTS idx_memory_project ON memory_docs(project_id)"),
-                ("idx_turns_project",
-                 "CREATE INDEX IF NOT EXISTS idx_turns_project ON turns(project_id)"),
-            ):
-                try:
-                    await db.execute(idx_ddl)
-                except Exception as e:
-                    msg = str(e).lower()
-                    if "no such column" in msg or "no such table" in msg:
-                        logger.warning(
-                            "init_db: %s skipped (%s) — projects_v1 may not "
-                            "have run; investigate", idx_name, e,
-                        )
-                        continue
-                    raise
 
             logger.info("init_db: schema ok, ensuring misc project")
             # Ensure the fallback project + active-project pointer
-            # exist on every fresh boot (idempotent — the migration
-            # also creates these on existing DBs).
+            # exist on every fresh boot. INSERT OR IGNORE — never
+            # overwrites a user-chosen active project.
             await db.execute(
                 "INSERT OR IGNORE INTO projects (id, name) VALUES (?, ?)",
                 (MISC_PROJECT_ID, MISC_PROJECT_NAME),
@@ -600,10 +395,10 @@ async def init_db() -> None:
 
             await db.commit()
 
-            # Phase 7 (PROJECTS_SPEC.md §8): write per-project CLAUDE.md
-            # stub for misc on first boot. First-write-only — preserves
-            # any user / Coach edits across restarts. Best-effort: a
-            # disk failure here doesn't crash init_db.
+            # Write the per-project CLAUDE.md stub for misc on first
+            # boot. First-write-only — preserves any user / Coach edits
+            # across restarts. Best-effort: a disk failure here doesn't
+            # crash init_db.
             try:
                 from server.paths import write_project_claude_md_stub
                 write_project_claude_md_stub(
@@ -619,11 +414,11 @@ async def init_db() -> None:
         raise
 
 
-# Phase 3 TOCTOU mitigation (PROJECTS_SPEC.md §13 Phase 3 follow-up).
-# The activate handler in server.projects_api pins the new project via
-# pin_active_project() during the swap so any tool call / event publish
-# that begins mid-switch sees a coherent view. Outside the pinned
-# context resolve_active_project reads team_config as before.
+# TOCTOU mitigation. The activate handler in server.projects_api
+# pins the new project via pin_active_project() during the swap so
+# any tool call / event publish that begins mid-switch sees a coherent
+# view. Outside the pinned context resolve_active_project reads
+# team_config as before.
 import contextvars as _ctx
 
 _pinned_project: _ctx.ContextVar[str | None] = _ctx.ContextVar(

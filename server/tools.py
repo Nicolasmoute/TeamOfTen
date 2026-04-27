@@ -1258,11 +1258,10 @@ def build_coord_server(caller_id: str) -> Any:
             f"decision '{title}' saved to {location} ({len(body)} chars of body)"
         )
 
-    # coord_write_context removed in projects_v2 — the legacy
-    # /data/context/ store is gone. Coach edits the global CLAUDE.md
-    # at /data/CLAUDE.md and per-project CLAUDE.md at
-    # /data/projects/<active>/CLAUDE.md via the standard Write tool;
-    # both files are read fresh on every agent turn (server/context.py).
+    # Coach edits the global CLAUDE.md at /data/CLAUDE.md and
+    # per-project CLAUDE.md at /data/projects/<active>/CLAUDE.md via
+    # the standard Write tool; both files are read fresh on every
+    # agent turn (server/context.py).
 
     @tool(
         "coord_list_team",
