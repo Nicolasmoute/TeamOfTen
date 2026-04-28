@@ -10,8 +10,6 @@ out explicitly.
 
 Companion references:
 
-- `Docs/HARNESS_SPEC.md`: original design reference.
-- `Docs/PROJECTS_SPEC.md`: project-refactor design and phase notes.
 - `CLAUDE.md`: working notes and constraints for agents editing this repo.
 - `README.md`: operator-facing overview and quick start.
 
@@ -73,8 +71,6 @@ TeamOfTen/
   .env.example
   mcp-servers.example.json
   Docs/
-    HARNESS_SPEC.md
-    PROJECTS_SPEC.md
     TOT-specs.md
   server/
     main.py
@@ -993,6 +989,15 @@ Write rules:
 - WebDAV mirroring happens later through project/global sync loops.
 - `file_written` event emitted by API.
 - Wiki writes trigger `update_wiki_index()` unless writing `INDEX.md` itself.
+  Triggers fire on three paths: (1) the HTTP file-write endpoint above
+  (UI Files-pane writes), (2) project creation in `projects_api.py`,
+  and (3) a `PostToolUse` SDK hook in `server/agents.py` matching
+  `Write|Edit|MultiEdit|NotebookEdit` whose tool_input path resolves
+  under `global_paths().wiki` — this last one is what catches agent
+  Write tool calls (which go through the SDK directly to disk and
+  bypass the HTTP write endpoint). `POST /api/wiki/reindex` is the
+  manual catch-all for external writers (cloud sync from another
+  machine, snapshot restore, manual `cp` into the tree).
 
 The `global` tree hides noisy/sensitive top-level entries:
 
@@ -1154,24 +1159,64 @@ Auto-compact:
 - If auto-compact produces no summary, it force-clears the session to escape a
   threshold loop.
 
+Compact prompt structure:
+
+`COMPACT_PROMPT` in `server/agents.py` instructs the agent to produce a
+1500–3000 word handoff document with these markdown sections, in order:
+
+1. **Primary request and intent** — original ask + scope additions, verbatim.
+2. **Key technical concepts** — glossary of terms used in the session.
+3. **All operator messages (verbatim, in order)** — every human message,
+   numbered, including one-word replies. Preserves voice that paraphrase
+   loses.
+4. **How we got here** — narrative arc, dead ends, recurring workflow pattern.
+5. **Files touched** — per-file inventory tagged **touched** vs **read-only**,
+   with diffs / snippets inline for recent or relevant files.
+6. **Errors & fixes** — one entry per failure: symptom, root cause, fix,
+   regression test.
+7. **Key findings & decisions** — what / why / who agreed.
+8. **Open questions** — unresolved items, quoted verbatim.
+9. **References** — URLs, commit hashes, external links not covered above.
+10. **People & roles** — who participated, responsibilities, preferences.
+11. **Context quirks & gotchas** — environment / tool peculiarities.
+12. **In-flight state at compact** — last assistant message verbatim, last
+    tool call, exact next action.
+13. **Pending — concrete checklist** — `[ ] Action — owner — blocking?` items.
+
+The prompt explicitly tells the agent NOT to append a footer pointing at the
+JSONL or handoff file. The harness appends that itself via
+`_build_compact_footer()`, naming `$CLAUDE_CONFIG_DIR/projects/<encoded-cwd>/
+<session-id>.jsonl` so fresh-you can read the full transcript on demand.
+
 Recent exchange preservation:
 
 - `last_exchange_json` stores a bounded rolling log.
 - Budget: `HARNESS_HANDOFF_TOKEN_BUDGET`, default 20,000 tokens.
 - Full session transcript remains in Claude CLI JSONL until session retention
-  trims it.
+  trims it (`HARNESS_SESSION_RETENTION_DAYS`, default 30).
 
 ### 10.4 Context Usage UI
 
 `GET /api/agents/{id}/context` returns:
 
 - `session_id`
-- estimated used tokens
+- estimated used tokens for the current resumed prompt/session footprint
 - context window
 - model
 - ratio
 
-The pane renders this as a compact context bar.
+Estimation semantics:
+
+- Read the Claude Code session JSONL under `CLAUDE_CONFIG_DIR/projects/`.
+- Use the latest assistant usage row as the prompt-size source of truth.
+- Count `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`.
+- Add the latest assistant output tokens because they become part of the next
+  resumed prompt.
+- Do not sum `ResultMessage.usage` across tool rounds; that overstates context
+  pressure when prompt caching is active.
+
+The pane renders this as a compact `ctx` bar: current footprint as a fraction
+of the model's max window.
 
 ---
 
@@ -2196,6 +2241,29 @@ When API returns 401 and `HARNESS_TOKEN` is required:
 - Token is stored in localStorage.
 - WebSocket uses `?token=`.
 
+### 16.9 Mobile Layout
+
+A `@media (max-width: 700px)` block in `server/static/style.css` reflows the
+app for phones:
+
+- Left rail moves to the bottom and splits across two grid rows.
+- The panes area becomes a horizontal swipe deck via
+  `scroll-snap-type: x mandatory` on `.panes`. Each `.pane-col` is forced
+  to `min-width: 100%` so one pane fills the screen.
+- Split.js gutters, pane drag-zones, layout-preset buttons, and the
+  maximize button are hidden — they don't fit single-pane navigation and
+  HTML5 drag-and-drop doesn't work on touch.
+- `EnvPane` becomes a full-screen overlay when toggled open.
+
+Pane ordering on phones is canonical, not history-based. `useIsPhone()`
+in `app.js` listens to the `(max-width: 700px)` media query; when active,
+`effectiveColumns` flattens all open slots, sorts them by
+`CANONICAL_SLOT_ORDER` (`coach`, `p1`..`p10`, then special slots like
+`__files` / `__projects` in insertion order), and singletonizes them into
+one slot per column. The swipe deck therefore always reads
+Coach → 1 → 2 → … regardless of the order panes were opened. Desktop
+layout keeps the user's 2D `openColumns` structure intact.
+
 ---
 
 ## 17. Git Workspaces
@@ -2440,7 +2508,6 @@ Legacy vars still present in `.env.example` but no longer wired:
 - `HARNESS_KNOWLEDGE_DIR`
 - `HARNESS_DECISIONS_DIR`
 - `HARNESS_UPLOADS_DIR`
-- `HARNESS_HANDOFFS_DIR`
 - `HARNESS_WORKSPACES_DIR` (implementation uses `HARNESS_WORKSPACES_ROOT`)
 
 ---

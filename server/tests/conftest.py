@@ -59,6 +59,16 @@ def fresh_db(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         monkeypatch.setattr(filesmod_local, "DATA_ROOT", data_root)
     except Exception:
         pass
+    # Same shape: `server.secrets` does `from server.db import DB_PATH`
+    # at import time. Without this patch, set_secret/get_secret hit
+    # the stale path (often the real /data/harness.db or a deleted
+    # tempfile) and fail with "no such table: secrets" because the
+    # current test's tempfile is the one with the schema.
+    try:
+        import server.secrets as secretsmod_local
+        monkeypatch.setattr(secretsmod_local, "DB_PATH", path)
+    except Exception:
+        pass
     # Phase 6: bootstrap_status() is a process-level cache. Reset it
     # between tests so a test that reads it without first calling
     # bootstrap_global_resources() doesn't pick up leftover state

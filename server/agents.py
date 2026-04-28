@@ -934,12 +934,22 @@ COMPACT_PROMPT = (
     "handoff document for the fresh-session version of yourself who "
     "will pick up after this compact. That future-you has NO memory "
     "of anything we just did — treat them as a well-briefed colleague "
-    "who joined the project today. The most recent exchanges are "
-    "preserved verbatim separately; this document covers EVERYTHING "
-    "ELSE from the session.\n\n"
+    "who joined the project today.\n\n"
+    "Two safety nets exist outside this document, so you can lean on "
+    "them rather than try to substitute for them:\n"
+    "1. The harness preserves the most recent exchanges verbatim and "
+    "injects them into the next session's system prompt automatically.\n"
+    "2. The FULL session transcript (every message, tool call, and "
+    "tool result) is still on disk as a JSONL file. Fresh-you can "
+    "read it on demand. The harness auto-appends a footer pointing at "
+    "the exact path — do NOT include such a footer yourself.\n\n"
+    "This document is the index + summary; the JSONL is the source of "
+    "truth. Optimize for scannability — fresh-you should be able to "
+    "find any piece of context in seconds, then drop into the JSONL "
+    "for verbatim detail when the summary glosses over it.\n\n"
     "Target length: 1500-3000 words. Err on the side of MORE detail "
-    "rather than less — this file will be saved to disk, not replayed "
-    "in every prompt, so length is cheap and missing context is "
+    "rather than less — this file is saved to disk, not replayed in "
+    "every prompt, so length is cheap and missing context is "
     "expensive. Do not abbreviate. Do not write 'see above' or 'as "
     "discussed' — spell it out.\n\n"
     "Use exactly these markdown sections, in this order. Within each "
@@ -947,61 +957,97 @@ COMPACT_PROMPT = (
     "If a section genuinely doesn't apply, write 'None this session.' "
     "rather than omitting it — fresh-you needs to know you considered "
     "it.\n\n"
-    "## Current task\n"
-    "What you are actively working on, who asked for it, the state "
-    "right now (investigating / blocked / implementing / reviewing / "
-    "…), and the next 1-3 concrete steps you were about to take. "
-    "Include the original goal as it was stated to you, verbatim if "
-    "possible.\n\n"
+    "## Primary request and intent\n"
+    "What the operator originally asked for, in their words; the "
+    "broader purpose this session serves in their work; and any "
+    "side-requests or scope additions layered on during the session. "
+    "Capture pivots explicitly — not just the final scope. Quote the "
+    "original ask verbatim if possible.\n\n"
+    "## Key technical concepts\n"
+    "Glossary of domain terms, frameworks, custom abbreviations, "
+    "invariants, and named entities used during the session. One line "
+    "per term — just enough that fresh-you can read the rest of this "
+    "doc fluently. Include both project-wide vocabulary that came up "
+    "and any session-specific nicknames or shorthand.\n\n"
+    "## All operator messages (verbatim, in order)\n"
+    "Every message the operator (human) sent during this session, "
+    "QUOTED VERBATIM, in chronological order, numbered. Include "
+    "interruptions and one-word replies ('go', 'continue', 'no'). "
+    "This preserves their voice — corrections, pivots, exact phrasing "
+    "— that paraphrase loses. The harness only preserves the last few "
+    "exchanges verbatim by default; everything older is lost without "
+    "this section.\n\n"
     "## How we got here\n"
     "Chronological narrative of the session's arc: what was tried, "
-    "what worked, what didn't, dead ends you ruled out and why. "
-    "Fresh-you reading this should understand the path of reasoning, "
-    "not just the final state. Include the PURPOSE this session serves "
-    "in the operator's broader work (not just what we did, but WHY "
-    "they need it). If this session has been running inside a recurring "
-    "workflow pattern (stepping through a list, iterating on revisions, "
-    "babysitting a long job), describe that pattern explicitly so "
-    "fresh-you knows whether to resume in the same mode. 2-5 "
-    "paragraphs.\n\n"
+    "what worked, what didn't, dead ends ruled out and why. Fresh-you "
+    "reading this should understand the path of reasoning, not just "
+    "the final state. If this session has been running inside a "
+    "recurring workflow pattern (stepping through a list, iterating "
+    "on revisions, babysitting a long job), describe that pattern "
+    "explicitly so fresh-you knows whether to resume in the same "
+    "mode. 2-5 paragraphs.\n\n"
+    "## Files touched\n"
+    "Per-file inventory of every file you read or modified this "
+    "session. For each file:\n"
+    "- **Path**.\n"
+    "- **State**: **touched** (you modified it) or **read-only** "
+    "(you only read it — pre-existing state you inherited).\n"
+    "- **What changed / what's relevant**: one paragraph. For touched "
+    "files, include the actual diff or key snippet inline as a code "
+    "block when it matters.\n\n"
+    "Recent / most-relevant files get verbatim snippets; older ones "
+    "get one line each. The goal is that recent work is replayable "
+    "and old work is findable.\n\n"
+    "## Errors & fixes\n"
+    "One entry per failure encountered. For each:\n"
+    "- **Symptom**: the exact error message or wrong behavior, quoted.\n"
+    "- **Root cause**: what was actually wrong.\n"
+    "- **Fix**: what you changed.\n"
+    "- **Regression test** (if any): the test name or path.\n\n"
+    "Don't summarize — these are the things fresh-you will hit again "
+    "if the diagnosis is lost.\n\n"
+    "## Key findings & decisions\n"
+    "Facts established and decisions made this session that aren't "
+    "already in decisions/ or knowledge/. For each: **what**, **why**, "
+    "**who agreed**. These are the things that would be LOST if this "
+    "handoff fails.\n\n"
     "## Open questions\n"
     "Everything still undecided or pending clarification. Quote each "
     "question VERBATIM as asked (by the human or by you to them). "
     "Include enough surrounding context that fresh-you can answer "
     "without asking 'wait, which X?'.\n\n"
-    "## Key findings & decisions\n"
-    "Facts established, decisions made, and conclusions reached this "
-    "session that aren't already in memory/ or decisions/. For each: "
-    "what, why, and who agreed. These are the things that would be "
-    "LOST if this handoff fails.\n\n"
     "## References\n"
-    "URLs fetched, file paths, exact error messages, commit hashes, "
-    "command output snippets, code fragments.\n\n"
-    "**Graduated detail**: the ~5 most-recent / most-relevant items "
-    "get verbatim code blocks or quoted strings (paraphrase destroys "
-    "these). Older references get one line each — just enough that "
-    "fresh-you can locate them. Don't flatten everything to verbatim "
-    "— the goal is that recent work is replayable and old work is "
-    "findable.\n\n"
-    "**Inherited vs. changed**: when listing files, tag each as "
-    "**touched** (you modified it this session) or **read-only** "
-    "(you only read it — pre-existing state you inherited). This "
-    "lets fresh-you tell their own work apart from what was already "
-    "there.\n\n"
+    "Non-file artifacts: URLs fetched, exact error messages not "
+    "already in Errors & fixes, commit hashes, command output "
+    "snippets, external ticket / spec / PR links. One line each "
+    "unless verbatim is essential.\n\n"
     "## People & roles\n"
-    "Who participated, what each person (or agent) is responsible "
-    "for, any stated preferences or pet-peeves that came up, and "
-    "anyone fresh-you should reach out to first.\n\n"
+    "Who participated (operator + any agents you messaged), what each "
+    "is responsible for, stated preferences or pet-peeves that came "
+    "up, and anyone fresh-you should reach out to first.\n\n"
     "## Context quirks & gotchas\n"
-    "Anything peculiar about the current setup — tools that "
-    "misbehaved, assumptions we agreed to, user preferences mentioned "
-    "in passing, environmental weirdness. One paragraph each.\n\n"
-    "## What fresh-you should do first\n"
-    "Concrete first actions: 'read file X', 'check Y', 'resume by "
-    "asking Z'. Write this as if you are leaving voicemail for "
-    "tomorrow-morning-you.\n\n"
+    "Anything peculiar about the current setup that isn't a discrete "
+    "error — tools that misbehaved, assumptions you agreed to, user "
+    "preferences mentioned in passing, environmental weirdness, SDK "
+    "version sensitivities. One paragraph each.\n\n"
+    "## In-flight state at compact\n"
+    "What was happening in the VERY LAST turn before this compact:\n"
+    "- The literal text of your most recent assistant message before "
+    "this prompt (quote it verbatim — even if it was mid-sentence).\n"
+    "- The last tool call you made or were about to make.\n"
+    "- The exact next action you would have taken if not for the "
+    "compact.\n\n"
+    "Distinct from 'Primary request and intent' (that's the goal); "
+    "this is the immediate suspended state.\n\n"
+    "## Pending — concrete checklist\n"
+    "Structured todo list, in execution order. Format each item as:\n"
+    "`- [ ] Action — owner — blocking? / ready / follow-up`\n\n"
+    "Include items waiting on the operator, items waiting on other "
+    "agents, and items you can pick up immediately.\n\n"
     "Reply with ONLY the markdown — no preamble, no sign-off, no "
-    "'Here is the handoff:'."
+    "'Here is the handoff:'. Do NOT include a footer pointing at the "
+    "session JSONL or this handoff file — the harness appends that "
+    "automatically."
 )
 
 
@@ -2227,6 +2273,45 @@ async def _pretool_continue_hook(
     return {"continue_": True}
 
 
+async def _posttool_wiki_index_hook(
+    input_data: dict[str, Any],
+    tool_use_id: str | None,
+    context: Any,
+) -> dict[str, Any]:
+    """Rebuild /data/wiki/INDEX.md after an agent Write/Edit/MultiEdit/
+    NotebookEdit lands under the wiki tree. The harness's HTTP file-write
+    endpoint already triggers this; agent SDK tool calls bypass that
+    endpoint, so without this hook the auto-update the wiki skill
+    promises never fires for the most common writer (the agent itself)."""
+    try:
+        tool_input = input_data.get("tool_input") or {}
+        path_str = (
+            tool_input.get("file_path")
+            or tool_input.get("notebook_path")
+            or ""
+        )
+        if not path_str:
+            return {}
+        from server.paths import global_paths, update_wiki_index
+
+        gp = global_paths()
+        wiki_root = gp.wiki.resolve()
+        try:
+            target = Path(path_str).resolve()
+        except OSError:
+            return {}
+        try:
+            target.relative_to(wiki_root)
+        except ValueError:
+            return {}
+        if target == gp.wiki_index.resolve():
+            return {}
+        await asyncio.to_thread(update_wiki_index)
+    except Exception:
+        logger.exception("posttool wiki index rebuild failed (non-fatal)")
+    return {}
+
+
 def _normalize_question_payload(input_data: dict[str, Any]) -> list[dict[str, Any]]:
     """Take AskUserQuestion's input (may be dict[{"questions": [...]}]
     OR already just a list) and return a list of normalised question
@@ -2991,7 +3076,24 @@ async def run_agent(
         # returns continue_ (documented workaround — without it the
         # stream closes before the permission callback can fire).
         can_use_tool=can_use_tool_cb,
-        hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[_pretool_continue_hook])]},
+        hooks={
+            "PreToolUse": [HookMatcher(matcher=None, hooks=[_pretool_continue_hook])],
+            # Phase 7 (PROJECTS_SPEC.md §14 Resolved: INDEX.md maintenance):
+            # the HTTP file-write endpoint already rebuilds INDEX.md, but
+            # agent Write/Edit tool calls go straight to disk and bypass
+            # it. This hook closes that gap so the wiki-skill promise
+            # ("auto-maintained on every wiki write event") holds for the
+            # most common writer (the agent itself).
+            "PostToolUse": [
+                HookMatcher(
+                    # Anchored alternation so this hook only fires for the
+                    # built-in Anthropic file-write tools, not future MCP
+                    # tools that happen to contain "Write" in their name.
+                    matcher=r"^(Write|Edit|MultiEdit|NotebookEdit)$",
+                    hooks=[_posttool_wiki_index_hook],
+                )
+            ],
+        },
     )
     # Partial-message streaming (token-by-token text + thinking deltas)
     # is off by default: the option is understood by recent SDK

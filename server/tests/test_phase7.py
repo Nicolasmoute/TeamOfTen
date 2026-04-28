@@ -413,3 +413,78 @@ def test_audit_update_wiki_index_handles_empty_subfolder(fresh_db) -> None:
     update_wiki_index()
     body = gp.wiki_index.read_text(encoding="utf-8")
     assert "### empty-project" not in body
+
+
+# ---------- PostToolUse hook: agent Write rebuilds INDEX.md --------
+
+
+async def test_posttool_wiki_index_hook_rebuilds_on_agent_write(fresh_db) -> None:
+    """The wiki skill promises 'auto-maintained on every wiki write
+    event'. Agent Write tool calls go through the SDK directly to disk
+    and bypass the harness's HTTP write endpoint, so before this hook
+    existed those writes never triggered a rebuild. Simulate the SDK
+    posting a PostToolUse for a Write that landed under /data/wiki/
+    and confirm INDEX.md picks up the new entry."""
+    from server.agents import _posttool_wiki_index_hook
+
+    bootstrap_global_resources()
+    gp = global_paths()
+    (gp.wiki / "alpha").mkdir(exist_ok=True)
+    entry = gp.wiki / "alpha" / "new-page.md"
+    entry.write_text("# New page\n\nbody.\n", encoding="utf-8")
+
+    # Pre-condition: the old INDEX.md (whatever bootstrap wrote) does
+    # not yet list new-page.md.
+    pre = gp.wiki_index.read_text(encoding="utf-8")
+    assert "new-page.md" not in pre
+
+    await _posttool_wiki_index_hook(
+        {"tool_name": "Write", "tool_input": {"file_path": str(entry)}},
+        "tu_1",
+        None,
+    )
+    post = gp.wiki_index.read_text(encoding="utf-8")
+    assert "[New page](alpha/new-page.md)" in post
+
+
+async def test_posttool_wiki_index_hook_skips_non_wiki_paths(fresh_db) -> None:
+    """A Write to anywhere outside /data/wiki/ must NOT trigger a
+    rebuild — otherwise every code edit in a worktree would thrash
+    the index file."""
+    from server.agents import _posttool_wiki_index_hook
+
+    bootstrap_global_resources()
+    gp = global_paths()
+    update_wiki_index()
+    before = gp.wiki_index.stat().st_mtime_ns
+
+    await _posttool_wiki_index_hook(
+        {
+            "tool_name": "Write",
+            "tool_input": {"file_path": "/workspaces/p1/project/foo.py"},
+        },
+        "tu_1",
+        None,
+    )
+    after = gp.wiki_index.stat().st_mtime_ns
+    assert after == before
+
+
+async def test_posttool_wiki_index_hook_skips_index_itself(fresh_db) -> None:
+    """A Write whose target IS INDEX.md must not trigger a rebuild
+    (would loop). The hook resolves both paths so symlinks / relative
+    forms still match."""
+    from server.agents import _posttool_wiki_index_hook
+
+    bootstrap_global_resources()
+    gp = global_paths()
+    update_wiki_index()
+    before = gp.wiki_index.stat().st_mtime_ns
+
+    await _posttool_wiki_index_hook(
+        {"tool_name": "Write", "tool_input": {"file_path": str(gp.wiki_index)}},
+        "tu_1",
+        None,
+    )
+    after = gp.wiki_index.stat().st_mtime_ns
+    assert after == before

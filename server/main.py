@@ -2919,6 +2919,26 @@ async def files_write(
     return {"ok": True, **result}
 
 
+@app.post("/api/wiki/reindex", dependencies=[Depends(require_token)])
+async def wiki_reindex() -> dict[str, Any]:
+    """Manual rebuild of /data/wiki/INDEX.md.
+
+    The PostToolUse hook in [server/agents.py](server/agents.py) handles
+    the agent-Write case and the file-write endpoint above handles the
+    UI case, but external writers (kDrive sync from another machine,
+    snapshot restore, manual `cp` into the wiki tree) bypass both.
+    This endpoint is the catch-all 'fix it now' button for those, and
+    a useful diagnostic when verifying the auto-rebuild itself.
+    """
+    try:
+        from server.paths import update_wiki_index
+        ok = update_wiki_index()
+    except Exception:
+        logger.exception("wiki reindex failed")
+        raise HTTPException(500, detail="reindex failed")
+    return {"ok": bool(ok)}
+
+
 @app.get("/api/turns", dependencies=[Depends(require_token)])
 async def list_turns(
     agent: str | None = None,

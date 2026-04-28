@@ -222,7 +222,10 @@ def test_read_roundtrip(fresh_db) -> None:
     asyncio.get_event_loop().run_until_complete(init_db())
     pp = project_paths(MISC_PROJECT_ID)
     pp.working_workspace.mkdir(parents=True, exist_ok=True)
-    (pp.working_workspace / "note.md").write_text("hello\n", encoding="utf-8")
+    # write_bytes (not write_text) so Windows doesn't translate
+    # \n -> \r\n. read_text reads raw bytes back — the test asserts
+    # the harness preserves what was on disk.
+    (pp.working_workspace / "note.md").write_bytes(b"hello\n")
     r = filesmod.read_text("project", "working/workspace/note.md")
     assert r["content"] == "hello\n"
     assert r["root"] == "project"

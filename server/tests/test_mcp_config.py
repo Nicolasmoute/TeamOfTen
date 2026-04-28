@@ -8,6 +8,7 @@ qualified mcp__<server>__<tool> names for allowed_tools.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -20,7 +21,12 @@ import server.mcp_config as mcp_config
 def tmp_config(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> Path:
     """Point HARNESS_MCP_CONFIG at a tempfile, return the path so each
     test writes its own content. Cleaned up automatically via tempfile."""
-    path = Path(tempfile.mkstemp(prefix="harness-mcp-", suffix=".json")[1])
+    fd, raw_path = tempfile.mkstemp(prefix="harness-mcp-", suffix=".json")
+    # mkstemp returns an OS-level fd that we don't use. On Windows
+    # leaving it open would hold a lock on the file and break the
+    # unlink + later overwrite below.
+    os.close(fd)
+    path = Path(raw_path)
     monkeypatch.setenv("HARNESS_MCP_CONFIG", str(path))
     # Tests write their own content; delete leftover empty file first.
     path.unlink(missing_ok=True)
