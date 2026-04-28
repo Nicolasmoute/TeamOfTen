@@ -70,7 +70,7 @@ Don't create an entry for:
 - Ephemeral state ("we're currently doing X") — that's an inbox
   message or a task update.
 - Code itself — code lives in the repo, not the wiki.
-- Things already documented in CLAUDE.md or HARNESS_SPEC.md.
+- Things already documented in CLAUDE.md or Docs/TOT-specs.md.
 
 ## Format
 

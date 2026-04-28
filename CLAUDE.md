@@ -2,7 +2,9 @@
 
 A personal orchestration harness for a **team of 11 Claude Code agents — 1 Coach + 10 Players** — sharing memory and a task board, with a multi-pane web UI, deployed to a single VPS (Zeabur). Max-plan OAuth only — no API keys.
 
-**Full spec**: [Docs/HARNESS_SPEC.md](Docs/HARNESS_SPEC.md) — read it before touching server code.
+**Full spec**: [Docs/TOT-specs.md](Docs/TOT-specs.md) — read it before touching server code.
+
+**Keep the spec in sync.** When you make non-trivial code changes (new feature, behavior change, schema/migration, prompt rewrite, UI subsystem, env var, MCP tool, etc.), reflect them in `Docs/TOT-specs.md` in the same turn. Skip only for genuinely minor tweaks (typos, log-message wording, single-line bug fixes that don't change documented behavior). When in doubt, update the spec — drift is more expensive to repair later than a paragraph is to write now.
 
 ## Team vocabulary
 
@@ -710,7 +712,7 @@ handles it.
 TeamOfTen/
 ├── CLAUDE.md                    # this file
 ├── Docs/
-│   └── HARNESS_SPEC.md          # full spec — source of truth for design decisions
+│   └── TOT-specs.md             # full spec — source of truth for design decisions
 ├── spike/
 │   ├── zeabur/                  # M-1 spike Dockerfile + shell for Zeabur
 │   │   ├── Dockerfile

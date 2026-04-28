@@ -251,6 +251,39 @@ function flatSlots(openColumns) {
   return out;
 }
 
+// Canonical agent slot order: Coach first, then p1..p10. Anything else
+// (special slots like __files / __projects) sorts after agents in
+// insertion order. Used by the mobile layout to give the swipe deck a
+// stable ordering regardless of pane-open history.
+const CANONICAL_SLOT_ORDER = [
+  "coach", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "p10",
+];
+function canonicalSlotIndex(slot) {
+  const i = CANONICAL_SLOT_ORDER.indexOf(slot);
+  return i === -1 ? CANONICAL_SLOT_ORDER.length : i;
+}
+
+// Track whether the viewport is in phone-layout territory (matches the
+// `@media (max-width: 700px)` block in style.css). Returns a boolean
+// that re-renders the consumer when the breakpoint flips (rotation,
+// devtools resize, etc.).
+function useIsPhone() {
+  const query = "(max-width: 700px)";
+  const [isPhone, setIsPhone] = useState(() =>
+    typeof window !== "undefined" && window.matchMedia
+      ? window.matchMedia(query).matches
+      : false
+  );
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mq = window.matchMedia(query);
+    const handler = (e) => setIsPhone(e.matches);
+    mq.addEventListener("change", handler);
+    return () => mq.removeEventListener("change", handler);
+  }, []);
+  return isPhone;
+}
+
 // Serialize a pane's events to markdown. Used by per-pane export (↓)
 // and whole-team export. `events` may include __result pairings; if
 // not, tool_use/tool_result render separately.
@@ -1778,6 +1811,13 @@ function App() {
     setMaximizedSlot(null);
   }, []);
 
+  // Phone layout: single-pane swipe deck, so we ignore the user's
+  // 2D column structure and singletonize every open slot. Sorted by
+  // canonical agent order (Coach → p1..p10 → special slots) so the
+  // swipe sequence is predictable instead of reflecting pane-open
+  // history.
+  const isPhone = useIsPhone();
+
   // While maximized: collapse the layout to a single solo column so
   // Split.js stands down (no gutters needed) and the chosen pane gets
   // the full panes-area. If the maximized slot is no longer open
@@ -1786,8 +1826,18 @@ function App() {
     if (maximizedSlot && flatSlots(openColumns).includes(maximizedSlot)) {
       return [[maximizedSlot]];
     }
+    if (isPhone) {
+      const flat = flatSlots(openColumns);
+      const sorted = [...flat].sort((a, b) => {
+        const ai = canonicalSlotIndex(a);
+        const bi = canonicalSlotIndex(b);
+        if (ai !== bi) return ai - bi;
+        return flat.indexOf(a) - flat.indexOf(b);
+      });
+      return sorted.map((s) => [s]);
+    }
     return openColumns;
-  }, [openColumns, maximizedSlot]);
+  }, [openColumns, maximizedSlot, isPhone]);
   const isMaximized = effectiveColumns !== openColumns;
   // Split.js: horizontal split across columns, vertical split inside each
   // multi-pane column. Rebind whenever the layout structure changes.
