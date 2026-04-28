@@ -1535,10 +1535,16 @@ function App() {
         ev.type === "cost_capped" ||
         ev.type === "session_cleared" ||
         ev.type === "player_assigned" ||
+        ev.type === "runtime_updated" ||
         ev.type === "lock_updated" ||
         ev.type === "agent_cancelled"
       ) {
         refreshAgents();
+      }
+      if (ev.type === "team_runtimes_updated") {
+        try {
+          window.dispatchEvent(new CustomEvent("team-runtimes-updated", { detail: ev }));
+        } catch (_) {}
       }
       if (ev.type === "pause_toggled") {
         setPaused(Boolean(ev.paused));
@@ -7918,6 +7924,18 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
   const paneModelValidForRuntime = !paneSettings.model ||
     modelOptionsFor(effectiveRuntime).some((m) => m.value === paneSettings.model);
 
+  const loadRoleDefaultRuntime = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/team/runtimes");
+      if (!res.ok) return;
+      const data = await res.json();
+      const id = slot === "coach" ? data.coach : data.players;
+      setRoleDefaultRuntime(id || "");
+    } catch (_e) {
+      // Silent - if this fails, model validation simply waits.
+    }
+  }, [slot]);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -7933,6 +7951,20 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
       }
     })();
     return () => { cancelled = true; };
+  }, [slot]);
+
+  useEffect(() => {
+    if (settingsOpen) loadRoleDefaultRuntime();
+  }, [settingsOpen, loadRoleDefaultRuntime]);
+
+  useEffect(() => {
+    const onTeamRuntimesUpdated = (e) => {
+      const detail = e.detail || {};
+      const id = slot === "coach" ? detail.coach : detail.players;
+      setRoleDefaultRuntime(id || "");
+    };
+    window.addEventListener("team-runtimes-updated", onTeamRuntimesUpdated);
+    return () => window.removeEventListener("team-runtimes-updated", onTeamRuntimesUpdated);
   }, [slot]);
 
   useEffect(() => {
@@ -8548,6 +8580,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
       // CLI, which we don't currently intercept).
     }
     setSubmitting(true);
+    let startTimeout = null;
     try {
       // Compose prompt string: include image paths the agent can Read.
       // We reference each attachment via a workspace-local symlinked path
@@ -8571,10 +8604,13 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
       }
       if (paneSettings.planMode) reqBody.plan_mode = true;
       if (paneSettings.effort) reqBody.effort = paneSettings.effort;
+      const controller = new AbortController();
+      startTimeout = setTimeout(() => controller.abort(), 15_000);
       const res = await authFetch("/api/agents/start", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(reqBody),
+        signal: controller.signal,
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const nextHistory = pushPromptHistory(slot, text);
@@ -8584,7 +8620,9 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
       setAttachments([]);
     } catch (err) {
       console.error("submit failed", err);
+      setInfoText("start failed: " + (err && err.name === "AbortError" ? "request timed out" : String(err)));
     } finally {
+      if (startTimeout) clearTimeout(startTimeout);
       setSubmitting(false);
     }
   }, [

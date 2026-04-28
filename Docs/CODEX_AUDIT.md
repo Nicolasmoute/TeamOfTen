@@ -397,17 +397,27 @@ Second fix pass:
     Codex `agentMessage` and reasoning events emit both `content` and
     `text`, matching the UI renderer and fixing blank answer rows.
 
+35. **Implemented - live pane refresh after runtime/model setting changes** (§F.1, §F.3). completed and audited
+    Agent panes now refresh role-default runtime state when their
+    settings popover opens and when `team_runtimes_updated` arrives
+    over the WebSocket. This closes the reload-only stale-runtime case
+    where the settings drawer changed Coach/Players to Codex but an
+    already-mounted pane still validated against the old Claude
+    default. Prompt submit also has a short timeout around
+    `/api/agents/start` so a failed/hung start cannot leave the Run
+    button disabled until page reload.
+
 ## Status counts
 
 - **Open app-code gaps:** 0.
 - **Implemented and locally verified:** 1, 2, 3, 5, 6, 7, 8, 9, 10,
   11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-  27, 28, 31, 33, 34.
+  27, 28, 31, 33, 34, 35.
 - **Intentional errata/no dependency change:** 4 (`mcp>=1.0` not
   needed for the current hand-rolled coord proxy).
 - **Still live-only validation risks:** 29, 30, 32.
 
-Total: 34 numbered items. The remaining work is validation against a
+Total: 35 numbered items. The remaining work is validation against a
 live Codex app-server/Zeabur session, not missing local implementation.
 
 ## Recommended next steps

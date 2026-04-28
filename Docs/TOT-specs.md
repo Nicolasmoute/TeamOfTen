@@ -2590,6 +2590,13 @@ split by runtime so a role configured for Codex reads
 falls back to Claude's Opus/Sonnet defaults. The Codex menu includes the
 current flagship and coding ids (`gpt-5.5`, `gpt-5.4*`,
 `gpt-5.3-codex`, `gpt-5.2-codex`, and GPT-5.1 Codex variants).
+Panes refresh role-default runtime state when their settings popover
+opens and when `team_runtimes_updated` arrives over the WebSocket, so a
+settings-drawer runtime change takes effect without a browser reload.
+Submitting a prompt ignores a stale per-pane model override if that
+model is not valid for the pane's current effective runtime, and the UI
+times out a stuck `/api/agents/start` request instead of leaving the
+Run button disabled indefinitely.
 
 ### 19.6 Coord MCP proxy (loopback, used by Codex)
 
