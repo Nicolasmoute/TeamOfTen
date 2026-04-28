@@ -299,6 +299,17 @@ async def open_thread(
 # Mapping from Codex item_type → (harness event_type, harness tool name).
 # Tool name is None for non-tool events; the renderer keys off the
 # canonical Claude tool names so the existing UI cards keep working.
+#
+# Notably absent (deliberate): `tool_result` / `shell_output` /
+# `apply_patch_result` shapes. The probe didn't capture a tool-using
+# turn, so the actual item_type names for tool RESULTS are unknown.
+# Until a follow-up probe captures them, those steps fall through to
+# the unknown-type skip path — degraded UI (tool_use card without a
+# paired result) but no crash. Add entries here once names are known.
+#
+# `mcp_tool_call` is also absent for the same reason; coord_* calls
+# from a Codex turn would currently be skipped. This is a known
+# limitation gated on item #11 (native tool execution observation).
 _ITEM_TYPE_TO_HARNESS: dict[str, tuple[str, str | None]] = {
     "userMessage": ("_skip", None),
     "agentMessage": ("text", None),
@@ -310,16 +321,28 @@ _ITEM_TYPE_TO_HARNESS: dict[str, tuple[str, str | None]] = {
 
 
 def _step_item_payload(step: Any) -> dict[str, Any]:
-    """Pull the raw `params.item` dict out of a ConversationStep.data.
-    Falls back to an empty dict when the SDK changes shape so callers
-    can still safely .get() into it."""
+    """Pull the raw item dict out of a ConversationStep.data.
+
+    The live spike showed `data` carries the item under BOTH
+    `data['params']['item']` (the JSON-RPC param wrapper) and
+    `data['item']` (a convenience top-level copy). Prefer the wrapped
+    location so we read what the SDK protocol promised; fall back to
+    the bare key if a future SDK build drops the wrapper.
+
+    Returns an empty dict if neither shape is available so callers can
+    safely .get() into it without an AttributeError.
+    """
     data = getattr(step, "data", None) or {}
-    if isinstance(data, dict):
-        params = data.get("params") or {}
-        if isinstance(params, dict):
-            item = params.get("item")
-            if isinstance(item, dict):
-                return item
+    if not isinstance(data, dict):
+        return {}
+    params = data.get("params")
+    if isinstance(params, dict):
+        item = params.get("item")
+        if isinstance(item, dict):
+            return item
+    fallback = data.get("item")
+    if isinstance(fallback, dict):
+        return fallback
     return {}
 
 
@@ -353,17 +376,17 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
         return
 
     if event_type == "text":
+        # Set got_result FIRST so a tool-only turn that ends with an
+        # empty final_answer step still flips the dispatcher's flag.
+        # The Claude path's ResultMessage works the same way (presence
+        # of the marker matters, not whether content is non-empty).
+        phase = item_payload.get("phase")
+        if phase == "final_answer":
+            turn_ctx["got_result"] = True
         if not text:
             return
         accumulated = turn_ctx.get("accumulated_text", "") + text
         turn_ctx["accumulated_text"] = accumulated
-        # Final-answer steps mark the turn-end. The dispatcher uses
-        # got_result to drive the post-result exception suppression and
-        # to skip the auto-retry counter increment on success — same
-        # discipline as the Claude path.
-        phase = item_payload.get("phase")
-        if phase == "final_answer":
-            turn_ctx["got_result"] = True
         await _emit(agent_id, "text", text=text)
         return
 

@@ -126,7 +126,7 @@ section it traces back to and a status:
    start_thread when no stored id, resume_thread when stored id,
    stale-thread auto-heal, config passthrough, cancellation propagation.
 
-10. **Missing — Notification → harness-event mapping** (§E.3). completed
+10. **Missing — Notification → harness-event mapping** (§E.3). completed and audited
     Implemented `handle_step(step, agent_id, turn_ctx)` in
     [server/runtimes/codex.py](../server/runtimes/codex.py).
     Translates `ConversationStep` instances yielded by `thread.chat()`
@@ -147,11 +147,29 @@ section it traces back to and a status:
     - `web_search` → `tool_use(tool='WebSearch')`
     - `reasoning` → `thinking`
 
-    Unknown item types log + skip (forward-compat for newer SDKs that
-    add categories). 9 new tests pin: skip-userMessage, agentMessage
-    text emission, multi-step text accumulation, empty-text no-op,
-    shell/apply_patch/web_search/reasoning emission, unknown-type
-    skip. Total codex tests: 31.
+    Unknown item types log + skip (forward-compat for newer SDKs).
+
+    Audit pass caught two bugs:
+    - **`got_result` was skipped on empty-text `final_answer`**. A
+      tool-only turn (model only used tools, no text reply) ending with
+      an empty `agentMessage(phase='final_answer')` must still flip
+      `got_result` — same discipline as Claude's `ResultMessage` where
+      presence of the marker matters, not content. Reordered: set
+      `got_result` first, then early-return on empty text. New test
+      `test_handle_step_final_answer_flips_got_result_even_when_empty`.
+    - **`_step_item_payload` only looked at `data['params']['item']`**,
+      missing the bare `data['item']` convenience copy that the live
+      SDK also sets. Added a fallback so a future SDK build that drops
+      the params wrapper still works. New test
+      `test_step_item_payload_falls_back_to_bare_item_key`.
+
+    Documented in code: `tool_result` / `shell_output` /
+    `apply_patch_result` / `mcp_tool_call` shapes are deliberately
+    absent from the table — the spike didn't capture a tool-using
+    turn so item names are unknown. Those steps fall through to the
+    unknown-type skip (degraded UI, no crash). Item #11 fills this in.
+
+    Total: 11 tests, 33 codex tests, 295 suite-wide.
 
 11. **Missing — Native tool execution observation** (§E.4). blocked — Tier 2
     `shell` / `apply_patch` / `web_search` calls inside Codex would be

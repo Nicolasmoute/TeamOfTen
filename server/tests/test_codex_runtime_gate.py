@@ -815,3 +815,49 @@ async def test_handle_step_unknown_item_type_logs_and_skips(monkeypatch) -> None
     )
     await handle_step(step, "p1", {})
     assert captured == []  # skipped, no exception
+
+
+async def test_handle_step_final_answer_flips_got_result_even_when_empty(
+    monkeypatch,
+) -> None:
+    """A tool-only turn ending with empty-text final_answer must still
+    flip got_result so the dispatcher's post-result handling triggers.
+    Mirrors Claude's ResultMessage discipline: presence of the marker
+    matters, not whether content is non-empty."""
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    step = _FakeStep(
+        step_type="codex", item_type="agentMessage",
+        text=None,
+        item={"type": "agentMessage", "phase": "final_answer", "text": ""},
+    )
+    ctx: dict = {}
+    await handle_step(step, "p1", ctx)
+
+    assert ctx.get("got_result") is True
+    assert captured == []  # no text emit (nothing to say)
+
+
+async def test_step_item_payload_falls_back_to_bare_item_key(
+    monkeypatch,
+) -> None:
+    """If a future SDK build drops the params wrapper and only sets the
+    bare `data['item']` key, _step_item_payload still finds the item."""
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    class _StepNoParams:
+        thread_id = "t"
+        turn_id = "tu"
+        item_id = "i_42"
+        step_type = "codex"
+        item_type = "shell"
+        status = "completed"
+        text = None
+        # No 'params' wrapper — only the bare item key.
+        data = {"item": {"command": ["ls"]}}
+
+    await handle_step(_StepNoParams(), "p1", {})
+    assert captured[0]["tool"] == "Bash"
+    assert captured[0]["input"] == {"command": ["ls"]}
