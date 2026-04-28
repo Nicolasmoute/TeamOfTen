@@ -183,16 +183,16 @@ section it traces back to and a status:
 
 ## Section I — Deps & packaging
 
-24. **Risk — Codex Python SDK not actually installed** (§I.1). blocked — Tier 2 (live spike)
-    `pyproject.toml` does not depend on `codex-app-server-sdk`.
-    `CodexRuntime._import_codex_sdk` raises a friendly ImportError
-    when called; the import is the gate. Per spec the PR 1 spike was
-    supposed to confirm install path (vendor / git URL / hand-rolled
-    JSON-RPC). No path was selected and committed.
-    **Blocked on live spike**: cannot select a sourcing strategy
-    without running `codex app-server` against a live container and
-    confirming the install path works. This is the gating item for
-    the entire E.* family (8-11, 14-15) and 25-26 + 28-32.
+24. **Risk — Codex Python SDK not actually installed** (§I.1). spike completed 2026-04-28
+    Resolved on the live Zeabur spike: `codex-app-server-sdk` is on
+    PyPI (versions 0.1.0 through 0.3.2 at probe time). Pinned in
+    `pyproject.toml` as `codex-app-server-sdk>=0.3.2`. `pip install`
+    works in the container build, no vendoring needed. The provisional
+    spec §E.2 names were wrong: real class is `CodexClient` (not
+    `AsyncCodex`), connect via `CodexClient.connect_stdio(command=...)`,
+    threads via `client.start_thread(config) -> ThreadHandle`. Full
+    captured surface in [Docs/CODEX_PROBE_OUTPUT.md](CODEX_PROBE_OUTPUT.md).
+    Items 8-11, 14, 15, 25, 26 are now unblocked for implementation.
 
 ## Section J — Tests
 
@@ -216,13 +216,15 @@ section it traces back to and a status:
 
 ## Section L — Risks not validated
 
-28. **Risk — Headless `codex login` viability on Zeabur** (§L.1). blocked — live spike
-    Highest-priority spike per spec. Not run. If device-code flow
-    can't complete in non-TTY container shell, the entire ChatGPT-
-    auth path needs to be replaced with API-key-only mode.
-    **Cannot be validated locally.** Mitigation already in place: the
-    API-key fallback is fully wired (items 5, 6, 7) so a failed
-    ChatGPT path doesn't strand the runtime.
+28. **Risk — Headless `codex login` viability on Zeabur** (§L.1). spike completed 2026-04-28
+    Validated. The default `codex login` opens a localhost callback
+    server which doesn't work headlessly, but `codex login --device-auth`
+    prints a code + URL; user visits the URL on a separate device,
+    enters the code, and the CLI completes the OAuth flow. `auth.json`
+    persists to `$CODEX_HOME=/data/codex` and survives redeploys.
+    `/api/health` `codex_auth.method` correctly returns `"chatgpt"`
+    after a fresh device-auth run. The API-key fallback (items 5/6/7)
+    remains the documented alternative for fully unattended deploys.
 
 29. **Risk — SDK "one active turn consumer per client" limit** (§L.2). blocked — live spike
     Spec asked to validate with a 5-turn loop confirming no

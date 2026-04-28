@@ -1,15 +1,21 @@
 """CodexRuntime — OpenAI Codex via the codex-app-server-sdk (Python).
 
-PR 5 ships this gated behind `HARNESS_CODEX_ENABLED=true`. The actual
-SDK signatures (`AsyncCodex.start_thread`, `thread.run`, etc.) are
-provisional — the PR 1 spike was supposed to confirm them against a
-live `codex app-server`, but that requires a Zeabur-side install we
-haven't validated yet. Method calls below are wrapped so an
-ImportError or AttributeError surfaces as a clear `human_attention`
-event rather than crashing the dispatcher.
+PR 5 ships this gated behind `HARNESS_CODEX_ENABLED=true`. SDK shape
+confirmed against the live SDK on Zeabur 2026-04-28 — see
+`Docs/CODEX_PROBE_OUTPUT.md` for the captured method surface.
+
+Real entry point is `CodexClient.connect_stdio(command=["codex",
+"app-server"], ...)` followed by `start()` + `initialize()`. Threads
+go through `client.start_thread(config) -> ThreadHandle` (or
+`resume_thread(thread_id)`). The turn stream is
+`thread.chat(text) -> AsyncIterator[ConversationStep]`. Native
+compact via `thread.compact()`.
+
+The body in `run_turn` below is the next milestone — this file still
+emits `human_attention` until the dispatcher carve-out lands.
 
 See `Docs/CODEX_RUNTIME_SPEC.md` §E for the design + §I.1 for SDK
-sourcing options.
+sourcing.
 """
 
 from __future__ import annotations
@@ -87,21 +93,16 @@ def _import_codex_sdk() -> Any:
     """Lazy SDK import.
 
     Raises ImportError with a friendly message if the package isn't
-    installed (PR 1 spike covers vendoring/install). Calling this
-    once per turn (cached on the slot client) avoids paying for the
-    import on every coord call.
+    installed (pinned in pyproject.toml as `codex-app-server-sdk>=0.3.2`,
+    confirmed live 2026-04-28 — see Docs/CODEX_PROBE_OUTPUT.md).
     """
     try:
-        # Provisional package name per spec §I.1 — confirm during
-        # spike. May ultimately be `codex_app_server_sdk` or a
-        # vendored module path.
         import codex_app_server_sdk as _sdk  # type: ignore[import]
         return _sdk
     except ImportError as exc:
         raise ImportError(
-            "Codex SDK not installed. PR 1 spike must vendor or pip-install "
-            "the SDK from openai/codex (sdk/python). See "
-            "Docs/CODEX_RUNTIME_SPEC.md §I.1."
+            "Codex SDK not installed. Add `codex-app-server-sdk>=0.3.2` to "
+            "pyproject.toml dependencies. See Docs/CODEX_RUNTIME_SPEC.md §I.1."
         ) from exc
 
 

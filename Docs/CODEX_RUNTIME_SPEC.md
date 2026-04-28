@@ -346,49 +346,74 @@ New "Codex auth" section mirroring Telegram pattern: read-only ChatGPT-session b
 ## E. CodexRuntime implementation
 
 ### E.1 Lifecycle
-**One `AsyncCodex` instance per slot**, cached in module-level `_codex_clients: dict[str, AsyncCodex]`. The `_SPAWN_LOCK` already enforces sequential turns per slot, satisfying the SDK's "one active turn consumer per client" constraint. Closed and re-opened on auth-error.
+
+**One `CodexClient` instance per slot**, cached in module-level
+`_codex_clients: dict[str, CodexClient]`. Constructed via
+`CodexClient.connect_stdio(command=["codex", "app-server"], cwd=...,
+env=...)` which spawns the `codex app-server` subprocess. After
+construction call `await client.start()` then `await client.initialize()`.
+The `_SPAWN_LOCK` already enforces sequential turns per slot,
+satisfying the SDK's "one active turn consumer per client" constraint.
+Close (`await client.close()`) and re-open on auth-error / transport
+error.
 
 ### E.2 Thread start vs resume
 
-> **Provisional pseudocode.** Method names below (`start_thread`,
-> `resume_thread`, `thread.send`, `thread.compact`) are placeholders
-> — confirm and update against the actual `AsyncCodex` signature
-> printed during the PR 1 spike (§I.1).
+Real signatures (confirmed live, see Docs/CODEX_PROBE_OUTPUT.md):
+
+```python
+client.start_thread(config: ThreadConfig | None = None) -> ThreadHandle
+client.resume_thread(thread_id: str, *,
+                     overrides: ThreadConfig | None = None) -> ThreadHandle
+# ThreadHandle exposes:
+thread.thread_id          # str, accessible immediately after start
+thread.chat(text, ...)    # AsyncIterator[ConversationStep]
+thread.chat_once(text, ...) -> ChatResult   # non-streaming
+thread.compact()          # native compact (returns Any)
+```
 
 - On entry: read `agent_sessions.codex_thread_id` for `(slot, project_id)`.
-- If null → start a new Codex thread with the assembled `system_prompt`,
-  model, and MCP server config. Persist the returned thread id into
-  `codex_thread_id` on first `turn.completed`.
-- If set → resume the existing thread and send `prompt`. On failure,
-  mirror Claude's stale-session auto-heal: emit `session_resume_failed`,
-  null `codex_thread_id` for that `(slot, project_id)`, retry once
-  with a fresh thread.
+- If null → `client.start_thread(config)`. `thread.thread_id` is available
+  immediately; persist it on first successful `chat()` step.
+- If set → `client.resume_thread(thread_id, overrides=cfg)`. On failure
+  (CodexProtocolError, "thread not found", etc.), mirror Claude's
+  stale-session auto-heal: emit `session_resume_failed`, null
+  `codex_thread_id`, retry once with `start_thread`.
 
-### E.3 Notification → harness event mapping
+### E.3 ConversationStep → harness event mapping
 
-> **Provisional.** All Codex notification names below
-> (`thread.started`, `turn.started`, `item.added type=*`,
-> `turn.completed`, `turn.failed`, `compact.completed`) are
-> placeholders informed by the public docs but not verified against
-> a live app-server. The PR 1 spike must enumerate the actual
-> notification stream from a real turn (assistant text, tool call,
-> tool result, completion, failure) and reconcile this table before
-> CodexRuntime reads any notification name in code. Treat the column
-> on the left as TBD until the spike confirms exact names + payload
-> shapes.
+`thread.chat(text)` yields `ConversationStep` objects. Each step has:
+`thread_id`, `turn_id`, `item_id`, `step_type`, `item_type`, `status`,
+`text` (set for final agent answer; None otherwise), and a `data` dict
+holding the raw `params.item` payload.
 
-| Codex notification | Harness event | Notes |
-|---|---|---|
-| `thread.started` | (internal) | persist `codex_thread_id` |
-| `turn.started` | (none — already emitted) | |
-| `item.added type=assistant_message` | `text` | accumulate into `turn_ctx["accumulated_text"]` |
-| `item.added type=reasoning` | `thinking` | parallel to Claude path |
-| `item.added type=tool_call` | `tool_use` | `{tool: name, args: ...}` |
-| `item.added type=tool_call_output` | `tool_result` | pair via tool_call_id |
-| `item.added type=mcp_tool_call` | `tool_use` (`tool: mcp__<server>__<name>`) | UI renderer pairing works |
-| `turn.completed` | `result` | extract usage; sets `got_result=True` |
-| `turn.failed` | `error` (pre-result) or suppressed (post-result) | mirror got_result discipline |
-| `compact.completed` | `session_compacted` | (E.6) |
+Confirmed step types from the live spike (minimal turn):
+- `step_type='userMessage'` — echo of the prompt; skip (already in DB).
+- `step_type='codex', item_type='agentMessage', text=<answer>` — the
+  model's reply, with `data['params']['item']['phase']='final_answer'`.
+
+Inferred from item_type field (need a tool-using turn to confirm shapes):
+
+| `step_type` / `item_type`                          | Harness event              | Notes |
+|----------------------------------------------------|----------------------------|-------|
+| `userMessage` / `userMessage`                      | (skip)                     | already in DB |
+| `codex` / `agentMessage` (text set)                | `text`                     | accumulate; phase=='final_answer' marks turn done |
+| `codex` / `reasoning` (TBD)                        | `thinking`                 | parallel to Claude path |
+| `codex` / `shell`                                  | `tool_use` (`tool=Bash`)   | renderer reuses Bash card |
+| `codex` / `apply_patch`                            | `tool_use` (`tool=Edit`)   | feed unified diff into diff@7 |
+| `codex` / `web_search`                             | `tool_use` (`tool=WebSearch`) | reuse WebSearch card |
+| `codex` / `mcp_tool_call` (TBD shape)              | `tool_use` (`tool=mcp__...`) | coord_* + external MCPs |
+| stream exhaustion                                  | `result`                   | extract usage from final ChatResult or trailing step |
+| `CodexTurnInactiveError` raised mid-iteration      | `error` (pre-result) → retry counter |
+| `CodexTimeoutError` / `CodexTransportError`        | `error` (pre-result) → retry counter; close + reopen client |
+| `CodexProtocolError`                               | `error`; if "thread not found" trigger stale-session retry |
+| `ApprovalRequest` via `set_approval_handler`       | `human_attention` or coord_ask_user (§E.8) |
+| `thread.compact()` return                          | `session_compacted` (§E.6) |
+
+The mapping for tool-call steps and the exact `result`/usage shape
+(streaming vs `chat_once`'s `ChatResult`) need a follow-up probe with
+a tool-using prompt. Implementation can land in stages: text-only first,
+tool observation next.
 
 ### E.4 Tool execution
 Codex executes native tools (`shell`, `apply_patch`, `web_search`) inside the codex-app-server subprocess — we *observe* via notifications. `coord_*` MCP tools route through MCP exactly like Claude, with the same `--caller-id <agent_id>` discipline.
@@ -408,19 +433,23 @@ Split `_extract_usage` into `_extract_usage_claude` and `_extract_usage_codex`, 
 
 ### E.6 Compact
 
-> **Provisional.** The pseudocode below assumes `thread.compact()`
-> returns a summary string. Per the PR 1 spike, confirm the actual
-> return shape — it may be a structured object, may require a
-> separate read call to fetch the produced summary, or may not be
-> exposed at the SDK level at all (in which case fall back to a
-> manual COMPACT_PROMPT turn against Codex, mirroring the Claude
-> path). Update this section once the signature is known.
+Native compact is available on the SDK: `ThreadHandle.compact() -> Any`
+(also `client.compact_thread(thread_id) -> Any`). Return shape is
+SDK-internal `Any` — the implementation must treat it as opaque and
+extract a summary string defensively (try common shapes: dict with
+`summary` / `text` / `result` keys, or fall back to repr).
 
-Sketch (subject to spike):
+Sketch:
 
 ```python
 if tc.compact_mode:
-    summary = await thread.compact()         # signature TBD
+    raw = await thread.compact()
+    summary = (
+        raw.get("summary") if isinstance(raw, dict)
+        else getattr(raw, "summary", None)
+        or getattr(raw, "text", None)
+        or str(raw)
+    )
     await _set_continuity_note(slot, project_id, summary)
     await _clear_codex_thread_id(slot, project_id)
     await _emit(tc.agent_id, "session_compacted")
