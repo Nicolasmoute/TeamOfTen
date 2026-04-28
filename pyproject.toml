@@ -12,6 +12,7 @@ dependencies = [
     "webdav4>=0.9",
     "cryptography>=42",
     "httpx>=0.27",
+    "codex-app-server-sdk @ git+https://github.com/openai/codex@3afb185a4f02dab00927ad597996f3e5528cea45#subdirectory=sdk/python",
 ]
 
 [project.optional-dependencies]
@@ -24,8 +25,10 @@ dev = [
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = ["server"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["server*"]
+exclude = ["server.tests*"]
 
 [tool.setuptools.package-data]
 server = ["*.html", "static/*.html", "static/*.js", "static/*.css"]
