@@ -2211,6 +2211,10 @@ Body:
 - Auto-scrolls to bottom during streaming.
 - Renders structured tool cards through `server/static/tools.js`.
 - Renders markdown safely with DOMPurify.
+- Event timeline rendering is isolated behind a shallow event-array
+  guard: local UI state changes such as plan/model/settings must not
+  remap or rerender every historical `EventItem` when the event array
+  itself is unchanged.
 - Shows transient streaming text/thinking when token streaming is enabled.
 
 Input:

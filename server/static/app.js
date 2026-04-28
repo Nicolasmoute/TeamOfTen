@@ -5,7 +5,7 @@
 // silently breaks. All other deps are vendored under /static/vendor/
 // (see scripts/vendor_deps.py) so cold loads don't fan out 17 cross-
 // origin module requests.
-import { h, render } from "https://esm.sh/preact@10";
+import { h, render, Component } from "https://esm.sh/preact@10";
 import { useState, useEffect, useMemo, useRef, useCallback, useLayoutEffect } from "https://esm.sh/preact@10/hooks";
 import htm from "/static/vendor/htm.js";
 import Split from "/static/vendor/split.js";
@@ -8896,7 +8896,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
         ${searchQuery.trim() && visibleEvents.length === 0 && allEvents.length > 0
           ? html`<div class="pane-empty-hint">No events match "${searchQuery}".</div>`
           : null}
-        ${visibleEvents.map((ev, i) => html`<${EventItem} key=${(ev.__id ?? "live-" + i)} event=${ev} />`)}
+        <${EventList} events=${visibleEvents} />
         ${streaming && streaming.thinking
           ? html`<div class="event thinking streaming">
               <div class="event-meta">💭 thinking…</div>
@@ -9109,6 +9109,18 @@ const _HIDDEN_EVENT_TYPES = new Set([
   "agent_stopped",
   "lock_updated",
 ]);
+
+class EventList extends Component {
+  shouldComponentUpdate(nextProps) {
+    return nextProps.events !== this.props.events;
+  }
+
+  render({ events }) {
+    return events.map((ev, i) =>
+      html`<${EventItem} key=${ev.__id ?? "live-" + i} event=${ev} />`
+    );
+  }
+}
 
 function EventItem({ event }) {
   const type = event.type;
