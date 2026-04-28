@@ -216,8 +216,32 @@ function filesRenderCode(text, path) {
 // of history), so the cache can't leak. Content-string check guards
 // against the rare case where an event mutates in place.
 const _markdownCache = new WeakMap();
+// Coerce arbitrarily-shaped event.content to a string. Claude thinking
+// blocks land here as `[{type:'thinking', thinking:'…'}]`; some Codex
+// reasoning items have similar nested shapes. A non-string slipping
+// through to a downstream `.split` / `marked.parse` would throw and
+// break the entire pane render — taking out click handlers in the
+// process. Keep this defensive even when callers think content is a
+// string.
+function _coerceContentToString(content) {
+  if (typeof content === "string") return content;
+  if (content == null) return "";
+  if (Array.isArray(content)) {
+    return content
+      .map((c) =>
+        typeof c === "string"
+          ? c
+          : (c && (c.thinking || c.text)) || ""
+      )
+      .filter(Boolean)
+      .join("\n");
+  }
+  return String(content);
+}
+
 function renderMarkdownFor(event) {
-  const content = event && event.content ? event.content : "";
+  const raw = event && event.content ? event.content : "";
+  const content = _coerceContentToString(raw);
   if (!content) return "";
   if (event && typeof event === "object") {
     const cached = _markdownCache.get(event);
@@ -452,6 +476,7 @@ function saveSplitSizes(map) {
 
 const PROMPT_HISTORY_KEY = "harness_prompt_history_v1";
 const PROMPT_HISTORY_MAX_PER_SLOT = 40;
+const EMPTY_EVENTS = [];
 
 function loadPromptHistory(slot) {
   try {
@@ -1141,8 +1166,7 @@ function App() {
   // closed panes default to green until the user opens the pane (which
   // triggers AgentPane's per-slot history loader). 11 small parallel
   // fetches; deduped by __id when merged with any live events that
-  // landed during the round-trip. Re-runs on every WS reconnect via
-  // `wsAttempt` so a long disconnect's gap fills in too.
+  // landed during the round-trip.
   const seedConversationsFromHistory = useCallback(async () => {
     const slots = ["coach", ...Array.from({ length: 10 }, (_, i) => "p" + (i + 1))];
     const SEED_LIMIT = 50;
@@ -1425,7 +1449,10 @@ function App() {
     };
     ws.onclose = () => {
       setWsConnected(false);
-      reopenTimer = setTimeout(() => setWsAttempt((a) => a + 1), 2000);
+      reopenTimer = setTimeout(
+        () => setWsAttempt((a) => a + 1),
+        Math.min(30_000, 2000 * Math.max(1, wsAttempt + 1))
+      );
     };
     ws.onerror = () => {
       // Let onclose handle the retry; just close so onclose fires.
@@ -2436,10 +2463,6 @@ function App() {
                           clearPendingFileOpen=${clearPendingFileOpen}
                         />`;
                       }
-                      // wsAttempt bumps on every WS reconnect.
-                      // AgentPane re-reads history when it changes so a
-                      // long disconnect (> 60s watchdog) doesn't leave
-                      // events missed during the gap invisible forever.
                       const agent = agents.find((a) => a.id === slot);
                       const currentTask = agent?.current_task_id
                         ? tasks.find((t) => t.id === agent.current_task_id)
@@ -2449,9 +2472,8 @@ function App() {
                         slot=${slot}
                         agent=${agent}
                         currentTask=${currentTask}
-                        liveEvents=${conversations.get(slot) || []}
+                        liveEvents=${conversations.get(slot) || EMPTY_EVENTS}
                         streaming=${streamingText.get(slot)}
-                        wsAttempt=${wsAttempt}
                         projectEpoch=${projectEpoch}
                         openSlots=${openSlots}
                         onClose=${() => closePane(slot)}
@@ -7887,7 +7909,7 @@ function ContextBar({ slot, liveEvents, model }) {
 // agent pane
 // ------------------------------------------------------------------
 
-function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt, projectEpoch, onClose, onDropEdge, onPopOut, stacked, isMaximized, onToggleMaximize }) {
+function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpoch, onClose, onDropEdge, onPopOut, stacked, isMaximized, onToggleMaximize }) {
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState([]); // {id, url, path, filename}
   const [submitting, setSubmitting] = useState(false);
@@ -8074,13 +8096,9 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
     return () => {
       cancelled = true;
     };
-    // Re-read history whenever wsAttempt changes (every WS reconnect).
-    // Long disconnects > 60s watchdog trigger this path, so events that
-    // landed during the gap show up in the pane via the DB re-fetch
-    // instead of being silently missed.
     // projectEpoch bumps on every successful project switch so the
     // pane re-fetches /api/events against the new active project.
-  }, [slot, wsAttempt, projectEpoch]);
+  }, [slot, projectEpoch]);
 
   // Walk further back into history. Anchored at the smallest id we
   // currently hold; the API's `before_id` returns events strictly
@@ -9079,7 +9097,10 @@ function TurnHeader({ event, ts }) {
 
 function ThinkingItem({ event, ts }) {
   const [open, setOpen] = useState(false);
-  const content = event.content || "";
+  // Defensive: event.content is sometimes a non-string (Claude thinking
+  // blocks arrive as arrays of objects). _coerceContentToString handles
+  // every shape we've seen.
+  const content = _coerceContentToString(event.content);
   const lines = content.split(/\n/).length;
   return html`<div class=${"event thinking" + (open ? " open" : "")}>
     <div

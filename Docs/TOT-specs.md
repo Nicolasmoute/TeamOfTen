@@ -2215,6 +2215,9 @@ Body:
   guard: local UI state changes such as plan/model/settings must not
   remap or rerender every historical `EventItem` when the event array
   itself is unchanged.
+- Pane history reloads on pane/project changes, not on every WebSocket
+  reconnect attempt. WebSocket reconnects use backoff so a broken or
+  flapping socket cannot continuously rebuild long pane histories.
 - Shows transient streaming text/thinking when token streaming is enabled.
 
 Input:
