@@ -95,100 +95,93 @@ async def main() -> int:
             for n in sorted(d for d in dir(TurnOverrides) if not d.startswith("_")):
                 print(f"  {n}")
 
-    _hr("instantiate CodexClient")
+    _hr("connect_stdio")
+    # CodexClient() needs a transport; use the connect_stdio
+    # classmethod which spawns `codex app-server` as a subprocess.
     try:
-        client = CodexClient()
+        connect = CodexClient.connect_stdio
+        sig = inspect.signature(connect)
+        print(f"signature: {sig}")
     except Exception:
-        print("FAIL: CodexClient() constructor")
+        traceback.print_exc()
+    try:
+        client = CodexClient.connect_stdio()
+        if inspect.isawaitable(client):
+            client = await client
+        print(f"client constructed: {type(client).__name__}")
+    except Exception:
+        print("FAIL: connect_stdio:")
         traceback.print_exc()
         return 1
-    print("client:", client)
-    print("instance attrs:", [a for a in dir(client) if not a.startswith("_")])
 
-    _hr("start_thread / thread_start (try both)")
-    thread = None
-    for method_name in ("start_thread", "thread_start", "create_thread", "new_thread"):
-        m = getattr(client, method_name, None)
-        if m is None:
-            continue
+    # Some SDKs require explicit start; try if it exists.
+    if hasattr(client, "start"):
         try:
-            sig = inspect.signature(m)
-        except (ValueError, TypeError):
-            sig = "(...)"
-        print(f"trying client.{method_name}{sig}")
-        try:
-            result = m()
-            if inspect.isawaitable(result):
-                result = await result
-            thread = result
-            print(f"  OK -> {type(thread).__name__}")
-            break
+            r = client.start()
+            if inspect.isawaitable(r):
+                r = await r
+            print(f"client.start() -> {type(r).__name__}")
         except Exception:
-            print(f"  FAIL on client.{method_name}:")
+            print("client.start() raised:")
             traceback.print_exc()
-    if thread is None:
-        print("FAIL: could not start a thread via any expected method name")
+
+    if hasattr(client, "initialize"):
+        try:
+            r = client.initialize()
+            if inspect.isawaitable(r):
+                r = await r
+            print(f"client.initialize() -> {type(r).__name__}: {repr(r)[:400]}")
+        except Exception:
+            print("client.initialize() raised:")
+            traceback.print_exc()
+
+    _hr("start_thread")
+    try:
+        r = client.start_thread()
+        if inspect.isawaitable(r):
+            r = await r
+        thread = r
+        print(f"  OK -> {type(thread).__name__}: {repr(thread)[:300]}")
+    except Exception:
+        print("FAIL start_thread:")
+        traceback.print_exc()
         return 1
 
-    _hr("thread methods")
-    for name in sorted(n for n in dir(thread) if not n.startswith("_")):
-        obj = getattr(thread, name)
-        if not callable(obj):
-            continue
-        try:
-            sig = inspect.signature(obj)
-        except (ValueError, TypeError):
-            sig = "(...)"
-        print(f"  {name}{sig}")
     print("thread instance attrs (non-callable):")
     for name in sorted(n for n in dir(thread) if not n.startswith("_")):
         obj = getattr(thread, name)
         if not callable(obj):
             print(f"  {name} = {obj!r}")
 
-    _hr("run a tiny turn — 'reply hi'")
-    run_method = None
-    for cand in ("run", "send", "stream", "start_turn"):
-        if hasattr(thread, cand):
-            run_method = cand
-            break
-    if run_method is None:
-        print("FAIL: thread has no recognizable run method")
-        return 1
-    print(f"using thread.{run_method}(...)")
+    _hr("run a tiny turn via thread.chat — 'reply hi'")
     try:
-        stream = getattr(thread, run_method)("reply with the single word: hi")
+        stream = thread.chat("reply with the single word: hi")
         if inspect.isawaitable(stream):
             stream = await stream
-        # Try async-iterating; if that fails, try buffering attrs.
         notifications = []
         try:
             async for note in stream:
                 notifications.append(note)
-                print(f"NOTE  {type(note).__name__}  {repr(note)[:400]}")
-                if len(notifications) > 60:
-                    print("(stopping after 60 notifications)")
+                print(f"NOTE  {type(note).__name__}  {repr(note)[:600]}")
+                if len(notifications) > 80:
+                    print("(stopping after 80 notifications)")
                     break
         except TypeError:
-            print("stream is not async-iterable; printing repr:")
+            print("stream not async-iterable; repr:")
             print(repr(stream)[:600])
-            return 1
     except Exception:
-        print("FAIL: running turn:")
+        print("FAIL chat:")
         traceback.print_exc()
-        return 1
 
-    _hr("compact / resume probing")
-    for cand in ("compact", "resume", "close", "delete"):
-        if hasattr(thread, cand):
-            obj = getattr(thread, cand)
-            try:
-                sig = inspect.signature(obj)
-            except (ValueError, TypeError):
-                sig = "(...)"
-            print(f"thread.{cand}{sig} EXISTS")
-        else:
-            print(f"thread.{cand}  -- not present")
+    _hr("close")
+    if hasattr(client, "close"):
+        try:
+            r = client.close()
+            if inspect.isawaitable(r):
+                r = await r
+            print("closed")
+        except Exception:
+            traceback.print_exc()
 
     _hr("done")
     return 0
