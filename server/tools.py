@@ -75,12 +75,17 @@ async def _is_locked(agent_id: str) -> bool:
     return bool(dict(row).get("locked"))
 
 
-def build_coord_server(caller_id: str) -> Any:
+def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) -> Any:
     """Build an in-process MCP server whose tools know which agent is calling.
 
     Each SDK query gets its own server so hierarchy enforcement (Coach can
     give orders, Players cannot) operates without the LLM needing to pass
     its own identity as a param.
+
+    By default the returned server is safe to hand to ClaudeAgentOptions.
+    The coord loopback proxy can opt into `_handlers` / `_tool_names`
+    metadata, which contains Python callables and must never be passed to
+    the Claude SDK because its options path JSON-serializes MCP config.
     """
 
     caller_is_coach = caller_id == "coach"
@@ -1709,10 +1714,11 @@ def build_coord_server(caller_id: str) -> Any:
     server = create_sdk_mcp_server(name="coord", version="0.8.0", tools=_tools)
     # Stash a name → handler map so the coord_mcp proxy endpoint
     # (server.coord_mcp + POST /api/_coord/{tool}) can dispatch by
-    # name without re-importing SDK internals. In-process Claude
-    # ignores this key. See Docs/CODEX_RUNTIME_SPEC.md §C.4.
-    server["_handlers"] = {t.name: t.handler for t in _tools}
-    server["_tool_names"] = [t.name for t in _tools]
+    # name without re-importing SDK internals. This metadata is not
+    # present by default because Claude serializes MCP config to JSON.
+    if include_proxy_metadata:
+        server["_handlers"] = {t.name: t.handler for t in _tools}
+        server["_tool_names"] = [t.name for t in _tools]
     return server
 
 
@@ -1722,7 +1728,7 @@ def coord_tool_names() -> list[str]:
     asserts the proxy enumeration matches the live registry.
     Builds a coord server for an arbitrary caller and pulls its names.
     """
-    server = build_coord_server("coach")
+    server = build_coord_server("coach", include_proxy_metadata=True)
     return list(server["_tool_names"])
 
 

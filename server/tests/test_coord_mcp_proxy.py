@@ -15,6 +15,8 @@ the dispatcher's behavior in `coord_proxy_call`. The subprocess in
 
 from __future__ import annotations
 
+import types
+
 import server.spawn_tokens as st
 from server.tools import build_coord_server, coord_tool_names
 
@@ -25,12 +27,35 @@ def test_coord_tool_names_matches_in_process_registry() -> None:
     would call a tool name that 404s on the dispatch endpoint.
     """
     names = coord_tool_names()
-    server = build_coord_server("p1")
-    assert "_handlers" in server, "build_coord_server must stash _handlers for the proxy"
+    server = build_coord_server("p1", include_proxy_metadata=True)
+    assert "_handlers" in server, "proxy mode must stash _handlers"
     handler_names = set(server["_handlers"].keys())
     assert set(names) == handler_names, (
         f"proxy catalog drift: catalog={set(names)} handlers={handler_names}"
     )
+
+
+def test_coord_server_default_has_no_non_json_proxy_metadata() -> None:
+    """Claude receives the default coord server; it must not include
+    function-valued proxy metadata because Claude serializes MCP config
+    before spawning the CLI."""
+    server = build_coord_server("coach")
+    assert "_handlers" not in server
+    assert "_tool_names" not in server
+    assert not _contains_function(server)
+
+
+def _contains_function(value: object) -> bool:
+    if isinstance(value, types.FunctionType):
+        return True
+    if isinstance(value, dict):
+        return any(
+            _contains_function(k) or _contains_function(v)
+            for k, v in value.items()
+        )
+    if isinstance(value, (list, tuple, set)):
+        return any(_contains_function(item) for item in value)
+    return False
 
 
 def test_coord_handlers_include_required_set() -> None:

@@ -379,6 +379,9 @@ thread.compact()          # native compact (returns Any)
   (CodexProtocolError, "thread not found", etc.), mirror Claude's
   stale-session auto-heal: emit `session_resume_failed`, null
   `codex_thread_id`, retry once with `start_thread`.
+- Codex prepares this start/resume before `agent_started` is emitted so
+  `agent_started.resumed_session` reflects the actual successful path,
+  not just the presence of a stored `codex_thread_id`.
 
 ### E.3 ConversationStep → harness event mapping
 

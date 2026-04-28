@@ -2508,7 +2508,7 @@ async def coord_proxy_call(
     #    event bus exactly like a Claude turn.
     from server.tools import build_coord_server
 
-    server = build_coord_server(bound_caller)
+    server = build_coord_server(bound_caller, include_proxy_metadata=True)
     handlers: dict = server.get("_handlers", {})
     handler = handlers.get(tool_name)
     if handler is None:

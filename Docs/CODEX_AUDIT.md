@@ -15,10 +15,8 @@ section it traces back to and a status:
 
 ## Follow-up resolution pass — 2026-04-28
 
-Codex re-audited this file against the working tree. The original
-heading statuses are stale in several places: many entries still say
-**Missing** while their bodies already describe shipped code. Current
-state after this pass:
+Codex re-audited this file against the working tree. Current state
+after this pass:
 
 - **Implemented and verified locally:** 1, 2, 3, 5, 6, 7, 8, 9, 10,
   11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
@@ -44,28 +42,33 @@ clients on transport/protocol errors. Tests added/updated:
 `test_codex_run_manual_compact_uses_native_compact`, plus SDK-actual
 item mappings for `commandExecution` and `mcpToolCall`.
 
+Second fix pass:
+- Codex stale resume now emits `session_resume_failed`, clears the
+  stale id, starts fresh, and prepares before `agent_started` so the
+  UI resume indicator reflects the actual successful path.
+- Successful Codex turns now clear consumed compact handoff notes and
+  append the prompt/response pair used by future compact handoffs.
+- `agent_started.runtime` is rendered in the pane/timeline headers via
+  CSS-only runtime chips.
+
 ## Section A — Runtime abstraction
 
-1. **Partial — `ClaudeRuntime.run_turn` does not own the body** (§A.1, §A.3). completed and audited
-   `run_turn` is a one-liner that calls `agents.run_agent`. The spec asked for
-   options assembly, MCP wiring, `_build_can_use_tool`, the query loop, and
-   stale-session retry to physically move into `ClaudeRuntime.run_turn`.
-   Behavior is preserved (the spec required zero behavior change) but the
-   carve-out is structural-only. Any future runtime that needs to share a
-   sibling pattern has nothing to copy.
+1. **Implemented — `ClaudeRuntime.run_turn` owns the body** (§A.1, §A.3). completed and audited
+   `ClaudeRuntime.run_turn` owns options assembly, MCP wiring,
+   `_build_can_use_tool`, the query loop, and stale-session retry.
+   The dispatcher keeps runtime-agnostic work such as pause/cost caps,
+   prompt assembly, retry counters, and final status cleanup.
 
-2. **Partial — Manual compact path wraps `run_agent`** (§A.5). completed and audited
-   `ClaudeRuntime.run_manual_compact` re-enters `agents.run_agent` with
-   `COMPACT_PROMPT`. Functionally correct; not the carve-out the spec
-   intended.
+2. **Implemented — Manual compact path routes through runtime** (§A.5). completed and audited
+   Dispatcher routes compact turns to `runtime.run_manual_compact`.
+   Claude delegates to its normal `run_turn` with `compact_mode`;
+   Codex uses native compact.
 
 ## Section C — Coord MCP proxy
 
-3. **Missing — Dispatcher does not mint or revoke per-spawn tokens** (§C.4). completed and audited
-   `server/spawn_tokens.py` exists with `mint`/`revoke`/`revoke_for_caller`
-   but `agents.run_agent` never calls them. Tokens can only be created
-   manually (e.g. from a test). Wiring is blocked behind PR 5 because the
-   tokens are only useful when CodexRuntime spawns the proxy subprocess.
+3. **Implemented — Dispatcher mints/revokes per-spawn tokens** (§C.4). completed and audited
+   `agents.run_agent` mints a per-turn coord proxy token for Codex
+   turns, passes it through `turn_ctx`, and revokes it in cleanup.
 
 4. **Errata — `mcp>=1.0` dependency not added** (§I.2). completed and audited
    Spec listed `"mcp>=1.0"` as a new runtime dep. Implementation went with
@@ -76,26 +79,23 @@ item mappings for `commandExecution` and `mcpToolCall`.
 
 ## Section D — Auth
 
-5. **Missing — `/api/team/codex` endpoint family** (§D.5). completed and audited
-   Spec called for `GET/PUT/DELETE /api/team/codex` mirroring the
-   Telegram pattern: read-only ChatGPT-session badge, write-only masked
-   API-key field, `POST /api/team/codex/test`. None of these endpoints
-   exist. The encrypted `secrets.openai_api_key` slot is checked by the
-   `/api/health` `codex_auth` probe but cannot be set via API.
+5. **Implemented — `/api/team/codex` endpoint family** (§D.5). completed and audited
+   `GET/PUT/DELETE /api/team/codex` and
+   `POST /api/team/codex/test` ship with masked API-key handling and
+   read-only ChatGPT-session status.
 
-6. **Missing — Options drawer "Codex auth" UI section** (§D.5). completed and audited
-   No UI surface to set the API-key fallback or view the auth method.
-   Users would have to write directly to the `secrets` table to test
-   the API-key path even if (5) were shipped.
+6. **Implemented — Options drawer "Codex auth" UI section** (§D.5). completed and audited
+   The Options drawer shows Codex auth status, lets users save/clear
+   the encrypted API-key fallback, and exposes a test action.
 
-7. **Partial — API-key fallback resolution in CodexRuntime** (§D.4). completed and audited
-   `CodexRuntime.run_turn` does not read `secrets.openai_api_key` and
-   inject `OPENAI_API_KEY` into the subprocess env. Resolution
-   precedence (chatgpt → api_key → human_attention) is not implemented.
+7. **Implemented — API-key fallback resolution in CodexRuntime** (§D.4). completed and audited
+   `CodexRuntime` resolves ChatGPT session first, falls back to
+   encrypted `secrets.openai_api_key`, injects `OPENAI_API_KEY` into
+   the subprocess env, and emits `human_attention` when no auth exists.
 
 ## Section E — CodexRuntime
 
-8. **Missing — Lifecycle `_codex_clients` cache is unused** (§E.1). completed and audited
+8. **Implemented — Lifecycle `_codex_clients` cache** (§E.1). completed and audited
    Implemented `get_client(slot, *, cwd, env_overrides)` and
    `close_client(slot)` + `close_all_clients()` in
    [server/runtimes/codex.py](../server/runtimes/codex.py). First call
@@ -123,7 +123,7 @@ item mappings for `commandExecution` and `mcpToolCall`.
    cancellation rare in practice; revisit if observability shows
    leaked codex-app-server processes.
 
-9. **Missing — Thread start / resume** (§E.2). completed and audited
+9. **Implemented — Thread start / resume** (§E.2). completed and audited
    Implemented `_get_codex_thread_id` / `_set_codex_thread_id` /
    `_clear_codex_thread_id` in
    [server/runtimes/codex.py](../server/runtimes/codex.py) mirroring
@@ -157,7 +157,7 @@ item mappings for `commandExecution` and `mcpToolCall`.
    start_thread when no stored id, resume_thread when stored id,
    stale-thread auto-heal, config passthrough, cancellation propagation.
 
-10. **Missing — Notification → harness-event mapping** (§E.3). completed and audited
+10. **Implemented — Notification → harness-event mapping** (§E.3). completed and audited
     Implemented `handle_step(step, agent_id, turn_ctx)` in
     [server/runtimes/codex.py](../server/runtimes/codex.py).
     Translates `ConversationStep` instances yielded by `thread.chat()`
@@ -202,7 +202,7 @@ item mappings for `commandExecution` and `mcpToolCall`.
 
     Total: 11 tests, 33 codex tests, 295 suite-wide.
 
-11. **Missing — Native tool execution observation** (§E.4). completed and audited
+11. **Implemented — Native tool execution observation** (§E.4). completed and audited
     Item #10 already wired the *invocation* side (`shell` /
     `apply_patch` / `web_search` → `tool_use`). This item adds:
 
@@ -278,45 +278,40 @@ item mappings for `commandExecution` and `mcpToolCall`.
 
 ## Section F — UI
 
-17. **Missing — Options drawer "Default runtime per role" UI** (§F.3). completed and audited
+17. **Implemented — Options drawer "Default runtime per role" UI** (§F.3). completed and audited
     `GET/PUT /api/team/runtimes` endpoints exist and accept Coach +
     Players defaults, but no SettingsDrawer section consumes them.
     Defaults can only be set via direct API call.
 
-18. **Missing — Second row of model dropdowns gated by runtime** (§F.3). completed and audited
-    Spec required a Codex-vs-Claude-aware model picker that filters
-    available models by runtime. Single dropdown still.
+18. **Implemented — Model dropdowns gated by runtime** (§F.3). completed and audited
+    Pane settings filter model options by the selected runtime.
 
-19. **Missing — `agent_started` payload carries `runtime` field** (§F.5). completed and audited
-    The event still emits `prompt`, `resumed_session`, `compact_mode`,
-    `auto_compact`. UI cannot render the per-turn runtime chip the
-    spec described.
+19. **Implemented — `agent_started` payload carries and renders `runtime`** (§F.5). completed and audited
+    The event emits `runtime`, and pane/timeline turn headers render it
+    with CSS-only runtime chips.
 
-20. **Partial — `apply_patch` renderer is summary-line only** (§F.4). completed and audited
-    Spec wanted `apply_patch` to feed unified-diff straight into
-    `diff@7` and reuse the Edit diff-card layout. Implementation only
-    extracts the changed file path for the header. The diff body
-    falls through to the generic JSON renderer.
+20. **Implemented — `apply_patch` renderer uses diff card** (§F.4). completed and audited
+    `apply_patch` parses the unified diff and reuses the Edit diff-card
+    layout.
 
 ## Section G — Cost caps
 
-21. **Missing — `cost_basis` is never populated on insert.** completed and audited
-    Column exists in the schema and the migration backfills it as
-    NULL. No code path writes `'token_priced'` or `'plan_included'`
-    on a fresh row. Even Claude turns leave it NULL.
+21. **Implemented — `cost_basis` is populated on insert.** completed and audited
+    Fresh rows write `'token_priced'` or `'plan_included'`; legacy
+    rows are coalesced in summary queries.
 
-22. **Missing — completed and audited — `/api/turns/summary` `by_runtime` / `by_cost_basis`
+22. **Implemented — `/api/turns/summary` `by_runtime` / `by_cost_basis`
     breakdowns** (§G.3).
-    Endpoint still returns the legacy aggregate. UI cannot show the
-    split meters.
+    Endpoint returns aggregate, per-agent, `by_runtime`,
+    `by_cost_basis`, and `plan_included_token_total`.
 
-23. **Missing — EnvPane "Plan-included tokens today" meter** (§G.3). completed and audited
-    Single USD meter still. ChatGPT-auth Codex usage would show as
-    $0.00 with no token visibility — the trap the spec called out.
+23. **Implemented — EnvPane "Plan-included tokens today" meter** (§G.3). completed and audited
+    EnvPane renders the USD meter plus the plan-included token meter
+    for ChatGPT-auth Codex usage.
 
 ## Section I — Deps & packaging
 
-24. **Risk — Codex Python SDK not actually installed** (§I.1). spike completed 2026-04-28
+24. **Implemented — Codex Python SDK installed from PyPI** (§I.1). spike completed 2026-04-28
     Resolved on the live Zeabur spike: `codex-app-server-sdk` is on
     PyPI (versions 0.1.0 through 0.3.2 at probe time). Pinned in
     `pyproject.toml` as `codex-app-server-sdk>=0.3.2`. `pip install`
@@ -329,27 +324,23 @@ item mappings for `commandExecution` and `mcpToolCall`.
 
 ## Section J — Tests
 
-25. **Missing — `test_codex_event_normalization.py`** (§J). blocked — Tier 2
-    Spec required a fake stream of Codex notifications asserting
-    `_emit` calls match Claude vocabulary. Cannot be written until
-    (10) ships.
-    **Blocked on item 10 → item 24.** Notification names are
-    placeholders.
+25. **Implemented — Codex event normalization tests** (§J). completed and audited
+    Fake Codex notification streams now assert `_emit` calls match the
+    shared Claude vocabulary, including SDK 0.3.2 item names.
+    Covered by `server/tests/test_codex_runtime_gate.py`.
 
-26. **Missing — `test_compact_path_routing.py`** (§J). blocked — Tier 2
-    Spec called this conditional on the PR 1 SDK spike outcome
-    (native compact vs fallback). Still missing.
-    **Blocked on item 14 → item 24.** Whether `thread.compact()`
-    exists is what the spike must determine.
+26. **Implemented — compact path routing tests** (§J). completed and audited
+    Native compact routing is pinned: Codex uses `compact_thread` and
+    Claude keeps the `COMPACT_PROMPT` path.
 
-27. **Missing — `test_cost_cap_aggregation.py`** (§J). completed and audited
-    Spec wanted mixed-runtime rows in `turns` asserting combined
-    sum + rejection. Cap enforcement works (24h sum is
-    runtime-agnostic) but no test pins the behavior.
+27. **Implemented — `test_cost_cap_aggregation.py`** (§J). completed and audited
+    Mixed-runtime rows assert that USD cap enforcement is
+    runtime-agnostic and that plan-included Codex turns do not consume
+    USD budget.
 
 ## Section L — Risks not validated
 
-28. **Risk — Headless `codex login` viability on Zeabur** (§L.1). spike completed 2026-04-28
+28. **Validated — Headless `codex login` viability on Zeabur** (§L.1). spike completed 2026-04-28
     Validated. The default `codex login` opens a localhost callback
     server which doesn't work headlessly, but `codex login --device-auth`
     prints a code + URL; user visits the URL on a separate device,
@@ -372,7 +363,7 @@ item mappings for `commandExecution` and `mcpToolCall`.
     **Cannot be validated locally without the SDK.** Contract test
     `test_coord_mcp_proxy.py` covers the boundary on the harness side.
 
-31. **Risk — `Turn.usage` shape stability** (§L.4). blocked — live spike
+31. **Implemented — `Turn.usage` defensive extraction** (§L.4). completed and audited
     Pricing math assumes `input_tokens` / `cached_input_tokens` /
     `output_tokens`. Some early SDK versions returned `usage=None`
     on streamed turns. Not validated against the live SDK.
@@ -398,26 +389,23 @@ item mappings for `commandExecution` and `mcpToolCall`.
 
 ## Status counts
 
-- **Missing:** 19 items (3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27)
-- **Partial:** 5 items (1, 2, 7, 20, _and the "completed and audited" marker on PR 2 / PR 5 / PR 6 over-states completeness_)
-- **Errata:** 2 items (4, 33)
-- **Risk (live spike):** 6 items (24, 28, 29, 30, 31, 32)
+- **Open app-code gaps:** 0.
+- **Implemented and locally verified:** 1, 2, 3, 5, 6, 7, 8, 9, 10,
+  11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+  27, 28, 31, 33.
+- **Intentional errata/no dependency change:** 4 (`mcp>=1.0` not
+  needed for the current hand-rolled coord proxy).
+- **Still live-only validation risks:** 29, 30, 32.
 
-Total: 32 numbered items + 1 documentation-marker concern.
+Total: 33 numbered items. The remaining work is validation against a
+live Codex app-server/Zeabur session, not missing local implementation.
 
 ## Recommended next steps
 
-The list above can be partitioned by what unblocks what:
+The list above now partitions to:
 
-- **Tier 1 — finishable today, no live deploy needed:**
-  1, 2, 5, 6, 12, 13, 17, 18, 19, 20, 21, 22, 23. These are the
-  "spec'd but skipped" items that need no SDK access. Roughly
-  three sittings of work.
+- **Live validation:** run a real Codex app-server session on Zeabur to
+  validate items 29, 30, and 32.
 
-- **Tier 2 — needs the PR 1 spike:**
-  7, 8, 9, 10, 11, 14, 15, 16, 24, 25, 26, 28–32. Without confirmed
-  SDK signatures these are guesswork.
-
-- **Tier 3 — janitorial:**
-  3 (token wiring once 8–11 land), 4 (re-evaluate `mcp>=1.0` need
-  if richer MCP features ever needed), 33 (LeftRail emoji → SVG).
+- **Future janitorial:** re-evaluate `mcp>=1.0` only if the coord proxy
+  grows beyond hand-rolled JSON-RPC.

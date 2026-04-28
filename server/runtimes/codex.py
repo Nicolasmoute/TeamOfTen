@@ -341,9 +341,9 @@ _ITEM_TYPE_TO_HARNESS: dict[str, tuple[str, str | None]] = {
 
 def _resolve_mcp_tool_name(item_payload: dict[str, Any]) -> str:
     """Build the Claude-convention `mcp__<server>__<name>` string from
-    a Codex `mcp_tool_call` item payload. The exact payload keys are
-    provisional pending probe-2; this looks up several plausible
-    spellings and falls back to a marker name on miss.
+    a Codex `mcp_tool_call` item payload. SDK payload keys have varied
+    across probes, so this looks up several plausible spellings and
+    falls back to a marker name on miss.
     """
     server = (
         item_payload.get("server")

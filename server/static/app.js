@@ -493,9 +493,7 @@ const MODEL_OPTIONS = [
 ];
 
 // Codex (OpenAI) model options for slots running on the codex
-// runtime. Pricing for these lives in `server/pricing.py`. Names are
-// provisional pending the PR 1 SDK spike — the live signature may
-// differ from the spec.
+// runtime. Pricing for these lives in `server/pricing.py`.
 const CODEX_MODEL_OPTIONS = [
   { value: "", label: "default" },
   { value: "gpt-5.4", label: "GPT-5.4" },

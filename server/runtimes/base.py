@@ -27,11 +27,10 @@ class TurnContext:
     dispatcher can inspect `got_result` / `accumulated_text` after the
     turn returns.
 
-    Prior-session state is NOT on TurnContext. Each runtime knows
-    which DB column to read (Claude → `agent_sessions.session_id`;
-    Codex → `agent_sessions.codex_thread_id`). Putting it on the
-    dispatcher would force a tagged-union or a clear-on-runtime-change
-    rule; both fail when a slot switches runtime and switches back.
+    The dispatcher supplies `prior_session` after reading the
+    runtime-specific session column (Claude `session_id`, Codex
+    `codex_thread_id`). Runtimes may still re-check or prepare their
+    native handle before the turn starts when a stored id can go stale.
     """
 
     agent_id: str
@@ -48,9 +47,8 @@ class TurnContext:
     auto_compact: bool = False
     # Prior-session continuation id, runtime-shaped. ClaudeRuntime
     # reads this as the SDK `resume` kwarg and as the stale-session
-    # retry detector. CodexRuntime would read its codex_thread_id
-    # equivalent. Set by the dispatcher before calling run_turn so
-    # the runtime doesn't re-query the DB.
+    # retry detector. CodexRuntime receives the stored codex_thread_id
+    # here, then may prepare/open the thread before `agent_started`.
     prior_session: str | None = None
     turn_ctx: dict[str, Any] = field(default_factory=dict)
 
@@ -59,12 +57,20 @@ class TurnContext:
 class AgentRuntime(Protocol):
     """Contract for per-agent runtime adapters.
 
-    Both runtimes implement all three methods on day one (Codex stubs
-    in PR 5). The dispatcher does not branch on runtime name beyond
-    `get_runtime(name)`.
+    The dispatcher does not branch on runtime name beyond
+    `get_runtime(name)` and the optional pre-start preparation hook.
     """
 
     name: str
+
+    async def prepare_turn_start(self, tc: TurnContext) -> bool:
+        """Return the exact `agent_started.resumed_session` value.
+
+        Claude returns `bool(tc.prior_session)`. Codex opens/resumes
+        its thread here so stale `codex_thread_id` values can emit
+        `session_resume_failed` and downgrade the start event to fresh.
+        """
+        ...
 
     async def run_turn(self, tc: TurnContext) -> None:
         """Execute one model turn.
@@ -101,9 +107,8 @@ class AgentRuntime(Protocol):
     async def run_manual_compact(self, tc: TurnContext) -> None:
         """Execute a manual `/compact` request.
 
-        ClaudeRuntime runs a `COMPACT_PROMPT` turn. CodexRuntime is
-        provisional pending the PR 1 SDK spike — may use a native
-        compact call or fall back to a manual COMPACT_PROMPT turn
-        against Codex.
+        ClaudeRuntime runs a `COMPACT_PROMPT` turn. CodexRuntime uses
+        the native app-server compact call, stores the returned summary
+        as continuity, and clears `codex_thread_id`.
         """
         ...

@@ -31,6 +31,9 @@ class ClaudeRuntime:
 
     name: str = "claude"
 
+    async def prepare_turn_start(self, tc: TurnContext) -> bool:
+        return bool(tc.prior_session)
+
     async def run_turn(self, tc: TurnContext) -> None:
         """Execute one Claude turn — owns SDK options, hooks, MCP wiring,
         the streaming query loop, and stale-session retry. Re-raises

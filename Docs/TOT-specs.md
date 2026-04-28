@@ -2547,6 +2547,15 @@ starts or resumes `agent_sessions.codex_thread_id`, streams
 ConversationStep items into the same harness event vocabulary, records
 Codex turns with `runtime='codex'` plus `cost_basis`, and uses native
 `compact_thread` for manual `/compact`.
+Codex opens/resumes the thread before emitting `agent_started` so stale
+thread ids can emit `session_resume_failed` and the resume indicator is
+accurate. Successful Codex turns also clear consumed compact handoff
+notes and append the prompt/response pair used by the next compact
+handoff.
+Pre-start Codex preparation may hold SDK clients, thread handles, and
+callbacks internally until `run_turn` consumes them; those objects must
+remain runtime-private and never be copied into persisted events or
+other JSON-serialized payloads.
 
 Codex auto-compact remains disabled until app-server exposes a stable
 context-pressure signal. Codex also does not receive Claude's
@@ -2567,6 +2576,11 @@ process. Loopback bind check + per-spawn bearer token (minted via
 token server-side; body's `caller_id` is a sanity check only. Codex
 runtime wires this into each turn's `ThreadConfig.config.mcp_servers`
 alongside any external MCP servers.
+The in-process Claude coord server is built without proxy-only metadata
+by default. The loopback dispatcher explicitly opts into `_handlers`
+and `_tool_names`; those contain Python callables and must not be
+attached to the server object passed to Claude, because the Claude SDK
+serializes its MCP configuration while spawning the CLI.
 
 ---
 

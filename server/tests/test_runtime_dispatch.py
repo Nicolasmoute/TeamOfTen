@@ -19,6 +19,10 @@ class FakeRuntime:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
+    async def prepare_turn_start(self, tc: TurnContext) -> bool:
+        self.calls.append("prepare_turn_start")
+        return bool(tc.prior_session)
+
     async def run_turn(self, tc: TurnContext) -> None:
         self.calls.append("run_turn")
         tc.turn_ctx["got_result"] = True
@@ -68,10 +72,16 @@ async def test_fake_runtime_records_calls() -> None:
     rt = FakeRuntime()
     tc = _make_tc()
     assert await rt.maybe_auto_compact(tc) is False
+    assert await rt.prepare_turn_start(tc) is False
     await rt.run_turn(tc)
     assert tc.turn_ctx["got_result"] is True
     await rt.run_manual_compact(tc)
-    assert rt.calls == ["maybe_auto_compact", "run_turn", "run_manual_compact"]
+    assert rt.calls == [
+        "maybe_auto_compact",
+        "prepare_turn_start",
+        "run_turn",
+        "run_manual_compact",
+    ]
 
 
 async def test_claude_maybe_auto_compact_short_circuits_in_compact_mode() -> None:
