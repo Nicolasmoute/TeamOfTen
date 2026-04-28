@@ -442,7 +442,7 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
             return
         accumulated = turn_ctx.get("accumulated_text", "") + text
         turn_ctx["accumulated_text"] = accumulated
-        await _emit(agent_id, "text", text=text)
+        await _emit(agent_id, "text", content=text, text=text)
         return
 
     if event_type == "thinking":
@@ -452,6 +452,7 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
         await _emit(
             agent_id,
             "thinking",
+            content=text or item_payload.get("text") or item_payload.get("summary"),
             text=text or item_payload.get("text") or item_payload.get("summary"),
             id=item_id,
         )

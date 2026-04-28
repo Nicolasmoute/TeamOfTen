@@ -699,6 +699,7 @@ async def test_handle_step_emits_text_for_agentMessage(monkeypatch) -> None:
     assert len(captured) == 1
     assert captured[0]["type"] == "text"
     assert captured[0]["text"] == "hello"
+    assert captured[0]["content"] == "hello"
     assert captured[0]["agent_id"] == "p1"
     # Final-answer phase flips got_result for the dispatcher.
     assert ctx.get("got_result") is True
@@ -832,6 +833,7 @@ async def test_handle_step_emits_thinking_for_reasoning(monkeypatch) -> None:
     await handle_step(step, "p1", {})
     assert captured[0]["type"] == "thinking"
     assert captured[0]["text"] == "considering options..."
+    assert captured[0]["content"] == "considering options..."
 
 
 async def test_handle_step_unknown_item_type_logs_and_skips(monkeypatch) -> None:
@@ -1132,13 +1134,13 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
     assert any(ev["type"] == "text" and ev["text"] == "hello" for ev in captured)
     result = [ev for ev in captured if ev["type"] == "result"][0]
     assert result["session_id"] == "thread_run_turn"
-    assert result["cost_usd"] == 0.000555
+    assert result["cost_usd"] == 0.002115
     assert insert_rows[0]["runtime"] == "codex"
     assert insert_rows[0]["cost_basis"] == "token_priced"
     assert insert_rows[0]["input_tokens"] == 1000
     assert insert_rows[0]["cache_read_tokens"] == 200
     assert insert_rows[0]["output_tokens"] == 300
-    assert added_costs == [("p1", 0.000555)]
+    assert added_costs == [("p1", 0.002115)]
     assert client.handlers[-1] is None
 
 
@@ -1289,7 +1291,7 @@ async def test_codex_run_turn_consumes_prepared_turn_state(
     assert thread.chat_calls[0]["text"] == "say hello"
     assert persisted_threads == [("p1", "thread_run_turn")]
     assert insert_rows[0]["runtime"] == "codex"
-    assert added_costs == [("p1", 0.000555)]
+    assert added_costs == [("p1", 0.002115)]
     assert any(ev["type"] == "result" for ev in captured)
     assert client.handlers[-1] is None
 

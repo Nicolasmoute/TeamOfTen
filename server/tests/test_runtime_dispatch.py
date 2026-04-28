@@ -199,6 +199,57 @@ async def test_resolve_runtime_for_per_slot_override(fresh_db: str) -> None:
     assert await _resolve_runtime_for("coach") == "claude"
 
 
+async def test_get_role_default_model_is_runtime_aware(fresh_db: str) -> None:
+    """Codex defaults are stored separately from Claude defaults."""
+    import server.db as dbmod
+    await dbmod.init_db()
+    from server.agents import _get_role_default_model
+
+    import aiosqlite
+    async with aiosqlite.connect(fresh_db, timeout=10.0) as db:
+        await db.execute(
+            "INSERT INTO team_config (key, value) VALUES "
+            "('coach_default_model', 'claude-opus-4-7')"
+        )
+        await db.execute(
+            "INSERT INTO team_config (key, value) VALUES "
+            "('coach_default_model_codex', 'gpt-5.5')"
+        )
+        await db.execute(
+            "INSERT INTO team_config (key, value) VALUES "
+            "('players_default_model', 'claude-sonnet-4-6')"
+        )
+        await db.execute(
+            "INSERT INTO team_config (key, value) VALUES "
+            "('players_default_model_codex', 'gpt-5.4-mini')"
+        )
+        await db.commit()
+
+    assert await _get_role_default_model("coach", "claude") == "claude-opus-4-7"
+    assert await _get_role_default_model("coach", "codex") == "gpt-5.5"
+    assert await _get_role_default_model("p1", "claude") == "claude-sonnet-4-6"
+    assert await _get_role_default_model("p1", "codex") == "gpt-5.4-mini"
+
+
+async def test_get_role_default_model_does_not_fall_back_to_claude_for_codex(
+    fresh_db: str,
+) -> None:
+    """A Codex turn with no Codex default should let the SDK choose."""
+    import server.db as dbmod
+    await dbmod.init_db()
+    from server.agents import _get_role_default_model
+
+    import aiosqlite
+    async with aiosqlite.connect(fresh_db, timeout=10.0) as db:
+        await db.execute(
+            "INSERT INTO team_config (key, value) VALUES "
+            "('players_default_model', 'claude-sonnet-4-6')"
+        )
+        await db.commit()
+
+    assert await _get_role_default_model("p1", "codex") is None
+
+
 async def test_claude_maybe_auto_compact_off_when_threshold_unparseable(
     monkeypatch: pytest.MonkeyPatch,
     fresh_db: str,

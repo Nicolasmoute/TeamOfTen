@@ -1116,19 +1116,39 @@ _ROLE_MODEL_DEFAULTS = {
     "coach": "claude-opus-4-7",
     "players": "claude-sonnet-4-6",
 }
-# Model names we let the UI pick. Keep in sync with MODEL_OPTIONS in
-# app.js. Empty string is also accepted and means "SDK default".
-_MODEL_WHITELIST = {
+_ROLE_CODEX_MODEL_DEFAULTS = {
+    "coach": "",
+    "players": "",
+}
+_CLAUDE_MODEL_WHITELIST = {
     "",
     "claude-opus-4-7",
     "claude-sonnet-4-6",
     "claude-haiku-4-5-20251001",
 }
+_CODEX_MODEL_WHITELIST = {
+    "",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.3-codex",
+    "gpt-5.2-codex",
+    "gpt-5.1-codex-max",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-mini",
+    "gpt-5-codex",
+}
+# Model names we let the UI pick. Keep in sync with MODEL_OPTIONS and
+# CODEX_MODEL_OPTIONS in app.js. Empty string means "SDK default".
+_MODEL_WHITELIST = _CLAUDE_MODEL_WHITELIST | _CODEX_MODEL_WHITELIST
 
 
 class TeamModelsWrite(BaseModel):
     coach: str = Field("", description="Default model for Coach. Empty = SDK default.")
     players: str = Field("", description="Default model for p1..p10. Empty = SDK default.")
+    coach_codex: str = Field("", description="Default Codex model for Coach. Empty = SDK default.")
+    players_codex: str = Field("", description="Default Codex model for p1..p10. Empty = SDK default.")
 
 
 async def _read_team_config_str(key: str) -> str:
@@ -1179,8 +1199,12 @@ async def get_team_models() -> dict[str, object]:
     return {
         "coach": await _read_team_config_str("coach_default_model"),
         "players": await _read_team_config_str("players_default_model"),
+        "coach_codex": await _read_team_config_str("coach_default_model_codex"),
+        "players_codex": await _read_team_config_str("players_default_model_codex"),
         "suggested": _ROLE_MODEL_DEFAULTS,
-        "available": sorted(_MODEL_WHITELIST - {""}),
+        "suggested_codex": _ROLE_CODEX_MODEL_DEFAULTS,
+        "available": sorted(_CLAUDE_MODEL_WHITELIST - {""}),
+        "available_codex": sorted(_CODEX_MODEL_WHITELIST - {""}),
     }
 
 
@@ -1251,10 +1275,19 @@ async def set_team_models(
 ) -> dict[str, object]:
     """Set both per-role defaults. Empty string clears (reverts to SDK
     default)."""
-    for role, value in (("coach", req.coach or ""), ("players", req.players or "")):
-        if value not in _MODEL_WHITELIST:
+    claude_values = (("coach", req.coach or ""), ("players", req.players or ""))
+    codex_values = (
+        ("coach", req.coach_codex or ""),
+        ("players", req.players_codex or ""),
+    )
+    for role, value in claude_values:
+        if value not in _CLAUDE_MODEL_WHITELIST:
             raise HTTPException(400, detail=f"unknown model '{value}' for {role}")
         await _write_team_config_str(f"{role}_default_model", value)
+    for role, value in codex_values:
+        if value not in _CODEX_MODEL_WHITELIST:
+            raise HTTPException(400, detail=f"unknown Codex model '{value}' for {role}")
+        await _write_team_config_str(f"{role}_default_model_codex", value)
     await bus.publish(
         {
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -1262,10 +1295,18 @@ async def set_team_models(
             "type": "team_models_updated",
             "coach": req.coach or "",
             "players": req.players or "",
+            "coach_codex": req.coach_codex or "",
+            "players_codex": req.players_codex or "",
             "actor": actor,
         }
     )
-    return {"ok": True, "coach": req.coach or "", "players": req.players or ""}
+    return {
+        "ok": True,
+        "coach": req.coach or "",
+        "players": req.players or "",
+        "coach_codex": req.coach_codex or "",
+        "players_codex": req.players_codex or "",
+    }
 
 
 @app.put("/api/team/tools", dependencies=[Depends(require_token)])

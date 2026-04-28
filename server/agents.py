@@ -1977,18 +1977,22 @@ async def _build_coach_coordination_block() -> str:
     return "\n".join(lines) + "\n"
 
 
-async def _get_role_default_model(agent_id: str) -> str | None:
+async def _get_role_default_model(agent_id: str, runtime_name: str = "claude") -> str | None:
     """Read the per-role default model from team_config.
 
     Keys:
-      coach_default_model   applies when agent_id == 'coach'
-      players_default_model applies to p1..p10
+      coach_default_model          Claude Coach default
+      players_default_model        Claude p1..p10 default
+      coach_default_model_codex    Codex Coach default
+      players_default_model_codex  Codex p1..p10 default
 
     Returns None when the row is missing / empty / unreadable so the
     caller can fall back to the SDK default (or the per-pane override
     that takes precedence upstream).
     """
-    key = "coach_default_model" if agent_id == "coach" else "players_default_model"
+    role = "coach" if agent_id == "coach" else "players"
+    suffix = "_codex" if runtime_name == "codex" else ""
+    key = f"{role}_default_model{suffix}"
     try:
         c = await configured_conn()
         try:
@@ -3224,13 +3228,12 @@ async def run_agent(
 
     # Model resolution precedence (highest → lowest):
     #   1. per-pane override (`model` arg from the gear popover)
-    #   2. per-role team default (team_config: coach_default_model /
-    #      players_default_model), set in the Settings drawer
+    #   2. runtime-aware per-role team default, set in Settings
     #   3. SDK default (no kwarg)
     # Resolved here in the dispatcher because the turn ledger row
     # (turns.model) records what we actually told the SDK to use.
     if not model:
-        model = await _get_role_default_model(agent_id)
+        model = await _get_role_default_model(agent_id, _runtime_name)
 
     # Per-turn context the ResultMessage handler appends to the turns
     # ledger. The runtime stamps started_at on each iterate call so

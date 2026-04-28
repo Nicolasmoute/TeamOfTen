@@ -400,8 +400,8 @@ Observed and implemented item_type mapping:
 | `step_type` / `item_type`                          | Harness event              | Notes |
 |----------------------------------------------------|----------------------------|-------|
 | `userMessage` / `userMessage`                      | (skip)                     | already in DB |
-| `codex` / `agentMessage` (text set)                | `text`                     | accumulate; phase=='final_answer' marks turn done |
-| `thinking` / `reasoning`                           | `thinking`                 | parallel to Claude path |
+| `codex` / `agentMessage` (text set)                | `text`                     | emit `content` + `text`, accumulate; phase=='final_answer' marks turn done |
+| `thinking` / `reasoning`                           | `thinking`                 | emit `content` + `text`; parallel to Claude path |
 | `exec` / `commandExecution`                        | `tool_use` (`tool=Bash`) + optional `tool_result` | SDK 0.3.2 normalized shell shape |
 | `codex` / `shell`                                  | `tool_use` (`tool=Bash`)   | draft compatibility |
 | `file` / `fileChange`                              | `tool_use` (`tool=Edit`) + optional `tool_result` | SDK 0.3.2 normalized file-change shape |
@@ -431,8 +431,16 @@ Codex's `Turn.usage` reports tokens but NOT USD. New module `server/pricing.py`:
 
 ```python
 CODEX_PRICING = {
-    "gpt-5.4":      {"input": 5.0,  "cached": 0.50, "output": 15.0},
-    "gpt-5.4-mini": {"input": 0.25, "cached": 0.025, "output": 1.0},
+    "gpt-5.5":      {"input": 5.0,  "cached": 0.50,  "output": 30.0},
+    "gpt-5.4":      {"input": 2.50, "cached": 0.25,  "output": 15.0},
+    "gpt-5.4-mini": {"input": 0.75, "cached": 0.075, "output": 4.50},
+    "gpt-5.4-nano": {"input": 0.20, "cached": 0.02,  "output": 1.25},
+    "gpt-5.3-codex": {"input": 1.75, "cached": 0.175, "output": 14.0},
+    "gpt-5.2-codex": {"input": 1.75, "cached": 0.175, "output": 14.0},
+    "gpt-5.1-codex-max": {"input": 1.25, "cached": 0.125, "output": 10.0},
+    "gpt-5.1-codex": {"input": 1.25, "cached": 0.125, "output": 10.0},
+    "gpt-5.1-codex-mini": {"input": 0.25, "cached": 0.025, "output": 2.0},
+    "gpt-5-codex": {"input": 1.25, "cached": 0.125, "output": 10.0},
 }
 def codex_cost_usd(model: str, usage: Mapping[str, int]) -> float: ...
 ```
@@ -504,7 +512,7 @@ Runtime radio (Claude | Codex). New `PUT /api/agents/{id}/runtime` mirroring `/b
 CSS-icon only (invariant #6). `.slot-runtime-claude::after` = filled disc; `.slot-runtime-codex::after` = filled square. Bottom-left of slot button (lock badge already owns bottom-right). Distinct hue per runtime.
 
 ### F.3 Options drawer defaults
-New section "Default runtime per role": Coach radio + Players radio. `team_config` keys `coach_default_runtime`, `players_default_runtime`. Resolution: per-agent > role default > `'claude'`. Add second row of model dropdowns gated by runtime; extend `_get_role_default_model` to read both.
+New section "Default runtime per role": Coach radio + Players radio. `team_config` keys `coach_default_runtime`, `players_default_runtime`. Resolution: per-agent > role default > `'claude'`. Default model controls are split by runtime (`coach_default_model` / `players_default_model` for Claude, `coach_default_model_codex` / `players_default_model_codex` for Codex), and pane model dropdowns resolve against the effective runtime (slot override or role default) before showing Claude vs Codex options.
 
 ### F.4 Codex tool renderers (`server/static/tools.js`)
 - `shell` → reuse Bash card.

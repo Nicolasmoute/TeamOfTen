@@ -21,19 +21,27 @@ from collections.abc import Mapping
 #
 # Update procedure when OpenAI revises rates: edit this table, bump
 # `PRICING_VERSION`, run `pytest server/tests/test_codex_pricing.py`.
-PRICING_VERSION = "2026-04-28"
+PRICING_VERSION = "2026-04-28-gpt55"
 
 CODEX_PRICING: dict[str, dict[str, float]] = {
     # Standard model ids. Lowercase canonical; lookup normalizes.
-    "gpt-5.4":      {"input": 5.0,   "cached": 0.50,  "output": 15.0},
-    "gpt-5.4-mini": {"input": 0.25,  "cached": 0.025, "output": 1.0},
+    "gpt-5.5":      {"input": 5.0,   "cached": 0.50,  "output": 30.0},
+    "gpt-5.4":      {"input": 2.50,  "cached": 0.25,  "output": 15.0},
+    "gpt-5.4-mini": {"input": 0.75,  "cached": 0.075, "output": 4.50},
+    "gpt-5.4-nano": {"input": 0.20,  "cached": 0.02,  "output": 1.25},
+    "gpt-5.3-codex": {"input": 1.75, "cached": 0.175, "output": 14.0},
+    "gpt-5.2-codex": {"input": 1.75, "cached": 0.175, "output": 14.0},
+    "gpt-5.1-codex-max": {"input": 1.25, "cached": 0.125, "output": 10.0},
+    "gpt-5.1-codex": {"input": 1.25, "cached": 0.125, "output": 10.0},
+    "gpt-5.1-codex-mini": {"input": 0.25, "cached": 0.025, "output": 2.0},
+    "gpt-5-codex": {"input": 1.25, "cached": 0.125, "output": 10.0},
 }
 
 # Fallback when an unknown model id is recorded — keeps the cost cap
 # functional rather than crashing on a model the table hasn't seen
 # yet. Numbers are intentionally pessimistic so a missing entry
 # over-estimates spend rather than under-estimating.
-_UNKNOWN_MODEL_PRICE = {"input": 5.0, "cached": 0.50, "output": 15.0}
+_UNKNOWN_MODEL_PRICE = {"input": 5.0, "cached": 0.50, "output": 30.0}
 
 
 def _normalize_model(model: str | None) -> str:

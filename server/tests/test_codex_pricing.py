@@ -12,27 +12,27 @@ from server.pricing import CODEX_PRICING, codex_cost_usd
 
 
 def test_gpt_5_4_basic_token_math() -> None:
-    # 1M input + 1M output → $5 + $15 = $20
+    # 1M input + 1M output -> $2.50 + $15 = $17.50
     cost = codex_cost_usd("gpt-5.4", {
         "input_tokens": 1_000_000,
         "output_tokens": 1_000_000,
     })
-    assert cost == pytest.approx(20.0, abs=1e-6)
+    assert cost == pytest.approx(17.5, abs=1e-6)
 
 
 def test_gpt_5_4_cached_input_priced_separately() -> None:
-    # 1M cached input → $0.50 (vs $5 uncached)
+    # 1M cached input -> $0.25 (vs $2.50 uncached)
     cost = codex_cost_usd("gpt-5.4", {"cached_input_tokens": 1_000_000})
-    assert cost == pytest.approx(0.50, abs=1e-6)
+    assert cost == pytest.approx(0.25, abs=1e-6)
 
 
 def test_gpt_5_4_mini_basic() -> None:
-    # 1M input + 1M output → $0.25 + $1.0 = $1.25
+    # 1M input + 1M output -> $0.75 + $4.50 = $5.25
     cost = codex_cost_usd("gpt-5.4-mini", {
         "input_tokens": 1_000_000,
         "output_tokens": 1_000_000,
     })
-    assert cost == pytest.approx(1.25, abs=1e-6)
+    assert cost == pytest.approx(5.25, abs=1e-6)
 
 
 def test_zero_usage_zero_cost() -> None:
@@ -42,9 +42,9 @@ def test_zero_usage_zero_cost() -> None:
 def test_unknown_model_uses_pessimistic_fallback() -> None:
     # The fallback should NOT be free — under-billing trips the cap
     # late and burns budget. 1M input on the fallback should cost
-    # the same as gpt-5.4 input (the fallback we picked).
+    # at least as much as the current flagship input rate.
     cost_unknown = codex_cost_usd("gpt-7-future", {"input_tokens": 1_000_000})
-    cost_known = codex_cost_usd("gpt-5.4", {"input_tokens": 1_000_000})
+    cost_known = codex_cost_usd("gpt-5.5", {"input_tokens": 1_000_000})
     assert cost_unknown == cost_known
     assert cost_unknown > 0
 
@@ -60,8 +60,8 @@ def test_garbage_token_values_dont_crash() -> None:
         "output_tokens": None,
         "cached_input_tokens": 100,
     })
-    # Cached: 100 * 0.50 / 1M = 0.00005
-    assert cost == pytest.approx(5e-5, abs=1e-9)
+    # Cached: 100 * 0.25 / 1M = 0.000025
+    assert cost == pytest.approx(2.5e-5, abs=1e-9)
 
 
 def test_extract_usage_codex_basic() -> None:
@@ -165,10 +165,13 @@ async def test_insert_turn_row_records_runtime_and_cost_basis(fresh_db) -> None:
 
 
 def test_pricing_table_has_required_models() -> None:
-    """Floor sanity — the table must list the two flagship Codex
+    """Floor sanity - the table must list the current Codex/runtime
     models. If OpenAI renames them, update CODEX_PRICING + this list
     in lockstep."""
+    assert "gpt-5.5" in CODEX_PRICING
     assert "gpt-5.4" in CODEX_PRICING
     assert "gpt-5.4-mini" in CODEX_PRICING
+    assert "gpt-5.3-codex" in CODEX_PRICING
+    assert "gpt-5.1-codex-mini" in CODEX_PRICING
     for entry in CODEX_PRICING.values():
         assert {"input", "cached", "output"} <= set(entry.keys())

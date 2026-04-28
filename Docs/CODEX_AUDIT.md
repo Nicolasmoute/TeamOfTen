@@ -387,17 +387,27 @@ Second fix pass:
     migrated. PR 6 did not touch it because it predates Codex work.
     New runtime badges added in PR 6 are CSS-only (compliant).
 
+34. **Implemented - runtime-aware Codex model UI + text rendering** (§F.1, §F.3, §E.3). completed and audited
+    The pane settings popover now resolves model options from the
+    effective runtime (slot override, then role default) and clears a
+    stale per-pane model override when it is not valid for that runtime.
+    Team model defaults are split into Claude and Codex rows so Codex
+    never inherits Opus/Sonnet defaults. The Codex menu includes
+    `gpt-5.5`, the GPT-5.4 family, and current Codex-specialized ids.
+    Codex `agentMessage` and reasoning events emit both `content` and
+    `text`, matching the UI renderer and fixing blank answer rows.
+
 ## Status counts
 
 - **Open app-code gaps:** 0.
 - **Implemented and locally verified:** 1, 2, 3, 5, 6, 7, 8, 9, 10,
   11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-  27, 28, 31, 33.
+  27, 28, 31, 33, 34.
 - **Intentional errata/no dependency change:** 4 (`mcp>=1.0` not
   needed for the current hand-rolled coord proxy).
 - **Still live-only validation risks:** 29, 30, 32.
 
-Total: 33 numbered items. The remaining work is validation against a
+Total: 34 numbered items. The remaining work is validation against a
 live Codex app-server/Zeabur session, not missing local implementation.
 
 ## Recommended next steps

@@ -496,13 +496,30 @@ const MODEL_OPTIONS = [
 // runtime. Pricing for these lives in `server/pricing.py`.
 const CODEX_MODEL_OPTIONS = [
   { value: "", label: "default" },
+  { value: "gpt-5.5", label: "GPT-5.5" },
   { value: "gpt-5.4", label: "GPT-5.4" },
   { value: "gpt-5.4-mini", label: "GPT-5.4 mini" },
+  { value: "gpt-5.4-nano", label: "GPT-5.4 nano" },
+  { value: "gpt-5.3-codex", label: "GPT-5.3 Codex" },
+  { value: "gpt-5.2-codex", label: "GPT-5.2 Codex" },
+  { value: "gpt-5.1-codex-max", label: "GPT-5.1 Codex Max" },
+  { value: "gpt-5.1-codex", label: "GPT-5.1 Codex" },
+  { value: "gpt-5.1-codex-mini", label: "GPT-5.1 Codex mini" },
+  { value: "gpt-5-codex", label: "GPT-5 Codex" },
 ];
 
 // Pick the right model dropdown by runtime name.
 function modelOptionsFor(runtime) {
   return runtime === "codex" ? CODEX_MODEL_OPTIONS : MODEL_OPTIONS;
+}
+
+function modelLabelFor(id, runtime) {
+  const opts = modelOptionsFor(runtime || "");
+  const match =
+    opts.find((m) => m.value === id) ||
+    CODEX_MODEL_OPTIONS.find((m) => m.value === id) ||
+    MODEL_OPTIONS.find((m) => m.value === id);
+  return match ? match.label : (id || "default");
 }
 
 // Effort: 1=low, 2=med, 3=high, 4=max. Mapped server-side to a
@@ -598,6 +615,7 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
   const [runtimeDraft, setRuntimeDraft] = useState(initialRuntime || "");
   const [runtimeSaving, setRuntimeSaving] = useState(false);
   const [runtimeError, setRuntimeError] = useState("");
+  const [roleDefaultRuntime, setRoleDefaultRuntime] = useState(null);
   const saveRuntime = useCallback(async (next) => {
     if (!slot) return;
     setRuntimeSaving(true);
@@ -624,12 +642,28 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
       setRuntimeSaving(false);
     }
   }, [slot, initialRuntime]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await authFetch("/api/team/runtimes");
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (cancelled) return;
+        const id = slot === "coach" ? data.coach : data.players;
+        setRoleDefaultRuntime(id || "");
+      } catch (_e) {
+        // Silent — the popover still works without the resolved label.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [slot]);
   // Resolve the team-wide default model so the "default" option in the
   // dropdown can show what it'll actually fall through to (e.g.
   // "default (Sonnet 4.6)"). Avoids the trap where users set a team
   // default in the Settings drawer and then see "default" in the gear
   // popover and assume the agent is running the SDK default.
-  const [roleDefaultModel, setRoleDefaultModel] = useState("");
+  const [roleDefaultModels, setRoleDefaultModels] = useState(null);
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -638,8 +672,7 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
         if (!res.ok || cancelled) return;
         const data = await res.json();
         if (cancelled) return;
-        const id = slot === "coach" ? data.coach : data.players;
-        setRoleDefaultModel(id || "");
+        setRoleDefaultModels(data);
       } catch (_e) {
         // Silent — the popover still works without the resolved label.
       }
@@ -653,14 +686,25 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
   // suffix that decorates the "default" entry uses the role-default
   // model resolved server-side.
   const modelOptions = useMemo(() => {
-    const base = modelOptionsFor(runtimeDraft || "");
+    const effectiveRuntime = runtimeDraft || roleDefaultRuntime || "claude";
+    const base = modelOptionsFor(effectiveRuntime);
+    const role = slot === "coach" ? "coach" : "players";
+    const key = effectiveRuntime === "codex" ? role + "_codex" : role;
+    const roleDefaultModel = roleDefaultModels ? (roleDefaultModels[key] || "") : "";
     if (!roleDefaultModel) return base;
     const match = base.find((m) => m.value === roleDefaultModel);
     const suffix = match ? match.label : roleDefaultModel;
     return base.map((m) =>
       m.value === "" ? { ...m, label: `default (${suffix})` } : m
     );
-  }, [roleDefaultModel, runtimeDraft]);
+  }, [roleDefaultModels, roleDefaultRuntime, runtimeDraft, slot]);
+  useEffect(() => {
+    if (!runtimeDraft && roleDefaultRuntime === null) return;
+    const current = settings.model || "";
+    if (!current) return;
+    if (modelOptions.some((m) => m.value === current)) return;
+    onChange((s) => ({ ...s, model: "" }));
+  }, [modelOptions, onChange, roleDefaultRuntime, runtimeDraft, settings.model]);
   const saveIdentity = useCallback(async () => {
     if (!slot) return;
     setIdentitySaving(true);
@@ -3365,8 +3409,12 @@ function TeamToolsSection() {
 function TeamModelsSection() {
   const [coachModel, setCoachModel] = useState("");
   const [playersModel, setPlayersModel] = useState("");
+  const [coachCodexModel, setCoachCodexModel] = useState("");
+  const [playersCodexModel, setPlayersCodexModel] = useState("");
   const [suggested, setSuggested] = useState({});
+  const [suggestedCodex, setSuggestedCodex] = useState({});
   const [available, setAvailable] = useState([]);
+  const [availableCodex, setAvailableCodex] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState(null);
@@ -3380,8 +3428,12 @@ function TeamModelsSection() {
         if (cancelled) return;
         setCoachModel(data.coach || "");
         setPlayersModel(data.players || "");
+        setCoachCodexModel(data.coach_codex || "");
+        setPlayersCodexModel(data.players_codex || "");
         setSuggested(data.suggested || {});
+        setSuggestedCodex(data.suggested_codex || {});
         setAvailable(Array.isArray(data.available) ? data.available : []);
+        setAvailableCodex(Array.isArray(data.available_codex) ? data.available_codex : []);
       } catch (e) {
         console.error("team models load failed", e);
       } finally {
@@ -3390,13 +3442,18 @@ function TeamModelsSection() {
     })();
     return () => { cancelled = true; };
   }, []);
-  const save = useCallback(async (coach, players) => {
+  const save = useCallback(async (coach, players, coachCodex, playersCodex) => {
     setSaving(true);
     try {
       const res = await authFetch("/api/team/models", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ coach, players }),
+        body: JSON.stringify({
+          coach,
+          players,
+          coach_codex: coachCodex,
+          players_codex: playersCodex,
+        }),
       });
       if (res.ok) setSavedAt(Date.now());
     } catch (e) {
@@ -3405,21 +3462,32 @@ function TeamModelsSection() {
       setSaving(false);
     }
   }, []);
-  const onCoachChange = (v) => { setCoachModel(v); save(v, playersModel); };
-  const onPlayersChange = (v) => { setPlayersModel(v); save(coachModel, v); };
-  const labelFor = (id) => {
-    const m = MODEL_OPTIONS.find((o) => o.value === id);
-    return m ? m.label : id;
+  const onCoachChange = (v) => {
+    setCoachModel(v);
+    save(v, playersModel, coachCodexModel, playersCodexModel);
+  };
+  const onPlayersChange = (v) => {
+    setPlayersModel(v);
+    save(coachModel, v, coachCodexModel, playersCodexModel);
+  };
+  const onCoachCodexChange = (v) => {
+    setCoachCodexModel(v);
+    save(coachModel, playersModel, v, playersCodexModel);
+  };
+  const onPlayersCodexChange = (v) => {
+    setPlayersCodexModel(v);
+    save(coachModel, playersModel, coachCodexModel, v);
   };
   return html`<section class="drawer-section">
     <h3>Default models</h3>
     <p class="muted" style="margin: 0 0 6px 0; font-size: 12px;">
-      Fallback model per role when a pane hasn't set its own. The
-      gear popover on any pane still overrides. Empty = SDK default.
+      Fallback model per role and runtime when a pane hasn't set its
+      own. The gear popover on any pane still overrides. Empty = SDK
+      default.
     </p>
     ${loaded
       ? html`<div style="display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center; font-size: 12px;">
-          <label>Coach</label>
+          <label>Coach Claude</label>
           <div>
             <select
               value=${coachModel}
@@ -3427,13 +3495,13 @@ function TeamModelsSection() {
               onChange=${(e) => onCoachChange(e.target.value)}
             >
               <option value="">SDK default</option>
-              ${available.map((m) => html`<option value=${m}>${labelFor(m)}</option>`)}
+              ${available.map((m) => html`<option value=${m}>${modelLabelFor(m, "claude")}</option>`)}
             </select>
             ${suggested.coach
-              ? html` <span class="muted" style="margin-left: 6px;">suggested: ${labelFor(suggested.coach)}</span>`
+              ? html` <span class="muted" style="margin-left: 6px;">suggested: ${modelLabelFor(suggested.coach, "claude")}</span>`
               : null}
           </div>
-          <label>Players</label>
+          <label>Players Claude</label>
           <div>
             <select
               value=${playersModel}
@@ -3441,10 +3509,38 @@ function TeamModelsSection() {
               onChange=${(e) => onPlayersChange(e.target.value)}
             >
               <option value="">SDK default</option>
-              ${available.map((m) => html`<option value=${m}>${labelFor(m)}</option>`)}
+              ${available.map((m) => html`<option value=${m}>${modelLabelFor(m, "claude")}</option>`)}
             </select>
             ${suggested.players
-              ? html` <span class="muted" style="margin-left: 6px;">suggested: ${labelFor(suggested.players)}</span>`
+              ? html` <span class="muted" style="margin-left: 6px;">suggested: ${modelLabelFor(suggested.players, "claude")}</span>`
+              : null}
+          </div>
+          <label>Coach Codex</label>
+          <div>
+            <select
+              value=${coachCodexModel}
+              disabled=${saving}
+              onChange=${(e) => onCoachCodexChange(e.target.value)}
+            >
+              <option value="">SDK default</option>
+              ${availableCodex.map((m) => html`<option value=${m}>${modelLabelFor(m, "codex")}</option>`)}
+            </select>
+            ${suggestedCodex.coach
+              ? html` <span class="muted" style="margin-left: 6px;">suggested: ${modelLabelFor(suggestedCodex.coach, "codex")}</span>`
+              : null}
+          </div>
+          <label>Players Codex</label>
+          <div>
+            <select
+              value=${playersCodexModel}
+              disabled=${saving}
+              onChange=${(e) => onPlayersCodexChange(e.target.value)}
+            >
+              <option value="">SDK default</option>
+              ${availableCodex.map((m) => html`<option value=${m}>${modelLabelFor(m, "codex")}</option>`)}
+            </select>
+            ${suggestedCodex.players
+              ? html` <span class="muted" style="margin-left: 6px;">suggested: ${modelLabelFor(suggestedCodex.players, "codex")}</span>`
               : null}
           </div>
         </div>
@@ -7815,6 +7911,34 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const bodyRef = useRef(null);
+  const [roleDefaultRuntime, setRoleDefaultRuntime] = useState(null);
+  const runtimeOverride = (agent?.runtime_override || "").toLowerCase();
+  const effectiveRuntime = runtimeOverride || roleDefaultRuntime || "claude";
+  const effectiveRuntimeKnown = !!runtimeOverride || roleDefaultRuntime !== null;
+  const paneModelValidForRuntime = !paneSettings.model ||
+    modelOptionsFor(effectiveRuntime).some((m) => m.value === paneSettings.model);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await authFetch("/api/team/runtimes");
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (cancelled) return;
+        const id = slot === "coach" ? data.coach : data.players;
+        setRoleDefaultRuntime(id || "");
+      } catch (_e) {
+        // Silent - if this fails, model validation simply waits.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [slot]);
+
+  useEffect(() => {
+    if (!effectiveRuntimeKnown || paneModelValidForRuntime) return;
+    setPaneSettings((s) => ({ ...s, model: "" }));
+  }, [effectiveRuntimeKnown, paneModelValidForRuntime]);
 
   // HTML5 DnD: the pane header is the drag source; the whole pane is
   // the drop target (drop inserts the dragged slot BEFORE this pane
@@ -8442,7 +8566,9 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
       // Include per-pane overrides. The server forwards these to
       // ClaudeAgentOptions (model / permission_mode="plan" / effort).
       const reqBody = { agent_id: slot, prompt };
-      if (paneSettings.model) reqBody.model = paneSettings.model;
+      if (effectiveRuntimeKnown && paneSettings.model && paneModelValidForRuntime) {
+        reqBody.model = paneSettings.model;
+      }
       if (paneSettings.planMode) reqBody.plan_mode = true;
       if (paneSettings.effort) reqBody.effort = paneSettings.effort;
       const res = await authFetch("/api/agents/start", {
@@ -8461,7 +8587,14 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
     } finally {
       setSubmitting(false);
     }
-  }, [input, attachments, slot, paneSettings]);
+  }, [
+    input,
+    attachments,
+    slot,
+    paneSettings,
+    effectiveRuntimeKnown,
+    paneModelValidForRuntime,
+  ]);
 
   // slashOpen: show autocomplete when the input is a single-line "/…"
   // prefix. We intentionally close once the user inserts a newline —
@@ -8777,7 +8910,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
             onClick=${() => setSettingsOpen(true)}
             title="Model (click to change)"
           >
-            ${(MODEL_OPTIONS.find((m) => m.value === (paneSettings.model || "")) || MODEL_OPTIONS[0]).label}
+            ${modelLabelFor(paneSettings.model || "", effectiveRuntime)}
           </button>
           <button
             class=${"pane-mode-chip" + (paneSettings.planMode ? " active" : "")}

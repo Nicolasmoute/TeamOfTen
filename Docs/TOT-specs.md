@@ -788,6 +788,10 @@ Known keys:
 - `extra_tools`: JSON array, team-wide SDK extras such as `WebSearch`.
 - `coach_default_model`: JSON string.
 - `players_default_model`: JSON string.
+- `coach_default_model_codex`: JSON string, Codex-only Coach model default.
+- `players_default_model_codex`: JSON string, Codex-only Player model default.
+- `coach_default_runtime`: JSON string, role default runtime (`claude`, `codex`, or empty).
+- `players_default_runtime`: JSON string, role default runtime (`claude`, `codex`, or empty).
 - `project_repo`: legacy/global repo URL override.
 - `project_branch`: legacy/global branch override.
 - `telegram_disabled`: `"1"` disables Telegram even if env fallback exists.
@@ -1961,8 +1965,10 @@ Timeout:
 | --- | --- |
 | `GET /api/team/tools` | Team extra tools |
 | `PUT /api/team/tools` | Set extras |
-| `GET /api/team/models` | Per-role default models |
-| `PUT /api/team/models` | Set per-role defaults |
+| `GET /api/team/models` | Per-role default models, split by runtime |
+| `PUT /api/team/models` | Set per-role defaults, split by runtime |
+| `GET /api/team/runtimes` | Per-role default runtimes |
+| `PUT /api/team/runtimes` | Set per-role default runtimes |
 | `GET /api/team/repo` | Legacy/global repo config |
 | `PUT /api/team/repo` | Set legacy/global repo config |
 | `POST /api/team/repo/provision` | Provision legacy/global workspaces |
@@ -1976,11 +1982,22 @@ Model whitelist:
 - `claude-opus-4-7`
 - `claude-sonnet-4-6`
 - `claude-haiku-4-5-20251001`
+- `gpt-5.5`
+- `gpt-5.4`
+- `gpt-5.4-mini`
+- `gpt-5.4-nano`
+- `gpt-5.3-codex`
+- `gpt-5.2-codex`
+- `gpt-5.1-codex-max`
+- `gpt-5.1-codex`
+- `gpt-5.1-codex-mini`
+- `gpt-5-codex`
 
 Suggested defaults:
 
 - Coach: `claude-opus-4-7`
 - Players: `claude-sonnet-4-6`
+- Codex Coach/Players: empty, meaning Codex SDK default.
 
 ### 14.13 MCP and Secrets
 
@@ -2565,6 +2582,15 @@ coord/human escalation paths instead.
 `HARNESS_CODEX_ENABLED` must be truthy before the API will accept
 `runtime=codex` on a slot. See `Docs/CODEX_RUNTIME_SPEC.md`.
 
+Model selection is runtime-aware. The pane gear popover resolves the
+effective runtime from the per-slot override, then the role default, and
+only then chooses the Claude or Codex model list. Team defaults are also
+split by runtime so a role configured for Codex reads
+`coach_default_model_codex` / `players_default_model_codex` and never
+falls back to Claude's Opus/Sonnet defaults. The Codex menu includes the
+current flagship and coding ids (`gpt-5.5`, `gpt-5.4*`,
+`gpt-5.3-codex`, `gpt-5.2-codex`, and GPT-5.1 Codex variants).
+
 ### 19.6 Coord MCP proxy (loopback, used by Codex)
 
 `POST /api/_coord/{tool_name}` and `GET /api/_coord/_tools` are
@@ -2592,8 +2618,8 @@ Representative env vars from `.env.example` and implementation:
 | --- | --- | --- |
 | `HARNESS_TOKEN` | unset | Optional API/WS bearer token |
 | `CLAUDE_CONFIG_DIR` | `/data/claude` | Claude OAuth/session dir |
-| `CODEX_HOME` | `/data/codex` | Codex CLI auth dir (auth.json) — see `Docs/CODEX_RUNTIME_SPEC.md` |
-| `HARNESS_CODEX_ENABLED` | unset | PR 5 feature gate — must be truthy for `PUT /api/agents/{id}/runtime` to accept `runtime=codex`. |
+| `CODEX_HOME` | `/data/codex` | Codex CLI auth dir (`auth.json`). Must point at persistent storage; after deploy run `CODEX_HOME=/data/codex codex login --device-auth` in the container to create the ChatGPT OAuth session. |
+| `HARNESS_CODEX_ENABLED` | unset | Codex runtime feature gate. Must be truthy (`true`, `1`, `yes`, `on`) before `PUT /api/agents/{id}/runtime` or the UI runtime controls can select `runtime=codex`. |
 | `HARNESS_DB_PATH` | `/data/harness.db` | SQLite path |
 | `HARNESS_DATA_ROOT` | `/data` | Global/project data root |
 | `HARNESS_PROJECT_REPO` | unset | Legacy/global git repo URL |
