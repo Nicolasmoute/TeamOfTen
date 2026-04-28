@@ -565,6 +565,33 @@ async def test_open_thread_falls_back_to_start_on_resume_failure(
     assert (await _get_codex_thread_id("p1")) is None
 
 
+async def test_open_thread_propagates_cancellation_during_resume(
+    fresh_db,
+) -> None:
+    """CancelledError must NOT trigger the auto-heal path. Cancellations
+    are user/dispatcher intent, not stale-thread signals — clearing the
+    stored id on cancel would lose context unnecessarily."""
+    import asyncio
+    import pytest
+    import server.db as dbmod
+    from server.runtimes.codex import (
+        open_thread, _set_codex_thread_id, _get_codex_thread_id,
+    )
+    await dbmod.init_db()
+    _FakeThread.instances.clear()
+    client = _ThreadFakeClient()
+    client.fail_resume_with = asyncio.CancelledError()
+
+    await _set_codex_thread_id("p1", "tid_alive")
+    with pytest.raises(asyncio.CancelledError):
+        await open_thread("p1", client)
+
+    # Stored id MUST still be intact after a cancellation.
+    assert (await _get_codex_thread_id("p1")) == "tid_alive"
+    # start_thread must NOT have been called as a fallback.
+    assert client.start_calls == []
+
+
 async def test_open_thread_passes_config_to_start_and_resume(
     fresh_db,
 ) -> None:

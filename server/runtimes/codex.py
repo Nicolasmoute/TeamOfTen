@@ -232,17 +232,25 @@ async def open_thread(
 ) -> tuple[Any, bool]:
     """Return a `ThreadHandle` for `agent_id`, creating or resuming as
     appropriate. Implements §E.2's stale-thread auto-heal: if a stored
-    `codex_thread_id` fails to resume (any exception), null it and fall
-    back to `start_thread` once.
+    `codex_thread_id` fails to resume (any non-cancellation exception),
+    null it and fall back to `start_thread` once.
 
     Returns `(thread_handle, resumed: bool)` so the dispatcher can stamp
     the `agent_started` event with the right `resumed_session` flag.
+
+    Persistence is the caller's responsibility: this function does not
+    write the freshly-started thread's id to `agent_sessions`. The
+    dispatcher should call `_set_codex_thread_id(agent_id, thread.thread_id)`
+    after the first successful chat step (§E.2 — persist on success, not
+    on construction, so a thread that fails its first turn isn't sticky).
+
+    `asyncio.CancelledError` inherits from `BaseException` in Py 3.12+
+    so `except Exception` correctly lets cancellations propagate.
     """
     existing = await _get_codex_thread_id(agent_id)
     if existing:
         try:
-            r = client.resume_thread(existing, overrides=config) \
-                if config is not None else client.resume_thread(existing)
+            r = client.resume_thread(existing, overrides=config)
             if hasattr(r, "__await__"):
                 r = await r
             return (r, True)
@@ -254,7 +262,7 @@ async def open_thread(
             )
             await _clear_codex_thread_id(agent_id)
 
-    r = client.start_thread(config) if config is not None else client.start_thread()
+    r = client.start_thread(config)
     if hasattr(r, "__await__"):
         r = await r
     return (r, False)

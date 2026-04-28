@@ -92,7 +92,7 @@ section it traces back to and a status:
    cancellation rare in practice; revisit if observability shows
    leaked codex-app-server processes.
 
-9. **Missing — Thread start / resume** (§E.2). completed
+9. **Missing — Thread start / resume** (§E.2). completed and audited
    Implemented `_get_codex_thread_id` / `_set_codex_thread_id` /
    `_clear_codex_thread_id` in
    [server/runtimes/codex.py](../server/runtimes/codex.py) mirroring
@@ -104,14 +104,27 @@ section it traces back to and a status:
    `open_thread(agent_id, client, *, config=None) -> (ThreadHandle, resumed: bool)`
    wraps the start-vs-resume decision: if a stored id exists,
    `client.resume_thread(id, overrides=config)` is tried first; on any
-   exception the stored id is nulled and `client.start_thread(config)`
-   runs as the fallback. The `resumed` boolean is what the dispatcher
-   needs to stamp `agent_started.resumed_session`.
+   `Exception` (CancelledError excluded — see below) the stored id is
+   nulled and `client.start_thread(config)` runs as the fallback. The
+   `resumed` boolean is what the dispatcher needs to stamp
+   `agent_started.resumed_session`. Persistence of a freshly-started
+   thread's id is the dispatcher's responsibility (item #10) — open_thread
+   does not write on success so a turn that fails its first chat step
+   doesn't leave a sticky id in the row.
 
-   6 new tests pin: round-trip get/set/clear, None / "system" no-ops,
+   Audit pass tightened the implementation:
+   - Dropped the `config is not None ? f(c) : f()` discrimination —
+     SDK accepts None as default, so always pass `config` for clarity.
+   - Verified that `asyncio.CancelledError` (BaseException subclass in
+     Python 3.12+) correctly propagates through `except Exception:`
+     without triggering auto-heal. Pinned with new test
+     `test_open_thread_propagates_cancellation_during_resume`: a
+     cancelled resume must NOT clear the stored id, and must NOT call
+     start_thread as a fallback.
+
+   7 tests total: round-trip get/set/clear, None / "system" no-ops,
    start_thread when no stored id, resume_thread when stored id,
-   stale-thread auto-heal (resume failure → clear → start), and config
-   passthrough on both paths.
+   stale-thread auto-heal, config passthrough, cancellation propagation.
 
 10. **Missing — Notification → harness-event mapping** (§E.3). blocked — Tier 2
     The full mapping table from `thread.started` / `item.added` /
