@@ -9,7 +9,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     # config) and .credentials.json (OAuth token) under this dir.
     # Without this, every Zeabur redeploy wipes auth and requires a
     # fresh device-code login.
-    CLAUDE_CONFIG_DIR=/data/claude
+    CLAUDE_CONFIG_DIR=/data/claude \
+    # Codex CLI auth dir — same persistence rationale as
+    # CLAUDE_CONFIG_DIR. Codex writes auth.json (ChatGPT session or
+    # API key fallback) under this path. PR 1 spike confirms the
+    # exact filename(s) on Zeabur.
+    CODEX_HOME=/data/codex
 
 # Install Node 20 + claude CLI via npm + git.
 # Rationale: https://claude.ai/install.sh is geo-blocked in some Zeabur
@@ -22,7 +27,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates git \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g @anthropic-ai/claude-code \
+    && npm install -g @anthropic-ai/claude-code @openai/codex \
+    && codex app-server --help > /dev/null \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 

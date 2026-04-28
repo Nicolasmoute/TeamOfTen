@@ -439,6 +439,30 @@ body {
   opacity: 0.75;
 }
 .slot.locked:hover { filter: grayscale(0.65) brightness(1); opacity: 1; }
+/* Runtime badge — bottom-LEFT (lock owns bottom-right). Only painted
+   when agents.runtime_override is set, to keep the default all-Claude
+   deploy uncluttered. CSS-drawn per the no-emoji invariant.
+   Claude  = filled disc (round)  in accent blue.
+   Codex   = filled square        in OpenAI green-ish (#10a37f). */
+.slot-runtime {
+  position: absolute;
+  left: 2px;
+  bottom: 2px;
+  width: 6px;
+  height: 6px;
+  pointer-events: none;
+}
+.slot-runtime-claude {
+  background: var(--accent);
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
+}
+.slot-runtime-codex {
+  background: #10a37f;
+  border-radius: 1px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
+}
+
 .slot-lock {
   position: absolute;
   bottom: 1px;
@@ -826,6 +850,50 @@ body {
   max-height: 300px;
   overflow-y: auto;
   line-height: 1.5;
+}
+
+/* Truth-proposal expanded view: summary line above the proposed-content
+   pre, plus a row of approve/deny buttons below. The approve button uses
+   a green accent so it's the visually obvious primary action; deny is a
+   neutral button so it doesn't compete. Both disable themselves while
+   the resolution call is in flight (busyId). */
+.env-truth-summary {
+  margin: 4px 0 4px 16px;
+  font-size: 11px;
+  color: var(--muted);
+  font-style: italic;
+}
+.env-truth-actions {
+  display: flex;
+  gap: 8px;
+  margin: 4px 0 8px 16px;
+}
+.env-truth-approve,
+.env-truth-deny {
+  font: inherit;
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--fg);
+  cursor: pointer;
+}
+.env-truth-approve {
+  border-color: var(--ok, #56d364);
+  color: var(--ok, #56d364);
+}
+.env-truth-approve:hover:not(:disabled) {
+  background: var(--ok, #56d364);
+  color: var(--bg);
+}
+.env-truth-deny:hover:not(:disabled) {
+  background: var(--border);
+}
+.env-truth-approve:disabled,
+.env-truth-deny:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 /* ---- env timeline ---- */
@@ -1712,15 +1780,42 @@ body {
   min-height: 0;
 }
 .files-tree {
+  /* The flex-basis is overridden inline (treeWidth state in
+     FilesPane). Keep min-width as a hard floor so a too-aggressive
+     drag can't make the tree disappear. */
   flex: 0 0 220px;
-  min-width: 160px;
-  max-width: 40%;
-  border-right: 1px solid var(--border);
+  min-width: 140px;
+  max-width: 60%;
+  border-right: 0;
   overflow-y: auto;
   padding: 6px 0;
   background: var(--card);
   font-size: 12px;
 }
+/* Vertical drag handle between the tree and the editor. Visually a
+   thin separator with a grippable centerline that thickens on hover. */
+.files-splitter {
+  flex: 0 0 6px;
+  cursor: col-resize;
+  background: var(--border);
+  position: relative;
+  align-self: stretch;
+  user-select: none;
+  touch-action: none;
+}
+.files-splitter:hover { background: var(--accent); }
+.files-splitter-grip {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 2px;
+  height: 32px;
+  background: var(--muted);
+  border-radius: 1px;
+  pointer-events: none;
+}
+.files-splitter:hover .files-splitter-grip { background: var(--bg); }
 .files-tree-roots {
   display: flex;
   gap: 4px;
@@ -1892,6 +1987,62 @@ body {
   padding: 12px 16px;
   line-height: 1.55;
   font-size: 14px;
+}
+/* Code-file preview: hljs-highlighted source. Keeps a single scrollable
+   pre that fills the editor area, matching the textarea's footprint. */
+.files-code-preview {
+  flex: 1 1 auto;
+  overflow: auto;
+  background: var(--bg);
+}
+.files-code-preview pre.files-code {
+  margin: 0;
+  padding: 10px 12px;
+  background: transparent;
+  border: 0;
+  font-family: ui-monospace, Menlo, Consolas, "Fira Code", monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre;
+  overflow-x: auto;
+}
+.files-code-preview pre.files-code code.hljs {
+  background: transparent;
+  padding: 0;
+  display: block;
+}
+.files-code-lang {
+  margin-left: auto;
+  font-family: ui-monospace, Menlo, Consolas, "Fira Code", monospace;
+  font-size: 10px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  align-self: center;
+  padding-right: 8px;
+}
+/* Binary placeholder — shown for files outside the previewable text
+   allowlist. The pane still selects them in the tree, just doesn't
+   try to render their contents. */
+.files-binary-card {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--muted);
+  padding: 32px;
+  text-align: center;
+}
+.files-binary-title {
+  color: var(--fg);
+  font-size: 13px;
+}
+.files-binary-meta {
+  font-family: ui-monospace, Menlo, Consolas, "Fira Code", monospace;
+  font-size: 12px;
+  word-break: break-all;
 }
 /* Shared markdown styling for the marked + DOMPurify + hljs pipeline.
    Used in two contexts: agent text/thinking events (.markdown class)
@@ -2180,6 +2331,24 @@ body {
 .pane-settings-hint {
   flex-basis: 100%;
   color: var(--muted);
+  font-size: 11px;
+  padding-left: 24px;
+}
+.pane-settings-runtime {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+.pane-settings-runtime label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+.pane-settings-runtime-err {
+  flex-basis: 100%;
+  color: var(--err);
   font-size: 11px;
   padding-left: 24px;
 }

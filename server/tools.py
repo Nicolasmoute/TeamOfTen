@@ -1264,6 +1264,106 @@ def build_coord_server(caller_id: str) -> Any:
     # agent turn (server/context.py).
 
     @tool(
+        "coord_propose_truth_update",
+        (
+            "Coach-only. Propose an update to a file under the active "
+            "project's truth/ folder. truth/ is the user's signed-off "
+            "source-of-truth (specs, brand guidelines, contracts); "
+            "agents NEVER write to it directly — the harness's "
+            "PreToolUse guard hook denies any direct Write/Edit/Bash "
+            "to truth/. This tool is the ONLY path to change truth/, "
+            "and approval is gated on an explicit human click in the "
+            "UI's 'Truth proposals' section. Players cannot call this "
+            "tool — they must ask Coach to relay.\n"
+            "\n"
+            "What happens:\n"
+            "  1. The proposal is queued (status=pending).\n"
+            "  2. The user reviews the diff in the UI and clicks "
+            "approve or deny.\n"
+            "  3. On approve, the harness writes the file with the "
+            "proposed content. On deny, the file is left as-is.\n"
+            "  4. A `truth_proposal_resolved` event fires so you'll "
+            "see the outcome on your next turn.\n"
+            "\n"
+            "Params:\n"
+            "- path: relative path under truth/ (e.g. 'specs.md' or "
+            "  'brand/colors.md'). Required. No leading slash, no "
+            "  '..' segments.\n"
+            "- content: full new file body (required). This is a full "
+            "  REPLACE — include the parts you're keeping verbatim, "
+            "  not just a diff.\n"
+            "- summary: one-line 'why' the user reads next to "
+            "  approve/deny (required, ≤ 200 chars). Be specific: "
+            "  'Add launch-date constraint to specs.md §3' beats "
+            "  'update specs'."
+        ),
+        {"path": str, "content": str, "summary": str},
+    )
+    async def propose_truth_update(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err(
+                "Only Coach can propose truth/ updates. Players: send "
+                "a coord_send_message to coach describing the proposed "
+                "change; Coach will relay it as a proposal."
+            )
+        rel = (args.get("path") or "").strip()
+        content = args.get("content")
+        summary = (args.get("summary") or "").strip()
+        if not rel:
+            return _err("path is required")
+        # Defensive strip: Coach is told to pass paths relative to truth/
+        # (e.g. "specs.md", not "truth/specs.md"), but accept the prefixed
+        # form too rather than fail confusingly. Strip a single leading
+        # "truth/" so "truth/specs.md" and "specs.md" both resolve to
+        # /data/projects/<slug>/truth/specs.md.
+        if rel.startswith("truth/"):
+            rel = rel[len("truth/"):]
+        if rel.startswith("/") or ".." in rel.split("/"):
+            return _err("path must be relative under truth/, no '..' segments")
+        if not isinstance(content, str):
+            return _err("content is required (string)")
+        if len(content) > 200_000:
+            return _err(
+                f"content too long ({len(content)} chars, max 200000)"
+            )
+        if not summary:
+            return _err("summary is required (one-line 'why' the user reads)")
+        if len(summary) > 200:
+            return _err(f"summary too long ({len(summary)} chars, max 200)")
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "INSERT INTO truth_proposals "
+                "(project_id, proposer_id, path, proposed_content, summary) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (project_id, caller_id, rel, content, summary),
+            )
+            await c.commit()
+            proposal_id = cur.lastrowid
+        finally:
+            await c.close()
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "truth_proposal_created",
+                "proposal_id": proposal_id,
+                "path": rel,
+                "summary": summary,
+                "size": len(content),
+            }
+        )
+        return _ok(
+            f"proposal #{proposal_id} queued for truth/{rel} "
+            f"({len(content)} chars). The user will review and "
+            f"approve or deny in the UI; you'll see "
+            f"`truth_proposal_resolved` on your next turn."
+        )
+
+    @tool(
         "coord_list_team",
         (
             "Read the current team roster: slot id, name, role, brief, "
@@ -1583,32 +1683,47 @@ def build_coord_server(caller_id: str) -> Any:
             "Continue or pause your current task as appropriate."
         )
 
-    return create_sdk_mcp_server(
-        name="coord",
-        version="0.8.0",
-        tools=[
-            list_tasks,
-            create_task,
-            claim_task,
-            update_task,
-            assign_task,
-            send_message,
-            read_inbox,
-            list_memory,
-            read_memory,
-            update_memory,
-            commit_push,
-            write_decision,
-            write_knowledge,
-            read_knowledge,
-            list_knowledge,
-            list_team,
-            set_player_role,
-            answer_question,
-            answer_plan,
-            request_human,
-        ],
-    )
+    _tools = [
+        list_tasks,
+        create_task,
+        claim_task,
+        update_task,
+        assign_task,
+        send_message,
+        read_inbox,
+        list_memory,
+        read_memory,
+        update_memory,
+        commit_push,
+        write_decision,
+        propose_truth_update,
+        write_knowledge,
+        read_knowledge,
+        list_knowledge,
+        list_team,
+        set_player_role,
+        answer_question,
+        answer_plan,
+        request_human,
+    ]
+    server = create_sdk_mcp_server(name="coord", version="0.8.0", tools=_tools)
+    # Stash a name → handler map so the coord_mcp proxy endpoint
+    # (server.coord_mcp + POST /api/_coord/{tool}) can dispatch by
+    # name without re-importing SDK internals. In-process Claude
+    # ignores this key. See Docs/CODEX_RUNTIME_SPEC.md §C.4.
+    server["_handlers"] = {t.name: t.handler for t in _tools}
+    server["_tool_names"] = [t.name for t in _tools]
+    return server
+
+
+def coord_tool_names() -> list[str]:
+    """Stable list of registered coord tool names — used by the proxy
+    catalog (`server.coord_mcp`) and by the contract test that
+    asserts the proxy enumeration matches the live registry.
+    Builds a coord server for an arbitrary caller and pulls its names.
+    """
+    server = build_coord_server("coach")
+    return list(server["_tool_names"])
 
 
 ALLOWED_COORD_TOOLS = [
@@ -1624,6 +1739,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_update_memory",
     "mcp__coord__coord_commit_push",
     "mcp__coord__coord_write_decision",
+    "mcp__coord__coord_propose_truth_update",
     "mcp__coord__coord_write_knowledge",
     "mcp__coord__coord_read_knowledge",
     "mcp__coord__coord_list_knowledge",

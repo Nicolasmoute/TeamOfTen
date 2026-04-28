@@ -46,6 +46,7 @@ class ProjectPaths:
     memory: Path
     decisions: Path
     knowledge: Path
+    truth: Path
     working: Path
     working_conversations: Path
     working_handoffs: Path
@@ -94,6 +95,11 @@ def project_paths(project_id: str) -> ProjectPaths:
         memory=working / "memory",
         decisions=root / "decisions",
         knowledge=working / "knowledge",
+        # truth/ is a sibling of decisions/ — also a "permanent /
+        # canonical" lane at project root. User-validated source of
+        # truth (specs, brand guidelines, etc.); agents are blocked
+        # from writing to it (PreToolUse hook in server/agents.py).
+        truth=root / "truth",
         working=working,
         working_conversations=working / "conversations",
         working_handoffs=working / "handoffs",
@@ -114,6 +120,7 @@ def project_paths(project_id: str) -> ProjectPaths:
 # one shared root).
 _PROJECT_SUBDIRS = (
     "decisions",
+    "truth",
     "working/conversations",
     "working/handoffs",
     "working/knowledge",

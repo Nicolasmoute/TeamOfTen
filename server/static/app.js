@@ -24,7 +24,7 @@ import hljsSql from "/static/vendor/hljs-sql.js";
 import hljsTs from "/static/vendor/hljs-typescript.js";
 import hljsXml from "/static/vendor/hljs-xml.js";
 import hljsYaml from "/static/vendor/hljs-yaml.js";
-import { renderToolCall, setAgentDirectory } from "/static/tools.js";
+import { renderToolCall, setAgentDirectory, langForFile } from "/static/tools.js";
 
 const html = htm.bind(h);
 
@@ -139,6 +139,72 @@ function renderMarkdown(md) {
   return DOMPurify.sanitize(raw, {
     ADD_ATTR: ["target", "rel", "data-lang"],
   });
+}
+
+// FilesPane helpers — extension allowlist for what we'll inline-preview
+// and a syntax-highlighted code renderer for non-markdown text files.
+//
+// The allowlist is conservative: only formats we know render readably.
+// Files outside the allowlist are treated as binary — the editor
+// shows a placeholder with size + extension and never fetches the
+// body, so opening a 50 MB blob doesn't lock the UI or burn the
+// /api/files/read 256 KB cap.
+const FILES_TEXT_EXTENSIONS = new Set([
+  ".md", ".markdown", ".mdx",
+  ".txt", ".log", ".text",
+  ".py", ".pyi",
+  ".js", ".mjs", ".cjs", ".jsx",
+  ".ts", ".tsx", ".d.ts",
+  ".json", ".jsonc", ".jsonl",
+  ".yaml", ".yml",
+  ".toml",
+  ".css", ".scss", ".sass", ".less",
+  ".html", ".htm", ".xml", ".svg",
+  ".go", ".rs",
+  ".sh", ".bash", ".zsh",
+  ".sql",
+  ".ini", ".cfg", ".conf",
+  ".csv", ".tsv",
+  ".env", ".gitignore", ".gitattributes", ".dockerignore",
+]);
+// Extensionless filenames worth previewing as text. Match by basename.
+const FILES_TEXT_BASENAMES = new Set([
+  "Dockerfile", "Makefile", "Justfile", "Procfile",
+  "README", "LICENSE", "CHANGELOG", "AUTHORS", "CONTRIBUTING",
+  ".gitignore", ".gitattributes", ".dockerignore", ".env",
+]);
+
+function filesIsPreviewableText(path) {
+  if (typeof path !== "string" || path.length === 0) return false;
+  const base = path.split("/").pop() || path;
+  if (FILES_TEXT_BASENAMES.has(base)) return true;
+  const dot = base.lastIndexOf(".");
+  if (dot < 0) return false;
+  return FILES_TEXT_EXTENSIONS.has(base.slice(dot).toLowerCase());
+}
+
+function filesRenderCode(text, path) {
+  const safe = String(text == null ? "" : text);
+  const lang = langForFile(path);
+  let body;
+  if (lang && hljs.getLanguage(lang)) {
+    try {
+      const highlighted = hljs.highlight(safe, {
+        language: lang, ignoreIllegals: true,
+      }).value;
+      body =
+        '<pre class="files-code"><code class="hljs language-' + lang +
+        '" data-lang="' + lang + '">' + highlighted + "</code></pre>";
+    } catch (_) {
+      body = null;
+    }
+  }
+  if (!body) {
+    const esc = safe
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    body = '<pre class="files-code"><code class="hljs">' + esc + "</code></pre>";
+  }
+  return DOMPurify.sanitize(body, { ADD_ATTR: ["data-lang"] });
 }
 
 // Per-event memo for renderMarkdown. Long panes re-render the App
@@ -426,6 +492,21 @@ const MODEL_OPTIONS = [
   { value: "claude-haiku-4-5-20251001", label: "Haiku 4.5" },
 ];
 
+// Codex (OpenAI) model options for slots running on the codex
+// runtime. Pricing for these lives in `server/pricing.py`. Names are
+// provisional pending the PR 1 SDK spike — the live signature may
+// differ from the spec.
+const CODEX_MODEL_OPTIONS = [
+  { value: "", label: "default" },
+  { value: "gpt-5.4", label: "GPT-5.4" },
+  { value: "gpt-5.4-mini", label: "GPT-5.4 mini" },
+];
+
+// Pick the right model dropdown by runtime name.
+function modelOptionsFor(runtime) {
+  return runtime === "codex" ? CODEX_MODEL_OPTIONS : MODEL_OPTIONS;
+}
+
 // Effort: 1=low, 2=med, 3=high, 4=max. Mapped server-side to a
 // thinking budget in tokens (see server/agents.py once wired).
 const EFFORT_LABELS = ["low", "med", "high", "max"];
@@ -500,7 +581,7 @@ function savePaneSettings(slot, settings) {
   }
 }
 
-function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, initialName, initialRole }) {
+function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, initialName, initialRole, initialRuntime }) {
   const effort = settings.effort || 0; // 0 = default (server decides)
   const rootRef = useRef(null);
   const [briefDraft, setBriefDraft] = useState(initialBrief || "");
@@ -512,6 +593,39 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
   const [identitySaving, setIdentitySaving] = useState(false);
   const identityDirty =
     nameDraft !== (initialName || "") || roleDraft !== (initialRole || "");
+  // PR 6: per-slot runtime override. UI saves immediately on change
+  // via PUT /api/agents/{slot}/runtime. Empty string = clear (fall
+  // through to role default → 'claude'). Mid-turn changes 409 on the
+  // server; we surface that via runtimeError below.
+  const [runtimeDraft, setRuntimeDraft] = useState(initialRuntime || "");
+  const [runtimeSaving, setRuntimeSaving] = useState(false);
+  const [runtimeError, setRuntimeError] = useState("");
+  const saveRuntime = useCallback(async (next) => {
+    if (!slot) return;
+    setRuntimeSaving(true);
+    setRuntimeError("");
+    try {
+      const res = await authFetch("/api/agents/" + slot + "/runtime", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runtime: next }),
+      });
+      if (!res.ok) {
+        let detail = "save failed";
+        try { detail = (await res.json()).detail || detail; } catch {}
+        setRuntimeError(detail);
+        // Bounce back to the previous value so the radio reflects truth.
+        setRuntimeDraft(initialRuntime || "");
+        return;
+      }
+      setRuntimeDraft(next);
+    } catch (e) {
+      setRuntimeError(String(e));
+      setRuntimeDraft(initialRuntime || "");
+    } finally {
+      setRuntimeSaving(false);
+    }
+  }, [slot, initialRuntime]);
   // Resolve the team-wide default model so the "default" option in the
   // dropdown can show what it'll actually fall through to (e.g.
   // "default (Sonnet 4.6)"). Avoids the trap where users set a team
@@ -534,14 +648,21 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
     })();
     return () => { cancelled = true; };
   }, [slot]);
+  // PR 6 / audit-item-18: model dropdown options depend on the
+  // currently-selected runtime. When the slot is on Codex, list
+  // CODEX_MODEL_OPTIONS; on Claude, list MODEL_OPTIONS. Falls back to
+  // Claude when the runtime isn't yet known (initial render). The
+  // suffix that decorates the "default" entry uses the role-default
+  // model resolved server-side.
   const modelOptions = useMemo(() => {
-    if (!roleDefaultModel) return MODEL_OPTIONS;
-    const match = MODEL_OPTIONS.find((m) => m.value === roleDefaultModel);
+    const base = modelOptionsFor(runtimeDraft || "");
+    if (!roleDefaultModel) return base;
+    const match = base.find((m) => m.value === roleDefaultModel);
     const suffix = match ? match.label : roleDefaultModel;
-    return MODEL_OPTIONS.map((m) =>
+    return base.map((m) =>
       m.value === "" ? { ...m, label: `default (${suffix})` } : m
     );
-  }, [roleDefaultModel]);
+  }, [roleDefaultModel, runtimeDraft]);
   const saveIdentity = useCallback(async () => {
     if (!slot) return;
     setIdentitySaving(true);
@@ -631,6 +752,47 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
             (m) => html`<option value=${m.value}>${m.label}</option>`
           )}
         </select>
+      </div>
+      <div class="pane-settings-row">
+        <label class="pane-settings-label">Runtime</label>
+        <div class="pane-settings-runtime">
+          <label>
+            <input
+              type="radio"
+              name=${"pane-runtime-" + (slot || "x")}
+              value=""
+              checked=${runtimeDraft === ""}
+              disabled=${runtimeSaving}
+              onChange=${() => saveRuntime("")}
+            />
+            default
+          </label>
+          <label>
+            <input
+              type="radio"
+              name=${"pane-runtime-" + (slot || "x")}
+              value="claude"
+              checked=${runtimeDraft === "claude"}
+              disabled=${runtimeSaving}
+              onChange=${() => saveRuntime("claude")}
+            />
+            Claude
+          </label>
+          <label>
+            <input
+              type="radio"
+              name=${"pane-runtime-" + (slot || "x")}
+              value="codex"
+              checked=${runtimeDraft === "codex"}
+              disabled=${runtimeSaving}
+              onChange=${() => saveRuntime("codex")}
+            />
+            Codex
+          </label>
+        </div>
+        ${runtimeError
+          ? html`<span class="pane-settings-runtime-err">${runtimeError}</span>`
+          : html`<span class="pane-settings-hint">Saves immediately. Mid-turn change is rejected — cancel the turn first.</span>`}
       </div>
       <div class="pane-settings-row">
         <label class="pane-settings-label">
@@ -2787,16 +2949,33 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
       : "";
     const lockHint = showLocked ? " — LOCKED (Coach can't assign / message)" : "";
     const tooltip = baseTip + dotHint + lockHint + " — shift-click to stack in last column";
+    // PR 6: Runtime badge. Only painted when an explicit
+    // runtime_override is set so the default all-Claude deploy isn't
+    // visually noisy. Claude → filled disc; Codex → filled square.
+    const runtimeOverride = (a.runtime_override || "").toLowerCase();
+    const runtimeBadge = runtimeOverride === "codex"
+      ? "slot-runtime-codex"
+      : runtimeOverride === "claude"
+      ? "slot-runtime-claude"
+      : "";
     return html`
       <button
         key=${a.id}
         class=${classes}
-        title=${tooltip}
+        title=${tooltip + (runtimeBadge ? ` — runtime: ${runtimeOverride}` : "")}
         onClick=${(e) => (e.shiftKey ? onStackInLast(a.id) : onOpen(a.id))}
       >
         <span class="slot-label">${slotShortLabel(a.id)}</span>
         ${dot ? html`<span class=${"slot-dot dot-" + dot}></span>` : null}
-        ${showLocked ? html`<span class="slot-lock" aria-hidden="true">🔒</span>` : null}
+        ${runtimeBadge ? html`<span class=${"slot-runtime " + runtimeBadge} aria-hidden="true"></span>` : null}
+        ${showLocked
+          ? html`<span
+              class="slot-lock"
+              aria-hidden="true"
+              dangerouslySetInnerHTML=${{ __html:
+                `<svg viewBox="0 0 20 20" width="9" height="9" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="9" width="11" height="8" rx="1.2"/><path d="M7 9V6.5a3 3 0 0 1 6 0V9"/></svg>` }}
+            ></span>`
+          : null}
       </button>
     `;
   };
@@ -3273,6 +3452,107 @@ function TeamModelsSection() {
         </div>
         ${savedAt
           ? html`<p class="muted" style="font-size: 11px; margin: 6px 0 0 0;">saved · takes effect on next turn</p>`
+          : null}`
+      : html`<p class="muted">loading…</p>`}
+  </section>`;
+}
+
+// Per-role default runtimes (PR 6 / audit-item-17). Mirrors
+// TeamModelsSection. Resolution order at spawn time: per-slot
+// runtime_override → role default here → 'claude'. Codex radio is
+// disabled when HARNESS_CODEX_ENABLED is unset on the server.
+function TeamRuntimesSection() {
+  const [coach, setCoach] = useState("");
+  const [players, setPlayers] = useState("");
+  const [codexEnabled, setCodexEnabled] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await authFetch("/api/team/runtimes");
+        if (!res.ok || cancelled) return;
+        const d = await res.json();
+        if (cancelled) return;
+        setCoach(d.coach || "");
+        setPlayers(d.players || "");
+        setCodexEnabled(!!d.codex_enabled);
+      } catch (e) {
+        console.error("team runtimes load failed", e);
+      } finally {
+        if (!cancelled) setLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const save = useCallback(async (nextCoach, nextPlayers) => {
+    setSaving(true);
+    setMsg(null);
+    try {
+      const res = await authFetch("/api/team/runtimes", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ coach: nextCoach, players: nextPlayers }),
+      });
+      if (res.ok) {
+        setMsg({ kind: "ok", text: "saved · takes effect on next turn" });
+      } else {
+        let detail;
+        try { detail = (await res.json()).detail; } catch (_) { detail = "HTTP " + res.status; }
+        setMsg({ kind: "err", text: typeof detail === "string" ? detail : JSON.stringify(detail) });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    } finally {
+      setSaving(false);
+    }
+  }, []);
+
+  const radioRow = (role, current, onChange) => html`
+    <div>
+      <label style="margin-right: 10px;">
+        <input type="radio" name=${"runtime-" + role} value=""
+          checked=${current === ""} disabled=${saving}
+          onChange=${() => onChange("")} /> default (claude)
+      </label>
+      <label style="margin-right: 10px;">
+        <input type="radio" name=${"runtime-" + role} value="claude"
+          checked=${current === "claude"} disabled=${saving}
+          onChange=${() => onChange("claude")} /> Claude
+      </label>
+      <label>
+        <input type="radio" name=${"runtime-" + role} value="codex"
+          checked=${current === "codex"} disabled=${saving || !codexEnabled}
+          title=${codexEnabled ? "" : "set HARNESS_CODEX_ENABLED on the server to enable"}
+          onChange=${() => onChange("codex")} /> Codex
+      </label>
+    </div>`;
+
+  return html`<section class="drawer-section">
+    <h3>Default runtime per role</h3>
+    <p class="muted" style="margin: 0 0 6px 0; font-size: 12px;">
+      Fallback runtime per role when a slot hasn't set its own
+      override. The gear popover on any pane still overrides. Mid-turn
+      changes are rejected — cancel the turn first.
+      ${codexEnabled
+        ? null
+        : html` <span style="color: var(--warn);">Codex disabled on the server (set HARNESS_CODEX_ENABLED).</span>`}
+    </p>
+    ${loaded
+      ? html`<div style="display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center; font-size: 12px;">
+          <label>Coach</label>
+          ${radioRow("coach", coach, (v) => { setCoach(v); save(v, players); })}
+          <label>Players</label>
+          ${radioRow("players", players, (v) => { setPlayers(v); save(coach, v); })}
+        </div>
+        ${msg
+          ? html`<p style="font-size: 11px; margin: 6px 0 0 0; color: ${msg.kind === "ok" ? "var(--ok)" : "var(--err)"};">
+              ${msg.text}
+            </p>`
           : null}`
       : html`<p class="muted">loading…</p>`}
   </section>`;
@@ -4056,6 +4336,175 @@ function TeamTelegramSection() {
   </section>`;
 }
 
+// Codex auth (PR 5+). Two sources: ChatGPT session (file at
+// $CODEX_HOME/auth.json — set inside container by `codex login`) and
+// OPENAI_API_KEY fallback (encrypted in `secrets`, settable here).
+function TeamCodexSection() {
+  const [data, setData] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+  const [keyDraft, setKeyDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [msg, setMsg] = useState(null);
+
+  const reload = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/team/codex");
+      if (res.ok) setData(await res.json());
+    } catch (e) {
+      console.error("codex auth load failed", e);
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+
+  const save = useCallback(async () => {
+    if (!keyDraft.trim()) {
+      setMsg({ kind: "err", text: "paste an API key first" });
+      return;
+    }
+    setSaving(true);
+    setMsg(null);
+    try {
+      const res = await authFetch("/api/team/codex", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ api_key: keyDraft.trim() }),
+      });
+      if (res.ok) {
+        setMsg({ kind: "ok", text: "saved" });
+        setKeyDraft("");
+        await reload();
+      } else {
+        let detail;
+        try { detail = (await res.json()).detail; } catch (_) { detail = "HTTP " + res.status; }
+        setMsg({ kind: "err", text: typeof detail === "string" ? detail : JSON.stringify(detail) });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    } finally {
+      setSaving(false);
+    }
+  }, [keyDraft, reload]);
+
+  const clearKey = useCallback(async () => {
+    if (!confirm("Wipe saved OpenAI API key? ChatGPT session (filesystem) is untouched.")) return;
+    setClearing(true);
+    setMsg(null);
+    try {
+      const res = await authFetch("/api/team/codex", { method: "DELETE" });
+      if (res.ok) {
+        setMsg({ kind: "ok", text: "cleared" });
+        await reload();
+      } else {
+        let detail;
+        try { detail = (await res.json()).detail; } catch (_) { detail = "HTTP " + res.status; }
+        setMsg({ kind: "err", text: detail });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    } finally {
+      setClearing(false);
+    }
+  }, [reload]);
+
+  const testKey = useCallback(async () => {
+    setTesting(true);
+    setMsg(null);
+    try {
+      const res = await authFetch("/api/team/codex/test", { method: "POST" });
+      if (res.ok) {
+        const d = await res.json();
+        const sample = (d.sample_models || []).slice(0, 3).join(", ");
+        setMsg({
+          kind: "ok",
+          text: sample ? `OK · models: ${sample}` : "OK · key valid",
+        });
+      } else {
+        let detail;
+        try { detail = (await res.json()).detail; } catch (_) { detail = "HTTP " + res.status; }
+        setMsg({ kind: "err", text: detail });
+      }
+    } catch (e) {
+      setMsg({ kind: "err", text: String(e) });
+    } finally {
+      setTesting(false);
+    }
+  }, []);
+
+  const keyOk = data && data.secrets_status && data.secrets_status.ok;
+  const keyReason = data && data.secrets_status && data.secrets_status.reason;
+
+  return html`<section class="drawer-section">
+    <h3>Codex auth</h3>
+    <p class="muted" style="margin: 0 0 6px 0; font-size: 12px;">
+      OpenAI Codex runtime. Two auth paths: a ChatGPT session set inside
+      the container via <code>codex login</code> (preferred — uses your
+      Plus/Pro plan), or an OPENAI_API_KEY fallback saved here
+      (token-priced). Keys are encrypted with
+      <code>HARNESS_SECRETS_KEY</code>.
+    </p>
+    ${loaded && data && !keyOk
+      ? html`<div style="font-size: 11px; color: var(--err); border: 1px solid var(--err); background: rgba(248,81,73,0.08); padding: 4px 8px; border-radius: 3px; margin-bottom: 6px;">
+          secrets store unavailable: ${keyReason || "unknown"}
+        </div>`
+      : null}
+    ${loaded && data
+      ? html`<div style="font-size: 11px; color: var(--muted); margin-bottom: 6px;">
+          <div>
+            runtime gate:
+            ${data.enabled
+              ? html`<span style="color: var(--ok);">● enabled</span>`
+              : html`<span style="color: var(--warn);">○ disabled (set HARNESS_CODEX_ENABLED)</span>`}
+          </div>
+          <div>
+            ChatGPT session:
+            ${data.chatgpt_session_present
+              ? html`<span style="color: var(--ok);">● present (${data.config_dir || "$CODEX_HOME"})</span>`
+              : html`<span style="color: var(--muted);">○ none — run <code>codex login</code> in the container, or use API key below</span>`}
+          </div>
+          <div>
+            API key fallback:
+            ${data.api_key_set
+              ? html`<span style="color: var(--ok);">● set</span>`
+              : html`<span style="color: var(--muted);">○ unset</span>`}
+            <span class="muted"> · resolution: ${data.method}</span>
+          </div>
+        </div>`
+      : null}
+    <div class="drawer-row">
+      <label class="drawer-label">API key</label>
+      <input
+        type="password"
+        placeholder=${data && data.api_key_set ? "•••••• (saved)" : "sk-..."}
+        value=${keyDraft}
+        onInput=${(e) => setKeyDraft(e.target.value)}
+        autocomplete="off"
+        spellcheck="false"
+        style="flex: 1; min-width: 0;"
+      />
+    </div>
+    <div class="drawer-row" style="gap: 6px;">
+      <button onClick=${save} disabled=${saving || !keyDraft.trim()}>
+        ${saving ? "saving…" : "save"}
+      </button>
+      <button onClick=${testKey} disabled=${testing || !(data && data.api_key_set)}>
+        ${testing ? "testing…" : "test"}
+      </button>
+      <button onClick=${clearKey} disabled=${clearing || !(data && data.api_key_set)}>
+        ${clearing ? "clearing…" : "clear"}
+      </button>
+    </div>
+    ${msg
+      ? html`<div style="font-size: 11px; color: ${msg.kind === "ok" ? "var(--ok)" : "var(--err)"}; margin-top: 4px;">
+          ${msg.text}
+        </div>`
+      : null}
+  </section>`;
+}
+
 // MCP server configuration. Paste a Claude-Desktop-style JSON
 // snippet; parse + detect server name(s); save to the DB. Each saved
 // server gets a row with status dot + enable/disable/delete/test. The
@@ -4782,9 +5231,13 @@ function SettingsDrawer({ onClose, serverStatus }) {
 
           <${TeamModelsSection} />
 
+          <${TeamRuntimesSection} />
+
           <${TeamRepoSection} />
 
           <${TeamTelegramSection} />
+
+          <${TeamCodexSection} />
 
           <${SecretsSection} />
 
@@ -4929,6 +5382,7 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, onCrea
         <${EnvInboxSection} conversations=${conversations} />
         <${EnvMemorySection} conversations=${conversations} />
         <${EnvDecisionsSection} conversations=${conversations} />
+        <${EnvTruthProposalsSection} conversations=${conversations} />
         <${EnvTimelineSection} conversations=${conversations} />
       </div>
     </aside>
@@ -5940,6 +6394,122 @@ function EnvDecisionsSection({ conversations }) {
   `;
 }
 
+// Truth proposals section — Coach proposes via coord_propose_truth_update,
+// the human approves or denies here. The approve action writes the file
+// server-side; the deny action just marks the row. Pending proposals are
+// the only ones rendered (resolved ones become events in the timeline).
+function EnvTruthProposalsSection({ conversations }) {
+  const [proposals, setProposals] = useState([]);
+  const [openId, setOpenId] = useState(null);
+  const [busyId, setBusyId] = useState(null);
+  const [err, setErr] = useState("");
+
+  const load = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/truth/proposals?status=pending");
+      if (!res.ok) return;
+      const data = await res.json();
+      setProposals(Array.isArray(data.proposals) ? data.proposals : []);
+    } catch (e) {
+      console.error("load truth proposals failed", e);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Refresh on any related event so a Coach propose / human resolve
+  // updates the list without a manual reload.
+  const eventCount = useMemo(() => {
+    let n = 0;
+    for (const list of conversations.values()) {
+      for (const ev of list) {
+        if (
+          ev.type === "truth_proposal_created" ||
+          ev.type === "truth_proposal_approved" ||
+          ev.type === "truth_proposal_denied" ||
+          ev.type === "truth_proposal_cancelled"
+        ) n++;
+      }
+    }
+    return n;
+  }, [conversations]);
+  useEffect(() => {
+    if (eventCount > 0) load();
+  }, [eventCount, load]);
+
+  const resolve = useCallback(async (id, action) => {
+    setBusyId(id);
+    setErr("");
+    try {
+      const res = await authFetch(
+        "/api/truth/proposals/" + id + "/" + action,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        }
+      );
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error("HTTP " + res.status + ": " + body.slice(0, 200));
+      }
+      // Drop from local list; the next load will reconcile.
+      setProposals((prev) => prev.filter((p) => p.id !== id));
+      if (openId === id) setOpenId(null);
+    } catch (e) {
+      setErr("resolve failed: " + String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }, [openId]);
+
+  return html`
+    <section class="env-section">
+      <h3 class="env-section-title">
+        Truth proposals <span class="env-count">${proposals.length}</span>
+      </h3>
+      ${err ? html`<div class="env-cost-hint">${err}</div>` : null}
+      ${proposals.length === 0
+        ? html`<div class="env-empty">(none pending)</div>`
+        : html`<div class="env-decision-list">
+            ${proposals.map((p) => {
+              const isOpen = openId === p.id;
+              return html`
+                <div class="env-decision" key=${p.id}>
+                  <button
+                    class="env-decision-head"
+                    onClick=${() => setOpenId(isOpen ? null : p.id)}
+                  >
+                    <span class="env-decision-arrow">${isOpen ? "▾" : "▸"}</span>
+                    <span class="env-decision-title">truth/${p.path}</span>
+                    <span class="env-decision-meta">${p.proposer_id}</span>
+                  </button>
+                  ${isOpen
+                    ? html`
+                        <div class="env-truth-summary">${p.summary}</div>
+                        <pre class="env-decision-body">${p.proposed_content}</pre>
+                        <div class="env-truth-actions">
+                          <button
+                            class="env-truth-approve"
+                            disabled=${busyId === p.id}
+                            onClick=${() => resolve(p.id, "approve")}
+                          >${busyId === p.id ? "…" : "approve & write"}</button>
+                          <button
+                            class="env-truth-deny"
+                            disabled=${busyId === p.id}
+                            onClick=${() => resolve(p.id, "deny")}
+                          >${busyId === p.id ? "…" : "deny"}</button>
+                        </div>
+                      `
+                    : null}
+                </div>
+              `;
+            })}
+          </div>`}
+    </section>
+  `;
+}
+
 const TASK_STATUS_FILTERS = [
   { key: "active", label: "active", match: (s) => s !== "done" && s !== "cancelled" },
   { key: "all", label: "all", match: () => true },
@@ -6119,6 +6689,35 @@ function EnvCostSection({ agents, serverStatus }) {
   const teamPct = teamCap > 0 ? Math.min(100, Math.round((teamToday / teamCap) * 100)) : 0;
   const teamBarClass =
     teamPct >= 100 ? " over" : teamPct >= 80 ? " warn" : "";
+
+  // Audit-item-23: plan-included token meter for ChatGPT-auth Codex
+  // turns. cost_usd is $0 by design for those, so the USD bar above
+  // wouldn't catch them; surface tokens used today instead. Polled
+  // every 60s via /api/turns/summary?hours=24. Hidden when zero so
+  // pure-Claude deployments don't see an empty meter.
+  const [planTokens, setPlanTokens] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const res = await authFetch("/api/turns/summary?hours=24");
+        if (!res.ok || cancelled) return;
+        const d = await res.json();
+        if (cancelled) return;
+        setPlanTokens(Number(d.plan_included_token_total) || 0);
+      } catch (_) {
+        // Silent — endpoint optional; bar just stays at last value.
+      }
+    };
+    refresh();
+    const t = setInterval(refresh, 60_000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+  const formatTokens = (n) => {
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + "M";
+    if (n >= 1_000) return (n / 1_000).toFixed(1) + "k";
+    return String(n);
+  };
   return html`
     <section class="env-section">
       <h3 class="env-section-title">
@@ -6137,6 +6736,14 @@ function EnvCostSection({ agents, serverStatus }) {
                   <div class=${"env-cap-bar-fill" + teamBarClass} style=${"width:" + teamPct + "%"}></div>
                 </div>`
               : null}
+          </div>`
+        : null}
+      ${planTokens > 0
+        ? html`<div class="env-cap-bar" style="margin-top: 4px;">
+            <div class="env-cap-bar-label">
+              plan-included tokens (24h): <strong>${formatTokens(planTokens)}</strong>
+              <span class="muted"> · ChatGPT-auth Codex usage (cost_usd = 0)</span>
+            </div>
           </div>`
         : null}
       ${working > 0
@@ -6421,6 +7028,42 @@ function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, 
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState("");
   const [previewMd, setPreviewMd] = useState(true);
+  // Code-file preview/edit toggle. Same idea as previewMd but for
+  // syntax-highlighted source. Default to preview so a non-editable
+  // file (e.g. from the global root with read-only intent) still
+  // reads nicely without an extra click.
+  const [previewCode, setPreviewCode] = useState(true);
+  // Tree-vs-editor splitter width. Session-only — no localStorage so
+  // every reload starts from a sensible default. CSS clamps the actual
+  // applied width to [160px, 60% of pane width] in case the saved
+  // value somehow ends up out of range.
+  const [treeWidth, setTreeWidth] = useState(220);
+  const splitterRef = useRef(null);
+  const onSplitterPointerDown = useCallback((e) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = treeWidth;
+    const onMove = (ev) => {
+      const dx = ev.clientX - startX;
+      // Bound: 140 (tree readable minimum) ↔ 600 (still leave room for
+      // the editor). The CSS max-width:60% clamps the visual size if
+      // the pane is narrower than 1000 px.
+      const next = Math.max(140, Math.min(600, startW + dx));
+      setTreeWidth(next);
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }, [treeWidth]);
 
   // Drop handling reuses the same protocol as AgentPane so DnD works
   // the same way — we just refuse to become a drag source.
@@ -6536,6 +7179,20 @@ function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, 
     setLoading(true);
     setErr("");
     try {
+      // Extension allowlist: skip the body fetch for binaries entirely.
+      // The pane still selects the file (so the user sees it as
+      // selected) but renders a "binary" placeholder card instead.
+      if (!filesIsPreviewableText(path)) {
+        // Probe size via /api/files/tree results that are already in
+        // memory; for the size we rely on the tree node's `size` field
+        // when present, but since we don't always have that here we
+        // just skip — the placeholder reads fine without it.
+        setSelected({ root, path });
+        setContent(null);
+        setDraft("");
+        setMeta(null);
+        return;
+      }
       const res = await authedFetch(
         "/api/files/read/" + root + "?path=" + encodeURIComponent(path)
       );
@@ -6633,6 +7290,12 @@ function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, 
 
   const dirty = content !== null && draft !== content;
   const isMd = selected?.path?.toLowerCase().endsWith(".md");
+  // Code preview applies to non-markdown text files where hljs has a
+  // language match. Markdown gets its own marked+highlight pipeline
+  // (renderMarkdown) so we keep them separate.
+  const codeLang = selected ? langForFile(selected.path) : "";
+  const isCode = !isMd && !!codeLang && filesIsPreviewableText(selected?.path);
+  const isPreviewable = selected ? filesIsPreviewableText(selected.path) : false;
 
   return html`
     <section
@@ -6673,7 +7336,7 @@ function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, 
       </header>
 
       <div class="files-body">
-        <nav class="files-tree">
+        <nav class="files-tree" style=${"flex: 0 0 " + treeWidth + "px;"}>
           ${roots.map((r) => {
             const id = r.id || r.key;
             const headerIcon = r.scope === "global" ? "🌐" : "📁";
@@ -6719,6 +7382,15 @@ function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, 
           })}
         </nav>
 
+        <div
+          class="files-splitter"
+          ref=${splitterRef}
+          onPointerDown=${onSplitterPointerDown}
+          role="separator"
+          aria-orientation="vertical"
+          title="Drag to resize"
+        ><span class="files-splitter-grip" /></div>
+
         <section class="files-editor">
           ${err ? html`<div class="files-err">${err}</div>` : null}
           ${!selected
@@ -6754,11 +7426,33 @@ function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, 
                       onClick=${() => setPreviewMd(false)}
                     >edit</button>
                   </div>`
+                : isCode
+                ? html`<div class="files-md-toolbar">
+                    <button
+                      class=${previewCode ? "active" : ""}
+                      onClick=${() => setPreviewCode(true)}
+                    >preview</button>
+                    <button
+                      class=${!previewCode ? "active" : ""}
+                      onClick=${() => setPreviewCode(false)}
+                    >edit</button>
+                    <span class="files-code-lang">${codeLang}</span>
+                  </div>`
                 : null}
-              ${isMd && previewMd
+              ${!isPreviewable
+                ? html`<div class="files-binary-card">
+                    <div class="files-binary-title">Binary file — preview not supported</div>
+                    <div class="files-binary-meta">${selected.path}</div>
+                  </div>`
+                : isMd && previewMd
                 ? html`<div
                     class="files-md-preview"
                     dangerouslySetInnerHTML=${{ __html: renderMarkdown(draft) }}
+                  />`
+                : isCode && previewCode
+                ? html`<div
+                    class="files-code-preview"
+                    dangerouslySetInnerHTML=${{ __html: filesRenderCode(draft, selected.path) }}
                   />`
                 : html`<textarea
                     class="files-textarea"
@@ -7980,6 +8674,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
               initialBrief=${agent?.brief || ""}
               initialName=${agent?.name || ""}
               initialRole=${agent?.role || ""}
+              initialRuntime=${agent?.runtime_override || ""}
               onClose=${() => setSettingsOpen(false)}
             />`
           : null}

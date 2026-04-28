@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -12,8 +13,6 @@ from typing import Any
 
 from claude_agent_sdk import (
     AssistantMessage,
-    ClaudeAgentOptions,
-    HookMatcher,
     PermissionResultAllow,
     PermissionResultDeny,
     ResultMessage,
@@ -24,7 +23,6 @@ from claude_agent_sdk import (
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
-    query,
 )
 
 from server import interactions as interactions_registry
@@ -33,7 +31,7 @@ from server.db import configured_conn, resolve_active_project
 from server.events import bus
 from server.webdav import webdav
 from server.mcp_config import load_external_servers
-from server.tools import ALLOWED_COACH_TOOLS, ALLOWED_PLAYER_TOOLS, build_coord_server
+from server.tools import ALLOWED_COACH_TOOLS, ALLOWED_PLAYER_TOOLS
 from server.workspaces import workspace_dir
 
 logger = logging.getLogger("harness.agents")
@@ -162,11 +160,20 @@ async def _insert_turn_row(
     output_tokens: int | None = None,
     cache_read_tokens: int | None = None,
     cache_creation_tokens: int | None = None,
+    runtime: str = "claude",
+    cost_basis: str | None = "token_priced",
 ) -> None:
     """Insert one row into the `turns` ledger — cheap analytics table
     (one row per SDK ResultMessage). Errors are swallowed: losing a
     ledger row should never break the live turn, the event log is
-    still the source of truth for audit."""
+    still the source of truth for audit.
+
+    `runtime` — 'claude' (default) or 'codex'. Recorded for
+    by-runtime analytics + the `cost_basis` split (§G).
+    `cost_basis` — 'token_priced' (cost_usd populated from a pricing
+    table or ResultMessage.total_cost_usd) or 'plan_included' (Codex
+    on ChatGPT auth; cost_usd = 0 by design). Pass None to defer.
+    """
     if agent_id == "system":
         return
     project_id = await resolve_active_project()
@@ -178,8 +185,9 @@ async def _insert_turn_row(
                 "agent_id, project_id, started_at, ended_at, duration_ms, cost_usd, "
                 "session_id, num_turns, stop_reason, is_error, "
                 "model, plan_mode, effort, "
-                "input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, "
+                "runtime, cost_basis"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     agent_id,
                     project_id,
@@ -198,6 +206,8 @@ async def _insert_turn_row(
                     output_tokens,
                     cache_read_tokens,
                     cache_creation_tokens,
+                    runtime,
+                    cost_basis,
                 ),
             )
             await c.commit()
@@ -207,15 +217,16 @@ async def _insert_turn_row(
         logger.exception("insert_turn_row failed: agent=%s", agent_id)
 
 
-def _extract_usage(msg: Any) -> dict[str, int]:
-    """Pull token counts from a ResultMessage's usage block. Defensive
+def _extract_usage_claude(msg: Any) -> dict[str, int]:
+    """Pull token counts from a Claude `ResultMessage.usage`. Defensive
     against SDK shape drift: `usage` may be a dict, a Pydantic model,
-    or an anthropic.types.Usage. Fields we want may or may not exist
+    or an `anthropic.types.Usage`. Fields we want may or may not exist
     depending on whether prompt caching kicked in. Missing fields
     become 0 so aggregation stays well-defined."""
     u = getattr(msg, "usage", None)
     if u is None:
         return {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+
     def _get(name: str) -> int:
         v = None
         if isinstance(u, dict):
@@ -226,12 +237,55 @@ def _extract_usage(msg: Any) -> dict[str, int]:
             return int(v) if v is not None else 0
         except (TypeError, ValueError):
             return 0
+
     return {
         "input": _get("input_tokens"),
         "output": _get("output_tokens"),
         "cache_read": _get("cache_read_input_tokens"),
         "cache_creation": _get("cache_creation_input_tokens"),
     }
+
+
+def _extract_usage_codex(usage: Any) -> dict[str, int]:
+    """Pull token counts from a Codex `Turn.usage` block.
+
+    Codex shape per spec §E.5:
+      - `input_tokens`           — prompt tokens (uncached)
+      - `cached_input_tokens`    — prompt tokens served from cache
+                                   (cheaper) → mapped to cache_read
+      - `output_tokens`          — completion + reasoning tokens
+    Codex caching has no separate creation cost, so cache_creation = 0.
+
+    Accepts the usage block directly (not the wrapping message) so the
+    caller can pass either `turn.usage` or a manually-shaped dict.
+    Missing fields → 0.
+    """
+    if usage is None:
+        return {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+
+    def _get(name: str) -> int:
+        v = None
+        if isinstance(usage, dict):
+            v = usage.get(name)
+        else:
+            v = getattr(usage, name, None)
+        try:
+            return int(v) if v is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "input": _get("input_tokens"),
+        "output": _get("output_tokens"),
+        "cache_read": _get("cached_input_tokens"),
+        "cache_creation": 0,
+    }
+
+
+# Backwards-compatible alias — older code paths call `_extract_usage`
+# expecting Claude-shape input. New callers should pick the explicit
+# variant. Remove this alias once every call site is updated.
+_extract_usage = _extract_usage_claude
 
 
 # Per-model context window in tokens. Used by the auto-compact check
@@ -843,6 +897,8 @@ async def _handle_message(
                 stop_reason=str(stop_reason) if stop_reason is not None else None,
                 is_error=bool(msg.is_error),
                 model=turn_ctx.get("model"),
+                runtime=turn_ctx.get("runtime") or "claude",
+                cost_basis=turn_ctx.get("cost_basis") or "token_priced",
                 plan_mode=bool(turn_ctx.get("plan_mode")),
                 effort=turn_ctx.get("effort"),
                 input_tokens=usage["input"],
@@ -1328,6 +1384,43 @@ async def _get_session_id(agent_id: str) -> str | None:
     return v if v else None
 
 
+async def _resolve_runtime_for(agent_id: str) -> str:
+    """Resolve which runtime to use for a slot.
+
+    Order: agents.runtime_override (per-slot) → team_config role
+    default (`coach_default_runtime` / `players_default_runtime`) →
+    `'claude'`. See Docs/CODEX_RUNTIME_SPEC.md §B.1.
+
+    Always returns a non-empty string so callers can safely call
+    `get_runtime(name)` without a default.
+    """
+    role_key = "coach_default_runtime" if agent_id == "coach" else "players_default_runtime"
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT runtime_override FROM agents WHERE id = ?",
+                (agent_id,),
+            )
+            row = await cur.fetchone()
+            override = (dict(row).get("runtime_override") if row else None) or ""
+            if override in ("claude", "codex"):
+                return override
+            cur = await c.execute(
+                "SELECT value FROM team_config WHERE key = ?",
+                (role_key,),
+            )
+            row = await cur.fetchone()
+            default = (dict(row).get("value") if row else "") or ""
+            if default in ("claude", "codex"):
+                return default
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("runtime resolution failed for %s; defaulting to claude", agent_id)
+    return "claude"
+
+
 async def _get_agent_brief(agent_id: str) -> str | None:
     """Read brief from agent_project_roles for the active project."""
     ident = await _get_agent_identity(agent_id)
@@ -1679,8 +1772,8 @@ async def _build_coach_coordination_block() -> str:
 
             # ---- Team composition (active project) -----------------
             cur = await c.execute(
-                "SELECT id, locked FROM agents WHERE kind = 'player' "
-                "ORDER BY id"
+                "SELECT id, locked, runtime_override FROM agents "
+                "WHERE kind = 'player' ORDER BY id"
             )
             player_rows = [dict(r) for r in await cur.fetchall()]
             cur = await c.execute(
@@ -1834,6 +1927,27 @@ async def _build_coach_coordination_block() -> str:
             "them, and remember broadcasts also skip them. Work "
             "around this constraint — pick other Players or tell "
             "the human if no suitable unlocked Player remains."
+        )
+        lines.append("")
+
+    # PR 6: Roster runtimes — only emit when the team is mixed (any
+    # Player on Codex). Saves prompt tokens on the default all-Claude
+    # deploy. Codex agents have a different native toolset (`shell`,
+    # `apply_patch`, `web_search` instead of Bash/Edit/WebSearch);
+    # coord_* is identical on both. Coach plans differently when a
+    # task needs apply_patch-shaped editing.
+    codex_players = [
+        p["id"] for p in player_rows
+        if (p.get("runtime_override") or "").lower() == "codex"
+    ]
+    if codex_players:
+        lines.append("### Roster runtimes")
+        lines.append("")
+        lines.append(
+            f"{', '.join(codex_players)} run on Codex (OpenAI) — their "
+            "tools differ: they have `shell`, `apply_patch`, "
+            "`web_search` instead of Bash, Edit, WebSearch. coord_* is "
+            "identical on both. Players not listed here run on Claude."
         )
         lines.append("")
 
@@ -2271,6 +2385,91 @@ async def _pretool_continue_hook(
     the stream closes before the permission callback fires. Doesn't
     modify tool behavior — just keeps the channel alive."""
     return {"continue_": True}
+
+
+def _path_is_under_truth(path_str: str) -> bool:
+    """Return True if `path_str` resolves under any project's truth/.
+
+    Used by the truth-guard hook to short-circuit agent writes regardless
+    of which project is currently active, since an agent could in theory
+    pass an absolute path into another project's tree.
+    """
+    if not path_str:
+        return False
+    try:
+        target = Path(path_str).resolve()
+    except OSError:
+        return False
+    from server.paths import DATA_ROOT
+
+    projects_root = (DATA_ROOT / "projects").resolve()
+    try:
+        rel = target.relative_to(projects_root)
+    except ValueError:
+        return False
+    parts = rel.parts
+    # `<slug>/truth/...` — at least 2 parts and second is exactly "truth".
+    return len(parts) >= 2 and parts[1] == "truth"
+
+
+# Bash heuristic — match a "truth/" path component anywhere in the
+# command string. Conservative: false-positive on a literal mention
+# (e.g. an `echo "truth/foo"` log line) is acceptable because (a)
+# agents have no reason to type that, and (b) over-deny just makes
+# the agent ask Coach for help, which is exactly the intended flow.
+_BASH_TRUTH_PATTERN = re.compile(r"(?:^|[\s/=:'\"])truth/")
+
+
+async def _pretool_truth_guard_hook(
+    input_data: dict[str, Any],
+    tool_use_id: str | None,
+    context: Any,
+) -> dict[str, Any]:
+    """Block any agent write to /data/projects/<slug>/truth/.
+
+    The truth/ tree is the user's validated source-of-truth (specs,
+    brand guidelines, etc.). It must NEVER be mutated by an agent
+    without explicit human approval — the only approval channel is the
+    user editing the file themselves through the Files pane UI. Coach
+    can propose changes by messaging the user; Players cannot propose
+    truth changes at all. See `server/templates/global_claude_md.md`.
+    """
+    try:
+        tool_name = input_data.get("tool_name") or ""
+        tool_input = input_data.get("tool_input") or {}
+        violator = False
+        if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+            path_str = (
+                tool_input.get("file_path")
+                or tool_input.get("notebook_path")
+                or ""
+            )
+            if _path_is_under_truth(path_str):
+                violator = True
+        elif tool_name == "Bash":
+            cmd = str(tool_input.get("command") or "")
+            if _BASH_TRUTH_PATTERN.search(cmd):
+                violator = True
+        if not violator:
+            return {}
+        reason = (
+            "truth/ is read-only for agents. The user maintains it as "
+            "the source-of-truth for the project (specs, brand "
+            "guidelines, etc.). To propose a change, message the user "
+            "(Coach: coord_send_message to=human; Players: ask Coach "
+            "to relay) describing the proposed update; the user will "
+            "edit truth/ themselves through the Files pane."
+        )
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }
+    except Exception:
+        logger.exception("truth-guard hook error (failing open)")
+        return {}
 
 
 async def _posttool_wiki_index_hook(
@@ -2731,54 +2930,33 @@ async def run_agent(
         logger.info("paused: refused to spawn %s", agent_id)
         return
 
-    # Auto-compact trip-wire: if this agent has a prior session and its
-    # estimated context is above HARNESS_AUTO_COMPACT_THRESHOLD of the
-    # model's window, run a compact turn FIRST (which nulls session_id
-    # and writes a continuity note), then fall through to run the
-    # user's original prompt on the fresh session. The original prompt
-    # is not lost — both turns run sequentially and both show up in
-    # the timeline. Skipped when compact_mode is already True (this
-    # call *is* the compact turn, avoid recursion) or when the env
-    # threshold is unset / 0 (feature off).
-    if not compact_mode:
-        threshold_env = os.environ.get("HARNESS_AUTO_COMPACT_THRESHOLD", "0.7")
-        try:
-            threshold = float(threshold_env)
-        except ValueError:
-            threshold = 0.7
-        if 0.0 < threshold < 1.0:
-            prior = await _get_session_id(agent_id)
-            if prior:
-                used = await _session_context_estimate(prior)
-                ctx_max = _context_window_for(model)
-                if ctx_max > 0 and used / ctx_max >= threshold:
-                    await _emit(
-                        agent_id,
-                        "auto_compact_triggered",
-                        used_tokens=used,
-                        context_window=ctx_max,
-                        ratio=round(used / ctx_max, 3),
-                        threshold=threshold,
-                        deferred_prompt=prompt,
-                    )
-                    try:
-                        await run_agent(
-                            agent_id,
-                            COMPACT_PROMPT,
-                            model=model,
-                            compact_mode=True,
-                            auto_compact=True,
-                        )
-                    except Exception:
-                        # Compact failure shouldn't block the user's
-                        # actual work. Log, emit, proceed anyway — the
-                        # worst case is the context-pressure error
-                        # they'd have hit without the feature.
-                        logger.exception(
-                            "auto-compact failed for %s; proceeding on original session",
-                            agent_id,
-                        )
-                        await _emit(agent_id, "auto_compact_failed")
+    # Auto-compact trip-wire is delegated to the runtime: each runtime
+    # knows its own session-state column and context-pressure signal
+    # (Claude probes the JSONL session file; Codex returns False in v1
+    # until app-server exposes a usable signal — see
+    # CODEX_RUNTIME_SPEC.md §A.5). When the runtime returns True it
+    # already ran a COMPACT_PROMPT turn, so we fall through to run the
+    # user's original prompt on the now-fresh session.
+    from server.runtimes import get_runtime
+    from server.runtimes.base import TurnContext
+
+    _runtime_name = await _resolve_runtime_for(agent_id)
+    _runtime = get_runtime(_runtime_name)
+    _tc_compact = TurnContext(
+        agent_id=agent_id,
+        project_id="",  # not consumed by maybe_auto_compact
+        prompt=prompt,
+        system_prompt="",
+        workspace_cwd="",
+        allowed_tools=[],
+        external_mcp_servers={},
+        model=model,
+        plan_mode=plan_mode,
+        effort=effort,
+        compact_mode=compact_mode,
+        auto_compact=auto_compact,
+    )
+    await _runtime.maybe_auto_compact(_tc_compact)
 
     # Concurrent-spawn guard: check + claim the slot atomically under
     # _SPAWN_LOCK so two parallel run_agent coroutines can't both pass
@@ -2844,26 +3022,27 @@ async def run_agent(
         resumed_session=bool(prior_session),
         compact_mode=compact_mode,
         auto_compact=auto_compact,
+        # Runtime is resolved here for the event payload; the actual
+        # `runtime` / `_runtime` locals used downstream are resolved
+        # separately (the second call below) so a future change to
+        # the auto-compact path doesn't accidentally lose this field.
+        runtime=_runtime_name,
     )
 
-    coord_server = build_coord_server(agent_id)
+    # Build the allowed-tools list and discover external MCP servers
+    # in the dispatcher (runtime-agnostic — both runtimes need a list
+    # of permitted tool names + the discovered MCP server configs).
+    # The runtime then merges with its runtime-specific MCP servers
+    # (Claude attaches a coord SDK MCP; Codex would attach the stdio
+    # coord proxy).
     allowed = list(
         ALLOWED_COACH_TOOLS if agent_id == "coach" else ALLOWED_PLAYER_TOOLS
     )
-    # Team-wide extras the human opted into via the Settings drawer
-    # (e.g. WebSearch / WebFetch). Applies to every agent on every
-    # turn — read fresh each spawn so toggles take effect on the
-    # next run with no restart. Duplicates from the baseline are harmless.
     team_extras = await _get_team_extra_tools()
     if team_extras:
         allowed.extend(team_extras)
-    # External MCP servers (GitHub / Linear / Notion / …) come from
-    # HARNESS_MCP_CONFIG. Loaded fresh each spawn so edits to the
-    # config file take effect on the next turn with no restart. Empty
-    # when no config — existing coord-only behavior preserved.
     external_servers, external_tools = load_external_servers()
     allowed.extend(external_tools)
-    mcp_servers: dict[str, Any] = {"coord": coord_server, **external_servers}
 
     # Governance-layer docs (CLAUDE.md / skills / rules) from kDrive/disk.
     # Appended to the hardcoded role brief so context edits take effect on
@@ -3059,157 +3238,88 @@ async def run_agent(
             handoff_chars=len(handoff_suffix),
         )
 
-    # can_use_tool callback: intercepts AskUserQuestion and routes per
-    # agent role. Coach → human form (via pending-question event + POST
-    # /api/questions/<id>/answer). Player → Coach's inbox (via send_message
-    # + coord_answer_question tool). Callback closes over agent_id so each
-    # spawn gets a callback scoped to its caller.
-    can_use_tool_cb = _build_can_use_tool(agent_id)
-
-    options_kwargs: dict[str, Any] = dict(
-        system_prompt=system_prompt,
-        cwd=str(workspace_dir(agent_id)),
-        max_turns=MAX_TURNS_PER_SPAWN,
-        mcp_servers=mcp_servers,
-        allowed_tools=allowed,
-        # can_use_tool requires streaming mode + a PreToolUse hook that
-        # returns continue_ (documented workaround — without it the
-        # stream closes before the permission callback can fire).
-        can_use_tool=can_use_tool_cb,
-        hooks={
-            "PreToolUse": [HookMatcher(matcher=None, hooks=[_pretool_continue_hook])],
-            # Phase 7 (PROJECTS_SPEC.md §14 Resolved: INDEX.md maintenance):
-            # the HTTP file-write endpoint already rebuilds INDEX.md, but
-            # agent Write/Edit tool calls go straight to disk and bypass
-            # it. This hook closes that gap so the wiki-skill promise
-            # ("auto-maintained on every wiki write event") holds for the
-            # most common writer (the agent itself).
-            "PostToolUse": [
-                HookMatcher(
-                    # Anchored alternation so this hook only fires for the
-                    # built-in Anthropic file-write tools, not future MCP
-                    # tools that happen to contain "Write" in their name.
-                    matcher=r"^(Write|Edit|MultiEdit|NotebookEdit)$",
-                    hooks=[_posttool_wiki_index_hook],
-                )
-            ],
-        },
-    )
-    # Partial-message streaming (token-by-token text + thinking deltas)
-    # is off by default: the option is understood by recent SDK
-    # versions but the corresponding CLI flag crashes exit=1 on some
-    # Claude Code CLI builds (confirmed against 2.1.118). Flip
-    # HARNESS_STREAM_TOKENS=true once you've verified your CLI handles
-    # it (e.g. `claude --help | grep partial`). Turns still complete
-    # fine without streaming — you just don't get the typing cursor.
-    if os.environ.get("HARNESS_STREAM_TOKENS", "").lower() in ("1", "true", "yes"):
-        options_kwargs["include_partial_messages"] = True
-    # Model resolution precedence (highest -> lowest):
-    #   1. per-pane override (`model` arg, from the gear popover)
+    # Model resolution precedence (highest → lowest):
+    #   1. per-pane override (`model` arg from the gear popover)
     #   2. per-role team default (team_config: coach_default_model /
     #      players_default_model), set in the Settings drawer
-    #   3. SDK default (no kwarg passed)
+    #   3. SDK default (no kwarg)
+    # Resolved here in the dispatcher because the turn ledger row
+    # (turns.model) records what we actually told the SDK to use.
     if not model:
         model = await _get_role_default_model(agent_id)
-    if model:
-        options_kwargs["model"] = model
-    # permission_mode: the SDK api-reference documents that
-    # can_use_tool only fires reliably when permission_mode="default"
-    # is explicitly set. We set that as the baseline so our
-    # AskUserQuestion routing actually triggers, and let plan_mode
-    # override to "plan" when the pane requested it.
-    options_kwargs["permission_mode"] = "plan" if plan_mode else "default"
-    if effort and effort in _EFFORT_LEVELS:
-        options_kwargs["effort"] = _EFFORT_LEVELS[effort]
 
-    # Resume: if the last turn captured a session_id (loaded above),
-    # hand it back to the SDK so this turn continues that conversation.
-    if prior_session:
-        options_kwargs["resume"] = prior_session
-
-    options = ClaudeAgentOptions(**options_kwargs)
-
-    # (slot already claimed under _SPAWN_LOCK above — the old
-    # register-here block has been hoisted; we're past the concurrent-
-    # spawn guard AND the cost cap early return by this point.)
-
-    # Per-turn context the ResultMessage handler needs to append a row
-    # to the turns ledger. started_at is stamped fresh on each _iterate
-    # call so a stale-session retry doesn't reuse the first try's clock.
+    # Per-turn context the ResultMessage handler appends to the turns
+    # ledger. The runtime stamps started_at on each iterate call so
+    # a stale-session retry doesn't reuse the first try's clock.
     turn_ctx: dict[str, Any] = {
         "model": model,
         "plan_mode": plan_mode,
         "effort": effort,
-        # When True, the ResultMessage handler saves the accumulated
-        # assistant text to agents.continuity_note and nulls session_id,
-        # implementing a CLI-/compact-equivalent: summarize, then drop
-        # the history so the next turn starts on a clean context.
         "compact_mode": compact_mode,
-        # True when this compact turn was auto-triggered (context over
-        # threshold) vs invoked manually via /compact. Used by the
-        # stuck-session guard: an empty auto-compact force-clears
-        # session_id to escape the retry loop, whereas an empty manual
-        # /compact leaves state alone so the user can retry.
         "auto_compact": auto_compact,
-        # True when the system prompt we just built embedded a handoff
-        # section — the ResultMessage handler uses this to clear the
-        # note on the first successful non-compact turn after a
-        # compact, so stale handoffs don't re-inject forever.
         "had_handoff_on_entry": bool(handoff_suffix) and not compact_mode,
-        # User prompt this turn was started with. Snapshot here so a
-        # post-result write to agents.last_exchange_json has the pair
-        # together, even if the SDK later mutates prompt in streaming
-        # mode.
         "entry_prompt": prompt,
+        # Runtime tag flows through to the turns ledger row so
+        # by-runtime analytics are accurate even on Codex turns. The
+        # ResultMessage handler reads this when calling
+        # _insert_turn_row. cost_basis defaults inside that function;
+        # CodexRuntime sets it explicitly when auth is plan_included.
+        "runtime": _runtime_name,
     }
 
-    async def _prompt_stream():
-        # Streaming-mode prompt required for can_use_tool (Python SDK).
-        # We yield a single user message carrying the turn's prompt —
-        # identical payload the SDK would build internally for a plain
-        # string prompt, just wrapped in the streaming envelope so the
-        # permission callback can fire.
-        yield {
-            "type": "user",
-            "message": {"role": "user", "content": prompt},
-        }
+    # Hand the runtime a TurnContext with everything it needs for one
+    # turn. The runtime owns SDK options, hooks, MCP wiring, the
+    # query loop, and stale-session retry. The dispatcher's outer
+    # try/except below owns post-result exception suppression and
+    # the auto-retry counter (universal to all runtimes).
+    from server.runtimes import get_runtime
+    from server.runtimes.base import TurnContext
 
-    async def _iterate(opts: ClaudeAgentOptions) -> None:
-        # Tiny indirection so we can retry the whole iteration once
-        # after stale-session cleanup without duplicating the body.
-        turn_ctx["started_at"] = _now()
-        async for msg in query(prompt=_prompt_stream(), options=opts):
-            await _handle_message(agent_id, msg, turn_ctx)
+    runtime_name = await _resolve_runtime_for(agent_id)
+    runtime = get_runtime(runtime_name)
+    tc = TurnContext(
+        agent_id=agent_id,
+        project_id=await resolve_active_project(),
+        prompt=prompt,
+        system_prompt=system_prompt,
+        workspace_cwd=str(workspace_dir(agent_id)),
+        allowed_tools=list(allowed),
+        external_mcp_servers=external_servers,
+        model=model,
+        plan_mode=plan_mode,
+        effort=effort,
+        compact_mode=compact_mode,
+        auto_compact=auto_compact,
+        prior_session=prior_session,
+        turn_ctx=turn_ctx,
+    )
+
+    # Coord-MCP-proxy token plumbing — only minted for runtimes that
+    # use the subprocess proxy (Codex). ClaudeRuntime keeps in-process
+    # MCP and ignores the token. Lifetime = exactly one turn: minted
+    # here, revoked in the finally block below regardless of how the
+    # turn ended (success / error / cancel). The token is stashed on
+    # turn_ctx so the runtime can read it without us widening the
+    # TurnContext shape for runtime-specific plumbing.
+    spawn_token: str | None = None
+    if runtime_name == "codex":
+        from server.spawn_tokens import mint as _mint_proxy_token
+        spawn_token = _mint_proxy_token(agent_id)
+        turn_ctx["coord_proxy_token"] = spawn_token
 
     try:
-        try:
-            await _iterate(options)
-        except Exception as e:
-            # Stale session auto-heal: when we tried to resume a prior
-            # session and the CLI rejected it (happens after /login
-            # rotation or CLI upgrade — the session id is a reference
-            # the new CLI can't validate), clear the stored id and
-            # retry once without resume. Only retry when the failure
-            # matches the narrow pattern: we had a prior_session AND
-            # the error came from the SDK subprocess layer.
-            is_process_err = type(e).__name__ == "ProcessError"
-            if prior_session and is_process_err:
-                logger.warning(
-                    "agent %s: resume of session=%s failed, clearing and retrying fresh",
-                    agent_id, prior_session,
-                )
-                await _emit(
-                    agent_id,
-                    "session_resume_failed",
-                    session_id=prior_session,
-                    error=f"{type(e).__name__}: {e}",
-                )
-                await _clear_session_id(agent_id)
-                options_kwargs.pop("resume", None)
-                retry_options = ClaudeAgentOptions(**options_kwargs)
-                await _iterate(retry_options)
-            else:
-                raise
+        # Dispatcher routes manual /compact (and recursive auto-compact)
+        # turns through the runtime's compact-specific entry point so
+        # CodexRuntime can call a native `thread.compact()` instead of
+        # running a COMPACT_PROMPT turn. ClaudeRuntime's
+        # `run_manual_compact` simply delegates to `run_turn` because
+        # for Claude the compact is structurally identical (same SDK
+        # query loop, just with COMPACT_PROMPT and the
+        # `turn_ctx["compact_mode"]` flag for the ResultMessage handler).
+        if compact_mode:
+            await runtime.run_manual_compact(tc)
+        else:
+            await runtime.run_turn(tc)
     except asyncio.CancelledError:
         # User (or the cost cap) asked us to stop. Emit a distinct
         # event so the timeline shows "cancelled" rather than a
@@ -3249,7 +3359,7 @@ async def run_agent(
             # timestamp.
             logger.exception(
                 "run_agent failed: agent=%s cwd=%s",
-                agent_id, options_kwargs.get("cwd"),
+                agent_id, str(workspace_dir(agent_id)),
             )
             # Friendlier message when a ProcessError was caused by the
             # model invoking a tool we didn't allow: the CLI exits 1
@@ -3271,7 +3381,7 @@ async def run_agent(
                 agent_id,
                 "error",
                 error=err_msg,
-                cwd=options_kwargs.get("cwd"),
+                cwd=str(workspace_dir(agent_id)),
             )
             await _set_status(agent_id, "error")
             # Auto-retry: bump the consecutive-error counter and
@@ -3293,6 +3403,14 @@ async def run_agent(
         # clears the record, which is fine (first post-restart wake
         # just fires immediately).
         _last_turn_ended_at[agent_id] = time.monotonic()
+        # Revoke the coord-proxy token regardless of how the turn
+        # ended. Belt-and-braces: revoke_for_caller catches any
+        # tokens this slot accumulated through nested compact /
+        # auto-compact recursion, in case mint() was called more than
+        # once and a previous revoke missed.
+        if spawn_token is not None:
+            from server.spawn_tokens import revoke_for_caller as _revoke_proxy_tokens
+            _revoke_proxy_tokens(agent_id)
 
     await _emit(agent_id, "agent_stopped")
 

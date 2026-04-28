@@ -15,6 +15,7 @@ project's `agent_project_roles` rows.
 
 - `CLAUDE.md`              — project-specific rules, stakeholders, glossary
 - `decisions/`             — append-only durable record of "we chose X because Y" (immutable ADRs)
+- `truth/`                 — **user-validated source-of-truth** (specs, brand guidelines, contracts, invariants the user has signed off on). **Direct agent writes are blocked** — a PreToolUse hook hard-denies any `Write` / `Edit` / `MultiEdit` / `NotebookEdit` / `Bash` against `truth/`, regardless of agent. The ONLY way truth/ changes: **Coach calls `coord_propose_truth_update(path, content, summary)`** (Coach-only tool — Players get an error). The proposal goes into a queue; the user clicks approve or deny in the Environment pane. On approve, the harness writes the file using the proposed content. Coach sees `truth_proposal_approved` (or `_denied`) on the next turn. Players never propose directly — they message Coach, who decides whether to relay.
 - `working/conversations/` — agent conversation snapshots; `live: true` when persisted mid-session
 - `working/handoffs/`      — inter-agent context handoffs
 - `working/knowledge/`     — text artifacts written via `coord_write_knowledge` (specs, research, design drafts that evolve)
@@ -26,7 +27,7 @@ project's `agent_project_roles` rows.
 - `attachments/`           — UI paste-target images (read via `Read`; local-only, not synced)
 - `repo/<your-slot>/`      — your git worktree (Players only; Coach has none)
 
-The split: `decisions/`, `outputs/`, `uploads/` are the "permanent / canonical" lanes. Everything that evolves (memory, knowledge, conversations, handoffs, plans, workspace) lives under `working/`.
+The split: `decisions/`, `truth/`, `outputs/`, `uploads/` are the "permanent / canonical" lanes. Of those, `truth/` is the **only one** that is read-only for agents — the rest are agent-writable through their normal tools. Everything that evolves (memory, knowledge, conversations, handoffs, plans, workspace) lives under `working/`.
 
 ## Global resources (cross-project)
 

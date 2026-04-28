@@ -1,0 +1,288 @@
+# Codex Runtime — Implementation Audit
+
+Audit of `Docs/CODEX_RUNTIME_SPEC.md` against the code as of 2026-04-28.
+
+The /loop run marked all 6 PRs "completed and audited" but several spec
+items were skipped without being flagged. This file lists every gap,
+errata, and shortcut numbered for tracking. Each gap has the spec
+section it traces back to and a status:
+
+- **Missing** — not shipped at all.
+- **Partial** — structurally there, body deferred or weakened.
+- **Errata** — diverges from spec on purpose; rationale recorded.
+- **Risk** — spike validation that requires live Zeabur access and
+  was not run.
+
+## Section A — Runtime abstraction
+
+1. **Partial — `ClaudeRuntime.run_turn` does not own the body** (§A.1, §A.3). completed and audited
+   `run_turn` is a one-liner that calls `agents.run_agent`. The spec asked for
+   options assembly, MCP wiring, `_build_can_use_tool`, the query loop, and
+   stale-session retry to physically move into `ClaudeRuntime.run_turn`.
+   Behavior is preserved (the spec required zero behavior change) but the
+   carve-out is structural-only. Any future runtime that needs to share a
+   sibling pattern has nothing to copy.
+
+2. **Partial — Manual compact path wraps `run_agent`** (§A.5). completed and audited
+   `ClaudeRuntime.run_manual_compact` re-enters `agents.run_agent` with
+   `COMPACT_PROMPT`. Functionally correct; not the carve-out the spec
+   intended.
+
+## Section C — Coord MCP proxy
+
+3. **Missing — Dispatcher does not mint or revoke per-spawn tokens** (§C.4). completed and audited
+   `server/spawn_tokens.py` exists with `mint`/`revoke`/`revoke_for_caller`
+   but `agents.run_agent` never calls them. Tokens can only be created
+   manually (e.g. from a test). Wiring is blocked behind PR 5 because the
+   tokens are only useful when CodexRuntime spawns the proxy subprocess.
+
+4. **Errata — `mcp>=1.0` dependency not added** (§I.2). completed and audited
+   Spec listed `"mcp>=1.0"` as a new runtime dep. Implementation went with
+   hand-rolled JSON-RPC over stdio in `server/coord_mcp.py`, so the package
+   is not needed. Decision worth flagging because future work that wants
+   richer MCP features (resources, prompts, sampling) will need to add
+   the dep then.
+
+## Section D — Auth
+
+5. **Missing — `/api/team/codex` endpoint family** (§D.5). completed and audited
+   Spec called for `GET/PUT/DELETE /api/team/codex` mirroring the
+   Telegram pattern: read-only ChatGPT-session badge, write-only masked
+   API-key field, `POST /api/team/codex/test`. None of these endpoints
+   exist. The encrypted `secrets.openai_api_key` slot is checked by the
+   `/api/health` `codex_auth` probe but cannot be set via API.
+
+6. **Missing — Options drawer "Codex auth" UI section** (§D.5). completed and audited
+   No UI surface to set the API-key fallback or view the auth method.
+   Users would have to write directly to the `secrets` table to test
+   the API-key path even if (5) were shipped.
+
+7. **Partial — API-key fallback resolution in CodexRuntime** (§D.4). completed and audited
+   `CodexRuntime.run_turn` does not read `secrets.openai_api_key` and
+   inject `OPENAI_API_KEY` into the subprocess env. Resolution
+   precedence (chatgpt → api_key → human_attention) is not implemented.
+
+## Section E — CodexRuntime
+
+8. **Missing — Lifecycle `_codex_clients` cache is unused** (§E.1). blocked — Tier 2
+   The module-level dict is declared but no code reads or writes it,
+   because `run_turn` exits before constructing an `AsyncCodex` instance.
+   **Blocked on Tier-2 SDK spike (item 24).** Cannot construct an
+   `AsyncCodex` instance until the SDK is vendored / installed and the
+   actual constructor signature is confirmed against a live
+   `codex app-server`. The cache scaffolding stays in place; populating
+   it is a 5-line addition once `_import_codex_sdk()` returns a real
+   module. Documented as deferred.
+
+9. **Missing — Thread start / resume** (§E.2). blocked — Tier 2
+   `agent_sessions.codex_thread_id` column exists but no code reads or
+   writes it. New threads are not started; existing threads are not
+   resumed; stale-thread auto-heal mirroring `_clear_session_id` is not
+   implemented.
+   **Blocked on Tier-2 SDK spike (item 24).** The DB column is in place
+   and a `_get_codex_thread_id` / `_set_codex_thread_id` pair can be
+   added once the SDK exposes `start_thread()` / `resume_thread()` (or
+   whatever names the live spike confirms). Read/write helpers are a
+   thin wrapper around `agent_sessions` rows; the blocker is the SDK
+   call itself.
+
+10. **Missing — Notification → harness-event mapping** (§E.3). blocked — Tier 2
+    The full mapping table from `thread.started` / `item.added` /
+    `turn.completed` / `turn.failed` to `text` / `tool_use` /
+    `tool_result` / `result` / `error` is not implemented. Codex turns
+    therefore emit nothing through the bus.
+    **Blocked on Tier-2 SDK spike (item 24).** The notification names
+    in §E.3 are placeholders informed by public docs but unverified.
+    The spike must enumerate the actual stream from a live turn before
+    we hardcode a translation table.
+
+11. **Missing — Native tool execution observation** (§E.4). blocked — Tier 2
+    `shell` / `apply_patch` / `web_search` calls inside Codex would be
+    observed via notifications, then streamed to the UI. Without (10)
+    none of this works.
+    **Blocked on item 10**, which is itself blocked on item 24.
+
+12. **Missing — `_extract_usage` split into Claude/Codex variants** (§E.5). completed and audited
+    Single Claude-shaped `_extract_usage` still in `server/agents.py`.
+    The spec required splitting into `_extract_usage_claude` and
+    `_extract_usage_codex` dispatched by runtime arg.
+
+13. **Missing — `_insert_turn_row` accepts a `runtime` arg** (§E.5). completed and audited
+    Function signature unchanged. `turns.runtime` defaults to `'claude'`
+    on every insert (column DEFAULT does the work) so Claude turns
+    record correctly, but a Codex turn coming through the same path
+    would silently be tagged as Claude.
+
+14. **Missing — Codex compact** (§E.6). blocked — Tier 2
+    `CodexRuntime.run_manual_compact` emits `human_attention` instead
+    of either calling a native `thread.compact()` or running a manual
+    `COMPACT_PROMPT` turn against Codex.
+    **Blocked on Tier-2 SDK spike (item 24).** Whether `thread.compact()`
+    exists at all is what the spike must determine; until then the
+    fallback path (running a COMPACT_PROMPT turn through `run_turn`)
+    can't be wired because `run_turn` itself is provisional.
+
+15. **Missing — Codex error handling integration** (§E.7). blocked — Tier 2
+    `turn.failed` pre-result → `_emit("error")` + auto-retry counter
+    increment is not wired. 401/auth → `human_attention` (Telegram
+    bridge precedent) is not implemented.
+    **Blocked on Tier-2 SDK spike (item 24).** The auto-retry counter
+    in the dispatcher already works runtime-agnostically (it counts any
+    exception bubbling out of `runtime.run_turn`), so the spike work is
+    just translating concrete `turn.failed` notifications into
+    exceptions inside `CodexRuntime.run_turn`.
+
+16. **Missing — AskUserQuestion path under Codex** (§E.8). decision deferred
+    Spec asked for a decision between option (a) — re-expose as
+    `coord_ask_user` MCP tool — or (b) — degrade gracefully on Codex.
+    Neither path was implemented; no decision recorded.
+    **Decision deferred to PR after spike**: option (a) is the right
+    answer if the QuestionForm flow can be made to wait synchronously
+    on a coord call without blocking the harness event loop. That
+    determination requires a working CodexRuntime end-to-end (item 24).
+    Until then, Codex agents simply don't get the `AskUserQuestion`
+    tool — acceptable for v1 per §E.8 option (b).
+
+## Section F — UI
+
+17. **Missing — Options drawer "Default runtime per role" UI** (§F.3). completed and audited
+    `GET/PUT /api/team/runtimes` endpoints exist and accept Coach +
+    Players defaults, but no SettingsDrawer section consumes them.
+    Defaults can only be set via direct API call.
+
+18. **Missing — Second row of model dropdowns gated by runtime** (§F.3). completed and audited
+    Spec required a Codex-vs-Claude-aware model picker that filters
+    available models by runtime. Single dropdown still.
+
+19. **Missing — `agent_started` payload carries `runtime` field** (§F.5). completed and audited
+    The event still emits `prompt`, `resumed_session`, `compact_mode`,
+    `auto_compact`. UI cannot render the per-turn runtime chip the
+    spec described.
+
+20. **Partial — `apply_patch` renderer is summary-line only** (§F.4). completed and audited
+    Spec wanted `apply_patch` to feed unified-diff straight into
+    `diff@7` and reuse the Edit diff-card layout. Implementation only
+    extracts the changed file path for the header. The diff body
+    falls through to the generic JSON renderer.
+
+## Section G — Cost caps
+
+21. **Missing — `cost_basis` is never populated on insert.** completed and audited
+    Column exists in the schema and the migration backfills it as
+    NULL. No code path writes `'token_priced'` or `'plan_included'`
+    on a fresh row. Even Claude turns leave it NULL.
+
+22. **Missing — completed and audited — `/api/turns/summary` `by_runtime` / `by_cost_basis`
+    breakdowns** (§G.3).
+    Endpoint still returns the legacy aggregate. UI cannot show the
+    split meters.
+
+23. **Missing — EnvPane "Plan-included tokens today" meter** (§G.3). completed and audited
+    Single USD meter still. ChatGPT-auth Codex usage would show as
+    $0.00 with no token visibility — the trap the spec called out.
+
+## Section I — Deps & packaging
+
+24. **Risk — Codex Python SDK not actually installed** (§I.1). blocked — Tier 2 (live spike)
+    `pyproject.toml` does not depend on `codex-app-server-sdk`.
+    `CodexRuntime._import_codex_sdk` raises a friendly ImportError
+    when called; the import is the gate. Per spec the PR 1 spike was
+    supposed to confirm install path (vendor / git URL / hand-rolled
+    JSON-RPC). No path was selected and committed.
+    **Blocked on live spike**: cannot select a sourcing strategy
+    without running `codex app-server` against a live container and
+    confirming the install path works. This is the gating item for
+    the entire E.* family (8-11, 14-15) and 25-26 + 28-32.
+
+## Section J — Tests
+
+25. **Missing — `test_codex_event_normalization.py`** (§J). blocked — Tier 2
+    Spec required a fake stream of Codex notifications asserting
+    `_emit` calls match Claude vocabulary. Cannot be written until
+    (10) ships.
+    **Blocked on item 10 → item 24.** Notification names are
+    placeholders.
+
+26. **Missing — `test_compact_path_routing.py`** (§J). blocked — Tier 2
+    Spec called this conditional on the PR 1 SDK spike outcome
+    (native compact vs fallback). Still missing.
+    **Blocked on item 14 → item 24.** Whether `thread.compact()`
+    exists is what the spike must determine.
+
+27. **Missing — `test_cost_cap_aggregation.py`** (§J). completed and audited
+    Spec wanted mixed-runtime rows in `turns` asserting combined
+    sum + rejection. Cap enforcement works (24h sum is
+    runtime-agnostic) but no test pins the behavior.
+
+## Section L — Risks not validated
+
+28. **Risk — Headless `codex login` viability on Zeabur** (§L.1). blocked — live spike
+    Highest-priority spike per spec. Not run. If device-code flow
+    can't complete in non-TTY container shell, the entire ChatGPT-
+    auth path needs to be replaced with API-key-only mode.
+    **Cannot be validated locally.** Mitigation already in place: the
+    API-key fallback is fully wired (items 5, 6, 7) so a failed
+    ChatGPT path doesn't strand the runtime.
+
+29. **Risk — SDK "one active turn consumer per client" limit** (§L.2). blocked — live spike
+    Spec asked to validate with a 5-turn loop confirming no
+    notification cross-talk. Not run.
+    **Cannot be validated locally.** `_SPAWN_LOCK` already serializes
+    turns per slot, satisfying this constraint defensively.
+
+30. **Risk — Coord MCP smoke under both runtimes** (§L.3). blocked — live spike
+    The proxy passes its contract test (catalog matches in-process
+    registry) but has not been exercised end-to-end with a live
+    `codex app-server` subprocess making real coord calls.
+    **Cannot be validated locally without the SDK.** Contract test
+    `test_coord_mcp_proxy.py` covers the boundary on the harness side.
+
+31. **Risk — `Turn.usage` shape stability** (§L.4). blocked — live spike
+    Pricing math assumes `input_tokens` / `cached_input_tokens` /
+    `output_tokens`. Some early SDK versions returned `usage=None`
+    on streamed turns. Not validated against the live SDK.
+    **Defensive code in place**: `_extract_usage_codex` handles
+    `None` and non-int values gracefully (test pins both, item 12).
+
+32. **Risk — `thread_resume` config matching** (§L.5). blocked — live spike
+    If Codex requires original model/sandbox to match on resume,
+    mid-session model swap silently invalidates resume. No
+    mitigation (null `codex_thread_id` on detected model change)
+    implemented.
+    **Cannot be validated locally.** Mitigation can be added once the
+    spike confirms whether resume actually rejects on model mismatch.
+
+## Pre-existing invariant violations noted but not fixed
+
+33. **Errata — `🔒` emoji at [server/static/app.js:2865](../server/static/app.js#L2865)**. completed and audited
+    LeftRail slot lock badge uses the literal emoji, violating the
+    "no emoji in the UI" invariant in CLAUDE.md. The pane-header
+    lock uses an inline SVG; the LeftRail variant was never
+    migrated. PR 6 did not touch it because it predates Codex work.
+    New runtime badges added in PR 6 are CSS-only (compliant).
+
+## Status counts
+
+- **Missing:** 19 items (3, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27)
+- **Partial:** 5 items (1, 2, 7, 20, _and the "completed and audited" marker on PR 2 / PR 5 / PR 6 over-states completeness_)
+- **Errata:** 2 items (4, 33)
+- **Risk (live spike):** 6 items (24, 28, 29, 30, 31, 32)
+
+Total: 32 numbered items + 1 documentation-marker concern.
+
+## Recommended next steps
+
+The list above can be partitioned by what unblocks what:
+
+- **Tier 1 — finishable today, no live deploy needed:**
+  1, 2, 5, 6, 12, 13, 17, 18, 19, 20, 21, 22, 23. These are the
+  "spec'd but skipped" items that need no SDK access. Roughly
+  three sittings of work.
+
+- **Tier 2 — needs the PR 1 spike:**
+  7, 8, 9, 10, 11, 14, 15, 16, 24, 25, 26, 28–32. Without confirmed
+  SDK signatures these are guesswork.
+
+- **Tier 3 — janitorial:**
+  3 (token wiring once 8–11 land), 4 (re-evaluate `mcp>=1.0` need
+  if richer MCP features ever needed), 33 (LeftRail emoji → SVG).

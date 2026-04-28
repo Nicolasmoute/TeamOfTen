@@ -52,7 +52,14 @@ CREATE TABLE IF NOT EXISTS agents (
     started_at            TEXT,
     last_heartbeat        TEXT,
     allowed_extra_tools   TEXT,
-    locked                INTEGER NOT NULL DEFAULT 0
+    locked                INTEGER NOT NULL DEFAULT 0,
+    -- Slot-level runtime preference. Nullable so role defaults can
+    -- apply (resolution: agents.runtime_override → team_config role
+    -- default → 'claude'). NOT NULL with a default would silently
+    -- ignore role defaults. See Docs/CODEX_RUNTIME_SPEC.md §B.1.
+    runtime_override      TEXT
+                          CHECK (runtime_override IS NULL
+                                 OR runtime_override IN ('claude','codex'))
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -187,7 +194,15 @@ CREATE TABLE IF NOT EXISTS turns (
     input_tokens          INTEGER,
     output_tokens         INTEGER,
     cache_read_tokens     INTEGER,
-    cache_creation_tokens INTEGER
+    cache_creation_tokens INTEGER,
+    -- Which runtime executed this turn. No CHECK constraint so future
+    -- runtimes don't require a schema migration to record turns.
+    runtime               TEXT NOT NULL DEFAULT 'claude',
+    -- 'token_priced' (cost_usd populated from a pricing table) or
+    -- 'plan_included' (ChatGPT-auth Codex; cost_usd = 0, tokens
+    -- populated for visibility). NULL on legacy rows. See
+    -- Docs/CODEX_RUNTIME_SPEC.md §G.
+    cost_basis            TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_turns_agent    ON turns(agent_id, id);
@@ -248,6 +263,12 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
     last_active         TEXT,
     continuity_note     TEXT,
     last_exchange_json  TEXT,
+    -- Codex thread id for this (slot, project). Separate from
+    -- session_id (Claude) because each runtime has its own continuation
+    -- state — a single field would force tagging or clear-on-runtime-
+    -- change and break the symmetric switch-back case. See
+    -- Docs/CODEX_RUNTIME_SPEC.md §B.1.
+    codex_thread_id     TEXT,
     PRIMARY KEY (slot, project_id)
 );
 
@@ -273,6 +294,32 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_synced_at   TEXT NOT NULL,
     PRIMARY KEY (project_id, tree, path)
 );
+
+-- truth/ proposals — Coach proposes changes to user-validated source-of-
+-- truth files, the human approves/denies, the harness applies the
+-- approved write server-side. Players cannot propose; the
+-- `coord_propose_truth_update` MCP tool is Coach-only. The PreToolUse
+-- truth-guard hook denies any direct agent Write/Edit/Bash on truth/
+-- regardless of role, so this table is the only path through which
+-- truth/ ever changes.
+CREATE TABLE IF NOT EXISTS truth_proposals (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    proposer_id       TEXT NOT NULL,                 -- 'coach' (enforced at tool layer)
+    -- relative path under /data/projects/<slug>/truth/
+    path              TEXT NOT NULL,
+    proposed_content  TEXT NOT NULL,                 -- full new file body
+    summary           TEXT NOT NULL,                 -- one-line "why" the user reads
+    status            TEXT NOT NULL DEFAULT 'pending'
+                      CHECK (status IN ('pending', 'approved', 'denied', 'cancelled')),
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    resolved_at       TEXT,
+    resolved_by       TEXT,                          -- 'human' (only legal value today)
+    resolved_note     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_truth_proposals_project_status
+    ON truth_proposals(project_id, status);
 """
 
 # Seed agents — idempotent via INSERT OR IGNORE. Per-(slot, project)
@@ -320,6 +367,29 @@ async def crash_recover() -> dict[str, int]:
     return {"agents_reset": agents_reset, "tasks_reset": tasks_reset}
 
 
+async def _ensure_columns(
+    db: aiosqlite.Connection,
+    table: str,
+    cols: list[tuple[str, str]],
+) -> None:
+    """Add missing columns to an existing table.
+
+    `cols` is a list of `(column_name, full_ddl_fragment)` pairs where
+    `full_ddl_fragment` is everything after `ADD COLUMN` (e.g.
+    `runtime TEXT NOT NULL DEFAULT 'claude'`).
+
+    SQLite's `ALTER TABLE … ADD COLUMN … NOT NULL DEFAULT …` populates
+    existing rows with the default automatically — no UPDATE needed.
+    CHECK constraints can't be added by ALTER TABLE without a full
+    table rebuild, so validate those at the API layer instead.
+    """
+    cur = await db.execute(f"PRAGMA table_info({table})")
+    existing = {row[1] for row in await cur.fetchall()}
+    for name, ddl in cols:
+        if name not in existing:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 async def init_db() -> None:
     """Create schema + seed agents. Called once on FastAPI startup.
 
@@ -362,6 +432,32 @@ async def init_db() -> None:
             await db.execute("PRAGMA foreign_keys = ON")
             logger.info("init_db: pragmas set, running schema")
             await db.executescript(SCHEMA)
+
+            # Inline migration runner — CREATE TABLE IF NOT EXISTS
+            # only creates missing tables, it doesn't add columns to
+            # existing ones. ALTER TABLE … ADD COLUMN populates new
+            # columns with the DEFAULT for existing rows; CHECK
+            # constraints can't be added retroactively without a table
+            # rebuild, so per-column CHECKs are validated at the API
+            # layer instead. Idempotent on re-run.
+            await _ensure_columns(
+                db,
+                "agents",
+                [("runtime_override", "runtime_override TEXT")],
+            )
+            await _ensure_columns(
+                db,
+                "agent_sessions",
+                [("codex_thread_id", "codex_thread_id TEXT")],
+            )
+            await _ensure_columns(
+                db,
+                "turns",
+                [
+                    ("runtime", "runtime TEXT NOT NULL DEFAULT 'claude'"),
+                    ("cost_basis", "cost_basis TEXT"),
+                ],
+            )
 
             logger.info("init_db: schema ok, ensuring misc project")
             # Ensure the fallback project + active-project pointer

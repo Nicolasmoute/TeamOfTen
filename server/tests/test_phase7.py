@@ -488,3 +488,381 @@ async def test_posttool_wiki_index_hook_skips_index_itself(fresh_db) -> None:
     )
     after = gp.wiki_index.stat().st_mtime_ns
     assert after == before
+
+
+# ---------- Truth folder + PreToolUse guard hook ------------------
+
+
+def test_truth_folder_in_project_paths(fresh_db) -> None:
+    """ProjectPaths exposes a `truth` field at /data/projects/<slug>/truth/."""
+    from server.paths import ensure_project_scaffold
+
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    assert pp.truth.name == "truth"
+    assert pp.truth.parent == pp.root
+    assert pp.truth.is_dir()
+
+
+async def test_truth_guard_denies_write_under_truth(fresh_db) -> None:
+    """Agent Write to /data/projects/<slug>/truth/anything must be denied."""
+    from server.agents import _pretool_truth_guard_hook
+    from server.paths import ensure_project_scaffold
+
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    target = pp.truth / "specs.md"
+    res = await _pretool_truth_guard_hook(
+        {"tool_name": "Write", "tool_input": {"file_path": str(target)}},
+        "tu_1",
+        None,
+    )
+    out = res.get("hookSpecificOutput") or {}
+    assert out.get("permissionDecision") == "deny"
+    assert "truth/" in (out.get("permissionDecisionReason") or "")
+
+
+async def test_truth_guard_allows_writes_outside_truth(fresh_db) -> None:
+    """Writes to non-truth paths (working/, knowledge/, etc.) pass through."""
+    from server.agents import _pretool_truth_guard_hook
+    from server.paths import ensure_project_scaffold
+
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    for safe in (
+        pp.working_workspace / "scratch.txt",
+        pp.knowledge / "notes.md",
+        pp.decisions / "0001-something.md",
+        pp.outputs / "deck.pdf",
+    ):
+        res = await _pretool_truth_guard_hook(
+            {"tool_name": "Write", "tool_input": {"file_path": str(safe)}},
+            "tu_1",
+            None,
+        )
+        assert res == {}, f"unexpected deny for {safe}: {res}"
+
+
+async def test_truth_guard_denies_edit_and_multiedit(fresh_db) -> None:
+    """All four file-mutating tools route through file_path the same way."""
+    from server.agents import _pretool_truth_guard_hook
+    from server.paths import ensure_project_scaffold
+
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    target = str(pp.truth / "brand.md")
+    for tool_name in ("Edit", "MultiEdit", "NotebookEdit"):
+        key = "notebook_path" if tool_name == "NotebookEdit" else "file_path"
+        res = await _pretool_truth_guard_hook(
+            {"tool_name": tool_name, "tool_input": {key: target}},
+            "tu_1",
+            None,
+        )
+        out = res.get("hookSpecificOutput") or {}
+        assert out.get("permissionDecision") == "deny", \
+            f"{tool_name} should have been denied"
+
+
+async def test_truth_guard_denies_bash_writing_into_truth(fresh_db) -> None:
+    """Bash redirects into truth/ are caught by the substring heuristic."""
+    from server.agents import _pretool_truth_guard_hook
+    from server.paths import ensure_project_scaffold
+
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    cases = [
+        "echo hello > truth/specs.md",
+        "cat input.txt >> /data/projects/misc/truth/brand.md",
+        "cp deck.pdf truth/deck.pdf",
+    ]
+    for cmd in cases:
+        res = await _pretool_truth_guard_hook(
+            {"tool_name": "Bash", "tool_input": {"command": cmd}},
+            "tu_1",
+            None,
+        )
+        out = res.get("hookSpecificOutput") or {}
+        assert out.get("permissionDecision") == "deny", f"cmd not denied: {cmd}"
+
+
+async def test_truth_guard_lets_innocuous_bash_through(fresh_db) -> None:
+    """Bash commands that don't reference truth/ pass through (no false-deny)."""
+    from server.agents import _pretool_truth_guard_hook
+
+    for cmd in (
+        "ls -la",
+        "git status",
+        "echo trustworthy",       # contains 'trust' but not 'truth/'
+        "cat /data/projects/misc/working/notes.md",
+    ):
+        res = await _pretool_truth_guard_hook(
+            {"tool_name": "Bash", "tool_input": {"command": cmd}},
+            "tu_1",
+            None,
+        )
+        assert res == {}, f"unexpected deny for cmd: {cmd!r} -> {res}"
+
+
+# ---------- Truth proposals (Coach proposes → human approves) -----
+
+
+def test_coord_propose_truth_update_in_coord_allowlist() -> None:
+    """The new tool is registered so the SDK will actually accept calls.
+    Coach-only enforcement is in the tool body (caller_is_coach
+    rejection); the tool is in the shared coord allowlist alongside
+    other Coach-rejecting tools like coord_write_decision."""
+    from server.tools import ALLOWED_COORD_TOOLS
+
+    assert "mcp__coord__coord_propose_truth_update" in ALLOWED_COORD_TOOLS
+
+
+async def test_truth_proposals_schema_smoke(fresh_db) -> None:
+    """truth_proposals table exists, accepts an insert, status defaults
+    to 'pending', and the CHECK constraint rejects bad statuses."""
+    await init_db()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "INSERT INTO truth_proposals "
+            "(project_id, proposer_id, path, proposed_content, summary) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (MISC_PROJECT_ID, "coach", "specs.md", "body", "summary"),
+        )
+        await c.commit()
+        row_id = cur.lastrowid
+        cur = await c.execute(
+            "SELECT status FROM truth_proposals WHERE id = ?", (row_id,),
+        )
+        row = await cur.fetchone()
+        assert row[0] == "pending"
+
+        import sqlite3
+        try:
+            await c.execute(
+                "INSERT INTO truth_proposals "
+                "(project_id, proposer_id, path, proposed_content, "
+                "summary, status) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    MISC_PROJECT_ID, "coach", "x.md", "b", "s",
+                    "bogus-status",
+                ),
+            )
+            assert False, "CHECK constraint should have rejected"
+        except sqlite3.IntegrityError:
+            pass
+    finally:
+        await c.close()
+
+
+async def test_resolve_truth_proposal_approve_writes_file_and_marks_row(
+    fresh_db,
+) -> None:
+    """Approve flow: pending row → file written under truth/ → row
+    marked approved. The actor goes into the event payload."""
+    from server.truth import resolve_truth_proposal
+    from server.paths import ensure_project_scaffold
+
+    await init_db()
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "INSERT INTO truth_proposals "
+            "(project_id, proposer_id, path, proposed_content, summary) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                MISC_PROJECT_ID, "coach", "specs.md",
+                "# Specs\n\nbody.\n",
+                "Add launch-date constraint",
+            ),
+        )
+        await c.commit()
+        proposal_id = cur.lastrowid
+    finally:
+        await c.close()
+
+    res = await resolve_truth_proposal(
+        proposal_id,
+        new_status="approved",
+        note="LGTM",
+        actor={"source": "ui", "ip": "127.0.0.1", "ua": "test"},
+    )
+    assert res["ok"] is True
+    assert res["status"] == "approved"
+
+    written = pp.truth / "specs.md"
+    assert written.is_file()
+    assert written.read_text(encoding="utf-8") == "# Specs\n\nbody.\n"
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT status, resolved_by, resolved_note FROM truth_proposals "
+            "WHERE id = ?", (proposal_id,),
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    assert row[0] == "approved"
+    assert row[1] == "human"
+    assert row[2] == "LGTM"
+
+
+async def test_resolve_truth_proposal_deny_does_not_write(fresh_db) -> None:
+    """Deny: row marked denied, NO file write under truth/."""
+    from server.truth import resolve_truth_proposal
+    from server.paths import ensure_project_scaffold
+
+    await init_db()
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "INSERT INTO truth_proposals "
+            "(project_id, proposer_id, path, proposed_content, summary) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                MISC_PROJECT_ID, "coach", "rejected.md",
+                "should not appear", "no thanks",
+            ),
+        )
+        await c.commit()
+        proposal_id = cur.lastrowid
+    finally:
+        await c.close()
+
+    res = await resolve_truth_proposal(
+        proposal_id, new_status="denied", note="not now",
+        actor={"source": "ui", "ip": "127.0.0.1", "ua": "test"},
+    )
+    assert res["status"] == "denied"
+
+    assert not (pp.truth / "rejected.md").exists()
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT status, resolved_note FROM truth_proposals WHERE id = ?",
+            (proposal_id,),
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    assert row[0] == "denied"
+    assert row[1] == "not now"
+
+
+async def test_resolve_truth_proposal_approves_yaml_and_oversize_md(
+    fresh_db,
+) -> None:
+    """Regression: the resolver originally delegated to filesmod.write_text
+    which only allows .md/.txt and caps at 100 KB. Truth/ holds specs,
+    brand guidelines, contracts — often .yaml/.json/.toml, sometimes
+    >100 KB. Both must approve cleanly now that truth.py does its own
+    write."""
+    from server.truth import resolve_truth_proposal
+    from server.paths import ensure_project_scaffold
+
+    await init_db()
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+
+    yaml_body = "primary_color: '#0066cc'\nsecondary_color: '#003366'\n"
+    big_md = "# Spec\n\n" + ("paragraph. " * 12_000)  # ~144 KB > 100 KB
+    assert len(big_md) > 100_000
+
+    for path, content in (
+        ("brand-colors.yaml", yaml_body),
+        ("massive-spec.md",   big_md),
+    ):
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "INSERT INTO truth_proposals "
+                "(project_id, proposer_id, path, proposed_content, summary) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (MISC_PROJECT_ID, "coach", path, content, "test"),
+            )
+            await c.commit()
+            proposal_id = cur.lastrowid
+        finally:
+            await c.close()
+
+        res = await resolve_truth_proposal(
+            proposal_id, new_status="approved", note=None,
+            actor={"source": "ui", "ip": "127.0.0.1", "ua": "test"},
+        )
+        assert res["status"] == "approved", f"failed for {path}: {res}"
+        written = pp.truth / path
+        assert written.is_file()
+        assert written.read_text(encoding="utf-8") == content
+
+
+async def test_truth_proposal_path_traversal_rejected(fresh_db) -> None:
+    """A maliciously-crafted DB row with `../` segments must fail the
+    truth_root.relative_to() check rather than escape into other
+    project subdirs. (The MCP tool already rejects '..' at insert
+    time, but defense-in-depth: a manual sqlite insert / migration
+    bug shouldn't be able to bypass.)"""
+    from server.truth import (
+        TruthProposalBadRequest, resolve_truth_proposal,
+    )
+    from server.paths import ensure_project_scaffold
+
+    await init_db()
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "INSERT INTO truth_proposals "
+            "(project_id, proposer_id, path, proposed_content, summary) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                MISC_PROJECT_ID, "coach",
+                "../decisions/sneaky.md",  # would land in decisions/
+                "x", "s",
+            ),
+        )
+        await c.commit()
+        proposal_id = cur.lastrowid
+    finally:
+        await c.close()
+
+    try:
+        await resolve_truth_proposal(
+            proposal_id, new_status="approved", note=None,
+            actor={"source": "ui", "ip": "127.0.0.1", "ua": "test"},
+        )
+        assert False, "traversal should have raised TruthProposalBadRequest"
+    except TruthProposalBadRequest as e:
+        assert "truth/" in str(e)
+
+
+async def test_resolve_truth_proposal_idempotent_conflict(fresh_db) -> None:
+    """A non-pending proposal can't be re-resolved — raises Conflict."""
+    from server.truth import (
+        TruthProposalConflict, resolve_truth_proposal,
+    )
+    from server.paths import ensure_project_scaffold
+
+    await init_db()
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "INSERT INTO truth_proposals "
+            "(project_id, proposer_id, path, proposed_content, summary, "
+            "status, resolved_at, resolved_by) "
+            "VALUES (?, ?, ?, ?, ?, 'approved', ?, 'human')",
+            (
+                MISC_PROJECT_ID, "coach", "already.md", "x", "s",
+                "2026-04-28T00:00:00Z",
+            ),
+        )
+        await c.commit()
+        proposal_id = cur.lastrowid
+    finally:
+        await c.close()
+
+    try:
+        await resolve_truth_proposal(
+            proposal_id, new_status="denied", note=None,
+            actor={"source": "ui", "ip": "127.0.0.1", "ua": "test"},
+        )
+        assert False, "second resolve should have raised TruthProposalConflict"
+    except TruthProposalConflict as e:
+        assert e.status == "approved"

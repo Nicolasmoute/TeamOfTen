@@ -584,9 +584,21 @@ build, (ii) print the actual installed `AsyncCodex` method signatures,
 
 ### I.2 Other Python deps (`pyproject.toml`)
 
+**Implementation note (errata — diverges from this section):** the
+`coord_mcp` proxy in `server/coord_mcp.py` was implemented as
+hand-rolled JSON-RPC 2.0 over stdio rather than using the `mcp`
+package. The proxy only needs `initialize`, `tools/list`,
+`tools/call`, and `ping` — about 200 lines of dispatcher. Pulling
+in `mcp>=1.0` (which is large, brings its own pydantic schemas,
+and pins MCP protocol versions) wasn't justified. Add the dep
+later if `coord_mcp` ever needs richer MCP features (resources,
+prompts, sampling).
+
+The pyproject deps stay minimal:
+
 ```toml
-"mcp>=1.0",                # NEW — coord_mcp stdio server
 # codex SDK added via git source URL or vendored path (see I.1)
+# (no `mcp` dep — see note above)
 ```
 
 ### I.3 Package discovery
@@ -657,7 +669,7 @@ Existing pattern: DB-level pytest, no FastAPI TestClient. New tests:
 
 ## K. Phased rollout — revised PR boundaries
 
-**PR 1 — Codex install/auth spike (no runtime code).**
+**PR 1 — Codex install/auth spike (no runtime code).** completed and audited
 - Dockerfile: install Codex CLI, `CODEX_HOME=/data/codex`.
 - Source the Python SDK per §I.1 option (b); vendor a Codex repo
   commit; smoke test `codex app-server --help` and a minimal
@@ -670,14 +682,14 @@ Existing pattern: DB-level pytest, no FastAPI TestClient. New tests:
 - Extend `/api/health` with `codex_auth.*`.
 - Packaging: switch `pyproject.toml` to discovery (§I.3).
 
-**PR 2 — Runtime abstraction, Claude-only.**
+**PR 2 — Runtime abstraction, Claude-only.** completed and audited
 - `server/runtimes/` package, `AgentRuntime`, `ClaudeRuntime` carved
   out of `run_agent`. Zero behavior change.
 - New `test_runtime_dispatch.py`. All ~113 existing tests green.
 - Manual smoke: Coach + 2 Players, code-touching turn, /compact,
   mid-turn cancel, project switch.
 
-**PR 3 — DB migration on `agent_sessions`.**
+**PR 3 — DB migration on `agent_sessions`.** completed and audited
 - Add `agents.runtime_override` (nullable), `agent_sessions.codex_thread_id`,
   `turns.runtime`, `turns.cost_basis` (§B).
 - `_ensure_columns` migration runner.
@@ -685,7 +697,7 @@ Existing pattern: DB-level pytest, no FastAPI TestClient. New tests:
 - No Codex code yet — this PR is just schema + the slot-level
   preference plumbed through, defaulting to `'claude'` everywhere.
 
-**PR 4 — Coord MCP proxy.**
+**PR 4 — Coord MCP proxy.** completed and audited
 - `server/coord_mcp.py` as the stdio→HTTP proxy (§C.2–C.4).
 - `POST /api/_coord/{tool}` internal endpoints (loopback bind +
   per-spawn token).
@@ -694,7 +706,7 @@ Existing pattern: DB-level pytest, no FastAPI TestClient. New tests:
 - Contract test: enumerate the proxy tool list and assert it
   matches `build_coord_server`'s registered tools.
 
-**PR 5 — CodexRuntime behind a feature flag, one-slot pilot.**
+**PR 5 — CodexRuntime behind a feature flag, one-slot pilot.** completed and audited
 - `server/runtimes/codex.py`, `server/pricing.py`.
 - `HARNESS_CODEX_ENABLED=true` env gate; `PUT /api/agents/{id}/runtime`
   rejects `codex` when the flag is unset.
@@ -705,7 +717,7 @@ Existing pattern: DB-level pytest, no FastAPI TestClient. New tests:
 - AskUserQuestion path decided per §E.8.
 - Cost-basis split working (§G); EnvPane shows both meters.
 
-**PR 6 — UI polish, renderers, mixed-team prompting.**
+**PR 6 — UI polish, renderers, mixed-team prompting.** completed and audited
 - LeftRail runtime badge.
 - Pane settings popover Runtime radio.
 - Options drawer per-role default + per-runtime model dropdowns.

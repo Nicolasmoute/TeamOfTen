@@ -630,6 +630,17 @@ preceding it.
 
 ---
 
+## Per-agent runtimes (Claude + Codex)
+
+The harness ships two runtimes (`server/runtimes/`):
+
+- **ClaudeRuntime** — default. Backed by `claude-agent-sdk`. In-process MCP for `coord_*`. All 11 slots use this unless overridden.
+- **CodexRuntime** — gated behind `HARNESS_CODEX_ENABLED`. Backed by the `codex-app-server-sdk` (provisional — PR 1 spike must confirm signatures). Native tools are `shell` / `apply_patch` / `web_search` instead of `Bash` / `Edit` / `WebSearch`. `coord_*` is identical via the stdio→loopback proxy in `server/coord_mcp.py`.
+
+Resolution at spawn time: `agents.runtime_override` (per-slot) → role default in `team_config` (`coach_default_runtime` / `players_default_runtime`) → `'claude'`. Set the per-slot override via the pane gear popover or `PUT /api/agents/{id}/runtime`.
+
+For full design: `Docs/CODEX_RUNTIME_SPEC.md`. The dispatcher in `agents.run_agent` is runtime-agnostic; the runtime-specific work lives behind the `AgentRuntime` protocol in `server/runtimes/base.py`.
+
 ## Known gotchas
 
 ### Claude CLI auth: persist via `CLAUDE_CONFIG_DIR` on the /data volume
@@ -641,6 +652,12 @@ Confirmed via M-1 spike. `~/.claude.json` holds only local CLI config (numStartu
 - On first deploy (or if you rotate secrets): shell into the container, run `claude`, type `/login`, follow the device-code flow once.
 - After that, every redeploy finds the existing token and you don't re-authenticate.
 - `/api/health` exposes `claude_auth.credentials_present: true/false` so you can confirm persistence without logging in to check.
+
+### Codex CLI auth: same `/data` strategy via `CODEX_HOME=/data/codex`
+
+The Dockerfile sets `CODEX_HOME=/data/codex` so Codex's `auth.json` (ChatGPT session) survives redeploys, mirroring the `CLAUDE_CONFIG_DIR` rule. Headless `codex login` viability is the highest-risk PR 1 spike item — if device-code can't complete in non-TTY container shell, fall back to API-key-only Codex via the `openai_api_key` entry in the encrypted `secrets` table.
+
+`/api/health` exposes `codex_auth.{credentials_present, method}` (`method` = `chatgpt` / `api_key` / `none`).
 
 ### Zeabur geo-block: install via npm, not the shell installer
 

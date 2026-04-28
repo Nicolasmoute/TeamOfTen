@@ -29,7 +29,7 @@ const EXT_TO_LANG = {
   ".yaml": "yaml", ".yml": "yaml",
 };
 
-function langForFile(path) {
+export function langForFile(path) {
   if (typeof path !== "string") return "";
   const m = /\.[A-Za-z0-9]+$/.exec(path);
   if (!m) return "";
@@ -120,6 +120,25 @@ const SUMMARIZERS = {
   },
   Edit: (i) => i.file_path || i.path || "",
   Bash: (i) => truncate(i.command || "", 120),
+  // Codex-native tools (PR 6). Reuse the existing card style; only
+  // the header summary differs.
+  shell: (i) => {
+    // Codex `shell` carries either {command: ["bash","-lc","..."]} or
+    // {command: "..."} depending on SDK shape. Both get summarized.
+    if (Array.isArray(i.command)) {
+      const last = i.command[i.command.length - 1] || "";
+      return truncate(typeof last === "string" ? last : i.command.join(" "), 120);
+    }
+    return truncate(i.command || "", 120);
+  },
+  apply_patch: (i) => {
+    // Codex `apply_patch` carries a unified-diff string in `patch` or
+    // `input` depending on SDK shape. Show first changed file.
+    const text = i.patch || i.input || "";
+    const m = /\*\*\* Update File: (\S+)/.exec(text) || /\+\+\+ b\/(\S+)/.exec(text);
+    return m ? m[1] : truncate(text.split("\n")[0] || "", 120);
+  },
+  web_search: (i) => (i.query ? `Searching web: "${i.query}"` : "Searching web"),
   Grep: (i) => {
     const p = i.pattern ? `"${i.pattern}"` : "";
     const scope = i.glob
@@ -270,6 +289,11 @@ const CATEGORY = {
   Edit: "write",
   NotebookEdit: "write",
   Bash: "run",
+  // Codex-native (PR 6) — same indicator-dot semantics as their
+  // Claude-side analogues.
+  shell: "run",
+  apply_patch: "write",
+  web_search: "read",
 };
 
 function category(name) {
@@ -452,6 +476,117 @@ function renderEditCard(name, input, result) {
 }
 
 // ------------------------------------------------------------------
+// Codex apply_patch — render as a real diff card.
+//
+// Codex carries a unified-diff string in `patch` (or sometimes
+// `input`). We extract per-hunk old/new line groups and reuse the
+// Edit diff-card layout so apply_patch reads the same as Edit. The
+// parser is forgiving — handles both classic unified diff
+// (`--- a/path` / `+++ b/path` / `@@ ...`) and Codex's
+// `*** Update File: path` / `@@ ...` shape per spec §F.4.
+// ------------------------------------------------------------------
+
+function _parseApplyPatch(patchText) {
+  if (typeof patchText !== "string" || !patchText.trim()) {
+    return { filePath: "", oldStr: "", newStr: "" };
+  }
+  const lines = patchText.split(/\r?\n/);
+  let filePath = "";
+  const oldLines = [];
+  const newLines = [];
+  let inHunk = false;
+  for (const ln of lines) {
+    // Codex envelope markers
+    let m;
+    if ((m = /^\*\*\* (?:Update|Add|Delete) File: (.+)$/.exec(ln))) {
+      if (!filePath) filePath = m[1].trim();
+      inHunk = false;
+      continue;
+    }
+    if (/^\*\*\* (?:Begin|End) Patch/.test(ln)) {
+      inHunk = false;
+      continue;
+    }
+    // Standard unified-diff headers
+    if ((m = /^\+\+\+ b\/(.+)$/.exec(ln))) {
+      if (!filePath) filePath = m[1].trim();
+      continue;
+    }
+    if (/^(?:---|diff --git|index )/.test(ln)) {
+      continue;
+    }
+    if (/^@@/.test(ln)) {
+      inHunk = true;
+      // Hunk separator — drop a blank line so multiple hunks read
+      // distinctly in the rendered diff.
+      if (oldLines.length) oldLines.push("");
+      if (newLines.length) newLines.push("");
+      continue;
+    }
+    if (!inHunk) continue;
+    if (ln.startsWith("+")) {
+      newLines.push(ln.slice(1));
+    } else if (ln.startsWith("-")) {
+      oldLines.push(ln.slice(1));
+    } else if (ln.startsWith(" ") || ln === "") {
+      const ctx = ln.startsWith(" ") ? ln.slice(1) : ln;
+      oldLines.push(ctx);
+      newLines.push(ctx);
+    }
+    // Other prefixes (e.g. '\\ No newline at end of file') ignored.
+  }
+  return {
+    filePath,
+    oldStr: oldLines.join("\n"),
+    newStr: newLines.join("\n"),
+  };
+}
+
+function renderApplyPatchCard(name, input, result) {
+  const patchText = typeof input.patch === "string"
+    ? input.patch
+    : typeof input.input === "string"
+    ? input.input
+    : "";
+  const { filePath, oldStr, newStr } = _parseApplyPatch(patchText);
+  if (!oldStr && !newStr) {
+    // Degenerate / unparseable — fall back to the generic JSON card so
+    // we don't silently lose information.
+    return renderGenericCard(name, input, result);
+  }
+  const rows = buildSideBySideRows(oldStr, newStr);
+  const { add, del } = diffStats(rows);
+  const delta = ` (-${del} +${add})`;
+  const lang = langForFile(filePath);
+  const langClass = lang ? " language-" + lang : "";
+  return html`
+    <details class="tool-card category-write edit-card" open>
+      <summary>
+        <span class="tool-name">${name}</span>
+        <span class="tool-summary">${filePath || "(patch)"}${delta}</span>
+        ${lang ? html`<span class="tool-lang">${lang}</span>` : null}
+      </summary>
+      <div class=${"diff diff-split hljs" + langClass}>
+        ${rows.length === 0
+          ? html`<div class="diff-row">
+              ${_renderHalf({ kind: "ctx", text: "(no change)" }, "", true)}
+            </div>`
+          : rows.map((r, i) => _isCtxRow(r)
+              ? html`<div key=${i} class="diff-row diff-row-full">
+                  ${_renderHalf(r.left, lang, true)}
+                </div>`
+              : html`<div key=${i} class="diff-row">
+                  ${_renderHalf(r.left, lang)}
+                  ${_renderHalf(r.right, lang)}
+                </div>`)}
+      </div>
+      ${result && result.is_error ? renderResultBlock(result) : null}
+    </details>
+  `;
+}
+
+
+// ------------------------------------------------------------------
 // Read of an image — render <img> inline
 // ------------------------------------------------------------------
 
@@ -511,6 +646,10 @@ export function renderToolCall(event) {
 
   if (name === "Edit" && (input.old_string || input.new_string)) {
     return renderEditCard(name, input, result);
+  }
+
+  if (name === "apply_patch" && (input.patch || input.input)) {
+    return renderApplyPatchCard(name, input, result);
   }
 
   if (name === "Read" && isImagePath(input.file_path || input.path)) {

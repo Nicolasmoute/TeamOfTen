@@ -48,6 +48,7 @@ from server.agents import (
     set_paused,
 )
 from server import files as filesmod
+from server import truth as truthmod
 from server.paths import project_paths
 from server.db import configured_conn, crash_recover, init_db, resolve_active_project
 from server.events import bus
@@ -443,6 +444,44 @@ async def health() -> JSONResponse:
             "reason": "CLAUDE_CONFIG_DIR not set — auth lives in default ~/.claude and will NOT survive redeploy",
         }
 
+    # 3c. Codex CLI auth persistence. Mirrors the claude_auth probe.
+    # CODEX_HOME on /data → auth.json (ChatGPT session) or api-key
+    # fallback survives redeploys. method = chatgpt | api_key | none.
+    codex_dir = os.environ.get("CODEX_HOME")
+    if codex_dir:
+        cdir = Path(codex_dir)
+        auth_file = cdir / "auth.json"
+        # Detect method: ChatGPT session leaves auth.json; API key
+        # fallback comes from the encrypted secrets table at runtime
+        # (CodexRuntime injects OPENAI_API_KEY env). Health only sees
+        # what is on disk plus the secret presence flag.
+        method = "none"
+        if auth_file.exists() and auth_file.stat().st_size > 0:
+            method = "chatgpt"
+        else:
+            try:
+                from server.secrets import get_secret  # lazy import
+                if await get_secret("openai_api_key"):
+                    method = "api_key"
+            except Exception:
+                pass
+        checks["codex_auth"] = {
+            "ok": True,  # informational
+            "config_dir": codex_dir,
+            "credentials_present": auth_file.exists(),
+            "method": method,
+            "hint": (
+                "run `codex login` inside the container, or save an API key in Options drawer"
+                if method == "none" else "persisted via /data volume"
+            ),
+        }
+    else:
+        checks["codex_auth"] = {
+            "ok": True,
+            "skipped": True,
+            "reason": "CODEX_HOME not set — Codex runtime unavailable until set on a /data path",
+        }
+
     # 4. kDrive — only check if configured. Cached for 60s to avoid
     # writing a probe file on every health hit. We cache the full
     # detail dict (not just a bool) so the UI can keep rendering the
@@ -715,7 +754,8 @@ async def list_agents() -> dict[str, list[dict[str, Any]]]:
             "       r.name AS name, r.role AS role, r.brief AS brief, "
             "       a.status, a.current_task_id, a.model, a.workspace_path, "
             "       s.session_id AS session_id, "
-            "       a.cost_estimate_usd, a.started_at, a.last_heartbeat, a.locked "
+            "       a.cost_estimate_usd, a.started_at, a.last_heartbeat, a.locked, "
+            "       a.runtime_override "
             "FROM agents a "
             "LEFT JOIN agent_project_roles r "
             "  ON r.slot = a.id AND r.project_id = ? "
@@ -1142,6 +1182,66 @@ async def get_team_models() -> dict[str, object]:
         "suggested": _ROLE_MODEL_DEFAULTS,
         "available": sorted(_MODEL_WHITELIST - {""}),
     }
+
+
+class TeamRuntimesWrite(BaseModel):
+    coach: str | None = Field(None, description="Coach default runtime: 'claude' | 'codex' | empty.")
+    players: str | None = Field(None, description="Players default runtime: 'claude' | 'codex' | empty.")
+
+
+@app.get("/api/team/runtimes", dependencies=[Depends(require_token)])
+async def get_team_runtimes() -> dict[str, object]:
+    """Return per-role default runtimes. Empty string means "fall
+    through to the hardcoded 'claude' default" — the lowest tier of
+    the resolution order described in CODEX_RUNTIME_SPEC.md §B.1.
+
+    `codex_enabled` reflects HARNESS_CODEX_ENABLED so the UI can
+    disable the Codex radio when the gate is off, instead of letting
+    the user pick something the API will reject.
+    """
+    from server.runtimes import is_codex_enabled
+    return {
+        "coach": await _read_team_config_str("coach_default_runtime"),
+        "players": await _read_team_config_str("players_default_runtime"),
+        "codex_enabled": is_codex_enabled(),
+    }
+
+
+@app.put("/api/team/runtimes", dependencies=[Depends(require_token)])
+async def set_team_runtimes(
+    req: TeamRuntimesWrite,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    """Set per-role default runtimes. Empty clears (falls back to
+    'claude'). `codex` is rejected with 400 when HARNESS_CODEX_ENABLED
+    is unset — same gate as the per-slot endpoint."""
+    from server.runtimes import is_codex_enabled
+    clean: dict[str, str] = {}
+    for role, value in (("coach", req.coach or ""), ("players", req.players or "")):
+        normalized = (value or "").strip().lower()
+        if normalized not in ("", "claude", "codex"):
+            raise HTTPException(
+                400,
+                detail=f"runtime must be 'claude', 'codex', or empty — got {value!r} for {role}",
+            )
+        if normalized == "codex" and not is_codex_enabled():
+            raise HTTPException(
+                400,
+                detail="Codex runtime is gated behind HARNESS_CODEX_ENABLED.",
+            )
+        clean[role] = normalized
+        await _write_team_config_str(f"{role}_default_runtime", normalized)
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "system",
+            "type": "team_runtimes_updated",
+            "coach": clean["coach"],
+            "players": clean["players"],
+            "actor": actor,
+        }
+    )
+    return {"ok": True, **clean}
 
 
 @app.put("/api/team/models", dependencies=[Depends(require_token)])
@@ -1881,6 +1981,198 @@ class TeamTelegramWrite(BaseModel):
     chat_ids: str | None = Field(default=None, max_length=2048)
 
 
+# ----------------------------------------------------------------
+# Codex auth (PR 5+, audit-item-5).
+#
+# Two auth sources are supported by CodexRuntime, in resolution order:
+#   1. ChatGPT session — file at $CODEX_HOME/auth.json, set via
+#      `codex login` inside the container. Read-only via API; the
+#      ChatGPT device-code flow can't be driven through HTTP.
+#   2. OPENAI_API_KEY fallback — stored in the encrypted `secrets`
+#      table under the name `openai_api_key`. Set via PUT below.
+#
+# All endpoints are loopback-token protected (HARNESS_TOKEN); the
+# value plaintext is never returned. Mirrors the Telegram pattern.
+# ----------------------------------------------------------------
+CODEX_API_KEY_SECRET_NAME = "openai_api_key"
+
+
+class TeamCodexWrite(BaseModel):
+    api_key: str | None = Field(
+        None,
+        description="OPENAI_API_KEY for CodexRuntime fallback when no ChatGPT session is present. Use DELETE to clear.",
+    )
+
+
+@app.get("/api/team/codex", dependencies=[Depends(require_token)])
+async def get_team_codex() -> dict[str, object]:
+    """Return Codex auth status — never the API-key plaintext."""
+    from server import secrets as secrets_store
+    from server.runtimes import is_codex_enabled
+
+    codex_dir = os.environ.get("CODEX_HOME", "").strip()
+    auth_path = Path(codex_dir) / "auth.json" if codex_dir else None
+    chatgpt_session_present = bool(
+        auth_path and auth_path.exists() and auth_path.stat().st_size > 0
+    )
+
+    api_key_set = False
+    try:
+        api_key_set = bool(await secrets_store.get_secret(CODEX_API_KEY_SECRET_NAME))
+    except Exception:
+        # Secrets store may be unavailable (no master key); api_key_set
+        # stays False. The status block below carries the diagnostic.
+        pass
+
+    if chatgpt_session_present:
+        method = "chatgpt"
+    elif api_key_set:
+        method = "api_key"
+    else:
+        method = "none"
+
+    return {
+        "enabled": is_codex_enabled(),
+        "config_dir": codex_dir,
+        "chatgpt_session_present": chatgpt_session_present,
+        "api_key_set": api_key_set,
+        "method": method,
+        "secrets_status": secrets_store.status(),
+        "secret_name": CODEX_API_KEY_SECRET_NAME,
+    }
+
+
+@app.put("/api/team/codex", dependencies=[Depends(require_token)])
+async def set_team_codex(
+    req: TeamCodexWrite,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    """Save the OPENAI_API_KEY into the encrypted secrets table.
+
+    Validation:
+      - The key must be non-empty. Use DELETE to wipe.
+      - Format check is intentionally light (`sk-` prefix) — OpenAI
+        rotates the key shape periodically and we'd rather accept a
+        legitimate new format than reject silently.
+    """
+    from server import secrets as secrets_store
+
+    key_status = secrets_store.status()
+    if not key_status.get("ok"):
+        raise HTTPException(
+            503,
+            detail=f"secrets store unavailable: {key_status.get('reason')}",
+        )
+
+    if req.api_key is None:
+        raise HTTPException(400, detail="api_key field required (use DELETE to clear)")
+    api_key = req.api_key.strip()
+    if not api_key:
+        raise HTTPException(
+            400,
+            detail="api_key cannot be empty — use DELETE /api/team/codex to wipe",
+        )
+    if not api_key.startswith(("sk-", "sk_")):
+        # Soft warning via 400 — saves users from pasting "sk_…" with
+        # underscore typo or random text. Future-proof: also accept
+        # `sk_`.
+        raise HTTPException(
+            400,
+            detail=(
+                "api_key does not look like an OpenAI key (expected "
+                "'sk-...' prefix) — paste from platform.openai.com/api-keys"
+            ),
+        )
+
+    ok = await secrets_store.set_secret(CODEX_API_KEY_SECRET_NAME, api_key)
+    if not ok:
+        raise HTTPException(500, detail="api_key write failed; see server logs")
+    secrets_store.bump_cache_version()
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "system",
+            "type": "team_codex_updated",
+            "actor": actor,
+        }
+    )
+    return {"ok": True}
+
+
+@app.delete("/api/team/codex", dependencies=[Depends(require_token)])
+async def clear_team_codex(
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    """Wipe the saved OPENAI_API_KEY. ChatGPT session (filesystem) is
+    NOT touched — that lives at `$CODEX_HOME/auth.json` and is
+    cleared by deleting that file inside the container."""
+    from server import secrets as secrets_store
+    await secrets_store.delete_secret(CODEX_API_KEY_SECRET_NAME)
+    secrets_store.bump_cache_version()
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "system",
+            "type": "team_codex_cleared",
+            "actor": actor,
+        }
+    )
+    return {"ok": True}
+
+
+@app.post("/api/team/codex/test", dependencies=[Depends(require_token)])
+async def test_team_codex(
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    """Smoke-test the saved API key by calling the cheapest Models
+    list endpoint. Returns 200 + {ok, status, models} on success;
+    400/401/etc. on failure with the upstream status surfaced.
+
+    Skipped when only ChatGPT session is configured — there's no
+    HTTP probe equivalent for that auth path. The user can still
+    eyeball `auth.json` mtime / `/api/health codex_auth.method`.
+    """
+    from server import secrets as secrets_store
+    api_key = await secrets_store.get_secret(CODEX_API_KEY_SECRET_NAME)
+    if not api_key:
+        raise HTTPException(
+            400,
+            detail="no API key saved — set one via PUT /api/team/codex first",
+        )
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, detail=f"upstream unreachable: {exc}") from exc
+
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "system",
+            "type": "team_codex_tested",
+            "status": resp.status_code,
+            "actor": actor,
+        }
+    )
+    if resp.status_code != 200:
+        # Surface the upstream status to the caller so the UI can
+        # render "401 — invalid key" vs "429 — rate limited" etc.
+        raise HTTPException(
+            resp.status_code if resp.status_code < 600 else 502,
+            detail=f"OpenAI API rejected key: HTTP {resp.status_code}",
+        )
+    try:
+        models = resp.json().get("data", [])
+        sample = sorted({m.get("id") for m in models if m.get("id")})[:5]
+    except Exception:
+        sample = []
+    return {"ok": True, "status": resp.status_code, "sample_models": sample}
+
+
 @app.get("/api/team/telegram", dependencies=[Depends(require_token)])
 async def get_team_telegram() -> dict[str, object]:
     """Return masked status — never the token plaintext. The chat IDs
@@ -2042,6 +2334,208 @@ async def clear_team_telegram(
 
 class AgentLockWrite(BaseModel):
     locked: bool = Field(..., description="True to lock the agent off from Coach orchestration.")
+
+
+class AgentRuntimeWrite(BaseModel):
+    runtime: str | None = Field(
+        None,
+        description=(
+            "Slot-level runtime override: 'claude' or 'codex'. "
+            "None / empty clears so role defaults apply."
+        ),
+    )
+
+
+@app.put("/api/agents/{agent_id}/runtime", dependencies=[Depends(require_token)])
+async def set_agent_runtime(
+    agent_id: str,
+    req: AgentRuntimeWrite,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    """Set the slot-level runtime override.
+
+    Resolution at spawn time: this column → role default in
+    `team_config` (`coach_default_runtime` / `players_default_runtime`,
+    PR 6) → `'claude'`. Nullable so role defaults can apply.
+
+    Mid-turn changes are rejected with 409 — the runtime is read at
+    spawn time and switching mid-flight would leave the in-flight turn
+    on the old runtime while subsequent turns use the new one. Cancel
+    the turn first, then set.
+
+    See Docs/CODEX_RUNTIME_SPEC.md §B.1 / §F.1.
+    """
+    if not (agent_id == "coach" or (agent_id.startswith("p") and agent_id[1:].isdigit() and 1 <= int(agent_id[1:]) <= 10)):
+        raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
+    raw = (req.runtime or "").strip().lower()
+    if raw == "":
+        runtime_value: str | None = None
+    elif raw in ("claude", "codex"):
+        runtime_value = raw
+    else:
+        raise HTTPException(
+            400,
+            detail=f"runtime must be 'claude', 'codex', or empty (got {req.runtime!r})",
+        )
+    # PR 5 feature gate — reject 'codex' until HARNESS_CODEX_ENABLED is
+    # set. Keeps the column accepting 'claude' / NULL on every deploy
+    # while we ship the SDK plumbing in stages.
+    if runtime_value == "codex":
+        from server.runtimes import is_codex_enabled
+        if not is_codex_enabled():
+            raise HTTPException(
+                400,
+                detail=(
+                    "Codex runtime is gated behind HARNESS_CODEX_ENABLED. "
+                    "Set the env var on the deployment to enable."
+                ),
+            )
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT status FROM agents WHERE id = ?", (agent_id,)
+        )
+        row = await cur.fetchone()
+        if not row:
+            raise HTTPException(404, detail=f"agent {agent_id} not found")
+        current_status = dict(row).get("status")
+        if current_status == "working":
+            raise HTTPException(
+                409,
+                detail=f"agent {agent_id} is mid-turn — cancel first, then set runtime",
+            )
+        await c.execute(
+            "UPDATE agents SET runtime_override = ? WHERE id = ?",
+            (runtime_value, agent_id),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": agent_id,
+            "type": "runtime_updated",
+            "runtime_override": runtime_value,
+            "actor": actor,
+        }
+    )
+    return {"ok": True, "agent_id": agent_id, "runtime_override": runtime_value}
+
+
+# ----------------------------------------------------------------
+# Coord MCP proxy endpoint — internal, loopback-only.
+#
+# Receives tool calls from `python -m server.coord_mcp` subprocesses
+# (Codex runtime, PR 5+) and dispatches to the same in-process coord
+# handlers ClaudeRuntime uses. Single source of truth for handler
+# bodies — bus.publish + maybe_wake_agent stay in the main process
+# where they have the in-process bus + scheduler. See
+# Docs/CODEX_RUNTIME_SPEC.md §C.
+#
+# Auth: bearer token issued by `server.spawn_tokens.mint(caller_id)`
+# at turn start; passed to the subprocess via env. The token resolves
+# to caller_id server-side — body's caller_id is a sanity check only.
+#
+# Loopback gate: requests must originate from 127.0.0.1 / ::1. PR 4
+# ships the endpoint dormant — Codex hasn't been wired in yet.
+# ----------------------------------------------------------------
+_LOOPBACK_HOSTS = frozenset({
+    "127.0.0.1",
+    "::1",
+    "localhost",
+    # IPv4-mapped IPv6 — uvicorn under dual-stack hands this shape
+    # back when the container is bound to ::. The remote side is
+    # still loopback; the canonical form just differs.
+    "::ffff:127.0.0.1",
+})
+
+
+def _is_loopback(client_host: str | None) -> bool:
+    if not client_host:
+        return False
+    return client_host in _LOOPBACK_HOSTS
+
+
+@app.post("/api/_coord/{tool_name}")
+async def coord_proxy_call(
+    tool_name: str,
+    request: Request,
+    body: dict = Body(...),
+) -> dict[str, object]:
+    """Dispatch a coord tool call from the proxy subprocess.
+
+    Body shape: `{"caller_id": str, "args": dict}`. The body's
+    `caller_id` must match the token-bound caller_id or we 403 — this
+    closes the impersonation hole described in §C.4.
+    """
+    # 1. Loopback bind check — never reachable from outside the
+    #    container even if a misconfigured proxy maps the port.
+    client = request.client
+    if not _is_loopback(client.host if client else None):
+        raise HTTPException(403, detail="loopback only")
+
+    # 2. Token gate — resolve token → bound caller_id.
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(401, detail="missing bearer token")
+    token = auth.split(None, 1)[1].strip()
+    from server.spawn_tokens import resolve as resolve_token
+    bound_caller = resolve_token(token)
+    if bound_caller is None:
+        raise HTTPException(401, detail="invalid or expired token")
+
+    # 3. Body sanity — caller_id must be a string and match the
+    #    bound identity. Type-checking before equality so a JSON
+    #    `caller_id: 42` doesn't squeak through equality with a
+    #    coerced string somewhere upstream.
+    body_caller = body.get("caller_id")
+    if body_caller is not None and not isinstance(body_caller, str):
+        raise HTTPException(400, detail="caller_id must be a string")
+    if body_caller is not None and body_caller != bound_caller:
+        raise HTTPException(
+            403,
+            detail=f"caller_id mismatch (token bound to {bound_caller!r}, body claims {body_caller!r})",
+        )
+
+    args = body.get("args") or {}
+    if not isinstance(args, dict):
+        raise HTTPException(400, detail="args must be a dict")
+
+    # 4. Build the per-caller coord server and dispatch by name. This
+    #    runs the same closures ClaudeRuntime uses in-process, so
+    #    bus.publish / maybe_wake_agent fire on the main process'
+    #    event bus exactly like a Claude turn.
+    from server.tools import build_coord_server
+
+    server = build_coord_server(bound_caller)
+    handlers: dict = server.get("_handlers", {})
+    handler = handlers.get(tool_name)
+    if handler is None:
+        raise HTTPException(404, detail=f"unknown coord tool: {tool_name}")
+    try:
+        result = await handler(args)
+    except Exception as e:
+        # Mirror the SDK's tool-error envelope: success=False, error
+        # message in content. Keeps the proxy subprocess consistent
+        # with in-process tool failures.
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    return {"ok": True, "result": result}
+
+
+@app.get("/api/_coord/_tools")
+async def coord_proxy_tools(request: Request) -> dict[str, object]:
+    """Tool catalog — returned to a proxy subprocess on tools/list.
+
+    Loopback-only, no token (the catalog is non-sensitive — the same
+    information is in the source). Lets `coord_mcp.py` declare the
+    static tool list at MCP init time without re-hardcoding it.
+    """
+    client = request.client
+    if not _is_loopback(client.host if client else None):
+        raise HTTPException(403, detail="loopback only")
+    from server.tools import coord_tool_names
+    return {"tools": coord_tool_names()}
 
 
 @app.put("/api/agents/{agent_id}/locked", dependencies=[Depends(require_token)])
@@ -2919,6 +3413,99 @@ async def files_write(
     return {"ok": True, **result}
 
 
+class TruthProposalResolution(BaseModel):
+    note: str | None = Field(default=None, max_length=400)
+
+
+@app.get("/api/truth/proposals", dependencies=[Depends(require_token)])
+async def list_truth_proposals(
+    status: str | None = None, limit: int = 50,
+) -> dict[str, Any]:
+    """List truth/ proposals for the active project, newest first.
+
+    Filter by status (`pending` | `approved` | `denied` | `cancelled`)
+    or omit to get all. Default limit 50; cap 200.
+    """
+    limit = max(1, min(limit, 200))
+    project_id = await resolve_active_project()
+    where = ["project_id = ?"]
+    params: list[Any] = [project_id]
+    if status:
+        if status not in ("pending", "approved", "denied", "cancelled"):
+            raise HTTPException(400, detail="invalid status filter")
+        where.append("status = ?")
+        params.append(status)
+    sql = (
+        "SELECT id, project_id, proposer_id, path, proposed_content, "
+        "summary, status, created_at, resolved_at, resolved_by, "
+        "resolved_note FROM truth_proposals WHERE "
+        + " AND ".join(where) + " ORDER BY id DESC LIMIT ?"
+    )
+    params.append(limit)
+    c = await configured_conn()
+    try:
+        cur = await c.execute(sql, params)
+        rows = await cur.fetchall()
+    finally:
+        await c.close()
+    return {
+        "proposals": [
+            truthmod.truth_proposal_row_to_dict(r) for r in rows
+        ],
+    }
+
+
+async def _resolve_truth_proposal_http(
+    proposal_id: int,
+    *,
+    new_status: str,
+    note: str | None,
+    actor: dict[str, Any],
+) -> dict[str, Any]:
+    """Thin HTTP wrapper around `truthmod.resolve_truth_proposal` —
+    translates the resolver's exception types into HTTP status codes."""
+    try:
+        return await truthmod.resolve_truth_proposal(
+            proposal_id, new_status=new_status, note=note, actor=actor,
+        )
+    except truthmod.TruthProposalNotFound as e:
+        raise HTTPException(404, detail=str(e))
+    except truthmod.TruthProposalConflict as e:
+        raise HTTPException(409, detail=str(e))
+    except truthmod.TruthProposalBadRequest as e:
+        raise HTTPException(400, detail=str(e))
+
+
+@app.post(
+    "/api/truth/proposals/{proposal_id}/approve",
+    dependencies=[Depends(require_token)],
+)
+async def approve_truth_proposal(
+    proposal_id: int,
+    body: TruthProposalResolution | None = None,
+    actor: dict[str, Any] = Depends(audit_actor),
+) -> dict[str, Any]:
+    note = body.note if body else None
+    return await _resolve_truth_proposal_http(
+        proposal_id, new_status="approved", note=note, actor=actor,
+    )
+
+
+@app.post(
+    "/api/truth/proposals/{proposal_id}/deny",
+    dependencies=[Depends(require_token)],
+)
+async def deny_truth_proposal(
+    proposal_id: int,
+    body: TruthProposalResolution | None = None,
+    actor: dict[str, Any] = Depends(audit_actor),
+) -> dict[str, Any]:
+    note = body.note if body else None
+    return await _resolve_truth_proposal_http(
+        proposal_id, new_status="denied", note=note, actor=actor,
+    )
+
+
 @app.post("/api/wiki/reindex", dependencies=[Depends(require_token)])
 async def wiki_reindex() -> dict[str, Any]:
     """Manual rebuild of /data/wiki/INDEX.md.
@@ -3006,6 +3593,42 @@ async def turns_summary(hours: int = 24) -> dict[str, Any]:
             (cutoff, project_id),
         )
         total_row = dict(await cur.fetchone())
+
+        # Audit-item-22 (CODEX_RUNTIME_SPEC.md §G.3): split totals by
+        # runtime + cost_basis so the EnvPane can render the
+        # plan-included token meter alongside the USD spend meter.
+        # COALESCE the runtime/cost_basis since legacy rows pre-PR3
+        # may have NULLs.
+        cur = await c.execute(
+            "SELECT COALESCE(runtime, 'claude') AS runtime, "
+            "COUNT(*) AS count, "
+            "COALESCE(SUM(cost_usd), 0) AS cost_usd, "
+            "COALESCE(SUM(input_tokens), 0) AS input_tokens, "
+            "COALESCE(SUM(output_tokens), 0) AS output_tokens "
+            "FROM turns WHERE ended_at >= ? AND project_id = ? "
+            "GROUP BY COALESCE(runtime, 'claude') "
+            "ORDER BY cost_usd DESC",
+            (cutoff, project_id),
+        )
+        by_runtime = [dict(r) for r in await cur.fetchall()]
+        cur = await c.execute(
+            "SELECT COALESCE(cost_basis, 'token_priced') AS cost_basis, "
+            "COUNT(*) AS count, "
+            "COALESCE(SUM(cost_usd), 0) AS cost_usd, "
+            "COALESCE(SUM(input_tokens), 0) AS input_tokens, "
+            "COALESCE(SUM(output_tokens), 0) AS output_tokens "
+            "FROM turns WHERE ended_at >= ? AND project_id = ? "
+            "GROUP BY COALESCE(cost_basis, 'token_priced')",
+            (cutoff, project_id),
+        )
+        by_cost_basis = [dict(r) for r in await cur.fetchall()]
+        # Surface the plan-included token total at the top level so
+        # the UI doesn't need to filter by_cost_basis client-side.
+        plan_included_token_total = sum(
+            int(row.get("input_tokens") or 0) + int(row.get("output_tokens") or 0)
+            for row in by_cost_basis
+            if row.get("cost_basis") == "plan_included"
+        )
     finally:
         await c.close()
     return {
@@ -3014,6 +3637,9 @@ async def turns_summary(hours: int = 24) -> dict[str, Any]:
         "total_turns": int(total_row["count"] or 0),
         "total_cost_usd": float(total_row["cost_usd"] or 0),
         "per_agent": per_agent,
+        "by_runtime": by_runtime,
+        "by_cost_basis": by_cost_basis,
+        "plan_included_token_total": plan_included_token_total,
     }
 
 
