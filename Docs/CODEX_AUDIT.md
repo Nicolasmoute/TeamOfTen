@@ -92,17 +92,26 @@ section it traces back to and a status:
    cancellation rare in practice; revisit if observability shows
    leaked codex-app-server processes.
 
-9. **Missing — Thread start / resume** (§E.2). blocked — Tier 2
-   `agent_sessions.codex_thread_id` column exists but no code reads or
-   writes it. New threads are not started; existing threads are not
-   resumed; stale-thread auto-heal mirroring `_clear_session_id` is not
-   implemented.
-   **Blocked on Tier-2 SDK spike (item 24).** The DB column is in place
-   and a `_get_codex_thread_id` / `_set_codex_thread_id` pair can be
-   added once the SDK exposes `start_thread()` / `resume_thread()` (or
-   whatever names the live spike confirms). Read/write helpers are a
-   thin wrapper around `agent_sessions` rows; the blocker is the SDK
-   call itself.
+9. **Missing — Thread start / resume** (§E.2). completed
+   Implemented `_get_codex_thread_id` / `_set_codex_thread_id` /
+   `_clear_codex_thread_id` in
+   [server/runtimes/codex.py](../server/runtimes/codex.py) mirroring
+   the Claude `_get/_set/_clear_session_id` pattern. They read/write
+   `agent_sessions.codex_thread_id` keyed by (slot, project_id) so a
+   single row can hold both a Claude session_id and a Codex thread_id
+   for an agent that switches runtimes.
+
+   `open_thread(agent_id, client, *, config=None) -> (ThreadHandle, resumed: bool)`
+   wraps the start-vs-resume decision: if a stored id exists,
+   `client.resume_thread(id, overrides=config)` is tried first; on any
+   exception the stored id is nulled and `client.start_thread(config)`
+   runs as the fallback. The `resumed` boolean is what the dispatcher
+   needs to stamp `agent_started.resumed_session`.
+
+   6 new tests pin: round-trip get/set/clear, None / "system" no-ops,
+   start_thread when no stored id, resume_thread when stored id,
+   stale-thread auto-heal (resume failure → clear → start), and config
+   passthrough on both paths.
 
 10. **Missing — Notification → harness-event mapping** (§E.3). blocked — Tier 2
     The full mapping table from `thread.started` / `item.added` /

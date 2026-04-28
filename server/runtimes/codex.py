@@ -141,6 +141,125 @@ async def close_all_clients() -> None:
         await close_client(slot)
 
 
+# ---------------------------------------------------------------------
+# Thread persistence (audit item #9 — Docs/CODEX_RUNTIME_SPEC.md §E.2)
+#
+# Mirrors the Claude `_get/_set/_clear_session_id` helpers in agents.py
+# but reads/writes `agent_sessions.codex_thread_id` instead. The
+# (slot, project_id) composite key matches the Claude path so a single
+# row can hold both a Claude session_id and a Codex thread_id (an agent
+# that switches runtimes preserves both).
+# ---------------------------------------------------------------------
+
+
+async def _get_codex_thread_id(agent_id: str) -> str | None:
+    """Read `agent_sessions.codex_thread_id` for the active project."""
+    if agent_id == "system":
+        return None
+    from server.db import resolve_active_project, configured_conn
+    project_id = await resolve_active_project()
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT codex_thread_id FROM agent_sessions "
+                "WHERE slot = ? AND project_id = ?",
+                (agent_id, project_id),
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("get_codex_thread_id failed: agent=%s", agent_id)
+        return None
+    if not row:
+        return None
+    v = dict(row).get("codex_thread_id")
+    return v if v else None
+
+
+async def _set_codex_thread_id(agent_id: str, thread_id: str | None) -> None:
+    """Persist a thread id after a successful first chat step. Pass
+    None to no-op (mirrors `_set_session_id`)."""
+    if not thread_id or agent_id == "system":
+        return
+    from server.db import resolve_active_project, configured_conn
+    from server.agents import _ensure_session_row, _now
+    project_id = await resolve_active_project()
+    try:
+        c = await configured_conn()
+        try:
+            await _ensure_session_row(c, agent_id, project_id)
+            await c.execute(
+                "UPDATE agent_sessions SET codex_thread_id = ?, last_active = ? "
+                "WHERE slot = ? AND project_id = ?",
+                (thread_id, _now(), agent_id, project_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("set_codex_thread_id failed: agent=%s", agent_id)
+
+
+async def _clear_codex_thread_id(agent_id: str) -> None:
+    """Null the stored thread id. Used on stale-thread auto-heal
+    (resume_thread raised) and on /compact success (§E.6)."""
+    if agent_id == "system":
+        return
+    from server.db import resolve_active_project, configured_conn
+    project_id = await resolve_active_project()
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE agent_sessions SET codex_thread_id = NULL "
+                "WHERE slot = ? AND project_id = ?",
+                (agent_id, project_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("clear_codex_thread_id failed: agent=%s", agent_id)
+
+
+async def open_thread(
+    agent_id: str,
+    client: Any,
+    *,
+    config: Any | None = None,
+) -> tuple[Any, bool]:
+    """Return a `ThreadHandle` for `agent_id`, creating or resuming as
+    appropriate. Implements §E.2's stale-thread auto-heal: if a stored
+    `codex_thread_id` fails to resume (any exception), null it and fall
+    back to `start_thread` once.
+
+    Returns `(thread_handle, resumed: bool)` so the dispatcher can stamp
+    the `agent_started` event with the right `resumed_session` flag.
+    """
+    existing = await _get_codex_thread_id(agent_id)
+    if existing:
+        try:
+            r = client.resume_thread(existing, overrides=config) \
+                if config is not None else client.resume_thread(existing)
+            if hasattr(r, "__await__"):
+                r = await r
+            return (r, True)
+        except Exception:
+            logger.exception(
+                "CodexRuntime: resume_thread failed for slot=%s "
+                "thread_id=%s — clearing and retrying with start_thread",
+                agent_id, existing,
+            )
+            await _clear_codex_thread_id(agent_id)
+
+    r = client.start_thread(config) if config is not None else client.start_thread()
+    if hasattr(r, "__await__"):
+        r = await r
+    return (r, False)
+
+
 def is_enabled() -> bool:
     """Feature-flag gate. Default off — PR 5 ships the runtime
     structurally; flipping the env var enables actual Codex turns."""

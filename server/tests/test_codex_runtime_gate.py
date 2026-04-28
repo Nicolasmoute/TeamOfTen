@@ -437,3 +437,147 @@ async def test_failed_handshake_does_not_poison_cache(
     assert client is _FakeClient.instances[1]
     assert client.initialized == 1
     assert codex_mod._codex_clients["p1"] is client
+
+
+# Audit item #9 — codex_thread_id persistence + open_thread auto-heal.
+
+class _FakeThread:
+    instances: list["_FakeThread"] = []
+
+    def __init__(self, thread_id: str = "thread_new", config=None) -> None:
+        self.thread_id = thread_id
+        self.config = config
+        _FakeThread.instances.append(self)
+
+
+class _ThreadFakeClient:
+    """Client stub that records start/resume calls and can be configured
+    to fail on resume. Independent of `_FakeClient` to keep the lifecycle
+    + thread tests decoupled."""
+
+    def __init__(self) -> None:
+        self.start_calls: list = []
+        self.resume_calls: list = []
+        self.fail_resume_with: Exception | None = None
+        self._counter = 0
+
+    def start_thread(self, config=None):
+        self._counter += 1
+        self.start_calls.append({"config": config})
+        return _FakeThread(thread_id=f"thread_new_{self._counter}", config=config)
+
+    def resume_thread(self, thread_id: str, *, overrides=None):
+        self.resume_calls.append({"thread_id": thread_id, "overrides": overrides})
+        if self.fail_resume_with is not None:
+            raise self.fail_resume_with
+        return _FakeThread(thread_id=thread_id, config=overrides)
+
+
+async def test_get_set_clear_codex_thread_id_round_trip(fresh_db) -> None:
+    import server.db as dbmod
+    from server.runtimes.codex import (
+        _get_codex_thread_id, _set_codex_thread_id, _clear_codex_thread_id,
+    )
+    await dbmod.init_db()
+
+    assert (await _get_codex_thread_id("p1")) is None
+
+    await _set_codex_thread_id("p1", "thread_abc")
+    assert (await _get_codex_thread_id("p1")) == "thread_abc"
+
+    await _clear_codex_thread_id("p1")
+    assert (await _get_codex_thread_id("p1")) is None
+
+
+async def test_set_codex_thread_id_ignores_none_and_system(fresh_db) -> None:
+    import server.db as dbmod
+    from server.runtimes.codex import _get_codex_thread_id, _set_codex_thread_id
+    await dbmod.init_db()
+
+    await _set_codex_thread_id("p1", None)  # no-op
+    assert (await _get_codex_thread_id("p1")) is None
+
+    await _set_codex_thread_id("system", "thread_x")  # ignored
+    assert (await _get_codex_thread_id("system")) is None
+
+
+async def test_open_thread_starts_fresh_when_no_stored_id(fresh_db) -> None:
+    import server.db as dbmod
+    from server.runtimes.codex import open_thread
+    await dbmod.init_db()
+    _FakeThread.instances.clear()
+    client = _ThreadFakeClient()
+
+    thread, resumed = await open_thread("p1", client)
+    assert resumed is False
+    assert client.start_calls == [{"config": None}]
+    assert client.resume_calls == []
+    assert thread.thread_id == "thread_new_1"
+
+
+async def test_open_thread_resumes_when_stored_id_present(fresh_db) -> None:
+    import server.db as dbmod
+    from server.runtimes.codex import open_thread, _set_codex_thread_id
+    await dbmod.init_db()
+    _FakeThread.instances.clear()
+    client = _ThreadFakeClient()
+
+    await _set_codex_thread_id("p1", "thread_existing")
+    thread, resumed = await open_thread("p1", client)
+    assert resumed is True
+    assert client.resume_calls == [
+        {"thread_id": "thread_existing", "overrides": None}
+    ]
+    assert client.start_calls == []
+    assert thread.thread_id == "thread_existing"
+
+
+async def test_open_thread_falls_back_to_start_on_resume_failure(
+    fresh_db,
+) -> None:
+    """Stale-thread auto-heal: if resume_thread raises, clear the stored
+    id and retry with start_thread once."""
+    import server.db as dbmod
+    from server.runtimes.codex import (
+        open_thread, _set_codex_thread_id, _get_codex_thread_id,
+    )
+    await dbmod.init_db()
+    _FakeThread.instances.clear()
+    client = _ThreadFakeClient()
+    client.fail_resume_with = RuntimeError("thread not found")
+
+    await _set_codex_thread_id("p1", "thread_stale")
+    thread, resumed = await open_thread("p1", client)
+
+    # Resume was tried, then start was called as the fallback.
+    assert client.resume_calls == [
+        {"thread_id": "thread_stale", "overrides": None}
+    ]
+    assert client.start_calls == [{"config": None}]
+    assert resumed is False, (
+        "even though we tried resume first, the successful path was "
+        "start_thread — UI should NOT show the resumed indicator"
+    )
+    assert thread.thread_id == "thread_new_1"
+
+    # Stale id was nulled so the next turn doesn't re-trigger the same
+    # failed resume.
+    assert (await _get_codex_thread_id("p1")) is None
+
+
+async def test_open_thread_passes_config_to_start_and_resume(
+    fresh_db,
+) -> None:
+    import server.db as dbmod
+    from server.runtimes.codex import open_thread, _set_codex_thread_id
+    await dbmod.init_db()
+    _FakeThread.instances.clear()
+    client = _ThreadFakeClient()
+
+    sentinel = object()  # stand-in for ThreadConfig
+    thread, _ = await open_thread("p1", client, config=sentinel)
+    assert client.start_calls == [{"config": sentinel}]
+
+    await _set_codex_thread_id("p1", "tid")
+    thread, _ = await open_thread("p1", client, config=sentinel)
+    assert client.resume_calls[-1] == {"thread_id": "tid", "overrides": sentinel}
