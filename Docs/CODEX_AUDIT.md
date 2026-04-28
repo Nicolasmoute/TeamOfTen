@@ -64,7 +64,7 @@ section it traces back to and a status:
 
 ## Section E — CodexRuntime
 
-8. **Missing — Lifecycle `_codex_clients` cache is unused** (§E.1). completed
+8. **Missing — Lifecycle `_codex_clients` cache is unused** (§E.1). completed and audited
    Implemented `get_client(slot, *, cwd, env_overrides)` and
    `close_client(slot)` + `close_all_clients()` in
    [server/runtimes/codex.py](../server/runtimes/codex.py). First call
@@ -79,6 +79,18 @@ section it traces back to and a status:
    honored). Failed handshakes close the partial client and re-raise
    without poisoning the cache. The dispatcher integration in
    `run_turn` lands with item #9.
+
+   Audit pass tightened the test for `test_get_client_caches_per_slot`
+   to also verify `connect_stdio` was invoked with the spec-correct
+   command (`["codex", "app-server"]`), the requested `cwd`, and an env
+   that's `os.environ + env_overrides` (not just the overrides). Caught
+   no real bugs but pins the constructor contract going forward.
+
+   Known caveat (acceptable, not fixed): a coroutine cancellation
+   between `connect_stdio` and the cache assignment orphans the
+   subprocess. The dispatcher's `_SPAWN_LOCK` makes mid-handshake
+   cancellation rare in practice; revisit if observability shows
+   leaked codex-app-server processes.
 
 9. **Missing — Thread start / resume** (§E.2). blocked — Tier 2
    `agent_sessions.codex_thread_id` column exists but no code reads or

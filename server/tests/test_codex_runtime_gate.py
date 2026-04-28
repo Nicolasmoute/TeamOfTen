@@ -347,14 +347,20 @@ def _install_fake_sdk(monkeypatch):
 
 async def test_get_client_caches_per_slot(monkeypatch, tmp_path) -> None:
     _install_fake_sdk(monkeypatch)
+    monkeypatch.setenv("PATH", "/usr/bin:/usr/local/bin")  # known os.environ key
     from server.runtimes.codex import get_client
 
     c1 = await get_client("p1", cwd=str(tmp_path), env_overrides={"X": "1"})
     c2 = await get_client("p1", cwd=str(tmp_path), env_overrides={"X": "1"})
     assert c1 is c2, "same slot must return the cached client"
     assert len(_FakeClient.instances) == 1
-    # connect_stdio received the env-overrides merged on top of os.environ.
-    assert _FakeClient.instances[0].env.get("X") == "1"
+    inst = _FakeClient.instances[0]
+    # Verify connect_stdio was invoked with the spec-correct command/cwd
+    # and the env was os.environ + overrides (not overrides alone).
+    assert inst.command == ["codex", "app-server"]
+    assert inst.cwd == str(tmp_path)
+    assert inst.env.get("X") == "1"
+    assert inst.env.get("PATH") == "/usr/bin:/usr/local/bin"
     # start + initialize each ran exactly once during construction.
     assert c1.started == 1
     assert c1.initialized == 1
@@ -404,6 +410,7 @@ async def test_failed_handshake_does_not_poison_cache(
 ) -> None:
     """A construction error mid-handshake (e.g. initialize raises) must
     not cache a half-open client. Next get_client should rebuild."""
+    import pytest
     _install_fake_sdk(monkeypatch)
     from server.runtimes.codex import get_client
     from server.runtimes import codex as codex_mod
@@ -418,7 +425,6 @@ async def test_failed_handshake_does_not_poison_cache(
 
     monkeypatch.setattr(_FakeClient, "__init__", init_with_failure)
 
-    import pytest
     with pytest.raises(RuntimeError, match="simulated initialize failure"):
         await get_client("p1", cwd=str(tmp_path))
 
