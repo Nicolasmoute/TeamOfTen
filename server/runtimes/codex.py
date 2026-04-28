@@ -11,9 +11,6 @@ go through `client.start_thread(config) -> ThreadHandle` (or
 `thread.chat(text) -> AsyncIterator[ConversationStep]`. Native
 compact via `thread.compact()`.
 
-The body in `run_turn` below is the next milestone — this file still
-emits `human_attention` until the dispatcher carve-out lands.
-
 See `Docs/CODEX_RUNTIME_SPEC.md` §E for the design + §I.1 for SDK
 sourcing.
 """
@@ -23,6 +20,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
+import time
+from collections.abc import Mapping
 from typing import Any
 
 from server.runtimes.base import TurnContext
@@ -95,7 +95,7 @@ async def get_client(
             r = client.initialize()
             if hasattr(r, "__await__"):
                 await r
-        except Exception:
+        except Exception as exc:
             # Construction failed mid-handshake; don't leave a half-open
             # client cached. Close best-effort and re-raise.
             try:
@@ -125,7 +125,7 @@ async def close_client(slot: str) -> None:
             r = client.close()
             if hasattr(r, "__await__"):
                 await r
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "CodexRuntime: close() raised for slot %s — dropping "
                 "from cache anyway", slot,
@@ -254,12 +254,26 @@ async def open_thread(
             if hasattr(r, "__await__"):
                 r = await r
             return (r, True)
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "CodexRuntime: resume_thread failed for slot=%s "
                 "thread_id=%s — clearing and retrying with start_thread",
                 agent_id, existing,
             )
+            try:
+                from server.agents import _emit
+                await _emit(
+                    agent_id,
+                    "session_resume_failed",
+                    session_id=existing,
+                    error=f"{type(exc).__name__}: {exc}",
+                    runtime="codex",
+                )
+            except Exception:
+                logger.exception(
+                    "CodexRuntime: session_resume_failed emit failed for slot=%s",
+                    agent_id,
+                )
             await _clear_codex_thread_id(agent_id)
 
     r = client.start_thread(config)
@@ -314,9 +328,14 @@ _ITEM_TYPE_TO_HARNESS: dict[str, tuple[str, str | None]] = {
     "userMessage": ("_skip", None),
     "agentMessage": ("text", None),
     "reasoning": ("thinking", None),
+    # Draft names from Docs/CODEX_PROBE_OUTPUT.md plus the names used
+    # by codex-app-server-sdk 0.3.2's normalizer.
     "shell": ("tool_use", "Bash"),
+    "commandExecution": ("tool_use", "Bash"),
     "apply_patch": ("tool_use", "Edit"),
+    "fileChange": ("tool_use", "Edit"),
     "web_search": ("tool_use", "WebSearch"),
+    "webSearch": ("tool_use", "WebSearch"),
 }
 
 
@@ -329,12 +348,15 @@ def _resolve_mcp_tool_name(item_payload: dict[str, Any]) -> str:
     server = (
         item_payload.get("server")
         or item_payload.get("server_name")
+        or item_payload.get("serverName")
         or item_payload.get("mcp_server")
+        or item_payload.get("mcpServer")
         or "unknown"
     )
     name = (
         item_payload.get("name")
         or item_payload.get("tool_name")
+        or item_payload.get("toolName")
         or item_payload.get("tool")
         or "unknown"
     )
@@ -384,7 +406,7 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
 
     # mcp_tool_call resolves its tool name from payload, so it lives
     # outside the static table.
-    if item_type == "mcp_tool_call":
+    if item_type in ("mcp_tool_call", "mcpToolCall"):
         await _emit(
             agent_id,
             "tool_use",
@@ -447,7 +469,245 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
             id=item_id,
             input=item_payload,
         )
+        result_text = _extract_step_tool_result(item_payload)
+        if result_text:
+            await _emit(
+                agent_id,
+                "tool_result",
+                tool_use_id=item_id,
+                content=result_text,
+                is_error=bool(_step_payload_is_error(item_payload)),
+            )
         return
+
+
+async def _await_if_needed(value: Any) -> Any:
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
+def _coord_proxy_url() -> str:
+    explicit = os.environ.get("HARNESS_COORD_PROXY_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    port = os.environ.get("PORT", "").strip() or "8000"
+    return f"http://127.0.0.1:{port}"
+
+
+def _build_mcp_servers(tc: TurnContext) -> dict[str, Any]:
+    servers: dict[str, Any] = {}
+    servers["coord"] = {
+        "command": sys.executable,
+        "args": [
+            "-m",
+            "server.coord_mcp",
+            "--caller-id",
+            tc.agent_id,
+            "--proxy-url",
+            _coord_proxy_url(),
+        ],
+        "env": {
+            "HARNESS_COORD_PROXY_TOKEN": tc.turn_ctx.get("coord_proxy_token", ""),
+        },
+    }
+    for name, cfg in (tc.external_mcp_servers or {}).items():
+        if name == "coord":
+            continue
+        servers[name] = cfg
+    return servers
+
+
+def _build_thread_config(sdk: Any, tc: TurnContext) -> Any:
+    """Build the SDK ThreadConfig while tolerating fake SDKs in tests."""
+    kwargs: dict[str, Any] = {
+        "cwd": tc.workspace_cwd or None,
+        "developer_instructions": tc.system_prompt or None,
+        "approval_policy": "never",
+        "sandbox": "danger-full-access",
+        "config": {"mcp_servers": _build_mcp_servers(tc)},
+    }
+    if tc.model:
+        kwargs["model"] = tc.model
+    cls = getattr(sdk, "ThreadConfig", None)
+    if cls is None:
+        return kwargs
+    return cls(**kwargs)
+
+
+_CODEX_EFFORT_LEVELS = {
+    1: "low",
+    2: "medium",
+    3: "high",
+    4: "xhigh",
+}
+
+
+def _build_turn_overrides(sdk: Any, tc: TurnContext) -> Any | None:
+    kwargs: dict[str, Any] = {}
+    if tc.workspace_cwd:
+        kwargs["cwd"] = tc.workspace_cwd
+    if tc.model:
+        kwargs["model"] = tc.model
+    effort = _CODEX_EFFORT_LEVELS.get(tc.effort or 0)
+    if effort:
+        kwargs["effort"] = effort
+    if not kwargs:
+        return None
+    cls = getattr(sdk, "TurnOverrides", None)
+    if cls is None:
+        return kwargs
+    return cls(**kwargs)
+
+
+def _extract_step_tool_result(item_payload: Mapping[str, Any]) -> str | None:
+    """Pull a concise result body from completed Codex tool items.
+
+    The live SDK emits completed items rather than Claude's separate
+    tool_use/tool_result pair. Known keys are still drifting, so accept
+    common output shapes and leave unknown payloads as invocation-only.
+    """
+    for key in (
+        "output",
+        "stdout",
+        "stderr",
+        "result",
+        "content",
+        "diff",
+        "message",
+    ):
+        value = item_payload.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                return text[:12000]
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, Mapping):
+                    t = item.get("text") or item.get("content") or item.get("output")
+                    if t is not None:
+                        parts.append(str(t))
+            text = "\n".join(p for p in parts if p).strip()
+            if text:
+                return text[:12000]
+        if isinstance(value, Mapping):
+            bits: list[str] = []
+            for nested_key in ("stdout", "stderr", "output", "text", "message"):
+                nested = value.get(nested_key)
+                if nested:
+                    bits.append(str(nested))
+            text = "\n".join(bits).strip()
+            if text:
+                return text[:12000]
+    return None
+
+
+def _step_payload_is_error(item_payload: Mapping[str, Any]) -> bool:
+    status = str(item_payload.get("status") or item_payload.get("state") or "").lower()
+    if "error" in status or "fail" in status:
+        return True
+    exit_code = (
+        item_payload.get("exit_code")
+        or item_payload.get("exitCode")
+        or item_payload.get("returncode")
+    )
+    try:
+        return int(exit_code) != 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _to_mapping(value: Any) -> Mapping[str, Any] | None:
+    if isinstance(value, Mapping):
+        return value
+    if hasattr(value, "model_dump"):
+        try:
+            dumped = value.model_dump()
+            return dumped if isinstance(dumped, Mapping) else None
+        except Exception:
+            return None
+    if hasattr(value, "__dict__"):
+        return vars(value)
+    return None
+
+
+def _find_first_mapping_by_key(payload: Any, key_lower: str) -> Mapping[str, Any] | None:
+    if isinstance(payload, Mapping):
+        for key, value in payload.items():
+            if str(key).lower() == key_lower:
+                mapped = _to_mapping(value)
+                if mapped is not None:
+                    return mapped
+        for value in payload.values():
+            found = _find_first_mapping_by_key(value, key_lower)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _find_first_mapping_by_key(item, key_lower)
+            if found is not None:
+                return found
+    return None
+
+
+def _find_turn_payload(thread_state: Any, turn_id: str | None) -> Mapping[str, Any] | None:
+    mapped = _to_mapping(thread_state)
+    if mapped is None:
+        return None
+    turns = None
+    thread_obj = mapped.get("thread")
+    if isinstance(thread_obj, Mapping):
+        turns = thread_obj.get("turns")
+    if turns is None:
+        turns = mapped.get("turns")
+    if not isinstance(turns, list) or not turns:
+        return None
+    if turn_id:
+        for turn in turns:
+            turn_map = _to_mapping(turn)
+            if turn_map is not None and turn_map.get("id") == turn_id:
+                return turn_map
+    return _to_mapping(turns[-1])
+
+
+def _extract_codex_usage_from_thread_state(
+    thread_state: Any,
+    turn_id: str | None,
+) -> Any:
+    turn = _find_turn_payload(thread_state, turn_id)
+    if turn is None:
+        return None
+    usage = turn.get("usage")
+    if usage is not None:
+        return usage
+    metrics = turn.get("metrics")
+    if isinstance(metrics, Mapping) and metrics.get("usage") is not None:
+        return metrics.get("usage")
+    token_usage = _find_first_mapping_by_key(turn, "usage")
+    return token_usage
+
+
+def _extract_compact_summary(raw: Any) -> str:
+    mapped = _to_mapping(raw)
+    if mapped is not None:
+        for key in ("summary", "text", "content", "message"):
+            value = mapped.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        nested = _find_first_mapping_by_key(mapped, "summary")
+        if nested is not None:
+            for key in ("text", "content", "message"):
+                value = nested.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    if isinstance(raw, str):
+        return raw.strip()
+    return str(raw).strip() if raw is not None else ""
 
 
 def is_enabled() -> bool:
@@ -524,6 +784,83 @@ class CodexRuntime:
 
     name: str = "codex"
 
+    async def prepare_turn_start(self, tc: TurnContext) -> bool:
+        """Prepare a non-compact turn before `agent_started`.
+
+        Stale Codex thread IDs are only discovered by calling
+        `resume_thread()`. Preparing here lets the dispatcher publish
+        `agent_started.resumed_session` from the actual thread handle
+        outcome instead of the optimistic DB value.
+        """
+        if tc.compact_mode:
+            return bool(tc.prior_session)
+
+        method, env_overrides = await resolve_auth()
+        tc.turn_ctx["codex_auth_method"] = method
+        tc.turn_ctx["codex_env_overrides"] = env_overrides
+        if method == "none":
+            tc.turn_ctx["codex_resumed_session"] = False
+            return False
+
+        try:
+            sdk = _import_codex_sdk()
+        except ImportError as exc:
+            tc.turn_ctx["_codex_prepare_import_error"] = exc
+            tc.turn_ctx["codex_resumed_session"] = False
+            return False
+
+        try:
+            client = await get_client(
+                tc.agent_id,
+                cwd=tc.workspace_cwd,
+                env_overrides=env_overrides,
+            )
+            config = _build_thread_config(sdk, tc)
+            turn_overrides = _build_turn_overrides(sdk, tc)
+
+            if hasattr(client, "set_approval_handler"):
+                from server.agents import _emit
+
+                async def _approval_handler(request: Any) -> str:
+                    await _emit(
+                        tc.agent_id,
+                        "human_attention",
+                        subject="Codex requested an unsupported approval",
+                        body=(
+                            "Codex requested approval for a command or file "
+                            "change. TeamOfTen v1 declines these side-channel "
+                            "approvals; use coord_request_human from the agent "
+                            "conversation when human input is needed."
+                        ),
+                        urgency="high",
+                        request_type=type(request).__name__,
+                    )
+                    return "decline"
+
+                client.set_approval_handler(_approval_handler)
+
+            thread, resumed = await open_thread(tc.agent_id, client, config=config)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await close_client(tc.agent_id)
+            tc.turn_ctx["_codex_prepare_error"] = exc
+            tc.turn_ctx["codex_resumed_session"] = False
+            return False
+
+        tc.turn_ctx["_codex_prepared_turn"] = {
+            "method": method,
+            "env_overrides": env_overrides,
+            "sdk": sdk,
+            "client": client,
+            "config": config,
+            "turn_overrides": turn_overrides,
+            "thread": thread,
+            "resumed": resumed,
+        }
+        tc.turn_ctx["codex_resumed_session"] = resumed
+        return bool(resumed)
+
     async def run_turn(self, tc: TurnContext) -> None:
         if not is_enabled():
             await self._emit_disabled_attention(tc)
@@ -531,14 +868,33 @@ class CodexRuntime:
 
         # Lazy import the rest of the harness machinery — agents.py is
         # the dispatcher and its imports cycle through us.
-        from server.agents import _emit, _set_status
+        from server.agents import (
+            _add_cost,
+            _append_exchange,
+            _emit,
+            _extract_usage_codex,
+            _insert_turn_row,
+            _now,
+            _set_continuity_note,
+            _set_status,
+        )
+        from server.pricing import codex_cost_usd
+
+        prepared = tc.turn_ctx.pop("_codex_prepared_turn", None)
+        prepare_error = tc.turn_ctx.pop("_codex_prepare_error", None)
+        if prepare_error is not None:
+            raise prepare_error
 
         # Auth resolution per §D.4 — ChatGPT session, then API-key
         # fallback, then human_attention abort. Stash the resolved
         # method + env overrides on turn_ctx so the SDK subprocess
         # body (when wired) can inject OPENAI_API_KEY without
         # re-querying the secrets store.
-        method, env_overrides = await resolve_auth()
+        if prepared:
+            method = prepared["method"]
+            env_overrides = prepared["env_overrides"]
+        else:
+            method, env_overrides = await resolve_auth()
         if method == "none":
             await _emit(
                 tc.agent_id,
@@ -558,8 +914,11 @@ class CodexRuntime:
         tc.turn_ctx["codex_auth_method"] = method
         tc.turn_ctx["codex_env_overrides"] = env_overrides
 
+        import_error = tc.turn_ctx.pop("_codex_prepare_import_error", None)
         try:
-            _import_codex_sdk()
+            if import_error is not None:
+                raise import_error
+            sdk = prepared["sdk"] if prepared else _import_codex_sdk()
         except ImportError as exc:
             logger.exception("CodexRuntime: SDK import failed for %s", tc.agent_id)
             await _emit(
@@ -573,34 +932,166 @@ class CodexRuntime:
             await _set_status(tc.agent_id, "error")
             return
 
-        # Once the SDK is in place, the body of run_turn:
-        #   1. Resolve auth (chatgpt session via CODEX_HOME, fallback to
-        #      OPENAI_API_KEY from secrets).
-        #   2. Build mcp_servers config (coord proxy via stdio,
-        #      external MCPs).
-        #   3. Read agent_sessions.codex_thread_id for (slot, project_id);
-        #      start_thread or resume_thread accordingly.
-        #   4. Stream notifications and translate to harness events
-        #      (see spec §E.3 for the table).
-        #   5. On turn.completed: extract usage, compute cost via
-        #      server.pricing.codex_cost_usd, insert turns row with
-        #      runtime='codex' and the appropriate cost_basis.
-        #   6. Persist codex_thread_id; clear on stale-thread errors
-        #      with a fresh-thread retry.
-        #
-        # The body is left as a structured TODO until the SDK spike
-        # confirms signatures. Surface a clear error so the dispatcher
-        # records the failure rather than the agent appearing to hang.
-        await _emit(
-            tc.agent_id,
-            "error",
-            error=(
-                "CodexRuntime.run_turn body is provisional pending the "
-                "PR 1 SDK spike. Set HARNESS_CODEX_ENABLED=false to "
-                "force runtime selection back to Claude."
-            ),
-        )
-        await _set_status(tc.agent_id, "error")
+        if prepared:
+            client = prepared["client"]
+            config = prepared["config"]
+            turn_overrides = prepared["turn_overrides"]
+        else:
+            client = await get_client(
+                tc.agent_id,
+                cwd=tc.workspace_cwd,
+                env_overrides=env_overrides,
+            )
+            config = _build_thread_config(sdk, tc)
+            turn_overrides = _build_turn_overrides(sdk, tc)
+
+        # Codex exposes approval requests as a side channel. The thread
+        # config asks for "never", but if an SDK/server mismatch still
+        # produces an approval, surface it and decline so the turn does
+        # not hang behind an invisible prompt.
+        if not prepared and hasattr(client, "set_approval_handler"):
+            async def _approval_handler(request: Any) -> str:
+                await _emit(
+                    tc.agent_id,
+                    "human_attention",
+                    subject="Codex requested an unsupported approval",
+                    body=(
+                        "Codex requested approval for a command or file "
+                        "change. TeamOfTen v1 declines these side-channel "
+                        "approvals; use coord_request_human from the agent "
+                        "conversation when human input is needed."
+                    ),
+                    urgency="high",
+                    request_type=type(request).__name__,
+                )
+                return "decline"
+            client.set_approval_handler(_approval_handler)
+
+        thread = None
+        resumed = False
+        final_turn_id: str | None = None
+        started_at = _now()
+        started_monotonic = time.monotonic()
+
+        try:
+            if prepared:
+                thread = prepared["thread"]
+                resumed = bool(prepared["resumed"])
+            else:
+                thread, resumed = await open_thread(tc.agent_id, client, config=config)
+            tc.turn_ctx["codex_resumed_session"] = resumed
+
+            stream = thread.chat(
+                tc.prompt,
+                user=tc.agent_id,
+                metadata={"project_id": tc.project_id},
+                turn_overrides=turn_overrides,
+            )
+            stream = await _await_if_needed(stream)
+            async for step in stream:
+                if getattr(step, "turn_id", None):
+                    final_turn_id = getattr(step, "turn_id")
+                await handle_step(step, tc.agent_id, tc.turn_ctx)
+
+            thread_id = getattr(thread, "thread_id", None)
+            if thread_id:
+                await _set_codex_thread_id(tc.agent_id, thread_id)
+
+            if not tc.turn_ctx.get("got_result"):
+                # Some tool-only turns may complete without an
+                # agentMessage final_answer in the stream. Exhaustion
+                # of thread.chat() is the SDK's terminal signal.
+                tc.turn_ctx["got_result"] = True
+
+            usage_raw = None
+            try:
+                read = thread.read(include_turns=True)
+                thread_state = await _await_if_needed(read)
+                usage_raw = _extract_codex_usage_from_thread_state(
+                    thread_state,
+                    final_turn_id,
+                )
+            except Exception:
+                logger.exception(
+                    "CodexRuntime: failed to read thread usage for slot=%s",
+                    tc.agent_id,
+                )
+            usage = _extract_usage_codex(usage_raw)
+
+            cost_basis = "plan_included" if method == "chatgpt" else "token_priced"
+            if cost_basis == "plan_included":
+                cost_usd = 0.0
+            else:
+                cost_usd = codex_cost_usd(
+                    tc.model,
+                    {
+                        "input_tokens": usage["input"],
+                        "cached_input_tokens": usage["cache_read"],
+                        "output_tokens": usage["output"],
+                    },
+                )
+            duration_ms = int((time.monotonic() - started_monotonic) * 1000)
+            await _emit(
+                tc.agent_id,
+                "result",
+                duration_ms=duration_ms,
+                cost_usd=cost_usd,
+                is_error=False,
+                session_id=thread_id,
+                stop_reason=None,
+                subtype=None,
+                num_turns=None,
+                errors=None,
+            )
+            if not tc.compact_mode:
+                if tc.turn_ctx.get("had_handoff_on_entry"):
+                    await _set_continuity_note(tc.agent_id, None)
+                response_text = (
+                    tc.turn_ctx.get("accumulated_text")
+                    or tc.turn_ctx.get("response_text")
+                    or ""
+                ).strip()
+                entry_prompt = (tc.turn_ctx.get("entry_prompt") or "").strip()
+                if response_text and entry_prompt:
+                    await _append_exchange(tc.agent_id, entry_prompt, response_text)
+            await _insert_turn_row(
+                agent_id=tc.agent_id,
+                started_at=started_at,
+                ended_at=_now(),
+                duration_ms=duration_ms,
+                cost_usd=cost_usd,
+                session_id=thread_id,
+                num_turns=None,
+                stop_reason=None,
+                is_error=False,
+                model=tc.model,
+                runtime="codex",
+                cost_basis=cost_basis,
+                plan_mode=tc.plan_mode,
+                effort=tc.effort,
+                input_tokens=usage["input"],
+                output_tokens=usage["output"],
+                cache_read_tokens=usage["cache_read"],
+                cache_creation_tokens=usage["cache_creation"],
+            )
+            await _add_cost(tc.agent_id, cost_usd)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Transport/protocol failures often poison the app-server
+            # stdio session. Drop the cached client so the dispatcher
+            # retry gets a fresh subprocess.
+            await close_client(tc.agent_id)
+            raise
+        finally:
+            if hasattr(client, "set_approval_handler"):
+                try:
+                    client.set_approval_handler(None)
+                except Exception:
+                    logger.exception(
+                        "CodexRuntime: clearing approval handler failed for %s",
+                        tc.agent_id,
+                    )
 
     async def maybe_auto_compact(self, tc: TurnContext) -> bool:
         """Disabled in v1 — Codex app-server doesn't expose a usable
@@ -609,24 +1100,108 @@ class CodexRuntime:
         return False
 
     async def run_manual_compact(self, tc: TurnContext) -> None:
-        """Provisional pending the PR 1 spike. The spec says we either
-        call a native `thread.compact()` or fall back to a manual
-        COMPACT_PROMPT turn. Until the SDK signature is confirmed, we
-        emit human_attention so the user knows the action wasn't
-        completed."""
-        from server.agents import _emit
+        """Compact the agent's Codex thread via the native SDK call.
+
+        Live spike confirmed `client.compact_thread(thread_id)` exists
+        and `ThreadHandle.compact()` exists. Use the client form so we
+        don't need to materialize a ThreadHandle just to call compact.
+
+        Audit item #14 — Docs/CODEX_RUNTIME_SPEC.md §E.6.
+
+        Flow:
+          1. Auth resolution — if no auth, emit human_attention + error.
+          2. Read codex_thread_id; if null, no-op success (nothing to
+             compact, but the user invoked /compact so flip got_result
+             to keep the dispatcher happy).
+          3. get_client (cached or fresh) and call compact_thread(id).
+          4. Defensively extract a summary from the opaque return shape
+             (dict.summary / .text / repr fallback).
+          5. Persist via `_set_continuity_note`, then null
+             `codex_thread_id` so the next non-compact turn starts a
+             fresh Codex thread that picks up the continuity note from
+             the system prompt.
+          6. Emit `session_compacted` and flip got_result.
+        """
+        if not is_enabled():
+            await self._emit_disabled_attention(tc)
+            return
+
+        from server.agents import _emit, _set_status, _set_continuity_note
+        from server.workspaces import workspace_dir
+
+        method, env_overrides = await resolve_auth()
+        if method == "none":
+            await _emit(
+                tc.agent_id,
+                "human_attention",
+                subject="Codex /compact: no auth configured",
+                body=(
+                    "Run `codex login` inside the container or save an "
+                    "API key in the Options drawer → Codex auth section."
+                ),
+                urgency="high",
+            )
+            await _emit(tc.agent_id, "error", error="Codex auth unavailable")
+            await _set_status(tc.agent_id, "error")
+            return
+
+        thread_id = await _get_codex_thread_id(tc.agent_id)
+        if not thread_id:
+            # No prior thread → nothing to compact. Treat as no-op success
+            # so the dispatcher's /compact slash command doesn't loop.
+            await _emit(
+                tc.agent_id,
+                "session_compacted",
+                note="no codex thread to compact (fresh session)",
+            )
+            tc.turn_ctx["got_result"] = True
+            return
+
+        try:
+            client = await get_client(
+                tc.agent_id,
+                cwd=str(workspace_dir(tc.agent_id)),
+                env_overrides=env_overrides,
+            )
+        except ImportError as exc:
+            await _emit(
+                tc.agent_id,
+                "human_attention",
+                subject="Codex /compact: SDK unavailable",
+                body=str(exc),
+                urgency="high",
+            )
+            await _emit(tc.agent_id, "error", error=f"ImportError: {exc}")
+            await _set_status(tc.agent_id, "error")
+            return
+
+        try:
+            raw = client.compact_thread(thread_id)
+            if hasattr(raw, "__await__"):
+                raw = await raw
+        except Exception as exc:
+            logger.exception(
+                "CodexRuntime: compact_thread failed for slot=%s thread=%s",
+                tc.agent_id, thread_id,
+            )
+            # Drop the cached client — compact failures often correlate
+            # with stale thread state on the subprocess side.
+            await close_client(tc.agent_id)
+            await _emit(tc.agent_id, "error", error=f"compact failed: {exc}")
+            await _set_status(tc.agent_id, "error")
+            return
+
+        summary = _extract_compact_summary(raw)
+        if summary:
+            await _set_continuity_note(tc.agent_id, summary)
+        await _clear_codex_thread_id(tc.agent_id)
+
         await _emit(
             tc.agent_id,
-            "human_attention",
-            subject="Codex /compact not yet wired",
-            body=(
-                "CodexRuntime.run_manual_compact is provisional — the "
-                "PR 1 SDK spike must confirm whether thread.compact() "
-                "exists or we fall back to a COMPACT_PROMPT turn. See "
-                "Docs/CODEX_RUNTIME_SPEC.md §E.6."
-            ),
-            urgency="normal",
+            "session_compacted",
+            summary_preview=(summary[:200] if summary else None),
         )
+        tc.turn_ctx["got_result"] = True
 
     async def _emit_disabled_attention(self, tc: TurnContext) -> None:
         from server.agents import _emit, _set_status

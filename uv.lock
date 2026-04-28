@@ -147,6 +147,19 @@ wheels = [
 ]
 
 [[package]]
+name = "codex-app-server-sdk"
+version = "0.3.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "websockets" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cb/eb/2d1dee1027b639afded260f5557eda874c9876461c80e65fb817b5e8eb3a/codex_app_server_sdk-0.3.2.tar.gz", hash = "sha256:ab21a374922ad8d5d29904c89453edb9c0bccd69719ed06c7ec7c66e82bdbbd4", size = 139171, upload-time = "2026-02-26T21:58:47.255Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/94/05/9f7c0329f086a25d4528944e02517c2ab36f434f4b8eb4d3408e1fbe3f9a/codex_app_server_sdk-0.3.2-py3-none-any.whl", hash = "sha256:f3c46357401d7c1b7a88ec421209ddbefe6b9631bf319ede0bf9899a9d7a3fd4", size = 55587, upload-time = "2026-02-26T21:58:45.596Z" },
+]
+
+[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -781,6 +794,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
     { name = "claude-agent-sdk" },
+    { name = "codex-app-server-sdk" },
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "httpx" },
@@ -799,6 +813,7 @@ dev = [
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "claude-agent-sdk", specifier = ">=0.1.60" },
+    { name = "codex-app-server-sdk", specifier = ">=0.3.2" },
     { name = "cryptography", specifier = ">=42" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },

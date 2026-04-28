@@ -2540,13 +2540,23 @@ runtime interpolator can read them for MCP/Telegram use.
 
 Two runtimes ship in v0.3+: ClaudeRuntime (default) and CodexRuntime
 (gated). Resolution at spawn time is `agents.runtime_override` →
-team_config role default → `'claude'`. PR 5 ships CodexRuntime
-structurally — actual SDK-bound `run_turn` is provisional pending the
-PR 1 spike that confirms `AsyncCodex` signatures live on Zeabur.
+team_config role default → `'claude'`. CodexRuntime is backed by
+`codex-app-server-sdk` and runs through `codex app-server`: it resolves
+ChatGPT-session auth first, falls back to encrypted `openai_api_key`,
+starts or resumes `agent_sessions.codex_thread_id`, streams
+ConversationStep items into the same harness event vocabulary, records
+Codex turns with `runtime='codex'` plus `cost_basis`, and uses native
+`compact_thread` for manual `/compact`.
+
+Codex auto-compact remains disabled until app-server exposes a stable
+context-pressure signal. Codex also does not receive Claude's
+`AskUserQuestion` interception; v1 deliberately degrades by declining
+Codex approval side-channel requests and asking agents to use normal
+coord/human escalation paths instead.
 `HARNESS_CODEX_ENABLED` must be truthy before the API will accept
 `runtime=codex` on a slot. See `Docs/CODEX_RUNTIME_SPEC.md`.
 
-### 19.6 Coord MCP proxy (loopback, dormant in v0.3)
+### 19.6 Coord MCP proxy (loopback, used by Codex)
 
 `POST /api/_coord/{tool_name}` and `GET /api/_coord/_tools` are
 internal-only endpoints used by the `python -m server.coord_mcp`
@@ -2554,8 +2564,9 @@ stdio MCP subprocess to forward coord_* calls into the main FastAPI
 process. Loopback bind check + per-spawn bearer token (minted via
 `server.spawn_tokens.mint(caller_id)`, passed to the subprocess via
 `HARNESS_COORD_PROXY_TOKEN` env). caller_id is resolved from the
-token server-side; body's `caller_id` is a sanity check only. Ships
-dormant — Codex runtime (PR 5+) wires it in.
+token server-side; body's `caller_id` is a sanity check only. Codex
+runtime wires this into each turn's `ThreadConfig.config.mcp_servers`
+alongside any external MCP servers.
 
 ---
 

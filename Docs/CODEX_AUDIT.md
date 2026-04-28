@@ -13,6 +13,37 @@ section it traces back to and a status:
 - **Risk** — spike validation that requires live Zeabur access and
   was not run.
 
+## Follow-up resolution pass — 2026-04-28
+
+Codex re-audited this file against the working tree. The original
+heading statuses are stale in several places: many entries still say
+**Missing** while their bodies already describe shipped code. Current
+state after this pass:
+
+- **Implemented and verified locally:** 1, 2, 3, 5, 6, 7, 8, 9, 10,
+  11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+  28, 31, 33.
+- **Implemented as the documented v1 degradation/decision:** 16
+  (Codex does not get Claude's `AskUserQuestion` hook; approval
+  side-channel requests emit `human_attention` and are declined so
+  turns do not hang).
+- **Intentional errata/no code change:** 4 (`mcp>=1.0` is still not
+  needed because the coord proxy is hand-rolled JSON-RPC over stdio).
+- **Still live-only validation risks:** 29, 30, 32. These require a
+  real Zeabur/Codex app-server session to validate cross-talk,
+  end-to-end coord MCP behavior, and thread-resume config matching.
+
+The main code gap closed by this pass was the previously provisional
+`CodexRuntime.run_turn`: it now resolves auth, opens the cached
+`CodexClient`, builds `ThreadConfig` with the coord MCP proxy, starts
+or resumes the Codex thread, streams notifications into harness events,
+reads usage best-effort from thread state, records `turns.runtime` /
+`turns.cost_basis`, persists `codex_thread_id`, and closes poisoned
+clients on transport/protocol errors. Tests added/updated:
+`test_codex_run_turn_streams_records_usage_and_persists_thread`,
+`test_codex_run_manual_compact_uses_native_compact`, plus SDK-actual
+item mappings for `commandExecution` and `mcpToolCall`.
+
 ## Section A — Runtime abstraction
 
 1. **Partial — `ClaudeRuntime.run_turn` does not own the body** (§A.1, §A.3). completed and audited
@@ -202,53 +233,48 @@ section it traces back to and a status:
       turn so it counts toward plan limits or costs a few cents on
       API-key auth.
 
-    Known remaining gap: tool RESULT step shapes are still unmapped
-    pending probe-2 against a live Codex turn. Until then, tool_use
-    cards render without paired results — degraded UI, not a crash.
-    The unknown-type skip path swallows them gracefully.
+    Follow-up pass mapped the SDK 0.3.2 normalized item names
+    `commandExecution`, `fileChange`, and `mcpToolCall`. Completed tool
+    items can now emit an optional `tool_result` when their payload
+    includes common result fields (`output`, `stdout`, `stderr`,
+    `result`, `content`, `diff`, or `message`). Truly unknown future
+    item types still fall through to the log-and-skip path.
 
     Total: 3 tests for #11, 36 codex tests, 298 suite-wide.
 
-12. **Missing — `_extract_usage` split into Claude/Codex variants** (§E.5). completed and audited
-    Single Claude-shaped `_extract_usage` still in `server/agents.py`.
-    The spec required splitting into `_extract_usage_claude` and
-    `_extract_usage_codex` dispatched by runtime arg.
+12. **Implemented — `_extract_usage` split into Claude/Codex variants** (§E.5). completed and audited
+    `server/agents.py` now exposes `_extract_usage_claude` and
+    `_extract_usage_codex`; the legacy `_extract_usage` alias remains
+    Claude-shaped for old call sites. CodexRuntime calls the Codex
+    variant directly after reading usage from thread state.
 
-13. **Missing — `_insert_turn_row` accepts a `runtime` arg** (§E.5). completed and audited
-    Function signature unchanged. `turns.runtime` defaults to `'claude'`
-    on every insert (column DEFAULT does the work) so Claude turns
-    record correctly, but a Codex turn coming through the same path
-    would silently be tagged as Claude.
+13. **Implemented — `_insert_turn_row` accepts a `runtime` arg** (§E.5). completed and audited
+    `_insert_turn_row` accepts `runtime` and `cost_basis`, and
+    CodexRuntime writes `runtime='codex'` with `token_priced` or
+    `plan_included` depending on the resolved auth method.
 
-14. **Missing — Codex compact** (§E.6). blocked — Tier 2
-    `CodexRuntime.run_manual_compact` emits `human_attention` instead
-    of either calling a native `thread.compact()` or running a manual
-    `COMPACT_PROMPT` turn against Codex.
-    **Blocked on Tier-2 SDK spike (item 24).** Whether `thread.compact()`
-    exists at all is what the spike must determine; until then the
-    fallback path (running a COMPACT_PROMPT turn through `run_turn`)
-    can't be wired because `run_turn` itself is provisional.
+14. **Implemented — Codex compact** (§E.6). completed and audited
+    `CodexRuntime.run_manual_compact` resolves auth, reads
+    `agent_sessions.codex_thread_id`, calls native
+    `client.compact_thread(thread_id)`, stores the returned summary in
+    the continuity note, clears `codex_thread_id`, emits
+    `session_compacted`, and flips `got_result`. Pinned by
+    `test_codex_run_manual_compact_uses_native_compact`.
 
-15. **Missing — Codex error handling integration** (§E.7). blocked — Tier 2
-    `turn.failed` pre-result → `_emit("error")` + auto-retry counter
-    increment is not wired. 401/auth → `human_attention` (Telegram
-    bridge precedent) is not implemented.
-    **Blocked on Tier-2 SDK spike (item 24).** The auto-retry counter
-    in the dispatcher already works runtime-agnostically (it counts any
-    exception bubbling out of `runtime.run_turn`), so the spike work is
-    just translating concrete `turn.failed` notifications into
-    exceptions inside `CodexRuntime.run_turn`.
+15. **Implemented — Codex error handling integration** (§E.7). completed and audited
+    No-auth and missing-SDK paths emit `human_attention` plus `error`.
+    Streaming/transport/protocol exceptions bubble out before
+    `got_result`, so the dispatcher emits the standard error event and
+    schedules the runtime-agnostic retry. Poisoned Codex clients are
+    closed so the retry starts with a fresh app-server subprocess.
 
-16. **Missing — AskUserQuestion path under Codex** (§E.8). decision deferred
-    Spec asked for a decision between option (a) — re-expose as
-    `coord_ask_user` MCP tool — or (b) — degrade gracefully on Codex.
-    Neither path was implemented; no decision recorded.
-    **Decision deferred to PR after spike**: option (a) is the right
-    answer if the QuestionForm flow can be made to wait synchronously
-    on a coord call without blocking the harness event loop. That
-    determination requires a working CodexRuntime end-to-end (item 24).
-    Until then, Codex agents simply don't get the `AskUserQuestion`
-    tool — acceptable for v1 per §E.8 option (b).
+16. **Implemented decision — AskUserQuestion path under Codex** (§E.8). completed and audited
+    v1 ships option (b). Codex agents do not receive Claude's
+    `AskUserQuestion` interception. `CodexRuntime` sets approval policy
+    to `never`; if the SDK still emits an approval side-channel request,
+    the harness emits `human_attention` and declines it so the turn does
+    not hang behind an invisible prompt. Future work can add a
+    `coord_ask_user` MCP tool if Codex agents need synchronous forms.
 
 ## Section F — UI
 

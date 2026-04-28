@@ -205,3 +205,122 @@ async def test_claude_maybe_auto_compact_off_when_threshold_unparseable(
     tc = _make_tc()
     result = await rt.maybe_auto_compact(tc)
     assert result is False
+
+
+async def test_run_agent_uses_codex_thread_id_for_started_resume_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_db: str,
+) -> None:
+    """Codex agent_started.resumed_session must read codex_thread_id,
+    not Claude's session_id column."""
+    import server.db as dbmod
+    await dbmod.init_db()
+
+    import server.agents as agentsmod
+    import server.runtimes as runtimes_mod
+    import server.runtimes.codex as codex_mod
+    from server.events import bus
+
+    class _Runtime:
+        name = "codex"
+
+        async def maybe_auto_compact(self, tc):
+            return False
+
+        async def run_turn(self, tc):
+            tc.turn_ctx["got_result"] = True
+
+        async def run_manual_compact(self, tc):
+            tc.turn_ctx["got_result"] = True
+
+    async def fail_get_session(agent_id):
+        raise AssertionError("Claude session_id should not be read for Codex")
+
+    async def get_codex_thread(agent_id):
+        return "codex_thread_existing"
+
+    async def runtime_for(agent_id):
+        return "codex"
+
+    monkeypatch.setattr(agentsmod, "_resolve_runtime_for", runtime_for)
+    monkeypatch.setattr(runtimes_mod, "get_runtime", lambda name: _Runtime())
+    monkeypatch.setattr(agentsmod, "_get_session_id", fail_get_session)
+    monkeypatch.setattr(codex_mod, "_get_codex_thread_id", get_codex_thread)
+
+    q = bus.subscribe()
+    try:
+        await agentsmod.run_agent("p1", "hello")
+        started = None
+        while True:
+            ev = await q.get()
+            if ev.get("type") == "agent_started":
+                started = ev
+                break
+        assert started["runtime"] == "codex"
+        assert started["resumed_session"] is True
+    finally:
+        bus.unsubscribe(q)
+
+
+async def test_run_agent_uses_codex_prepared_resume_flag_for_started_event(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_db: str,
+) -> None:
+    """Codex pre-start preparation can downgrade a stale stored thread
+    to a fresh-start `agent_started` event before the turn renders."""
+    import server.db as dbmod
+    await dbmod.init_db()
+
+    import server.agents as agentsmod
+    import server.runtimes as runtimes_mod
+    import server.runtimes.codex as codex_mod
+    from server.events import bus
+
+    calls: list[str] = []
+
+    class _Runtime:
+        name = "codex"
+
+        async def maybe_auto_compact(self, tc):
+            calls.append("maybe_auto_compact")
+            return False
+
+        async def prepare_turn_start(self, tc):
+            calls.append("prepare_turn_start")
+            assert tc.prior_session == "codex_thread_stale"
+            return False
+
+        async def run_turn(self, tc):
+            calls.append("run_turn")
+            tc.turn_ctx["got_result"] = True
+
+        async def run_manual_compact(self, tc):
+            calls.append("run_manual_compact")
+            tc.turn_ctx["got_result"] = True
+
+    runtime = _Runtime()
+
+    async def get_codex_thread(agent_id):
+        return "codex_thread_stale"
+
+    async def runtime_for(agent_id):
+        return "codex"
+
+    monkeypatch.setattr(agentsmod, "_resolve_runtime_for", runtime_for)
+    monkeypatch.setattr(runtimes_mod, "get_runtime", lambda name: runtime)
+    monkeypatch.setattr(codex_mod, "_get_codex_thread_id", get_codex_thread)
+
+    q = bus.subscribe()
+    try:
+        await agentsmod.run_agent("p1", "hello")
+        started = None
+        while True:
+            ev = await q.get()
+            if ev.get("type") == "agent_started":
+                started = ev
+                break
+        assert started["runtime"] == "codex"
+        assert started["resumed_session"] is False
+        assert calls == ["maybe_auto_compact", "prepare_turn_start", "run_turn"]
+    finally:
+        bus.unsubscribe(q)

@@ -3005,29 +3005,14 @@ async def run_agent(
         _running_tasks.pop(agent_id, None)
         return
 
-    # Read prior session BEFORE emitting agent_started so the event
-    # carries the resume flag — the UI can visually distinguish fresh
-    # turns from continuations.
-    prior_session = await _get_session_id(agent_id)
-
-    # Status flip BEFORE the agent_started WS event, not after: the UI
-    # handler refetches /api/agents on agent_started to repaint the
-    # left-rail slot, and it needs to see status='working' on that
-    # fetch — otherwise it paints the amber pulse one event late.
-    await _set_status(agent_id, "working")
-    await _emit(
-        agent_id,
-        "agent_started",
-        prompt=prompt,
-        resumed_session=bool(prior_session),
-        compact_mode=compact_mode,
-        auto_compact=auto_compact,
-        # Runtime is resolved here for the event payload; the actual
-        # `runtime` / `_runtime` locals used downstream are resolved
-        # separately (the second call below) so a future change to
-        # the auto-compact path doesn't accidentally lose this field.
-        runtime=_runtime_name,
-    )
+    # Read prior continuation before the start event. Codex may later
+    # prove this stale during its optional pre-start prepare; the final
+    # `agent_started.resumed_session` value is emitted below.
+    if _runtime_name == "codex":
+        from server.runtimes.codex import _get_codex_thread_id
+        prior_session = await _get_codex_thread_id(agent_id)
+    else:
+        prior_session = await _get_session_id(agent_id)
 
     # Build the allowed-tools list and discover external MCP servers
     # in the dispatcher (runtime-agnostic — both runtimes need a list
@@ -3227,16 +3212,15 @@ async def run_agent(
         + handoff_suffix
         + lock_suffix
     )
+    context_applied_payload = None
     if context_suffix or brief_suffix or handoff_suffix or prior_error_suffix:
-        # Emit sizes (not content) so the user can see "yes my stuff was
-        # picked up" without drowning the timeline in prompt text.
-        await _emit(
-            agent_id,
-            "context_applied",
-            chars=len(context_suffix) + len(brief_suffix) + len(handoff_suffix),
-            brief_chars=len(brief_suffix),
-            handoff_chars=len(handoff_suffix),
-        )
+        # Emit sizes (not content) below, after agent_started, so the
+        # visible turn boundary remains the first event for this spawn.
+        context_applied_payload = {
+            "chars": len(context_suffix) + len(brief_suffix) + len(handoff_suffix),
+            "brief_chars": len(brief_suffix),
+            "handoff_chars": len(handoff_suffix),
+        }
 
     # Model resolution precedence (highest → lowest):
     #   1. per-pane override (`model` arg from the gear popover)
@@ -3306,6 +3290,27 @@ async def run_agent(
         from server.spawn_tokens import mint as _mint_proxy_token
         spawn_token = _mint_proxy_token(agent_id)
         turn_ctx["coord_proxy_token"] = spawn_token
+
+    # Status flips before `agent_started` so UI refetches see the slot
+    # as working. Some runtimes can prepare just enough before the
+    # event to make the resume flag exact; Codex uses this to auto-heal
+    # stale `codex_thread_id` values before the turn boundary renders.
+    await _set_status(agent_id, "working")
+    resumed_session = bool(prior_session)
+    prepare_turn_start = getattr(runtime, "prepare_turn_start", None)
+    if callable(prepare_turn_start) and not compact_mode:
+        resumed_session = bool(await prepare_turn_start(tc))
+    await _emit(
+        agent_id,
+        "agent_started",
+        prompt=prompt,
+        resumed_session=resumed_session,
+        compact_mode=compact_mode,
+        auto_compact=auto_compact,
+        runtime=runtime_name,
+    )
+    if context_applied_payload is not None:
+        await _emit(agent_id, "context_applied", **context_applied_payload)
 
     try:
         # Dispatcher routes manual /compact (and recursive auto-compact)

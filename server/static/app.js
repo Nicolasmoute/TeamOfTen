@@ -6850,6 +6850,7 @@ function EnvTimelineItem({ event }) {
     return html`<div class="env-tl-item env-tl-started">
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
+      <${RuntimeChip} runtime=${event.runtime} compact=${true} />
       <span class="env-tl-arrow" title=${event.resumed_session ? "resumed prior session" : "fresh start"}>${arrow}</span>
       <span class="env-tl-body">${prompt}</span>
     </div>`;
@@ -8847,6 +8848,16 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, wsAttempt,
 // event renderer (v2b generic; v2c adds per-tool richness)
 // ------------------------------------------------------------------
 
+function RuntimeChip({ runtime, compact = false }) {
+  const r = (runtime || "claude").toLowerCase();
+  if (r !== "claude" && r !== "codex") return null;
+  return html`<span
+    class=${"runtime-chip runtime-chip-" + r + (compact ? " compact" : "")}
+    title=${"runtime: " + r}
+    aria-label=${"runtime: " + r}
+  />`;
+}
+
 function TurnHeader({ event, ts }) {
   const [open, setOpen] = useState(false);
   const prompt = event.prompt || "";
@@ -8867,6 +8878,7 @@ function TurnHeader({ event, ts }) {
       >
         <span class="turn-header-arrow" title="compact turn">⤵</span>
         <span class="turn-header-ts">${ts}</span>
+        <${RuntimeChip} runtime=${event.runtime} />
         <span class="turn-header-compact-badge">${label}</span>
         <span class="turn-header-chev">${open ? "▾" : "▸"}</span>
       </div>
@@ -8886,6 +8898,7 @@ function TurnHeader({ event, ts }) {
         title=${event.resumed_session ? "resumed prior session" : "fresh start"}
       >${arrow}</span>
       <span class="turn-header-ts">${ts}</span>
+      <${RuntimeChip} runtime=${event.runtime} />
       <span class="turn-header-prompt">${oneLiner || "(empty prompt)"}</span>
       <span class="turn-header-chev">${open ? "▾" : "▸"}</span>
     </div>

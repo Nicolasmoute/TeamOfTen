@@ -533,6 +533,7 @@ async def test_open_thread_resumes_when_stored_id_present(fresh_db) -> None:
 
 
 async def test_open_thread_falls_back_to_start_on_resume_failure(
+    monkeypatch: pytest.MonkeyPatch,
     fresh_db,
 ) -> None:
     """Stale-thread auto-heal: if resume_thread raises, clear the stored
@@ -545,6 +546,7 @@ async def test_open_thread_falls_back_to_start_on_resume_failure(
     _FakeThread.instances.clear()
     client = _ThreadFakeClient()
     client.fail_resume_with = RuntimeError("thread not found")
+    captured = _capture_emit(monkeypatch)
 
     await _set_codex_thread_id("p1", "thread_stale")
     thread, resumed = await open_thread("p1", client)
@@ -563,6 +565,15 @@ async def test_open_thread_falls_back_to_start_on_resume_failure(
     # Stale id was nulled so the next turn doesn't re-trigger the same
     # failed resume.
     assert (await _get_codex_thread_id("p1")) is None
+    assert captured == [
+        {
+            "agent_id": "p1",
+            "type": "session_resume_failed",
+            "session_id": "thread_stale",
+            "error": "RuntimeError: thread not found",
+            "runtime": "codex",
+        }
+    ]
 
 
 async def test_open_thread_propagates_cancellation_during_resume(
@@ -757,6 +768,26 @@ async def test_handle_step_emits_tool_use_for_shell(monkeypatch) -> None:
     assert e["input"] == item_payload
 
 
+async def test_handle_step_emits_tool_use_for_command_execution(monkeypatch) -> None:
+    """codex-app-server-sdk 0.3.2 normalizes shell work as
+    item_type='commandExecution', not the earlier draft 'shell'."""
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    step = _FakeStep(
+        step_type="exec",
+        item_type="commandExecution",
+        item_id="cmd_1",
+        item={"type": "commandExecution", "command": "echo hi", "output": "hi\n"},
+    )
+    await handle_step(step, "p1", {})
+    assert captured[0]["type"] == "tool_use"
+    assert captured[0]["tool"] == "Bash"
+    assert captured[1]["type"] == "tool_result"
+    assert captured[1]["tool_use_id"] == "cmd_1"
+    assert captured[1]["content"] == "hi"
+
+
 async def test_handle_step_emits_tool_use_for_apply_patch(monkeypatch) -> None:
     captured = _capture_emit(monkeypatch)
     from server.runtimes.codex import handle_step
@@ -885,6 +916,25 @@ async def test_handle_step_mcp_tool_use_falls_back_when_keys_missing(
     assert captured[0]["tool"] == "mcp__unknown__unknown"
 
 
+async def test_handle_step_emits_mcp_tool_use_for_actual_sdk_item_name(
+    monkeypatch,
+) -> None:
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    step = _FakeStep(
+        step_type="tool",
+        item_type="mcpToolCall",
+        item={
+            "type": "mcpToolCall",
+            "serverName": "coord",
+            "toolName": "coord_read_inbox",
+        },
+    )
+    await handle_step(step, "p1", {})
+    assert captured[0]["tool"] == "mcp__coord__coord_read_inbox"
+
+
 async def test_resolve_mcp_tool_name_accepts_alternate_key_spellings() -> None:
     """Forward-compat for plausible alternate key names: server_name,
     mcp_server, tool_name, tool. Update once probe-2 confirms which the
@@ -923,3 +973,383 @@ async def test_step_item_payload_falls_back_to_bare_item_key(
     await handle_step(_StepNoParams(), "p1", {})
     assert captured[0]["tool"] == "Bash"
     assert captured[0]["input"] == {"command": ["ls"]}
+
+
+class _FakeThreadConfig:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+
+
+class _FakeTurnOverrides:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+
+
+class _FakeCodexSdk:
+    ThreadConfig = _FakeThreadConfig
+    TurnOverrides = _FakeTurnOverrides
+
+
+class _RunTurnFakeThread:
+    thread_id = "thread_run_turn"
+
+    def __init__(self) -> None:
+        self.chat_calls: list[dict] = []
+        self.read_calls: list[dict] = []
+
+    async def chat(self, text, *, user=None, metadata=None, turn_overrides=None):
+        self.chat_calls.append(
+            {
+                "text": text,
+                "user": user,
+                "metadata": metadata,
+                "turn_overrides": turn_overrides,
+            }
+        )
+        yield _FakeStep(
+            step_type="codex",
+            item_type="agentMessage",
+            item_id="msg_1",
+            text="hello",
+            item={"type": "agentMessage", "text": "hello", "phase": "final_answer"},
+        )
+
+    async def read(self, *, include_turns=True):
+        self.read_calls.append({"include_turns": include_turns})
+        return {
+            "thread": {
+                "turns": [
+                    {
+                        "id": "turn_test",
+                        "usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 200,
+                            "output_tokens": 300,
+                        },
+                    }
+                ]
+            }
+        }
+
+
+class _RunTurnFakeClient:
+    def __init__(self) -> None:
+        self.handlers: list[object] = []
+
+    def set_approval_handler(self, handler) -> None:
+        self.handlers.append(handler)
+
+
+async def _async_value(value):
+    return value
+
+
+async def test_codex_run_turn_streams_records_usage_and_persists_thread(
+    monkeypatch,
+) -> None:
+    import server.agents as agentsmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    captured = _capture_emit(monkeypatch)
+    insert_rows: list[dict] = []
+    added_costs: list[tuple[str, float | None]] = []
+    persisted_threads: list[tuple[str, str | None]] = []
+    client = _RunTurnFakeClient()
+    thread = _RunTurnFakeThread()
+    get_client_calls: list[dict] = []
+    open_thread_calls: list[dict] = []
+
+    async def fake_get_client(slot, *, cwd, env_overrides=None):
+        get_client_calls.append(
+            {"slot": slot, "cwd": cwd, "env_overrides": dict(env_overrides or {})}
+        )
+        return client
+
+    async def fake_open_thread(agent_id, client_arg, *, config=None):
+        open_thread_calls.append(
+            {"agent_id": agent_id, "client": client_arg, "config": config}
+        )
+        return thread, False
+
+    async def fake_insert_turn_row(**kwargs):
+        insert_rows.append(kwargs)
+
+    async def fake_add_cost(agent_id, cost):
+        added_costs.append((agent_id, cost))
+
+    async def fake_set_thread(agent_id, thread_id):
+        persisted_threads.append((agent_id, thread_id))
+
+    monkeypatch.setattr(
+        codex_mod,
+        "resolve_auth",
+        lambda: _async_value(("api_key", {"OPENAI_API_KEY": "sk-test"})),
+    )
+    monkeypatch.setattr(codex_mod, "_import_codex_sdk", lambda: _FakeCodexSdk)
+    monkeypatch.setattr(codex_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(codex_mod, "open_thread", fake_open_thread)
+    monkeypatch.setattr(codex_mod, "_set_codex_thread_id", fake_set_thread)
+    monkeypatch.setattr(agentsmod, "_insert_turn_row", fake_insert_turn_row)
+    monkeypatch.setattr(agentsmod, "_add_cost", fake_add_cost)
+
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="say hello",
+        system_prompt="system rules",
+        workspace_cwd="C:/work/p1/project",
+        allowed_tools=["Bash", "Edit"],
+        external_mcp_servers={"extra": {"command": "extra-mcp"}},
+        model="gpt-5.4-mini",
+        effort=4,
+        turn_ctx={"coord_proxy_token": "tok_test"},
+    )
+
+    rt = CodexRuntime()
+    await rt.run_turn(tc)
+
+    assert get_client_calls == [
+        {
+            "slot": "p1",
+            "cwd": "C:/work/p1/project",
+            "env_overrides": {"OPENAI_API_KEY": "sk-test"},
+        }
+    ]
+    config = open_thread_calls[0]["config"]
+    assert config.kwargs["developer_instructions"] == "system rules"
+    assert config.kwargs["model"] == "gpt-5.4-mini"
+    assert config.kwargs["sandbox"] == "danger-full-access"
+    mcp_servers = config.kwargs["config"]["mcp_servers"]
+    assert mcp_servers["coord"]["env"]["HARNESS_COORD_PROXY_TOKEN"] == "tok_test"
+    assert mcp_servers["extra"] == {"command": "extra-mcp"}
+
+    assert thread.chat_calls[0]["text"] == "say hello"
+    assert thread.chat_calls[0]["user"] == "p1"
+    assert thread.chat_calls[0]["turn_overrides"].kwargs["effort"] == "xhigh"
+    assert persisted_threads == [("p1", "thread_run_turn")]
+    assert any(ev["type"] == "text" and ev["text"] == "hello" for ev in captured)
+    result = [ev for ev in captured if ev["type"] == "result"][0]
+    assert result["session_id"] == "thread_run_turn"
+    assert result["cost_usd"] == 0.000555
+    assert insert_rows[0]["runtime"] == "codex"
+    assert insert_rows[0]["cost_basis"] == "token_priced"
+    assert insert_rows[0]["input_tokens"] == 1000
+    assert insert_rows[0]["cache_read_tokens"] == 200
+    assert insert_rows[0]["output_tokens"] == 300
+    assert added_costs == [("p1", 0.000555)]
+    assert client.handlers[-1] is None
+
+
+async def test_codex_run_turn_updates_continuity_bookkeeping(
+    monkeypatch,
+) -> None:
+    import server.agents as agentsmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    _capture_emit(monkeypatch)
+    client = _RunTurnFakeClient()
+    thread = _RunTurnFakeThread()
+    cleared_notes: list[tuple[str, str | None]] = []
+    appended: list[tuple[str, str, str]] = []
+
+    async def fake_insert_turn_row(**kwargs):
+        return None
+
+    async def fake_add_cost(agent_id, cost):
+        return None
+
+    async def fake_set_note(agent_id, text):
+        cleared_notes.append((agent_id, text))
+
+    async def fake_append(agent_id, prompt, response):
+        appended.append((agent_id, prompt, response))
+
+    monkeypatch.setattr(
+        codex_mod,
+        "resolve_auth",
+        lambda: _async_value(("api_key", {"OPENAI_API_KEY": "sk-test"})),
+    )
+    monkeypatch.setattr(codex_mod, "_import_codex_sdk", lambda: _FakeCodexSdk)
+    monkeypatch.setattr(
+        codex_mod,
+        "get_client",
+        lambda slot, *, cwd, env_overrides=None: _async_value(client),
+    )
+    monkeypatch.setattr(
+        codex_mod,
+        "open_thread",
+        lambda agent_id, client_arg, *, config=None: _async_value((thread, False)),
+    )
+    monkeypatch.setattr(codex_mod, "_set_codex_thread_id", lambda *_: _async_value(None))
+    monkeypatch.setattr(agentsmod, "_insert_turn_row", fake_insert_turn_row)
+    monkeypatch.setattr(agentsmod, "_add_cost", fake_add_cost)
+    monkeypatch.setattr(agentsmod, "_set_continuity_note", fake_set_note)
+    monkeypatch.setattr(agentsmod, "_append_exchange", fake_append)
+
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="user-visible prompt",
+        system_prompt="system rules",
+        workspace_cwd="C:/work/p1/project",
+        allowed_tools=[],
+        external_mcp_servers={},
+        model="gpt-5.4-mini",
+        turn_ctx={
+            "had_handoff_on_entry": True,
+            "entry_prompt": "user-visible prompt",
+        },
+    )
+
+    await CodexRuntime().run_turn(tc)
+
+    assert cleared_notes == [("p1", None)]
+    assert appended == [("p1", "user-visible prompt", "hello")]
+
+
+async def test_codex_run_turn_consumes_prepared_turn_state(
+    monkeypatch,
+) -> None:
+    import server.agents as agentsmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    captured = _capture_emit(monkeypatch)
+    insert_rows: list[dict] = []
+    added_costs: list[tuple[str, float | None]] = []
+    persisted_threads: list[tuple[str, str | None]] = []
+    client = _RunTurnFakeClient()
+    thread = _RunTurnFakeThread()
+    get_client_calls: list[dict] = []
+    open_thread_calls: list[dict] = []
+
+    async def fake_get_client(slot, *, cwd, env_overrides=None):
+        get_client_calls.append(
+            {"slot": slot, "cwd": cwd, "env_overrides": dict(env_overrides or {})}
+        )
+        return client
+
+    async def fake_open_thread(agent_id, client_arg, *, config=None):
+        open_thread_calls.append(
+            {"agent_id": agent_id, "client": client_arg, "config": config}
+        )
+        return thread, False
+
+    async def fake_insert_turn_row(**kwargs):
+        insert_rows.append(kwargs)
+
+    async def fake_add_cost(agent_id, cost):
+        added_costs.append((agent_id, cost))
+
+    async def fake_set_thread(agent_id, thread_id):
+        persisted_threads.append((agent_id, thread_id))
+
+    monkeypatch.setattr(
+        codex_mod,
+        "resolve_auth",
+        lambda: _async_value(("api_key", {"OPENAI_API_KEY": "sk-test"})),
+    )
+    monkeypatch.setattr(codex_mod, "_import_codex_sdk", lambda: _FakeCodexSdk)
+    monkeypatch.setattr(codex_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(codex_mod, "open_thread", fake_open_thread)
+    monkeypatch.setattr(codex_mod, "_set_codex_thread_id", fake_set_thread)
+    monkeypatch.setattr(agentsmod, "_insert_turn_row", fake_insert_turn_row)
+    monkeypatch.setattr(agentsmod, "_add_cost", fake_add_cost)
+    monkeypatch.setattr(agentsmod, "_set_continuity_note", lambda *_: _async_value(None))
+    monkeypatch.setattr(agentsmod, "_append_exchange", lambda *_: _async_value(None))
+
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="say hello",
+        system_prompt="system rules",
+        workspace_cwd="C:/work/p1/project",
+        allowed_tools=["Bash", "Edit"],
+        external_mcp_servers={},
+        model="gpt-5.4-mini",
+        effort=4,
+        turn_ctx={"coord_proxy_token": "tok_test"},
+    )
+
+    rt = CodexRuntime()
+    assert await rt.prepare_turn_start(tc) is False
+    assert len(get_client_calls) == 1
+    assert len(open_thread_calls) == 1
+
+    await rt.run_turn(tc)
+
+    assert len(get_client_calls) == 1
+    assert len(open_thread_calls) == 1
+    assert "_codex_prepared_turn" not in tc.turn_ctx
+    assert thread.chat_calls[0]["text"] == "say hello"
+    assert persisted_threads == [("p1", "thread_run_turn")]
+    assert insert_rows[0]["runtime"] == "codex"
+    assert added_costs == [("p1", 0.000555)]
+    assert any(ev["type"] == "result" for ev in captured)
+    assert client.handlers[-1] is None
+
+
+class _CompactFakeClient:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def compact_thread(self, thread_id):
+        self.calls.append(thread_id)
+        return {"summary": "compact summary"}
+
+
+async def test_codex_run_manual_compact_uses_native_compact(
+    monkeypatch,
+) -> None:
+    import server.agents as agentsmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    captured = _capture_emit(monkeypatch)
+    notes: list[tuple[str, str | None]] = []
+    cleared: list[str] = []
+    client = _CompactFakeClient()
+
+    async def fake_get_client(slot, *, cwd, env_overrides=None):
+        return client
+
+    async def fake_set_note(agent_id, note):
+        notes.append((agent_id, note))
+
+    async def fake_clear(agent_id):
+        cleared.append(agent_id)
+
+    monkeypatch.setattr(
+        codex_mod,
+        "resolve_auth",
+        lambda: _async_value(("chatgpt", {})),
+    )
+    monkeypatch.setattr(codex_mod, "_get_codex_thread_id", lambda agent_id: _async_value("tid_1"))
+    monkeypatch.setattr(codex_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(codex_mod, "_clear_codex_thread_id", fake_clear)
+    monkeypatch.setattr(agentsmod, "_set_continuity_note", fake_set_note)
+
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="/compact",
+        system_prompt="",
+        workspace_cwd="C:/work/p1/project",
+        allowed_tools=[],
+        external_mcp_servers={},
+        turn_ctx={},
+    )
+
+    await CodexRuntime().run_manual_compact(tc)
+
+    assert client.calls == ["tid_1"]
+    assert notes == [("p1", "compact summary")]
+    assert cleared == ["p1"]
+    assert tc.turn_ctx["got_result"] is True
+    assert captured[-1]["type"] == "session_compacted"

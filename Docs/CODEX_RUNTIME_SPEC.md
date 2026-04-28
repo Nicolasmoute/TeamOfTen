@@ -87,14 +87,14 @@ class AgentRuntime(Protocol):
     async def run_manual_compact(self, tc: TurnContext) -> None:
         """Execute a manual /compact request. Receives the full
         TurnContext for the same reason as maybe_auto_compact.
-        ClaudeRuntime runs a COMPACT_PROMPT turn; CodexRuntime is
-        provisional pending the PR 1 SDK spike — may use a native
-        compact call, may fall back to a manual COMPACT_PROMPT turn
-        against Codex (see §E.6)."""
+        ClaudeRuntime runs a COMPACT_PROMPT turn; CodexRuntime uses
+        native `client.compact_thread(thread_id)` and stores the
+        returned summary defensively (see §E.6)."""
 ```
 
 PR 2 ships exactly this contract; both runtimes implement all three
-methods on day one (CodexRuntime stubs are added in PR 5).
+methods. CodexRuntime's `run_turn` is SDK-bound as of the 2026-04-28
+follow-up pass; the remaining caveats are live validation, not stubs.
 
 `HarnessEvent` is **not** a new struct — reuse the existing `_emit(agent_id, type, **payload)` bus vocabulary (`tool_use`, `tool_result`, `text`, `thinking`, `result`, `error`, `agent_started`, `agent_stopped`, `context_applied`, `auto_compact_triggered`, `session_compacted`, `session_resume_failed`, `cost_capped`, `agent_cancelled`, `paused`, `spawn_rejected`). CodexRuntime maps Codex notifications onto **this same vocabulary**.
 
@@ -112,9 +112,9 @@ The dispatcher delegates **both** flows to the runtime:
   usable context-pressure signal.
 - **Manual `/compact` (or `POST /api/agents/{id}/compact`)**:
   dispatcher calls `runtime.run_manual_compact(...)`. ClaudeRuntime
-  runs the existing COMPACT_PROMPT turn. **CodexRuntime is
-  provisional pending the PR 1 SDK spike** — see §E.6 for the
-  native-vs-fallback decision.
+  runs the existing COMPACT_PROMPT turn. CodexRuntime uses the native
+  compact endpoint and clears `codex_thread_id` after storing the
+  returned summary.
 
 ### A.6 Tests
 All ~113 existing pytests pass. New `server/tests/test_runtime_dispatch.py` builds a `FakeRuntime` and asserts dispatcher contract (cost-cap rejects before `run_turn`, `agent_started` before, `agent_stopped` after).
@@ -392,31 +392,36 @@ Confirmed step types from the live spike (minimal turn):
 - `step_type='codex', item_type='agentMessage', text=<answer>` — the
   model's reply, with `data['params']['item']['phase']='final_answer'`.
 
-Inferred from item_type field (need a tool-using turn to confirm shapes):
+Observed and implemented item_type mapping:
 
 | `step_type` / `item_type`                          | Harness event              | Notes |
 |----------------------------------------------------|----------------------------|-------|
 | `userMessage` / `userMessage`                      | (skip)                     | already in DB |
 | `codex` / `agentMessage` (text set)                | `text`                     | accumulate; phase=='final_answer' marks turn done |
-| `codex` / `reasoning` (TBD)                        | `thinking`                 | parallel to Claude path |
-| `codex` / `shell`                                  | `tool_use` (`tool=Bash`)   | renderer reuses Bash card |
-| `codex` / `apply_patch`                            | `tool_use` (`tool=Edit`)   | feed unified diff into diff@7 |
-| `codex` / `web_search`                             | `tool_use` (`tool=WebSearch`) | reuse WebSearch card |
-| `codex` / `mcp_tool_call` (TBD shape)              | `tool_use` (`tool=mcp__...`) | coord_* + external MCPs |
-| stream exhaustion                                  | `result`                   | extract usage from final ChatResult or trailing step |
+| `thinking` / `reasoning`                           | `thinking`                 | parallel to Claude path |
+| `exec` / `commandExecution`                        | `tool_use` (`tool=Bash`) + optional `tool_result` | SDK 0.3.2 normalized shell shape |
+| `codex` / `shell`                                  | `tool_use` (`tool=Bash`)   | draft compatibility |
+| `file` / `fileChange`                              | `tool_use` (`tool=Edit`) + optional `tool_result` | SDK 0.3.2 normalized file-change shape |
+| `codex` / `apply_patch`                            | `tool_use` (`tool=Edit`)   | draft compatibility; unified diff feeds diff@7 |
+| `codex` / `web_search` or `webSearch`              | `tool_use` (`tool=WebSearch`) | reuse WebSearch card |
+| `tool` / `mcpToolCall` or `mcp_tool_call`          | `tool_use` (`tool=mcp__...`) | coord_* + external MCPs |
+| stream exhaustion                                  | `result`                   | usage is read best-effort from `thread.read(include_turns=True)` |
 | `CodexTurnInactiveError` raised mid-iteration      | `error` (pre-result) → retry counter |
 | `CodexTimeoutError` / `CodexTransportError`        | `error` (pre-result) → retry counter; close + reopen client |
 | `CodexProtocolError`                               | `error`; if "thread not found" trigger stale-session retry |
-| `ApprovalRequest` via `set_approval_handler`       | `human_attention` or coord_ask_user (§E.8) |
+| `ApprovalRequest` via `set_approval_handler`       | `human_attention`, then decline (§E.8 option b) |
 | `thread.compact()` return                          | `session_compacted` (§E.6) |
 
-The mapping for tool-call steps and the exact `result`/usage shape
-(streaming vs `chat_once`'s `ChatResult`) need a follow-up probe with
-a tool-using prompt. Implementation can land in stages: text-only first,
-tool observation next.
+`ChatResult` in `codex-app-server-sdk` 0.3.2 does not expose usage
+directly, so the runtime reads the thread after stream exhaustion and
+extracts the matching turn's `usage` defensively. Missing usage records
+zeros rather than failing the turn.
 
 ### E.4 Tool execution
-Codex executes native tools (`shell`, `apply_patch`, `web_search`) inside the codex-app-server subprocess — we *observe* via notifications. `coord_*` MCP tools route through MCP exactly like Claude, with the same `--caller-id <agent_id>` discipline.
+Codex executes native tools inside the codex-app-server subprocess — we
+observe completed items via notifications. `coord_*` MCP tools route
+through the stdio MCP proxy with the same token-bound
+`--caller-id <agent_id>` discipline as the Claude in-process handler.
 
 ### E.5 Cost / pricing
 Codex's `Turn.usage` reports tokens but NOT USD. New module `server/pricing.py`:
@@ -429,7 +434,7 @@ CODEX_PRICING = {
 def codex_cost_usd(model: str, usage: Mapping[str, int]) -> float: ...
 ```
 
-Split `_extract_usage` into `_extract_usage_claude` and `_extract_usage_codex`, dispatched by runtime arg. Map Codex's single `cached_input_tokens` → `cache_read_tokens`, write `0` to `cache_creation_tokens` (Codex caching has no separate creation cost). `_insert_turn_row` accepts a new `runtime` arg.
+Split `_extract_usage` into `_extract_usage_claude` and `_extract_usage_codex`. CodexRuntime passes the usage block it reads from thread state. Map Codex's single `cached_input_tokens` → `cache_read_tokens`, write `0` to `cache_creation_tokens` (Codex caching has no separate creation cost). `_insert_turn_row` accepts a new `runtime` arg.
 
 ### E.6 Compact
 
@@ -479,9 +484,11 @@ ClaudeRuntime intercepts `AskUserQuestion` via `can_use_tool` ([server/agents.py
 - (b) Skip AskUserQuestion on Codex agents. Players currently use it
   rarely; Coach uses it more. Acceptable degradation for v1.
 
-**Pick (a)** if the QuestionForm flow can be made to wait synchronously
-on a coord call without blocking the harness event loop. Otherwise
-ship (b) in PR 5 and revisit.
+v1 ships option (b). The runtime sets `approval_policy='never'`; if the
+SDK still emits an approval side-channel request, TeamOfTen surfaces a
+`human_attention` event and declines it so the turn does not hang behind
+an invisible prompt. A future `coord_ask_user` MCP tool can replace this
+degradation if Codex agents prove to need synchronous user questions.
 
 ---
 
@@ -739,11 +746,15 @@ Existing pattern: DB-level pytest, no FastAPI TestClient. New tests:
 - `server/runtimes/codex.py`, `server/pricing.py`.
 - `HARNESS_CODEX_ENABLED=true` env gate; `PUT /api/agents/{id}/runtime`
   rejects `codex` when the flag is unset.
-- Pilot path: enable flag, set p10's runtime to `codex`, run the
-  full turn vocabulary (text, tool_use, tool_result, error,
-  compact, resume) end-to-end. Auto-retry counter behavior matches
-  Claude.
-- AskUserQuestion path decided per §E.8.
+- Runtime path: resolve ChatGPT/API-key auth, open cached
+  `CodexClient`, start/resume the per-slot thread, attach coord MCP
+  proxy + external MCP servers, stream notifications into harness
+  events, persist `codex_thread_id`, and insert `turns` rows with
+  runtime/cost-basis metadata.
+- Manual compact uses native `compact_thread`; auto-compact stays off
+  until app-server exposes context-pressure telemetry.
+- AskUserQuestion path decided per §E.8: v1 degrades and declines
+  side-channel approval requests after surfacing `human_attention`.
 - Cost-basis split working (§G); EnvPane shows both meters.
 
 **PR 6 — UI polish, renderers, mixed-team prompting.** completed and audited

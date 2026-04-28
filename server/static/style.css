@@ -2804,6 +2804,28 @@ body {
   font-size: 10px;
   flex: 0 0 auto;
 }
+.runtime-chip {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
+  display: inline-block;
+  border: 1px solid transparent;
+}
+.runtime-chip-claude {
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 1px rgba(88, 166, 255, 0.22);
+}
+.runtime-chip-codex {
+  border-radius: 2px;
+  background: var(--ok);
+  box-shadow: 0 0 0 1px rgba(63, 185, 80, 0.22);
+}
+.runtime-chip.compact {
+  width: 7px;
+  height: 7px;
+  flex-basis: 7px;
+}
 .turn-header-prompt {
   color: var(--fg);
   flex: 1 1 auto;
