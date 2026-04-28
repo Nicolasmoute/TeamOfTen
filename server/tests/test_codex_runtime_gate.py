@@ -839,6 +839,68 @@ async def test_handle_step_final_answer_flips_got_result_even_when_empty(
     assert captured == []  # no text emit (nothing to say)
 
 
+async def test_handle_step_emits_mcp_tool_use_with_prefixed_name(
+    monkeypatch,
+) -> None:
+    """Audit item #11. mcp_tool_call → tool_use(tool='mcp__<server>__<name>')
+    so the existing renderers + tool-name allow-list logic keep working."""
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    item_payload = {
+        "type": "mcp_tool_call",
+        "id": "mcp_call_1",
+        "server": "coord",
+        "name": "coord_send_message",
+        "args": {"to_id": "p2", "body": "hello"},
+    }
+    step = _FakeStep(
+        step_type="codex", item_type="mcp_tool_call",
+        item_id="mcp_call_1", item=item_payload,
+    )
+    await handle_step(step, "p1", {})
+
+    assert len(captured) == 1
+    assert captured[0]["type"] == "tool_use"
+    assert captured[0]["tool"] == "mcp__coord__coord_send_message"
+    assert captured[0]["id"] == "mcp_call_1"
+    assert captured[0]["input"] == item_payload
+
+
+async def test_handle_step_mcp_tool_use_falls_back_when_keys_missing(
+    monkeypatch,
+) -> None:
+    """If probe-2 reveals the SDK uses different key names than we
+    guessed (server/name), `_resolve_mcp_tool_name` should still produce
+    a non-crashing name (`mcp__unknown__unknown`) so the UI shows
+    *something* rather than emitting an error."""
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    step = _FakeStep(
+        step_type="codex", item_type="mcp_tool_call",
+        item={"type": "mcp_tool_call", "id": "x", "args": {}},
+    )
+    await handle_step(step, "p1", {})
+    assert captured[0]["tool"] == "mcp__unknown__unknown"
+
+
+async def test_resolve_mcp_tool_name_accepts_alternate_key_spellings() -> None:
+    """Forward-compat for plausible alternate key names: server_name,
+    mcp_server, tool_name, tool. Update once probe-2 confirms which the
+    SDK actually emits."""
+    from server.runtimes.codex import _resolve_mcp_tool_name
+
+    assert (
+        _resolve_mcp_tool_name({"server_name": "coord", "tool_name": "x"})
+        == "mcp__coord__x"
+    )
+    assert (
+        _resolve_mcp_tool_name({"mcp_server": "github", "tool": "search"})
+        == "mcp__github__search"
+    )
+
+
 async def test_step_item_payload_falls_back_to_bare_item_key(
     monkeypatch,
 ) -> None:

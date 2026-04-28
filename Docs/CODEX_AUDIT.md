@@ -171,11 +171,34 @@ section it traces back to and a status:
 
     Total: 11 tests, 33 codex tests, 295 suite-wide.
 
-11. **Missing — Native tool execution observation** (§E.4). blocked — Tier 2
-    `shell` / `apply_patch` / `web_search` calls inside Codex would be
-    observed via notifications, then streamed to the UI. Without (10)
-    none of this works.
-    **Blocked on item 10**, which is itself blocked on item 24.
+11. **Missing — Native tool execution observation** (§E.4). completed
+    Item #10 already wired the *invocation* side (`shell` /
+    `apply_patch` / `web_search` → `tool_use`). This item adds:
+
+    - **`mcp_tool_call` mapping**: handle_step now resolves the Codex
+      `mcp_tool_call` step into a Claude-convention prefixed tool name
+      (`mcp__<server>__<name>`) so the existing per-tool renderers and
+      tool-name allow-list logic keep working unchanged. Helper
+      `_resolve_mcp_tool_name(item)` accepts plausible alternate
+      key spellings (`server` / `server_name` / `mcp_server`,
+      `name` / `tool_name` / `tool`) and falls back to
+      `mcp__unknown__unknown` if probe-2 reveals the SDK uses keys we
+      didn't anticipate.
+    - **Probe-2 script**: `scripts/codex_probe_tools.py` issues a
+      shell-eliciting prompt and prints every ConversationStep that
+      comes back, including full payload structure for non-text steps.
+      Output feeds back into `_ITEM_TYPE_TO_HARNESS` (for tool RESULT
+      shapes — `shell_output` / `tool_result` / etc.) and into
+      `_resolve_mcp_tool_name` (to confirm the actual key names).
+
+    Known remaining gap: tool RESULT step shapes are still unmapped
+    pending probe-2 against a live Codex turn. Until then, tool_use
+    cards render without paired results — degraded UI, not a crash.
+    The unknown-type skip path swallows them gracefully.
+
+    3 new tests pin: `mcp_tool_call` → prefixed name with primary keys,
+    fallback name when keys missing, alternate key spellings accepted
+    by `_resolve_mcp_tool_name`. Total codex tests: 36, suite: 298.
 
 12. **Missing — `_extract_usage` split into Claude/Codex variants** (§E.5). completed and audited
     Single Claude-shaped `_extract_usage` still in `server/agents.py`.

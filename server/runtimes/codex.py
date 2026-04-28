@@ -299,17 +299,17 @@ async def open_thread(
 # Mapping from Codex item_type → (harness event_type, harness tool name).
 # Tool name is None for non-tool events; the renderer keys off the
 # canonical Claude tool names so the existing UI cards keep working.
+# `mcp_tool_call` resolves the tool name dynamically from the payload
+# (`mcp__<server>__<name>`) so we use a sentinel that handle_step
+# special-cases below.
 #
 # Notably absent (deliberate): `tool_result` / `shell_output` /
-# `apply_patch_result` shapes. The probe didn't capture a tool-using
-# turn, so the actual item_type names for tool RESULTS are unknown.
-# Until a follow-up probe captures them, those steps fall through to
-# the unknown-type skip path — degraded UI (tool_use card without a
-# paired result) but no crash. Add entries here once names are known.
-#
-# `mcp_tool_call` is also absent for the same reason; coord_* calls
-# from a Codex turn would currently be skipped. This is a known
-# limitation gated on item #11 (native tool execution observation).
+# `apply_patch_result` shapes. Probe-1 didn't capture a tool-using
+# turn, so item-type names for tool RESULTS are still unknown. Until
+# a follow-up probe (scripts/codex_probe_tools.py) captures them,
+# those steps fall through to the unknown-type skip path — degraded
+# UI (tool_use card without paired result) but no crash. Add entries
+# here once names are known.
 _ITEM_TYPE_TO_HARNESS: dict[str, tuple[str, str | None]] = {
     "userMessage": ("_skip", None),
     "agentMessage": ("text", None),
@@ -317,7 +317,29 @@ _ITEM_TYPE_TO_HARNESS: dict[str, tuple[str, str | None]] = {
     "shell": ("tool_use", "Bash"),
     "apply_patch": ("tool_use", "Edit"),
     "web_search": ("tool_use", "WebSearch"),
+    "mcp_tool_call": ("tool_use", "__mcp_dynamic__"),
 }
+
+
+def _resolve_mcp_tool_name(item_payload: dict[str, Any]) -> str:
+    """Build the Claude-convention `mcp__<server>__<name>` string from
+    a Codex `mcp_tool_call` item payload. The exact payload keys are
+    provisional pending probe-2; this looks up several plausible
+    spellings and falls back to a marker name on miss.
+    """
+    server = (
+        item_payload.get("server")
+        or item_payload.get("server_name")
+        or item_payload.get("mcp_server")
+        or "unknown"
+    )
+    name = (
+        item_payload.get("name")
+        or item_payload.get("tool_name")
+        or item_payload.get("tool")
+        or "unknown"
+    )
+    return f"mcp__{server}__{name}"
 
 
 def _step_item_payload(step: Any) -> dict[str, Any]:
@@ -403,14 +425,19 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
         return
 
     if event_type == "tool_use":
+        resolved_tool = (
+            _resolve_mcp_tool_name(item_payload)
+            if tool_name == "__mcp_dynamic__"
+            else tool_name
+        )
         # Args extraction is permissive: pass the full item payload
-        # through under `args` so the existing per-tool renderers (Bash
-        # card, Edit diff, WebSearch card) can pick the keys they want
-        # without the dispatcher pre-flattening.
+        # through under `input` so the existing per-tool renderers (Bash
+        # card, Edit diff, WebSearch card, mcp__* renderer) can pick the
+        # keys they want without the dispatcher pre-flattening.
         await _emit(
             agent_id,
             "tool_use",
-            tool=tool_name,
+            tool=resolved_tool,
             id=item_id,
             input=item_payload,
         )
