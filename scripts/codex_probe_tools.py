@@ -21,6 +21,10 @@ Feed the output back into:
 This script never prints auth tokens. The CodexClient subprocess can
 read $OPENAI_API_KEY / $CODEX_HOME, but the notification stream is
 content-only.
+
+Cost note: this DOES make a real Codex turn. On a ChatGPT plan it
+counts toward plan limits; on an API key it costs a few cents at
+most (one shell-only turn). Run sparingly.
 """
 
 from __future__ import annotations

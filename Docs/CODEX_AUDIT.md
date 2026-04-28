@@ -171,11 +171,11 @@ section it traces back to and a status:
 
     Total: 11 tests, 33 codex tests, 295 suite-wide.
 
-11. **Missing — Native tool execution observation** (§E.4). completed
+11. **Missing — Native tool execution observation** (§E.4). completed and audited
     Item #10 already wired the *invocation* side (`shell` /
     `apply_patch` / `web_search` → `tool_use`). This item adds:
 
-    - **`mcp_tool_call` mapping**: handle_step now resolves the Codex
+    - **`mcp_tool_call` mapping**: handle_step resolves the Codex
       `mcp_tool_call` step into a Claude-convention prefixed tool name
       (`mcp__<server>__<name>`) so the existing per-tool renderers and
       tool-name allow-list logic keep working unchanged. Helper
@@ -191,14 +191,23 @@ section it traces back to and a status:
       shapes — `shell_output` / `tool_result` / etc.) and into
       `_resolve_mcp_tool_name` (to confirm the actual key names).
 
+    Audit pass refactored:
+    - Removed the `__mcp_dynamic__` magic-string sentinel from the
+      mapping table — the table's value of being inspectable was being
+      undermined by a string that looked like a real tool name. Now
+      `mcp_tool_call` is special-cased in `handle_step` directly, with
+      a clear comment explaining why. The static table holds only
+      static mappings.
+    - Added a cost note to probe-2's docstring: it makes a real Codex
+      turn so it counts toward plan limits or costs a few cents on
+      API-key auth.
+
     Known remaining gap: tool RESULT step shapes are still unmapped
     pending probe-2 against a live Codex turn. Until then, tool_use
     cards render without paired results — degraded UI, not a crash.
     The unknown-type skip path swallows them gracefully.
 
-    3 new tests pin: `mcp_tool_call` → prefixed name with primary keys,
-    fallback name when keys missing, alternate key spellings accepted
-    by `_resolve_mcp_tool_name`. Total codex tests: 36, suite: 298.
+    Total: 3 tests for #11, 36 codex tests, 298 suite-wide.
 
 12. **Missing — `_extract_usage` split into Claude/Codex variants** (§E.5). completed and audited
     Single Claude-shaped `_extract_usage` still in `server/agents.py`.

@@ -299,9 +299,9 @@ async def open_thread(
 # Mapping from Codex item_type → (harness event_type, harness tool name).
 # Tool name is None for non-tool events; the renderer keys off the
 # canonical Claude tool names so the existing UI cards keep working.
-# `mcp_tool_call` resolves the tool name dynamically from the payload
-# (`mcp__<server>__<name>`) so we use a sentinel that handle_step
-# special-cases below.
+# `mcp_tool_call` is special-cased in handle_step (not in this table)
+# because its tool name resolves dynamically from the payload —
+# putting a sentinel string here would hurt the table's inspectability.
 #
 # Notably absent (deliberate): `tool_result` / `shell_output` /
 # `apply_patch_result` shapes. Probe-1 didn't capture a tool-using
@@ -317,7 +317,6 @@ _ITEM_TYPE_TO_HARNESS: dict[str, tuple[str, str | None]] = {
     "shell": ("tool_use", "Bash"),
     "apply_patch": ("tool_use", "Edit"),
     "web_search": ("tool_use", "WebSearch"),
-    "mcp_tool_call": ("tool_use", "__mcp_dynamic__"),
 }
 
 
@@ -383,6 +382,18 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
     text = getattr(step, "text", None)
     item_payload = _step_item_payload(step)
 
+    # mcp_tool_call resolves its tool name from payload, so it lives
+    # outside the static table.
+    if item_type == "mcp_tool_call":
+        await _emit(
+            agent_id,
+            "tool_use",
+            tool=_resolve_mcp_tool_name(item_payload),
+            id=item_id,
+            input=item_payload,
+        )
+        return
+
     mapping = _ITEM_TYPE_TO_HARNESS.get(item_type)
 
     if mapping is None:
@@ -425,19 +436,14 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
         return
 
     if event_type == "tool_use":
-        resolved_tool = (
-            _resolve_mcp_tool_name(item_payload)
-            if tool_name == "__mcp_dynamic__"
-            else tool_name
-        )
         # Args extraction is permissive: pass the full item payload
         # through under `input` so the existing per-tool renderers (Bash
-        # card, Edit diff, WebSearch card, mcp__* renderer) can pick the
-        # keys they want without the dispatcher pre-flattening.
+        # card, Edit diff, WebSearch card) can pick the keys they want
+        # without the dispatcher pre-flattening.
         await _emit(
             agent_id,
             "tool_use",
-            tool=resolved_tool,
+            tool=tool_name,
             id=item_id,
             input=item_payload,
         )
