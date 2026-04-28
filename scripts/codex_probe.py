@@ -42,13 +42,13 @@ async def main() -> int:
         kind = type(obj).__name__
         print(f"  {name}  ({kind})")
 
-    _hr("AsyncCodex methods")
-    AsyncCodex = getattr(sdk, "AsyncCodex", None)
-    if AsyncCodex is None:
-        print("FAIL: sdk has no AsyncCodex attribute")
+    _hr("CodexClient methods")
+    CodexClient = getattr(sdk, "CodexClient", None)
+    if CodexClient is None:
+        print("FAIL: sdk has no CodexClient attribute")
         return 1
-    for name in sorted(n for n in dir(AsyncCodex) if not n.startswith("_")):
-        obj = getattr(AsyncCodex, name)
+    for name in sorted(n for n in dir(CodexClient) if not n.startswith("_")):
+        obj = getattr(CodexClient, name)
         if not callable(obj):
             continue
         try:
@@ -57,11 +57,49 @@ async def main() -> int:
             sig = "(...)"
         print(f"  {name}{sig}")
 
-    _hr("instantiate AsyncCodex")
+    _hr("ThreadHandle methods")
+    ThreadHandle = getattr(sdk, "ThreadHandle", None)
+    if ThreadHandle is not None:
+        for name in sorted(n for n in dir(ThreadHandle) if not n.startswith("_")):
+            obj = getattr(ThreadHandle, name)
+            if not callable(obj):
+                continue
+            try:
+                sig = inspect.signature(obj)
+            except (ValueError, TypeError):
+                sig = "(...)"
+            print(f"  {name}{sig}")
+
+    _hr("ThreadConfig fields")
+    ThreadConfig = getattr(sdk, "ThreadConfig", None)
+    if ThreadConfig is not None:
+        try:
+            from pydantic import BaseModel
+            if issubclass(ThreadConfig, BaseModel):
+                for fname, finfo in ThreadConfig.model_fields.items():
+                    print(f"  {fname}: {finfo.annotation} default={finfo.default!r}")
+        except Exception:
+            print("  (not a pydantic model)")
+            for n in sorted(d for d in dir(ThreadConfig) if not d.startswith("_")):
+                print(f"  {n}")
+
+    _hr("TurnOverrides fields")
+    TurnOverrides = getattr(sdk, "TurnOverrides", None)
+    if TurnOverrides is not None:
+        try:
+            from pydantic import BaseModel
+            if issubclass(TurnOverrides, BaseModel):
+                for fname, finfo in TurnOverrides.model_fields.items():
+                    print(f"  {fname}: {finfo.annotation} default={finfo.default!r}")
+        except Exception:
+            for n in sorted(d for d in dir(TurnOverrides) if not d.startswith("_")):
+                print(f"  {n}")
+
+    _hr("instantiate CodexClient")
     try:
-        client = AsyncCodex()
+        client = CodexClient()
     except Exception:
-        print("FAIL: AsyncCodex() constructor")
+        print("FAIL: CodexClient() constructor")
         traceback.print_exc()
         return 1
     print("client:", client)
