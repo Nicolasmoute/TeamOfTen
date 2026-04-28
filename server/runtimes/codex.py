@@ -30,11 +30,115 @@ from server.runtimes.base import TurnContext
 logger = logging.getLogger(__name__)
 
 
-# Module-level cache of `AsyncCodex` instances per slot. The harness
+# Module-level cache of `CodexClient` instances per slot. The harness
 # already serializes turns per slot via `_SPAWN_LOCK` (see agents.py),
 # satisfying the SDK's "one active turn consumer per client" rule.
-# Closed and re-opened on auth-error.
+# Closed and re-opened on auth-error / transport error.
 _codex_clients: dict[str, Any] = {}
+
+# Per-slot async locks to serialize get-or-create. The dispatcher's
+# _SPAWN_LOCK already serializes whole turns per slot, but a defensive
+# lock here lets `get_client` / `close_client` be safely called from
+# health probes / shutdown handlers that don't hold the spawn lock.
+_client_locks: dict[str, asyncio.Lock] = {}
+
+
+def _slot_lock(slot: str) -> asyncio.Lock:
+    lock = _client_locks.get(slot)
+    if lock is None:
+        lock = asyncio.Lock()
+        _client_locks[slot] = lock
+    return lock
+
+
+async def get_client(
+    slot: str,
+    *,
+    cwd: str,
+    env_overrides: dict[str, str] | None = None,
+) -> Any:
+    """Return a started, initialized `CodexClient` for `slot`.
+
+    Spawns `codex app-server` via stdio on first call; reuses the cached
+    client thereafter. Callers who hit a `CodexTransportError` /
+    `CodexProtocolError` should call `close_client(slot)` and retry —
+    that drops the cached client so the next `get_client` rebuilds it.
+
+    Confirmed against live SDK 0.3.2 on 2026-04-28; see
+    Docs/CODEX_PROBE_OUTPUT.md for the surface this calls into.
+    """
+    async with _slot_lock(slot):
+        cached = _codex_clients.get(slot)
+        if cached is not None:
+            return cached
+
+        sdk = _import_codex_sdk()
+        env = dict(os.environ)
+        if env_overrides:
+            env.update(env_overrides)
+
+        client = sdk.CodexClient.connect_stdio(
+            command=["codex", "app-server"],
+            cwd=cwd,
+            env=env,
+        )
+        # `connect_stdio` is sync in 0.3.2 (returns CodexClient directly,
+        # not a coroutine), but the spec calls out that some early
+        # builds returned awaitables. Accept both shapes.
+        if hasattr(client, "__await__"):
+            client = await client  # type: ignore[misc]
+
+        try:
+            r = client.start()
+            if hasattr(r, "__await__"):
+                await r
+            r = client.initialize()
+            if hasattr(r, "__await__"):
+                await r
+        except Exception:
+            # Construction failed mid-handshake; don't leave a half-open
+            # client cached. Close best-effort and re-raise.
+            try:
+                close = client.close()
+                if hasattr(close, "__await__"):
+                    await close
+            except Exception:
+                logger.exception(
+                    "CodexRuntime: close() during failed handshake raised "
+                    "for slot %s", slot,
+                )
+            raise
+
+        _codex_clients[slot] = client
+        logger.info("CodexRuntime: opened client for slot=%s", slot)
+        return client
+
+
+async def close_client(slot: str) -> None:
+    """Close + drop the cached client for `slot`. Safe if no client is
+    cached. Called on auth-error / transport-error / shutdown."""
+    async with _slot_lock(slot):
+        client = _codex_clients.pop(slot, None)
+        if client is None:
+            return
+        try:
+            r = client.close()
+            if hasattr(r, "__await__"):
+                await r
+        except Exception:
+            logger.exception(
+                "CodexRuntime: close() raised for slot %s — dropping "
+                "from cache anyway", slot,
+            )
+        else:
+            logger.info("CodexRuntime: closed client for slot=%s", slot)
+
+
+async def close_all_clients() -> None:
+    """Close every cached client. Called on harness shutdown."""
+    slots = list(_codex_clients.keys())
+    for slot in slots:
+        await close_client(slot)
 
 
 def is_enabled() -> bool:

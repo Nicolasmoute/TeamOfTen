@@ -291,3 +291,143 @@ async def test_runtime_endpoint_accepts_claude_regardless_of_flag(
         r2 = c.put("/api/agents/p1/runtime", json={"runtime": ""})
         assert r2.status_code == 200
         assert r2.json().get("runtime_override") is None
+
+
+# Audit item #8 — `_codex_clients` lifecycle cache.
+# Stubs `codex_app_server_sdk` so the test can run anywhere — the live
+# SDK shape is pinned in Docs/CODEX_PROBE_OUTPUT.md.
+
+class _FakeClient:
+    """Minimal CodexClient stand-in. Records start/initialize/close
+    calls and the env that connect_stdio was given."""
+
+    instances: list["_FakeClient"] = []
+
+    def __init__(self, *, command, cwd, env, **kwargs) -> None:
+        self.command = command
+        self.cwd = cwd
+        self.env = env
+        self.started = 0
+        self.initialized = 0
+        self.closed = 0
+        self.fail_on_initialize = False
+        _FakeClient.instances.append(self)
+
+    @classmethod
+    def connect_stdio(cls, **kwargs):
+        return cls(**kwargs)
+
+    def start(self):
+        self.started += 1
+        return self
+
+    def initialize(self):
+        self.initialized += 1
+        if self.fail_on_initialize:
+            raise RuntimeError("simulated initialize failure")
+        return object()
+
+    def close(self):
+        self.closed += 1
+
+
+class _FakeSdk:
+    CodexClient = _FakeClient
+
+
+def _install_fake_sdk(monkeypatch):
+    """Replace `_import_codex_sdk` so the cache helpers don't try to
+    import the real SDK during tests."""
+    _FakeClient.instances.clear()
+    from server.runtimes import codex as codex_mod
+    codex_mod._codex_clients.clear()
+    codex_mod._client_locks.clear()
+    monkeypatch.setattr(codex_mod, "_import_codex_sdk", lambda: _FakeSdk)
+
+
+async def test_get_client_caches_per_slot(monkeypatch, tmp_path) -> None:
+    _install_fake_sdk(monkeypatch)
+    from server.runtimes.codex import get_client
+
+    c1 = await get_client("p1", cwd=str(tmp_path), env_overrides={"X": "1"})
+    c2 = await get_client("p1", cwd=str(tmp_path), env_overrides={"X": "1"})
+    assert c1 is c2, "same slot must return the cached client"
+    assert len(_FakeClient.instances) == 1
+    # connect_stdio received the env-overrides merged on top of os.environ.
+    assert _FakeClient.instances[0].env.get("X") == "1"
+    # start + initialize each ran exactly once during construction.
+    assert c1.started == 1
+    assert c1.initialized == 1
+
+
+async def test_get_client_separate_slots_get_separate_clients(
+    monkeypatch, tmp_path,
+) -> None:
+    _install_fake_sdk(monkeypatch)
+    from server.runtimes.codex import get_client
+
+    a = await get_client("p1", cwd=str(tmp_path))
+    b = await get_client("p2", cwd=str(tmp_path))
+    assert a is not b
+    assert len(_FakeClient.instances) == 2
+
+
+async def test_close_client_drops_and_closes(monkeypatch, tmp_path) -> None:
+    _install_fake_sdk(monkeypatch)
+    from server.runtimes.codex import get_client, close_client
+    from server.runtimes import codex as codex_mod
+
+    client = await get_client("p1", cwd=str(tmp_path))
+    await close_client("p1")
+    assert client.closed == 1
+    assert "p1" not in codex_mod._codex_clients
+
+    # Calling close on an already-empty slot is a no-op (no exception).
+    await close_client("p1")
+    assert client.closed == 1
+
+
+async def test_close_all_clients(monkeypatch, tmp_path) -> None:
+    _install_fake_sdk(monkeypatch)
+    from server.runtimes.codex import get_client, close_all_clients
+    from server.runtimes import codex as codex_mod
+
+    a = await get_client("p1", cwd=str(tmp_path))
+    b = await get_client("p2", cwd=str(tmp_path))
+    await close_all_clients()
+    assert a.closed == 1 and b.closed == 1
+    assert codex_mod._codex_clients == {}
+
+
+async def test_failed_handshake_does_not_poison_cache(
+    monkeypatch, tmp_path,
+) -> None:
+    """A construction error mid-handshake (e.g. initialize raises) must
+    not cache a half-open client. Next get_client should rebuild."""
+    _install_fake_sdk(monkeypatch)
+    from server.runtimes.codex import get_client
+    from server.runtimes import codex as codex_mod
+
+    # Patch the FakeClient to fail on initialize for the first attempt.
+    original_init = _FakeClient.__init__
+
+    def init_with_failure(self, **kwargs):
+        original_init(self, **kwargs)
+        if len(_FakeClient.instances) == 1:
+            self.fail_on_initialize = True
+
+    monkeypatch.setattr(_FakeClient, "__init__", init_with_failure)
+
+    import pytest
+    with pytest.raises(RuntimeError, match="simulated initialize failure"):
+        await get_client("p1", cwd=str(tmp_path))
+
+    # First client was closed best-effort during the rollback, NOT cached.
+    assert "p1" not in codex_mod._codex_clients
+    assert _FakeClient.instances[0].closed == 1
+
+    # Second attempt rebuilds successfully.
+    client = await get_client("p1", cwd=str(tmp_path))
+    assert client is _FakeClient.instances[1]
+    assert client.initialized == 1
+    assert codex_mod._codex_clients["p1"] is client

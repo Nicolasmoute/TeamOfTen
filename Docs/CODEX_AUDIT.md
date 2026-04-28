@@ -64,15 +64,21 @@ section it traces back to and a status:
 
 ## Section E — CodexRuntime
 
-8. **Missing — Lifecycle `_codex_clients` cache is unused** (§E.1). blocked — Tier 2
-   The module-level dict is declared but no code reads or writes it,
-   because `run_turn` exits before constructing an `AsyncCodex` instance.
-   **Blocked on Tier-2 SDK spike (item 24).** Cannot construct an
-   `AsyncCodex` instance until the SDK is vendored / installed and the
-   actual constructor signature is confirmed against a live
-   `codex app-server`. The cache scaffolding stays in place; populating
-   it is a 5-line addition once `_import_codex_sdk()` returns a real
-   module. Documented as deferred.
+8. **Missing — Lifecycle `_codex_clients` cache is unused** (§E.1). completed
+   Implemented `get_client(slot, *, cwd, env_overrides)` and
+   `close_client(slot)` + `close_all_clients()` in
+   [server/runtimes/codex.py](../server/runtimes/codex.py). First call
+   spawns `codex app-server` via `CodexClient.connect_stdio(command=...,
+   cwd=..., env=...)`, calls `start()` + `initialize()`, caches under
+   the slot id. A per-slot `asyncio.Lock` serializes get-or-create so
+   health probes / shutdown handlers can call without holding the
+   dispatcher's `_SPAWN_LOCK`. Defensive `__await__` checks on `start`
+   / `initialize` / `close` accept both sync and async return shapes
+   (the live 0.3.2 SDK returned `CodexClient` directly from
+   `connect_stdio`, but the spec note about awaitable variants stays
+   honored). Failed handshakes close the partial client and re-raise
+   without poisoning the cache. The dispatcher integration in
+   `run_turn` lands with item #9.
 
 9. **Missing — Thread start / resume** (§E.2). blocked — Tier 2
    `agent_sessions.codex_thread_id` column exists but no code reads or
