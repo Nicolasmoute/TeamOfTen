@@ -126,15 +126,32 @@ section it traces back to and a status:
    start_thread when no stored id, resume_thread when stored id,
    stale-thread auto-heal, config passthrough, cancellation propagation.
 
-10. **Missing — Notification → harness-event mapping** (§E.3). blocked — Tier 2
-    The full mapping table from `thread.started` / `item.added` /
-    `turn.completed` / `turn.failed` to `text` / `tool_use` /
-    `tool_result` / `result` / `error` is not implemented. Codex turns
-    therefore emit nothing through the bus.
-    **Blocked on Tier-2 SDK spike (item 24).** The notification names
-    in §E.3 are placeholders informed by public docs but unverified.
-    The spike must enumerate the actual stream from a live turn before
-    we hardcode a translation table.
+10. **Missing — Notification → harness-event mapping** (§E.3). completed
+    Implemented `handle_step(step, agent_id, turn_ctx)` in
+    [server/runtimes/codex.py](../server/runtimes/codex.py).
+    Translates `ConversationStep` instances yielded by `thread.chat()`
+    into harness `_emit` calls. Translation table lives as a single
+    `_ITEM_TYPE_TO_HARNESS` dict at module scope so the mapping is
+    inspectable without reading control flow.
+
+    Confirmed shapes from the live spike (Docs/CODEX_PROBE_OUTPUT.md):
+    - `userMessage` → `_skip` (already persisted by dispatcher)
+    - `agentMessage` → `text` event; `phase=='final_answer'` flips
+      `turn_ctx['got_result']` so the dispatcher's post-result
+      suppression + retry counter behave like Claude
+
+    Inferred shapes (translated permissively, full item payload passed
+    under `input` so renderers can pick keys):
+    - `shell` → `tool_use(tool='Bash')`
+    - `apply_patch` → `tool_use(tool='Edit')`
+    - `web_search` → `tool_use(tool='WebSearch')`
+    - `reasoning` → `thinking`
+
+    Unknown item types log + skip (forward-compat for newer SDKs that
+    add categories). 9 new tests pin: skip-userMessage, agentMessage
+    text emission, multi-step text accumulation, empty-text no-op,
+    shell/apply_patch/web_search/reasoning emission, unknown-type
+    skip. Total codex tests: 31.
 
 11. **Missing — Native tool execution observation** (§E.4). blocked — Tier 2
     `shell` / `apply_patch` / `web_search` calls inside Codex would be

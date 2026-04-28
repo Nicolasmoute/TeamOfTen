@@ -268,6 +268,132 @@ async def open_thread(
     return (r, False)
 
 
+# ---------------------------------------------------------------------
+# ConversationStep → harness event translator
+# (audit item #10 — Docs/CODEX_RUNTIME_SPEC.md §E.3)
+#
+# Translates each step yielded by `thread.chat()` into one or more
+# harness events via `_emit`. Confirmed shapes (live spike 2026-04-28):
+#
+#   step.step_type='userMessage', item_type='userMessage'
+#       → skip (already persisted by the dispatcher when it took the
+#          prompt)
+#   step.step_type='codex',       item_type='agentMessage', text=<str>
+#       → emit text=<...>; phase='final_answer' marks the turn-ending
+#          message
+#
+# Inferred shapes (need a tool-using prompt to validate; passed through
+# to `_emit` with a permissive arg extractor that doesn't assume keys):
+#
+#   item_type='shell'        → tool_use(tool='Bash')
+#   item_type='apply_patch'  → tool_use(tool='Edit')
+#   item_type='web_search'   → tool_use(tool='WebSearch')
+#   item_type='reasoning'    → thinking
+#   item_type='mcp_tool_call'→ tool_use(tool='mcp__<server>__<name>')
+#
+# Unknown item_types log + skip rather than crashing the turn — newer
+# SDKs may add categories we haven't seen yet.
+# ---------------------------------------------------------------------
+
+
+# Mapping from Codex item_type → (harness event_type, harness tool name).
+# Tool name is None for non-tool events; the renderer keys off the
+# canonical Claude tool names so the existing UI cards keep working.
+_ITEM_TYPE_TO_HARNESS: dict[str, tuple[str, str | None]] = {
+    "userMessage": ("_skip", None),
+    "agentMessage": ("text", None),
+    "reasoning": ("thinking", None),
+    "shell": ("tool_use", "Bash"),
+    "apply_patch": ("tool_use", "Edit"),
+    "web_search": ("tool_use", "WebSearch"),
+}
+
+
+def _step_item_payload(step: Any) -> dict[str, Any]:
+    """Pull the raw `params.item` dict out of a ConversationStep.data.
+    Falls back to an empty dict when the SDK changes shape so callers
+    can still safely .get() into it."""
+    data = getattr(step, "data", None) or {}
+    if isinstance(data, dict):
+        params = data.get("params") or {}
+        if isinstance(params, dict):
+            item = params.get("item")
+            if isinstance(item, dict):
+                return item
+    return {}
+
+
+async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> None:
+    """Translate one ConversationStep to harness events via `_emit`.
+
+    Pure function over `step` and `turn_ctx`; the only side effect is
+    `_emit` calls. Caller (the dispatcher in run_turn) supplies
+    `turn_ctx` so accumulated text + got_result can survive across
+    steps within a single turn.
+    """
+    from server.agents import _emit
+
+    item_type = getattr(step, "item_type", None) or ""
+    item_id = getattr(step, "item_id", None)
+    text = getattr(step, "text", None)
+    item_payload = _step_item_payload(step)
+
+    mapping = _ITEM_TYPE_TO_HARNESS.get(item_type)
+
+    if mapping is None:
+        logger.info(
+            "CodexRuntime: unmapped item_type=%s step_type=%s — skipping",
+            item_type, getattr(step, "step_type", None),
+        )
+        return
+
+    event_type, tool_name = mapping
+
+    if event_type == "_skip":
+        return
+
+    if event_type == "text":
+        if not text:
+            return
+        accumulated = turn_ctx.get("accumulated_text", "") + text
+        turn_ctx["accumulated_text"] = accumulated
+        # Final-answer steps mark the turn-end. The dispatcher uses
+        # got_result to drive the post-result exception suppression and
+        # to skip the auto-retry counter increment on success — same
+        # discipline as the Claude path.
+        phase = item_payload.get("phase")
+        if phase == "final_answer":
+            turn_ctx["got_result"] = True
+        await _emit(agent_id, "text", text=text)
+        return
+
+    if event_type == "thinking":
+        # Reasoning items may be ['summary'] or ['text']; pass through
+        # whatever's in the payload so the UI renderer can render
+        # whichever shape the SDK emits.
+        await _emit(
+            agent_id,
+            "thinking",
+            text=text or item_payload.get("text") or item_payload.get("summary"),
+            id=item_id,
+        )
+        return
+
+    if event_type == "tool_use":
+        # Args extraction is permissive: pass the full item payload
+        # through under `args` so the existing per-tool renderers (Bash
+        # card, Edit diff, WebSearch card) can pick the keys they want
+        # without the dispatcher pre-flattening.
+        await _emit(
+            agent_id,
+            "tool_use",
+            tool=tool_name,
+            id=item_id,
+            input=item_payload,
+        )
+        return
+
+
 def is_enabled() -> bool:
     """Feature-flag gate. Default off — PR 5 ships the runtime
     structurally; flipping the env var enables actual Codex turns."""

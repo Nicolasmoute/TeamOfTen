@@ -608,3 +608,210 @@ async def test_open_thread_passes_config_to_start_and_resume(
     await _set_codex_thread_id("p1", "tid")
     thread, _ = await open_thread("p1", client, config=sentinel)
     assert client.resume_calls[-1] == {"thread_id": "tid", "overrides": sentinel}
+
+
+# Audit item #10 — ConversationStep → harness event mapping.
+# Captures emitted events so we can assert what handle_step did.
+
+class _FakeStep:
+    """Stand-in for codex_app_server_sdk.ConversationStep. Mirrors the
+    fields observed in the live spike (see Docs/CODEX_PROBE_OUTPUT.md)."""
+
+    def __init__(
+        self,
+        *,
+        step_type: str,
+        item_type: str,
+        item_id: str = "item_x",
+        text: str | None = None,
+        item: dict | None = None,
+    ) -> None:
+        self.thread_id = "thread_test"
+        self.turn_id = "turn_test"
+        self.item_id = item_id
+        self.step_type = step_type
+        self.item_type = item_type
+        self.status = "completed"
+        self.text = text
+        self.data = {
+            "params": {
+                "item": item or {},
+                "threadId": self.thread_id,
+                "turnId": self.turn_id,
+            },
+            "item": item or {},
+        }
+
+
+def _capture_emit(monkeypatch):
+    """Monkeypatch `server.agents._emit` to record calls in-memory."""
+    captured: list[dict] = []
+
+    async def fake_emit(agent_id, event_type, **payload):
+        captured.append({"agent_id": agent_id, "type": event_type, **payload})
+
+    import server.agents as agentsmod
+    monkeypatch.setattr(agentsmod, "_emit", fake_emit)
+    return captured
+
+
+async def test_handle_step_skips_userMessage(monkeypatch) -> None:
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    step = _FakeStep(
+        step_type="userMessage",
+        item_type="userMessage",
+        item={"type": "userMessage", "content": [{"type": "text", "text": "hi"}]},
+    )
+    ctx: dict = {}
+    await handle_step(step, "p1", ctx)
+    assert captured == []
+    assert ctx == {}
+
+
+async def test_handle_step_emits_text_for_agentMessage(monkeypatch) -> None:
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    step = _FakeStep(
+        step_type="codex",
+        item_type="agentMessage",
+        item_id="msg_abc",
+        text="hello",
+        item={"type": "agentMessage", "id": "msg_abc", "text": "hello",
+              "phase": "final_answer", "memoryCitation": None},
+    )
+    ctx: dict = {}
+    await handle_step(step, "p1", ctx)
+
+    assert len(captured) == 1
+    assert captured[0]["type"] == "text"
+    assert captured[0]["text"] == "hello"
+    assert captured[0]["agent_id"] == "p1"
+    # Final-answer phase flips got_result for the dispatcher.
+    assert ctx.get("got_result") is True
+    assert ctx.get("accumulated_text") == "hello"
+
+
+async def test_handle_step_accumulates_text_across_steps(monkeypatch) -> None:
+    """Streaming agentMessage steps before the final_answer should
+    accumulate. got_result stays False until phase=='final_answer'."""
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    s1 = _FakeStep(
+        step_type="codex", item_type="agentMessage", item_id="m",
+        text="hel", item={"phase": "in_progress"},
+    )
+    s2 = _FakeStep(
+        step_type="codex", item_type="agentMessage", item_id="m",
+        text="lo", item={"phase": "final_answer"},
+    )
+    ctx: dict = {}
+    await handle_step(s1, "p1", ctx)
+    assert ctx.get("got_result") is not True  # not final yet
+    assert ctx["accumulated_text"] == "hel"
+
+    await handle_step(s2, "p1", ctx)
+    assert ctx["accumulated_text"] == "hello"
+    assert ctx["got_result"] is True
+    assert [c["text"] for c in captured] == ["hel", "lo"]
+
+
+async def test_handle_step_empty_text_is_noop(monkeypatch) -> None:
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    step = _FakeStep(
+        step_type="codex", item_type="agentMessage",
+        text=None, item={"phase": "in_progress"},
+    )
+    await handle_step(step, "p1", {})
+    assert captured == []
+
+
+async def test_handle_step_emits_tool_use_for_shell(monkeypatch) -> None:
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    item_payload = {
+        "type": "shell",
+        "id": "tool_42",
+        "command": ["ls", "-la"],
+        "cwd": "/workspaces/p1",
+    }
+    step = _FakeStep(
+        step_type="codex", item_type="shell",
+        item_id="tool_42", item=item_payload,
+    )
+    await handle_step(step, "p1", {})
+
+    assert len(captured) == 1
+    e = captured[0]
+    assert e["type"] == "tool_use"
+    assert e["tool"] == "Bash"
+    assert e["id"] == "tool_42"
+    # Permissive arg extraction: full item payload comes through under
+    # `input` so existing renderers can pick keys they want.
+    assert e["input"] == item_payload
+
+
+async def test_handle_step_emits_tool_use_for_apply_patch(monkeypatch) -> None:
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    item_payload = {
+        "type": "apply_patch",
+        "id": "patch_1",
+        "patch": "*** Begin Patch\n+hello\n*** End Patch",
+        "path": "foo.py",
+    }
+    step = _FakeStep(
+        step_type="codex", item_type="apply_patch",
+        item_id="patch_1", item=item_payload,
+    )
+    await handle_step(step, "p1", {})
+    assert captured[0]["tool"] == "Edit"
+    assert captured[0]["input"] == item_payload
+
+
+async def test_handle_step_emits_tool_use_for_web_search(monkeypatch) -> None:
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    item_payload = {"type": "web_search", "id": "ws_1", "query": "foo"}
+    step = _FakeStep(
+        step_type="codex", item_type="web_search",
+        item_id="ws_1", item=item_payload,
+    )
+    await handle_step(step, "p1", {})
+    assert captured[0]["tool"] == "WebSearch"
+    assert captured[0]["input"] == item_payload
+
+
+async def test_handle_step_emits_thinking_for_reasoning(monkeypatch) -> None:
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    step = _FakeStep(
+        step_type="codex", item_type="reasoning",
+        item={"summary": "considering options..."},
+    )
+    await handle_step(step, "p1", {})
+    assert captured[0]["type"] == "thinking"
+    assert captured[0]["text"] == "considering options..."
+
+
+async def test_handle_step_unknown_item_type_logs_and_skips(monkeypatch) -> None:
+    """Newer SDKs may add item types we haven't mapped yet — handle_step
+    must NOT crash the turn for them."""
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    step = _FakeStep(
+        step_type="codex", item_type="future_unmapped_type",
+        item={"foo": "bar"},
+    )
+    await handle_step(step, "p1", {})
+    assert captured == []  # skipped, no exception
