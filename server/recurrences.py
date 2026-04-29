@@ -54,7 +54,10 @@ MAX_RECURRENCES_PER_PROJECT = max(
 
 _DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 _DAY_INDEX = {d: i for i, d in enumerate(_DAYS)}
-_TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+# Spec §5.1: TIME := HH:MM (24h). Strict — single-digit hour like
+# `9:00` is rejected so the surface stays consistent with the
+# documented grammar.
+_TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 _DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 
 
@@ -69,7 +72,11 @@ def _parse_time(token: str) -> time:
     return time(int(m.group(1)), int(m.group(2)))
 
 
-def _parse_day_list(token: str) -> list[int]:
+def _parse_day_list(token: str, *, allow_single: bool = True) -> list[int]:
+    """Parse a comma-separated day list. Spec §5.1: bare-list shape
+    is `DAY ("," DAY)+` — that is, **two or more** days. Single days
+    must be expressed as `weekly DAY TIME`. ``allow_single=False``
+    enforces the spec for the bare DAY_LIST entry point."""
     parts = [p.strip() for p in token.split(",")]
     out: list[int] = []
     for p in parts:
@@ -79,6 +86,10 @@ def _parse_day_list(token: str) -> list[int]:
             out.append(_DAY_INDEX[p])
     if not out:
         raise CronParseError("empty day list")
+    if not allow_single and len(out) < 2:
+        raise CronParseError(
+            f"single-day shorthand: use 'weekly {parts[0]} HH:MM' instead"
+        )
     return out
 
 
@@ -121,7 +132,7 @@ def parse_cron(dsl: str) -> dict[str, Any]:
         # bare DAY_LIST TIME (e.g. "mon,thu 14:00")
         return {
             "type": "weekly",
-            "days": _parse_day_list(first),
+            "days": _parse_day_list(first, allow_single=False),
             "time": _parse_time(t_token),
         }
 
@@ -318,47 +329,48 @@ TICK_BASE_PROMPT = (
 )
 
 
-def _objectives_asked_key(project_id: str) -> str:
-    return f"objectives_asked_{project_id}"
+async def _coach_recently_asked_objectives(
+    project_id: str,
+) -> bool:
+    """True if Coach has emitted any text mentioning 'project-
+    objectives.md' or 'objectives' in a sent message within the last
+    24h for this project. Used by ``compose_tick_prompt`` to suppress
+    re-elicitation per spec §15.5 ("subsequent ticks → end quietly").
 
-
-async def _objectives_asked(project_id: str) -> bool:
-    """Has the harness already shown Coach the elicitation prompt for
-    this project's missing objectives? Tracked in `team_config` so the
-    state survives restarts."""
+    This replaces the older team_config-flag mechanism, which marked
+    the elicitation as 'asked' even when the inbox / todos were busy
+    and Coach never actually saw the hint as actionable.
+    """
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT value FROM team_config WHERE key = ?",
-            (_objectives_asked_key(project_id),),
+            """
+            SELECT 1 FROM events
+            WHERE project_id = ?
+              AND agent_id = 'coach'
+              AND type = 'message_sent'
+              AND id IN (
+                SELECT id FROM events
+                WHERE project_id = ?
+                  AND agent_id = 'coach'
+                  AND type = 'message_sent'
+                ORDER BY id DESC
+                LIMIT 50
+              )
+              AND (
+                payload LIKE '%project-objectives.md%'
+                OR payload LIKE '%define%objectives%'
+                OR payload LIKE '%trying to accomplish%'
+              )
+            LIMIT 1
+            """,
+            (project_id, project_id),
         )
-        row = await cur.fetchone()
-    finally:
-        await c.close()
-    return row is not None
-
-
-async def _mark_objectives_asked(project_id: str) -> None:
-    c = await configured_conn()
-    try:
-        await c.execute(
-            "INSERT OR REPLACE INTO team_config (key, value) "
-            "VALUES (?, '1')",
-            (_objectives_asked_key(project_id),),
-        )
-        await c.commit()
-    finally:
-        await c.close()
-
-
-async def _clear_objectives_asked(project_id: str) -> None:
-    c = await configured_conn()
-    try:
-        await c.execute(
-            "DELETE FROM team_config WHERE key = ?",
-            (_objectives_asked_key(project_id),),
-        )
-        await c.commit()
+        return await cur.fetchone() is not None
+    except Exception:
+        # DB hiccup → fail open (include the hint); Coach can
+        # self-regulate by reading inbox.
+        return False
     finally:
         await c.close()
 
@@ -366,30 +378,21 @@ async def _clear_objectives_asked(project_id: str) -> None:
 async def compose_tick_prompt(project_id: str) -> str:
     """Per-tick user prompt for Coach (`recurrence-specs.md` §4).
 
-    The base orientation is constant. Spec §15.5 distinguishes the
-    first empty-objectives tick (Coach asks) from subsequent ticks
-    (Coach ends quietly). Implemented via a ``team_config`` flag:
-
-    * Objectives present: clear the flag (so a future "objectives
-      deleted" cycle starts fresh) and return the base prompt.
-    * Objectives missing AND flag unset: append the elicitation
-      hint and stamp the flag — the next tick will see it set.
-    * Objectives missing AND flag set: base prompt only; Coach
-      already saw the hint and §4 step 4 says end the turn quietly.
+    The base orientation is constant. When ``project-objectives.md``
+    is missing or empty AND Coach hasn't already asked recently
+    (last 50 outgoing messages, scanned for objectives-related
+    wording), append the elicitation hint per spec §15.5. Once Coach
+    sends an objectives-asking message, the events log is the source
+    of truth — no team_config flag needed.
     """
     from server.coach_objectives import (
         OBJECTIVES_ELICITATION_PROMPT, has_objectives,
     )
     prompt = TICK_BASE_PROMPT
     if has_objectives(project_id):
-        # State recovered — reset the asked flag so a future delete
-        # of objectives.md re-enters the elicitation flow.
-        await _clear_objectives_asked(project_id)
         return prompt
-
-    if await _objectives_asked(project_id):
+    if await _coach_recently_asked_objectives(project_id):
         return prompt
-
     prompt += (
         "\n\nNote: project-objectives.md is missing or empty. If "
         "your inbox is empty AND there are no open coach-todos, "
@@ -397,7 +400,6 @@ async def compose_tick_prompt(project_id: str) -> str:
         "Once they reply, save the answer via the Write tool to "
         f"/data/projects/{project_id}/project-objectives.md."
     )
-    await _mark_objectives_asked(project_id)
     return prompt
 
 
@@ -448,25 +450,25 @@ async def _skip_row(
     kind = row["kind"]
     project_id = row["project_id"]
     next_fire = await _compute_next_for_row(row, now)
-    if next_fire is None and kind == "cron":
+
+    one_shot_terminal = next_fire is None and kind == "cron"
+    if one_shot_terminal:
+        # Past one-shot: persist the disable (no future fire) but
+        # still emit the skip first per spec §11 — the operator
+        # should see WHY the row was skipped (coach_busy /
+        # cost_capped) before it disappears.
         await db.execute(
-            "UPDATE coach_recurrence SET enabled = 0 WHERE id = ?",
+            "UPDATE coach_recurrence SET enabled = 0, "
+            "next_fire_at = NULL WHERE id = ?",
             (rid,),
         )
-        await db.commit()
-        await _emit({
-            "type": "recurrence_disabled",
-            "id": rid,
-            "kind": kind,
-            "reason": "one_shot_complete",
-            "project_id": project_id,
-        })
-        return
-    await db.execute(
-        "UPDATE coach_recurrence SET next_fire_at = ? WHERE id = ?",
-        (_format_iso(next_fire) if next_fire else None, rid),
-    )
+    else:
+        await db.execute(
+            "UPDATE coach_recurrence SET next_fire_at = ? WHERE id = ?",
+            (_format_iso(next_fire) if next_fire else None, rid),
+        )
     await db.commit()
+
     await _emit({
         "type": "recurrence_skipped",
         "id": rid,
@@ -474,15 +476,23 @@ async def _skip_row(
         "reason": reason,
         "project_id": project_id,
     })
+    if one_shot_terminal:
+        await _emit({
+            "type": "recurrence_disabled",
+            "id": rid,
+            "kind": kind,
+            "reason": "one_shot_complete",
+            "project_id": project_id,
+        })
 
 
 async def _handle_due_row(
     db: Any, row: dict[str, Any], coach_busy: bool, now: datetime,
-) -> None:
+) -> bool:
     """Process one due row. Updates next_fire_at / last_fired_at and
-    emits the appropriate events. ``coach_busy`` reflects the state at
-    the start of the scheduler iteration; later rows in the same pass
-    will see busy=True after the first row fires."""
+    emits the appropriate events. Returns True if Coach was actually
+    spawned (so the pass can force-skip subsequent rows per spec
+    §15.1). Returns False on skip / disable paths."""
     # Imported lazily to dodge an import cycle during module load.
     from server.agents import _check_cost_caps
 
@@ -492,7 +502,7 @@ async def _handle_due_row(
 
     if coach_busy:
         await _skip_row(db, row, "coach_busy", now)
-        return
+        return False
 
     # §15.9: a recurrence fire is subject to the same per-agent and
     # team-daily cost caps as any other Coach turn. Skip with
@@ -501,7 +511,7 @@ async def _handle_due_row(
     allowed, _reason = await _check_cost_caps("coach")
     if not allowed:
         await _skip_row(db, row, "cost_capped", now)
-        return
+        return False
 
     # Coach is free + under cap — fire the row. last_fired_at stamps
     # before the spawn so a long-running turn doesn't push next_fire_at
@@ -542,6 +552,7 @@ async def _handle_due_row(
             "reason": "one_shot_complete",
             "project_id": project_id,
         })
+    return True
 
 
 async def _scheduler_iteration() -> None:
@@ -572,14 +583,19 @@ async def _scheduler_iteration() -> None:
         if not rows:
             return
 
-        # Hold a single coach-busy snapshot for the start of the pass;
-        # after the first row fires, _coach_is_working will return True
-        # and subsequent rows in this pass will be deferred (skip with
-        # reason=coach_busy). That's the spec's "fire sequentially"
-        # rule (§15.1).
+        # Spec §15.1: "Multiple due rows in one scheduler tick: fire
+        # them sequentially; after the first fires, the rest see
+        # 'coach_busy' and skip." Because we await the full Coach turn
+        # inside _fire_row, ``_coach_is_working`` is False again once
+        # the await returns — so a second await would happily fire
+        # another row. Track a local flag and force-skip any further
+        # rows in this pass.
+        fired_in_pass = False
         for row in rows:
-            busy = await _coach_is_working()
-            await _handle_due_row(db, row, busy, _now_utc())
+            busy = fired_in_pass or await _coach_is_working()
+            did_fire = await _handle_due_row(db, row, busy, _now_utc())
+            if did_fire:
+                fired_in_pass = True
     finally:
         await db.close()
 
@@ -792,6 +808,12 @@ async def upsert_tick(
         existing = await cur.fetchone()
         if existing:
             existing_d = _row_to_dict(existing)
+            before_snapshot = {
+                "cadence": existing_d["cadence"],
+                "enabled": bool(existing_d["enabled"]),
+                "tz": None,
+                "prompt": None,
+            }
             new_enabled = (
                 existing_d["enabled"] if enabled is None
                 else (1 if enabled else 0)
@@ -846,20 +868,44 @@ async def upsert_tick(
             rec_id = cur.lastrowid
             await c.commit()
             event_type = "recurrence_added"
+            before_snapshot = None
     finally:
         await c.close()
 
     row = await get_recurrence(int(rec_id))
     if row is None:
         return None
-    event: dict[str, Any] = {
-        "type": event_type,
-        "id": row["id"],
-        "kind": row["kind"],
-        "cadence": row["cadence"],
-        "enabled": row["enabled"],
-        "project_id": project_id,
-    }
+
+    # Spec §13:
+    #   recurrence_added  → id, kind, cadence, tz, prompt
+    #   recurrence_changed → id, before, after
+    # tick rows have no tz / prompt — emit them as null so consumers
+    # that key off the field exist regardless of kind.
+    if event_type == "recurrence_added":
+        event: dict[str, Any] = {
+            "type": "recurrence_added",
+            "id": row["id"],
+            "kind": row["kind"],
+            "cadence": row["cadence"],
+            "tz": row["tz"],
+            "prompt": row["prompt"],
+            "enabled": row["enabled"],
+            "project_id": project_id,
+        }
+    else:
+        event = {
+            "type": "recurrence_changed",
+            "id": row["id"],
+            "kind": row["kind"],
+            "before": before_snapshot,
+            "after": {
+                "cadence": row["cadence"],
+                "enabled": row["enabled"],
+                "tz": row["tz"],
+                "prompt": row["prompt"],
+            },
+            "project_id": project_id,
+        }
     if actor:
         event["actor"] = actor
     await _emit(event)

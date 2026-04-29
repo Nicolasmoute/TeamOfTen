@@ -1234,7 +1234,7 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
     assert "Do not use shell commands, direct SQLite/database access" in config.kwargs["developer_instructions"]
     assert config.kwargs["model"] == "gpt-5.4-mini"
     assert config.kwargs["sandbox"] == "danger-full-access"
-    assert config.kwargs["config"]["plugins"]["enabled"] is False
+    assert "plugins" not in config.kwargs["config"]
     mcp_servers = config.kwargs["config"]["mcp_servers"]
     assert mcp_servers["coord"]["type"] == "stdio"
     assert mcp_servers["coord"]["cwd"]
@@ -1276,7 +1276,7 @@ def test_codex_thread_config_makes_coach_read_only() -> None:
 
     config = _build_thread_config(_FakeCodexSdk, tc)
     assert config.kwargs["sandbox"] == "read-only"
-    assert config.kwargs["config"]["plugins"]["enabled"] is False
+    assert "plugins" not in config.kwargs["config"]
 
 
 async def test_codex_run_turn_updates_continuity_bookkeeping(

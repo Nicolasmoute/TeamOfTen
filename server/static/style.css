@@ -2234,24 +2234,61 @@ body {
 .gear.files-open.active { color: var(--fg); }
 
 /* Recurrence rail icon — circular arrows (recurrence-specs.md §12.1).
-   Inline SVG so the two arcs and arrowheads stay visually crisp at
-   small sizes; uses currentColor so it inherits the rail's accent
-   state like the other rail icons. */
+   CSS-drawn: two partial-border circles (top arc + bottom arc) with
+   small triangular heads. Class names match the spec
+   (.recurrence-icon-arc-top / -arc-bottom / -head-*) so the parts
+   are inspectable and consistent with .files-icon-* and .projects-icon-*.
+   Uses currentColor so it inherits the rail's accent state. */
 .gear.recurrence-toggle { padding: 6px; line-height: 0; }
 .gear.recurrence-toggle.active { color: var(--accent); }
 .recurrence-icon {
   display: inline-block;
+  position: relative;
   width: 18px;
   height: 18px;
+  vertical-align: middle;
 }
-.recurrence-icon svg {
-  width: 100%;
-  height: 100%;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.6;
-  stroke-linecap: round;
-  stroke-linejoin: round;
+.recurrence-icon-arc-top,
+.recurrence-icon-arc-bottom {
+  position: absolute;
+  inset: 1px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  /* Hide the half opposite to the arc's "side" so each renders as a
+     C-shape. Top arc has a gap on the bottom-right; bottom arc has a
+     gap on the top-left — together they form the classic refresh
+     two-arrows ring. */
+}
+.recurrence-icon-arc-top {
+  border-bottom-color: transparent;
+  border-right-color: transparent;
+}
+.recurrence-icon-arc-bottom {
+  border-top-color: transparent;
+  border-left-color: transparent;
+}
+.recurrence-icon-head-right,
+.recurrence-icon-head-left {
+  position: absolute;
+  width: 0;
+  height: 0;
+  border: 3px solid transparent;
+}
+/* Top arc ends near the right side, pointing down-and-right. */
+.recurrence-icon-head-right {
+  top: 1px;
+  right: -1px;
+  border-left-color: currentColor;
+  border-top-color: currentColor;
+  transform: rotate(45deg);
+}
+/* Bottom arc ends near the left side, pointing up-and-left. */
+.recurrence-icon-head-left {
+  bottom: 1px;
+  left: -1px;
+  border-right-color: currentColor;
+  border-bottom-color: currentColor;
+  transform: rotate(45deg);
 }
 
 /* Recurrence pane — a side panel that opens alongside the EnvPane

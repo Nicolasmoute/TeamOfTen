@@ -105,7 +105,13 @@ async def test_coord_mcp_stdio_subprocess_lists_and_calls_tool() -> None:
                 return
             self._send_json(
                 200,
-                {"tools": ["coord_list_team", "coord_send_message"]},
+                {
+                    "tools": [
+                        "coord_list_team",
+                        "coord_send_message",
+                        "coord_assign_task",
+                    ]
+                },
             )
 
         def do_POST(self) -> None:  # noqa: N802 - http.server API
@@ -121,6 +127,26 @@ async def test_coord_mcp_stdio_subprocess_lists_and_calls_tool() -> None:
                 self._send_json(401, {"ok": False, "error": "bad token"})
                 return
             if self.path != "/api/_coord/coord_list_team":
+                if self.path == "/api/_coord/coord_send_message":
+                    self._send_json(
+                        403,
+                        {"detail": "caller_id mismatch (token bound to 'coach')"},
+                    )
+                    return
+                if self.path == "/api/_coord/coord_assign_task":
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "result": {
+                                "content": [
+                                    {"type": "text", "text": "ERROR: task is not open"}
+                                ],
+                                "isError": True,
+                            },
+                        },
+                    )
+                    return
                 self._send_json(404, {"ok": False, "error": "unknown"})
                 return
             self._send_json(200, {"ok": True, "result": {"team": [{"id": "coach"}]}})
@@ -161,6 +187,7 @@ async def test_coord_mcp_stdio_subprocess_lists_and_calls_tool() -> None:
                 assert [t.name for t in listed.tools] == [
                     "coord_list_team",
                     "coord_send_message",
+                    "coord_assign_task",
                 ]
 
                 result = await session.call_tool("coord_list_team", {"verbose": True})
@@ -168,6 +195,21 @@ async def test_coord_mcp_stdio_subprocess_lists_and_calls_tool() -> None:
                 assert json.loads(result.content[0].text) == {
                     "team": [{"id": "coach"}],
                 }
+
+                http_error = await session.call_tool(
+                    "coord_send_message",
+                    {"to": "p1", "body": "hello"},
+                )
+                assert http_error.isError is True
+                assert "HTTP 403" in http_error.content[0].text
+                assert "caller_id mismatch" in http_error.content[0].text
+
+                tool_error = await session.call_tool(
+                    "coord_assign_task",
+                    {"task_id": "t-1", "to": "p1"},
+                )
+                assert tool_error.isError is True
+                assert tool_error.content[0].text == "ERROR: task is not open"
 
         assert calls == [
             {
@@ -177,7 +219,23 @@ async def test_coord_mcp_stdio_subprocess_lists_and_calls_tool() -> None:
                     "caller_id": "coach",
                     "args": {"verbose": True},
                 },
-            }
+            },
+            {
+                "path": "/api/_coord/coord_send_message",
+                "authorization": f"Bearer {token}",
+                "payload": {
+                    "caller_id": "coach",
+                    "args": {"to": "p1", "body": "hello"},
+                },
+            },
+            {
+                "path": "/api/_coord/coord_assign_task",
+                "authorization": f"Bearer {token}",
+                "payload": {
+                    "caller_id": "coach",
+                    "args": {"task_id": "t-1", "to": "p1"},
+                },
+            },
         ]
     finally:
         httpd.shutdown()

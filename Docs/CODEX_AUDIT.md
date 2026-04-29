@@ -73,6 +73,9 @@ Second fix pass:
    transport instead of the earlier hand-rolled JSON-RPC loop. The
    dependency is declared directly in `pyproject.toml`, and a subprocess
    smoke test speaks MCP initialize/tools/list/tools/call to the proxy.
+   The proxy also preserves FastAPI `detail`/`error` text and maps
+   coord handler `isError: true` envelopes to MCP tool errors, so Codex
+   sees actionable causes instead of generic proxy failures.
 
 ## Section D — Auth
 

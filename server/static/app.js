@@ -3219,14 +3219,12 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
             title=${recurrenceOpen ? "Close recurrence panel" : "Open recurrence panel — Coach tick / repeats / crons"}
             onClick=${onToggleRecurrence}
           >
-            <span class="recurrence-icon" aria-hidden="true">${html`
-              <svg viewBox="0 0 24 24">
-                <path d="M20 8 A 9 9 0 0 0 4 11" />
-                <polyline points="20 3 20 8 15 8" />
-                <path d="M4 16 A 9 9 0 0 0 20 13" />
-                <polyline points="4 21 4 16 9 16" />
-              </svg>
-            `}</span>
+            <span class="recurrence-icon" aria-hidden="true">
+              <span class="recurrence-icon-arc-top"></span>
+              <span class="recurrence-icon-arc-bottom"></span>
+              <span class="recurrence-icon-head-right"></span>
+              <span class="recurrence-icon-head-left"></span>
+            </span>
           </button>
           <button
             class=${"gear env-toggle" + (envOpen ? " active" : "")}
@@ -5667,11 +5665,55 @@ function RecurrencePane({ rows, onClose, onRefresh, onError }) {
     if ("cadence" in e) body.cadence = e.cadence;
     if ("prompt" in e) body.prompt = e.prompt;
     if (Object.keys(body).length === 0) return;
+    // Spec §12.2: "TZ is read-only, captured at create time, but
+    // re-saving picks up the operator's current TZ." For cron rows,
+    // include the browser's current TZ on every save so a move (DST
+    // shift, laptop relocation) re-anchors next-fire computation.
+    if (row.kind === "cron") body.tz = tz;
     return _http(`/api/recurrences/${row.id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }).then(() => clearEdit(row.id));
+  }
+
+  // Live DSL validation for the cron schedule input. Mirrors the
+  // grammar in server/recurrences.py:parse_cron — reject bad input
+  // before sending so the Save button is disabled visually instead
+  // of triggering a 400 round-trip.
+  function _validCronDSL(s) {
+    if (typeof s !== "string") return false;
+    const trimmed = s.trim();
+    if (!trimmed) return false;
+    // Spec §5.1: TIME = HH:MM strict. Bare DAY_LIST must have ≥2
+    // days; single-day uses `weekly DAY TIME`.
+    const T = "[01]\\d|2[0-3]";
+    const M = "[0-5]\\d";
+    const TIME = `(${T}):(${M})`;
+    const DAY = "mon|tue|wed|thu|fri|sat|sun";
+    const DAYLIST_MULTI = `(${DAY})(,(${DAY}))+`;
+    const patterns = [
+      `^daily ${TIME}$`,
+      `^weekdays ${TIME}$`,
+      `^weekends ${TIME}$`,
+      `^${DAYLIST_MULTI} ${TIME}$`,
+      `^weekly (${DAY}) ${TIME}$`,
+      `^monthly ([1-9]|[12]\\d|3[01]) ${TIME}$`,
+      `^\\d{4}-\\d{2}-\\d{2} ${TIME}$`,
+    ];
+    return patterns.some((p) => new RegExp(p).test(trimmed));
+  }
+
+  function rowSaveDisabled(row) {
+    const e = edits[row.id] || {};
+    if (row.kind === "cron" && "cadence" in e) {
+      return !_validCronDSL(e.cadence);
+    }
+    if (row.kind === "repeat" && "cadence" in e) {
+      const n = parseInt(e.cadence, 10);
+      return !n || n < 1;
+    }
+    return false;
   }
 
   return html`
@@ -5756,7 +5798,11 @@ function RecurrencePane({ rows, onClose, onRefresh, onError }) {
                   </div>
                   <div class="rec-actions">
                     ${hasEdits(r.id)
-                      ? html`<button onClick=${() => saveRow(r)} disabled=${busy}>save</button>
+                      ? html`<button
+                              onClick=${() => saveRow(r)}
+                              disabled=${busy || rowSaveDisabled(r)}
+                              title=${rowSaveDisabled(r) ? "Invalid input — fix above" : "Save edits"}
+                            >save</button>
                             <button onClick=${() => clearEdit(r.id)} disabled=${busy}>discard</button>`
                       : html`<button onClick=${() => toggleRow(r)} disabled=${busy}>${r.enabled ? "disable" : "enable"}</button>
                             <button class="rec-delete" onClick=${() => deleteRow(r.id)} disabled=${busy}>delete</button>`}
@@ -5816,7 +5862,11 @@ function RecurrencePane({ rows, onClose, onRefresh, onError }) {
                   </div>
                   <div class="rec-actions">
                     ${hasEdits(r.id)
-                      ? html`<button onClick=${() => saveRow(r)} disabled=${busy}>save</button>
+                      ? html`<button
+                              onClick=${() => saveRow(r)}
+                              disabled=${busy || rowSaveDisabled(r)}
+                              title=${rowSaveDisabled(r) ? "Invalid input — fix above" : "Save edits"}
+                            >save</button>
                             <button onClick=${() => clearEdit(r.id)} disabled=${busy}>discard</button>`
                       : html`<button onClick=${() => toggleRow(r)} disabled=${busy}>${r.enabled ? "disable" : "enable"}</button>
                             <button class="rec-delete" onClick=${() => deleteRow(r.id)} disabled=${busy}>delete</button>`}

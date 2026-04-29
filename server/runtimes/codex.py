@@ -914,10 +914,6 @@ def _codex_sandbox_for(agent_id: str) -> str:
 def _codex_config_overrides(tc: TurnContext) -> dict[str, Any]:
     return {
         "mcp_servers": _build_mcp_servers(tc),
-        # TeamOfTen supplies its own coordination surface. Disabling
-        # plugin warmups prevents Cloudflare/plugin-sync noise from
-        # killing embedded app-server sessions.
-        "plugins": {"enabled": False},
     }
 
 

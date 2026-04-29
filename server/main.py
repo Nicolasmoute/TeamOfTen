@@ -890,6 +890,29 @@ async def create_recurrence_endpoint(
     return row
 
 
+async def _ensure_active_project_recurrence(rec_id: int) -> dict:
+    """Enforce the project-scoping invariant: PATCH/DELETE on a
+    recurrence row must target the active project. Otherwise a
+    cross-project mutation could fire scheduled work against the
+    wrong project (or silently disable rows the operator can't see
+    in the pane). Returns the row dict for the caller's reuse;
+    raises HTTPException on miss / mismatch."""
+    from server.recurrences import get_recurrence
+    active = await resolve_active_project()
+    row = await get_recurrence(rec_id)
+    if row is None:
+        raise HTTPException(404, detail="recurrence not found")
+    if row["project_id"] != active:
+        raise HTTPException(
+            404,
+            detail=(
+                "recurrence belongs to a different project; "
+                "switch to that project to edit it"
+            ),
+        )
+    return row
+
+
 @app.patch(
     "/api/recurrences/{rec_id}", dependencies=[Depends(require_token)]
 )
@@ -899,6 +922,7 @@ async def patch_recurrence_endpoint(
 ) -> dict[str, object]:
     """Update a recurrence's cadence / prompt / tz / enabled. Pass
     only the fields you want changed."""
+    await _ensure_active_project_recurrence(rec_id)
     from server.recurrences import update_recurrence
     try:
         row = await update_recurrence(
@@ -922,6 +946,7 @@ async def patch_recurrence_endpoint(
 async def delete_recurrence_endpoint(
     rec_id: int, actor: dict = Depends(audit_actor),
 ) -> dict[str, object]:
+    await _ensure_active_project_recurrence(rec_id)
     from server.recurrences import delete_recurrence
     ok = await delete_recurrence(rec_id, actor=actor)
     if not ok:

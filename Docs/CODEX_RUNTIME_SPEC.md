@@ -261,7 +261,11 @@ Body is a stdio MCP server that:
   catalog and the real handlers is caught by contract tests (§J).
 - On each tool invocation, POSTs to `${proxy_url}/api/_coord/{tool_name}`
   with `{caller_id, args}` and `Authorization: Bearer ${proxy_token}`.
-- Streams the response back as the MCP tool result.
+- Streams the response back as the MCP tool result. FastAPI HTTP errors
+  must preserve their `detail`/`error`/`message` text in the MCP error
+  (`HTTP 403: ...`, not a generic "unknown coord proxy error"), and
+  in-process coord handler envelopes with `isError: true` must become
+  MCP tool errors.
 
 ### C.4 New endpoint family `POST /api/_coord/{tool}`
 

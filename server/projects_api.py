@@ -941,6 +941,66 @@ def build_router(*, require_token, audit_actor):
             ],
         }
 
+    @router.put(
+        "/api/projects/{project_id}/coach-todos",
+        dependencies=[Depends(require_token)],
+    )
+    async def replace_coach_todos(
+        project_id: str,
+        body: dict[str, Any] = Body(...),
+        actor: dict = Depends(audit_actor),
+    ) -> dict[str, Any]:
+        """Full-file replace per spec §9. The body's `text` field is
+        the raw markdown that lands at coach-todos.md verbatim. Shape
+        is validated by parsing the result through `coach_todos.parse`
+        — if no bullets parse out OR a malformed bullet without an id
+        slips through, returns 400 so the operator sees the error
+        before Coach picks up garbage on the next turn (spec §15.6)."""
+        from server import coach_todos as todos
+        await _project_must_exist(project_id)
+        text = body.get("text")
+        if text is None:
+            raise HTTPException(400, detail="'text' field required")
+        if not isinstance(text, str):
+            raise HTTPException(400, detail="'text' must be a string")
+        if len(text) > 200_000:
+            raise HTTPException(
+                400,
+                detail=f"text too long ({len(text)} chars, max 200000)",
+            )
+        # Parse + validate before writing — empty string is allowed
+        # (clears the file); non-empty must contain at least one
+        # well-formed bullet OR be header-only.
+        parsed = todos.parse(text)
+        if text.strip() and not parsed:
+            # Has body but no parseable bullets → likely a bad edit.
+            # Header-only is fine (parse returns empty); reject only
+            # when the operator clearly intended bullets.
+            if "- [" in text:
+                raise HTTPException(
+                    400,
+                    detail=(
+                        "no parseable todo bullets found; each must "
+                        "look like `- [ ] **title** <!-- id:t-N -->`"
+                    ),
+                )
+        from server.paths import project_paths
+        pp = project_paths(project_id)
+        kdrive_rel = f"projects/{project_id}/coach-todos.md"
+        await todos._write_with_mirror(pp.coach_todos, text, kdrive_rel)
+        await bus.publish({
+            "ts": _now_iso(),
+            "agent_id": "coach",
+            "type": "coach_todo_updated",
+            "id": "*",
+            "fields": ["text"],
+            "actor": actor,
+        })
+        return {
+            "ok": True, "project_id": project_id,
+            "size": len(text), "todos": len(parsed),
+        }
+
     @router.post(
         "/api/projects/{project_id}/coach-todos",
         dependencies=[Depends(require_token)],
@@ -1081,6 +1141,21 @@ def build_router(*, require_token, audit_actor):
         pp = project_paths(project_id)
         pp.project_objectives.parent.mkdir(parents=True, exist_ok=True)
         pp.project_objectives.write_text(text, encoding="utf-8")
+        # Spec §3.3 "kDrive mirror: yes". Mirror synchronously so the
+        # human-readable .md is durable the moment the PUT returns —
+        # same shape as coach_todos._write_with_mirror.
+        from server.webdav import webdav
+        if webdav.enabled:
+            try:
+                await webdav.write_text(
+                    f"projects/{project_id}/project-objectives.md",
+                    text,
+                )
+            except Exception:
+                logger.exception(
+                    "objectives PUT: kDrive mirror failed for %s",
+                    project_id,
+                )
         await bus.publish({
             "ts": _now_iso(),
             "agent_id": actor.get("source", "human"),

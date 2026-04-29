@@ -14,6 +14,7 @@ Phase 1 cover:
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, time, timezone
 from typing import Any
 from unittest.mock import patch
@@ -651,13 +652,35 @@ async def test_compose_tick_prompt_skips_elicitation_after_asked(
 ) -> None:
     """Spec §15.5: subsequent empty-objectives ticks end quietly —
     the harness must not pester Coach with the same elicitation.
-    First call sets a team_config flag; second call sees it set and
-    returns the base prompt only."""
+    The prompt composer suppresses the hint after Coach actually sends
+    the objectives-asking message."""
     await init_db()
     from server.paths import ensure_project_scaffold
     ensure_project_scaffold("misc")
     first = await recmod.compose_tick_prompt("misc")
     assert "missing or empty" in first
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO events (ts, agent_id, project_id, type, payload) "
+            "VALUES (?, 'coach', 'misc', 'message_sent', ?)",
+            (
+                "2026-04-29T00:00:00Z",
+                json.dumps(
+                    {
+                        "to": "human",
+                        "body": (
+                            "This project has no objectives defined. "
+                            "What are we trying to accomplish? Once you reply, "
+                            "I'll save them to project-objectives.md."
+                        ),
+                    }
+                ),
+            ),
+        )
+        await c.commit()
+    finally:
+        await c.close()
     second = await recmod.compose_tick_prompt("misc")
     assert "missing or empty" not in second
     assert second == recmod.TICK_BASE_PROMPT
@@ -673,7 +696,8 @@ async def test_compose_tick_prompt_resets_after_objectives_saved(
     from server.paths import ensure_project_scaffold, project_paths
     ensure_project_scaffold("misc")
     pp = project_paths("misc")
-    # First empty-objectives tick stamps the flag.
+    # First empty-objectives tick includes the hint but does not stamp
+    # anything until Coach actually sends the question.
     await recmod.compose_tick_prompt("misc")
     # Operator saves objectives.
     pp.project_objectives.write_text("Be brilliant.\n", encoding="utf-8")
@@ -893,3 +917,205 @@ async def test_scheduler_one_shot_disables_after_fire(
         await c.close()
     assert row["enabled"] == 0
     assert row["next_fire_at"] is None
+
+
+# --- Audit gap regressions -------------------------------------------
+
+
+async def test_scheduler_only_fires_one_row_per_pass(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec §15.1: when multiple rows are due in the same scheduler
+    pass, only the first one fires; the rest skip with reason=
+    coach_busy. The previous implementation awaited the full Coach
+    turn before checking the next row, so all due rows fired
+    back-to-back — fixed by tracking a fired_in_pass flag."""
+    monkeypatch.setenv("HARNESS_COACH_TICK_INTERVAL", "0")
+    await init_db()
+    c = await configured_conn()
+    try:
+        # Two due repeats — both have past next_fire_at.
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, prompt, enabled, next_fire_at) "
+            "VALUES ('misc', 'repeat', '30', 'A', 1, "
+            "'2020-01-01T00:00:00.000Z')"
+        )
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, prompt, enabled, next_fire_at) "
+            "VALUES ('misc', 'repeat', '30', 'B', 1, "
+            "'2020-01-01T00:00:00.000Z')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    fired: list[str] = []
+    skipped: list[dict[str, Any]] = []
+
+    async def fake_run(agent_id: str, prompt: str, **kw: Any) -> None:
+        fired.append(prompt)
+
+    async def fake_busy() -> bool:
+        return False
+
+    def fake_paused() -> bool:
+        return False
+
+    async def fake_caps(agent_id: str) -> tuple[bool, str]:
+        return True, ""
+
+    real_publish = recmod.bus.publish
+
+    async def capture(event: dict[str, Any]) -> None:
+        if event.get("type") == "recurrence_skipped":
+            skipped.append(event)
+        await real_publish(event)
+
+    with patch("server.agents.run_agent", fake_run), \
+            patch("server.agents._coach_is_working", fake_busy), \
+            patch("server.agents.is_paused", fake_paused), \
+            patch("server.agents._check_cost_caps", fake_caps), \
+            patch.object(recmod.bus, "publish", capture):
+        await recmod._scheduler_iteration()
+
+    # Exactly one fire.
+    assert len(fired) == 1
+    # And exactly one skip with reason=coach_busy.
+    assert len(skipped) == 1
+    assert skipped[0]["reason"] == "coach_busy"
+
+
+async def test_one_shot_busy_emits_skipped_then_disabled(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec §11: skipped fires must be recorded. A one-shot cron
+    that's both busy AND past should emit recurrence_skipped before
+    being disabled — the operator needs to see WHY it was skipped
+    before the row goes silent."""
+    monkeypatch.setenv("HARNESS_COACH_TICK_INTERVAL", "0")
+    await init_db()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, tz, prompt, enabled, "
+            "next_fire_at) "
+            "VALUES ('misc', 'cron', '2020-01-01 10:00', 'UTC', "
+            "'once', 1, '2020-01-01T10:00:00.000Z')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    events: list[dict[str, Any]] = []
+
+    async def fake_run(*a: Any, **kw: Any) -> None:
+        return None
+
+    async def fake_busy() -> bool:
+        return True  # Force the busy path.
+
+    def fake_paused() -> bool:
+        return False
+
+    real_publish = recmod.bus.publish
+
+    async def capture(event: dict[str, Any]) -> None:
+        t = event.get("type", "")
+        if t.startswith("recurrence_"):
+            events.append(event)
+        await real_publish(event)
+
+    with patch("server.agents.run_agent", fake_run), \
+            patch("server.agents._coach_is_working", fake_busy), \
+            patch("server.agents.is_paused", fake_paused), \
+            patch.object(recmod.bus, "publish", capture):
+        await recmod._scheduler_iteration()
+
+    types = [e["type"] for e in events]
+    # Both events present, in order: skip first, disable second.
+    assert "recurrence_skipped" in types
+    assert "recurrence_disabled" in types
+    assert types.index("recurrence_skipped") < types.index(
+        "recurrence_disabled"
+    )
+
+
+async def test_cron_grammar_rejects_single_digit_hour(fresh_db: str) -> None:
+    """Spec §5.1: TIME = HH:MM. Single-digit hour is now rejected."""
+    with pytest.raises(recmod.CronParseError):
+        recmod.parse_cron("daily 9:00")
+
+
+async def test_cron_grammar_rejects_bare_single_day(fresh_db: str) -> None:
+    """Spec §5.1: bare DAY_LIST requires ≥2 days. Single days must
+    use `weekly DAY TIME` shorthand."""
+    with pytest.raises(recmod.CronParseError):
+        recmod.parse_cron("mon 09:00")
+
+
+async def test_tick_added_event_includes_tz_and_prompt(
+    fresh_db: str,
+) -> None:
+    """Spec §13: recurrence_added payload = id, kind, cadence, tz,
+    prompt. tick rows have null tz/prompt but the keys still exist
+    so consumers can index uniformly."""
+    await init_db()
+    captured: list[dict[str, Any]] = []
+    real_publish = recmod.bus.publish
+
+    async def capture(event: dict[str, Any]) -> None:
+        if event.get("type") == "recurrence_added":
+            captured.append(event)
+        await real_publish(event)
+
+    with patch.object(recmod.bus, "publish", capture):
+        await recmod.upsert_tick(project_id="misc", minutes=60)
+
+    assert len(captured) == 1
+    ev = captured[0]
+    assert "tz" in ev
+    assert "prompt" in ev
+    assert ev["tz"] is None
+    assert ev["prompt"] is None
+
+
+async def test_tick_changed_event_uses_before_after(
+    fresh_db: str,
+) -> None:
+    """Spec §13: recurrence_changed payload has `before` and `after`
+    snapshots."""
+    await init_db()
+    await recmod.upsert_tick(project_id="misc", minutes=60)
+    captured: list[dict[str, Any]] = []
+    real_publish = recmod.bus.publish
+
+    async def capture(event: dict[str, Any]) -> None:
+        if event.get("type") == "recurrence_changed":
+            captured.append(event)
+        await real_publish(event)
+
+    with patch.object(recmod.bus, "publish", capture):
+        await recmod.upsert_tick(project_id="misc", minutes=15)
+
+    assert len(captured) == 1
+    ev = captured[0]
+    assert ev["before"]["cadence"] == "60"
+    assert ev["after"]["cadence"] == "15"
+
+
+async def test_schema_version_stamped(fresh_db: str) -> None:
+    """Spec §10: migration recurrence_v1 stamps team_config.schema_version."""
+    await init_db()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT value FROM team_config WHERE key = 'schema_version'"
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    assert row is not None
+    assert dict(row)["value"] == "recurrence_v1"

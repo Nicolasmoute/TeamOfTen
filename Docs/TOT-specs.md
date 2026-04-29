@@ -2678,6 +2678,12 @@ by default. The loopback dispatcher explicitly opts into `_handlers`
 and `_tool_names`; those contain Python callables and must not be
 attached to the server object passed to Claude, because the Claude SDK
 serializes its MCP configuration while spawning the CLI.
+The stdio proxy preserves FastAPI HTTP error details (`detail`,
+`error`, or `message`) in MCP tool errors, and treats an in-process
+coord handler result with `isError: true` as an MCP error instead of a
+successful JSON blob. This keeps Codex-visible failures actionable
+(`HTTP 403: caller_id mismatch`, `ERROR: task is not open`, etc.) and
+prevents agents from interpreting proxy failures as missing tools.
 
 ---
 

@@ -29,6 +29,62 @@ from mcp.server.stdio import stdio_server
 logger = logging.getLogger("server.coord_mcp")
 
 
+def _stringify(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except TypeError:
+        return str(value)
+
+
+def _response_payload(resp: httpx.Response) -> Any:
+    try:
+        return resp.json()
+    except ValueError:
+        return resp.text.strip()
+
+
+def _http_error_text(status_code: int, payload: Any) -> str:
+    detail: Any = None
+    if isinstance(payload, dict):
+        detail = (
+            payload.get("error")
+            or payload.get("detail")
+            or payload.get("message")
+        )
+    elif payload:
+        detail = payload
+    text = _stringify(detail if detail is not None else payload)
+    return f"HTTP {status_code}: {text}" if text else f"HTTP {status_code}"
+
+
+def _proxy_error_text(resp: dict[str, Any]) -> str:
+    for key in ("error", "detail", "message"):
+        value = resp.get(key)
+        if value:
+            return _stringify(value)
+    return _stringify(resp) or "unknown coord proxy error"
+
+
+def _tool_result_content(result: Any) -> list[types.TextContent]:
+    if isinstance(result, dict) and isinstance(result.get("content"), list):
+        items: list[types.TextContent] = []
+        for item in result["content"]:
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "text"
+                and isinstance(item.get("text"), str)
+            ):
+                items.append(types.TextContent(type="text", text=item["text"]))
+            else:
+                items.append(types.TextContent(type="text", text=_stringify(item)))
+        return items or [types.TextContent(type="text", text="")]
+    return [types.TextContent(type="text", text=_stringify(result))]
+
+
 class CoordProxyClient:
     """Forward tool calls to `${proxy_url}/api/_coord/{tool}`."""
 
@@ -50,9 +106,18 @@ class CoordProxyClient:
             headers={"Authorization": f"Bearer {self.token}"},
             json={"caller_id": self.caller_id, "args": args},
         )
-        if resp.status_code >= 500:
-            resp.raise_for_status()
-        return resp.json()
+        payload = _response_payload(resp)
+        if resp.status_code >= 400:
+            return {
+                "ok": False,
+                "error": _http_error_text(resp.status_code, payload),
+            }
+        if not isinstance(payload, dict):
+            return {
+                "ok": False,
+                "error": f"unexpected proxy response: {_stringify(payload)}",
+            }
+        return payload
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -100,15 +165,21 @@ async def _serve(client: CoordProxyClient) -> int:
                 content=[
                     types.TextContent(
                         type="text",
-                        text=str(resp.get("error") or "unknown coord proxy error"),
+                        text=_proxy_error_text(resp),
                     )
                 ],
                 isError=True,
             )
 
-        text = json.dumps(resp.get("result"), ensure_ascii=False)
+        result = resp.get("result")
+        if isinstance(result, dict) and result.get("isError"):
+            return types.CallToolResult(
+                content=_tool_result_content(result),
+                isError=True,
+            )
+
         return types.CallToolResult(
-            content=[types.TextContent(type="text", text=text)],
+            content=_tool_result_content(result),
             isError=False,
         )
 

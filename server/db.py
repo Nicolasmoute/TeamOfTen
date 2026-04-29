@@ -590,6 +590,15 @@ async def _seed_recurrence_from_env(db: aiosqlite.Connection) -> None:
         "INSERT OR REPLACE INTO team_config (key, value) "
         "VALUES ('recurrence_v1_seeded', '1')"
     )
+    # Spec §10: migration recurrence_v1 stamps team_config.schema_version.
+    # We don't otherwise track schema versions in this codebase (CREATE
+    # TABLE IF NOT EXISTS handles the rest), but stamping here gives a
+    # cheap signal that the v1 migration ran and is forward-compatible
+    # with a future versioned-migration runner.
+    await db.execute(
+        "INSERT OR REPLACE INTO team_config (key, value) "
+        "VALUES ('schema_version', 'recurrence_v1')"
+    )
     await db.commit()
 
 
