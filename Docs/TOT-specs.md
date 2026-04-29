@@ -1302,6 +1302,23 @@ Estimation semantics — Codex path (when `codex_thread_id` is set):
 - Same shape as the Claude path, so the UI percentage stays comparable
   across runtimes.
 
+Codex usage source of truth: the on-disk rollout JSONL at
+`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*-<thread_id>.jsonl`.
+SDK 0.3.2's `Thread.read(include_turns=True).turns[*]` does **not**
+expose a `usage` field — codex emits `event_msg` lines whose payload
+type is `token_count` with `info.last_token_usage` and
+`info.model_context_window`. The CodexRuntime parses that file after
+every turn and writes the per-turn counts into `turns`. See
+`Docs/CODEX_RUNTIME_SPEC.md` §E.5 for the parser + shape translation.
+
+**Known limitation** — Codex's CLI internally compresses context, so
+`info.model_context_window` (e.g. 258400 for gpt-5.5) is smaller than
+the model's theoretical max recorded in `_CONTEXT_WINDOWS` (1.05M for
+gpt-5.5). The context endpoint currently divides by the theoretical
+max, so the bar under-reports actual context pressure on Codex. A
+future fix should surface `model_context_window` from the rollout
+into the response and divide by that instead.
+
 Window resolution: `_context_window_for(model)` returns the per-model max.
 Codex variants (`gpt-5.x-codex`, `gpt-5.4-mini`, `gpt-5.4-nano`) are pinned
 at 400K; frontier general models (`gpt-5.4`, `gpt-5.5`) and Claude Max
@@ -1970,7 +1987,7 @@ Message body max 5000 chars. Subject max 200 chars.
 | Endpoint | Notes |
 | --- | --- |
 | `GET /api/events` | Active-project event history with filters |
-| `GET /api/turns` | Active-project turn rows |
+| `GET /api/turns` | Active-project turn rows (full token + runtime detail) |
 | `GET /api/turns/summary?hours=24` | Per-agent spend/turn aggregate |
 
 `GET /api/events` supports:
@@ -1983,12 +2000,25 @@ Message body max 5000 chars. Subject max 200 chars.
 
 Events are returned oldest-to-newest within the page.
 
+`GET /api/turns` returns these columns per row:
+
+- `id`, `agent_id`, `started_at`, `ended_at`, `duration_ms`
+- `cost_usd`, `session_id`, `num_turns`, `stop_reason`, `is_error`
+- `model`, `plan_mode`, `effort`
+- `input_tokens`, `output_tokens`, `cache_read_tokens`,
+  `cache_creation_tokens` — used by `_session_context_estimate` /
+  `_codex_session_context_estimate` to feed the per-pane ContextBar
+- `runtime` (`claude` | `codex`), `cost_basis`
+  (`token_priced` | `plan_included`) — needed to disambiguate Codex
+  ChatGPT-auth turns where `cost_usd = 0` is correct rather than
+  missing data.
+
 ### 14.10 Attachments
 
 | Endpoint | Notes |
 | --- | --- |
-| `POST /api/attachments` | Upload pasted image to active project |
-| `GET /api/attachments/{filename}` | Serve active-project image |
+| `POST /api/attachments` | Upload pasted image to active project (Bearer auth) |
+| `GET /api/attachments/{filename}` | Serve active-project image (Bearer **or** `?token=` query) |
 
 Allowed extensions:
 
@@ -2003,14 +2033,26 @@ Storage:
 - If `HARNESS_ATTACHMENTS_DIR` is set, use that legacy global dir.
 - Otherwise `/data/projects/<active>/attachments/`.
 
-Current caveat:
+Auth on the GET endpoint:
 
-- Frontend prompt text references attachments as
-  `/workspaces/<slot>/attachments/<filename>`.
-- Dockerfile creates symlinks to `/data/attachments`, but active-project
-  attachments now default to `/data/projects/<active>/attachments`.
-- Unless `HARNESS_ATTACHMENTS_DIR=/data/attachments` is set, the workspace
-  symlink path may not point at the active project's uploaded file.
+- Browsers can't set Authorization on `<img>` subresource loads, so the
+  endpoint accepts `?token=<HARNESS_TOKEN>` in the query string the same
+  way `/ws` does. The UI appends it when rendering attachment thumbnails
+  and inline Read-of-image previews. The Bearer header still works for
+  programmatic callers.
+
+Path injected into agent prompts:
+
+- The frontend pastes the **absolute** on-disk path returned by
+  `POST /api/attachments` (`path` field, e.g.
+  `/data/projects/<slug>/attachments/<id>.<ext>`) into the prompt as the
+  `Read` target. Earlier code synthesized a
+  `/workspaces/<slot>/attachments/...` path expecting a per-slot
+  symlink that `ensure_workspaces` never created — broken for every
+  slot and outright unreachable for Coach (no worktree).
+- Coach's read-only Codex sandbox grants `root` filesystem read access,
+  so the absolute `/data/...` path resolves under sandbox. Players run
+  with broader access and have always been able to read it.
 
 ### 14.11 Pending Interactions
 

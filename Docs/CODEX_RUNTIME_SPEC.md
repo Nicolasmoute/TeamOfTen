@@ -464,7 +464,7 @@ Observed and implemented item_type mapping:
 | `codex` / `apply_patch`                            | `tool_use` (`name=Edit`, `tool=Edit`)   | draft compatibility; unified diff feeds diff@7 |
 | `codex` / `web_search` or `webSearch`              | `tool_use` (`name=WebSearch`, `tool=WebSearch`) | reuse WebSearch card |
 | `tool` / `mcpToolCall` or `mcp_tool_call`          | `tool_use` (`name=mcp__...`, `tool=mcp__...`) + optional `tool_result` | coord_* + external MCPs; unwrap `args`/`arguments`/`input` into renderer input |
-| stream exhaustion                                  | `result`                   | usage is read best-effort from `thread.read(include_turns=True)` |
+| stream exhaustion                                  | `result`                   | usage is read from the rollout JSONL pointed to by `thread.read().thread.path` (see §E.5); thread.read fields are unused by SDK 0.3.2 |
 | `CodexTurnInactiveError` raised mid-iteration      | `error` (pre-result) → retry counter |
 | `CodexTimeoutError` / `CodexTransportError`        | `error` (pre-result) -> retry counter; close + reopen client; transport errors include captured app-server stderr tail when available |
 | `CodexProtocolError`                               | `error`; if "thread not found" trigger stale-session retry |
@@ -472,9 +472,10 @@ Observed and implemented item_type mapping:
 | `thread.compact()` return                          | `session_compacted` (§E.6) |
 
 `ChatResult` in `codex-app-server-sdk` 0.3.2 does not expose usage
-directly, so the runtime reads the thread after stream exhaustion and
-extracts the matching turn's `usage` defensively. Missing usage records
-zeros rather than failing the turn.
+directly, **and** `thread.read(include_turns=True).turns[*]` ships
+without a `usage` field either (verified live 2026-04-29 against
+Codex CLI 0.125.0 / SDK 0.3.2). Token counts only land on disk in the
+rollout JSONL — see §E.5 for the parser the runtime now uses.
 
 ### E.4 Tool execution
 Codex executes native tools inside the codex-app-server subprocess — we
@@ -502,6 +503,46 @@ def codex_cost_usd(model: str, usage: Mapping[str, int]) -> float: ...
 ```
 
 Split `_extract_usage` into `_extract_usage_claude` and `_extract_usage_codex`. CodexRuntime passes the usage block it reads from thread state. Map Codex's single `cached_input_tokens` → `cache_read_tokens`, write `0` to `cache_creation_tokens` (Codex caching has no separate creation cost). `_insert_turn_row` accepts a new `runtime` arg.
+
+**Rollout JSONL parser (live since 2026-04-29).** The canonical source
+of per-turn token counts in SDK 0.3.2 is the on-disk session log at
+`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*-<thread_id>.jsonl`. The
+path is exposed on `thread.read().thread.path`. After every turn the
+runtime opens that file and scans for the most recent
+`payload.type == "token_count"` event:
+
+```json
+{"type": "event_msg", "payload": {
+  "type": "token_count",
+  "info": {
+    "last_token_usage": {
+      "input_tokens": 37118,           // total prompt (incl. cached)
+      "cached_input_tokens": 3456,     // cached subset
+      "output_tokens": 58,
+      "reasoning_output_tokens": 0,
+      "total_tokens": 37176
+    },
+    "total_token_usage": { ... },      // cumulative across the session
+    "model_context_window": 258400     // Codex CLI's effective working window
+  }
+}}
+```
+
+Translation to harness shape (mirrors the Anthropic convention so
+cost / context-bar math is consistent across runtimes):
+
+- `input_tokens (harness) = max(0, last.input_tokens − last.cached_input_tokens)`
+- `cache_read_tokens (harness) = last.cached_input_tokens`
+- `output_tokens (harness) = last.output_tokens + last.reasoning_output_tokens`
+- `cache_creation_tokens (harness) = 0`
+
+Helpers live in `server/runtimes/codex.py`:
+`_rollout_path_from_thread_state`, `_read_codex_token_count_from_rollout`,
+`_codex_usage_from_rollout_info`, and `_model_from_rollout` (last-resort
+model id pulled from rollout `turn_context` events when `tc.model` was
+None — happens when no per-role Codex default is set in `team_config`).
+The legacy `_extract_codex_usage_from_thread_state` walker is kept as
+a fallback for any future SDK that ships usage directly on `Turn`.
 
 ### E.6 Compact
 
