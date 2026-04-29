@@ -761,6 +761,7 @@ async def list_agents() -> dict[str, list[dict[str, Any]]]:
             "       r.name AS name, r.role AS role, r.brief AS brief, "
             "       a.status, a.current_task_id, a.model, a.workspace_path, "
             "       s.session_id AS session_id, "
+            "       s.codex_thread_id AS codex_thread_id, "
             "       a.cost_estimate_usd, a.started_at, a.last_heartbeat, a.locked, "
             "       a.runtime_override "
             "FROM agents a "
