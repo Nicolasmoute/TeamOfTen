@@ -9390,23 +9390,50 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
       }
       if (paneSettings.planMode) reqBody.plan_mode = true;
       if (paneSettings.effort) reqBody.effort = paneSettings.effort;
+      // /api/agents/start is fire-and-forget on the server: the request
+      // handler queues a BackgroundTask and returns immediately, so the
+      // round-trip is fast under normal conditions. The timeout here
+      // exists only to recover from a wedged proxy / network — bump it
+      // generously so cold spawns (MCP server warmup, slow worktree
+      // provisioning) don't trip it under healthy conditions.
       const controller = new AbortController();
-      startTimeout = setTimeout(() => controller.abort(), 15_000);
-      const res = await authFetch("/api/agents/start", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(reqBody),
-        signal: controller.signal,
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      startTimeout = setTimeout(() => controller.abort(), 60_000);
+      let aborted = false;
+      try {
+        const res = await authFetch("/api/agents/start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(reqBody),
+          signal: controller.signal,
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      } catch (err) {
+        if (err && err.name === "AbortError") {
+          // The server almost certainly received and queued the request
+          // before we gave up (the handler is fire-and-forget). Don't
+          // strand the user's text in the textarea — proceed as if the
+          // start succeeded and surface a soft notice. If it really
+          // didn't land, the next agent_started event simply won't show
+          // and the user can resubmit.
+          aborted = true;
+        } else {
+          throw err;
+        }
+      }
       const nextHistory = pushPromptHistory(slot, text);
       setPromptHistory(nextHistory);
       setPromptHistoryIdx(null);
       setInput("");
       setAttachments([]);
+      if (aborted) {
+        setInfoText(
+          "start request timed out, but the agent likely received it — " +
+          "watch the timeline for an agent_started event."
+        );
+      }
     } catch (err) {
       console.error("submit failed", err);
-      setInfoText("start failed: " + (err && err.name === "AbortError" ? "request timed out" : String(err)));
+      setInfoText("start failed: " + String(err));
     } finally {
       if (startTimeout) clearTimeout(startTimeout);
       setSubmitting(false);
