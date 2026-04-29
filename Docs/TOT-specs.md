@@ -1274,13 +1274,15 @@ Recent exchange preservation:
 
 `GET /api/agents/{id}/context` returns:
 
-- `session_id`
+- `session_id` (Claude SDK)
+- `codex_thread_id` (Codex)
 - estimated used tokens for the current resumed prompt/session footprint
 - context window
-- model
+- model (resolved — falls back to the latest turn's model when the UI
+  doesn't pass an override)
 - ratio
 
-Estimation semantics:
+Estimation semantics — Claude path (when `session_id` is set):
 
 - Read the Claude Code session JSONL under `CLAUDE_CONFIG_DIR/projects/`.
 - Use the latest assistant usage row as the prompt-size source of truth.
@@ -1289,6 +1291,25 @@ Estimation semantics:
   resumed prompt.
 - Do not sum `ResultMessage.usage` across tool rounds; that overstates context
   pressure when prompt caching is active.
+
+Estimation semantics — Codex path (when `codex_thread_id` is set):
+
+- Codex doesn't write a per-session jsonl in `CLAUDE_CONFIG_DIR`, so the
+  Claude path returns 0 for codex sessions.
+- Read the latest `turns` row whose `session_id` equals the codex thread id
+  (with `runtime = 'codex'`) and reconstruct prompt size from
+  `input_tokens + cache_read_tokens + cache_creation_tokens + output_tokens`.
+- Same shape as the Claude path, so the UI percentage stays comparable
+  across runtimes.
+
+Window resolution: `_context_window_for(model)` returns the per-model max.
+Codex variants (`gpt-5.x-codex`, `gpt-5.4-mini`, `gpt-5.4-nano`) are pinned
+at 400K; frontier general models (`gpt-5.4`, `gpt-5.5`) and Claude Max
+models at 1M+. Unknown models fall through to a conservative default. When
+the UI doesn't pass `?model=`, the server reads the model recorded on the
+latest turn for the active session — without this fallback, Codex panes
+would always resolve against the global default and the bar would
+under-report by ~2.5×.
 
 The pane renders this as a compact `ctx` bar: current footprint as a fraction
 of the model's max window.

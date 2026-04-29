@@ -295,11 +295,27 @@ _extract_usage = _extract_usage_claude
 # usage: that usage is aggregated across all API calls in a turn and
 # can exceed the real model window during tool-heavy turns.
 _CONTEXT_WINDOWS = {
+    # Claude (Max plan)
     "claude-opus-4-7": 1_000_000,
     "claude-opus-4-7[1m]": 1_000_000,
     "claude-sonnet-4-6": 1_000_000,
     "claude-sonnet-4-6[1m]": 1_000_000,
     "claude-haiku-4-5-20251001": 200_000,
+    # OpenAI / Codex (per developers.openai.com 2026-04). Frontier
+    # general models (gpt-5.5 / gpt-5.4) ship at ~1.05M; the smaller
+    # mini and the codex-tuned variants are pinned at 400K. Numbers
+    # here are conservative against the published max so the auto-
+    # compact threshold trips before the real wall.
+    "gpt-5.5": 1_050_000,
+    "gpt-5.4": 1_050_000,
+    "gpt-5.4-mini": 400_000,
+    "gpt-5.4-nano": 400_000,
+    "gpt-5.3-codex": 400_000,
+    "gpt-5.2-codex": 400_000,
+    "gpt-5.1-codex": 400_000,
+    "gpt-5.1-codex-max": 400_000,
+    "gpt-5.1-codex-mini": 400_000,
+    "gpt-5-codex": 400_000,
 }
 
 # Observed ceilings learned from one assistant API call's prompt usage.
@@ -560,6 +576,49 @@ async def _session_context_estimate(session_id: str) -> int:
     """Return estimated tokens already occupied by a resumed session."""
     used, _latest_prompt = await _session_context_metrics(session_id)
     return used
+
+
+async def _codex_session_context_estimate(thread_id: str) -> int:
+    """Estimate current context for a resumed Codex thread.
+
+    Codex doesn't write a per-session jsonl in `CLAUDE_CONFIG_DIR`,
+    so the Claude path returns 0 for codex sessions. Instead we read
+    the most recent `turns` row whose `session_id` equals the codex
+    thread_id and reconstruct prompt size from the recorded usage:
+    `input + cache_read + cache_creation + latest output` (output
+    will be part of the next resumed prompt). Same shape as the
+    Claude jsonl path so the UI percentage stays comparable across
+    runtimes.
+    """
+    if not thread_id:
+        return 0
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT input_tokens, output_tokens, "
+                "       cache_read_tokens, cache_creation_tokens "
+                "FROM turns "
+                "WHERE session_id = ? AND runtime = 'codex' "
+                "ORDER BY id DESC LIMIT 1",
+                (thread_id,),
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("codex_session_context_estimate: DB read failed")
+        return 0
+    if not row:
+        return 0
+    r = dict(row)
+    prompt = (
+        int(r.get("input_tokens") or 0)
+        + int(r.get("cache_read_tokens") or 0)
+        + int(r.get("cache_creation_tokens") or 0)
+    )
+    output = int(r.get("output_tokens") or 0)
+    return prompt + output
 
 
 async def _handle_message(

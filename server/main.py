@@ -2753,33 +2753,62 @@ async def get_agent_context(
         raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
     from server.agents import (
         _context_window_for,
+        _codex_session_context_estimate,
         _session_context_estimate,
     )
     project_id = await resolve_active_project()
     c = await configured_conn()
     try:
-        # Verify the slot exists, then read the per-(slot, project) session.
         cur = await c.execute("SELECT 1 FROM agents WHERE id = ?", (agent_id,))
         if not await cur.fetchone():
             raise HTTPException(404, detail=f"agent {agent_id} not found")
+        # Read both session columns. ClaudeRuntime populates session_id
+        # from ResultMessage; CodexRuntime populates codex_thread_id
+        # after the first successful chat step. The estimator we run
+        # depends on which is set.
         cur = await c.execute(
-            "SELECT session_id FROM agent_sessions "
+            "SELECT session_id, codex_thread_id FROM agent_sessions "
             "WHERE slot = ? AND project_id = ?",
             (agent_id, project_id),
         )
         row = await cur.fetchone()
     finally:
         await c.close()
-    session_id = dict(row).get("session_id") if row else None
+    rec = dict(row) if row else {}
+    session_id = rec.get("session_id")
+    codex_thread_id = rec.get("codex_thread_id")
     used = 0
-    if session_id:
+    if codex_thread_id:
+        used = await _codex_session_context_estimate(codex_thread_id)
+    elif session_id:
         used = await _session_context_estimate(session_id)
     resolved_model = (model or "").strip() or None
+    # When the UI didn't pass a per-pane model override, fall back to
+    # the model recorded on the latest turn for the active session.
+    # Without this the window resolves to the global default (1M) for
+    # every agent, which over-reports for Codex's 400K models — the
+    # CTX bar would crawl up to 50% before tripping any UI signal.
+    if not resolved_model:
+        latest_session = codex_thread_id or session_id
+        if latest_session:
+            c2 = await configured_conn()
+            try:
+                cur2 = await c2.execute(
+                    "SELECT model FROM turns WHERE session_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (latest_session,),
+                )
+                mrow = await cur2.fetchone()
+            finally:
+                await c2.close()
+            if mrow:
+                resolved_model = (dict(mrow).get("model") or "").strip() or None
     window = _context_window_for(resolved_model)
     ratio = used / window if window > 0 else 0.0
     return {
         "agent_id": agent_id,
         "session_id": session_id,
+        "codex_thread_id": codex_thread_id,
         "used_tokens": used,
         "context_window": window,
         "model": resolved_model,
