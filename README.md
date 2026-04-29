@@ -4,6 +4,8 @@
 
 ![tests](https://github.com/Nicolasmoute/TeamOfTen/actions/workflows/tests.yml/badge.svg)
 
+![TeamOfTen multi-pane UI](Docs/Screenshot%202026-04-26%20232144.jpg)
+
 I couldn't find a multi-agent setup that felt right — most were either heavy frameworks or black-box products. This is the opposite: a single-container web app where **1 Coach + 10 Players** share a task board, message each other, and work directly on your GitHub repo via per-Player git worktrees. They produce documents at every level (scratchpad memory, knowledge artifacts, immutable decisions, binary deliverables) that mirror to your cloud drive in real time. They can plug into third-party **MCP servers** (Notion, Slack, Linear, Sentry — anything that speaks MCP) for the work that lives outside the codebase. Everything is visible in a tileable multi-pane UI: intervene on any agent directly, watch the inter-agent chatter unfold live, or just sit back and steer through Coach. You're part of the team — even though the main idea is to keep Coach as the single entry point.
 
 Set it up once on a VPS and it runs 24/7. Send goals to Coach from your phone via the mobile UI or a Telegram bridge. Read the team's output from your kDrive folder anywhere. Open Obsidian on the same folder and you have a live second-brain the agents write into.
