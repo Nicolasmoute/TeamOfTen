@@ -3262,18 +3262,14 @@ async def run_agent(
         turn_ctx=turn_ctx,
     )
 
-    # Coord-MCP-proxy token plumbing — only minted for runtimes that
-    # use the subprocess proxy (Codex). ClaudeRuntime keeps in-process
-    # MCP and ignores the token. Lifetime = exactly one turn: minted
-    # here, revoked in the finally block below regardless of how the
-    # turn ended (success / error / cancel). The token is stashed on
-    # turn_ctx so the runtime can read it without us widening the
-    # TurnContext shape for runtime-specific plumbing.
-    spawn_token: str | None = None
-    if runtime_name == "codex":
-        from server.spawn_tokens import mint as _mint_proxy_token
-        spawn_token = _mint_proxy_token(agent_id)
-        turn_ctx["coord_proxy_token"] = spawn_token
+    # Coord-MCP-proxy token plumbing is owned by CodexRuntime: the
+    # codex app-server subprocess is cached per-slot across turns and
+    # captures its env (including HARNESS_COORD_PROXY_TOKEN) at first
+    # spawn, so a per-turn dispatcher mint/revoke would invalidate the
+    # token used by the running subprocess after turn 1. The runtime
+    # mints in `get_client` and revokes in `close_client` so the
+    # token's lifetime matches the subprocess's. ClaudeRuntime's
+    # in-process MCP doesn't need this.
 
     # Status flips before `agent_started` so UI refetches see the slot
     # as working. Some runtimes can prepare just enough before the
@@ -3392,14 +3388,10 @@ async def run_agent(
         # clears the record, which is fine (first post-restart wake
         # just fires immediately).
         _last_turn_ended_at[agent_id] = time.monotonic()
-        # Revoke the coord-proxy token regardless of how the turn
-        # ended. Belt-and-braces: revoke_for_caller catches any
-        # tokens this slot accumulated through nested compact /
-        # auto-compact recursion, in case mint() was called more than
-        # once and a previous revoke missed.
-        if spawn_token is not None:
-            from server.spawn_tokens import revoke_for_caller as _revoke_proxy_tokens
-            _revoke_proxy_tokens(agent_id)
+        # Coord-proxy token revocation is owned by CodexRuntime
+        # (`close_client`), bound to the cached subprocess lifetime
+        # rather than the per-turn cycle. See the matching comment
+        # at the top of run_agent.
 
     await _emit(agent_id, "agent_stopped")
 

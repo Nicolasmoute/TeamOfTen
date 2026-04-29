@@ -270,14 +270,18 @@ def test_spawn_token_unknown_returns_none() -> None:
     assert st.resolve("definitely-not-a-token") is None
 
 
-async def test_dispatcher_revokes_codex_proxy_token_after_turn(
+async def test_dispatcher_does_not_touch_codex_proxy_token(
     fresh_db: str,
     monkeypatch,
 ) -> None:
-    """Audit-item-3 contract: a Codex turn must mint a coord-proxy
-    token at spawn and revoke it before the turn finishes (success
-    path). We stub the runtime to short-circuit before any SDK work
-    so the test stays DB-only.
+    """The dispatcher must NOT mint or revoke the coord-proxy token
+    for Codex turns. The codex app-server subprocess is cached per
+    slot across turns and captures its env at first spawn, so a
+    per-turn dispatcher mint/revoke would invalidate the in-flight
+    subprocess's token after turn 1 (HTTP 401 on every subsequent
+    `coord_*` call). The token's lifecycle is owned by CodexRuntime
+    — minted in `get_client`, revoked in `close_client`. See the
+    sibling test `test_codex_runtime_owns_proxy_token_lifecycle`.
     """
     import server.db as dbmod
     await dbmod.init_db()
@@ -285,7 +289,7 @@ async def test_dispatcher_revokes_codex_proxy_token_after_turn(
     import server.agents as agentsmod
     from server.runtimes.base import TurnContext
 
-    captured_tokens: list[str] = []
+    seen_token_in_turn_ctx: list[str | None] = []
 
     class StubCodexRuntime:
         name = "codex"
@@ -294,16 +298,11 @@ async def test_dispatcher_revokes_codex_proxy_token_after_turn(
             return False
 
         async def run_turn(self, tc: TurnContext) -> None:
-            tok = tc.turn_ctx.get("coord_proxy_token")
-            if tok:
-                captured_tokens.append(tok)
-                # Confirm token resolves while the turn is in flight.
-                assert st.resolve(tok) == tc.agent_id
+            seen_token_in_turn_ctx.append(tc.turn_ctx.get("coord_proxy_token"))
 
         async def run_manual_compact(self, tc: TurnContext) -> None:
             await self.run_turn(tc)
 
-    # Force runtime resolution to codex without touching env or DB.
     async def _stub_resolve(_agent_id):
         return "codex"
 
@@ -316,18 +315,83 @@ async def test_dispatcher_revokes_codex_proxy_token_after_turn(
     import server.runtimes as runtimes_pkg
     monkeypatch.setattr(runtimes_pkg, "get_runtime", _stub_get_runtime)
 
-    # Drive a turn through the dispatcher. run_agent does a lot of
-    # prelude work (autoname, cost cap, system prompt assembly) — the
-    # stub runtime no-ops the SDK part.
+    # Snapshot the token registry before the turn so we can assert
+    # the dispatcher didn't add or remove anything.
+    before = set(st._tokens.keys())
+
     await agentsmod.run_agent("p1", "hello")
 
-    assert captured_tokens, "runtime did not see a coord_proxy_token"
-    # After the finally block, every token for this caller should be
-    # revoked — resolve must return None.
-    for tok in captured_tokens:
-        assert st.resolve(tok) is None, (
-            "dispatcher must revoke per-spawn coord proxy tokens after the turn"
-        )
+    # Dispatcher must not have stashed a token on turn_ctx.
+    assert seen_token_in_turn_ctx == [None]
+    # Dispatcher must not have minted or revoked any token.
+    assert set(st._tokens.keys()) == before
+
+
+async def test_codex_runtime_owns_proxy_token_lifecycle(monkeypatch) -> None:
+    """`get_client` mints a token and stashes it in
+    `_codex_client_tokens`; `_coord_mcp_env` reads from there so the
+    same token reaches the coord_mcp subprocess every turn;
+    `close_client` revokes the token. This is what guarantees the
+    cached codex app-server subprocess never sees its token expire
+    mid-life.
+    """
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    # Fake CodexClient: we only need start()/initialize()/close().
+    class _FakeClient:
+        def start(self): return None
+        def initialize(self): return None
+        def close(self): return None
+
+    class _FakeSdk:
+        @staticmethod
+        def CodexClient():
+            return None
+
+    # Stub `connect_stdio` and the SDK importer so get_client never
+    # actually launches a subprocess.
+    captured_env: dict[str, str] = {}
+
+    def _connect_stdio(*, command, cwd, env):
+        captured_env.update(env)
+        return _FakeClient()
+    _FakeSdk.CodexClient = type("CC", (), {"connect_stdio": staticmethod(_connect_stdio)})
+
+    monkeypatch.setattr(codex_mod, "_import_codex_sdk", lambda: _FakeSdk)
+    monkeypatch.setattr(codex_mod, "_install_captured_stdio_transport", lambda sdk: None)
+
+    # Belt-and-braces: clear any leaked state from previous tests.
+    codex_mod._codex_clients.pop("p1", None)
+    codex_mod._codex_client_tokens.pop("p1", None)
+
+    await codex_mod.get_client("p1", cwd="C:/work/p1", env_overrides={"X": "1"})
+    token = codex_mod._codex_client_tokens.get("p1")
+    assert token, "get_client must mint a token and cache it"
+    assert captured_env.get("HARNESS_COORD_PROXY_TOKEN") == token, (
+        "subprocess env must carry the cached token"
+    )
+    assert st.resolve(token) == "p1", "minted token must resolve to slot"
+
+    # `_coord_mcp_env` should pick up the cached token (no turn_ctx
+    # override).
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="x",
+        system_prompt="x",
+        workspace_cwd="C:/work/p1",
+        allowed_tools=[],
+        external_mcp_servers={},
+        turn_ctx={},
+    )
+    env = codex_mod._coord_mcp_env(tc)
+    assert env["HARNESS_COORD_PROXY_TOKEN"] == token
+
+    # close_client revokes.
+    await codex_mod.close_client("p1")
+    assert "p1" not in codex_mod._codex_client_tokens
+    assert st.resolve(token) is None, "close_client must revoke the cached token"
 
 
 def test_spawn_token_expiry() -> None:

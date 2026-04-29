@@ -7,8 +7,27 @@ flag is unset.
 
 from __future__ import annotations
 
+import pytest
+
 from server.runtimes import CodexRuntime, get_runtime, is_codex_enabled
 from server.runtimes.base import AgentRuntime
+
+
+@pytest.fixture(autouse=True)
+def _clean_codex_runtime_state():
+    """Make sure the per-slot client cache and proxy-token registry
+    don't leak between tests. `get_client` mints a token for every
+    fresh client; tests that don't pair it with `close_client` would
+    otherwise leave the global `spawn_tokens._tokens` registry dirty
+    and trip token-count assertions in sibling test files."""
+    yield
+    from server.runtimes import codex as codex_mod
+    from server import spawn_tokens as st
+    for tok in list(codex_mod._codex_client_tokens.values()):
+        st.revoke(tok)
+    codex_mod._codex_client_tokens.clear()
+    codex_mod._codex_clients.clear()
+    codex_mod._client_locks.clear()
 
 
 def test_codex_runtime_satisfies_protocol() -> None:
@@ -340,6 +359,13 @@ def _install_fake_sdk(monkeypatch):
     import the real SDK during tests."""
     _FakeClient.instances.clear()
     from server.runtimes import codex as codex_mod
+    # Revoke any tokens cached against this test's slot identifiers
+    # before clearing the dict so the global spawn-token registry
+    # doesn't accumulate leakers across tests.
+    from server import spawn_tokens as st
+    for tok in codex_mod._codex_client_tokens.values():
+        st.revoke(tok)
+    codex_mod._codex_client_tokens.clear()
     codex_mod._codex_clients.clear()
     codex_mod._client_locks.clear()
     monkeypatch.setattr(codex_mod, "_import_codex_sdk", lambda: _FakeSdk)

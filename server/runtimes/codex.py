@@ -39,6 +39,16 @@ logger = logging.getLogger(__name__)
 # Closed and re-opened on auth-error / transport error.
 _codex_clients: dict[str, Any] = {}
 
+# Per-slot coord-MCP-proxy tokens. The codex app-server subprocess is
+# long-lived (cached across turns), and the env it inherits — including
+# `HARNESS_COORD_PROXY_TOKEN` — is captured at spawn time. A per-turn
+# mint/revoke would invalidate the token used by the running subprocess
+# after turn 1, causing 401s on every subsequent turn's MCP call. So
+# the runtime mints a token bound to the client's lifetime and revokes
+# it in `close_client` — same identity-binding guarantees, scoped to
+# the subprocess instead of the turn.
+_codex_client_tokens: dict[str, str] = {}
+
 # Per-slot async locks to serialize get-or-create. The dispatcher's
 # _SPAWN_LOCK already serializes whole turns per slot, but a defensive
 # lock here lets `get_client` / `close_client` be safely called from
@@ -258,6 +268,16 @@ async def get_client(
         if env_overrides:
             env.update(env_overrides)
 
+        # Mint the coord-proxy token here, not in the dispatcher: the
+        # subprocess we're about to spawn captures its env once and
+        # uses that token forever. The dispatcher's per-turn mint
+        # would be invalidated as soon as turn 1 ended, breaking
+        # every subsequent turn's `coord_*` call with HTTP 401.
+        from server.spawn_tokens import mint as _mint_proxy_token
+        token = _mint_proxy_token(slot)
+        _codex_client_tokens[slot] = token
+        env["HARNESS_COORD_PROXY_TOKEN"] = token
+
         _install_captured_stdio_transport(sdk)
         client = sdk.CodexClient.connect_stdio(
             command=["codex", "app-server"],
@@ -279,7 +299,9 @@ async def get_client(
                 await r
         except Exception as exc:
             # Construction failed mid-handshake; don't leave a half-open
-            # client cached. Close best-effort and re-raise.
+            # client cached. Close best-effort, revoke the token we
+            # just minted (the subprocess that would have used it never
+            # came up), and re-raise.
             try:
                 close = client.close()
                 if hasattr(close, "__await__"):
@@ -289,6 +311,10 @@ async def get_client(
                     "CodexRuntime: close() during failed handshake raised "
                     "for slot %s", slot,
                 )
+            from server.spawn_tokens import revoke as _revoke_proxy_token
+            stale = _codex_client_tokens.pop(slot, None)
+            if stale:
+                _revoke_proxy_token(stale)
             raise
 
         _codex_clients[slot] = client
@@ -301,6 +327,12 @@ async def close_client(slot: str) -> None:
     cached. Called on auth-error / transport-error / shutdown."""
     async with _slot_lock(slot):
         client = _codex_clients.pop(slot, None)
+        # Revoke the proxy token bound to this subprocess. Done
+        # whether or not the client object existed — defensive cleanup.
+        token = _codex_client_tokens.pop(slot, None)
+        if token:
+            from server.spawn_tokens import revoke as _revoke_proxy_token
+            _revoke_proxy_token(token)
         if client is None:
             return
         try:
@@ -821,8 +853,14 @@ def _harness_root() -> str:
 def _coord_mcp_env(tc: TurnContext) -> dict[str, str]:
     root = _harness_root()
     pythonpath = os.environ.get("PYTHONPATH", "").strip()
+    # Prefer an explicit `turn_ctx["coord_proxy_token"]` so unit tests
+    # that synthesise a TurnContext can drive what lands in env. In
+    # production the dispatcher no longer populates turn_ctx, so we
+    # fall back to the runtime-owned token cached against this slot's
+    # codex app-server subprocess by `get_client`.
+    token = tc.turn_ctx.get("coord_proxy_token") or _codex_client_tokens.get(tc.agent_id, "")
     return {
-        "HARNESS_COORD_PROXY_TOKEN": tc.turn_ctx.get("coord_proxy_token", ""),
+        "HARNESS_COORD_PROXY_TOKEN": token,
         "PYTHONPATH": root if not pythonpath else os.pathsep.join([root, pythonpath]),
     }
 
