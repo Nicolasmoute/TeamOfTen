@@ -104,10 +104,36 @@ def _ws_url(after_id: int | None = None) -> str:
     return base + "/ws" + ("?" + "&".join(qs) if qs else "")
 
 
+async def _restore_runtime(original: str | None) -> None:
+    """Best-effort restore of the slot's runtime_override to whatever
+    it was before we set it to codex. Empty string clears any override
+    (falls through to role default → claude). Silent on failure — this
+    is cleanup, not part of the verdict."""
+    if original is None:
+        return
+    payload = {"runtime": original}
+    status, body = _request(
+        "PUT", f"/api/agents/{SLOT}/runtime", body=payload, timeout=5.0,
+    )
+    if status == 200:
+        print(f"  restored runtime_override → {original!r}")
+    else:
+        print(
+            f"  WARN: could not restore runtime_override (status={status}). "
+            "Set it back manually via the pane settings popover."
+        )
+
+
 async def _watch_via_polling(*, since_id: int, deadline: float) -> dict:
-    """If `websockets` isn't installed, poll /api/events for the slot
-    until either we observe success or deadline passes. Slower but
-    works without extra deps."""
+    """Poll /api/events for the slot until success or deadline.
+
+    Event shape (per server/main.py /api/events):
+      {"id": <int>, "ts": ..., "agent_id": ..., "type": ...,
+       "payload": {...type-specific keys...}}
+    The cursor query parameter is `since_id`, not `after_id`. Fields
+    like `tool`, `is_error`, `error`, `content` live on `payload`,
+    not at the top level.
+    """
     saw_coord_tool_use = False
     saw_coord_tool_result = False
     saw_tool_error: str | None = None
@@ -117,7 +143,7 @@ async def _watch_via_polling(*, since_id: int, deadline: float) -> dict:
 
     while time.time() < deadline:
         path = (
-            f"/api/events?agent={SLOT}&after_id={last_id}&limit=200"
+            f"/api/events?agent={SLOT}&since_id={last_id}&limit=200"
         )
         status, body = _request("GET", path)
         if status != 200 or not isinstance(body, dict):
@@ -125,18 +151,20 @@ async def _watch_via_polling(*, since_id: int, deadline: float) -> dict:
             continue
         events = body.get("events") or []
         for ev in events:
-            eid = ev.get("__id") or ev.get("id")
+            eid = ev.get("id")
             if isinstance(eid, int) and eid > last_id:
                 last_id = eid
             t = ev.get("type")
-            if t == "tool_use" and str(ev.get("tool", "")).startswith("mcp__coord__"):
+            payload = ev.get("payload") or {}
+            if not isinstance(payload, dict):
+                payload = {}
+            if t == "tool_use" and str(payload.get("tool", "")).startswith("mcp__coord__"):
                 saw_coord_tool_use = True
-                print(f"  + tool_use mcp__coord__... id={ev.get('id')}")
+                print(f"  + tool_use {payload.get('tool')} id={payload.get('id')}")
             elif t == "tool_result":
-                tid = ev.get("id") or ""
                 if saw_coord_tool_use:
-                    content = ev.get("content")
-                    is_err = bool(ev.get("is_error"))
+                    content = payload.get("content")
+                    is_err = bool(payload.get("is_error"))
                     if is_err:
                         saw_tool_error = (
                             content if isinstance(content, str)
@@ -144,13 +172,13 @@ async def _watch_via_polling(*, since_id: int, deadline: float) -> dict:
                         )
                     else:
                         saw_coord_tool_result = True
-                    print(f"  + tool_result id={tid} is_error={is_err}")
+                    print(f"  + tool_result id={payload.get('id')} is_error={is_err}")
             elif t == "error":
-                saw_turn_error = str(ev.get("error") or "")[:300]
+                saw_turn_error = str(payload.get("error") or "")[:300]
                 print(f"  + error: {saw_turn_error}")
             elif t == "result":
                 done = True
-                print(f"  + result: ok")
+                print("  + result: ok")
         if done:
             break
         await asyncio.sleep(1.5)
@@ -161,6 +189,7 @@ async def _watch_via_polling(*, since_id: int, deadline: float) -> dict:
         "saw_tool_error": saw_tool_error,
         "saw_turn_error": saw_turn_error,
         "done": done,
+        "last_id": last_id,
     }
 
 
@@ -186,7 +215,17 @@ async def main() -> int:
         return 1
     print(f"  codex auth method: {codex_auth.get('method')}")
 
-    # 2. Set the slot to codex runtime.
+    # 2. Snapshot original runtime so we can restore on exit.
+    status, body = _request("GET", "/api/agents")
+    original_runtime: str | None = None
+    if status == 200 and isinstance(body, dict):
+        for a in body.get("agents") or []:
+            if a.get("id") == SLOT:
+                original_runtime = a.get("runtime_override") or ""
+                break
+    print(f"  original runtime_override for {SLOT} = {original_runtime!r}")
+
+    # 3. Set the slot to codex runtime.
     _hr("set runtime → codex")
     status, body = _request(
         "PUT", f"/api/agents/{SLOT}/runtime",
@@ -199,28 +238,43 @@ async def main() -> int:
                 "  (HARNESS_CODEX_ENABLED probably not set — flip the "
                 "env var on the deployed harness and redeploy.)"
             )
+        elif status == 409:
+            print(
+                "  (Slot is mid-turn. Wait for it to finish or cancel "
+                f"via the UI, then re-run.)"
+            )
         return 1
     print(f"  runtime_override = {body.get('runtime_override')}")
 
-    # 3. Snapshot the latest event id BEFORE starting the turn so the
-    #    poller can scope to events the turn emits.
+    # 4. Snapshot the latest event id BEFORE starting the turn so the
+    #    poller can scope to events the turn emits. /api/events returns
+    #    events ordered oldest→newest; the last one is the largest id.
     status, body = _request("GET", f"/api/events?agent={SLOT}&limit=1")
     since_id = 0
     if status == 200 and isinstance(body, dict):
         events = body.get("events") or []
         if events:
-            since_id = events[-1].get("__id") or events[-1].get("id") or 0
+            since_id = events[-1].get("id") or 0
     print(f"  events since_id = {since_id}")
 
-    # 4. Fire the turn.
+    # 5. Fire the turn.
     _hr(f"start turn — {COORD_PROMPT[:60]}…")
     status, body = _request(
         "POST", f"/api/agents/{SLOT}/start",
         body={"prompt": COORD_PROMPT},
         timeout=15.0,
     )
+    if status == 409:
+        print(
+            f"FAIL: slot {SLOT} is mid-turn (409). Either wait for the "
+            "current turn to finish, or pick a different slot via "
+            f"HARNESS_VALIDATE_SLOT=<slotid>."
+        )
+        await _restore_runtime(original_runtime)
+        return 1
     if status not in (200, 202):
         print(f"FAIL: POST start returned {status}: {body!r}")
+        await _restore_runtime(original_runtime)
         return 1
     print(f"  start ok — observing for up to {TURN_TIMEOUT_S}s")
 
@@ -229,38 +283,42 @@ async def main() -> int:
     deadline = time.time() + TURN_TIMEOUT_S
     obs = await _watch_via_polling(since_id=since_id, deadline=deadline)
 
-    # 6. Verdict.
+    # 6. Verdict. Always restore the original runtime before returning
+    #    so re-running this script doesn't leave the slot pinned to codex.
     _hr("verdict")
-    if obs["saw_turn_error"]:
-        print(f"FAIL — turn errored before coord call: {obs['saw_turn_error']}")
-        return 1
-    if not obs["saw_coord_tool_use"]:
+    try:
+        if obs["saw_turn_error"]:
+            print(f"FAIL — turn errored before coord call: {obs['saw_turn_error']}")
+            return 1
+        if not obs["saw_coord_tool_use"]:
+            print(
+                "FAIL — no `mcp__coord__*` tool_use observed within timeout. "
+                "Possible causes: agent ignored the instruction, the proxy "
+                "subprocess didn't start, or HARNESS_COORD_PROXY_TOKEN env "
+                "wasn't injected. Check the agent pane timeline and the "
+                "harness logs around the turn."
+            )
+            return 1
+        if obs["saw_tool_error"]:
+            print(f"FAIL — coord tool returned error: {obs['saw_tool_error']}")
+            return 1
+        if not obs["saw_coord_tool_result"]:
+            print(
+                "PARTIAL — coord tool_use observed but no successful "
+                "tool_result before deadline. Re-run with a longer timeout "
+                "or check whether the harness's /api/_coord endpoint is "
+                "reachable from the proxy subprocess."
+            )
+            return 2
+        print("PASS — Codex invoked coord_*, the proxy reached the harness, "
+              "and the result came back without error.")
         print(
-            "FAIL — no `mcp__coord__*` tool_use observed within timeout. "
-            "Possible causes: agent ignored the instruction, the proxy "
-            "subprocess didn't start, or HARNESS_COORD_PROXY_TOKEN env "
-            "wasn't injected. Check the agent pane timeline and the "
-            "harness logs around the turn."
+            "\nFlip Docs/CODEX_AUDIT.md item #30 to `completed and audited` "
+            "and record the run timestamp."
         )
-        return 1
-    if obs["saw_tool_error"]:
-        print(f"FAIL — coord tool returned error: {obs['saw_tool_error']}")
-        return 1
-    if not obs["saw_coord_tool_result"]:
-        print(
-            "PARTIAL — coord tool_use observed but no successful "
-            "tool_result before deadline. Re-run with a longer timeout "
-            "or check whether the harness's /api/_coord endpoint is "
-            "reachable from the proxy subprocess."
-        )
-        return 2
-    print("PASS — Codex invoked coord_*, the proxy reached the harness, "
-          "and the result came back without error.")
-    print(
-        "\nFlip Docs/CODEX_AUDIT.md item #30 to `completed and audited` "
-        "and record the run timestamp."
-    )
-    return 0
+        return 0
+    finally:
+        await _restore_runtime(original_runtime)
 
 
 if __name__ == "__main__":

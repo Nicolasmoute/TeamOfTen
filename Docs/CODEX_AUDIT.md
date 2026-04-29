@@ -392,7 +392,7 @@ Second fix pass:
     close as `completed and audited` once the verdict is pasted in
     here (or to escalate to the `handle_step` change if INTERLEAVED).
 
-30. **Partially validated — Coord MCP smoke under Codex path** (§L.3). validation script ready
+30. **Partially validated — Coord MCP smoke under Codex path** (§L.3). validation script ready and audited
     The proxy passes both the catalog/dispatcher contract tests and
     a real stdio MCP subprocess smoke against a loopback HTTP fake.
     Codex runtime pins the coord MCP subprocess `cwd`/`PYTHONPATH` to
@@ -404,13 +404,20 @@ Second fix pass:
     running harness's HTTP API and observes the event stream:
 
     1. Confirms `/api/health` reports `codex_auth.credentials_present`.
-    2. PUTs `runtime=codex` for the validation slot (default `p10`).
-    3. POSTs a turn with a prompt instructing the agent to call
-       `coord_list_tasks`.
-    4. Polls `/api/events` for the slot, asserts a `tool_use` with
-       `tool` starting `mcp__coord__` arrives, paired with a
-       successful (non-error) `tool_result`.
-    5. Prints `PASS` / `FAIL` / `PARTIAL` plus the next remediation
+    2. Snapshots the slot's existing `runtime_override` so it can be
+       restored on exit (success and failure paths both restore via
+       `try/finally`).
+    3. PUTs `runtime=codex` for the validation slot (default `p10`).
+       409 → reports the slot is mid-turn and exits without changing
+       state.
+    4. Snapshots the latest `events.id` for the slot, POSTs a turn
+       asking the agent to call `coord_list_tasks`. 409 on the start
+       endpoint → restore + exit.
+    5. Polls `/api/events?since_id=<snapshot>` for the slot, reads the
+       harness-shaped event payload (`{id, type, payload: {...}}`)
+       and asserts a `payload.tool` starting `mcp__coord__` arrives,
+       paired with a `tool_result` whose `payload.is_error` is false.
+    6. Prints `PASS` / `FAIL` / `PARTIAL` plus the next remediation
        step. Exit code: 0 / 1 / 2.
 
     Required env: `HARNESS_BASE` (default `http://127.0.0.1:8080`),
@@ -418,8 +425,20 @@ Second fix pass:
     `HARNESS_VALIDATE_TIMEOUT` (default 120s). Zero external Python
     deps — uses `urllib` only.
 
-    Run on Zeabur, then flip the status to `completed and audited`
-    once it prints `PASS`.
+    Audit pass caught and fixed three real bugs in the first pass:
+    - Used `after_id=` query parameter, but `/api/events` reads
+      `since_id`. Fixed.
+    - Read `tool` / `is_error` / `error` at the top level of the
+      event dict, but `/api/events` nests them under `payload`. Fixed
+      the field paths.
+    - No restore of the slot's prior `runtime_override`, so a run
+      left the slot pinned to codex. Now snapshots on entry,
+      restores in a `finally` on every exit path. Mid-turn 409s on
+      both PUT runtime and POST start now report cleanly with a
+      remediation hint.
+
+    Run on Zeabur, then flip status to `completed and audited` once
+    it prints `PASS`.
 
 31. **Implemented — `Turn.usage` defensive extraction** (§L.4). completed and audited
     Pricing math assumes `input_tokens` / `cached_input_tokens` /
