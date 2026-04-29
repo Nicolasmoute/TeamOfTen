@@ -9366,13 +9366,16 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
     let startTimeout = null;
     try {
       // Compose prompt string: include image paths the agent can Read.
-      // We reference each attachment via a workspace-local symlinked path
-      // (/workspaces/<slot>/attachments/<filename>) so the agent sees it
-      // as in-cwd regardless of whether Read has path-subtree restrictions.
+      // The upload endpoint stores under /data/projects/<slug>/attachments/
+      // and returns the absolute path on the upload response — pass that
+      // to the agent verbatim so Read finds the file. (Earlier code
+      // synthesized a /workspaces/<slot>/attachments/... path expecting a
+      // symlink that ensure_workspaces never created — broke for every
+      // slot, including Coach which has no worktree at all.)
       let prompt = text;
       if (attachments.length > 0) {
         const paths = attachments
-          .map((a) => `/workspaces/${slot}/attachments/${a.filename}`)
+          .map((a) => a.path || `/api/attachments/${a.filename}`)
           .join("\n  - ");
         const header = text
           ? "\n\nAttached images (use Read to load):\n  - "
@@ -9708,12 +9711,18 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
           ? html`
               <div class="attachments">
                 ${attachments.map(
-                  (a) => html`
-                    <div class="attachment" key=${a.id}>
-                      <img src=${a.url} alt=${a.filename} />
-                      <button class="x" onClick=${() => removeAttachment(a.id)} title="Remove">×</button>
-                    </div>
-                  `
+                  (a) => {
+                    // Browsers can't set Authorization on <img>; mirror the
+                    // /ws pattern by appending ?token=<...> when one's set.
+                    const tok = (typeof localStorage !== "undefined" && localStorage.getItem("harness_token")) || "";
+                    const src = tok ? `${a.url}?token=${encodeURIComponent(tok)}` : a.url;
+                    return html`
+                      <div class="attachment" key=${a.id}>
+                        <img src=${src} alt=${a.filename} />
+                        <button class="x" onClick=${() => removeAttachment(a.id)} title="Remove">×</button>
+                      </div>
+                    `;
+                  }
                 )}
               </div>
             `

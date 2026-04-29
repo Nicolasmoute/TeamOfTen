@@ -3957,8 +3957,15 @@ async def upload_attachment(file: UploadFile = File(...)) -> dict[str, Any]:
     }
 
 
-@app.get("/api/attachments/{filename}", dependencies=[Depends(require_token)])
-async def get_attachment(filename: str):
+@app.get("/api/attachments/{filename}")
+async def get_attachment(filename: str, token: str | None = Query(default=None)):
+    # `<img src=...>` browser loads can't set the Authorization header
+    # (browsers only attach it on fetch/XHR), so we accept the token via
+    # `?token=` query string the same way the /ws endpoint does. The UI
+    # appends `?token=<...>` when rendering thumbnails. Bearer header
+    # still works for fetch-based callers.
+    if HARNESS_TOKEN and token != HARNESS_TOKEN:
+        raise HTTPException(401, detail="invalid or missing token")
     # Reject path traversal attempts
     if "/" in filename or ".." in filename:
         raise HTTPException(400, detail="invalid filename")

@@ -350,14 +350,18 @@ function isImagePath(p) {
 }
 
 function imageSrcForPath(path) {
-  // Prefer the /api/attachments route — both /data/attachments/xyz.png
-  // and /workspaces/<slot>/attachments/xyz.png resolve to the same file,
-  // and /api/attachments/xyz.png serves it back to the browser.
+  // Prefer the /api/attachments route — uploads land under
+  // /data/projects/<slug>/attachments/ and /api/attachments/<filename>
+  // serves whatever's at the active project's attachments dir. Browsers
+  // can't set Authorization on <img>, so when HARNESS_TOKEN is set the
+  // ?token=<...> query mirrors the /ws pattern.
   const m = path.match(/\/attachments\/([^/]+)$/);
-  if (m) return `/api/attachments/${m[1]}`;
-  // Fallback: try the path as-is (will 404 unless it happens to be
-  // under /api/attachments).
-  return path;
+  const url = m ? `/api/attachments/${m[1]}` : path;
+  const tok = (typeof localStorage !== "undefined" && localStorage.getItem("harness_token")) || "";
+  if (tok && url.startsWith("/api/attachments/")) {
+    return `${url}?token=${encodeURIComponent(tok)}`;
+  }
+  return url;
 }
 
 // ------------------------------------------------------------------
