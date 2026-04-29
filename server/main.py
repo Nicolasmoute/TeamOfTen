@@ -3728,7 +3728,9 @@ async def list_turns(
         cur = await c.execute(
             "SELECT id, agent_id, started_at, ended_at, duration_ms, "
             "cost_usd, session_id, num_turns, stop_reason, is_error, "
-            "model, plan_mode, effort "
+            "model, plan_mode, effort, "
+            "input_tokens, output_tokens, cache_read_tokens, "
+            "cache_creation_tokens, runtime, cost_basis "
             f"FROM turns{where_sql} ORDER BY id DESC LIMIT ?",
             params + [limit],
         )
