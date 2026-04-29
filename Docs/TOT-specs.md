@@ -1843,7 +1843,7 @@ Emits `claude_auth_updated`.
 
 | Endpoint | Notes |
 | --- | --- |
-| `GET /api/agents` | Active-project identity/session joined with global roster |
+| `GET /api/agents` | Active-project identity/session joined with global roster. Each row includes both `session_id` (Claude) and `codex_thread_id` (Codex) so the UI can detect "has session" regardless of runtime — the trash button + LeftRail activation visuals + Options-drawer batch-clear list trigger off either being non-null. |
 | `POST /api/agents/start` | Start one turn |
 | `POST /api/agents/{id}/cancel` | Cancel one turn |
 | `POST /api/agents/cancel-all` | Cancel all running turns |
@@ -2664,19 +2664,43 @@ internal-only endpoints used by the `python -m server.coord_mcp`
 stdio MCP subprocess to forward coord_* calls into the main FastAPI
 process. The subprocess uses the official `mcp` stdio server transport
 so Codex sees a normal MCP initialize/tools/list/tools/call handshake,
-not a harness-specific JSON-RPC dialect. Loopback bind check + per-spawn bearer token (minted via
-`server.spawn_tokens.mint(caller_id)`, passed to the subprocess via
-`HARNESS_COORD_PROXY_TOKEN` env). caller_id is resolved from the
-token server-side; body's `caller_id` is a sanity check only. Codex
-runtime wires this into each turn's `ThreadConfig.config.mcp_servers`
-as an explicit `type="stdio"` server alongside any external MCP
-servers. The coord MCP config pins both `cwd` and `PYTHONPATH` to the
-harness root so `python -m server.coord_mcp` remains importable even
-when Codex runs the agent workspace from `/workspaces/<slot>/project`.
-The in-process Claude coord server is built without proxy-only metadata
-by default. The loopback dispatcher explicitly opts into `_handlers`
-and `_tool_names`; those contain Python callables and must not be
-attached to the server object passed to Claude, because the Claude SDK
+not a harness-specific JSON-RPC dialect. Loopback bind check + bearer
+token (minted via `server.spawn_tokens.mint(caller_id)`, passed to the
+subprocess via `HARNESS_COORD_PROXY_TOKEN` env). caller_id is resolved
+from the token server-side; body's `caller_id` is a sanity check only.
+
+**Token lifetime is bound to the cached `CodexClient` (subprocess),
+not to a single turn.** The codex app-server subprocess is cached per
+slot via `_codex_clients` and lives across many turns; the env it
+inherits — including `HARNESS_COORD_PROXY_TOKEN` — is captured once at
+spawn. Per-turn mint+revoke would invalidate the token after turn 1
+and every subsequent `coord_*` call would 401. `CodexRuntime.get_client`
+mints the token on first spawn and stores it in `_codex_client_tokens`;
+`close_client` revokes it (called on auth/transport error, manual
+session-clear, harness shutdown, or handshake failure). See
+`Docs/CODEX_RUNTIME_SPEC.md` §C.4 for the security argument.
+
+Codex runtime wires this into each turn's
+`ThreadConfig.config.mcp_servers` as an explicit `type="stdio"` server
+alongside any external MCP servers. The coord entry sets
+`default_tools_approval_mode: "approve"` so every `coord_*` tool is
+pre-approved at the Codex elicitation/approval layer; without this,
+calls fail with "user rejected MCP tool call" under restrictive
+sandboxes (Coach is `read-only`) because the embedded app-server
+client has no `request_user_input` handler. `coord_*` is harness-
+trusted by the single-write-handle invariant, so blanket approval is
+correct (see openai/codex issue #16685). The harness must NOT pass
+`config.plugins` — Codex's TOML schema treats `plugins` as a map
+keyed by plugin name with `PluginConfig` values, so any boolean there
+fails serde at `thread/start`.
+
+The coord MCP config pins both `cwd` and `PYTHONPATH` to the harness
+root so `python -m server.coord_mcp` remains importable even when
+Codex runs the agent workspace from `/workspaces/<slot>/project`. The
+in-process Claude coord server is built without proxy-only metadata by
+default. The loopback dispatcher explicitly opts into `_handlers` and
+`_tool_names`; those contain Python callables and must not be attached
+to the server object passed to Claude, because the Claude SDK
 serializes its MCP configuration while spawning the CLI.
 The stdio proxy preserves FastAPI HTTP error details (`detail`,
 `error`, or `message`) in MCP tool errors, and treats an in-process

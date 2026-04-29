@@ -565,6 +565,63 @@ Pane maximize / restore:
   scroll position) resets. Conversation history reloads from
   `/api/events` cache.
 
+**Recent (2026-04-29) — Codex runtime unblock:**
+
+Three live bugs surfaced when Coach actually exercised Codex mode
+end-to-end. All three blocked `coord_*` MCP calls in different ways;
+each fix is small but the architecture for the second one shifted.
+
+- **`config.plugins` removed** —
+  [server/runtimes/codex.py:_codex_config_overrides](server/runtimes/codex.py).
+  Earlier drafts passed `config = {"plugins": {"enabled": false}}` to
+  suppress plugin warmups. Codex's TOML schema treats `plugins` as a
+  map keyed by plugin *name* with `PluginConfig` values, so
+  `plugins.enabled` is parsed as plugin name `"enabled"` with value
+  `false` — `thread/start` fails with
+  `invalid type: boolean false, expected struct PluginConfig`. Default
+  (no `plugins` key) is correct. Spec mirror in
+  `Docs/CODEX_RUNTIME_SPEC.md` §C.5.
+- **`default_tools_approval_mode = "approve"` on coord MCP server** —
+  [server/runtimes/codex.py:_build_mcp_servers](server/runtimes/codex.py).
+  Codex routes MCP tool calls through an elicitation/approval path
+  under restrictive sandboxes. Coach (`read-only`) hit
+  `"user rejected MCP tool call"` because the embedded app-server
+  client has no `request_user_input` handler (the SDK's
+  `set_approval_handler` only sees Command/FileChange approvals, not
+  MCP). The Python `codex-app-server-sdk` 0.3.2 does not expose the
+  MCP-approval hook, so we mark the whole `coord` server pre-approved
+  via the documented per-server config key. `coord_*` is harness-
+  trusted by the single-write-handle invariant. Players
+  (`danger-full-access`) skip the approval path so they were already
+  fine. External MCP servers are untouched. See openai/codex issue
+  #16685 + PR #16632 for upstream context.
+- **Coord-proxy token lifetime: per-client, not per-turn** —
+  [server/runtimes/codex.py:get_client](server/runtimes/codex.py),
+  [server/runtimes/codex.py:close_client](server/runtimes/codex.py),
+  [server/agents.py:run_agent](server/agents.py). The codex
+  app-server subprocess (and its child `coord_mcp` stdio process) is
+  cached per slot via `_codex_clients`; its env, including
+  `HARNESS_COORD_PROXY_TOKEN`, is captured once at first spawn. The
+  dispatcher used to mint a fresh token per turn and call
+  `revoke_for_caller(slot)` in the `finally` block — which killed the
+  long-lived token still held by the running subprocess. Turn 1 worked,
+  every subsequent turn 401'd on `coord_*`. Token lifecycle is now
+  owned by `CodexRuntime`: `get_client` mints + caches in a new
+  `_codex_client_tokens: dict[slot, str]` map, `close_client` revokes.
+  Identity binding still holds (each subprocess gets exactly one
+  token, dies with its subprocess). Spec mirror in
+  `Docs/CODEX_RUNTIME_SPEC.md` §C.4.
+
+UI:
+- **Trash icon on Codex panes** — `/api/agents` now returns
+  `codex_thread_id` alongside `session_id`
+  ([server/main.py:list_agents](server/main.py)); the pane-header
+  trash button, LeftRail "activated agent" visuals, and the Options-
+  drawer batch session-clear list all key off `(session_id ||
+  codex_thread_id)` so Codex agents look identical to Claude ones.
+  The DELETE endpoint was already runtime-agnostic (drops the whole
+  `agent_sessions` row), so no server change beyond the SELECT.
+
 **Next likely:**
 - **Mobile UI polish** — touch-drag doesn't work with HTML5 DnD;
    layout breakpoints for < 900 px need a rethink.

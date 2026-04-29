@@ -6,7 +6,7 @@
 // app.js for why). Other deps are vendored under /static/vendor/.
 import { h } from "https://esm.sh/preact@10";
 import htm from "/static/vendor/htm.js";
-import { diffLines } from "/static/vendor/diff.js";
+import { diffLines, diffWordsWithSpace } from "/static/vendor/diff.js";
 import hljs from "/static/vendor/hljs-core.js";
 const html = htm.bind(h);
 
@@ -389,9 +389,47 @@ function _splitLines(s) {
   return lines;
 }
 
+// Escape a string for safe HTML interpolation.
+function _escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// Word-level intra-line diff between an old line and its paired new
+// line. Returns {leftHtml, rightHtml} with unchanged segments emitted
+// as plain escaped text and changed segments wrapped in
+// `.diff-chg` spans so the reader can spot exactly what moved within
+// the line. Used only for paired modifications; pure adds and pure
+// removes don't need it (the whole line is the change). Antigravity-
+// style: we drop syntax highlighting on these rows because the
+// word-level emphasis is the more useful signal.
+function _wordLevelDiff(a, b) {
+  const parts = diffWordsWithSpace(a || "", b || "");
+  let left = "";
+  let right = "";
+  for (const p of parts) {
+    const esc = _escapeHtml(p.value);
+    if (p.removed) {
+      left += `<span class="diff-chg">${esc}</span>`;
+    } else if (p.added) {
+      right += `<span class="diff-chg">${esc}</span>`;
+    } else {
+      left += esc;
+      right += esc;
+    }
+  }
+  return { leftHtml: left, rightHtml: right };
+}
+
 // Build aligned diff rows for a side-by-side viewer. Each row is
 // {left, right} where each side is either null (blank placeholder
-// keeping the row aligned) or {kind, text}. kind ∈ {ctx, del, add}.
+// keeping the row aligned) or {kind, text, html?}. kind ∈ {ctx, del, add}.
+// `html` is set on paired modification lines so `_renderHalf` can skip
+// hljs and render the precomputed word-level diff instead.
 //
 // Pairing strategy: when a `removed` part is immediately followed by
 // an `added` part, treat them as a modification and zip line-by-line
@@ -420,10 +458,22 @@ function buildSideBySideRows(oldStr, newStr) {
         const newLines = _splitLines(next.value);
         const maxLen = Math.max(oldLines.length, newLines.length);
         for (let j = 0; j < maxLen; j++) {
-          rows.push({
-            left: j < oldLines.length ? { kind: "del", text: oldLines[j] } : null,
-            right: j < newLines.length ? { kind: "add", text: newLines[j] } : null,
-          });
+          const oLine = j < oldLines.length ? oldLines[j] : null;
+          const nLine = j < newLines.length ? newLines[j] : null;
+          // When both sides have a line, compute word-level diff so
+          // the reader can spot the exact tokens that changed.
+          let leftHalf = null;
+          let rightHalf = null;
+          if (oLine !== null && nLine !== null) {
+            const { leftHtml, rightHtml } = _wordLevelDiff(oLine, nLine);
+            leftHalf = { kind: "del", text: oLine, html: leftHtml };
+            rightHalf = { kind: "add", text: nLine, html: rightHtml };
+          } else if (oLine !== null) {
+            leftHalf = { kind: "del", text: oLine };
+          } else if (nLine !== null) {
+            rightHalf = { kind: "add", text: nLine };
+          }
+          rows.push({ left: leftHalf, right: rightHalf });
         }
         i++; // consumed the paired add
       } else {
@@ -455,7 +505,17 @@ function diffStats(rows) {
 
 function _renderHalf(side, lang, full) {
   const kind = side ? side.kind : "blank";
-  const html_ = side ? (highlightLine(side.text, lang) || "&nbsp;") : "&nbsp;";
+  // Paired-modification rows precompute word-level diff HTML; use it
+  // verbatim instead of running hljs on the whole line. For other
+  // rows (pure ctx / pure add / pure del), syntax-highlight as before.
+  let html_;
+  if (!side) {
+    html_ = "&nbsp;";
+  } else if (typeof side.html === "string") {
+    html_ = side.html || "&nbsp;";
+  } else {
+    html_ = highlightLine(side.text, lang) || "&nbsp;";
+  }
   // No prefix gutter — the band color carries the add/del signal.
   // Antigravity-style: text starts at the left edge of the half with
   // just a few pixels of breathing room. `full` makes the cell span

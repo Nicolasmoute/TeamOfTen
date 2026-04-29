@@ -3148,15 +3148,28 @@ body {
   max-height: 480px;
   overflow-y: auto;
   background: var(--card);
+  /* Container query host — the rows inside flip from side-by-side
+     to stacked when the diff itself is too narrow, regardless of the
+     viewport. Lets a narrow pane show diffs vertically while a wide
+     pane keeps the two columns. */
+  container-type: inline-size;
+  container-name: edit-diff;
 }
 .tool-card.edit-card .diff-row {
   display: flex;
   align-items: stretch;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+}
+.tool-card.edit-card .diff-row:last-child { border-bottom: 0; }
+.tool-card.edit-card .diff-row:hover .diff-half {
+  /* Subtle row sync — hovering anywhere on the row brightens both
+     halves so the reader knows they're paired. */
+  filter: brightness(1.08);
 }
 .tool-card.edit-card .diff-half {
   flex: 1 1 50%;
   min-width: 0;
-  padding: 1px 10px;
+  padding: 1px 8px;
   border-right: 1px solid var(--border);
   white-space: pre-wrap;
   word-break: break-word;
@@ -3170,13 +3183,22 @@ body {
   border-right: 0;
 }
 .tool-card.edit-card .diff-add {
-  background: rgba(63, 185, 80, 0.14);
+  background: rgba(63, 185, 80, 0.16);
+  color: #d2f3d2;
 }
 .tool-card.edit-card .diff-del {
-  background: rgba(248, 81, 73, 0.14);
+  background: rgba(248, 81, 73, 0.16);
+  color: #f3d2d2;
+  /* Strikethrough on deletions — the band color is the primary
+     signal but the line-through reinforces "this text is going
+     away" at a glance, especially when scanning a long edit. The
+     strike color is a faint red so it doesn't drown the text. */
+  text-decoration: line-through;
+  text-decoration-color: rgba(248, 81, 73, 0.55);
+  text-decoration-thickness: 1px;
 }
 .tool-card.edit-card .diff-ctx {
-  opacity: 0.65;
+  opacity: 0.62;
 }
 .tool-card.edit-card .diff-blank {
   background: repeating-linear-gradient(
@@ -3186,6 +3208,58 @@ body {
     rgba(255, 255, 255, 0.025) 6px,
     rgba(255, 255, 255, 0.025) 12px
   );
+}
+/* Word-level intra-line emphasis. On a paired modification row the
+   row builder pre-computes char-by-char diff between old and new
+   lines and wraps the changed runs with .diff-chg. The wrapping span
+   inherits the half's background tint (red on the left, green on the
+   right) and adds a stronger background + bolder weight so the
+   reader can see exactly which tokens moved without reading the
+   whole line. Antigravity does the same. */
+.tool-card.edit-card .diff-chg {
+  /* `inline-block` forms a decoration boundary so the parent's
+     line-through (on .diff-del halves) breaks around the changed
+     words instead of striking through them. Without this, the strike
+     draws right across the bold word-emphasis and the eye can't pick
+     it out. Side-effect: tiny vertical alignment shift, harmless. */
+  display: inline-block;
+  border-radius: 2px;
+  font-weight: 600;
+  /* Belt-and-braces: explicit text-decoration none on the chg run.
+     `inline-block` is what actually does the work, but spelling out
+     the intent helps the next reader. */
+  text-decoration: none;
+}
+.tool-card.edit-card .diff-del .diff-chg {
+  background: rgba(248, 81, 73, 0.42);
+}
+.tool-card.edit-card .diff-add .diff-chg {
+  background: rgba(63, 185, 80, 0.42);
+}
+/* Stacked layout: when the diff container itself is narrow (e.g. a
+   single-column pane on a phone, or a stacked pane in a tight
+   column), put the old block above the new block instead of crushing
+   the side-by-side columns. Each half goes full-width and the
+   between-halves divider becomes a horizontal rule. */
+@container edit-diff (max-width: 520px) {
+  .tool-card.edit-card .diff-row {
+    flex-direction: column;
+  }
+  .tool-card.edit-card .diff-half {
+    flex: 1 1 100%;
+    border-right: 0;
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  }
+  .tool-card.edit-card .diff-half:last-child {
+    border-bottom: 0;
+  }
+  /* Empty placeholders read as wasted vertical space when stacked.
+     Hide them so a pure add reads as one green block, a pure remove
+     as one red block. Side-by-side mode keeps them so the row align
+     hint survives. */
+  .tool-card.edit-card .diff-half.diff-blank {
+    display: none;
+  }
 }
 /* Lang badge in the summary line (e.g. "PYTHON", "MARKDOWN"). */
 .tool-card.edit-card .tool-lang {

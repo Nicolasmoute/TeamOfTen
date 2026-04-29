@@ -276,21 +276,36 @@ existing `bus.publish` and `maybe_wake_agent` calls inside those
 handlers run in the main process where they belong.
 
 **Auth model — caller identity comes from the token, NOT the body.**
-When the dispatcher spawns a Codex turn, it generates a per-spawn
-token, **records it server-side as `(token → caller_id)`**, and passes
-the token to the subprocess via env. The endpoint:
+When `CodexRuntime.get_client` first spawns the codex app-server
+subprocess for a slot, it generates a token, **records it server-side
+as `(token → caller_id)`**, and passes the token to the subprocess via
+env. The endpoint:
 
 1. Looks up the bearer token in the spawn-token table.
 2. Reads `caller_id` from the token record. The body's `caller_id`
    field, if present, is a sanity check only — mismatch → 403.
-3. Token is single-use-bound-to-slot for the duration of the turn;
-   revoked when the turn ends (success, error, or cancel).
+3. Token is bound to the slot for the lifetime of the cached
+   `CodexClient` (i.e. the running codex app-server subprocess).
+   Revoked in `close_client` — on auth-error / transport-error
+   teardown, harness shutdown, manual session-clear, or handshake
+   failure during initial spawn.
+
+**Why client-lifetime, not turn-lifetime.** The codex app-server
+subprocess is cached per slot across many turns. The env it inherits —
+including `HARNESS_COORD_PROXY_TOKEN` — is captured exactly once, at
+spawn. A per-turn mint+revoke would invalidate the live subprocess's
+token after turn 1, so every subsequent turn would 401 on `coord_*`
+calls (observed live with Coach in Codex mode, 2026-04-29). Tying the
+token's lifetime to the subprocess fixes that without weakening the
+identity binding: when the subprocess dies, so does the token.
 
 Without server-side identity binding, a compromised proxy or any
 process that learns the token could forge requests as any caller_id —
 agent X could send messages as Coach. The token-to-identity map closes
 that hole. Tokens live in a small in-memory dict keyed by token →
-`{caller_id, expires_at}`, no DB write needed (lifetime ≤ one turn).
+`{caller_id, expires_at}`, no DB write needed; the per-slot
+`_codex_client_tokens` map in [server/runtimes/codex.py](../server/runtimes/codex.py)
+holds the back-reference so `close_client` knows what to revoke.
 
 ### C.5 ClaudeRuntime continues working
 
@@ -309,14 +324,34 @@ mcp_servers = {"coord": coord_server, **external_servers}
 # CodexRuntime mcp_servers config (TOML/JSON via start_thread):
 {
   "coord": {
+    "type": "stdio",
     "command": sys.executable,
     "args": ["-m", "server.coord_mcp",
              "--caller-id", agent_id,
              "--proxy-url", "http://127.0.0.1:8000"],
-    "env": {"HARNESS_COORD_PROXY_TOKEN": spawn_token}
+    "env": {"HARNESS_COORD_PROXY_TOKEN": <runtime-owned token>},
+    # Pre-approve every coord_* tool. Without this, Codex routes
+    # MCP calls through the elicitation/approval path under
+    # restrictive sandboxes (Coach is read-only) and the embedded
+    # client has no user-input handler — the call is auto-cancelled
+    # and the model sees "user rejected MCP tool call". coord_* is
+    # harness-trusted by the single-write-handle invariant, so
+    # blanket approval is correct. See openai/codex issue #16685
+    # and PR #16632 for upstream context.
+    "default_tools_approval_mode": "approve"
   }
 }
 ```
+
+> **Don't pass `config.plugins`.** Earlier drafts injected
+> `config = {"plugins": {"enabled": false}}` to suppress plugin
+> warmups. Codex's TOML schema treats `plugins` as a map keyed by
+> plugin *name* with `PluginConfig` values (a struct with an
+> `enabled: bool` field), so `plugins.enabled = false` is parsed
+> as plugin name `"enabled"` with a bool — `thread/start` fails
+> with `invalid type: boolean false, expected struct PluginConfig`.
+> Default (no `plugins` key) is correct. To disable a specific
+> plugin, use `plugins = { "<name>" = { enabled = false } }`.
 
 AskUserQuestion stays in-process via Claude's `can_use_tool` interception. For Codex, AskUserQuestion needs a different path entirely — see §E.8.
 
