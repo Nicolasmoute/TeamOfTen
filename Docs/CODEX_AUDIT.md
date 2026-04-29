@@ -236,8 +236,14 @@ Second fix pass:
     includes common result fields (`output`, `stdout`, `stderr`,
     `result`, `content`, `diff`, or `message`). Truly unknown future
     item types still fall through to the log-and-skip path.
+    Codex tool-use events now also emit Claude-compatible `name` in
+    addition to the internal `tool` alias, and MCP call arguments are
+    unwrapped from `args` / `arguments` / `input` before they reach the
+    UI. This keeps the existing coord_* cards from rendering raw
+    `type="mcpToolCall"` payloads.
 
-    Total: 3 tests for #11, 36 codex tests, 298 suite-wide.
+    Pinned by focused Codex runtime tests for MCP name resolution,
+    argument extraction, and paired result emission.
 
 12. **Implemented — `_extract_usage` split into Claude/Codex variants** (§E.5). completed and audited
     `server/agents.py` now exposes `_extract_usage_claude` and
@@ -351,11 +357,28 @@ Second fix pass:
     after a fresh device-auth run. The API-key fallback (items 5/6/7)
     remains the documented alternative for fully unattended deploys.
 
-29. **Risk — SDK "one active turn consumer per client" limit** (§L.2). blocked — live spike
+29. **Risk — SDK "one active turn consumer per client" limit** (§L.2). validation script ready
     Spec asked to validate with a 5-turn loop confirming no
-    notification cross-talk. Not run.
-    **Cannot be validated locally.** `_SPAWN_LOCK` already serializes
-    turns per slot, satisfying this constraint defensively.
+    notification cross-talk. Local-side defense already in place:
+    `_SPAWN_LOCK` serializes turns per slot.
+
+    **Validation script committed:**
+    [scripts/codex_validate_concurrency.py](../scripts/codex_validate_concurrency.py)
+    runs two checks against a live `codex app-server`:
+
+    - **Check A** — 5 sequential turns; asserts each turn carries its
+      own `turn_id` and no id reappears across turn boundaries
+      (catches cross-turn leakage in the steady-state path).
+    - **Check B** — deliberately concurrent `thread.chat()` calls on
+      the same client (the constraint the spec calls out). Probes
+      whether the SDK *rejects* (e.g. `CodexTurnInactiveError`),
+      *serializes* internally, or — the dangerous case —
+      *interleaves* notifications across turns. If it interleaves,
+      `handle_step` must gain a turn_id check before closing this item.
+
+    Run on Zeabur after `codex login`; feed the printed verdict back
+    here to flip status to `completed and audited` (or to drive the
+    follow-up `handle_step` change).
 
 30. **Partially validated — Coord MCP smoke under Codex path** (§L.3). local smoke completed
     The proxy now passes both the catalog/dispatcher contract tests and
