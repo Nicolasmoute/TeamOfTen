@@ -180,9 +180,12 @@ async def _check_b_concurrent(thread) -> str:
     elif overlap:
         verdict = (
             f"INTERLEAVED — turn_ids overlap: {overlap}. The SDK mixes "
-            "notifications across concurrent turns. handle_step MUST add "
-            "a turn_id check; otherwise tool-results/usage may attach to "
-            "the wrong turn under any rare _SPAWN_LOCK breach."
+            "notifications across concurrent turns. Action: add a "
+            "turn_id check to server/runtimes/codex.py::handle_step "
+            "(stamp turn_ctx['expected_turn_id'] from the first step, "
+            "skip subsequent steps whose turn_id differs). Otherwise "
+            "tool-results/usage may attach to the wrong turn under any "
+            "rare _SPAWN_LOCK breach."
         )
     elif not a_tids or not b_tids:
         verdict = "INCONCLUSIVE — at least one turn produced no turn_ids. Inspect manually."
@@ -218,7 +221,15 @@ async def main() -> int:
         print(f"thread_id: {thread.thread_id}")
 
         ok_a = await _check_a_sequential(thread)
-        verdict_b = await _check_b_concurrent(thread)
+        if not ok_a:
+            verdict_b = (
+                "SKIPPED — Check A failed (basic 5-turn flow is broken). "
+                "Fix Check A first; the concurrency probe is meaningless "
+                "if sequential turns don't already work."
+            )
+            print("\n" + verdict_b)
+        else:
+            verdict_b = await _check_b_concurrent(thread)
     finally:
         try:
             r = client.close()

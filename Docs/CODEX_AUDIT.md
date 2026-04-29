@@ -357,7 +357,7 @@ Second fix pass:
     after a fresh device-auth run. The API-key fallback (items 5/6/7)
     remains the documented alternative for fully unattended deploys.
 
-29. **Risk — SDK "one active turn consumer per client" limit** (§L.2). validation script ready
+29. **Risk — SDK "one active turn consumer per client" limit** (§L.2). validation script ready and audited
     Spec asked to validate with a 5-turn loop confirming no
     notification cross-talk. Local-side defense already in place:
     `_SPAWN_LOCK` serializes turns per slot.
@@ -373,12 +373,24 @@ Second fix pass:
       the same client (the constraint the spec calls out). Probes
       whether the SDK *rejects* (e.g. `CodexTurnInactiveError`),
       *serializes* internally, or — the dangerous case —
-      *interleaves* notifications across turns. If it interleaves,
-      `handle_step` must gain a turn_id check before closing this item.
+      *interleaves* notifications across turns. The verdict line
+      points at `server/runtimes/codex.py::handle_step` for the
+      remediation if interleaving is observed.
 
-    Run on Zeabur after `codex login`; feed the printed verdict back
-    here to flip status to `completed and audited` (or to drive the
-    follow-up `handle_step` change).
+    Audit pass tightened the script:
+    - Skip Check B when Check A failed — saves a Codex turn when the
+      sequential flow is already broken (verdict surfaces as
+      "SKIPPED" with the reason).
+    - INTERLEAVED verdict now names the exact remediation site
+      (`handle_step` + `turn_ctx['expected_turn_id']` plumbing) so the
+      follow-up PR is unambiguous.
+    - Spec §L.2 now points at the script so future maintainers find
+      it without searching.
+
+    Local-side scope is closed; live verdict still needs a Zeabur run
+    to record. The audit-marker captures that this item is ready to
+    close as `completed and audited` once the verdict is pasted in
+    here (or to escalate to the `handle_step` change if INTERLEAVED).
 
 30. **Partially validated — Coord MCP smoke under Codex path** (§L.3). local smoke completed
     The proxy now passes both the catalog/dispatcher contract tests and

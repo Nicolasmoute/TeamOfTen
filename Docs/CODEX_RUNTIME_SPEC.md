@@ -419,12 +419,12 @@ Observed and implemented item_type mapping:
 | `userMessage` / `userMessage`                      | (skip)                     | already in DB |
 | `codex` / `agentMessage` (text set)                | `text`                     | emit `content` + `text`, accumulate; phase=='final_answer' marks turn done |
 | `thinking` / `reasoning`                           | `thinking`                 | emit `content` + `text`; parallel to Claude path |
-| `exec` / `commandExecution`                        | `tool_use` (`tool=Bash`) + optional `tool_result` | SDK 0.3.2 normalized shell shape |
-| `codex` / `shell`                                  | `tool_use` (`tool=Bash`)   | draft compatibility |
-| `file` / `fileChange`                              | `tool_use` (`tool=Edit`) + optional `tool_result` | SDK 0.3.2 normalized file-change shape |
-| `codex` / `apply_patch`                            | `tool_use` (`tool=Edit`)   | draft compatibility; unified diff feeds diff@7 |
-| `codex` / `web_search` or `webSearch`              | `tool_use` (`tool=WebSearch`) | reuse WebSearch card |
-| `tool` / `mcpToolCall` or `mcp_tool_call`          | `tool_use` (`tool=mcp__...`) | coord_* + external MCPs |
+| `exec` / `commandExecution`                        | `tool_use` (`name=Bash`, `tool=Bash`) + optional `tool_result` | SDK 0.3.2 normalized shell shape |
+| `codex` / `shell`                                  | `tool_use` (`name=Bash`, `tool=Bash`)   | draft compatibility |
+| `file` / `fileChange`                              | `tool_use` (`name=Edit`, `tool=Edit`) + optional `tool_result` | SDK 0.3.2 normalized file-change shape |
+| `codex` / `apply_patch`                            | `tool_use` (`name=Edit`, `tool=Edit`)   | draft compatibility; unified diff feeds diff@7 |
+| `codex` / `web_search` or `webSearch`              | `tool_use` (`name=WebSearch`, `tool=WebSearch`) | reuse WebSearch card |
+| `tool` / `mcpToolCall` or `mcp_tool_call`          | `tool_use` (`name=mcp__...`, `tool=mcp__...`) + optional `tool_result` | coord_* + external MCPs; unwrap `args`/`arguments`/`input` into renderer input |
 | stream exhaustion                                  | `result`                   | usage is read best-effort from `thread.read(include_turns=True)` |
 | `CodexTurnInactiveError` raised mid-iteration      | `error` (pre-result) → retry counter |
 | `CodexTimeoutError` / `CodexTransportError`        | `error` (pre-result) -> retry counter; close + reopen client; transport errors include captured app-server stderr tail when available |
@@ -801,7 +801,7 @@ before continuing.
 ## L. Risks / unknowns to validate
 
 1. **Headless `codex login` viability.** Highest risk. PR 0 spike. If device-code can't complete in non-TTY container shell, fall back to API-key-only Codex.
-2. **SDK "one active turn consumer per client" limit.** Validate with 5-turn loop, confirm no notification cross-talk.
+2. **SDK "one active turn consumer per client" limit.** Validate with 5-turn loop, confirm no notification cross-talk. Live-validation script: [scripts/codex_validate_concurrency.py](../scripts/codex_validate_concurrency.py) — runs sequential + concurrent probes and prints a verdict keyed to follow-up actions.
 3. **Coord MCP under both runtimes.** Codex's MCP config shape may differ — verify standalone smoke test from both runtimes before integrating.
 4. **`Turn.usage` shape.** Confirm `cached_input_tokens` is a single field; some early SDK versions returned `usage=None` on streamed turns.
 5. **`thread_resume` config matching.** If Codex requires original model/sandbox to match on resume, mid-session model swap invalidates resume. Mitigation: null `codex_thread_id` on detected model change.
