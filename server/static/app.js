@@ -394,7 +394,7 @@ function formatEventsAsMarkdown(events, { slot, agent, headingLevel = 1 } = {}) 
     } else if (ev.type === "text") {
       lines.push("", ev.content || "");
     } else if (ev.type === "tool_use") {
-      lines.push("", "**" + (ev.name || "tool") + "**");
+      lines.push("", "**" + (ev.name || ev.tool || "tool") + "**");
       lines.push("```json");
       lines.push(JSON.stringify(ev.input || {}, null, 2));
       lines.push("```");
@@ -764,7 +764,14 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
   useEffect(() => {
     const onDocClick = (e) => {
       if (!rootRef.current) return;
-      if (!rootRef.current.contains(e.target)) onClose();
+      // Click inside the popover — leave it open.
+      if (rootRef.current.contains(e.target)) return;
+      // Click on the triggering gear button — let the gear's own
+      // toggle handler decide. Without this exclusion, mousedown fires
+      // close() then the gear's click toggles back to open, so the
+      // popover never closes via the gear (visible flicker).
+      if (e.target.closest && e.target.closest(".pane-gear")) return;
+      onClose();
     };
     const onKey = (e) => { if (e.key === "Escape") onClose(); };
     document.addEventListener("mousedown", onDocClick);
@@ -8411,171 +8418,10 @@ function FileTreeNode({ node, root, path, depth, expanded, setExpanded, selected
 // and its private helpers (_safeHref, renderInline) — the marked
 // pipeline supersedes them.
 
-// ------------------------------------------------------------------
-// active loops bar (Coach-only): shows the tick loop (/loop) and the
-// repeat loop (/repeat) when active, each with a live countdown to
-// next fire, collapse toggle, and a trash button to kill it.
-// ------------------------------------------------------------------
-
-const LOOP_COLLAPSED_KEY = "harness_active_loops_collapsed_v1";
-
-function ActiveLoops({ liveEvents }) {
-  const [tick, setTick] = useState({ interval: 0, nextAt: 0 });
-  const [repeat, setRepeat] = useState({ interval: 0, prompt: null, nextAt: 0 });
-  const [now, setNow] = useState(Date.now());
-  const [err, setErr] = useState(null);
-  const [collapsed, setCollapsed] = useState(() => {
-    try { return JSON.parse(localStorage.getItem(LOOP_COLLAPSED_KEY) || "{}"); }
-    catch (_) { return {}; }
-  });
-
-  const saveCollapsed = (next) => {
-    setCollapsed(next);
-    try { localStorage.setItem(LOOP_COLLAPSED_KEY, JSON.stringify(next)); } catch (_) {}
-  };
-
-  // Initial fetch of both loop states.
-  useEffect(() => {
-    authFetch("/api/coach/loop")
-      .then((r) => r.json())
-      .then((d) => {
-        const s = d.interval_seconds || 0;
-        setTick({ interval: s, nextAt: s > 0 ? Date.now() + s * 1000 : 0 });
-      })
-      .catch(() => {});
-    authFetch("/api/coach/repeat")
-      .then((r) => r.json())
-      .then((d) => {
-        const s = d.interval_seconds || 0;
-        setRepeat({
-          interval: s,
-          prompt: d.prompt || null,
-          nextAt: s > 0 ? Date.now() + s * 1000 : 0,
-        });
-      })
-      .catch(() => {});
-  }, []);
-
-  // React to WS events to resync state and countdowns.
-  useEffect(() => {
-    if (!liveEvents || liveEvents.length === 0) return;
-    const last = liveEvents[liveEvents.length - 1];
-    if (!last || last.agent_id !== "coach") return;
-    const t = last.type;
-    if (t === "coach_loop_changed") {
-      const s = last.interval_seconds || 0;
-      setTick({ interval: s, nextAt: s > 0 ? Date.now() + s * 1000 : 0 });
-    } else if (t === "coach_tick_fired") {
-      setTick((prev) =>
-        prev.interval > 0
-          ? { ...prev, nextAt: Date.now() + prev.interval * 1000 }
-          : prev
-      );
-    } else if (t === "coach_repeat_changed") {
-      const s = last.interval_seconds || 0;
-      setRepeat({
-        interval: s,
-        prompt: last.prompt || null,
-        nextAt: s > 0 ? Date.now() + s * 1000 : 0,
-      });
-    } else if (t === "coach_repeat_fired") {
-      setRepeat((prev) =>
-        prev.interval > 0
-          ? { ...prev, nextAt: Date.now() + prev.interval * 1000 }
-          : prev
-      );
-    }
-  }, [liveEvents]);
-
-  const anyActive = tick.interval > 0 || repeat.interval > 0;
-
-  // Tick only when at least one loop is active.
-  useEffect(() => {
-    if (!anyActive) return;
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, [anyActive]);
-
-  if (!anyActive) return null;
-
-  const fmt = (ms) => {
-    const s = Math.max(0, Math.ceil(ms / 1000));
-    const m = Math.floor(s / 60);
-    const r = s % 60;
-    return `${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}`;
-  };
-
-  const kill = async (url, body) => {
-    setErr(null);
-    try {
-      const r = await authFetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (!r.ok) {
-        const text = await r.text().catch(() => "");
-        setErr(`kill failed: HTTP ${r.status}${text ? " — " + text.slice(0, 80) : ""}`);
-      }
-    } catch (e) {
-      setErr("kill failed: " + String(e));
-    }
-  };
-  const killTick = () => kill("/api/coach/loop", { interval_seconds: 0 });
-  const killRepeat = () => kill("/api/coach/repeat", { interval_seconds: 0, prompt: null });
-
-  const row = (key, label, interval, nextAt, promptText, onKill) => {
-    const isCollapsed = !!collapsed[key];
-    const remaining = nextAt ? nextAt - now : 0;
-    const toggle = () => saveCollapsed({ ...collapsed, [key]: !isCollapsed });
-    return html`<div class="active-loop" key=${key}>
-      <button
-        class="active-loop-toggle"
-        onClick=${toggle}
-        title=${isCollapsed ? "Expand" : "Collapse"}
-      >${isCollapsed ? "▸" : "▾"}</button>
-      <span class="active-loop-label">${label}</span>
-      <span class="active-loop-countdown" title=${`Every ${interval}s`}>${fmt(remaining)}</span>
-      ${!isCollapsed
-        ? html`<span class="active-loop-prompt" title=${promptText}>${promptText}</span>`
-        : null}
-      <button
-        class="active-loop-kill"
-        onClick=${onKill}
-        title="Stop this loop"
-      >🗑</button>
-    </div>`;
-  };
-
-  return html`<div class="active-loops">
-    ${tick.interval > 0
-      ? row(
-          "tick",
-          "loop",
-          tick.interval,
-          tick.nextAt,
-          "Routine inbox tick",
-          killTick
-        )
-      : null}
-    ${repeat.interval > 0
-      ? row(
-          "repeat",
-          "repeat",
-          repeat.interval,
-          repeat.nextAt,
-          repeat.prompt || "",
-          killRepeat
-        )
-      : null}
-    ${err
-      ? html`<div class="active-loop-err">
-          ${err}
-          <button class="active-loop-err-x" onClick=${() => setErr(null)}>×</button>
-        </div>`
-      : null}
-  </div>`;
-}
+// Phase 8 of recurrence v2 (Docs/recurrence-specs.md) deleted the
+// ActiveLoops countdown bar — the Recurrence pane (rail icon:
+// circular arrows) is the canonical surface for tick / repeat /
+// cron now, with editable cards and live next-fire stamps.
 
 // ------------------------------------------------------------------
 // context usage bar — compact horizontal meter next to the effort chip.
@@ -8988,6 +8834,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
         ev.prompt,
         ev.text,
         ev.name,
+        ev.tool,
         ev.error,
         ev.subject,
         ev.body,
@@ -9813,9 +9660,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
               </div>
             `
           : null}
-        ${slot === "coach"
-          ? html`<${ActiveLoops} liveEvents=${liveEvents} />`
-          : null}
+        ${/* ActiveLoops bar removed in phase 8; see RecurrencePane. */ null}
         <!-- Compact mode chips: one-glance view of the pane's current
              model / plan / effort, each clickable to open the full
              settings popover. Mirrors the Claude-Code-style inline
@@ -10183,22 +10028,11 @@ function EventItem({ event }) {
     </div>`;
   }
 
-  if (type === "coach_loop_changed") {
-    const s = event.interval_seconds;
-    return html`<div class="event sys">
-      <div class="event-meta">${ts} · coach autoloop ${s > 0 ? `every ${s}s` : "OFF"}</div>
-    </div>`;
-  }
-
-  if (type === "coach_repeat_changed") {
-    const s = event.interval_seconds;
-    const p = event.prompt
-      ? ` — "${String(event.prompt).slice(0, 60)}${event.prompt.length > 60 ? "…" : ""}"`
-      : "";
-    return html`<div class="event sys">
-      <div class="event-meta">${ts} · coach repeat ${s > 0 ? `every ${s}s` : "OFF"}${p}</div>
-    </div>`;
-  }
+  // Recurrence v2 phase 8: legacy `coach_loop_changed` and
+  // `coach_repeat_changed` event renderers removed. The new
+  // `recurrence_added` / `recurrence_changed` / `recurrence_disabled`
+  // events fall through to the generic .sys renderer; the Recurrence
+  // pane is the primary surface.
 
   if (type === "auto_compact_triggered") {
     const r = event.ratio != null ? ` (${Math.round(event.ratio * 100)}% of ${event.context_window || "?"})` : "";

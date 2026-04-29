@@ -68,6 +68,43 @@ function stripMcp(name) {
   return name.replace(/^mcp__[^_]+__/, "");
 }
 
+function parseJsonObject(value) {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (!text) return {};
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed
+      : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function normalizeMcpInput(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+
+  const views = [input];
+  for (const key of ["call", "toolCall", "tool_call", "mcp", "mcpToolCall"]) {
+    const nested = input[key];
+    if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+      views.push(nested);
+    }
+  }
+
+  for (const view of views) {
+    for (const key of ["args", "arguments", "input", "params"]) {
+      const value = view[key];
+      if (value && typeof value === "object" && !Array.isArray(value)) return value;
+      const parsed = parseJsonObject(value);
+      if (parsed) return parsed;
+    }
+  }
+
+  return input;
+}
+
 function truncate(s, n) {
   if (typeof s !== "string") return "";
   return s.length > n ? s.slice(0, n) + "…" : s;
@@ -639,9 +676,12 @@ function renderGenericCard(name, input, result) {
 // ------------------------------------------------------------------
 
 export function renderToolCall(event) {
-  const rawName = event?.name || "?";
+  const rawName = event?.name || event?.tool || "?";
   const name = stripMcp(rawName);
-  const input = event?.input || {};
+  const rawInput = event?.input || {};
+  const input = rawName.startsWith("mcp__") || rawInput?.type === "mcpToolCall"
+    ? normalizeMcpInput(rawInput)
+    : rawInput;
   const result = event?.__result;
 
   if (name === "Edit" && (input.old_string || input.new_string)) {

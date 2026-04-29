@@ -4,9 +4,8 @@ Implements the unified recurrence runtime described in
 `Docs/recurrence-specs.md` §11. Three flavors share one row format and
 one scheduler loop:
 
-  * **tick**   — singleton per project, harness-composed prompt
-                 (currently the legacy ``COACH_TICK_PROMPT``; phase 5
-                 swaps in the smart composer).
+  * **tick**   — singleton per project, harness-composed prompt via
+                 :func:`compose_tick_prompt` (recurrence-specs.md §4).
   * **repeat** — many per project, fixed-minute cadence + caller prompt.
   * **cron**   — many per project, DSL string + timezone + caller prompt.
 
@@ -989,11 +988,10 @@ async def delete_recurrence(
 
 async def recurrence_scheduler_loop() -> None:
     """Background task: every SCHEDULER_TICK_SECONDS, check the active
-    project for due rows and fire them. Replaces the legacy
-    `coach_tick_loop` / `coach_repeat_loop` per `recurrence-specs.md`
-    §14 step 3 — the legacy globals (`_coach_tick_interval`,
-    `_coach_repeat_interval`) are kept for slash-command compatibility
-    until phase 8."""
+    project for due rows and fire them. The unified replacement for
+    the legacy per-flavor loops; recurrence-specs.md phase 8 removed
+    the old `coach_tick_loop` / `coach_repeat_loop` and their module
+    globals."""
     logger.info(
         "recurrence scheduler running (resolution %ds)",
         SCHEDULER_TICK_SECONDS,

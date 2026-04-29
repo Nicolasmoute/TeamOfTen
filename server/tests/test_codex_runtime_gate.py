@@ -528,6 +528,37 @@ async def test_set_codex_thread_id_ignores_none_and_system(fresh_db) -> None:
     assert (await _get_codex_thread_id("system")) is None
 
 
+async def test_codex_tool_contract_bump_clears_stale_threads(fresh_db) -> None:
+    import server.db as dbmod
+    from server.db import configured_conn
+    from server.runtimes.codex import (
+        _CODEX_TOOL_CONTRACT_VERSION,
+        _get_codex_thread_id,
+        _set_codex_thread_id,
+        ensure_codex_tool_contract_current,
+    )
+    await dbmod.init_db()
+    await _set_codex_thread_id("coach", "thread_old")
+    await _set_codex_thread_id("p1", "thread_old_p1")
+
+    cleared = await ensure_codex_tool_contract_current()
+    assert cleared == 2
+    assert await _get_codex_thread_id("coach") is None
+    assert await _get_codex_thread_id("p1") is None
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT value FROM team_config WHERE key = ?",
+            ("codex_tool_contract_version",),
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    assert dict(row)["value"] == _CODEX_TOOL_CONTRACT_VERSION
+    assert await ensure_codex_tool_contract_current() == 0
+
+
 async def test_open_thread_starts_fresh_when_no_stored_id(fresh_db) -> None:
     import server.db as dbmod
     from server.runtimes.codex import open_thread
@@ -789,6 +820,7 @@ async def test_handle_step_emits_tool_use_for_shell(monkeypatch) -> None:
     assert len(captured) == 1
     e = captured[0]
     assert e["type"] == "tool_use"
+    assert e["name"] == "Bash"
     assert e["tool"] == "Bash"
     assert e["id"] == "tool_42"
     # Permissive arg extraction: full item payload comes through under
@@ -922,9 +954,10 @@ async def test_handle_step_emits_mcp_tool_use_with_prefixed_name(
 
     assert len(captured) == 1
     assert captured[0]["type"] == "tool_use"
+    assert captured[0]["name"] == "mcp__coord__coord_send_message"
     assert captured[0]["tool"] == "mcp__coord__coord_send_message"
     assert captured[0]["id"] == "mcp_call_1"
-    assert captured[0]["input"] == item_payload
+    assert captured[0]["input"] == {"to_id": "p2", "body": "hello"}
 
 
 async def test_handle_step_mcp_tool_use_falls_back_when_keys_missing(
@@ -943,6 +976,8 @@ async def test_handle_step_mcp_tool_use_falls_back_when_keys_missing(
     )
     await handle_step(step, "p1", {})
     assert captured[0]["tool"] == "mcp__unknown__unknown"
+    assert captured[0]["name"] == "mcp__unknown__unknown"
+    assert captured[0]["input"] == {}
 
 
 async def test_handle_step_emits_mcp_tool_use_for_actual_sdk_item_name(
@@ -962,6 +997,41 @@ async def test_handle_step_emits_mcp_tool_use_for_actual_sdk_item_name(
     )
     await handle_step(step, "p1", {})
     assert captured[0]["tool"] == "mcp__coord__coord_read_inbox"
+    assert captured[0]["name"] == "mcp__coord__coord_read_inbox"
+
+
+async def test_handle_step_mcp_tool_call_parses_sdk_arguments_and_result(
+    monkeypatch,
+) -> None:
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    step = _FakeStep(
+        step_type="tool",
+        item_type="mcpToolCall",
+        item_id="mcp_call_real",
+        item={
+            "type": "mcpToolCall",
+            "id": "mcp_call_real",
+            "serverName": "coord",
+            "toolName": "coord_set_player_role",
+            "arguments": '{"player_id":"p5","name":"Mira","role":"Backend"}',
+            "result": [{"type": "text", "text": '{"ok":true}'}],
+        },
+    )
+    await handle_step(step, "coach", {})
+
+    assert captured[0]["type"] == "tool_use"
+    assert captured[0]["name"] == "mcp__coord__coord_set_player_role"
+    assert captured[0]["tool"] == "mcp__coord__coord_set_player_role"
+    assert captured[0]["input"] == {
+        "player_id": "p5",
+        "name": "Mira",
+        "role": "Backend",
+    }
+    assert captured[1]["type"] == "tool_result"
+    assert captured[1]["tool_use_id"] == "mcp_call_real"
+    assert captured[1]["content"] == '{"ok":true}'
 
 
 async def test_resolve_mcp_tool_name_accepts_alternate_key_spellings() -> None:
@@ -977,6 +1047,14 @@ async def test_resolve_mcp_tool_name_accepts_alternate_key_spellings() -> None:
     assert (
         _resolve_mcp_tool_name({"mcp_server": "github", "tool": "search"})
         == "mcp__github__search"
+    )
+    assert (
+        _resolve_mcp_tool_name({
+            "serverName": "coord",
+            "toolName": "coord_set_player_role",
+            "name": "Mira",
+        })
+        == "mcp__coord__coord_set_player_role"
     )
 
 
@@ -1151,8 +1229,12 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
     assert "treat every CLAUDE.md file exactly as you would" in config.kwargs["developer_instructions"]
     assert "Treat .claude/ directories exactly as" in config.kwargs["developer_instructions"]
     assert ".agents/" in config.kwargs["developer_instructions"]
+    assert "TeamOfTen coord tools in Codex" in config.kwargs["developer_instructions"]
+    assert "`coord_read_inbox`" in config.kwargs["developer_instructions"]
+    assert "Do not use shell commands, direct SQLite/database access" in config.kwargs["developer_instructions"]
     assert config.kwargs["model"] == "gpt-5.4-mini"
     assert config.kwargs["sandbox"] == "danger-full-access"
+    assert config.kwargs["config"]["plugins"]["enabled"] is False
     mcp_servers = config.kwargs["config"]["mcp_servers"]
     assert mcp_servers["coord"]["type"] == "stdio"
     assert mcp_servers["coord"]["cwd"]
@@ -1175,6 +1257,26 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
     assert insert_rows[0]["output_tokens"] == 300
     assert added_costs == [("p1", 0.002115)]
     assert client.handlers[-1] is None
+
+
+def test_codex_thread_config_makes_coach_read_only() -> None:
+    from server.runtimes.base import TurnContext
+    from server.runtimes.codex import _build_thread_config
+
+    tc = TurnContext(
+        agent_id="coach",
+        project_id="default",
+        prompt="check board",
+        system_prompt="system rules",
+        workspace_cwd="C:/work/coach",
+        allowed_tools=[],
+        external_mcp_servers={},
+        turn_ctx={"coord_proxy_token": "tok_test"},
+    )
+
+    config = _build_thread_config(_FakeCodexSdk, tc)
+    assert config.kwargs["sandbox"] == "read-only"
+    assert config.kwargs["config"]["plugins"]["enabled"] is False
 
 
 async def test_codex_run_turn_updates_continuity_bookkeeping(

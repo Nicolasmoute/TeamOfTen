@@ -39,8 +39,6 @@ from server.agents import (
     _today_spend,
     cancel_agent,
     cancel_all_agents,
-    coach_tick_loop,
-    coach_repeat_loop,
     stale_task_watch_loop,
     is_paused,
     run_agent,
@@ -210,6 +208,16 @@ async def lifespan(app: FastAPI):
             )
     except Exception:
         logger.exception("crash_recover failed (non-fatal)")
+    try:
+        from server.runtimes.codex import ensure_codex_tool_contract_current
+        cleared = await ensure_codex_tool_contract_current()
+        if cleared:
+            logger.info(
+                "codex tool contract changed: cleared %d persisted thread ids",
+                cleared,
+            )
+    except Exception:
+        logger.exception("codex tool-contract refresh failed (non-fatal)")
     # Attachments are per-project (PROJECTS_SPEC.md §4); the upload
     # handler lazily creates the directory under the active project.
     # Honor the legacy env override at boot if set so tests + pinned
@@ -258,32 +266,6 @@ async def lifespan(app: FastAPI):
     snapshot_task = asyncio.create_task(snapshot_loop())
     project_sync_task = asyncio.create_task(project_sync_loop())
     global_sync_task = asyncio.create_task(global_sync_loop())
-    # Recurrence v1 (Docs/recurrence-specs.md §11): if init_db's
-    # env-var migration seeded a tick row, the new scheduler is the
-    # one that should fire — zero out the legacy in-memory interval
-    # so it doesn't double-fire alongside the new scheduler. The
-    # legacy globals stay live for slash-command parity until phase 2
-    # rewires them.
-    try:
-        from server.agents import set_coach_interval
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT 1 FROM coach_recurrence WHERE kind = 'tick' LIMIT 1"
-            )
-            row = await cur.fetchone()
-        finally:
-            await c.close()
-        if row:
-            set_coach_interval(0)
-            logger.info(
-                "recurrence: tick row present — legacy in-memory "
-                "coach autoloop disabled"
-            )
-    except Exception:
-        logger.exception("recurrence: legacy disable check failed")
-    coach_task = asyncio.create_task(coach_tick_loop())
-    coach_repeat_task = asyncio.create_task(coach_repeat_loop())
     recurrence_task = asyncio.create_task(recurrence_scheduler_loop())
     stale_task_task = asyncio.create_task(stale_task_watch_loop())
     trim_task = asyncio.create_task(events_trim_loop())
@@ -297,7 +279,7 @@ async def lifespan(app: FastAPI):
         await start_telegram_bridge()
     except Exception:
         logger.exception("telegram bridge failed to start (non-fatal)")
-    bg_tasks = (snapshot_task, project_sync_task, global_sync_task, coach_task, coach_repeat_task, recurrence_task, stale_task_task, trim_task, att_trim_task, sessions_trim_task)
+    bg_tasks = (snapshot_task, project_sync_task, global_sync_task, recurrence_task, stale_task_task, trim_task, att_trim_task, sessions_trim_task)
     try:
         yield
     finally:
@@ -841,70 +823,13 @@ async def set_pause_state(req: PauseRequest) -> dict[str, bool]:
     return {"paused": is_paused()}
 
 
-class CoachLoopRequest(BaseModel):
-    interval_seconds: int = Field(..., ge=0, le=86_400)
-
-
-@app.get("/api/coach/loop", dependencies=[Depends(require_token)])
-async def get_coach_loop() -> dict[str, object]:
-    from server.agents import get_coach_interval
-    return {"interval_seconds": get_coach_interval()}
-
-
-@app.post("/api/coach/loop", dependencies=[Depends(require_token)])
-async def set_coach_loop(req: CoachLoopRequest) -> dict[str, object]:
-    """Set Coach's autoloop interval at runtime. 0 disables. The
-    background loop re-reads this each iteration, so changes take
-    effect on the next tick (no restart)."""
-    from server.agents import set_coach_interval
-    set_coach_interval(req.interval_seconds)
-    await bus.publish(
-        {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "agent_id": "coach",
-            "type": "coach_loop_changed",
-            "interval_seconds": req.interval_seconds,
-        }
-    )
-    return {"ok": True, "interval_seconds": req.interval_seconds}
-
-
-class CoachRepeatRequest(BaseModel):
-    interval_seconds: int = Field(..., ge=0, le=86_400)
-    prompt: str | None = None
-
-
-@app.get("/api/coach/repeat", dependencies=[Depends(require_token)])
-async def get_coach_repeat_endpoint() -> dict[str, object]:
-    from server.agents import get_coach_repeat
-    interval, prompt = get_coach_repeat()
-    return {"interval_seconds": interval, "prompt": prompt}
-
-
-@app.post("/api/coach/repeat", dependencies=[Depends(require_token)])
-async def set_coach_repeat_endpoint(req: CoachRepeatRequest) -> dict[str, object]:
-    """Set Coach's repeat loop at runtime. Independent of the tick
-    autoloop. Passing interval_seconds=0 disables + clears the prompt.
-    A non-zero interval requires a non-empty prompt."""
-    from server.agents import set_coach_repeat
-    prompt = (req.prompt or "").strip() or None
-    if req.interval_seconds > 0 and not prompt:
-        raise HTTPException(400, detail="prompt required when interval > 0")
-    set_coach_repeat(req.interval_seconds, prompt)
-    await bus.publish(
-        {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "agent_id": "coach",
-            "type": "coach_repeat_changed",
-            "interval_seconds": req.interval_seconds if prompt else 0,
-            "prompt": prompt if req.interval_seconds > 0 else None,
-        }
-    )
-    return {
-        "ok": True,
-        "interval_seconds": req.interval_seconds if prompt else 0,
-        "prompt": prompt if req.interval_seconds > 0 else None,
-    }
+# Recurrence v2 (Docs/recurrence-specs.md): the legacy
+# `/api/coach/loop` and `/api/coach/repeat` endpoints + their
+# `CoachLoopRequest` / `CoachRepeatRequest` bodies were removed in
+# phase 8. Recurring tick → `PUT /api/coach/tick` (body
+# `{minutes, enabled}`); recurring custom prompts → POST/PATCH
+# /api/recurrences with `kind: "repeat"`. Manual one-off tick remains
+# `POST /api/coach/tick`.
 
 
 # --- Recurrences (Docs/recurrence-specs.md §9) -----------------------

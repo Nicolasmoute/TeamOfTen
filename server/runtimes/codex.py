@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import sys
@@ -43,6 +44,10 @@ _codex_clients: dict[str, Any] = {}
 # lock here lets `get_client` / `close_client` be safely called from
 # health probes / shutdown handlers that don't hold the spawn lock.
 _client_locks: dict[str, asyncio.Lock] = {}
+
+# Bump when the Codex-visible coord tool contract changes in a way that
+# old persisted Codex threads might not pick up on resume.
+_CODEX_TOOL_CONTRACT_VERSION = "2026-04-29.coord-mcp-names-v2"
 
 
 class _CapturedStdioTransport:
@@ -401,6 +406,43 @@ async def _clear_codex_thread_id(agent_id: str) -> None:
         logger.exception("clear_codex_thread_id failed: agent=%s", agent_id)
 
 
+async def ensure_codex_tool_contract_current() -> int:
+    """Clear stale Codex thread ids after a tool-contract bump.
+
+    Codex app-server can preserve thread-local tool state across
+    resumes. When TeamOfTen changes how coord MCP tools are exposed or
+    described, old thread ids can keep telling the model a coord tool is
+    unavailable "in this session". This one-time boot migration forces
+    the next Codex turn to start with the current MCP config.
+    """
+    from server.db import configured_conn
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT value FROM team_config WHERE key = ?",
+            ("codex_tool_contract_version",),
+        )
+        row = await cur.fetchone()
+        current = dict(row)["value"] if row else None
+        if current == _CODEX_TOOL_CONTRACT_VERSION:
+            return 0
+        cur = await c.execute(
+            "UPDATE agent_sessions SET codex_thread_id = NULL "
+            "WHERE codex_thread_id IS NOT NULL"
+        )
+        cleared = cur.rowcount if cur.rowcount is not None else 0
+        await c.execute(
+            "INSERT INTO team_config (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("codex_tool_contract_version", _CODEX_TOOL_CONTRACT_VERSION),
+        )
+        await c.commit()
+        return int(cleared or 0)
+    finally:
+        await c.close()
+
+
 async def open_thread(
     agent_id: str,
     client: Any,
@@ -516,28 +558,114 @@ _ITEM_TYPE_TO_HARNESS: dict[str, tuple[str, str | None]] = {
 }
 
 
-def _resolve_mcp_tool_name(item_payload: dict[str, Any]) -> str:
+_MCP_TOOL_METADATA_KEYS = {
+    "type",
+    "id",
+    "server",
+    "server_name",
+    "serverName",
+    "mcp_server",
+    "mcpServer",
+    "name",
+    "tool_name",
+    "toolName",
+    "tool",
+    "args",
+    "arguments",
+    "input",
+    "params",
+    "result",
+    "output",
+    "response",
+    "content",
+    "status",
+    "state",
+    "durationMs",
+    "duration_ms",
+}
+
+
+def _mcp_payload_views(item_payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    views: list[Mapping[str, Any]] = [item_payload]
+    for key in ("call", "toolCall", "tool_call", "mcp", "mcpToolCall"):
+        nested = item_payload.get(key)
+        if isinstance(nested, Mapping):
+            views.append(nested)
+    return views
+
+
+def _json_object_from_string(value: str) -> dict[str, Any] | None:
+    text = value.strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return dict(parsed) if isinstance(parsed, dict) else None
+
+
+def _resolve_mcp_tool_name(item_payload: Mapping[str, Any]) -> str:
     """Build the Claude-convention `mcp__<server>__<name>` string from
     a Codex `mcp_tool_call` item payload. SDK payload keys have varied
     across probes, so this looks up several plausible spellings and
     falls back to a marker name on miss.
     """
-    server = (
-        item_payload.get("server")
-        or item_payload.get("server_name")
-        or item_payload.get("serverName")
-        or item_payload.get("mcp_server")
-        or item_payload.get("mcpServer")
-        or "unknown"
-    )
-    name = (
-        item_payload.get("name")
-        or item_payload.get("tool_name")
-        or item_payload.get("toolName")
-        or item_payload.get("tool")
-        or "unknown"
-    )
-    return f"mcp__{server}__{name}"
+    server: Any = None
+    name: Any = None
+    for view in _mcp_payload_views(item_payload):
+        server = server or (
+            view.get("server")
+            or view.get("server_name")
+            or view.get("serverName")
+            or view.get("mcp_server")
+            or view.get("mcpServer")
+        )
+        name = name or (
+            view.get("tool_name")
+            or view.get("toolName")
+            or view.get("tool")
+            or view.get("name")
+        )
+    server_s = str(server or "unknown")
+    name_s = str(name or "unknown")
+    if name_s.startswith("mcp__"):
+        return name_s
+    return f"mcp__{server_s}__{name_s}"
+
+
+def _extract_mcp_tool_input(item_payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the actual MCP arguments, not the Codex wrapper object."""
+    for view in _mcp_payload_views(item_payload):
+        for key in ("args", "arguments", "input", "params"):
+            value = view.get(key)
+            if isinstance(value, Mapping):
+                return dict(value)
+            if isinstance(value, str):
+                parsed = _json_object_from_string(value)
+                if parsed is not None:
+                    return parsed
+                if value.strip():
+                    return {"arguments": value}
+
+    # Some SDK/protocol builds may flatten MCP arguments at the top
+    # level. Preserve those user fields while dropping wrapper/result
+    # metadata so coord_* renderers can still summarize the call.
+    flattened: dict[str, Any] = {}
+    for k, v in item_payload.items():
+        if isinstance(v, (dict, list)) or v is None:
+            continue
+        key = str(k)
+        if key == "name":
+            # `name` is ambiguous: some protocol drafts use it for the
+            # MCP tool name, while coord_set_player_role uses it for the
+            # player's human name. Keep likely argument values.
+            if isinstance(v, str) and (v.startswith("coord_") or v.startswith("mcp__")):
+                continue
+        elif key in _MCP_TOOL_METADATA_KEYS:
+            continue
+        flattened[key] = v
+    return flattened
 
 
 def _step_item_payload(step: Any) -> dict[str, Any]:
@@ -584,13 +712,25 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
     # mcp_tool_call resolves its tool name from payload, so it lives
     # outside the static table.
     if item_type in ("mcp_tool_call", "mcpToolCall"):
+        tool_name = _resolve_mcp_tool_name(item_payload)
+        tool_input = _extract_mcp_tool_input(item_payload)
         await _emit(
             agent_id,
             "tool_use",
-            tool=_resolve_mcp_tool_name(item_payload),
+            name=tool_name,
+            tool=tool_name,
             id=item_id,
-            input=item_payload,
+            input=tool_input,
         )
+        result_text = _extract_step_tool_result(item_payload)
+        if result_text:
+            await _emit(
+                agent_id,
+                "tool_result",
+                tool_use_id=item_id,
+                content=result_text,
+                is_error=bool(_step_payload_is_error(item_payload)),
+            )
         return
 
     mapping = _ITEM_TYPE_TO_HARNESS.get(item_type)
@@ -643,6 +783,7 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
         await _emit(
             agent_id,
             "tool_use",
+            name=tool_name,
             tool=tool_name,
             id=item_id,
             input=item_payload,
@@ -724,9 +865,60 @@ directories because they use Claude naming.
 
 def _codex_developer_instructions(system_prompt: str | None) -> str:
     body = (system_prompt or "").strip()
+    compat = (
+        _CODEX_CLAUDE_COMPAT_INSTRUCTIONS
+        + "\n\n"
+        + _codex_coord_tool_instructions()
+    )
     if body:
-        return body + "\n\n" + _CODEX_CLAUDE_COMPAT_INSTRUCTIONS
-    return _CODEX_CLAUDE_COMPAT_INSTRUCTIONS
+        return body + "\n\n" + compat
+    return compat
+
+
+def _codex_coord_tool_instructions() -> str:
+    try:
+        from server.tools import coord_tool_names
+        names = coord_tool_names()
+    except Exception:
+        logger.exception("CodexRuntime: failed to build coord tool instruction list")
+        names = []
+    if names:
+        tool_list = ", ".join(f"`{name}`" for name in names)
+        list_line = f"Current coord MCP tools: {tool_list}."
+    else:
+        list_line = "Current coord MCP tools are exposed by the `coord` MCP server."
+    return (
+        "## TeamOfTen coord tools in Codex\n\n"
+        "TeamOfTen coord_* tools are exposed through the MCP server named "
+        "`coord`. In Codex they may appear as MCP tools named like "
+        "`coord_read_inbox`, or internally as `mcp__coord__coord_read_inbox`. "
+        "Use those MCP tools directly for board, inbox, memory, role, todo, "
+        "and human-escalation work.\n\n"
+        + list_line
+        + "\n\nDo not use shell commands, direct SQLite/database access, "
+        "or HTTP API fallbacks for harness state when a coord_* tool exists. "
+        "Do not say a coord_* tool is unavailable unless an attempted MCP "
+        "tool call returns an explicit tool-not-found error; if that happens, "
+        "report the exact tool error."
+    )
+
+
+def _codex_sandbox_for(agent_id: str) -> str:
+    # Coach coordinates through coord_* MCP tools and must not mutate
+    # code or harness state through shell/database fallbacks. Players
+    # still need full access for repo/test work until a narrower Codex
+    # write policy is implemented.
+    return "read-only" if agent_id == "coach" else "danger-full-access"
+
+
+def _codex_config_overrides(tc: TurnContext) -> dict[str, Any]:
+    return {
+        "mcp_servers": _build_mcp_servers(tc),
+        # TeamOfTen supplies its own coordination surface. Disabling
+        # plugin warmups prevents Cloudflare/plugin-sync noise from
+        # killing embedded app-server sessions.
+        "plugins": {"enabled": False},
+    }
 
 
 def _build_thread_config(sdk: Any, tc: TurnContext) -> Any:
@@ -735,8 +927,8 @@ def _build_thread_config(sdk: Any, tc: TurnContext) -> Any:
         "cwd": tc.workspace_cwd or None,
         "developer_instructions": _codex_developer_instructions(tc.system_prompt),
         "approval_policy": "never",
-        "sandbox": "danger-full-access",
-        "config": {"mcp_servers": _build_mcp_servers(tc)},
+        "sandbox": _codex_sandbox_for(tc.agent_id),
+        "config": _codex_config_overrides(tc),
     }
     if tc.model:
         kwargs["model"] = tc.model

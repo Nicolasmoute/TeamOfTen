@@ -125,6 +125,61 @@ async def test_patch_updates_fields(client: Any) -> None:
     assert body["due"] is None
 
 
+async def test_http_emits_coach_todo_events_with_agent_coach(
+    fresh_db: str,
+) -> None:
+    """Spec §13 says coach_todo_* events surface in Coach's pane. The
+    pane router uses agent_id, so HTTP-side emits must use 'coach'
+    even when the actor is 'human'. Locks the contract via the bus."""
+    from server.events import bus
+    from server.projects_api import build_router
+    import asyncio
+
+    async def fake_token() -> None:
+        return None
+
+    def fake_actor(*a: Any, **kw: Any) -> dict[str, str]:
+        return {"source": "human", "ip": "", "ua": ""}
+
+    await init_db()
+    ensure_project_scaffold("misc")
+    captured: list[dict[str, Any]] = []
+    q = bus.subscribe()
+
+    async def drain() -> None:
+        while True:
+            ev = await q.get()
+            if ev.get("type", "").startswith("coach_todo_"):
+                captured.append(ev)
+                if len(captured) >= 2:
+                    return
+
+    drain_task = asyncio.create_task(drain())
+
+    from fastapi.testclient import TestClient
+    import server.main as mainmod
+    mainmod.HARNESS_TOKEN = ""
+    with TestClient(mainmod.app) as c:
+        r = c.post("/api/projects/misc/coach-todos",
+                   json={"title": "x"})
+        assert r.status_code == 200
+        rid = r.json()["id"]
+        r = c.post(f"/api/projects/misc/coach-todos/{rid}/complete")
+        assert r.status_code == 200
+
+    try:
+        await asyncio.wait_for(drain_task, timeout=2.0)
+    except asyncio.TimeoutError:
+        drain_task.cancel()
+    bus.unsubscribe(q)
+    assert len(captured) == 2
+    for ev in captured:
+        assert ev["agent_id"] == "coach", \
+            f"event {ev['type']} should fan into Coach's pane"
+        # actor still records the human-side trigger.
+        assert ev.get("actor", {}).get("source") == "human"
+
+
 async def test_patch_rejects_empty_body(client: Any) -> None:
     r = client.post(
         "/api/projects/misc/coach-todos",

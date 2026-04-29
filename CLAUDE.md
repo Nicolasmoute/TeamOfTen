@@ -81,10 +81,14 @@ deployed Zeabur instance — see "What needs verification" below.
    lists with click-to-expand body, refreshes on `decision_written` events.
 - **Snapshot retention** ✓ kDrive snapshot loop prunes oldest beyond
    `HARNESS_KDRIVE_SNAPSHOT_RETENTION` (default 48 ≈ 2 days hourly).
-- **Coach autoloop** ✓ env-gated background task: when
-   `HARNESS_COACH_TICK_INTERVAL > 0`, Coach is nudged to drain inbox at
-   that cadence. Skips when Coach is already working. Manual trigger:
-   `POST /api/coach/tick` (409 if busy).
+- **Coach recurrence scheduler** ✓ unified
+   `recurrence_scheduler_loop` reads rows from `coach_recurrence`
+   every `HARNESS_RECURRENCE_TICK_SECONDS` (default 30s). Three
+   flavors: tick (singleton, smart-composed prompt) / repeat (custom
+   prompt) / cron (DSL). Skips when Coach is already working or daily
+   cap hit. Manual trigger: `POST /api/coach/tick` (409 if busy).
+   Replaced the legacy in-memory `coach_tick_loop` /
+   `coach_repeat_loop` pair — see `Docs/recurrence-specs.md`.
 
 - **M5 step 2** ✓ `ClaudeAgentOptions(resume=<session_id>)` wired;
    agent_started events carry `resumed_session: bool`; UI shows ↻ vs →
@@ -594,9 +598,11 @@ Still unverified end-to-end:
    RETENTION+1 snapshots, confirm only the newest RETENTION remain.
 6. **MCP server smoke-test** — has the paste-JSON flow survived an
    actual GitHub / Notion MCP? Only self-tested with a stub.
-7. **Coach autoloop steady-state** — set
-   `HARNESS_COACH_TICK_INTERVAL=120`, confirm `routine tick` events
-   fire on cadence and skip while a prior turn is working.
+7. **Coach recurrence steady-state** — set a 2-minute tick via
+   `/tick 2` or `PUT /api/coach/tick {minutes: 2}`, confirm
+   `recurrence_fired` events arrive on cadence and `recurrence_skipped`
+   reasons (`coach_busy` / `cost_capped`) fire under the matching
+   conditions.
 8. **Telegram bridge** — set the bot token + chat IDs via Options
    drawer → "Telegram bridge" section (or via env on first boot),
    send a message to the bot, confirm Coach turn fires and reply
@@ -642,6 +648,18 @@ Resolution at spawn time: `agents.runtime_override` (per-slot) → role default 
 For full design: `Docs/CODEX_RUNTIME_SPEC.md`. The dispatcher in `agents.run_agent` is runtime-agnostic; the runtime-specific work lives behind the `AgentRuntime` protocol in `server/runtimes/base.py`.
 
 ## Known gotchas
+
+### `HARNESS_COACH_TICK_INTERVAL` is deprecated (recurrence v2)
+
+The legacy in-memory tick loop was replaced by the unified
+`recurrence_scheduler_loop` (see `Docs/recurrence-specs.md`). The env
+var is now honored **only on the first migration**: if non-zero on a
+fresh DB, `db._seed_recurrence_from_env` seeds a `coach_recurrence`
+tick row at that cadence and stamps `team_config.recurrence_v1_seeded`
+so subsequent boots ignore the env var. To set the recurring tick at
+runtime use `PUT /api/coach/tick {minutes: N}` or the `/tick N` slash
+command — both write to the `coach_recurrence` table directly. To stop
+it, use `PUT /api/coach/tick {enabled: false}` or `/tick off`.
 
 ### Claude CLI auth: persist via `CLAUDE_CONFIG_DIR` on the /data volume
 

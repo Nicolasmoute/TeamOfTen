@@ -634,8 +634,8 @@ When `coord_create_project` (or whatever creates a project today) runs:
 4. Project objectives: file, system-prompt injection, first-turn prompt. **completed and audited**
 5. Smart tick prompt composition (replaces `COACH_TICK_PROMPT`). **completed and audited**
 6. Recurrence pane UI + rail icon. **completed and audited**
-7. EnvPane sections for todos and objectives. **completed**
-8. Migration cleanup: delete old loop functions, env-var deprecation note.
+7. EnvPane sections for todos and objectives. **completed and audited**
+8. Migration cleanup: delete old loop functions, env-var deprecation note. **completed and audited**
 
 Each phase is independently shippable. Phases 1–2 give the operator parity
 with today's `/loop` + `/repeat` plus persistence + cron. Phases 3–5 turn

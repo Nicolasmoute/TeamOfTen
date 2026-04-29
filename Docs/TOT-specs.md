@@ -1362,40 +1362,66 @@ Rules:
 - Based on UTC day spend from `turns.cost_usd`.
 - Blocked spawns emit `cost_capped`.
 
-### 11.3 Coach Loops
+### 11.3 Coach Recurrences (formerly Coach Loops)
 
-Routine tick loop:
+Replaced the legacy in-memory loops with a unified, project-scoped,
+persisted recurrence model — see `Docs/recurrence-specs.md` for the
+full design. Three flavors share one `coach_recurrence` table and one
+scheduler (`recurrence_scheduler_loop`):
 
-- Initial env: `HARNESS_COACH_TICK_INTERVAL`, default 0.
-- Runtime API:
-  - `GET /api/coach/loop`
-  - `POST /api/coach/loop {interval_seconds}`
-- UI slash:
-  - `/loop`
-  - `/loop 60`
-  - `/loop off`
-- Prompt: "Routine tick. Read your inbox..."
-- Skips when paused or Coach is already working.
-- Emits `coach_tick_fired` and `coach_loop_changed`.
+- **tick** — singleton per project, harness-composed prompt via
+  `compose_tick_prompt()`. Spec §4 priority: inbox → todos →
+  objectives → end quietly when all empty.
+- **repeat** — many per project, fixed-minute cadence + caller prompt.
+- **cron** — many per project, friendly DSL (`daily 09:00`,
+  `weekdays 18:00`, `mon,thu 14:00`, `monthly 1 09:00`,
+  `2026-05-01 10:00`) + TZ + caller prompt.
 
-Repeat loop:
+Runtime API:
 
-- Independent from routine tick.
-- Runtime API:
-  - `GET /api/coach/repeat`
-  - `POST /api/coach/repeat {interval_seconds, prompt}`
-- UI slash:
-  - `/repeat`
-  - `/repeat 120 <prompt>`
-  - `/repeat off`
-- Coach-only in UI.
-- Emits `coach_repeat_fired` and `coach_repeat_changed`.
+- `GET /api/recurrences` — list all rows for the active project.
+- `POST /api/recurrences {kind, cadence, prompt, tz?}` — create
+  repeat or cron.
+- `PATCH /api/recurrences/{id} {cadence?, prompt?, tz?, enabled?}`.
+- `DELETE /api/recurrences/{id}`.
+- `PUT /api/coach/tick {minutes?, enabled?}` — set or disable the
+  recurring tick.
+- `POST /api/coach/tick` — fire one tick now (kept; uses the smart
+  composer). Rejects with 409 if Coach is working.
 
-Manual tick:
+UI slash commands (Coach pane only):
 
-- `POST /api/coach/tick`
-- UI slash `/tick`
-- Rejects with 409 if Coach is working.
+- `/tick` — fire one tick now.
+- `/tick N` — set recurring tick every N minutes; auto-enables.
+- `/tick off` — disable recurring tick.
+- `/repeat` — list active repeats; `/repeat N <prompt>` adds; `/repeat
+  rm <id>` deletes.
+- `/cron` — list active crons; `/cron <when> <prompt>` adds (DSL); 
+  `/cron rm <id>` deletes.
+- `/loop` — typing it surfaces the rename message (legacy command
+  removed in phase 8).
+
+UI surface:
+
+- **Recurrence pane** (rail icon: circular arrows) — opens alongside
+  EnvPane, shows three sections (tick / repeats / crons) with editable
+  cards, status dots, next/last fire stamps.
+- **EnvPane sections** — `Project objectives` (multiline editor) +
+  `Coach todos` (checkbox list, click-to-expand, archive toggle).
+
+Skips when paused, Coach is already working, or daily cost cap hit
+(emits `recurrence_skipped` with `reason="coach_busy"` /
+`reason="cost_capped"`).
+
+Events emitted: `recurrence_added`, `recurrence_changed`,
+`recurrence_deleted`, `recurrence_fired`, `recurrence_skipped`,
+`recurrence_disabled`. Plus `coach_todo_added`, `coach_todo_completed`,
+`coach_todo_updated`, `objectives_updated`.
+
+Migration: `HARNESS_COACH_TICK_INTERVAL` is honored only on first
+migration via `db._seed_recurrence_from_env`; the `recurrence_v1_seeded`
+flag in `team_config` makes the seed idempotent. Subsequent boots
+ignore the env var. Documented as deprecated.
 
 ### 11.4 Auto-Wake
 
@@ -1847,11 +1873,16 @@ Emits `claude_auth_updated`.
 
 | Endpoint | Notes |
 | --- | --- |
-| `GET /api/coach/loop` | Routine loop interval |
-| `POST /api/coach/loop` | Set routine loop interval |
-| `GET /api/coach/repeat` | Repeat loop state |
-| `POST /api/coach/repeat` | Set repeat loop |
-| `POST /api/coach/tick` | Manual Coach tick |
+| `GET /api/recurrences` | List active project's recurrences |
+| `POST /api/recurrences` | Create repeat or cron |
+| `PATCH /api/recurrences/{id}` | Edit cadence / prompt / tz / enabled |
+| `DELETE /api/recurrences/{id}` | Remove a recurrence |
+| `PUT /api/coach/tick` | Set / disable the recurring tick (`{minutes?, enabled?}`) |
+| `POST /api/coach/tick` | Fire one tick now (smart composer) |
+| `GET/POST/PATCH /api/projects/{id}/coach-todos` | Coach todos surface |
+| `POST /api/projects/{id}/coach-todos/{tid}/complete` | Mark todo done |
+| `GET /api/projects/{id}/coach-todos/archive` | Archived todos |
+| `GET/PUT /api/projects/{id}/objectives` | Project objectives |
 
 ### 14.5 Tasks
 
@@ -2077,6 +2108,12 @@ Agent lifecycle:
 - `context_applied`
 - `context_usage`
 
+`tool_use` payloads use Claude's renderer shape: `name`, `id`, and
+`input`. Codex also carries a duplicate `tool` alias for runtime
+debugging, but the UI must prefer `name` and fall back to `tool` for
+older persisted Codex rows. Codex MCP calls unwrap protocol wrapper
+fields and pass the actual coord_* arguments as `input`.
+
 Task and coordination:
 
 - `task_created`
@@ -2094,13 +2131,19 @@ Task and coordination:
 - `lock_updated`
 - `human_attention`
 
-Loops and runtime:
+Recurrences and runtime:
 
 - `pause_toggled`
-- `coach_loop_changed`
-- `coach_tick_fired`
-- `coach_repeat_changed`
-- `coach_repeat_fired`
+- `recurrence_added`
+- `recurrence_changed`
+- `recurrence_deleted`
+- `recurrence_fired`
+- `recurrence_skipped`
+- `recurrence_disabled`
+- `coach_todo_added`
+- `coach_todo_completed`
+- `coach_todo_updated`
+- `objectives_updated`
 - `team_tools_updated`
 - `team_models_updated`
 - `team_repo_updated`
@@ -2210,6 +2253,11 @@ Body:
 - Filters with in-pane search.
 - Auto-scrolls to bottom during streaming.
 - Renders structured tool cards through `server/static/tools.js`.
+- Tool cards accept `event.name` or legacy `event.tool`; this keeps
+  older Codex MCP history readable after the runtime began emitting
+  Claude-compatible tool names. They also unwrap legacy MCP wrapper
+  inputs (`args` / `arguments` / `input`) before running coord_*
+  summarizers.
 - Renders markdown safely with DOMPurify.
 - Event timeline rendering is isolated behind a shallow event-array
   guard: local UI state changes such as plan/model/settings must not
@@ -2662,7 +2710,9 @@ Representative env vars from `.env.example` and implementation:
 | `HARNESS_LIVE_CONVERSATION_S` | `30` | Recent conversation live tag window |
 | `HARNESS_AGENT_DAILY_CAP` | `5.0` | Per-agent daily spend cap |
 | `HARNESS_TEAM_DAILY_CAP` | `20.0` | Team daily spend cap |
-| `HARNESS_COACH_TICK_INTERVAL` | `0` | Routine Coach loop startup interval |
+| `HARNESS_COACH_TICK_INTERVAL` | `0` | **Deprecated.** Honored only on first migration to seed a tick row in `coach_recurrence`. After that the env var is ignored — runtime control is via `PUT /api/coach/tick` or `/tick N`. |
+| `HARNESS_RECURRENCE_TICK_SECONDS` | `30` | Scheduler resolution for `recurrence_scheduler_loop` |
+| `HARNESS_MAX_RECURRENCES_PER_PROJECT` | `50` | Soft cap per project; POST 409s when exceeded |
 | `HARNESS_AUTOWAKE_DEBOUNCE` | `10` | Auto-wake debounce seconds |
 | `HARNESS_ERROR_RETRY_DELAY` | `45` | Error retry delay |
 | `HARNESS_ERROR_RETRY_MAX_CONSECUTIVE` | `3` | Retry limit |

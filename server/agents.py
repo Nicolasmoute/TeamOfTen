@@ -934,9 +934,10 @@ TEAM_DAILY_CAP_USD = float(os.environ.get("HARNESS_TEAM_DAILY_CAP", "20.0"))
 _running_tasks: dict[str, asyncio.Task[Any]] = {}
 
 # Global pause switch: when True, run_agent rejects new starts (emits
-# a 'paused' event) and coach_tick_loop skips its tick. In-flight turns
-# are NOT cancelled — to stop those, use POST /api/agents/<id>/cancel.
-# In-memory only: a restart lifts the pause automatically.
+# a 'paused' event) and the recurrence scheduler skips firing rows.
+# In-flight turns are NOT cancelled — to stop those, use POST
+# /api/agents/<id>/cancel. In-memory only: a restart lifts the pause
+# automatically.
 _paused = False
 
 
@@ -1107,64 +1108,19 @@ COMPACT_PROMPT = (
 )
 
 
-# Standard prompt the autonomous loop and POST /api/coach/tick both
-# send to Coach. Kept here so callers stay in sync.
-COACH_TICK_PROMPT = (
-    "Routine tick. Read your inbox for new human goals and Player updates. "
-    "If there's nothing actionable, end the turn without calling tools. "
-    "Otherwise decompose goals into tasks, assign or reassign as needed, "
-    "and reply to Players who need direction. Be terse."
-)
-COACH_TICK_INTERVAL_SECONDS = int(
-    os.environ.get("HARNESS_COACH_TICK_INTERVAL", "0")
-)
-
-# Mutable Coach tick interval — initialized from the env var, but
-# changeable at runtime via set_coach_interval() (POST /api/coach/loop
-# or the /loop slash command). The loop reads this each iteration, so
-# changes take effect on the NEXT tick without restart.
-_coach_tick_interval: int = COACH_TICK_INTERVAL_SECONDS
-
-
-def get_coach_interval() -> int:
-    return _coach_tick_interval
-
-
-def set_coach_interval(seconds: int) -> None:
-    """Update the Coach autoloop cadence at runtime. 0 disables. The
-    loop polls this every few seconds so changes take effect promptly."""
-    global _coach_tick_interval
-    _coach_tick_interval = max(0, int(seconds))
-    logger.info("coach autoloop interval set to %ds", _coach_tick_interval)
-
-
-# Independent "repeat" loop: same shape as the tick loop but with an
-# arbitrary caller-supplied prompt. Driven by /repeat slash command
-# (POST /api/coach/repeat). Coach-only. Runs in parallel with the
-# routine tick loop — both can fire independently, coach_is_working
-# guard prevents actual concurrent turns.
-_coach_repeat_interval: int = 0
-_coach_repeat_prompt: str | None = None
-
-
-def get_coach_repeat() -> tuple[int, str | None]:
-    return _coach_repeat_interval, _coach_repeat_prompt
-
-
-def set_coach_repeat(seconds: int, prompt: str | None) -> None:
-    """Set the Coach repeat-loop cadence + prompt at runtime. Passing
-    seconds=0 disables the loop (prompt is cleared). Changes take
-    effect on the next iteration of coach_repeat_loop."""
-    global _coach_repeat_interval, _coach_repeat_prompt
-    _coach_repeat_interval = max(0, int(seconds))
-    _coach_repeat_prompt = (prompt or "").strip() or None
-    if _coach_repeat_interval <= 0:
-        _coach_repeat_prompt = None
-    logger.info(
-        "coach repeat loop set: %ds, prompt=%r",
-        _coach_repeat_interval,
-        (_coach_repeat_prompt or "")[:60],
-    )
+# Recurrence v2 (Docs/recurrence-specs.md): the legacy
+# `coach_tick_loop` / `coach_repeat_loop` pair, the
+# `_coach_tick_interval` / `_coach_repeat_*` module globals, the
+# `set/get_coach_interval` and `set/get_coach_repeat` accessors, and
+# the COACH_TICK_PROMPT constant were all deleted in phase 8. The
+# unified `recurrence_scheduler_loop` (server/recurrences.py) now
+# drives every Coach tick / repeat / cron from rows in the
+# `coach_recurrence` table; per-fire prompts come from
+# `compose_tick_prompt(project_id)`.
+#
+# `HARNESS_COACH_TICK_INTERVAL` is honored only on first migration
+# (db._seed_recurrence_from_env) — see CLAUDE.md "Known gotchas" for
+# the deprecation note.
 
 
 # Auto-wake: when Coach assigns a task to p3 or messages p3, we start
@@ -3792,94 +3748,6 @@ async def _coach_is_working() -> bool:
         logger.exception("coach autoloop: status read failed")
         return False
     return bool(row) and dict(row)["status"] == "working"
-
-
-async def coach_tick_loop() -> None:
-    """Background task: periodically nudge Coach to drain inbox.
-
-    Reads _coach_tick_interval each iteration so set_coach_interval()
-    (from /api/coach/loop or the /loop slash command) can toggle the
-    cadence at runtime with no restart. When the interval is <= 0,
-    the loop idles with a short poll until it's re-enabled."""
-    logger.info(
-        "coach autoloop running (initial interval %ds; 0=disabled)",
-        _coach_tick_interval,
-    )
-    while True:
-        interval = _coach_tick_interval
-        try:
-            if interval <= 0:
-                # Idle poll — wake every 5s to check if someone enabled
-                # us via set_coach_interval().
-                await asyncio.sleep(5)
-                continue
-            await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            raise
-        try:
-            if _coach_tick_interval <= 0:
-                # Disabled between sleep start and now — skip this tick.
-                continue
-            if _paused:
-                logger.info("coach autoloop: skipping — harness paused")
-                continue
-            if await _coach_is_working():
-                logger.info("coach autoloop: skipping — coach is working")
-                continue
-            await bus.publish(
-                {
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "agent_id": "coach",
-                    "type": "coach_tick_fired",
-                    "interval_seconds": _coach_tick_interval,
-                }
-            )
-            await run_agent("coach", COACH_TICK_PROMPT)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("coach autoloop: tick failed")
-
-
-async def coach_repeat_loop() -> None:
-    """Background task: periodically send a user-supplied prompt to
-    Coach. Independent of coach_tick_loop — both can be active at
-    once, each with its own cadence. Idles when interval<=0."""
-    logger.info("coach repeat loop running (disabled until /repeat set)")
-    while True:
-        interval = _coach_repeat_interval
-        try:
-            if interval <= 0:
-                await asyncio.sleep(5)
-                continue
-            await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            raise
-        try:
-            if _coach_repeat_interval <= 0:
-                continue
-            prompt = _coach_repeat_prompt
-            if not prompt:
-                continue
-            if _paused:
-                logger.info("coach repeat loop: skipping — harness paused")
-                continue
-            if await _coach_is_working():
-                logger.info("coach repeat loop: skipping — coach is working")
-                continue
-            await bus.publish(
-                {
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "agent_id": "coach",
-                    "type": "coach_repeat_fired",
-                    "interval_seconds": _coach_repeat_interval,
-                }
-            )
-            await run_agent("coach", prompt)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("coach repeat loop: tick failed")
 
 
 # Stale-task watchdog config. Env-tunable so the default can be safe
