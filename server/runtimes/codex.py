@@ -916,10 +916,32 @@ def _codex_developer_instructions(system_prompt: str | None) -> str:
         _CODEX_CLAUDE_COMPAT_INSTRUCTIONS
         + "\n\n"
         + _codex_coord_tool_instructions()
+        + "\n\n"
+        + _codex_web_tool_instructions()
     )
     if body:
         return body + "\n\n" + compat
     return compat
+
+
+def _codex_web_tool_instructions() -> str:
+    """Tell the Codex agent how Claude-shaped web tools map onto its
+    native ones. Without this, agents read 'WebSearch is enabled' in
+    their context and try to invoke a tool that doesn't exist in
+    Codex, then mistakenly conclude the web is unreachable."""
+    return (
+        "## Web access in Codex\n\n"
+        "Claude-shaped tool names (`WebSearch`, `WebFetch`) do not exist "
+        "in this runtime. Use Codex's native `web_search` tool when "
+        "you would have used `WebSearch` or `WebFetch` — `web_search` "
+        "is enabled iff the team-wide WebSearch toggle is on, which "
+        "you can assume to be the case if your context lists "
+        "`WebSearch` among the allowed tools. There is no per-URL "
+        "fetch tool: pass the URL through `web_search` as a query "
+        "rather than reaching for `curl` (the read-only sandbox "
+        "blocks it for Coach anyway). Do not say 'web access is "
+        "unavailable' before attempting `web_search`."
+    )
 
 
 def _codex_coord_tool_instructions() -> str:
@@ -959,9 +981,24 @@ def _codex_sandbox_for(agent_id: str) -> str:
 
 
 def _codex_config_overrides(tc: TurnContext) -> dict[str, Any]:
-    return {
+    overrides: dict[str, Any] = {
         "mcp_servers": _build_mcp_servers(tc),
     }
+    # Translate the team-wide web-access toggle into Codex's native
+    # switch. The Settings drawer toggle is stored under the legacy
+    # Claude SDK tool names ("WebSearch" / "WebFetch") for backwards
+    # compatibility; semantically it means "the team is allowed to
+    # use the web". For Codex that maps to `config.web_search = "live"`
+    # — the documented setting that gates the model's built-in search.
+    # When the operator explicitly enabled the toggle they want fresh
+    # results; `cached` doesn't materially reduce prompt-injection
+    # risk so it's not a useful default. There's no Codex analogue
+    # for per-URL fetch — the developer instructions tell the agent
+    # to pass URLs through `web_search` instead of reaching for curl.
+    allowed = set(tc.allowed_tools or [])
+    if "WebSearch" in allowed or "WebFetch" in allowed:
+        overrides["web_search"] = "live"
+    return overrides
 
 
 def _build_thread_config(sdk: Any, tc: TurnContext) -> Any:

@@ -3507,9 +3507,13 @@ function TeamToolsSection() {
   return html`<section class="drawer-section">
     <h3>Team tools</h3>
     <p class="muted" style="margin: 0 0 6px 0; font-size: 12px;">
-      Extra SDK tools beyond the role baseline. Applies to every
-      agent on their next turn — off by default so web calls don't
-      fire unexpectedly.
+      Extra tools beyond the role baseline. Applies to every agent
+      on their next turn — off by default so web calls don't fire
+      unexpectedly. The toggle is team-wide and runtime-shared:
+      Claude agents get the SDK tool of the same name; Codex agents
+      get the equivalent native capability (WebSearch / WebFetch
+      both flip Codex's <code>web_search</code> to <code>live</code>;
+      Codex has no per-URL fetch — pass URLs through web_search).
     </p>
     ${loaded
       ? available.length === 0

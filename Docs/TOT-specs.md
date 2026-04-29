@@ -1784,6 +1784,23 @@ Controlled by:
 - `PUT /api/team/tools`
 - stored in `team_config.extra_tools`
 
+The toggle is **team-wide and runtime-shared**: one switch, both runtimes
+honor it. The CamelCase names are a backwards-compat artifact (Claude
+was the only runtime when storage was set); semantically the toggle
+means "the team is allowed to use the web".
+
+Runtime translation:
+
+- ClaudeRuntime: passes the literal strings as `allowed_tools` to the
+  SDK — `WebSearch` and `WebFetch` are first-class Claude tools.
+- CodexRuntime: there are no tools by those names. The
+  `_codex_config_overrides` builder sets `config.web_search = "live"`
+  whenever either toggle is on, which gates Codex's native built-in
+  search. There's no per-URL fetch in Codex — the developer
+  instructions tell the agent to pass URLs through `web_search`
+  rather than reach for `curl` (Coach's `read-only` sandbox blocks
+  shell network access anyway).
+
 External MCP servers:
 
 - Loaded from `HARNESS_MCP_CONFIG`.
