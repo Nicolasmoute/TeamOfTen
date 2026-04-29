@@ -3,6 +3,8 @@ README.md
 pyproject.toml
 server/__init__.py
 server/agents.py
+server/coach_objectives.py
+server/coach_todos.py
 server/context.py
 server/coord_mcp.py
 server/db.py
@@ -17,6 +19,7 @@ server/paths.py
 server/pricing.py
 server/project_sync.py
 server/projects_api.py
+server/recurrences.py
 server/secrets.py
 server/spawn_tokens.py
 server/sync.py

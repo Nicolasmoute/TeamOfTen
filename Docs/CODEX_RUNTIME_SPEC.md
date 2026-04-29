@@ -248,10 +248,17 @@ reads the env var at startup.
 
 Body is a stdio MCP server that:
 
-- Statically declares the coord tool list (names, schemas) — no DB
-  access, just a hardcoded mirror of what `build_coord_server` registers
-  today. Schema drift between the proxy and the real handlers is caught
-  by a contract test (§J).
+- Uses the official `mcp` Python stdio server transport. The proxy must
+  respond to the standard MCP initialize, tools/list, and tools/call
+  flow so Codex app-server can register coord_* tools reliably across
+  Linux deployment and Windows development hosts.
+- Codex runtime sets the coord MCP subprocess `cwd` and prepends the
+  harness root to `PYTHONPATH`, because Codex turns execute inside the
+  agent workspace (`/workspaces/<slot>/project`) while the proxy module
+  lives in the TeamOfTen server package.
+- Statically declares the coord tool list (names, permissive schemas)
+  fetched from the loopback catalog. Handler drift between the proxy
+  catalog and the real handlers is caught by contract tests (§J).
 - On each tool invocation, POSTs to `${proxy_url}/api/_coord/{tool_name}`
   with `{caller_id, args}` and `Authorization: Bearer ${proxy_token}`.
 - Streams the response back as the MCP tool result.
@@ -352,6 +359,10 @@ New "Codex auth" section mirroring Telegram pattern: read-only ChatGPT-session b
 `CodexClient.connect_stdio(command=["codex", "app-server"], cwd=...,
 env=...)` which spawns the `codex app-server` subprocess. After
 construction call `await client.start()` then `await client.initialize()`.
+The harness patches the SDK stdio transport to pipe a bounded
+`codex app-server` stderr tail into `CodexTransportError` messages;
+the stock SDK transport discards stderr and otherwise leaves only
+opaque "failed reading from stdio transport" diagnostics.
 The `_SPAWN_LOCK` already enforces sequential turns per slot,
 satisfying the SDK's "one active turn consumer per client" constraint.
 Close (`await client.close()`) and re-open on auth-error / transport
@@ -385,6 +396,12 @@ thread.compact()          # native compact (returns Any)
 
 ### E.3 ConversationStep → harness event mapping
 
+Developer instructions also append a Codex compatibility note: this
+Claude-origin harness treats `CLAUDE.md` as `AGENTS.md`/`agents.md`,
+and `.claude/` directories as `.agents/`. Codex agents must read and
+obey those files/directories for the applicable tree instead of
+ignoring them because of the Claude names.
+
 `thread.chat(text)` yields `ConversationStep` objects. Each step has:
 `thread_id`, `turn_id`, `item_id`, `step_type`, `item_type`, `status`,
 `text` (set for final agent answer; None otherwise), and a `data` dict
@@ -410,7 +427,7 @@ Observed and implemented item_type mapping:
 | `tool` / `mcpToolCall` or `mcp_tool_call`          | `tool_use` (`tool=mcp__...`) | coord_* + external MCPs |
 | stream exhaustion                                  | `result`                   | usage is read best-effort from `thread.read(include_turns=True)` |
 | `CodexTurnInactiveError` raised mid-iteration      | `error` (pre-result) → retry counter |
-| `CodexTimeoutError` / `CodexTransportError`        | `error` (pre-result) → retry counter; close + reopen client |
+| `CodexTimeoutError` / `CodexTransportError`        | `error` (pre-result) -> retry counter; close + reopen client; transport errors include captured app-server stderr tail when available |
 | `CodexProtocolError`                               | `error`; if "thread not found" trigger stale-session retry |
 | `ApprovalRequest` via `set_approval_handler`       | `human_attention`, then decline (§E.8 option b) |
 | `thread.compact()` return                          | `session_compacted` (§E.6) |
@@ -631,21 +648,19 @@ build, (ii) print the actual installed `AsyncCodex` method signatures,
 
 ### I.2 Other Python deps (`pyproject.toml`)
 
-**Implementation note (errata — diverges from this section):** the
-`coord_mcp` proxy in `server/coord_mcp.py` was implemented as
-hand-rolled JSON-RPC 2.0 over stdio rather than using the `mcp`
-package. The proxy only needs `initialize`, `tools/list`,
-`tools/call`, and `ping` — about 200 lines of dispatcher. Pulling
-in `mcp>=1.0` (which is large, brings its own pydantic schemas,
-and pins MCP protocol versions) wasn't justified. Add the dep
-later if `coord_mcp` ever needs richer MCP features (resources,
-prompts, sampling).
+**Implementation note:** the `coord_mcp` proxy in
+`server/coord_mcp.py` now uses the official `mcp` Python stdio server
+transport. The dependency is intentional: Codex app-server gets the
+standard initialize/tools/list/tools/call handshake, while TeamOfTen
+keeps the actual coord tool execution centralized behind the loopback
+HTTP proxy.
 
-The pyproject deps stay minimal:
+The pyproject deps include the MCP transport and the SDK's direct
+WebSocket runtime dependency:
 
 ```toml
-# codex SDK added via git source URL or vendored path (see I.1)
-# (no `mcp` dep — see note above)
+"mcp>=1.0",
+"websockets>=16.0",
 ```
 
 ### I.3 Package discovery

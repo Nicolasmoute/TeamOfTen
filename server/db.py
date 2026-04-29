@@ -320,6 +320,34 @@ CREATE TABLE IF NOT EXISTS truth_proposals (
 
 CREATE INDEX IF NOT EXISTS idx_truth_proposals_project_status
     ON truth_proposals(project_id, status);
+
+-- Coach recurrences (recurrence-specs.md §10). Three flavors share one
+-- table: tick (singleton per project, harness-composed prompt), repeat
+-- (many per project, fixed-minute cadence + user prompt), cron (many
+-- per project, friendly DSL + TZ + user prompt). `cadence` holds
+-- minutes-as-string for tick/repeat and the DSL string for cron.
+-- `next_fire_at` is recomputed after each fire; the scheduler reads
+-- it as its only due-row signal.
+CREATE TABLE IF NOT EXISTS coach_recurrence (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    kind          TEXT NOT NULL CHECK (kind IN ('tick', 'repeat', 'cron')),
+    cadence       TEXT NOT NULL,
+    tz            TEXT,
+    prompt        TEXT,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    next_fire_at  TEXT,
+    last_fired_at TEXT,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    created_by    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_recurrence_project
+    ON coach_recurrence(project_id, enabled);
+-- One tick per project — enforced via partial unique index. Repeat /
+-- cron rows are unconstrained.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_recurrence_one_tick
+    ON coach_recurrence(project_id) WHERE kind = 'tick';
 """
 
 # Seed agents — idempotent via INSERT OR IGNORE. Per-(slot, project)
@@ -505,10 +533,64 @@ async def init_db() -> None:
                 logger.exception(
                     "init_db: write_project_claude_md_stub failed for misc"
                 )
+            await _seed_recurrence_from_env(db)
+
             logger.info("init_db: complete")
     except Exception:
         logger.exception("init_db: sqlite operations failed")
         raise
+
+
+async def _seed_recurrence_from_env(db: aiosqlite.Connection) -> None:
+    """One-shot migration: if HARNESS_COACH_TICK_INTERVAL is non-zero,
+    seed a tick row for every existing project (so the new scheduler
+    fires on the same cadence as the legacy in-memory loop did).
+
+    Idempotent via the `recurrence_v1_seeded` team_config flag —
+    later boots skip this entirely. Per `recurrence-specs.md` §14, the
+    env var is honored on first migration only and is documented as
+    deprecated thereafter.
+
+    Cadence is converted seconds→minutes, rounded up, min 1, capped at
+    a sane upper bound. The legacy var was seconds; the new schema is
+    minutes (`recurrence-specs.md` §1: "durations are in minutes
+    everywhere").
+    """
+    cur = await db.execute(
+        "SELECT value FROM team_config WHERE key = 'recurrence_v1_seeded'"
+    )
+    if await cur.fetchone():
+        return
+    raw = os.environ.get("HARNESS_COACH_TICK_INTERVAL", "0").strip()
+    try:
+        seconds = max(0, int(raw))
+    except ValueError:
+        seconds = 0
+    if seconds > 0:
+        # Round up so a sub-minute env value (e.g. 30s) yields a 1-min
+        # tick. Floor would silently drop the recurrence.
+        minutes = max(1, (seconds + 59) // 60)
+        cur = await db.execute("SELECT id FROM projects")
+        rows = await cur.fetchall()
+        for (project_id,) in rows:
+            await db.execute(
+                "INSERT OR IGNORE INTO coach_recurrence "
+                "(project_id, kind, cadence, prompt, enabled, "
+                "next_fire_at, created_by) "
+                "VALUES (?, 'tick', ?, NULL, 1, "
+                "strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'env_migration')",
+                (project_id, str(minutes)),
+            )
+        logger.info(
+            "init_db: seeded recurrence tick rows from "
+            "HARNESS_COACH_TICK_INTERVAL=%s (minutes=%d, projects=%d)",
+            raw, minutes, len(rows),
+        )
+    await db.execute(
+        "INSERT OR REPLACE INTO team_config (key, value) "
+        "VALUES ('recurrence_v1_seeded', '1')"
+    )
+    await db.commit()
 
 
 # TOCTOU mitigation. The activate handler in server.projects_api

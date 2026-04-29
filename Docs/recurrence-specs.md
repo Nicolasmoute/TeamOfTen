@@ -628,13 +628,13 @@ When `coord_create_project` (or whatever creates a project today) runs:
 
 ## 17. Implementation order (suggested)
 
-1. Migration + table + scheduler (no UI). Tick rows seeded from env var.
-2. Slash commands + HTTP API for recurrences.
-3. Coach todos: file format, MCP tools, system-prompt injection.
-4. Project objectives: file, system-prompt injection, first-turn prompt.
-5. Smart tick prompt composition (replaces `COACH_TICK_PROMPT`).
-6. Recurrence pane UI + rail icon.
-7. EnvPane sections for todos and objectives.
+1. Migration + table + scheduler (no UI). Tick rows seeded from env var. **completed and audited**
+2. Slash commands + HTTP API for recurrences. **completed and audited**
+3. Coach todos: file format, MCP tools, system-prompt injection. **completed and audited**
+4. Project objectives: file, system-prompt injection, first-turn prompt. **completed and audited**
+5. Smart tick prompt composition (replaces `COACH_TICK_PROMPT`). **completed and audited**
+6. Recurrence pane UI + rail icon. **completed and audited**
+7. EnvPane sections for todos and objectives. **completed**
 8. Migration cleanup: delete old loop functions, env-var deprecation note.
 
 Each phase is independently shippable. Phases 1–2 give the operator parity

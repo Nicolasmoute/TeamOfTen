@@ -18,15 +18,13 @@ section it traces back to and a status:
 Codex re-audited this file against the working tree. Current state
 after this pass:
 
-- **Implemented and verified locally:** 1, 2, 3, 5, 6, 7, 8, 9, 10,
+- **Implemented and verified locally:** 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
   11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
   28, 31, 33.
 - **Implemented as the documented v1 degradation/decision:** 16
   (Codex does not get Claude's `AskUserQuestion` hook; approval
   side-channel requests emit `human_attention` and are declined so
   turns do not hang).
-- **Intentional errata/no code change:** 4 (`mcp>=1.0` is still not
-  needed because the coord proxy is hand-rolled JSON-RPC over stdio).
 - **Still live-only validation risks:** 29, 30, 32. These require a
   real Zeabur/Codex app-server session to validate cross-talk,
   end-to-end coord MCP behavior, and thread-resume config matching.
@@ -70,12 +68,11 @@ Second fix pass:
    `agents.run_agent` mints a per-turn coord proxy token for Codex
    turns, passes it through `turn_ctx`, and revokes it in cleanup.
 
-4. **Errata — `mcp>=1.0` dependency not added** (§I.2). completed and audited
-   Spec listed `"mcp>=1.0"` as a new runtime dep. Implementation went with
-   hand-rolled JSON-RPC over stdio in `server/coord_mcp.py`, so the package
-   is not needed. Decision worth flagging because future work that wants
-   richer MCP features (resources, prompts, sampling) will need to add
-   the dep then.
+4. **Implemented — `mcp>=1.0` coord proxy dependency** (§I.2). completed and audited
+   `server/coord_mcp.py` now uses the official MCP Python stdio server
+   transport instead of the earlier hand-rolled JSON-RPC loop. The
+   dependency is declared directly in `pyproject.toml`, and a subprocess
+   smoke test speaks MCP initialize/tools/list/tools/call to the proxy.
 
 ## Section D — Auth
 
@@ -267,6 +264,10 @@ Second fix pass:
     `got_result`, so the dispatcher emits the standard error event and
     schedules the runtime-agnostic retry. Poisoned Codex clients are
     closed so the retry starts with a fresh app-server subprocess.
+    The SDK stdio transport is patched by the harness to capture a
+    bounded `codex app-server` stderr tail, so future
+    `CodexTransportError: failed reading from stdio transport` events
+    include the child process diagnostics when available.
 
 16. **Implemented decision — AskUserQuestion path under Codex** (§E.8). completed and audited
     v1 ships option (b). Codex agents do not receive Claude's
@@ -356,12 +357,15 @@ Second fix pass:
     **Cannot be validated locally.** `_SPAWN_LOCK` already serializes
     turns per slot, satisfying this constraint defensively.
 
-30. **Risk — Coord MCP smoke under both runtimes** (§L.3). blocked — live spike
-    The proxy passes its contract test (catalog matches in-process
-    registry) but has not been exercised end-to-end with a live
-    `codex app-server` subprocess making real coord calls.
-    **Cannot be validated locally without the SDK.** Contract test
-    `test_coord_mcp_proxy.py` covers the boundary on the harness side.
+30. **Partially validated — Coord MCP smoke under Codex path** (§L.3). local smoke completed
+    The proxy now passes both the catalog/dispatcher contract tests and
+    a real stdio MCP subprocess smoke against a loopback HTTP fake. This
+    validates the MCP handshake and tool-call bridge that Codex
+    app-server consumes. Codex runtime also pins the coord MCP
+    subprocess `cwd`/`PYTHONPATH` to the harness root so the bridge is
+    importable from agent workspaces. The only remaining live validation
+    gap is a full authenticated `codex app-server` turn on Zeabur
+    actually invoking a coord_* tool.
 
 31. **Implemented — `Turn.usage` defensive extraction** (§L.4). completed and audited
     Pricing math assumes `input_tokens` / `cached_input_tokens` /
@@ -410,11 +414,9 @@ Second fix pass:
 ## Status counts
 
 - **Open app-code gaps:** 0.
-- **Implemented and locally verified:** 1, 2, 3, 5, 6, 7, 8, 9, 10,
+- **Implemented and locally verified:** 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
   11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
   27, 28, 31, 33, 34, 35.
-- **Intentional errata/no dependency change:** 4 (`mcp>=1.0` not
-  needed for the current hand-rolled coord proxy).
 - **Still live-only validation risks:** 29, 30, 32.
 
 Total: 35 numbered items. The remaining work is validation against a
@@ -427,5 +429,5 @@ The list above now partitions to:
 - **Live validation:** run a real Codex app-server session on Zeabur to
   validate items 29, 30, and 32.
 
-- **Future janitorial:** re-evaluate `mcp>=1.0` only if the coord proxy
-  grows beyond hand-rolled JSON-RPC.
+- **Future janitorial:** run the authenticated Zeabur/Codex live smoke
+  once the deployment session is available, especially coord_* tool use.

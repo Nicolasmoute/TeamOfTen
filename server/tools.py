@@ -1688,6 +1688,148 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "Continue or pause your current task as appropriate."
         )
 
+    @tool(
+        "coord_add_todo",
+        (
+            "Coach-only. Append a new entry to the project's "
+            "coach-todos.md — the finite, strikeable backlog injected "
+            "into your system prompt every turn (recurrence-specs.md "
+            "§3.1).\n"
+            "\n"
+            "Use this for items YOU need to do in future turns: a "
+            "follow-up to check, a small task too thin to assign to a "
+            "Player, an objective-driven action to advance next time. "
+            "DO NOT use it as a Player task board — that's `tasks` "
+            "via coord_create_task.\n"
+            "\n"
+            "Params:\n"
+            "- title: short imperative title (required)\n"
+            "- description: optional free markdown, can span lines\n"
+            "- due: optional 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:MMZ'"
+        ),
+        {"title": str, "description": str, "due": str},
+    )
+    async def add_todo(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err(
+                "Only Coach manages coach-todos. Players: send a "
+                "coord_send_message to coach if you want them to "
+                "queue a follow-up."
+            )
+        title = (args.get("title") or "").strip()
+        description = (args.get("description") or "").strip()
+        due = (args.get("due") or "").strip() or None
+        if not title:
+            return _err("title is required")
+        from server import coach_todos as todos_mod
+        project_id = await resolve_active_project()
+        try:
+            todo = await todos_mod.add_todo(
+                project_id, title=title,
+                description=description, due=due,
+            )
+        except ValueError as e:
+            return _err(str(e))
+        await bus.publish({
+            "ts": _now_iso(),
+            "agent_id": caller_id,
+            "type": "coach_todo_added",
+            "id": todo.id,
+            "title": todo.title,
+            "due": todo.due,
+        })
+        return _ok(
+            f"todo {todo.id} added: {todo.title}"
+            + (f" (due {todo.due})" if todo.due else "")
+        )
+
+    @tool(
+        "coord_complete_todo",
+        (
+            "Coach-only. Mark a coach-todos.md entry done. The entry "
+            "moves to working/coach-todos-archive.md (still readable "
+            "via Read but not injected into the system prompt). The "
+            "id is permanent — completed entries keep theirs.\n"
+            "\n"
+            "Params:\n"
+            "- id: the t-N identifier from coach-todos.md (required)"
+        ),
+        {"id": str},
+    )
+    async def complete_todo(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("Only Coach manages coach-todos.")
+        tid = (args.get("id") or "").strip()
+        if not tid:
+            return _err("id is required (e.g. 't-3')")
+        from server import coach_todos as todos_mod
+        project_id = await resolve_active_project()
+        try:
+            todo = await todos_mod.complete_todo(project_id, tid)
+        except KeyError as e:
+            return _err(str(e))
+        await bus.publish({
+            "ts": _now_iso(),
+            "agent_id": caller_id,
+            "type": "coach_todo_completed",
+            "id": todo.id,
+            "title": todo.title,
+        })
+        return _ok(f"todo {todo.id} completed: {todo.title}")
+
+    @tool(
+        "coord_update_todo",
+        (
+            "Coach-only. Edit a coach-todos.md entry in place. Pass "
+            "only the fields you want to change. Useful when the "
+            "scope of a planned action shifts or a deadline moves.\n"
+            "\n"
+            "Params:\n"
+            "- id: the t-N identifier (required)\n"
+            "- title: new title (optional)\n"
+            "- description: new description (optional)\n"
+            "- due: new 'YYYY-MM-DD' or empty string to clear"
+        ),
+        {"id": str, "title": str, "description": str, "due": str},
+    )
+    async def update_todo(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("Only Coach manages coach-todos.")
+        tid = (args.get("id") or "").strip()
+        if not tid:
+            return _err("id is required (e.g. 't-3')")
+        # Distinguish "field omitted" from "field passed as empty string".
+        # Pydantic-free MCP args mean we read the dict directly.
+        kwargs: dict[str, Any] = {}
+        if "title" in args:
+            kwargs["title"] = args["title"]
+        if "description" in args:
+            kwargs["description"] = args["description"]
+        if "due" in args:
+            # Empty due clears the deadline.
+            due_val = args.get("due")
+            kwargs["due"] = None if (
+                due_val is None or str(due_val).strip() == ""
+            ) else str(due_val)
+        if not kwargs:
+            return _err("pass at least one of: title, description, due")
+        from server import coach_todos as todos_mod
+        project_id = await resolve_active_project()
+        try:
+            todo = await todos_mod.update_todo(
+                project_id, tid, **kwargs,
+            )
+        except (KeyError, ValueError) as e:
+            return _err(str(e))
+        await bus.publish({
+            "ts": _now_iso(),
+            "agent_id": caller_id,
+            "type": "coach_todo_updated",
+            "id": todo.id,
+            "fields": list(kwargs.keys()),
+        })
+        return _ok(f"todo {todo.id} updated: {todo.title}")
+
     _tools = [
         list_tasks,
         create_task,
@@ -1710,6 +1852,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         answer_question,
         answer_plan,
         request_human,
+        add_todo,
+        complete_todo,
+        update_todo,
     ]
     server = create_sdk_mcp_server(name="coord", version="0.8.0", tools=_tools)
     # Stash a name → handler map so the coord_mcp proxy endpoint
@@ -1755,6 +1900,9 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_answer_question",
     "mcp__coord__coord_answer_plan",
     "mcp__coord__coord_request_human",
+    "mcp__coord__coord_add_todo",
+    "mcp__coord__coord_complete_todo",
+    "mcp__coord__coord_update_todo",
 ]
 
 MEMORY_TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")

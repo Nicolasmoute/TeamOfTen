@@ -2588,6 +2588,10 @@ Codex approval side-channel requests and asking agents to use normal
 coord/human escalation paths instead.
 `HARNESS_CODEX_ENABLED` must be truthy before the API will accept
 `runtime=codex` on a slot. See `Docs/CODEX_RUNTIME_SPEC.md`.
+Codex developer instructions include a compatibility note for this
+Claude-origin harness: Codex agents must treat `CLAUDE.md` as
+`AGENTS.md`/`agents.md`, and `.claude/` directories as `.agents/`
+directories, reading and obeying them for the applicable tree.
 
 Model selection is runtime-aware. The pane gear popover resolves the
 effective runtime from the per-slot override, then the role default, and
@@ -2610,12 +2614,17 @@ Run button disabled indefinitely.
 `POST /api/_coord/{tool_name}` and `GET /api/_coord/_tools` are
 internal-only endpoints used by the `python -m server.coord_mcp`
 stdio MCP subprocess to forward coord_* calls into the main FastAPI
-process. Loopback bind check + per-spawn bearer token (minted via
+process. The subprocess uses the official `mcp` stdio server transport
+so Codex sees a normal MCP initialize/tools/list/tools/call handshake,
+not a harness-specific JSON-RPC dialect. Loopback bind check + per-spawn bearer token (minted via
 `server.spawn_tokens.mint(caller_id)`, passed to the subprocess via
 `HARNESS_COORD_PROXY_TOKEN` env). caller_id is resolved from the
 token server-side; body's `caller_id` is a sanity check only. Codex
 runtime wires this into each turn's `ThreadConfig.config.mcp_servers`
-alongside any external MCP servers.
+as an explicit `type="stdio"` server alongside any external MCP
+servers. The coord MCP config pins both `cwd` and `PYTHONPATH` to the
+harness root so `python -m server.coord_mcp` remains importable even
+when Codex runs the agent workspace from `/workspaces/<slot>/project`.
 The in-process Claude coord server is built without proxy-only metadata
 by default. The loopback dispatcher explicitly opts into `_handlers`
 and `_tool_names`; those contain Python callables and must not be

@@ -208,7 +208,7 @@ def build_router(*, require_token, audit_actor):
     cleanly in environments where fastapi isn't installed (e.g. the
     pytest dev venv that only needs to test pure helpers).
     """
-    from fastapi import APIRouter, Depends, HTTPException
+    from fastapi import APIRouter, Body, Depends, HTTPException
 
     router = APIRouter()
 
@@ -902,6 +902,207 @@ def build_router(*, require_token, audit_actor):
             }
         )
         return {"ok": True, "project_id": project_id, "result": result}
+
+    # ---- Coach todos + project objectives (recurrence-specs.md §9) ----
+
+    async def _project_must_exist(project_id: str) -> None:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT 1 FROM projects WHERE id = ?", (project_id,)
+            )
+            if not await cur.fetchone():
+                raise HTTPException(
+                    404, detail=f"project '{project_id}' not found"
+                )
+        finally:
+            await c.close()
+
+    @router.get(
+        "/api/projects/{project_id}/coach-todos",
+        dependencies=[Depends(require_token)],
+    )
+    async def get_coach_todos(project_id: str) -> dict[str, Any]:
+        """Parsed array of OPEN coach todos for the EnvPane."""
+        from server import coach_todos as todos
+        await _project_must_exist(project_id)
+        items = todos.load_open(project_id)
+        return {
+            "project_id": project_id,
+            "todos": [
+                {
+                    "id": t.id, "title": t.title,
+                    "description": t.description, "due": t.due,
+                    "done": t.done,
+                }
+                for t in items
+            ],
+        }
+
+    @router.get(
+        "/api/projects/{project_id}/coach-todos/archive",
+        dependencies=[Depends(require_token)],
+    )
+    async def get_coach_todos_archive(project_id: str) -> dict[str, Any]:
+        from server import coach_todos as todos
+        await _project_must_exist(project_id)
+        items = todos.load_archive(project_id)
+        return {
+            "project_id": project_id,
+            "todos": [
+                {
+                    "id": t.id, "title": t.title,
+                    "description": t.description, "due": t.due,
+                    "completed": t.completed, "done": t.done,
+                }
+                for t in items
+            ],
+        }
+
+    @router.post(
+        "/api/projects/{project_id}/coach-todos",
+        dependencies=[Depends(require_token)],
+    )
+    async def add_coach_todo(
+        project_id: str,
+        body: dict[str, Any] = Body(...),
+        actor: dict = Depends(audit_actor),
+    ) -> dict[str, Any]:
+        """Human-side add — mirrors the coord_add_todo MCP tool."""
+        from server import coach_todos as todos
+        await _project_must_exist(project_id)
+        title = (body.get("title") or "").strip()
+        if not title:
+            raise HTTPException(400, detail="title is required")
+        try:
+            t = await todos.add_todo(
+                project_id,
+                title=title,
+                description=str(body.get("description") or ""),
+                due=body.get("due") or None,
+            )
+        except ValueError as e:
+            raise HTTPException(400, detail=str(e)) from e
+        await bus.publish({
+            "ts": _now_iso(),
+            "agent_id": actor.get("source", "human"),
+            "type": "coach_todo_added",
+            "id": t.id, "title": t.title, "due": t.due,
+            "actor": actor,
+        })
+        return {
+            "id": t.id, "title": t.title,
+            "description": t.description, "due": t.due,
+        }
+
+    @router.post(
+        "/api/projects/{project_id}/coach-todos/{todo_id}/complete",
+        dependencies=[Depends(require_token)],
+    )
+    async def complete_coach_todo(
+        project_id: str, todo_id: str,
+        actor: dict = Depends(audit_actor),
+    ) -> dict[str, Any]:
+        """Human-side complete — moves todo to archive (mirrors
+        coord_complete_todo)."""
+        from server import coach_todos as todos
+        await _project_must_exist(project_id)
+        try:
+            t = await todos.complete_todo(project_id, todo_id)
+        except KeyError as e:
+            raise HTTPException(404, detail=str(e)) from e
+        await bus.publish({
+            "ts": _now_iso(),
+            "agent_id": actor.get("source", "human"),
+            "type": "coach_todo_completed",
+            "id": t.id, "title": t.title, "actor": actor,
+        })
+        return {
+            "id": t.id, "title": t.title,
+            "completed": t.completed,
+        }
+
+    @router.patch(
+        "/api/projects/{project_id}/coach-todos/{todo_id}",
+        dependencies=[Depends(require_token)],
+    )
+    async def update_coach_todo(
+        project_id: str, todo_id: str,
+        body: dict[str, Any] = Body(...),
+        actor: dict = Depends(audit_actor),
+    ) -> dict[str, Any]:
+        from server import coach_todos as todos
+        await _project_must_exist(project_id)
+        kwargs: dict[str, Any] = {}
+        if "title" in body:
+            kwargs["title"] = body["title"]
+        if "description" in body:
+            kwargs["description"] = body["description"]
+        if "due" in body:
+            kwargs["due"] = body["due"] if body["due"] else None
+        if not kwargs:
+            raise HTTPException(
+                400, detail="must pass at least one of: title, description, due"
+            )
+        try:
+            t = await todos.update_todo(project_id, todo_id, **kwargs)
+        except KeyError as e:
+            raise HTTPException(404, detail=str(e)) from e
+        except ValueError as e:
+            raise HTTPException(400, detail=str(e)) from e
+        await bus.publish({
+            "ts": _now_iso(),
+            "agent_id": actor.get("source", "human"),
+            "type": "coach_todo_updated",
+            "id": t.id, "fields": list(kwargs.keys()),
+            "actor": actor,
+        })
+        return {
+            "id": t.id, "title": t.title,
+            "description": t.description, "due": t.due,
+        }
+
+    @router.get(
+        "/api/projects/{project_id}/objectives",
+        dependencies=[Depends(require_token)],
+    )
+    async def get_project_objectives(project_id: str) -> dict[str, Any]:
+        from server import coach_objectives as objs
+        await _project_must_exist(project_id)
+        return {"project_id": project_id, "text": objs.read_objectives(project_id)}
+
+    @router.put(
+        "/api/projects/{project_id}/objectives",
+        dependencies=[Depends(require_token)],
+    )
+    async def put_project_objectives(
+        project_id: str,
+        body: dict[str, Any] = Body(...),
+        actor: dict = Depends(audit_actor),
+    ) -> dict[str, Any]:
+        """Replace project-objectives.md. Empty body clears the file."""
+        from server.paths import project_paths
+        await _project_must_exist(project_id)
+        text = body.get("text")
+        if text is None:
+            raise HTTPException(400, detail="'text' field required")
+        if not isinstance(text, str):
+            raise HTTPException(400, detail="'text' must be a string")
+        if len(text) > 100_000:
+            raise HTTPException(
+                400, detail=f"text too long ({len(text)} chars, max 100000)"
+            )
+        pp = project_paths(project_id)
+        pp.project_objectives.parent.mkdir(parents=True, exist_ok=True)
+        pp.project_objectives.write_text(text, encoding="utf-8")
+        await bus.publish({
+            "ts": _now_iso(),
+            "agent_id": actor.get("source", "human"),
+            "type": "objectives_updated",
+            "project_id": project_id,
+            "actor": actor,
+        })
+        return {"ok": True, "project_id": project_id, "size": len(text)}
 
     return router
 

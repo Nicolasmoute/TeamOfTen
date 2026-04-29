@@ -18,11 +18,13 @@ sourcing.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import sys
 import time
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from server.runtimes.base import TurnContext
@@ -41,6 +43,180 @@ _codex_clients: dict[str, Any] = {}
 # lock here lets `get_client` / `close_client` be safely called from
 # health probes / shutdown handlers that don't hold the spawn lock.
 _client_locks: dict[str, asyncio.Lock] = {}
+
+
+class _CapturedStdioTransport:
+    """SDK-compatible stdio transport that keeps a stderr tail.
+
+    codex-app-server-sdk 0.3.2's bundled StdioTransport sends stderr to
+    DEVNULL. That makes app-server crashes show up as the opaque
+    "failed reading from stdio transport" error. This transport mirrors
+    the SDK behavior but pipes stderr into a bounded in-memory tail so
+    the harness error event has something actionable.
+    """
+
+    def __init__(
+        self,
+        command: list[str],
+        *,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        connect_timeout: float = 30.0,
+        transport_error_cls: type[Exception] = RuntimeError,
+        stderr_limit: int = 12000,
+    ) -> None:
+        if not command:
+            raise ValueError("stdio command must not be empty")
+        self._command = list(command)
+        self._cwd = cwd
+        self._env = dict(env) if env is not None else None
+        self._connect_timeout = connect_timeout
+        self._transport_error_cls = transport_error_cls
+        self._stderr_limit = stderr_limit
+        self._proc: asyncio.subprocess.Process | None = None
+        self._stderr_tail = ""
+        self._stderr_task: asyncio.Task[None] | None = None
+
+    async def connect(self) -> None:
+        if self._proc is not None:
+            return
+        try:
+            self._proc = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    *self._command,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=self._cwd,
+                    env=self._env,
+                ),
+                timeout=self._connect_timeout,
+            )
+        except Exception as exc:  # pragma: no cover
+            raise self._transport_error_cls(
+                f"failed to start stdio transport command: {self._command!r}"
+            ) from exc
+        if self._proc.stderr is not None:
+            self._stderr_task = asyncio.create_task(self._drain_stderr())
+
+    async def _drain_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        while True:
+            chunk = await proc.stderr.read(4096)
+            if not chunk:
+                return
+            text = chunk.decode("utf-8", errors="replace")
+            self._stderr_tail = (self._stderr_tail + text)[-self._stderr_limit:]
+
+    def _message_with_diagnostics(self, message: str) -> str:
+        bits = [message]
+        proc = self._proc
+        if proc is not None and proc.returncode is not None:
+            bits.append(f"process exit code: {proc.returncode}")
+        tail = self._stderr_tail.strip()
+        if tail:
+            bits.append("stderr tail:\n" + tail)
+        return "\n".join(bits)
+
+    def _raise_transport(self, message: str, exc: Exception | None = None) -> None:
+        raise self._transport_error_cls(
+            self._message_with_diagnostics(message)
+        ) from exc
+
+    async def send(self, payload: Mapping[str, Any]) -> None:
+        if self._proc is None or self._proc.stdin is None:
+            self._raise_transport("stdio transport is not connected")
+        line = json_dumps_compact(dict(payload)) + "\n"
+        try:
+            self._proc.stdin.write(line.encode("utf-8"))
+            await self._proc.stdin.drain()
+        except Exception as exc:
+            self._raise_transport("failed writing to stdio transport", exc)
+
+    async def recv(self) -> dict[str, Any]:
+        if self._proc is None or self._proc.stdout is None:
+            self._raise_transport("stdio transport is not connected")
+        try:
+            line = await self._proc.stdout.readline()
+        except Exception as exc:
+            self._raise_transport("failed reading from stdio transport", exc)
+        if not line:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._proc.wait(), timeout=0.05)
+            if self._stderr_task is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        asyncio.shield(self._stderr_task),
+                        timeout=0.05,
+                    )
+            self._raise_transport("stdio transport closed")
+        try:
+            import json
+
+            return json.loads(line.decode("utf-8"))
+        except Exception as exc:
+            self._raise_transport("received invalid JSON from stdio transport", exc)
+
+    async def close(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        if proc.stdin is not None:
+            with contextlib.suppress(Exception):
+                proc.stdin.close()
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        if self._stderr_task is not None:
+            try:
+                await asyncio.wait_for(self._stderr_task, timeout=0.5)
+            except asyncio.TimeoutError:
+                self._stderr_task.cancel()
+
+
+def json_dumps_compact(value: Mapping[str, Any]) -> str:
+    import json
+
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _install_captured_stdio_transport(sdk: Any) -> None:
+    """Patch the SDK's connect_stdio factory to use stderr capture."""
+    transport_error_cls = getattr(sdk, "CodexTransportError", None)
+    client_cls = getattr(sdk, "CodexClient", None)
+    module_name = getattr(client_cls, "__module__", "")
+    module = sys.modules.get(module_name)
+    if transport_error_cls is None or module is None:
+        return
+    if getattr(module, "_harness_stdio_capture_installed", False):
+        return
+
+    class _HarnessCapturedTransport(_CapturedStdioTransport):
+        def __init__(
+            self,
+            command: list[str],
+            *,
+            cwd: str | None = None,
+            env: Mapping[str, str] | None = None,
+            connect_timeout: float = 30.0,
+        ) -> None:
+            super().__init__(
+                command,
+                cwd=cwd,
+                env=env,
+                connect_timeout=connect_timeout,
+                transport_error_cls=transport_error_cls,
+            )
+
+    setattr(module, "StdioTransport", _HarnessCapturedTransport)
+    setattr(module, "_harness_stdio_capture_installed", True)
 
 
 def _slot_lock(slot: str) -> asyncio.Lock:
@@ -77,6 +253,7 @@ async def get_client(
         if env_overrides:
             env.update(env_overrides)
 
+        _install_captured_stdio_transport(sdk)
         client = sdk.CodexClient.connect_stdio(
             command=["codex", "app-server"],
             cwd=cwd,
@@ -496,10 +673,26 @@ def _coord_proxy_url() -> str:
     return f"http://127.0.0.1:{port}"
 
 
+def _harness_root() -> str:
+    return str(Path(__file__).resolve().parents[2])
+
+
+def _coord_mcp_env(tc: TurnContext) -> dict[str, str]:
+    root = _harness_root()
+    pythonpath = os.environ.get("PYTHONPATH", "").strip()
+    return {
+        "HARNESS_COORD_PROXY_TOKEN": tc.turn_ctx.get("coord_proxy_token", ""),
+        "PYTHONPATH": root if not pythonpath else os.pathsep.join([root, pythonpath]),
+    }
+
+
 def _build_mcp_servers(tc: TurnContext) -> dict[str, Any]:
     servers: dict[str, Any] = {}
+    root = _harness_root()
     servers["coord"] = {
+        "type": "stdio",
         "command": sys.executable,
+        "cwd": root,
         "args": [
             "-m",
             "server.coord_mcp",
@@ -508,9 +701,7 @@ def _build_mcp_servers(tc: TurnContext) -> dict[str, Any]:
             "--proxy-url",
             _coord_proxy_url(),
         ],
-        "env": {
-            "HARNESS_COORD_PROXY_TOKEN": tc.turn_ctx.get("coord_proxy_token", ""),
-        },
+        "env": _coord_mcp_env(tc),
     }
     for name, cfg in (tc.external_mcp_servers or {}).items():
         if name == "coord":
@@ -519,11 +710,30 @@ def _build_mcp_servers(tc: TurnContext) -> dict[str, Any]:
     return servers
 
 
+_CODEX_CLAUDE_COMPAT_INSTRUCTIONS = """## Codex compatibility note
+
+This harness predates AGENTS.md naming. When working in any repository
+or TeamOfTen project, treat every CLAUDE.md file exactly as you would
+AGENTS.md/agents.md: read it and follow it as agent instructions for
+the applicable directory tree. Treat .claude/ directories exactly as
+.agents/ directories: look there for project or agent instructions,
+skills, commands, and related metadata. Do not ignore these files or
+directories because they use Claude naming.
+"""
+
+
+def _codex_developer_instructions(system_prompt: str | None) -> str:
+    body = (system_prompt or "").strip()
+    if body:
+        return body + "\n\n" + _CODEX_CLAUDE_COMPAT_INSTRUCTIONS
+    return _CODEX_CLAUDE_COMPAT_INSTRUCTIONS
+
+
 def _build_thread_config(sdk: Any, tc: TurnContext) -> Any:
     """Build the SDK ThreadConfig while tolerating fake SDKs in tests."""
     kwargs: dict[str, Any] = {
         "cwd": tc.workspace_cwd or None,
-        "developer_instructions": tc.system_prompt or None,
+        "developer_instructions": _codex_developer_instructions(tc.system_prompt),
         "approval_policy": "never",
         "sandbox": "danger-full-access",
         "config": {"mcp_servers": _build_mcp_servers(tc)},

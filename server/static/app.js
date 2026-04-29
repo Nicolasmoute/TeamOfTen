@@ -564,9 +564,9 @@ const SLASH_COMMANDS = [
   { cmd: "/clear",   desc: "clear session so the next turn starts fresh" },
   { cmd: "/compact", desc: "summarize current session; next turn resumes with summary" },
   { cmd: "/cancel",  desc: "cancel the in-flight turn on this pane" },
-  { cmd: "/loop",   desc: "Coach autoloop: /loop 60 → tick every 60s · /loop off" },
-  { cmd: "/repeat", desc: "Coach repeat: /repeat 120 <prompt> · /repeat off" },
-  { cmd: "/tick",   desc: "nudge Coach to drain inbox right now" },
+  { cmd: "/tick",   desc: "/tick → fire now · /tick N → every N min · /tick off" },
+  { cmd: "/repeat", desc: "Coach repeat: /repeat → list · /repeat N <prompt> · /repeat rm <id>" },
+  { cmd: "/cron",   desc: "Coach cron: /cron → list · /cron <when> <prompt> · /cron rm <id>" },
   { cmd: "/status", desc: "show server runtime state (paused, running, spend)" },
   { cmd: "/spend",  desc: "per-agent spend over last 24h" },
   { cmd: "/help",   desc: "show available slash commands" },
@@ -1029,6 +1029,17 @@ function App() {
   const [envWidth, setEnvWidth] = useState(
     () => loadLayout()?.envWidth ?? 340
   );
+  // Recurrence pane (recurrence-specs.md §12). Lives alongside EnvPane;
+  // both can be open simultaneously. Persisted under its own localStorage
+  // key so the existing layout key isn't bloated for users who never
+  // touch recurrences.
+  const [recurrenceOpen, setRecurrenceOpen] = useState(() => {
+    try {
+      return localStorage.getItem("harness_recurrence_pane_v1") === "1";
+    } catch (e) { return false; }
+  });
+  const [recurrenceRows, setRecurrenceRows] = useState([]);
+  const [recurrenceError, setRecurrenceError] = useState(null);
   // Roots metadata for the file-link resolver. Loaded once on mount;
   // FilesPane reads this via prop instead of self-fetching, so a click
   // on a `[data-harness-path]` link can resolve and open the file
@@ -1386,6 +1397,38 @@ function App() {
     saveLayout({ openColumns, envOpen, envWidth, maximizedSlot });
   }, [openColumns, envOpen, envWidth, maximizedSlot]);
 
+  // Persist recurrence pane open/closed independently of harness_layout_v1
+  // (recurrence-specs.md §12.2).
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "harness_recurrence_pane_v1", recurrenceOpen ? "1" : "0",
+      );
+    } catch (e) { /* localStorage unavailable */ }
+  }, [recurrenceOpen]);
+
+  // Fetch the recurrence-row list. Called on pane-open, on every
+  // recurrence_* WS event, and when the active project changes.
+  const refreshRecurrences = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/recurrences");
+      if (!res.ok) {
+        if (res.status === 401) return; // auth modal handles it
+        throw new Error("HTTP " + res.status);
+      }
+      const data = await res.json();
+      setRecurrenceRows(Array.isArray(data) ? data : []);
+      setRecurrenceError(null);
+    } catch (e) {
+      setRecurrenceError(String(e.message || e));
+    }
+  }, []);
+
+  // Initial load + reload on pane-open + reload on project switch.
+  useEffect(() => {
+    if (recurrenceOpen) refreshRecurrences();
+  }, [recurrenceOpen, activeProjectId, refreshRecurrences]);
+
   // Keep tool-renderer name directory (slot → human name) in sync
   // so coord_send_message etc. can print "→ Gait" instead of "→ p3".
   useEffect(() => {
@@ -1492,6 +1535,21 @@ function App() {
       //   - message_sent: to_id (an agent id, 'coach', or 'broadcast')
       //   - task_assigned: to    (always a slot id)
       // Broadcasts fan to every agent id we know about.
+      // Recurrence pane live refresh (recurrence-specs.md §12.4).
+      // Any of these events means a row was added/removed/changed/
+      // fired/skipped/disabled — reload the list so timestamps and
+      // counts stay accurate.
+      if (
+        ev.type === "recurrence_added" ||
+        ev.type === "recurrence_changed" ||
+        ev.type === "recurrence_deleted" ||
+        ev.type === "recurrence_fired" ||
+        ev.type === "recurrence_skipped" ||
+        ev.type === "recurrence_disabled"
+      ) {
+        if (recurrenceOpen) refreshRecurrences();
+      }
+
       const fanoutTargets = new Set();
       fanoutTargets.add(aid);
       if (ev.type === "message_sent") {
@@ -2185,9 +2243,22 @@ function App() {
     window.addEventListener("pointerup", up);
   }, []);
 
-  const appStyle = envOpen
-    ? `grid-template-columns: 44px 1fr ${envWidth}px`
-    : undefined;
+  // 4-column grid when both envOpen and recurrenceOpen are true.
+  // Recurrence pane sits LEFT of env pane (matches spec §12.2: "opens
+  // to the right side, alongside the EnvPane"), so order is:
+  //   rail | panes | recurrence | env
+  const appStyle = (() => {
+    if (envOpen && recurrenceOpen) {
+      return `grid-template-columns: 44px 1fr 320px ${envWidth}px`;
+    }
+    if (envOpen) {
+      return `grid-template-columns: 44px 1fr ${envWidth}px`;
+    }
+    if (recurrenceOpen) {
+      return `grid-template-columns: 44px 1fr 320px`;
+    }
+    return undefined;
+  })();
 
   // Phase 4: multi-stage switch flow.
   //   1. onActivateProject(slug) → fetch /switch-preview → open
@@ -2421,6 +2492,8 @@ function App() {
         wsConnected=${wsConnected}
         envOpen=${envOpen}
         onToggleEnv=${() => setEnvOpen((v) => !v)}
+        recurrenceOpen=${recurrenceOpen}
+        onToggleRecurrence=${() => setRecurrenceOpen((v) => !v)}
         onOpenSettings=${() => setSettingsOpen(true)}
         paused=${paused}
         onTogglePause=${togglePause}
@@ -2502,6 +2575,14 @@ function App() {
                   />`}
             `}
       </main>
+      ${recurrenceOpen
+        ? html`<${RecurrencePane}
+            rows=${recurrenceRows}
+            onClose=${() => setRecurrenceOpen(false)}
+            onRefresh=${refreshRecurrences}
+            onError=${(msg) => setRecurrenceError(msg)}
+          />`
+        : null}
       ${envOpen
         ? html`<${EnvPane}
             agents=${agents}
@@ -2509,6 +2590,7 @@ function App() {
             conversations=${conversations}
             openSlots=${openSlots}
             serverStatus=${serverStatus}
+            activeProjectId=${activeProjectId}
             onCreateTask=${createHumanTask}
             onClose=${() => setEnvOpen(false)}
             onResizerDown=${onEnvResizerDown}
@@ -2958,7 +3040,7 @@ function ProjectSwitchBusyModal({ busy, onDismiss, onRetry }) {
   `;
 }
 
-function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, activeProjectId, switchingProject, onActivateProject, onCreateProject, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, onOpenSettings, paused, onTogglePause, onLayoutPreset, onCancelAll }) {
+function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, activeProjectId, switchingProject, onActivateProject, onCreateProject, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, recurrenceOpen, onToggleRecurrence, onOpenSettings, paused, onTogglePause, onLayoutPreset, onCancelAll }) {
   const workingCount = agents.filter((a) => a.status === "working").length;
   const grouped = useMemo(() => {
     const coach = agents.find((a) => a.kind === "coach");
@@ -3125,6 +3207,20 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
           >${paused ? "▶" : "❚❚"}</button>
         </div>
         <div class="rail-group rail-env">
+          <button
+            class=${"gear recurrence-toggle" + (recurrenceOpen ? " active" : "")}
+            title=${recurrenceOpen ? "Close recurrence panel" : "Open recurrence panel — Coach tick / repeats / crons"}
+            onClick=${onToggleRecurrence}
+          >
+            <span class="recurrence-icon" aria-hidden="true">${html`
+              <svg viewBox="0 0 24 24">
+                <path d="M20 8 A 9 9 0 0 0 4 11" />
+                <polyline points="20 3 20 8 15 8" />
+                <path d="M4 16 A 9 9 0 0 0 20 13" />
+                <polyline points="4 21 4 16 9 16" />
+              </svg>
+            `}</span>
+          </button>
           <button
             class=${"gear env-toggle" + (envOpen ? " active" : "")}
             title=${(envOpen ? "Collapse environment panel" : "Open environment panel") + " (⌘/Ctrl+B)"}
@@ -5416,10 +5512,343 @@ function SettingsDrawer({ onClose, serverStatus }) {
 }
 
 // ------------------------------------------------------------------
+// recurrence pane (right side): coach tick / repeats / crons
+// (recurrence-specs.md §12)
+// ------------------------------------------------------------------
+
+function _formatRelative(iso) {
+  if (!iso) return "—";
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return "—";
+  const delta = Math.round((ts - Date.now()) / 1000);
+  const abs = Math.abs(delta);
+  let label;
+  if (abs < 60) label = `${abs}s`;
+  else if (abs < 3600) label = `${Math.round(abs / 60)} min`;
+  else if (abs < 86400) label = `${Math.round(abs / 3600)} h`;
+  else label = `${Math.round(abs / 86400)} d`;
+  return delta >= 0 ? `in ${label}` : `${label} ago`;
+}
+
+function _tickRow(rows) {
+  return rows.find((r) => r.kind === "tick") || null;
+}
+
+function _filterKind(rows, kind) {
+  return rows.filter((r) => r.kind === kind);
+}
+
+function RecurrencePane({ rows, onClose, onRefresh, onError }) {
+  const [tickInput, setTickInput] = useState("");
+  const [newRepeat, setNewRepeat] = useState({ cadence: "", prompt: "" });
+  const [newCron, setNewCron] = useState({ cadence: "", prompt: "" });
+  // Per-row pending edits — { [id]: { cadence?, prompt? } }. Lives in
+  // pane state so a re-render driven by a WS refresh doesn't blow away
+  // in-progress typing. Cleared on save / discard.
+  const [edits, setEdits] = useState({});
+  const [busy, setBusy] = useState(false);
+
+  function patchEdit(id, field, value) {
+    setEdits((e) => ({
+      ...e,
+      [id]: { ...(e[id] || {}), [field]: value },
+    }));
+  }
+
+  function clearEdit(id) {
+    setEdits((e) => {
+      const next = { ...e };
+      delete next[id];
+      return next;
+    });
+  }
+
+  function hasEdits(id) {
+    return edits[id] && Object.keys(edits[id]).length > 0;
+  }
+
+  function effective(row, field) {
+    if (edits[row.id] && field in edits[row.id]) return edits[row.id][field];
+    return row[field] || "";
+  }
+  const tick = _tickRow(rows);
+  const repeats = _filterKind(rows, "repeat");
+  const crons = _filterKind(rows, "cron");
+
+  const tz = (Intl.DateTimeFormat().resolvedOptions().timeZone) || "UTC";
+
+  async function _http(url, opts) {
+    setBusy(true);
+    try {
+      const res = await authFetch(url, opts);
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status}${body ? ": " + body.slice(0, 120) : ""}`);
+      }
+      const data = await res.json().catch(() => ({}));
+      onRefresh && onRefresh();
+      return data;
+    } catch (e) {
+      onError && onError(String(e.message || e));
+      throw e;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function applyTick(minutes) {
+    return _http("/api/coach/tick", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ minutes }),
+    });
+  }
+
+  function disableTick() {
+    return _http("/api/coach/tick", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: false }),
+    });
+  }
+
+  function fireNow() {
+    return _http("/api/coach/tick", { method: "POST" });
+  }
+
+  function addRepeat() {
+    const minutes = parseInt(newRepeat.cadence, 10);
+    const prompt = (newRepeat.prompt || "").trim();
+    if (!minutes || minutes < 1 || !prompt) return;
+    return _http("/api/recurrences", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        kind: "repeat", cadence: String(minutes), prompt,
+      }),
+    }).then(() => setNewRepeat({ cadence: "", prompt: "" }));
+  }
+
+  function addCron() {
+    const cadence = (newCron.cadence || "").trim();
+    const prompt = (newCron.prompt || "").trim();
+    if (!cadence || !prompt) return;
+    return _http("/api/recurrences", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        kind: "cron", cadence, prompt, tz,
+      }),
+    }).then(() => setNewCron({ cadence: "", prompt: "" }));
+  }
+
+  function deleteRow(id) {
+    return _http(`/api/recurrences/${id}`, { method: "DELETE" });
+  }
+
+  function toggleRow(row) {
+    return _http(`/api/recurrences/${row.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: !row.enabled }),
+    });
+  }
+
+  function saveRow(row) {
+    const e = edits[row.id] || {};
+    const body = {};
+    if ("cadence" in e) body.cadence = e.cadence;
+    if ("prompt" in e) body.prompt = e.prompt;
+    if (Object.keys(body).length === 0) return;
+    return _http(`/api/recurrences/${row.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(() => clearEdit(row.id));
+  }
+
+  return html`
+    <aside class="rec-pane">
+      <div class="rec-head">
+        <span class="rec-title">Recurrences</span>
+        <button class="rec-close" title="Close" onClick=${onClose}>×</button>
+      </div>
+      <div class="rec-body">
+        <section class="rec-section">
+          <h3 class="rec-section-title">Tick</h3>
+          ${tick
+            ? html`
+                <div class="rec-card">
+                  <div class="rec-card-row">
+                    <span class="rec-status-dot ${tick.enabled ? "on" : "off"}"></span>
+                    <span>every <strong>${tick.cadence}</strong> min</span>
+                  </div>
+                  <div class="rec-card-meta">
+                    <span title=${tick.next_fire_at || ""}>next: ${_formatRelative(tick.next_fire_at)}</span>
+                    <span title=${tick.last_fired_at || ""}>last: ${_formatRelative(tick.last_fired_at)}</span>
+                  </div>
+                  <div class="rec-actions">
+                    <button onClick=${fireNow} disabled=${busy}>fire now</button>
+                    ${tick.enabled
+                      ? html`<button class="rec-delete" onClick=${disableTick} disabled=${busy}>disable</button>`
+                      : html`<button onClick=${() => applyTick(parseInt(tick.cadence, 10) || 60)} disabled=${busy}>enable</button>`}
+                  </div>
+                </div>`
+            : html`<div class="rec-empty">No tick yet — set one below.</div>`}
+          <div class="rec-card-row" style="margin-top:8px">
+            <label>minutes</label>
+            <input
+              type="number"
+              min="1"
+              placeholder="60"
+              value=${tickInput}
+              onInput=${(e) => setTickInput(e.target.value)}
+            />
+          </div>
+          <div class="rec-actions">
+            <button
+              disabled=${busy || !parseInt(tickInput, 10)}
+              onClick=${() => {
+                const n = parseInt(tickInput, 10);
+                if (n > 0) {
+                  applyTick(n).then(() => setTickInput(""));
+                }
+              }}
+            >${tick ? "update" : "create"}</button>
+          </div>
+        </section>
+
+        <section class="rec-section">
+          <h3 class="rec-section-title">Repeats <span style="margin-left:auto;font-weight:400">${repeats.length}</span></h3>
+          ${repeats.length === 0
+            ? html`<div class="rec-empty">No repeats.</div>`
+            : repeats.map((r) => html`
+                <div class="rec-card" key=${r.id}>
+                  <div class="rec-card-row">
+                    <span class="rec-status-dot ${r.enabled ? "on" : "off"}"></span>
+                    <span>#${r.id}</span>
+                  </div>
+                  <div class="rec-card-row">
+                    <label>minutes</label>
+                    <input
+                      type="number"
+                      min="1"
+                      value=${effective(r, "cadence")}
+                      onInput=${(e) => patchEdit(r.id, "cadence", e.target.value)}
+                    />
+                  </div>
+                  <div class="rec-card-row">
+                    <label>prompt</label>
+                    <textarea
+                      onInput=${(e) => patchEdit(r.id, "prompt", e.target.value)}
+                    >${effective(r, "prompt")}</textarea>
+                  </div>
+                  <div class="rec-card-meta">
+                    <span title=${r.next_fire_at || ""}>next: ${_formatRelative(r.next_fire_at)}</span>
+                    <span title=${r.last_fired_at || ""}>last: ${_formatRelative(r.last_fired_at)}</span>
+                  </div>
+                  <div class="rec-actions">
+                    ${hasEdits(r.id)
+                      ? html`<button onClick=${() => saveRow(r)} disabled=${busy}>save</button>
+                            <button onClick=${() => clearEdit(r.id)} disabled=${busy}>discard</button>`
+                      : html`<button onClick=${() => toggleRow(r)} disabled=${busy}>${r.enabled ? "disable" : "enable"}</button>
+                            <button class="rec-delete" onClick=${() => deleteRow(r.id)} disabled=${busy}>delete</button>`}
+                  </div>
+                </div>`)}
+          <div class="rec-card" style="margin-top:8px">
+            <div class="rec-card-row">
+              <label>minutes</label>
+              <input
+                type="number"
+                min="1"
+                placeholder="30"
+                value=${newRepeat.cadence}
+                onInput=${(e) => setNewRepeat({ ...newRepeat, cadence: e.target.value })}
+              />
+            </div>
+            <div class="rec-card-row">
+              <label>prompt</label>
+              <textarea
+                placeholder="summarize new commits"
+                value=${newRepeat.prompt}
+                onInput=${(e) => setNewRepeat({ ...newRepeat, prompt: e.target.value })}
+              ></textarea>
+            </div>
+            <button class="rec-add-btn" onClick=${addRepeat} disabled=${busy}>+ add repeat</button>
+          </div>
+        </section>
+
+        <section class="rec-section">
+          <h3 class="rec-section-title">Crons <span style="margin-left:auto;font-weight:400">${crons.length}</span></h3>
+          ${crons.length === 0
+            ? html`<div class="rec-empty">No crons.</div>`
+            : crons.map((r) => html`
+                <div class="rec-card" key=${r.id}>
+                  <div class="rec-card-row">
+                    <span class="rec-status-dot ${r.enabled ? "on" : "off"}"></span>
+                    <span>#${r.id}</span>
+                  </div>
+                  <div class="rec-card-row">
+                    <label>schedule</label>
+                    <input
+                      type="text"
+                      value=${effective(r, "cadence")}
+                      onInput=${(e) => patchEdit(r.id, "cadence", e.target.value)}
+                    />
+                  </div>
+                  <div class="rec-card-row">
+                    <label>prompt</label>
+                    <textarea
+                      onInput=${(e) => patchEdit(r.id, "prompt", e.target.value)}
+                    >${effective(r, "prompt")}</textarea>
+                  </div>
+                  <div class="rec-card-meta">
+                    <span>tz: ${r.tz || "UTC"}</span>
+                    <span title=${r.next_fire_at || ""}>next: ${_formatRelative(r.next_fire_at)}</span>
+                    <span title=${r.last_fired_at || ""}>last: ${_formatRelative(r.last_fired_at)}</span>
+                  </div>
+                  <div class="rec-actions">
+                    ${hasEdits(r.id)
+                      ? html`<button onClick=${() => saveRow(r)} disabled=${busy}>save</button>
+                            <button onClick=${() => clearEdit(r.id)} disabled=${busy}>discard</button>`
+                      : html`<button onClick=${() => toggleRow(r)} disabled=${busy}>${r.enabled ? "disable" : "enable"}</button>
+                            <button class="rec-delete" onClick=${() => deleteRow(r.id)} disabled=${busy}>delete</button>`}
+                  </div>
+                </div>`)}
+          <div class="rec-card" style="margin-top:8px">
+            <div class="rec-card-row">
+              <label>schedule</label>
+              <input
+                type="text"
+                placeholder="daily 09:00"
+                value=${newCron.cadence}
+                onInput=${(e) => setNewCron({ ...newCron, cadence: e.target.value })}
+              />
+            </div>
+            <div class="rec-card-row">
+              <label>prompt</label>
+              <textarea
+                placeholder="morning summary"
+                value=${newCron.prompt}
+                onInput=${(e) => setNewCron({ ...newCron, prompt: e.target.value })}
+              ></textarea>
+            </div>
+            <div class="rec-card-meta">
+              <span>tz: ${tz}</span>
+            </div>
+            <button class="rec-add-btn" onClick=${addCron} disabled=${busy}>+ add cron</button>
+          </div>
+        </section>
+      </div>
+    </aside>
+  `;
+}
+
+// ------------------------------------------------------------------
 // environment pane (right side): tasks + cost + timeline
 // ------------------------------------------------------------------
 
-function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, onCreateTask, onClose, onResizerDown }) {
+function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, activeProjectId, onCreateTask, onClose, onResizerDown }) {
   const [exporting, setExporting] = useState(false);
 
   const exportTeam = useCallback(async () => {
@@ -5501,6 +5930,14 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, onCrea
         <${EnvKDriveStatusSection} conversations=${conversations} />
         <${EnvTasksSection} tasks=${tasks} onCreate=${onCreateTask} />
         <${EnvCostSection} agents=${agents} serverStatus=${serverStatus} />
+        <${EnvObjectivesSection}
+          conversations=${conversations}
+          activeProjectId=${activeProjectId}
+        />
+        <${EnvCoachTodosSection}
+          conversations=${conversations}
+          activeProjectId=${activeProjectId}
+        />
         <${EnvInboxSection} conversations=${conversations} />
         <${EnvMemorySection} conversations=${conversations} />
         <${EnvDecisionsSection} conversations=${conversations} />
@@ -6273,6 +6710,320 @@ function EnvKDriveStatusSection({ conversations }) {
       <div class="env-kdrive-hint">
         Files left local-only; next push cycle will retry. Check kDrive auth or disk space if this persists.
       </div>
+    </section>
+  `;
+}
+
+// Project objectives — multiline editor + Save (recurrence-specs.md
+// §12.3). Reads/writes the per-project project-objectives.md via the
+// HTTP shim. Refreshes on `objectives_updated` events.
+function EnvObjectivesSection({ conversations, activeProjectId }) {
+  const [text, setText] = useState("");
+  const [pending, setPending] = useState(null); // null = no edit in flight
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const load = useCallback(async () => {
+    if (!activeProjectId) return;
+    try {
+      const res = await authFetch(
+        `/api/projects/${encodeURIComponent(activeProjectId)}/objectives`
+      );
+      if (!res.ok) return;
+      const data = await res.json();
+      setText(data.text || "");
+      setPending(null);
+    } catch (e) {
+      console.error("loadObjectives failed", e);
+    }
+  }, [activeProjectId]);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Refresh on `objectives_updated` from any agent.
+  const eventCount = useMemo(() => {
+    let n = 0;
+    for (const list of conversations.values()) {
+      for (const ev of list) if (ev.type === "objectives_updated") n++;
+    }
+    return n;
+  }, [conversations]);
+  useEffect(() => {
+    if (eventCount > 0) load();
+  }, [eventCount, load]);
+
+  const save = useCallback(async () => {
+    if (pending == null || !activeProjectId) return;
+    setSaving(true);
+    setError("");
+    try {
+      const res = await authFetch(
+        `/api/projects/${encodeURIComponent(activeProjectId)}/objectives`,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ text: pending }),
+        }
+      );
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        setError(`HTTP ${res.status}${txt ? ": " + txt.slice(0, 120) : ""}`);
+        return;
+      }
+      setText(pending);
+      setPending(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  }, [pending, activeProjectId]);
+
+  const dirty = pending != null && pending !== text;
+
+  return html`
+    <section class="env-section">
+      <h3 class="env-section-title">
+        Objectives
+      </h3>
+      <textarea
+        class="env-msg-composer-body"
+        placeholder="What is this project trying to accomplish? Free markdown."
+        value=${pending != null ? pending : text}
+        onInput=${(e) => setPending(e.target.value)}
+        rows="6"
+      ></textarea>
+      ${error ? html`<div class="rec-error">${error}</div>` : null}
+      <div class="rec-actions">
+        ${dirty
+          ? html`
+              <button onClick=${save} disabled=${saving || !activeProjectId}>
+                ${saving ? "saving…" : "save"}
+              </button>
+              <button onClick=${() => setPending(null)} disabled=${saving}>
+                discard
+              </button>`
+          : null}
+      </div>
+    </section>
+  `;
+}
+
+// Coach todos — checkbox list of OPEN todos with click-to-expand
+// description, strikethrough on complete, "+ add" form, link to
+// archive (recurrence-specs.md §12.3). Refresh on coach_todo_*
+// events from any agent.
+function EnvCoachTodosSection({ conversations, activeProjectId }) {
+  const [todos, setTodos] = useState([]);
+  const [archive, setArchive] = useState([]);
+  const [openId, setOpenId] = useState(null);
+  const [composing, setComposing] = useState(false);
+  const [showArchive, setShowArchive] = useState(false);
+  const [newTitle, setNewTitle] = useState("");
+  const [newDue, setNewDue] = useState("");
+  const [newDesc, setNewDesc] = useState("");
+  const [busyIds, setBusyIds] = useState(new Set());
+  const [error, setError] = useState("");
+
+  const load = useCallback(async () => {
+    if (!activeProjectId) return;
+    try {
+      const res = await authFetch(
+        `/api/projects/${encodeURIComponent(activeProjectId)}/coach-todos`
+      );
+      if (res.ok) {
+        const data = await res.json();
+        setTodos(data.todos || []);
+      }
+    } catch (e) {
+      console.error("loadTodos failed", e);
+    }
+  }, [activeProjectId]);
+
+  const loadArchive = useCallback(async () => {
+    if (!activeProjectId) return;
+    try {
+      const res = await authFetch(
+        `/api/projects/${encodeURIComponent(activeProjectId)}/coach-todos/archive`
+      );
+      if (res.ok) {
+        const data = await res.json();
+        setArchive(data.todos || []);
+      }
+    } catch (e) {
+      console.error("loadArchive failed", e);
+    }
+  }, [activeProjectId]);
+
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    if (showArchive) loadArchive();
+  }, [showArchive, loadArchive]);
+
+  const eventCount = useMemo(() => {
+    let n = 0;
+    for (const list of conversations.values()) {
+      for (const ev of list) {
+        if (
+          ev.type === "coach_todo_added" ||
+          ev.type === "coach_todo_completed" ||
+          ev.type === "coach_todo_updated"
+        ) n++;
+      }
+    }
+    return n;
+  }, [conversations]);
+  useEffect(() => {
+    if (eventCount > 0) {
+      load();
+      if (showArchive) loadArchive();
+    }
+  }, [eventCount, load, loadArchive, showArchive]);
+
+  function markBusy(id, on) {
+    setBusyIds((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(id); else next.delete(id);
+      return next;
+    });
+  }
+
+  const complete = useCallback(async (id) => {
+    if (!activeProjectId) return;
+    markBusy(id, true);
+    setError("");
+    try {
+      const res = await authFetch(
+        `/api/projects/${encodeURIComponent(activeProjectId)}/coach-todos/${encodeURIComponent(id)}/complete`,
+        { method: "POST" }
+      );
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        setError(`HTTP ${res.status}${txt ? ": " + txt.slice(0, 120) : ""}`);
+      } else {
+        load();
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      markBusy(id, false);
+    }
+  }, [activeProjectId, load]);
+
+  const addNew = useCallback(async () => {
+    const title = newTitle.trim();
+    if (!title || !activeProjectId) return;
+    setError("");
+    try {
+      const res = await authFetch(
+        `/api/projects/${encodeURIComponent(activeProjectId)}/coach-todos`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            title,
+            description: newDesc,
+            due: newDue.trim() || null,
+          }),
+        }
+      );
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        setError(`HTTP ${res.status}${txt ? ": " + txt.slice(0, 120) : ""}`);
+        return;
+      }
+      setNewTitle("");
+      setNewDue("");
+      setNewDesc("");
+      setComposing(false);
+      load();
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [newTitle, newDue, newDesc, activeProjectId, load]);
+
+  return html`
+    <section class="env-section">
+      <h3 class="env-section-title">
+        Coach todos <span class="env-count">${todos.length}</span>
+        <button
+          class="env-attention-dismiss-all"
+          style="margin-left: auto; border-color: var(--accent); color: var(--accent);"
+          onClick=${() => (composing ? setComposing(false) : setComposing(true))}
+        >${composing ? "cancel" : "+ add"}</button>
+      </h3>
+      ${composing
+        ? html`<div class="env-msg-composer">
+            <input
+              type="text"
+              class="env-msg-composer-subject"
+              placeholder="title"
+              value=${newTitle}
+              onInput=${(e) => setNewTitle(e.target.value)}
+            />
+            <input
+              type="text"
+              class="env-msg-composer-subject"
+              placeholder="due (optional, YYYY-MM-DD)"
+              value=${newDue}
+              onInput=${(e) => setNewDue(e.target.value)}
+            />
+            <textarea
+              class="env-msg-composer-body"
+              placeholder="description (optional)"
+              value=${newDesc}
+              onInput=${(e) => setNewDesc(e.target.value)}
+              rows="3"
+            ></textarea>
+            <div class="rec-actions">
+              <button onClick=${addNew} disabled=${!newTitle.trim()}>save</button>
+            </div>
+          </div>`
+        : null}
+      ${error ? html`<div class="rec-error">${error}</div>` : null}
+      ${todos.length === 0
+        ? html`<div class="env-empty">No open todos.</div>`
+        : todos.map((t) => html`
+            <div
+              class="env-todo-row"
+              key=${t.id}
+              style="display:flex;align-items:flex-start;gap:6px;padding:4px 0;border-bottom:1px solid var(--border);font-size:12px"
+            >
+              <input
+                type="checkbox"
+                onChange=${() => complete(t.id)}
+                disabled=${busyIds.has(t.id)}
+                style="margin-top:3px"
+              />
+              <div style="flex:1;min-width:0">
+                <div
+                  onClick=${() => setOpenId(openId === t.id ? null : t.id)}
+                  style="cursor:pointer"
+                >
+                  <strong>${t.title}</strong>
+                  ${t.due ? html`<span class="env-cost-hint" style="margin-left:6px">due ${t.due}</span>` : null}
+                </div>
+                ${openId === t.id && t.description
+                  ? html`<div style="margin-top:4px;color:var(--muted);white-space:pre-wrap">${t.description}</div>`
+                  : null}
+              </div>
+            </div>`)}
+      <div class="rec-actions">
+        <button onClick=${() => setShowArchive((v) => !v)}>
+          ${showArchive ? "hide archive" : `show archive (${archive.length || "…"})`}
+        </button>
+      </div>
+      ${showArchive
+        ? html`<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:11px;color:var(--muted)">
+            ${archive.length === 0
+              ? html`<div class="env-empty">No archived todos.</div>`
+              : archive.map((t) => html`
+                  <div key=${t.id} style="padding:2px 0;text-decoration:line-through">
+                    ${t.title}
+                    ${t.completed ? html`<span style="margin-left:6px">${t.completed.slice(0, 16)}</span>` : null}
+                  </div>`)}
+          </div>`
+        : null}
     </section>
   `;
 }
@@ -8403,122 +9154,231 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
         return true;
       }
       case "/loop": {
-        // Toggle / set Coach's autoloop interval at runtime.
-        //   /loop            → report current state
-        //   /loop 60         → tick every 60 seconds
-        //   /loop 0 | off    → disable
-        let target = null;
-        const a = arg.trim().toLowerCase();
-        if (!a) {
-          authFetch("/api/coach/loop")
-            .then((r) => r.json())
-            .then((d) => {
-              setInfoText(
-                d.interval_seconds
-                  ? `Coach autoloop: every ${d.interval_seconds}s. '/loop off' to stop.`
-                  : "Coach autoloop: OFF. '/loop 60' to start a 60s tick."
-              );
-            })
-            .catch((e) => setInfoText("loop query failed: " + String(e)));
-          return true;
-        }
-        if (a === "off" || a === "0" || a === "stop") target = 0;
-        else target = parseInt(a, 10);
-        if (target == null || isNaN(target) || target < 0) {
-          setInfoText("usage: /loop [seconds | off]");
-          return true;
-        }
-        authFetch("/api/coach/loop", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ interval_seconds: target }),
-        })
-          .then(() => {
-            // For start (target > 0) the persistent LOOP row shows the
-            // cadence + countdown. For off, give a one-line confirm
-            // since the row disappears.
-            if (target === 0) setInfoText("Coach autoloop stopped.");
-          })
-          .catch((e) => setInfoText("loop set failed: " + String(e)));
+        // Renamed in recurrence v2 (Docs/recurrence-specs.md §8). The
+        // wording matches the spec verbatim so muscle memory of the
+        // old command lands on the canonical replacement.
+        setInfoText(
+          "/loop was renamed /tick. Use /tick N for recurring, " +
+          "/tick for one-off, /tick off to disable."
+        );
         return true;
       }
       case "/repeat": {
-        // Coach-only independent repeat loop with custom prompt.
-        //   /repeat                  → show current state
-        //   /repeat 120 <prompt...>  → fire <prompt> every 120s
-        //   /repeat off              → disable
+        // Coach repeats — fixed-interval (minutes) recurring prompts.
+        //   /repeat                       → list active repeats
+        //   /repeat <minutes> <prompt...> → add a repeat
+        //   /repeat rm <id>               → delete a repeat
         if (slot !== "coach") {
           setInfoText("/repeat is Coach-only.");
           return true;
         }
         const raw = arg.trim();
         if (!raw) {
-          authFetch("/api/coach/repeat")
-            .then(async (r) => {
-              if (!r.ok) {
-                const body = await r.text().catch(() => "");
-                throw new Error(`HTTP ${r.status}${body ? " — " + body.slice(0, 80) : ""}`);
+          authFetch("/api/recurrences")
+            .then((r) => r.json())
+            .then((rows) => {
+              const repeats = (rows || []).filter((r) => r.kind === "repeat");
+              if (repeats.length === 0) {
+                setInfoText(
+                  "No active repeats. " +
+                  "'/repeat <minutes> <prompt>' to add one."
+                );
+                return;
               }
-              return r.json();
-            })
-            .then((d) => {
-              setInfoText(
-                d.interval_seconds && d.prompt
-                  ? `Coach repeat: every ${d.interval_seconds}s — ${d.prompt}`
-                  : "Coach repeat: OFF. '/repeat 120 <prompt>' to start."
+              const lines = repeats.map((r) =>
+                `${String(r.id).padStart(3)}  ${r.enabled ? "on " : "off"}  ` +
+                `${String(r.cadence).padStart(4)}m  ${(r.prompt || "").slice(0, 60)}`
               );
+              setInfoText("Active repeats:\n" + lines.join("\n"));
             })
-            .catch((e) => setInfoText("repeat query failed: " + String(e.message || e)));
+            .catch((e) => setInfoText("repeat query failed: " + String(e)));
           return true;
         }
-        const first = raw.split(/\s+/, 1)[0].toLowerCase();
-        if (first === "off" || first === "0" || first === "stop") {
-          authFetch("/api/coach/repeat", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ interval_seconds: 0, prompt: null }),
-          })
-            .then(() => setInfoText("Coach repeat stopped."))
-            .catch((e) => setInfoText("repeat off failed: " + String(e)));
+        const rmMatch = raw.match(/^rm\s+(\d+)$/);
+        if (rmMatch) {
+          const id = parseInt(rmMatch[1], 10);
+          authFetch(`/api/recurrences/${id}`, { method: "DELETE" })
+            .then(async (r) => {
+              if (r.ok) setInfoText(`Repeat ${id} deleted.`);
+              else if (r.status === 404) setInfoText(`No repeat ${id}.`);
+              else throw new Error(`HTTP ${r.status}`);
+            })
+            .catch((e) => setInfoText("repeat rm failed: " + String(e)));
           return true;
         }
         const m = raw.match(/^(\d+)\s+([\s\S]+)$/);
         if (!m) {
-          setInfoText("usage: /repeat <seconds> <prompt...>  or  /repeat off");
+          setInfoText(
+            "usage: /repeat <minutes> <prompt...>  ·  " +
+            "/repeat rm <id>  ·  /repeat (list)"
+          );
           return true;
         }
-        const secs = parseInt(m[1], 10);
+        const minutes = parseInt(m[1], 10);
         const prompt = m[2].trim();
-        if (!secs || secs < 1 || !prompt) {
-          setInfoText("usage: /repeat <seconds> <prompt...>  or  /repeat off");
+        if (!minutes || minutes < 1 || !prompt) {
+          setInfoText("usage: /repeat <minutes> <prompt...>");
           return true;
         }
-        authFetch("/api/coach/repeat", {
+        authFetch("/api/recurrences", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ interval_seconds: secs, prompt }),
+          body: JSON.stringify({
+            kind: "repeat", cadence: String(minutes), prompt,
+          }),
         })
-          .then((r) => {
-            if (!r.ok) throw new Error("HTTP " + r.status);
-            // Silent success — the persistent REPEAT row above the
-            // input already shows cadence + countdown + prompt.
+          .then(async (r) => {
+            if (!r.ok) {
+              const body = await r.text().catch(() => "");
+              throw new Error(`HTTP ${r.status}${body ? " — " + body.slice(0, 80) : ""}`);
+            }
+            return r.json();
           })
-          .catch((e) => setInfoText("repeat set failed: " + String(e)));
+          .then((row) => setInfoText(
+            `Repeat ${row.id} added: every ${row.cadence}m — ${(row.prompt || "").slice(0, 60)}`
+          ))
+          .catch((e) => setInfoText("repeat add failed: " + String(e.message || e)));
         return true;
       }
-      case "/tick":
-        // Fire a Coach tick right now without waiting for the autoloop
-        // (which may be off or on a long interval). 409 means Coach is
-        // already working; the server will just keep doing what it's
-        // doing.
-        authFetch("/api/coach/tick", { method: "POST" })
-          .then((r) => {
-            if (r.ok) setInfoText("Coach ticked. Watch their pane.");
-            else if (r.status === 409) setInfoText("Coach is already working.");
-            else setInfoText("tick failed: HTTP " + r.status);
+      case "/cron": {
+        // Coach cron — friendly DSL recurrences (daily, weekdays, etc).
+        //   /cron                      → list
+        //   /cron <when> <prompt...>   → add (DSL per recurrence-specs.md §5)
+        //   /cron rm <id>              → delete
+        if (slot !== "coach") {
+          setInfoText("/cron is Coach-only.");
+          return true;
+        }
+        const raw = arg.trim();
+        if (!raw) {
+          authFetch("/api/recurrences")
+            .then((r) => r.json())
+            .then((rows) => {
+              const crons = (rows || []).filter((r) => r.kind === "cron");
+              if (crons.length === 0) {
+                setInfoText(
+                  "No active crons. " +
+                  "'/cron <when> <prompt>' to add one. " +
+                  "Examples: 'daily 09:00', 'weekdays 18:00', 'mon,thu 14:00'."
+                );
+                return;
+              }
+              const lines = crons.map((r) =>
+                `${String(r.id).padStart(3)}  ${r.enabled ? "on " : "off"}  ` +
+                `[${r.tz || "UTC"}] ${r.cadence}  ${(r.prompt || "").slice(0, 50)}`
+              );
+              setInfoText("Active crons:\n" + lines.join("\n"));
+            })
+            .catch((e) => setInfoText("cron query failed: " + String(e)));
+          return true;
+        }
+        const rmMatch = raw.match(/^rm\s+(\d+)$/);
+        if (rmMatch) {
+          const id = parseInt(rmMatch[1], 10);
+          authFetch(`/api/recurrences/${id}`, { method: "DELETE" })
+            .then(async (r) => {
+              if (r.ok) setInfoText(`Cron ${id} deleted.`);
+              else if (r.status === 404) setInfoText(`No cron ${id}.`);
+              else throw new Error(`HTTP ${r.status}`);
+            })
+            .catch((e) => setInfoText("cron rm failed: " + String(e)));
+          return true;
+        }
+        // Parse "daily HH:MM <prompt>", "weekdays HH:MM <prompt>",
+        // "mon,thu HH:MM <prompt>", "weekly DAY HH:MM <prompt>",
+        // "monthly DOM HH:MM <prompt>", "YYYY-MM-DD HH:MM <prompt>".
+        // The cadence DSL is everything up to the second whitespace
+        // *after* the time token, except for `weekly` and `monthly`
+        // which spend an extra token before the time. Cleanest split:
+        // find the HH:MM token, take everything before it inclusive
+        // as the schedule, the rest as the prompt.
+        const timeMatch = raw.match(/\b\d{1,2}:\d{2}\b/);
+        if (!timeMatch) {
+          setInfoText(
+            "usage: /cron <when> <prompt...> — when must include " +
+            "an HH:MM time. e.g. /cron daily 09:00 morning summary"
+          );
+          return true;
+        }
+        const timeEnd = timeMatch.index + timeMatch[0].length;
+        const cadence = raw.slice(0, timeEnd).trim();
+        const prompt = raw.slice(timeEnd).trim();
+        if (!cadence || !prompt) {
+          setInfoText(
+            "usage: /cron <when> <prompt...>  ·  " +
+            "/cron rm <id>  ·  /cron (list)"
+          );
+          return true;
+        }
+        const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+        authFetch("/api/recurrences", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            kind: "cron", cadence, prompt, tz,
+          }),
+        })
+          .then(async (r) => {
+            if (!r.ok) {
+              const body = await r.text().catch(() => "");
+              throw new Error(`HTTP ${r.status}${body ? " — " + body.slice(0, 100) : ""}`);
+            }
+            return r.json();
           })
-          .catch((e) => setInfoText("tick failed: " + String(e)));
+          .then((row) => setInfoText(
+            `Cron ${row.id} added: ${row.cadence} [${row.tz}] — ${(row.prompt || "").slice(0, 60)}`
+          ))
+          .catch((e) => setInfoText("cron add failed: " + String(e.message || e)));
         return true;
+      }
+      case "/tick": {
+        // /tick           → fire one tick now
+        // /tick N         → set recurring tick to every N minutes
+        // /tick off       → disable recurring tick
+        const a = arg.trim().toLowerCase();
+        if (!a) {
+          authFetch("/api/coach/tick", { method: "POST" })
+            .then((r) => {
+              if (r.ok) setInfoText("Coach ticked. Watch their pane.");
+              else if (r.status === 409) setInfoText("Coach is already working.");
+              else setInfoText("tick failed: HTTP " + r.status);
+            })
+            .catch((e) => setInfoText("tick failed: " + String(e)));
+          return true;
+        }
+        if (a === "off" || a === "0" || a === "stop") {
+          authFetch("/api/coach/tick", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled: false }),
+          })
+            .then(async (r) => {
+              if (r.ok) setInfoText("Recurring tick disabled.");
+              else if (r.status === 400) setInfoText("No tick to disable yet.");
+              else throw new Error("HTTP " + r.status);
+            })
+            .catch((e) => setInfoText("tick off failed: " + String(e)));
+          return true;
+        }
+        const minutes = parseInt(a, 10);
+        if (!minutes || minutes < 1) {
+          setInfoText(
+            "usage: /tick (fire now)  ·  /tick <minutes>  ·  /tick off"
+          );
+          return true;
+        }
+        authFetch("/api/coach/tick", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ minutes }),
+        })
+          .then(async (r) => {
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            setInfoText(`Recurring tick: every ${minutes} min.`);
+          })
+          .catch((e) => setInfoText("tick set failed: " + String(e)));
+        return true;
+      }
       case "/spend":
         // Per-agent spend breakdown over the last 24h (or whatever
         // hours arg, via `/spend 168` for a week etc.). Pulls from

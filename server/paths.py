@@ -57,6 +57,13 @@ class ProjectPaths:
     attachments: Path
     repo: Path
     bare_clone: Path
+    # Recurrence v2 artifacts (recurrence-specs.md §3). Coach todos
+    # live at the project root (so humans see them in the Files pane);
+    # the archive is in working/ because it's reference-only and not
+    # injected into the system prompt.
+    coach_todos: Path
+    coach_todos_archive: Path
+    project_objectives: Path
 
     def worktree(self, slot: str) -> Path:
         return self.repo / slot
@@ -110,6 +117,9 @@ def project_paths(project_id: str) -> ProjectPaths:
         attachments=root / "attachments",
         repo=repo,
         bare_clone=repo / ".project",
+        coach_todos=root / "coach-todos.md",
+        coach_todos_archive=working / "coach-todos-archive.md",
+        project_objectives=root / "project-objectives.md",
     )
 
 

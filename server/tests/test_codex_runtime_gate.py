@@ -439,6 +439,33 @@ async def test_failed_handshake_does_not_poison_cache(
     assert codex_mod._codex_clients["p1"] is client
 
 
+async def test_captured_stdio_transport_includes_stderr_on_close() -> None:
+    import pytest
+    import sys
+    from server.runtimes.codex import _CapturedStdioTransport
+
+    class TransportBoom(Exception):
+        pass
+
+    transport = _CapturedStdioTransport(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write('codex app-server boom\\n'); sys.stderr.flush(); sys.exit(7)",
+        ],
+        transport_error_cls=TransportBoom,
+    )
+    await transport.connect()
+    with pytest.raises(TransportBoom) as excinfo:
+        await transport.recv()
+    await transport.close()
+
+    message = str(excinfo.value)
+    assert "stdio transport closed" in message
+    assert "process exit code: 7" in message
+    assert "codex app-server boom" in message
+
+
 # Audit item #9 — codex_thread_id persistence + open_thread auto-heal.
 
 class _FakeThread:
@@ -1120,10 +1147,16 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
         }
     ]
     config = open_thread_calls[0]["config"]
-    assert config.kwargs["developer_instructions"] == "system rules"
+    assert config.kwargs["developer_instructions"].startswith("system rules")
+    assert "treat every CLAUDE.md file exactly as you would" in config.kwargs["developer_instructions"]
+    assert "Treat .claude/ directories exactly as" in config.kwargs["developer_instructions"]
+    assert ".agents/" in config.kwargs["developer_instructions"]
     assert config.kwargs["model"] == "gpt-5.4-mini"
     assert config.kwargs["sandbox"] == "danger-full-access"
     mcp_servers = config.kwargs["config"]["mcp_servers"]
+    assert mcp_servers["coord"]["type"] == "stdio"
+    assert mcp_servers["coord"]["cwd"]
+    assert mcp_servers["coord"]["env"]["PYTHONPATH"].startswith(mcp_servers["coord"]["cwd"])
     assert mcp_servers["coord"]["env"]["HARNESS_COORD_PROXY_TOKEN"] == "tok_test"
     assert mcp_servers["extra"] == {"command": "extra-mcp"}
 

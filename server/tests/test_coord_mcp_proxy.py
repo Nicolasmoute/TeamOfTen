@@ -15,7 +15,13 @@ the dispatcher's behavior in `coord_proxy_call`. The subprocess in
 
 from __future__ import annotations
 
+import json
+import os
+import sys
+import threading
 import types
+from datetime import timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import server.spawn_tokens as st
 from server.tools import build_coord_server, coord_tool_names
@@ -74,6 +80,109 @@ def test_coord_handlers_include_required_set() -> None:
     }
     missing = required - names
     assert not missing, f"missing required coord tools: {missing}"
+
+
+async def test_coord_mcp_stdio_subprocess_lists_and_calls_tool() -> None:
+    """Spawn the real coord_mcp stdio bridge and speak MCP to it."""
+    from mcp.client.session import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    token = "tok_coord_stdio_test"
+    calls: list[dict[str, object]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send_json(self, status: int, body: dict[str, object]) -> None:
+            raw = json.dumps(body).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self) -> None:  # noqa: N802 - http.server API
+            if self.path != "/api/_coord/_tools":
+                self._send_json(404, {"detail": "not found"})
+                return
+            self._send_json(
+                200,
+                {"tools": ["coord_list_team", "coord_send_message"]},
+            )
+
+        def do_POST(self) -> None:  # noqa: N802 - http.server API
+            length = int(self.headers.get("Content-Length") or "0")
+            body = self.rfile.read(length).decode("utf-8")
+            payload = json.loads(body) if body else {}
+            calls.append({
+                "path": self.path,
+                "authorization": self.headers.get("Authorization"),
+                "payload": payload,
+            })
+            if self.headers.get("Authorization") != f"Bearer {token}":
+                self._send_json(401, {"ok": False, "error": "bad token"})
+                return
+            if self.path != "/api/_coord/coord_list_team":
+                self._send_json(404, {"ok": False, "error": "unknown"})
+                return
+            self._send_json(200, {"ok": True, "result": {"team": [{"id": "coach"}]}})
+
+        def log_message(self, _fmt: str, *_args: object) -> None:
+            return
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        env = dict(os.environ)
+        env["HARNESS_COORD_PROXY_TOKEN"] = token
+        port = httpd.server_address[1]
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=[
+                "-m",
+                "server.coord_mcp",
+                "--caller-id",
+                "coach",
+                "--proxy-url",
+                f"http://127.0.0.1:{port}",
+            ],
+            env=env,
+            cwd=os.getcwd(),
+        )
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(
+                read,
+                write,
+                read_timeout_seconds=timedelta(seconds=10),
+            ) as session:
+                init = await session.initialize()
+                assert init.serverInfo.name == "coord-proxy"
+
+                listed = await session.list_tools()
+                assert [t.name for t in listed.tools] == [
+                    "coord_list_team",
+                    "coord_send_message",
+                ]
+
+                result = await session.call_tool("coord_list_team", {"verbose": True})
+                assert result.isError is False
+                assert json.loads(result.content[0].text) == {
+                    "team": [{"id": "coach"}],
+                }
+
+        assert calls == [
+            {
+                "path": "/api/_coord/coord_list_team",
+                "authorization": f"Bearer {token}",
+                "payload": {
+                    "caller_id": "coach",
+                    "args": {"verbose": True},
+                },
+            }
+        ]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
 
 
 def test_spawn_token_mint_resolve_round_trip() -> None:

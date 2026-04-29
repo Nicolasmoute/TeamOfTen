@@ -3206,12 +3206,37 @@ async def run_agent(
         if body:
             coordination_block = body + "\n"
 
+    # Recurrence v2 (recurrence-specs.md §6): Coach gets two extra
+    # sections after CLAUDE.md + brief — project objectives (phase 4)
+    # then open coach todos (phase 3), in that order. Both are read
+    # fresh each turn. Players' system prompts are not modified.
+    coach_supplement = ""
+    if agent_id == "coach":
+        try:
+            from server.coach_objectives import objectives_block
+            from server.coach_todos import open_todos_block
+            project_id = await resolve_active_project()
+            sections: list[str] = []
+            ob = objectives_block(project_id)
+            if ob:
+                sections.append(ob)
+            tb = open_todos_block(project_id)
+            if tb:
+                sections.append(tb)
+            if sections:
+                coach_supplement = "\n\n" + "\n\n".join(sections)
+        except Exception:
+            logger.exception(
+                "coach supplement: system-prompt build failed"
+            )
+
     system_prompt = (
         identity_prefix
         + coordination_block
         + _system_prompt_for(agent_id)
         + context_suffix
         + brief_suffix
+        + coach_supplement
         + prior_error_suffix
         + handoff_suffix
         + lock_suffix

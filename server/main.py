@@ -35,7 +35,6 @@ from pydantic import BaseModel, Field
 
 from server.agents import (
     AGENT_DAILY_CAP_USD,
-    COACH_TICK_PROMPT,
     TEAM_DAILY_CAP_USD,
     _today_spend,
     cancel_agent,
@@ -63,6 +62,7 @@ from server.project_sync import (
     global_sync_loop,
     project_sync_loop,
 )
+from server.recurrences import recurrence_scheduler_loop
 from server.workspaces import ensure_workspaces, get_status as get_workspaces_status
 
 logger = logging.getLogger("harness.main")
@@ -258,8 +258,33 @@ async def lifespan(app: FastAPI):
     snapshot_task = asyncio.create_task(snapshot_loop())
     project_sync_task = asyncio.create_task(project_sync_loop())
     global_sync_task = asyncio.create_task(global_sync_loop())
+    # Recurrence v1 (Docs/recurrence-specs.md §11): if init_db's
+    # env-var migration seeded a tick row, the new scheduler is the
+    # one that should fire — zero out the legacy in-memory interval
+    # so it doesn't double-fire alongside the new scheduler. The
+    # legacy globals stay live for slash-command parity until phase 2
+    # rewires them.
+    try:
+        from server.agents import set_coach_interval
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT 1 FROM coach_recurrence WHERE kind = 'tick' LIMIT 1"
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+        if row:
+            set_coach_interval(0)
+            logger.info(
+                "recurrence: tick row present — legacy in-memory "
+                "coach autoloop disabled"
+            )
+    except Exception:
+        logger.exception("recurrence: legacy disable check failed")
     coach_task = asyncio.create_task(coach_tick_loop())
     coach_repeat_task = asyncio.create_task(coach_repeat_loop())
+    recurrence_task = asyncio.create_task(recurrence_scheduler_loop())
     stale_task_task = asyncio.create_task(stale_task_watch_loop())
     trim_task = asyncio.create_task(events_trim_loop())
     att_trim_task = asyncio.create_task(attachments_trim_loop())
@@ -272,7 +297,7 @@ async def lifespan(app: FastAPI):
         await start_telegram_bridge()
     except Exception:
         logger.exception("telegram bridge failed to start (non-fatal)")
-    bg_tasks = (snapshot_task, project_sync_task, global_sync_task, coach_task, coach_repeat_task, stale_task_task, trim_task, att_trim_task, sessions_trim_task)
+    bg_tasks = (snapshot_task, project_sync_task, global_sync_task, coach_task, coach_repeat_task, recurrence_task, stale_task_task, trim_task, att_trim_task, sessions_trim_task)
     try:
         yield
     finally:
@@ -882,6 +907,131 @@ async def set_coach_repeat_endpoint(req: CoachRepeatRequest) -> dict[str, object
     }
 
 
+# --- Recurrences (Docs/recurrence-specs.md §9) -----------------------
+
+
+class RecurrenceCreateRequest(BaseModel):
+    kind: str = Field(..., pattern="^(repeat|cron)$")
+    cadence: str
+    prompt: str
+    tz: str | None = None
+
+
+class RecurrencePatchRequest(BaseModel):
+    cadence: str | None = None
+    prompt: str | None = None
+    tz: str | None = None
+    enabled: bool | None = None
+
+
+class CoachTickPutRequest(BaseModel):
+    minutes: int | None = Field(default=None, ge=1, le=525_600)
+    enabled: bool | None = None
+
+
+@app.get("/api/recurrences", dependencies=[Depends(require_token)])
+async def list_recurrences_endpoint(
+    actor: dict = Depends(audit_actor),
+) -> list[dict[str, object]]:
+    """Return all recurrence rows for the active project. Disabled
+    rows are included so the UI can show 'turned off' state."""
+    from server.recurrences import list_recurrences
+    project_id = await resolve_active_project()
+    return await list_recurrences(project_id)
+
+
+@app.post("/api/recurrences", dependencies=[Depends(require_token)])
+async def create_recurrence_endpoint(
+    req: RecurrenceCreateRequest,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    """Create a repeat or cron recurrence for the active project."""
+    from server.recurrences import create_recurrence
+    project_id = await resolve_active_project()
+    try:
+        row = await create_recurrence(
+            project_id=project_id,
+            kind=req.kind,
+            cadence=req.cadence,
+            prompt=req.prompt,
+            tz=req.tz,
+            created_by=actor.get("source", "human"),
+            actor=actor,
+        )
+    except PermissionError as exc:
+        raise HTTPException(409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+    return row
+
+
+@app.patch(
+    "/api/recurrences/{rec_id}", dependencies=[Depends(require_token)]
+)
+async def patch_recurrence_endpoint(
+    rec_id: int, req: RecurrencePatchRequest,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    """Update a recurrence's cadence / prompt / tz / enabled. Pass
+    only the fields you want changed."""
+    from server.recurrences import update_recurrence
+    try:
+        row = await update_recurrence(
+            rec_id,
+            cadence=req.cadence,
+            prompt=req.prompt,
+            tz=req.tz,
+            enabled=req.enabled,
+            actor=actor,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+    if row is None:
+        raise HTTPException(404, detail="recurrence not found")
+    return row
+
+
+@app.delete(
+    "/api/recurrences/{rec_id}", dependencies=[Depends(require_token)]
+)
+async def delete_recurrence_endpoint(
+    rec_id: int, actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    from server.recurrences import delete_recurrence
+    ok = await delete_recurrence(rec_id, actor=actor)
+    if not ok:
+        raise HTTPException(404, detail="recurrence not found")
+    return {"ok": True, "id": rec_id}
+
+
+@app.put("/api/coach/tick", dependencies=[Depends(require_token)])
+async def put_coach_tick(
+    req: CoachTickPutRequest, actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    """Set the recurring tick interval (minutes). Body shapes:
+      * ``{"minutes": 60}`` — set or update interval; auto-enables.
+      * ``{"enabled": false}`` — disable the tick (preserves the row).
+      * Both — set and toggle in one call.
+    """
+    from server.recurrences import upsert_tick
+    if req.minutes is None and req.enabled is None:
+        raise HTTPException(400, detail="must pass minutes or enabled")
+    project_id = await resolve_active_project()
+    try:
+        row = await upsert_tick(
+            project_id=project_id,
+            minutes=req.minutes,
+            enabled=req.enabled,
+            created_by=actor.get("source", "human"),
+            actor=actor,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+    if row is None:
+        return {"ok": True, "row": None}
+    return {"ok": True, "row": row}
+
+
 @app.post("/api/coach/tick", dependencies=[Depends(require_token)])
 async def coach_tick(background: BackgroundTasks) -> dict[str, object]:
     """Nudge Coach to drain its inbox. Foundation of the autonomous
@@ -899,8 +1049,14 @@ async def coach_tick(background: BackgroundTasks) -> dict[str, object]:
         await c.close()
     if row and dict(row)["status"] == "working":
         raise HTTPException(409, detail="coach is already working")
-    background.add_task(run_agent, "coach", COACH_TICK_PROMPT)
-    return {"ok": True, "prompt": COACH_TICK_PROMPT}
+    # Phase 5 (recurrence-specs.md §4): manual ticks use the same smart
+    # composer as the recurrence scheduler, so the priority order is
+    # consistent across both fire paths.
+    from server.recurrences import compose_tick_prompt
+    project_id = await resolve_active_project()
+    tick_prompt = await compose_tick_prompt(project_id)
+    background.add_task(run_agent, "coach", tick_prompt)
+    return {"ok": True, "prompt": tick_prompt}
 
 
 @app.post("/api/agents/cancel-all", dependencies=[Depends(require_token)])

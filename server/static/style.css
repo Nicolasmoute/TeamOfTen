@@ -2233,6 +2233,178 @@ body {
 .files-icon-row-3 { left: 7px; top: 12px; right: 0; }
 .gear.files-open.active { color: var(--fg); }
 
+/* Recurrence rail icon — circular arrows (recurrence-specs.md §12.1).
+   Inline SVG so the two arcs and arrowheads stay visually crisp at
+   small sizes; uses currentColor so it inherits the rail's accent
+   state like the other rail icons. */
+.gear.recurrence-toggle { padding: 6px; line-height: 0; }
+.gear.recurrence-toggle.active { color: var(--accent); }
+.recurrence-icon {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+}
+.recurrence-icon svg {
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* Recurrence pane — a side panel that opens alongside the EnvPane
+   (recurrence-specs.md §12.2). Reuses the env-pane visual language
+   so the operator sees the two as siblings. Distinct .rec-* classes
+   so styling can diverge later without ripple. */
+.rec-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--border);
+  background: var(--bg);
+  overflow: hidden;
+}
+.rec-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+}
+.rec-title {
+  font-weight: 600;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  flex: 1;
+}
+.rec-close {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+.rec-close:hover { color: var(--fg); }
+.rec-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 0;
+}
+.rec-section {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.rec-section:last-child { border-bottom: 0; }
+.rec-section-title {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+.rec-empty {
+  color: var(--muted);
+  font-style: italic;
+  font-size: 12px;
+  padding: 4px 0;
+}
+.rec-card {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  background: var(--card);
+  font-size: 12px;
+}
+.rec-card:last-child { margin-bottom: 0; }
+.rec-card-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 6px;
+  align-items: center;
+}
+.rec-card-row:last-child { margin-bottom: 0; }
+.rec-card-row label {
+  width: 70px;
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+.rec-card-row input,
+.rec-card-row textarea {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 4px 6px;
+  border-radius: 3px;
+}
+.rec-card-row textarea {
+  min-height: 36px;
+  resize: vertical;
+}
+.rec-card-meta {
+  font-size: 11px;
+  color: var(--muted);
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.rec-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+.rec-status-dot.on { background: var(--ok, #4caf50); }
+.rec-status-dot.off { background: var(--muted); opacity: 0.5; }
+.rec-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+  justify-content: flex-end;
+}
+.rec-actions button {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  padding: 3px 8px;
+  font-size: 11px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.rec-actions button:hover { border-color: var(--accent); }
+.rec-actions button.rec-delete:hover { border-color: var(--danger, #c64); }
+.rec-add-btn {
+  width: 100%;
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--muted);
+  padding: 6px;
+  font-size: 11px;
+  border-radius: 3px;
+  cursor: pointer;
+  margin-top: 4px;
+}
+.rec-add-btn:hover { border-color: var(--accent); color: var(--fg); }
+.rec-error {
+  color: var(--danger, #c64);
+  font-size: 11px;
+  padding: 4px 0;
+}
+
 .pane-gear, .pane-export, .pane-search-toggle, .pane-pop-out, .pane-maximize {
   background: transparent;
   border: 0;
