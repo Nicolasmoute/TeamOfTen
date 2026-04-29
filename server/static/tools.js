@@ -509,19 +509,23 @@ function _renderHalf(side, lang, full) {
   // verbatim instead of running hljs on the whole line. For other
   // rows (pure ctx / pure add / pure del), syntax-highlight as before.
   let html_;
+  let isPaired = false;
   if (!side) {
     html_ = "&nbsp;";
   } else if (typeof side.html === "string") {
     html_ = side.html || "&nbsp;";
+    isPaired = true;
   } else {
     html_ = highlightLine(side.text, lang) || "&nbsp;";
   }
-  // No prefix gutter — the band color carries the add/del signal.
-  // Antigravity-style: text starts at the left edge of the half with
-  // just a few pixels of breathing room. `full` makes the cell span
-  // both columns (used for unchanged context that's identical on
-  // both sides — no point duplicating it).
-  const cls = "diff-half diff-" + kind + (full ? " diff-full" : "");
+  // Paired vs pure changes get different tint strengths: paired rows
+  // already carry bright word-level chg highlights, so the half tint
+  // can stay subtle. Pure rows (whole line is the change) need a
+  // strong tint to read at a glance — that's where the user's
+  // "sometimes green, sometimes not?" confusion came from.
+  const cls = "diff-half diff-" + kind
+    + (isPaired ? " diff-paired" : "")
+    + (full ? " diff-full" : "");
   return html`
     <div
       class=${cls}

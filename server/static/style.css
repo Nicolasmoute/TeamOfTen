@@ -3182,13 +3182,23 @@ body {
   flex: 1 1 100%;
   border-right: 0;
 }
+/* Pure add/del rows (the whole line is the change — left is blank or
+   right is blank) need a strong tint because there are no word-level
+   highlights to draw the eye. Paired rows (`.diff-paired`) carry
+   bright `.diff-chg` spans on the changed tokens so the half tint
+   can stay much lighter; otherwise both layers compete and the
+   row looks muddy. */
 .tool-card.edit-card .diff-add {
-  background: rgba(63, 185, 80, 0.16);
+  background: rgba(63, 185, 80, 0.30);
   color: #d2f3d2;
+  border-left: 3px solid rgba(63, 185, 80, 0.75);
+  padding-left: 5px;
 }
 .tool-card.edit-card .diff-del {
-  background: rgba(248, 81, 73, 0.16);
+  background: rgba(248, 81, 73, 0.26);
   color: #f3d2d2;
+  border-left: 3px solid rgba(248, 81, 73, 0.75);
+  padding-left: 5px;
   /* Strikethrough on deletions — the band color is the primary
      signal but the line-through reinforces "this text is going
      away" at a glance, especially when scanning a long edit. The
@@ -3197,16 +3207,26 @@ body {
   text-decoration-color: rgba(248, 81, 73, 0.55);
   text-decoration-thickness: 1px;
 }
+.tool-card.edit-card .diff-add.diff-paired {
+  background: rgba(63, 185, 80, 0.13);
+}
+.tool-card.edit-card .diff-del.diff-paired {
+  background: rgba(248, 81, 73, 0.13);
+}
 .tool-card.edit-card .diff-ctx {
   opacity: 0.62;
 }
 .tool-card.edit-card .diff-blank {
+  /* Stronger hatched fill so an empty side reads unambiguously as
+     "this side has no content" instead of "context I should read".
+     The previous 0.025 alpha was nearly invisible against the dark
+     card bg. */
   background: repeating-linear-gradient(
     -45deg,
     transparent,
     transparent 6px,
-    rgba(255, 255, 255, 0.025) 6px,
-    rgba(255, 255, 255, 0.025) 12px
+    rgba(255, 255, 255, 0.06) 6px,
+    rgba(255, 255, 255, 0.06) 12px
   );
 }
 /* Word-level intra-line emphasis. On a paired modification row the
@@ -3225,16 +3245,19 @@ body {
   display: inline-block;
   border-radius: 2px;
   font-weight: 600;
+  padding: 0 2px;
   /* Belt-and-braces: explicit text-decoration none on the chg run.
      `inline-block` is what actually does the work, but spelling out
      the intent helps the next reader. */
   text-decoration: none;
 }
 .tool-card.edit-card .diff-del .diff-chg {
-  background: rgba(248, 81, 73, 0.42);
+  background: rgba(248, 81, 73, 0.55);
+  color: #ffe4e4;
 }
 .tool-card.edit-card .diff-add .diff-chg {
-  background: rgba(63, 185, 80, 0.42);
+  background: rgba(63, 185, 80, 0.55);
+  color: #e8ffe8;
 }
 /* Stacked layout: when the diff container itself is narrow (e.g. a
    single-column pane on a phone, or a stacked pane in a tight
