@@ -3137,6 +3137,13 @@ body {
 
    Half kinds: diff-ctx (muted, both sides identical), diff-add (green
    band, right), diff-del (red band, left), diff-blank (placeholder). */
+/* Diff card — Monaco / Antigravity model. Two-tier color overlay:
+   a low-alpha line band signals "this whole line changed", a brighter
+   word band signals "this token specifically changed". Syntax
+   highlighting is preserved on every line — the diff layer is a
+   background, never a foreground replacement. No strikethrough,
+   no border accents, no font-weight changes, no row separators —
+   the chromatic subtlety is the whole point. */
 .tool-card.edit-card .diff {
   margin-top: 6px;
   border-radius: 4px;
@@ -3148,23 +3155,15 @@ body {
   max-height: 480px;
   overflow-y: auto;
   background: var(--card);
-  /* Container query host — the rows inside flip from side-by-side
-     to stacked when the diff itself is too narrow, regardless of the
-     viewport. Lets a narrow pane show diffs vertically while a wide
-     pane keeps the two columns. */
+  /* Container query host — rows flip from side-by-side to stacked
+     when the diff itself is too narrow (narrow pane on desktop or
+     phone), independent of the viewport. */
   container-type: inline-size;
   container-name: edit-diff;
 }
 .tool-card.edit-card .diff-row {
   display: flex;
   align-items: stretch;
-  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
-}
-.tool-card.edit-card .diff-row:last-child { border-bottom: 0; }
-.tool-card.edit-card .diff-row:hover .diff-half {
-  /* Subtle row sync — hovering anywhere on the row brightens both
-     halves so the reader knows they're paired. */
-  filter: brightness(1.08);
 }
 .tool-card.edit-card .diff-half {
   flex: 1 1 50%;
@@ -3175,89 +3174,51 @@ body {
   word-break: break-word;
 }
 .tool-card.edit-card .diff-half:last-child { border-right: 0; }
-/* Unchanged context rows span the full width — identical text on both
-   sides was wasted real estate. Only changed rows (add/del/blank)
-   keep the side-by-side split. */
+/* Unchanged context rows span both columns — identical text twice
+   would just be noise. Only changed rows keep the side-by-side
+   split. */
 .tool-card.edit-card .diff-half.diff-full {
   flex: 1 1 100%;
   border-right: 0;
 }
-/* Pure add/del rows (the whole line is the change — left is blank or
-   right is blank) need a strong tint because there are no word-level
-   highlights to draw the eye. Paired rows (`.diff-paired`) carry
-   bright `.diff-chg` spans on the changed tokens so the half tint
-   can stay much lighter; otherwise both layers compete and the
-   row looks muddy. */
+/* Tier 1 — line band. ~15% alpha so syntax-colored text stays
+   legible. Paired and pure changes get the SAME line tint; Monaco
+   makes no distinction. The two-tier signal comes from the optional
+   word band on top, not from differentiating the line. */
 .tool-card.edit-card .diff-add {
-  background: rgba(63, 185, 80, 0.30);
-  color: #d2f3d2;
-  border-left: 3px solid rgba(63, 185, 80, 0.75);
-  padding-left: 5px;
+  background: rgba(63, 185, 80, 0.15);
 }
 .tool-card.edit-card .diff-del {
-  background: rgba(248, 81, 73, 0.26);
-  color: #f3d2d2;
-  border-left: 3px solid rgba(248, 81, 73, 0.75);
-  padding-left: 5px;
-  /* Strikethrough on deletions — the band color is the primary
-     signal but the line-through reinforces "this text is going
-     away" at a glance, especially when scanning a long edit. The
-     strike color is a faint red so it doesn't drown the text. */
-  text-decoration: line-through;
-  text-decoration-color: rgba(248, 81, 73, 0.55);
-  text-decoration-thickness: 1px;
-}
-.tool-card.edit-card .diff-add.diff-paired {
-  background: rgba(63, 185, 80, 0.13);
-}
-.tool-card.edit-card .diff-del.diff-paired {
-  background: rgba(248, 81, 73, 0.13);
+  background: rgba(248, 81, 73, 0.15);
 }
 .tool-card.edit-card .diff-ctx {
   opacity: 0.62;
 }
 .tool-card.edit-card .diff-blank {
-  /* Stronger hatched fill so an empty side reads unambiguously as
-     "this side has no content" instead of "context I should read".
-     The previous 0.025 alpha was nearly invisible against the dark
-     card bg. */
+  /* Diagonal hatch on empty halves — Monaco's `diagonalFill`. Low
+     alpha so it doesn't compete with content on the other side. */
   background: repeating-linear-gradient(
     -45deg,
     transparent,
     transparent 6px,
-    rgba(255, 255, 255, 0.06) 6px,
-    rgba(255, 255, 255, 0.06) 12px
+    rgba(255, 255, 255, 0.05) 6px,
+    rgba(255, 255, 255, 0.05) 12px
   );
 }
-/* Word-level intra-line emphasis. On a paired modification row the
-   row builder pre-computes char-by-char diff between old and new
-   lines and wraps the changed runs with .diff-chg. The wrapping span
-   inherits the half's background tint (red on the left, green on the
-   right) and adds a stronger background + bolder weight so the
-   reader can see exactly which tokens moved without reading the
-   whole line. Antigravity does the same. */
+/* Tier 2 — word band. Painted on changed token ranges within paired
+   modification lines. ~40% alpha sits visibly above the 15% line
+   band but doesn't dominate the syntax color underneath. No bold,
+   no border, no padding pill — just a brighter rectangle, exactly
+   like Monaco. The contained text is already syntax-highlighted by
+   hljs (per-segment). */
 .tool-card.edit-card .diff-chg {
-  /* `inline-block` forms a decoration boundary so the parent's
-     line-through (on .diff-del halves) breaks around the changed
-     words instead of striking through them. Without this, the strike
-     draws right across the bold word-emphasis and the eye can't pick
-     it out. Side-effect: tiny vertical alignment shift, harmless. */
-  display: inline-block;
-  border-radius: 2px;
-  font-weight: 600;
-  padding: 0 2px;
-  /* Belt-and-braces: explicit text-decoration none on the chg run.
-     `inline-block` is what actually does the work, but spelling out
-     the intent helps the next reader. */
-  text-decoration: none;
+  background: rgba(255, 255, 255, 0); /* base; per-side overrides below */
 }
 .tool-card.edit-card .diff-del .diff-chg {
-  background: rgba(248, 81, 73, 0.55);
-  color: #ffe4e4;
+  background: rgba(248, 81, 73, 0.40);
 }
 .tool-card.edit-card .diff-add .diff-chg {
-  background: rgba(63, 185, 80, 0.55);
-  color: #e8ffe8;
+  background: rgba(63, 185, 80, 0.40);
 }
 /* Stacked layout: when the diff container itself is narrow (e.g. a
    single-column pane on a phone, or a stacked pane in a tight

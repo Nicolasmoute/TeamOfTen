@@ -400,26 +400,29 @@ function _escapeHtml(s) {
 }
 
 // Word-level intra-line diff between an old line and its paired new
-// line. Returns {leftHtml, rightHtml} with unchanged segments emitted
-// as plain escaped text and changed segments wrapped in
-// `.diff-chg` spans so the reader can spot exactly what moved within
-// the line. Used only for paired modifications; pure adds and pure
-// removes don't need it (the whole line is the change). Antigravity-
-// style: we drop syntax highlighting on these rows because the
-// word-level emphasis is the more useful signal.
-function _wordLevelDiff(a, b) {
+// line. Returns {leftHtml, rightHtml}. Each segment (equal / removed /
+// added) is run through hljs independently so syntax coloring is
+// preserved on edited lines — Antigravity / Monaco never replace
+// language colors with diff colors; the diff signal lives entirely in
+// background tints layered behind normal text. Changed segments are
+// wrapped in a `.diff-chg` span which only adds a brighter background.
+function _wordLevelDiff(a, b, lang) {
   const parts = diffWordsWithSpace(a || "", b || "");
   let left = "";
   let right = "";
   for (const p of parts) {
-    const esc = _escapeHtml(p.value);
+    // Per-segment hljs is imperfect at boundaries (a string literal
+    // split mid-edit may lose its quote-state) but acceptable for
+    // typical single-line edits. The win — keeping syntax color on
+    // every line — outweighs the edge case.
+    const colored = highlightLine(p.value, lang) || _escapeHtml(p.value);
     if (p.removed) {
-      left += `<span class="diff-chg">${esc}</span>`;
+      left += `<span class="diff-chg">${colored}</span>`;
     } else if (p.added) {
-      right += `<span class="diff-chg">${esc}</span>`;
+      right += `<span class="diff-chg">${colored}</span>`;
     } else {
-      left += esc;
-      right += esc;
+      left += colored;
+      right += colored;
     }
   }
   return { leftHtml: left, rightHtml: right };
@@ -437,7 +440,7 @@ function _wordLevelDiff(a, b) {
 // adds (no preceding remove) get blank-left rows; pure removes get
 // blank-right rows. Context appears identically on both sides so the
 // reader can scan horizontally.
-function buildSideBySideRows(oldStr, newStr) {
+function buildSideBySideRows(oldStr, newStr, lang) {
   const parts = diffLines(oldStr || "", newStr || "");
   const rows = [];
   for (let i = 0; i < parts.length; i++) {
@@ -465,7 +468,7 @@ function buildSideBySideRows(oldStr, newStr) {
           let leftHalf = null;
           let rightHalf = null;
           if (oLine !== null && nLine !== null) {
-            const { leftHtml, rightHtml } = _wordLevelDiff(oLine, nLine);
+            const { leftHtml, rightHtml } = _wordLevelDiff(oLine, nLine, lang);
             leftHalf = { kind: "del", text: oLine, html: leftHtml };
             rightHalf = { kind: "add", text: nLine, html: rightHtml };
           } else if (oLine !== null) {
@@ -545,10 +548,10 @@ function renderEditCard(name, input, result) {
   const filePath = input.file_path || input.path || "";
   const oldStr = typeof input.old_string === "string" ? input.old_string : "";
   const newStr = typeof input.new_string === "string" ? input.new_string : "";
-  const rows = buildSideBySideRows(oldStr, newStr);
+  const lang = langForFile(filePath);
+  const rows = buildSideBySideRows(oldStr, newStr, lang);
   const { add, del } = diffStats(rows);
   const delta = ` (-${del} +${add})`;
-  const lang = langForFile(filePath);
   const langClass = lang ? " language-" + lang : "";
   return html`
     <details class="tool-card category-write edit-card" open>
@@ -655,10 +658,10 @@ function renderApplyPatchCard(name, input, result) {
     // we don't silently lose information.
     return renderGenericCard(name, input, result);
   }
-  const rows = buildSideBySideRows(oldStr, newStr);
+  const lang = langForFile(filePath);
+  const rows = buildSideBySideRows(oldStr, newStr, lang);
   const { add, del } = diffStats(rows);
   const delta = ` (-${del} +${add})`;
-  const lang = langForFile(filePath);
   const langClass = lang ? " language-" + lang : "";
   return html`
     <details class="tool-card category-write edit-card" open>
