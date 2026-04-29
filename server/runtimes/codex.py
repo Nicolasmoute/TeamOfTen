@@ -55,11 +55,6 @@ _codex_client_tokens: dict[str, str] = {}
 # health probes / shutdown handlers that don't hold the spawn lock.
 _client_locks: dict[str, asyncio.Lock] = {}
 
-# One-shot diagnostic gate: slots whose first all-zero token-usage
-# extraction has already been logged. Reset on process restart so a
-# redeploy after a parser fix re-arms the dump.
-_USAGE_DIAG_DUMPED: set[str] = set()
-
 # Bump when the Codex-visible coord tool contract changes in a way that
 # old persisted Codex threads might not pick up on resume.
 _CODEX_TOOL_CONTRACT_VERSION = "2026-04-29.coord-mcp-names-v2"
@@ -1180,6 +1175,154 @@ def _extract_codex_usage_from_thread_state(
     return token_usage
 
 
+def _rollout_path_from_thread_state(thread_state: Any) -> Path | None:
+    """Pull the on-disk rollout JSONL path out of a `thread/read` response.
+
+    The Codex CLI writes one JSONL per thread under
+    `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*-<thread_id>.jsonl`.
+    `thread.read(include_turns=True)` exposes that path on the thread
+    object — that's where token usage actually lives in SDK 0.3.2,
+    since `thread.turns[*].usage` is empty.
+    """
+    if isinstance(thread_state, Mapping):
+        thread_obj = thread_state.get("thread")
+    else:
+        thread_obj = getattr(thread_state, "thread", None)
+    if isinstance(thread_obj, Mapping):
+        path = thread_obj.get("path")
+    else:
+        path = getattr(thread_obj, "path", None)
+    if not path:
+        return None
+    try:
+        p = Path(str(path))
+    except (TypeError, ValueError):
+        return None
+    return p if p.is_file() else None
+
+
+def _read_codex_token_count_from_rollout(rollout_path: Path) -> Mapping[str, Any] | None:
+    """Parse the most recent `token_count` event from a Codex rollout JSONL.
+
+    Codex SDK 0.3.2's `Thread.read(include_turns=True)` returns turn
+    objects with no `usage` field, so we go to the on-disk event log
+    instead. Each model call writes one or more lines shaped:
+
+        {"timestamp": "...", "type": "event_msg", "payload": {
+          "type": "token_count",
+          "info": {
+            "last_token_usage": {"input_tokens": ..., "cached_input_tokens": ...,
+                                 "output_tokens": ..., "reasoning_output_tokens": ...},
+            "total_token_usage": {...},
+            "model_context_window": ...
+          }
+        }}
+
+    Returns the `info` block of the latest `token_count` event, or None
+    if the file is unreadable / contains no such event. Caller decides
+    whether to use `last_token_usage` (per-turn) or `total_token_usage`
+    (cumulative).
+    """
+    try:
+        latest_info: Mapping[str, Any] | None = None
+        with rollout_path.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = line.strip()
+                # Cheap pre-filter — most lines aren't token_count, and
+                # JSON parsing every line of a long session would burn
+                # CPU per /context poll.
+                if not s or '"token_count"' not in s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                payload = obj.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get("type") != "token_count":
+                    continue
+                info = payload.get("info")
+                if isinstance(info, dict):
+                    latest_info = info
+        return latest_info
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.exception("CodexRuntime: failed reading rollout %s", rollout_path)
+        return None
+
+
+def _codex_usage_from_rollout_info(info: Mapping[str, Any]) -> dict[str, int]:
+    """Translate a Codex `token_count.info` block to the harness usage shape.
+
+    Codex JSONL convention: `last_token_usage.input_tokens` is the
+    *total* prompt tokens (uncached + cached). Harness convention
+    (mirrors Anthropic's): `input_tokens` is uncached only and
+    `cache_read_tokens` is the cached subset. We translate by
+    subtracting cached from total. `reasoning_output_tokens` rolls
+    into output for billing-equivalent counts.
+    """
+    last = info.get("last_token_usage") if isinstance(info, Mapping) else None
+    if not isinstance(last, Mapping):
+        return {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+
+    def _i(name: str) -> int:
+        v = last.get(name)
+        try:
+            return int(v) if v is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    total_in = _i("input_tokens")
+    cached = _i("cached_input_tokens")
+    out = _i("output_tokens")
+    reasoning = _i("reasoning_output_tokens")
+    return {
+        "input": max(0, total_in - cached),
+        "output": out + reasoning,
+        "cache_read": cached,
+        "cache_creation": 0,
+    }
+
+
+def _model_from_rollout(rollout_path: Path) -> str | None:
+    """Last-resort model lookup for turns where `tc.model` was None.
+
+    The rollout's `turn_context` events carry the model id that Codex
+    actually used (e.g. "gpt-5.5"). We surface it so the turns ledger
+    + context-bar window resolution find a real value when the per-role
+    Codex default in team_config is unset.
+    """
+    try:
+        latest_model: str | None = None
+        with rollout_path.open(encoding="utf-8", errors="replace") as f:
+            for line in f:
+                s = line.strip()
+                if not s or '"turn_context"' not in s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict) or obj.get("type") != "turn_context":
+                    continue
+                payload = obj.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                m = payload.get("model")
+                if isinstance(m, str) and m.strip():
+                    latest_model = m.strip()
+        return latest_model
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.exception("CodexRuntime: failed reading rollout for model %s", rollout_path)
+        return None
+
+
 def _extract_compact_summary(raw: Any) -> str:
     mapped = _to_mapping(raw)
     if mapped is not None:
@@ -1491,60 +1634,43 @@ class CodexRuntime:
                 # of thread.chat() is the SDK's terminal signal.
                 tc.turn_ctx["got_result"] = True
 
+            # Token usage extraction — see _read_codex_token_count_from_rollout
+            # for why we go to the on-disk JSONL instead of thread.turns.
+            # Fall back to the legacy thread-state walker only if the
+            # rollout file isn't reachable; that keeps us forward-compat
+            # with any future SDK that ships usage on Turn directly.
             usage_raw = None
-            thread_state = None
+            usage_from_rollout: dict[str, int] | None = None
+            rollout_model: str | None = None
             try:
                 read = thread.read(include_turns=True)
                 thread_state = await _await_if_needed(read)
-                usage_raw = _extract_codex_usage_from_thread_state(
-                    thread_state,
-                    final_turn_id,
-                )
+                rollout_path = _rollout_path_from_thread_state(thread_state)
+                if rollout_path is not None:
+                    rollout_info = _read_codex_token_count_from_rollout(rollout_path)
+                    if rollout_info is not None:
+                        usage_from_rollout = _codex_usage_from_rollout_info(rollout_info)
+                    if not tc.model:
+                        rollout_model = _model_from_rollout(rollout_path)
+                if usage_from_rollout is None:
+                    usage_raw = _extract_codex_usage_from_thread_state(
+                        thread_state,
+                        final_turn_id,
+                    )
             except Exception:
                 logger.exception(
                     "CodexRuntime: failed to read thread usage for slot=%s",
                     tc.agent_id,
                 )
-            usage = _extract_usage_codex(usage_raw)
-            # Diagnostic: when token extraction returns all-zero, dump the
-            # raw thread_state shape once per process so we can map the
-            # SDK's actual key layout. Bounded to one dump per slot per
-            # process via _USAGE_DIAG_DUMPED so a hot loop doesn't spam.
-            if (
-                thread_state is not None
-                and not any(usage.values())
-                and tc.agent_id not in _USAGE_DIAG_DUMPED
-            ):
-                _USAGE_DIAG_DUMPED.add(tc.agent_id)
-                try:
-                    import json
-                    if hasattr(thread_state, "model_dump"):
-                        snap = thread_state.model_dump()
-                    elif hasattr(thread_state, "dict"):
-                        snap = thread_state.dict()
-                    elif isinstance(thread_state, Mapping):
-                        snap = dict(thread_state)
-                    else:
-                        snap = {"_repr": repr(thread_state)[:4000]}
-                    logger.warning(
-                        "CodexRuntime: zero-token usage for slot=%s turn=%s — "
-                        "thread_state shape: %s",
-                        tc.agent_id,
-                        final_turn_id,
-                        json.dumps(snap, default=str)[:6000],
-                    )
-                except Exception:
-                    logger.exception(
-                        "CodexRuntime: failed to dump thread_state for diag (slot=%s)",
-                        tc.agent_id,
-                    )
+            usage = usage_from_rollout if usage_from_rollout is not None else _extract_usage_codex(usage_raw)
+            effective_model = tc.model or rollout_model
 
             cost_basis = "plan_included" if method == "chatgpt" else "token_priced"
             if cost_basis == "plan_included":
                 cost_usd = 0.0
             else:
                 cost_usd = codex_cost_usd(
-                    tc.model,
+                    effective_model,
                     {
                         "input_tokens": usage["input"],
                         "cached_input_tokens": usage["cache_read"],
@@ -1585,7 +1711,7 @@ class CodexRuntime:
                 num_turns=None,
                 stop_reason=None,
                 is_error=False,
-                model=tc.model,
+                model=effective_model,
                 runtime="codex",
                 cost_basis=cost_basis,
                 plan_mode=tc.plan_mode,
