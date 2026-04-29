@@ -55,6 +55,11 @@ _codex_client_tokens: dict[str, str] = {}
 # health probes / shutdown handlers that don't hold the spawn lock.
 _client_locks: dict[str, asyncio.Lock] = {}
 
+# One-shot diagnostic gate: slots whose first all-zero token-usage
+# extraction has already been logged. Reset on process restart so a
+# redeploy after a parser fix re-arms the dump.
+_USAGE_DIAG_DUMPED: set[str] = set()
+
 # Bump when the Codex-visible coord tool contract changes in a way that
 # old persisted Codex threads might not pick up on resume.
 _CODEX_TOOL_CONTRACT_VERSION = "2026-04-29.coord-mcp-names-v2"
@@ -1487,6 +1492,7 @@ class CodexRuntime:
                 tc.turn_ctx["got_result"] = True
 
             usage_raw = None
+            thread_state = None
             try:
                 read = thread.read(include_turns=True)
                 thread_state = await _await_if_needed(read)
@@ -1500,6 +1506,38 @@ class CodexRuntime:
                     tc.agent_id,
                 )
             usage = _extract_usage_codex(usage_raw)
+            # Diagnostic: when token extraction returns all-zero, dump the
+            # raw thread_state shape once per process so we can map the
+            # SDK's actual key layout. Bounded to one dump per slot per
+            # process via _USAGE_DIAG_DUMPED so a hot loop doesn't spam.
+            if (
+                thread_state is not None
+                and not any(usage.values())
+                and tc.agent_id not in _USAGE_DIAG_DUMPED
+            ):
+                _USAGE_DIAG_DUMPED.add(tc.agent_id)
+                try:
+                    import json
+                    if hasattr(thread_state, "model_dump"):
+                        snap = thread_state.model_dump()
+                    elif hasattr(thread_state, "dict"):
+                        snap = thread_state.dict()
+                    elif isinstance(thread_state, Mapping):
+                        snap = dict(thread_state)
+                    else:
+                        snap = {"_repr": repr(thread_state)[:4000]}
+                    logger.warning(
+                        "CodexRuntime: zero-token usage for slot=%s turn=%s — "
+                        "thread_state shape: %s",
+                        tc.agent_id,
+                        final_turn_id,
+                        json.dumps(snap, default=str)[:6000],
+                    )
+                except Exception:
+                    logger.exception(
+                        "CodexRuntime: failed to dump thread_state for diag (slot=%s)",
+                        tc.agent_id,
+                    )
 
             cost_basis = "plan_included" if method == "chatgpt" else "token_priced"
             if cost_basis == "plan_included":
