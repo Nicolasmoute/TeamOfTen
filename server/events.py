@@ -211,6 +211,8 @@ async def stop_event_writer(timeout: float = 2.0) -> None:
     # the difference between "shutdown is clean" and "occasionally
     # loses the last event of a turn".
     await _drain_and_flush()
+    global _write_queue
+    _write_queue = None
     _writer_task = None
 
 
