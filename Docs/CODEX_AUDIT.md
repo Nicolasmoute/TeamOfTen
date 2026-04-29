@@ -392,15 +392,34 @@ Second fix pass:
     close as `completed and audited` once the verdict is pasted in
     here (or to escalate to the `handle_step` change if INTERLEAVED).
 
-30. **Partially validated — Coord MCP smoke under Codex path** (§L.3). local smoke completed
-    The proxy now passes both the catalog/dispatcher contract tests and
-    a real stdio MCP subprocess smoke against a loopback HTTP fake. This
-    validates the MCP handshake and tool-call bridge that Codex
-    app-server consumes. Codex runtime also pins the coord MCP
-    subprocess `cwd`/`PYTHONPATH` to the harness root so the bridge is
-    importable from agent workspaces. The only remaining live validation
-    gap is a full authenticated `codex app-server` turn on Zeabur
-    actually invoking a coord_* tool.
+30. **Partially validated — Coord MCP smoke under Codex path** (§L.3). validation script ready
+    The proxy passes both the catalog/dispatcher contract tests and
+    a real stdio MCP subprocess smoke against a loopback HTTP fake.
+    Codex runtime pins the coord MCP subprocess `cwd`/`PYTHONPATH` to
+    the harness root so the bridge is importable from agent workspaces.
+
+    **E2E validation script committed:**
+    [scripts/codex_validate_coord_e2e.py](../scripts/codex_validate_coord_e2e.py)
+    drives a full authenticated `codex app-server` turn through the
+    running harness's HTTP API and observes the event stream:
+
+    1. Confirms `/api/health` reports `codex_auth.credentials_present`.
+    2. PUTs `runtime=codex` for the validation slot (default `p10`).
+    3. POSTs a turn with a prompt instructing the agent to call
+       `coord_list_tasks`.
+    4. Polls `/api/events` for the slot, asserts a `tool_use` with
+       `tool` starting `mcp__coord__` arrives, paired with a
+       successful (non-error) `tool_result`.
+    5. Prints `PASS` / `FAIL` / `PARTIAL` plus the next remediation
+       step. Exit code: 0 / 1 / 2.
+
+    Required env: `HARNESS_BASE` (default `http://127.0.0.1:8080`),
+    optional `HARNESS_TOKEN`, `HARNESS_VALIDATE_SLOT` (default `p10`),
+    `HARNESS_VALIDATE_TIMEOUT` (default 120s). Zero external Python
+    deps — uses `urllib` only.
+
+    Run on Zeabur, then flip the status to `completed and audited`
+    once it prints `PASS`.
 
 31. **Implemented — `Turn.usage` defensive extraction** (§L.4). completed and audited
     Pricing math assumes `input_tokens` / `cached_input_tokens` /

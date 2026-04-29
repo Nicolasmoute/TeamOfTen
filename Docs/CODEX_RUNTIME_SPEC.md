@@ -802,6 +802,6 @@ before continuing.
 
 1. **Headless `codex login` viability.** Highest risk. PR 0 spike. If device-code can't complete in non-TTY container shell, fall back to API-key-only Codex.
 2. **SDK "one active turn consumer per client" limit.** Validate with 5-turn loop, confirm no notification cross-talk. Live-validation script: [scripts/codex_validate_concurrency.py](../scripts/codex_validate_concurrency.py) — runs sequential + concurrent probes and prints a verdict keyed to follow-up actions.
-3. **Coord MCP under both runtimes.** Codex's MCP config shape may differ — verify standalone smoke test from both runtimes before integrating.
+3. **Coord MCP under both runtimes.** Codex's MCP config shape may differ — verify standalone smoke test from both runtimes before integrating. Live E2E script: [scripts/codex_validate_coord_e2e.py](../scripts/codex_validate_coord_e2e.py) — drives a real Codex turn through the running harness API and asserts a coord_* tool round-trip.
 4. **`Turn.usage` shape.** Confirm `cached_input_tokens` is a single field; some early SDK versions returned `usage=None` on streamed turns.
 5. **`thread_resume` config matching.** If Codex requires original model/sandbox to match on resume, mid-session model swap invalidates resume. Mitigation: null `codex_thread_id` on detected model change.
