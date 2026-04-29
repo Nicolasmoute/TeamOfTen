@@ -843,6 +843,15 @@ def _build_mcp_servers(tc: TurnContext) -> dict[str, Any]:
             _coord_proxy_url(),
         ],
         "env": _coord_mcp_env(tc),
+        # Pre-approve every coord_* tool. Without this, Codex routes
+        # MCP calls through the elicitation/approval path under
+        # restrictive sandboxes (Coach is read-only) and the embedded
+        # client has no user-input handler — the call is auto-cancelled
+        # with "user rejected MCP tool call". coord_* is harness-trusted
+        # by definition (single write-handle invariant), so blanket
+        # approval is the right default. See openai/codex issue #16685
+        # and PR #16632 for the upstream context.
+        "default_tools_approval_mode": "approve",
     }
     for name, cfg in (tc.external_mcp_servers or {}).items():
         if name == "coord":
