@@ -3219,12 +3219,14 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
             title=${recurrenceOpen ? "Close recurrence panel" : "Open recurrence panel — Coach tick / repeats / crons"}
             onClick=${onToggleRecurrence}
           >
-            <span class="recurrence-icon" aria-hidden="true">
-              <span class="recurrence-icon-arc-top"></span>
-              <span class="recurrence-icon-arc-bottom"></span>
-              <span class="recurrence-icon-head-right"></span>
-              <span class="recurrence-icon-head-left"></span>
-            </span>
+            <span class="recurrence-icon" aria-hidden="true">${html`
+              <svg viewBox="0 0 24 24">
+                <path d="M20 8 A 9 9 0 0 0 4 11" />
+                <polyline points="20 3 20 8 15 8" />
+                <path d="M4 16 A 9 9 0 0 0 20 13" />
+                <polyline points="4 21 4 16 9 16" />
+              </svg>
+            `}</span>
           </button>
           <button
             class=${"gear env-toggle" + (envOpen ? " active" : "")}
