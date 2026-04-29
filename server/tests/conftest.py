@@ -59,6 +59,26 @@ def fresh_db(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
         monkeypatch.setattr(filesmod_local, "DATA_ROOT", data_root)
     except Exception:
         pass
+    
+    # Similarly patch other modules that capture legacy paths at import time.
+    try:
+        import server.main as mainmod_local
+        monkeypatch.setattr(mainmod_local, "OUTPUTS_DIR", data_root / "outputs")
+    except Exception:
+        pass
+
+    try:
+        import server.outputs as outputsmod_local
+        monkeypatch.setattr(outputsmod_local, "OUTPUTS_DIR", data_root / "outputs")
+    except Exception:
+        pass
+
+    try:
+        import server.sync as syncmod_local
+        monkeypatch.setattr(syncmod_local, "UPLOADS_LOCAL_DIR", data_root / "uploads")
+        monkeypatch.setattr(syncmod_local, "OUTPUTS_LOCAL_DIR", data_root / "outputs")
+    except Exception:
+        pass
     # Same shape: `server.secrets` does `from server.db import DB_PATH`
     # at import time. Without this patch, set_secret/get_secret hit
     # the stale path (often the real /data/harness.db or a deleted
