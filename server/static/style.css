@@ -1110,6 +1110,14 @@ body {
   resize: vertical;
   min-height: 60px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /* Without width:100%, the textarea falls back to its `cols`
+     default (~20 chars) when it isn't inside a flex container — which
+     is the case for the Project objectives editor (direct child of
+     `.env-section`, not `.env-msg-composer`). border-box keeps the
+     1px border + padding inside the 100% width so it doesn't
+     overflow the section's right edge. */
+  width: 100%;
+  box-sizing: border-box;
 }
 .env-msg-composer select { flex: 1; }
 .env-msg-preview {

@@ -2479,19 +2479,39 @@ Features:
 
 ### 16.6 Environment Pane
 
-Shows:
+Shows (top-to-bottom):
 
 - Human attention banner.
 - Pending questions/plans.
 - kDrive sync failure banner.
 - Tasks with filters.
-- Cost/spend summaries.
+- Cost/spend summaries with per-project dropdown and reset.
+- Project objectives (multiline editor with always-visible save/discard,
+  disabled when no pending changes).
+- Coach todos (checkbox list + add/edit composer + archive toggle).
 - Inbox/recent messages.
 - Memory list/content.
 - Decisions list/content.
+- Truth proposals queue (Coach proposes → human approves/denies).
 - Timeline of important events.
 
-It scopes project-sensitive sections to the active project through the API.
+It scopes project-sensitive sections to the active project through the
+API. `Project objectives` and `Coach todos` reload automatically when
+the active project changes — both are stored on disk under the
+project's slug (`/data/projects/<slug>/project-objectives.md` and
+`/data/projects/<slug>/coach-todos.md`).
+
+**Collapsible parameter sections.** A subset is wrapped in
+`.env-section.collapsible`: Tasks, Cost, Project objectives, Coach
+todos, Memory, Decisions, Truth proposals. Click the section title to
+toggle; state persists per-section in `localStorage` under
+`harness_env_collapsed_v1`. Default is open. The remaining sections
+(Attention, kDrive errors, Inbox, Timeline) are messages-/stream-style
+content and stay always-expanded since collapsing them would hide
+live signal. The collapse mechanic is the same shared pattern as the
+Settings drawer (§16.7) — CSS-drawn chevron, h3 click handler that
+ignores interactive children (buttons, inputs, etc.) so inline
+controls in section titles still work.
 
 ### 16.7 Settings Drawer
 
@@ -2509,6 +2529,17 @@ Contains:
 - Sessions clear.
 - Display/layout options.
 - About/help text.
+
+**Collapsible sections.** Every `.drawer-section` is collapsible —
+click the section title (h3) to toggle. State persists per-section in
+`localStorage` under `harness_drawer_collapsed_v1`. Default is
+**closed** (opposite of the Environment pane's default-open) so the
+drawer opens to a compact list of titles instead of a long scroll.
+Click handler ignores interactive children (e.g. Health's refresh
+button) so inline controls keep working. The h3-title key is
+extracted from the first non-empty text node, so inline counts /
+button text changes don't drift the persistence key. Same pattern is
+reused in the Environment pane (§16.6) for parameter sections.
 
 Projects section:
 
