@@ -2439,15 +2439,20 @@ Input:
 - Textarea.
 - Image paste/upload strip.
 - Mode chips for model, plan, effort, context. Each chip shows the
-  **currently running parameter**, no labels or `key:` prefix:
+  **currently running parameter**, no labels or `key:` prefix, and
+  never the word "default" or "auto":
     - **Model chip** — actual model name ("Sonnet 4.6", "Opus 4.7",
-      "GPT-5.1 Codex"), resolved via paneSettings.model →
-      `/api/team/models[role|role_codex]` → suggested fallback. The
-      word "default" is never shown — when nothing resolves the chip
-      reads `auto`.
+      "GPT-5.1 Codex"). Resolution chain: paneSettings.model →
+      `/api/team/models[role|role_codex]` → server-side `suggested`
+      fallback → latest `turns.model` row for this slot
+      (`/api/turns?agent=<slot>&limit=1`, refreshed on every `result`
+      event). For a brand-new Codex agent with no role default and
+      no completed turn (the only fully-unknown case), the chip
+      shows the runtime tag (`Claude` / `Codex`).
     - **Plan chip** — `plan` or `no plan`. Toggle on click.
-    - **Effort chip** — `low` / `med` / `high` / `max` when overridden,
-      `auto` when not (no `effort:` prefix; "default" is never shown).
+    - **Effort chip** — `low` / `med` / `high` / `max`. Resolution
+      chain: paneSettings.effort → latest `turns.effort` → `low`
+      (the implicit minimum when nothing else resolves).
   The Settings drawer's role-default save dispatches a
   `team-models-updated` window event so all open panes refresh their
   resolved model labels live.

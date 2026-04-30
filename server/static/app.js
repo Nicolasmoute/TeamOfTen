@@ -8996,22 +8996,35 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
   const effectiveRuntimeKnown = !!runtimeOverride || roleDefaultRuntime !== null;
   const paneModelValidForRuntime = !paneSettings.model ||
     modelOptionsFor(effectiveRuntime).some((m) => m.value === paneSettings.model);
+  // Latest completed turn for this slot — the most reliable
+  // ground-truth source of "what model + effort actually ran".
+  // Populated from /api/turns?agent=<slot>&limit=1 on mount and after
+  // every `result` event arriving over the WS.
+  const [lastTurn, setLastTurn] = useState(null);
   // Resolve the effective model id for the chip label. Precedence:
-  //   pane override > role default (per runtime) > role suggested
-  //   (server-side fallback) > "" (whatever the SDK picks).
-  // Used by the model chip to show e.g. "Sonnet 4.6" instead of a
-  // useless "default" — see /api/team/models for shape.
+  //   pane override > role default (per runtime) > server suggested
+  //   fallback > latest turn's model > "" (only on a brand-new agent
+  //   with no role default and no completed turn — Codex edge case).
   const effectiveModelId = useMemo(() => {
     if (paneSettings.model) return paneSettings.model;
-    if (!roleDefaultModels) return "";
-    const role = slot === "coach" ? "coach" : "players";
-    const key = effectiveRuntime === "codex" ? role + "_codex" : role;
-    if (roleDefaultModels[key]) return roleDefaultModels[key];
-    const suggested = effectiveRuntime === "codex"
-      ? roleDefaultModels.suggested_codex
-      : roleDefaultModels.suggested;
-    return (suggested && suggested[role]) || "";
-  }, [paneSettings.model, roleDefaultModels, effectiveRuntime, slot]);
+    if (roleDefaultModels) {
+      const role = slot === "coach" ? "coach" : "players";
+      const key = effectiveRuntime === "codex" ? role + "_codex" : role;
+      if (roleDefaultModels[key]) return roleDefaultModels[key];
+      const suggested = effectiveRuntime === "codex"
+        ? roleDefaultModels.suggested_codex
+        : roleDefaultModels.suggested;
+      if (suggested && suggested[role]) return suggested[role];
+    }
+    if (lastTurn?.model) return lastTurn.model;
+    return "";
+  }, [paneSettings.model, roleDefaultModels, effectiveRuntime, slot, lastTurn]);
+  // Resolve the effort tier shown on the chip. Precedence:
+  //   pane override (1..4) > latest turn's effort > 0 (no override
+  //   recorded yet — fall through to "low" as the implicit floor).
+  const effectiveEffort = paneSettings.effort
+    ? paneSettings.effort
+    : (lastTurn && typeof lastTurn.effort === "number" ? lastTurn.effort : 0);
 
   const loadRoleDefaultRuntime = useCallback(async () => {
     try {
@@ -9073,6 +9086,30 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
     })();
     return () => { cancelled = true; };
   }, [slot]);
+
+  // Latest turn fetch — initial load + refresh whenever a new
+  // `result` event lands for this slot. /api/turns is small (one row)
+  // and only fires once per turn, so the load is negligible.
+  const loadLastTurn = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/turns?agent=" + encodeURIComponent(slot) + "&limit=1");
+      if (!res.ok) return;
+      const data = await res.json();
+      const row = (data.turns || [])[0] || null;
+      setLastTurn(row);
+    } catch (_e) {
+      // Silent — chips simply use the resolution chain without the
+      // turn-row hint.
+    }
+  }, [slot]);
+  useEffect(() => {
+    loadLastTurn();
+  }, [loadLastTurn]);
+  useEffect(() => {
+    if (!liveEvents || liveEvents.length === 0) return;
+    const last = liveEvents[liveEvents.length - 1];
+    if (last && last.type === "result") loadLastTurn();
+  }, [liveEvents, loadLastTurn]);
 
   useEffect(() => {
     const onTeamModelsUpdated = (e) => {
@@ -10376,15 +10413,16 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
             onClick=${() => setSettingsOpen(true)}
             title=${paneSettings.model
               ? "Model: per-pane override (click to change)"
-              : "Model: inheriting role default (click to change)"}
+              : "Model: resolved from role default / last turn (click to override)"}
           >
             ${(() => {
-              const label = modelLabelFor(effectiveModelId || "", effectiveRuntime);
-              // modelLabelFor falls back to "default" when the resolved
-              // id is empty — replace with "auto" since the user just
-              // wants to see the running model name, never the word
-              // "default".
-              return (!effectiveModelId || label === "default") ? "auto" : label;
+              if (effectiveModelId) {
+                return modelLabelFor(effectiveModelId, effectiveRuntime);
+              }
+              // Genuinely unknown — Codex agent with no role default
+              // and no completed turn yet. Show the runtime tag so the
+              // user at least knows which family will run.
+              return effectiveRuntime === "codex" ? "Codex" : "Claude";
             })()}
           </button>
           <button
@@ -10400,12 +10438,10 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
             class=${"pane-mode-chip" + (paneSettings.effort ? " active" : "")}
             onClick=${() => setSettingsOpen(true)}
             title=${paneSettings.effort
-              ? "Effort tier (click to change)"
-              : "Effort: model default — click to override (low/med/high/max)"}
+              ? "Effort tier: per-pane override (click to change)"
+              : "Effort tier: from last turn / implicit minimum (click to override)"}
           >
-            ${paneSettings.effort
-              ? EFFORT_LABELS[paneSettings.effort - 1]
-              : "auto"}
+            ${EFFORT_LABELS[(effectiveEffort || 1) - 1]}
           </button>
           <${ContextBar} slot=${slot} liveEvents=${liveEvents} model=${paneSettings.model || ""} />
           <span class="pane-modes-spacer"></span>

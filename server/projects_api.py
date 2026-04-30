@@ -868,7 +868,14 @@ def build_router(*, require_token, audit_actor):
             _os.environ["HARNESS_PROJECT_REPO"] = repo
             try:
                 with pin_active_project(project_id):
-                    result = await asyncio.to_thread(ensure_workspaces)
+                    # ensure_workspaces is async — call it directly. Do
+                    # NOT wrap in asyncio.to_thread: that runs the
+                    # callable in a worker thread, where calling an
+                    # `async def` returns a coroutine instead of its
+                    # result. The thread hands the unawaited coroutine
+                    # back to us, and FastAPI then 500s with
+                    # PydanticSerializationError on the response.
+                    result = await ensure_workspaces()
             finally:
                 if prev is None:
                     _os.environ.pop("HARNESS_PROJECT_REPO", None)
