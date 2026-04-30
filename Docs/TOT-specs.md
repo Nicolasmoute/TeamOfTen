@@ -967,7 +967,14 @@ or override flag — the deny is unconditional for every agent
    content, summary)`. Players cannot — the tool body rejects any
    non-Coach caller. The tool inserts a row in `truth_proposals`
    (`status='pending'`) with the full proposed content and a one-line
-   summary; it does NOT touch the file.
+   summary; it does NOT touch the file. The `path` argument is a
+   relative path *within the currently active project's truth/
+   folder* — it is NOT a path anywhere under `/data/projects/`. The
+   harness rejects paths starting with `projects/` or with a known
+   project slug as the first segment, with an error message that
+   tells Coach to switch active project first. This catches the
+   recurrent mistake of encoding a sibling project slug in the path
+   when truth/ is per-active-project by design.
 2. The harness emits a `truth_proposal_created` event; the
    `EnvTruthProposalsSection` of the Environment pane shows the
    pending proposal with summary + full proposed content + approve /

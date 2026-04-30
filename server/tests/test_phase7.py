@@ -611,6 +611,97 @@ def test_coord_propose_truth_update_in_coord_allowlist() -> None:
     assert "mcp__coord__coord_propose_truth_update" in ALLOWED_COORD_TOOLS
 
 
+async def _propose_truth(handler, **kwargs):
+    """Test helper — wraps a coord_propose_truth_update handler call."""
+    args = {"path": kwargs.get("path", ""),
+            "content": kwargs.get("content", "body"),
+            "summary": kwargs.get("summary", "why")}
+    return await handler(args)
+
+
+async def test_propose_truth_update_rejects_projects_prefix(fresh_db) -> None:
+    """Coach passing 'projects/<slug>/...' as path is the recurrent
+    mistake — truth/ is rooted at the active project, not anywhere
+    under /data/projects/. The tool must reject with a hint about
+    switching active project, not silently accept and queue a
+    nested-path proposal."""
+    await init_db()
+    from server.paths import ensure_project_scaffold
+    ensure_project_scaffold("misc")
+    from server.tools import build_coord_server
+    srv = build_coord_server("coach", include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_propose_truth_update"]
+
+    out = await _propose_truth(
+        handler,
+        path="projects/dynamichypergraph/CLAUDE.md",
+        content="rule body",
+        summary="add zeabur scope rule",
+    )
+    assert out.get("isError") is True
+    text = out["content"][0]["text"]
+    assert "projects/" in text
+    assert "switch" in text.lower() or "active project" in text.lower()
+
+
+async def test_propose_truth_update_rejects_known_project_slug_prefix(
+    fresh_db,
+) -> None:
+    """Coach passing '<existing-slug>/CLAUDE.md' should be rejected
+    with a hint to switch active project. Catches the case where
+    Coach drops the literal 'projects/' prefix but still names a
+    sibling project as the first path segment."""
+    await init_db()
+    from server.paths import ensure_project_scaffold
+    ensure_project_scaffold("misc")
+    # Insert a second project so its slug is detectable.
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO projects (id, name) VALUES (?, ?)",
+            ("dynamichypergraph", "Dynamic Hypergraph"),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    from server.tools import build_coord_server
+    srv = build_coord_server("coach", include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_propose_truth_update"]
+
+    out = await _propose_truth(
+        handler,
+        path="dynamichypergraph/CLAUDE.md",
+        content="rule body",
+        summary="add zeabur scope rule",
+    )
+    assert out.get("isError") is True
+    text = out["content"][0]["text"]
+    assert "dynamichypergraph" in text
+    assert "switch" in text.lower() or "active project" in text.lower()
+
+
+async def test_propose_truth_update_accepts_bare_filename(fresh_db) -> None:
+    """Sanity: a bare filename still works — the new validation only
+    rejects project-prefixed paths, not legitimate truth/ files."""
+    await init_db()
+    from server.paths import ensure_project_scaffold
+    ensure_project_scaffold("misc")
+    from server.tools import build_coord_server
+    srv = build_coord_server("coach", include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_propose_truth_update"]
+
+    out = await _propose_truth(
+        handler,
+        path="CLAUDE.md",
+        content="rule body",
+        summary="add zeabur scope rule",
+    )
+    assert out.get("isError") is not True
+    text = out["content"][0]["text"]
+    assert "queued" in text or "proposal" in text.lower()
+
+
 async def test_truth_proposals_schema_smoke(fresh_db) -> None:
     """truth_proposals table exists, accepts an insert, status defaults
     to 'pending', and the CHECK constraint rejects bad statuses."""

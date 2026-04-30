@@ -1271,15 +1271,20 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     @tool(
         "coord_propose_truth_update",
         (
-            "Coach-only. Propose an update to a file under the active "
-            "project's truth/ folder. truth/ is the user's signed-off "
-            "source-of-truth (specs, brand guidelines, contracts); "
-            "agents NEVER write to it directly — the harness's "
-            "PreToolUse guard hook denies any direct Write/Edit/Bash "
-            "to truth/. This tool is the ONLY path to change truth/, "
-            "and approval is gated on an explicit human click in the "
-            "UI's 'Truth proposals' section. Players cannot call this "
-            "tool — they must ask Coach to relay.\n"
+            "Coach-only. Propose an update to a file under the **currently "
+            "active** project's truth/ folder. The path is rooted at "
+            "`/data/projects/<active-slug>/truth/` — it is NOT a path "
+            "anywhere under `/data/projects/`. To target a different "
+            "project, ask the user to switch the active project first; "
+            "do not encode the project slug in the path.\n"
+            "\n"
+            "truth/ is the user's signed-off source-of-truth (specs, "
+            "brand guidelines, contracts); agents NEVER write to it "
+            "directly — the harness's PreToolUse guard hook denies any "
+            "direct Write/Edit/Bash to truth/. This tool is the ONLY "
+            "path to change truth/, and approval is gated on an explicit "
+            "human click in the UI's 'Truth proposals' section. Players "
+            "cannot call this tool — they must ask Coach to relay.\n"
             "\n"
             "What happens:\n"
             "  1. The proposal is queued (status=pending).\n"
@@ -1291,9 +1296,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "see the outcome on your next turn.\n"
             "\n"
             "Params:\n"
-            "- path: relative path under truth/ (e.g. 'specs.md' or "
-            "  'brand/colors.md'). Required. No leading slash, no "
-            "  '..' segments.\n"
+            "- path: relative path WITHIN the active project's truth/ "
+            "  (e.g. 'specs.md' or 'brand/colors.md', NOT "
+            "  'projects/<slug>/...' or '/data/...'). Required. No "
+            "  leading slash, no '..' segments, no leading project "
+            "  slug.\n"
             "- content: full new file body (required). This is a full "
             "  REPLACE — include the parts you're keeping verbatim, "
             "  not just a diff.\n"
@@ -1324,7 +1331,46 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         if rel.startswith("truth/"):
             rel = rel[len("truth/"):]
         if rel.startswith("/") or ".." in rel.split("/"):
-            return _err("path must be relative under truth/, no '..' segments")
+            return _err(
+                "path must be relative under the active project's "
+                "truth/ folder, no leading slash, no '..' segments"
+            )
+        # Catch a recurrent Coach mistake: encoding the target project
+        # slug in the path (e.g. "projects/dynamichypergraph/CLAUDE.md").
+        # truth/ is rooted at the active project — there's no way to
+        # cross-project from the path. Detect when the first segment
+        # matches an existing project slug and tell Coach to switch
+        # active project instead. Also catches a literal "projects/"
+        # prefix even when the second segment isn't a known slug.
+        first_seg = rel.split("/", 1)[0]
+        if first_seg == "projects":
+            return _err(
+                f"path '{rel}' starts with 'projects/' — truth/ is rooted "
+                "at the active project's truth folder, not anywhere under "
+                "/data/projects/. To target a different project, ask the "
+                "user to switch the active project first, then pass the "
+                "path relative to that project's truth/ (e.g. "
+                "'CLAUDE.md', not 'projects/<slug>/CLAUDE.md')."
+            )
+        c_slug_check = await configured_conn()
+        try:
+            cur = await c_slug_check.execute(
+                "SELECT 1 FROM projects WHERE id = ? LIMIT 1",
+                (first_seg,),
+            )
+            slug_match = await cur.fetchone()
+        finally:
+            await c_slug_check.close()
+        if slug_match:
+            return _err(
+                f"path '{rel}' starts with project slug '{first_seg}' — "
+                "the path is rooted at the *currently active* project's "
+                "truth/ folder, not anywhere under /data/projects/. To "
+                f"target the '{first_seg}' project, ask the user to "
+                "switch active project to it first, then pass the path "
+                "relative to its truth/ (e.g. drop the leading "
+                f"'{first_seg}/')."
+            )
         if not isinstance(content, str):
             return _err("content is required (string)")
         if len(content) > 200_000:

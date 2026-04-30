@@ -5393,6 +5393,81 @@ function SettingsDrawer({ onClose, serverStatus }) {
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  // Collapsible drawer sections. Default: every section starts
+  // collapsed; user toggles by clicking the h3. State is persisted per
+  // section by its title in localStorage so the open/closed shape
+  // survives reloads. Wired via event delegation + MutationObserver so
+  // it works for every <section class="drawer-section"> including
+  // ones that render asynchronously (Health probe, MCP list, etc.)
+  // without each section component having to opt in.
+  // useLayoutEffect (not useEffect) so the initial collapsed class is
+  // applied before paint — avoids a flash of fully-expanded drawer.
+  useLayoutEffect(() => {
+    const KEY = "harness_drawer_collapsed_v1";
+    let stored = {};
+    try {
+      stored = JSON.parse(localStorage.getItem(KEY) || "{}");
+    } catch (_) {
+      stored = {};
+    }
+    // Pick the SettingsDrawer's body specifically — `.drawer-body` is
+    // also used by the auth modal, which has no `.drawer-section`
+    // children. Find the first drawer-body that actually contains
+    // sections so we don't mis-attach.
+    const drawer = Array.from(
+      document.querySelectorAll(".drawer-body")
+    ).find((db) => db.querySelector(".drawer-section"));
+    if (!drawer) return;
+
+    const titleOf = (h3) =>
+      (h3.textContent || "").trim().replace(/\s+/g, " ");
+
+    const apply = () => {
+      const sections = drawer.querySelectorAll(".drawer-section");
+      sections.forEach((sec) => {
+        if (sec.dataset.collapseInit === "1") return;
+        const h3 = sec.querySelector(":scope > h3");
+        if (!h3) return;
+        sec.dataset.collapseInit = "1";
+        const t = titleOf(h3);
+        // Default collapsed unless user previously opened this section.
+        if (stored[t] !== true) sec.classList.add("collapsed");
+      });
+    };
+    apply();
+
+    const observer = new MutationObserver(apply);
+    observer.observe(drawer, { childList: true, subtree: true });
+
+    const onClick = (e) => {
+      const h3 = e.target.closest("h3");
+      if (!h3) return;
+      const sec = h3.parentElement;
+      if (!sec || !sec.classList.contains("drawer-section")) return;
+      // Don't toggle when clicking a button/input/link inside the h3
+      // (e.g. Health's refresh button). Only the title text + chevron
+      // toggle the section.
+      const interactive = e.target.closest(
+        "button, input, select, textarea, a"
+      );
+      if (interactive && interactive !== h3 && h3.contains(interactive)) {
+        return;
+      }
+      sec.classList.toggle("collapsed");
+      const t = titleOf(h3);
+      stored[t] = !sec.classList.contains("collapsed");
+      try {
+        localStorage.setItem(KEY, JSON.stringify(stored));
+      } catch (_) {}
+    };
+    drawer.addEventListener("click", onClick);
+
+    return () => {
+      observer.disconnect();
+      drawer.removeEventListener("click", onClick);
+    };
+  }, []);
+
   const stop = (e) => e.stopPropagation();
 
   return html`
