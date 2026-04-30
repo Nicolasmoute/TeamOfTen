@@ -2416,12 +2416,12 @@ above peer chatter and tool narration):
   to `.event.tool_use` (non-comm), `.event.tool_result`,
   `.event.thinking`, `.event.sys`, `.event.result`, and lifecycle
   markers (`.agent_started`, `.agent_stopped`, `.connected`). The
-  per-category `.tool-name` rules used to set `var(--fg)` (white)
-  and beat the tier-3 muted intent — fixed via `!important` on the
-  tier-3 selectors. Tool-specific colors (Read/Edit/Bash/Grep/etc.)
-  stay on the **left border** + the small dot drawn by
-  `summary::before` as identity markers — only the body content dims,
-  so cards remain distinguishable by tool type.
+  tool-NAME word itself (`Bash`, `Read`, `Edit`, `Grep` …) keeps its
+  per-category color (read=accent, write=tool, run=warn, coord=ok)
+  as a built-in identity marker — only the following text (the
+  path / command / args) and the friendly-phrase variants (e.g.
+  `coord_*` rendered as "Reading inbox" / "Listing tasks") dim. The
+  left border + `summary::before` dot also stay colored.
 
 Errors and asks ignore the tiering and stay loud regardless: `.event.error`
 red, `.event.tool_result.error` red, plus AskUserQuestion / plan-mode
@@ -2438,7 +2438,15 @@ Input:
 
 - Textarea.
 - Image paste/upload strip.
-- Mode chips for model, plan, effort, context.
+- Mode chips for model, plan, effort, context. Each chip shows its
+  **resolved value** rather than just a label — e.g. the model chip
+  says "Sonnet 4.6" not "default", resolving via paneSettings.model →
+  `/api/team/models[role|role_codex]` → suggested fallback. Plan chip
+  reads "plan: on" / "plan: off" so the off state is unambiguous.
+  Effort chip reads "effort: default" when no override is set,
+  "effort: low|med|high|max" when one is. The Settings drawer's role-
+  default save dispatches a `team-models-updated` window event so all
+  open panes refresh their resolved model labels live.
 - Slash command autocomplete.
 - Prompt history.
 - Ctrl/Cmd+Enter sends.

@@ -3581,7 +3581,10 @@ function TeamModelsSection() {
           players_codex: playersCodex,
         }),
       });
-      if (res.ok) setSavedAt(Date.now());
+      if (res.ok) {
+        setSavedAt(Date.now());
+        window.dispatchEvent(new CustomEvent("team-models-updated"));
+      }
     } catch (e) {
       console.error("team models save failed", e);
     } finally {
@@ -8975,11 +8978,28 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
   //     flip it to "queued" and surface a notice in the pane.
   const [pending, setPending] = useState([]);
   const [roleDefaultRuntime, setRoleDefaultRuntime] = useState(null);
+  const [roleDefaultModels, setRoleDefaultModels] = useState(null);
   const runtimeOverride = (agent?.runtime_override || "").toLowerCase();
   const effectiveRuntime = runtimeOverride || roleDefaultRuntime || "claude";
   const effectiveRuntimeKnown = !!runtimeOverride || roleDefaultRuntime !== null;
   const paneModelValidForRuntime = !paneSettings.model ||
     modelOptionsFor(effectiveRuntime).some((m) => m.value === paneSettings.model);
+  // Resolve the effective model id for the chip label. Precedence:
+  //   pane override > role default (per runtime) > role suggested
+  //   (server-side fallback) > "" (whatever the SDK picks).
+  // Used by the model chip to show e.g. "Sonnet 4.6" instead of a
+  // useless "default" — see /api/team/models for shape.
+  const effectiveModelId = useMemo(() => {
+    if (paneSettings.model) return paneSettings.model;
+    if (!roleDefaultModels) return "";
+    const role = slot === "coach" ? "coach" : "players";
+    const key = effectiveRuntime === "codex" ? role + "_codex" : role;
+    if (roleDefaultModels[key]) return roleDefaultModels[key];
+    const suggested = effectiveRuntime === "codex"
+      ? roleDefaultModels.suggested_codex
+      : roleDefaultModels.suggested;
+    return (suggested && suggested[role]) || "";
+  }, [paneSettings.model, roleDefaultModels, effectiveRuntime, slot]);
 
   const loadRoleDefaultRuntime = useCallback(async () => {
     try {
@@ -9022,6 +9042,40 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
     };
     window.addEventListener("team-runtimes-updated", onTeamRuntimesUpdated);
     return () => window.removeEventListener("team-runtimes-updated", onTeamRuntimesUpdated);
+  }, [slot]);
+
+  // Fetch role-default models so the model chip can resolve "(default)"
+  // → an actual model name. Same pattern as runtimes above.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await authFetch("/api/team/models");
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        if (cancelled) return;
+        setRoleDefaultModels(data);
+      } catch (_e) {
+        // Silent — chip falls back to raw id.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [slot]);
+
+  useEffect(() => {
+    const onTeamModelsUpdated = (e) => {
+      // Settings drawer dispatches this when the user saves new role
+      // defaults; refetch full payload (suggested + available are
+      // static per process, but easier than rebuilding here).
+      (async () => {
+        try {
+          const res = await authFetch("/api/team/models");
+          if (res.ok) setRoleDefaultModels(await res.json());
+        } catch (_e) {}
+      })();
+    };
+    window.addEventListener("team-models-updated", onTeamModelsUpdated);
+    return () => window.removeEventListener("team-models-updated", onTeamModelsUpdated);
   }, [slot]);
 
   useEffect(() => {
@@ -10289,25 +10343,31 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
           <button
             class=${"pane-mode-chip" + (paneSettings.model ? " active" : "")}
             onClick=${() => setSettingsOpen(true)}
-            title="Model (click to change)"
+            title=${paneSettings.model
+              ? "Model: per-pane override (click to change)"
+              : "Model: inheriting role default (click to change)"}
           >
-            ${modelLabelFor(paneSettings.model || "", effectiveRuntime)}
+            ${modelLabelFor(effectiveModelId || "", effectiveRuntime)}
           </button>
           <button
             class=${"pane-mode-chip" + (paneSettings.planMode ? " active" : "")}
             onClick=${() => setPaneSettings((s) => ({ ...s, planMode: !s.planMode }))}
-            title="Plan mode (click to toggle)"
+            title=${paneSettings.planMode
+              ? "Plan mode ON — agent drafts a plan first (click to turn off)"
+              : "Plan mode OFF — agent acts directly (click to turn on)"}
           >
-            ${paneSettings.planMode ? "plan ✓" : "plan"}
+            ${paneSettings.planMode ? "plan: on" : "plan: off"}
           </button>
           <button
             class=${"pane-mode-chip" + (paneSettings.effort ? " active" : "")}
             onClick=${() => setSettingsOpen(true)}
-            title="Effort (click to change)"
+            title=${paneSettings.effort
+              ? "Effort tier (click to change)"
+              : "Effort: model default (click to override)"}
           >
-            ${paneSettings.effort
+            effort: ${paneSettings.effort
               ? EFFORT_LABELS[paneSettings.effort - 1]
-              : "effort"}
+              : "default"}
           </button>
           <${ContextBar} slot=${slot} liveEvents=${liveEvents} model=${paneSettings.model || ""} />
           <span class="pane-modes-spacer"></span>

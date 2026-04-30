@@ -2994,10 +2994,15 @@ body {
    These overrides are stronger than the tier-3 selectors below, so
    we override them HERE with !important to keep tier-3 truly muted. */
 .event.tool_use { border-color: var(--tool); padding: 4px 10px; }
+/* The tool-NAME word itself (Bash, Read, Edit, Grep…) keeps its
+   per-category color — it's the identity marker that tells the eye
+   which kind of work this card represents. We only mute the
+   following text (the path / command / args), and the friendly verb
+   phrases like "Reading inbox" / "Listing tasks" which carry no
+   extra summary. */
 .event.tool_use .event-body,
 .event.tool_use .tool-card-body,
 .event.tool_use .tool-summary,
-.event.tool_use .tool-card .tool-name,
 .event.tool_use .tool-card .tool-name.tool-phrase {
   color: var(--muted) !important;
 }
