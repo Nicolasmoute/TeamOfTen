@@ -6,7 +6,11 @@
 
 ![TeamOfTen multi-pane UI](Docs/Screenshot%202026-04-26%20232144.jpg)
 
-I couldn't find a multi-agent setup that felt right — most were either heavy frameworks or black-box products. This is the opposite: a single-container web app where **1 Coach + 10 Players** share memory, a task board, and a tileable multi-pane UI. Coach plans, Players execute in their own git worktrees and push straight to your repo, and everything human-readable mirrors to a WebDAV-compatible cloud drive (kDrive, Nextcloud, ownCloud, Fastmail). Intervene on any agent live, or steer through Coach.
+I couldn't find a multi-agent setup that felt right — most were either heavy frameworks or black-box products. Especially since the real challenge of multi-agent work isn't running them in parallel — it's keeping them aligned with the spec over time.
+
+AI agents are remarkable 90% of the time. The remaining 10% — wrong assumption, missed constraint, drift from the spec — quietly compounds turn after turn until the project goes off the rails, and existing tools either hide that drift behind a swarm dashboard or trap you in one-on-one chat. TeamOfTen makes human supervision *efficient* rather than constant: every agent's work is visible live, a `truth/` folder holds specs agents can't edit directly (they propose, you approve), and you steer through Coach instead of eleven Players. Tight loop, low friction.
+
+Concretely: a single-container web app where **1 Coach + 10 Players** share memory, a task board, and a tileable multi-pane UI. Coach plans, Players execute in their own git worktrees and push straight to your repo, and everything human-readable mirrors to a WebDAV-compatible cloud drive (kDrive, Nextcloud, ownCloud, Fastmail). Intervene on any agent live, or steer through Coach.
 
 Set it up once on a VPS and it runs 24/7. Drive Coach from your phone via Telegram or the mobile UI. Open Obsidian on the synced folder and you have a live second-brain the agents write into. Nice little project. Have fun, improve it.
 
