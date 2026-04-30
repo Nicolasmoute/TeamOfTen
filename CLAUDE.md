@@ -642,6 +642,30 @@ UI:
   cover idle-close, in-flight-pop, and the mixed `evict_all_clients`
   case. Spec mirror in [Docs/CODEX_RUNTIME_SPEC.md](Docs/CODEX_RUNTIME_SPEC.md) §E.1.
 
+- **External MCP servers pre-approved for Codex.** The
+  `default_tools_approval_mode = "approve"` policy that unblocked
+  `coord` for Coach (read-only) on 2026-04-29 only covered the coord
+  server. Every UI-added external MCP server (Zeabur, Notion, etc.)
+  hit the same cancellation path: Codex routed the call through
+  elicitation/approval, the embedded app-server client had no
+  approval handler, and the call auto-cancelled with "user rejected
+  MCP tool call". `_build_mcp_servers` now injects
+  `default_tools_approval_mode = "approve"` on every external server
+  unless the saved config already specifies a value (opt-out
+  preserved). Players (`danger-full-access`) skip approval anyway so
+  they were already fine. Spec mirror in `Docs/CODEX_RUNTIME_SPEC.md` §C.
+
+- **Health probe `mcp_external` reflects DB-managed servers.** The
+  probe in [server/main.py](server/main.py) used to short-circuit to
+  "skipped — HARNESS_MCP_CONFIG not set" whenever the legacy env
+  path was unset, ignoring the UI-managed `mcp_servers` table
+  entirely. So adding a server via the Options drawer left the
+  Settings pane reading "only coord active" even when the new server
+  was loaded and serving tools. Probe now always calls
+  `load_external_servers()` (which merges file + DB) and reports the
+  merged count. The `skipped` flag is only set when both sources
+  yield zero servers.
+
 **Next likely:**
 - **Mobile UI polish** — touch-drag doesn't work with HTML5 DnD;
    layout breakpoints for < 900 px need a rethink.

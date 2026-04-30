@@ -1825,6 +1825,17 @@ External MCP servers:
 - DB wins on name collision.
 - Explicit `allowed_tools` list is required; no automatic tool exposure.
 - Tool names become `mcp__<server>__<tool>`.
+- Codex runtime injects `default_tools_approval_mode = "approve"` on every
+  external server unless the saved config already sets one. Without this
+  pre-approval, Coach (read-only sandbox) can't invoke any external tool —
+  Codex's elicitation/approval path auto-cancels the call because the
+  embedded app-server client has no `request_user_input` handler. The act
+  of saving a server through the Options drawer is the user's
+  authorization signal; users who want explicit approval-on-use can set
+  `default_tools_approval_mode` to a different value in the saved config
+  (it's preserved verbatim). Players (`danger-full-access`) skip approval
+  and are unaffected. Claude runtime is unaffected — its allow-list is
+  enforced through `ClaudeAgentOptions.allowed_tools`.
 
 ---
 
@@ -1847,7 +1858,13 @@ Health checks:
 - Claude CLI version.
 - Claude auth credential file presence.
 - WebDAV probe, cached 60s.
-- External MCP config parse/status.
+- External MCP merged status — always probes `load_external_servers()`,
+  which merges the legacy `HARNESS_MCP_CONFIG` file with the
+  `mcp_servers` DB table. Reports the merged server count, server
+  names, and total allowed-tool count. `skipped` is set only when both
+  sources yield zero servers; a present-but-broken file still reports
+  `error`. DB-managed servers added through the Options drawer surface
+  here regardless of whether the legacy env var is set.
 - Secrets store readiness.
 - Workspaces git status when repo configured.
 - Wiki/global resources presence.
@@ -2115,13 +2132,22 @@ Suggested defaults:
 | Endpoint | Notes |
 | --- | --- |
 | `GET /api/mcp/servers` | List DB MCP servers, redacted |
-| `POST /api/mcp/servers` | Save one or more server configs from paste |
-| `PATCH /api/mcp/servers/{name}` | Toggle enabled/tools |
-| `DELETE /api/mcp/servers/{name}` | Delete DB MCP server |
+| `POST /api/mcp/servers` | Save one or more server configs from paste; evicts cached Codex clients |
+| `PATCH /api/mcp/servers/{name}` | Toggle enabled/tools; evicts cached Codex clients |
+| `DELETE /api/mcp/servers/{name}` | Delete DB MCP server; evicts cached Codex clients |
 | `POST /api/mcp/servers/{name}/test` | Smoke-test command/url |
 | `GET /api/secrets` | List secret metadata and store status |
 | `PUT /api/secrets/{name}` | Upsert encrypted secret |
 | `DELETE /api/secrets/{name}` | Delete secret |
+
+The three CRUD endpoints (save/patch/delete) call
+`CodexRuntime.evict_all_clients()` so newly-added or removed MCP
+servers take effect on each agent's next turn without a server
+restart. See §19 (Codex coord MCP) for the eviction lifecycle. The
+single + batch `DELETE /api/agents/{id}/session` endpoints also call
+`evict_client(slot)` for the same reason — clearing a session and
+clearing the cached Codex subprocess are two faces of the same
+"start fresh" intent.
 
 MCP paste shapes accepted:
 
@@ -2613,6 +2639,21 @@ Secret names must match:
 ^[A-Za-z_][A-Za-z0-9_]{0,63}$
 ```
 
+Names are entered plain (e.g. `ZEABUR_API_KEY`). The `${NAME}` wrapper
+is the *placeholder syntax* used inside config files that interpolate
+the secret (MCP configs, repo URLs, anything else routed through
+`_interpolate`) — not the secret's name. The Settings drawer input
+auto-strips a `${NAME}` or `$NAME` wrapper before submission so a
+copy-paste from an MCP config doesn't fail validation. Server-side
+validation still enforces the regex above and rejects malformed names
+with a 400.
+
+Secrets are general-purpose. They can be referenced anywhere the
+harness expands `${VAR}` placeholders — MCP server configs, the
+project repo URL, future config fields. The store wins over `os.environ`
+on name collision so a UI-stored secret transparently overrides any
+matching env var.
+
 Values max 32,768 chars through API.
 
 ### 18.3 Telegram Bridge
@@ -2769,10 +2810,31 @@ calls fail with "user rejected MCP tool call" under restrictive
 sandboxes (Coach is `read-only`) because the embedded app-server
 client has no `request_user_input` handler. `coord_*` is harness-
 trusted by the single-write-handle invariant, so blanket approval is
-correct (see openai/codex issue #16685). The harness must NOT pass
-`config.plugins` — Codex's TOML schema treats `plugins` as a map
-keyed by plugin name with `PluginConfig` values, so any boolean there
-fails serde at `thread/start`.
+correct (see openai/codex issue #16685). External MCP servers added
+through the Options drawer inherit the same `default_tools_approval_mode
+= "approve"` injection (see §13 above) — without it, Coach can't call
+*any* external MCP tool. The harness must NOT pass `config.plugins` —
+Codex's TOML schema treats `plugins` as a map keyed by plugin name
+with `PluginConfig` values, so any boolean there fails serde at
+`thread/start`.
+
+**Cache invalidation on config change.** The Codex app-server subprocess
+captures `mcp_servers` at spawn time, so a UI-side MCP server add /
+patch / delete won't propagate into the running subprocess. Two helpers
+in `server/runtimes/codex.py` handle this:
+
+- `evict_client(slot)` — full `close_client` on idle slots; cache-pop
+  only when a turn is in flight (the live turn keeps its client
+  reference; next turn rebuilds with current MCP config).
+- `evict_all_clients()` — same, applied to every cached slot.
+
+`evict_client(slot)` is called from `DELETE /api/agents/{id}/session`
+(single + batch). `evict_all_clients()` is called from the MCP CRUD
+endpoints (`POST/PATCH/DELETE /api/mcp/servers/...`). Result: MCP
+server changes take effect on the next turn without a full server
+restart. ClaudeRuntime is unaffected because it constructs
+`ClaudeAgentOptions` fresh per turn and re-reads
+`load_external_servers()` each time.
 
 The coord MCP config pins both `cwd` and `PYTHONPATH` to the harness
 root so `python -m server.coord_mcp` remains importable even when

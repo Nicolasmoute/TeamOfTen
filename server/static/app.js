@@ -5147,8 +5147,26 @@ function SecretsSection() {
   useEffect(() => { reload(); }, [reload]);
 
   const save = useCallback(async () => {
-    const trimmed = name.trim();
+    // Common copy-paste mistake: user pastes `${ZEABUR_API_KEY}` from an
+    // MCP config straight into the name field. The placeholder wrapper
+    // is the *interpolation syntax*, not part of the secret name. Strip
+    // it transparently so the user doesn't have to guess. Also strip a
+    // leading `$` (e.g. `$FOO` shell-style).
+    let trimmed = name.trim();
+    const placeholder = trimmed.match(/^\$\{([A-Za-z_][A-Za-z0-9_]{0,63})\}$/);
+    if (placeholder) {
+      trimmed = placeholder[1];
+    } else if (/^\$[A-Za-z_][A-Za-z0-9_]*$/.test(trimmed)) {
+      trimmed = trimmed.slice(1);
+    }
     if (!trimmed || !value) return;
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(trimmed)) {
+      setMsg({
+        kind: "err",
+        text: `name must match env-var rules: [A-Za-z_][A-Za-z0-9_]*, max 64 chars (got '${trimmed}')`,
+      });
+      return;
+    }
     setBusy(true);
     setMsg(null);
     try {
@@ -5198,10 +5216,15 @@ function SecretsSection() {
   return html`<section class="drawer-section">
     <h3>Secrets</h3>
     <p class="muted" style="margin: 0 0 6px 0; font-size: 12px;">
-      Encrypted values referenced by <code>\${NAME}</code> placeholders in
-      MCP configs. On collision with an env var of the same name, the
-      stored secret wins. Values are write-only — you can replace or
-      delete, but never read back.
+      Encrypted values you can reference anywhere the harness expands
+      <code>\${NAME}</code> placeholders — MCP configs, project repo URLs,
+      and other config fields that interpolate at runtime. Enter the
+      name plain (e.g. <code>ZEABUR_API_KEY</code>), without the
+      <code>\${...}</code> wrapper — the wrapper is the placeholder
+      syntax used in the config files that consume the secret. On
+      collision with an env var of the same name, the stored secret
+      wins. Values are write-only — you can replace or delete, but
+      never read back.
     </p>
     ${disabled
       ? html`<p style="font-size: 12px; color: var(--err); margin: 0 0 6px 0;">

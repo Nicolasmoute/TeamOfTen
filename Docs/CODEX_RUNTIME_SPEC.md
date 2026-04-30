@@ -343,6 +343,17 @@ mcp_servers = {"coord": coord_server, **external_servers}
 }
 ```
 
+**External MCP servers inherit the same approval policy.** Servers added
+through the Options drawer (Phase 1 MCP UI) are merged into `mcp_servers`
+with `default_tools_approval_mode = "approve"` injected when not already
+set. Without this, Coach (read-only sandbox) can't call any external
+tool — every call hits the same auto-cancellation path that previously
+broke `coord`. The act of adding a server via the UI is the user's
+authorization signal; an explicit `default_tools_approval_mode` value
+in the saved config is preserved (opt-out for users who want
+approval-on-use). Implementation in `_build_mcp_servers`
+([server/runtimes/codex.py](../server/runtimes/codex.py)).
+
 > **Don't pass `config.plugins`.** Earlier drafts injected
 > `config = {"plugins": {"enabled": false}}` to suppress plugin
 > warmups. Codex's TOML schema treats `plugins` as a map keyed by

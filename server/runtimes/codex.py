@@ -937,6 +937,20 @@ def _build_mcp_servers(tc: TurnContext) -> dict[str, Any]:
     for name, cfg in (tc.external_mcp_servers or {}).items():
         if name == "coord":
             continue
+        # Mirror the approval policy applied to `coord`: external MCP
+        # servers added through the Options drawer are user-authorized
+        # by the act of adding them, so pre-approve their tool calls.
+        # Without this, Coach (read-only sandbox) can't invoke any
+        # external MCP tool — Codex routes the call through the
+        # elicitation/approval path, the embedded app-server client
+        # has no `request_user_input` handler, and the call is
+        # auto-cancelled with "user rejected MCP tool call". Players
+        # (danger-full-access) skip approval so they're unaffected
+        # either way. Caller-provided `default_tools_approval_mode` is
+        # respected if present (so a user who explicitly wants
+        # approval-on-use can keep it).
+        if isinstance(cfg, dict) and "default_tools_approval_mode" not in cfg:
+            cfg = {**cfg, "default_tools_approval_mode": "approve"}
         servers[name] = cfg
     return servers
 

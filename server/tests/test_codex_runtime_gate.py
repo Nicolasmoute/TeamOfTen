@@ -477,6 +477,40 @@ async def test_evict_all_clients_mixes_idle_and_running(monkeypatch, tmp_path) -
     assert codex_mod._codex_clients == {}
 
 
+async def test_build_mcp_servers_pre_approves_external_servers() -> None:
+    """External MCP servers added via the Options drawer must inherit
+    `default_tools_approval_mode='approve'` so Coach (read-only sandbox)
+    can call their tools. Without this, Codex's approval flow auto-cancels
+    every external tool call with 'user rejected MCP tool call' because
+    the embedded app-server client has no approval handler."""
+    from server.runtimes.codex import _build_mcp_servers
+    from server.runtimes.base import TurnContext
+
+    tc = TurnContext(
+        agent_id="coach",
+        project_id="default",
+        prompt="hi",
+        system_prompt="",
+        workspace_cwd="",
+        allowed_tools=[],
+        external_mcp_servers={
+            "zeabur": {"type": "stdio", "command": "npx", "args": ["zeabur-mcp"]},
+            "explicit_off": {
+                "type": "stdio",
+                "command": "x",
+                "default_tools_approval_mode": "request",
+            },
+        },
+    )
+    servers = _build_mcp_servers(tc)
+    assert servers["coord"]["default_tools_approval_mode"] == "approve"
+    assert servers["zeabur"]["default_tools_approval_mode"] == "approve"
+    # Caller-provided value is respected — opt-out for users who want it.
+    assert servers["explicit_off"]["default_tools_approval_mode"] == "request"
+    # Original cfg dict in tc must not be mutated in place.
+    assert "default_tools_approval_mode" not in tc.external_mcp_servers["zeabur"]
+
+
 async def test_failed_handshake_does_not_poison_cache(
     monkeypatch, tmp_path,
 ) -> None:
@@ -1312,7 +1346,13 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
     assert mcp_servers["coord"]["cwd"]
     assert mcp_servers["coord"]["env"]["PYTHONPATH"].startswith(mcp_servers["coord"]["cwd"])
     assert mcp_servers["coord"]["env"]["HARNESS_COORD_PROXY_TOKEN"] == "tok_test"
-    assert mcp_servers["extra"] == {"command": "extra-mcp"}
+    # External MCP server config is passed through, plus an injected
+    # `default_tools_approval_mode='approve'` so Coach (read-only) can
+    # use it. See test_build_mcp_servers_pre_approves_external_servers.
+    assert mcp_servers["extra"] == {
+        "command": "extra-mcp",
+        "default_tools_approval_mode": "approve",
+    }
 
     assert thread.chat_calls[0]["text"] == "say hello"
     assert thread.chat_calls[0]["user"] == "p1"

@@ -516,21 +516,21 @@ async def health() -> JSONResponse:
             "url": webdav.url,
         }
 
-    # 5. External MCP servers — reports what HARNESS_MCP_CONFIG yielded
-    # at load time. Purely informational (we don't fail health on a
-    # missing config — it's optional). Re-reads the file each probe so
-    # edits since last boot are visible without restart.
+    # 5. External MCP servers — reports what's loaded from BOTH sources:
+    # the legacy `HARNESS_MCP_CONFIG` file path (optional) and the
+    # UI-managed `mcp_servers` DB table. New servers are added through
+    # the Options drawer; the file path is kept for boot-time bootstrap.
+    # Always probes the merged list so DB-sourced servers surface in
+    # health regardless of whether the env var is set.
+    from server.mcp_config import load_external_servers
     mcp_cfg_path = os.environ.get("HARNESS_MCP_CONFIG", "").strip()
+    mcp_status: dict[str, Any] = {}
+    file_error: str | None = None
     if mcp_cfg_path:
-        from server.mcp_config import load_external_servers
-        # Do a parallel sanity read so we can distinguish file-missing /
-        # parse-error / no-servers-in-file from each other —
-        # load_external_servers collapses all three to (empty, empty)
-        # and only logs. Report here so the UI surfaces the failure.
-        mcp_status: dict[str, Any] = {"config_path": mcp_cfg_path}
+        mcp_status["config_path"] = mcp_cfg_path
         cfg_file = Path(mcp_cfg_path)
         if not cfg_file.is_file():
-            mcp_status.update({"ok": False, "error": "file does not exist"})
+            file_error = "file does not exist"
         else:
             try:
                 raw = cfg_file.read_text(encoding="utf-8")
@@ -540,27 +540,39 @@ async def health() -> JSONResponse:
                 servers_in = parsed.get("servers")
                 if servers_in is not None and not isinstance(servers_in, dict):
                     raise ValueError("'servers' key must be an object")
-                servers, tool_names = load_external_servers()
-                mcp_status.update({
-                    "ok": True,
-                    "server_count": len(servers),
-                    "servers": sorted(servers.keys()),
-                    "allowed_tool_count": len(tool_names),
-                })
             except Exception as e:
-                mcp_status.update({
-                    "ok": False,
-                    "error": f"{type(e).__name__}: {str(e)[:200]}",
-                })
-        if not mcp_status.get("ok"):
-            overall_ok = False
-        checks["mcp_external"] = mcp_status
+                file_error = f"{type(e).__name__}: {str(e)[:200]}"
+
+    servers, tool_names = load_external_servers()
+    mcp_status.update({
+        "server_count": len(servers),
+        "servers": sorted(servers.keys()),
+        "allowed_tool_count": len(tool_names),
+    })
+    if file_error:
+        mcp_status["ok"] = False
+        mcp_status["error"] = file_error
+        overall_ok = False
     else:
-        checks["mcp_external"] = {
-            "ok": True,
-            "skipped": True,
-            "reason": "HARNESS_MCP_CONFIG not set — only the in-process 'coord' server is active",
-        }
+        mcp_status["ok"] = True
+        if not servers:
+            mcp_status["skipped"] = True
+            if mcp_cfg_path:
+                mcp_status["reason"] = (
+                    "config file parsed but yielded no servers — "
+                    "only the in-process 'coord' server is active"
+                )
+            else:
+                mcp_status["reason"] = (
+                    "no external MCP servers configured — only the "
+                    "in-process 'coord' server is active"
+                )
+        elif not mcp_cfg_path:
+            mcp_status["reason"] = (
+                f"{len(servers)} server(s) loaded from DB "
+                "(Options drawer); HARNESS_MCP_CONFIG not set"
+            )
+    checks["mcp_external"] = mcp_status
 
     # 6. Secrets store — reports master-key readiness + current count.
     # Non-fatal for overall health: an unset HARNESS_SECRETS_KEY is a
