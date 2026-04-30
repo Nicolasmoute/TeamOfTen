@@ -9254,6 +9254,42 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
       );
   }, [mergedEvents]);
 
+  // POST a prompt to /api/agents/start. Returns "ok" / "aborted" /
+  // "failed". Doesn't touch the textarea or pending list — those are
+  // managed by the callers (submit, auto-retry).
+  // Declared BEFORE any effect that depends on it (reconciliation,
+  // auto-retry) so the dep array isn't evaluated in the temporal dead
+  // zone on first render — that's a black-screen-class bug.
+  const postStart = useCallback(async (reqBody) => {
+    const controller = new AbortController();
+    const startTimeout = setTimeout(() => controller.abort(), 60_000);
+    try {
+      try {
+        const res = await authFetch("/api/agents/start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(reqBody),
+          signal: controller.signal,
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return "ok";
+      } catch (err) {
+        if (err && err.name === "AbortError") {
+          // The server almost certainly received and queued the request
+          // before we gave up (the handler is fire-and-forget). Treat
+          // as ok — the next agent_started event will reconcile our
+          // pending entry; if it really didn't land, the pending entry
+          // stays as "sending" until the user notices and retries.
+          return "aborted";
+        }
+        console.error("postStart failed", err);
+        return "failed";
+      }
+    } finally {
+      clearTimeout(startTimeout);
+    }
+  }, []);
+
   // Reconcile pending entries against the latest events. Runs whenever
   // allEvents grows. The effect is idempotent: it returns the same list
   // reference when nothing changes, so React skips a re-render.
@@ -9833,39 +9869,6 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
         return false;
     }
   }, [slot, paneSettings]);
-
-  // POST a prompt to /api/agents/start. Returns "ok" / "aborted" /
-  // "failed". Doesn't touch the textarea or pending list — those are
-  // managed by the callers (submit, auto-retry).
-  const postStart = useCallback(async (reqBody) => {
-    const controller = new AbortController();
-    const startTimeout = setTimeout(() => controller.abort(), 60_000);
-    try {
-      try {
-        const res = await authFetch("/api/agents/start", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(reqBody),
-          signal: controller.signal,
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return "ok";
-      } catch (err) {
-        if (err && err.name === "AbortError") {
-          // The server almost certainly received and queued the request
-          // before we gave up (the handler is fire-and-forget). Treat
-          // as ok — the next agent_started event will reconcile our
-          // pending entry; if it really didn't land, the pending entry
-          // stays as "sending" until the user notices and retries.
-          return "aborted";
-        }
-        console.error("postStart failed", err);
-        return "failed";
-      }
-    } finally {
-      clearTimeout(startTimeout);
-    }
-  }, []);
 
   const submit = useCallback(async () => {
     const text = input.trim();
