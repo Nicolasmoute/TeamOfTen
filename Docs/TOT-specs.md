@@ -2394,6 +2394,36 @@ Body:
   flapping socket cannot continuously rebuild long pane histories.
 - Shows transient streaming text/thinking when token streaming is enabled.
 
+Three-tier visual language for the event timeline (so a long pane is
+scannable — the user's direct dialogue with the agent stands out
+above peer chatter and tool narration):
+
+- **Tier 1 — direct dialogue with the human.** Full `--fg` contrast
+  (white-ish). Applies to `.event.text` (this agent's reply on a
+  turn) and `.event.message_sent.human-thread` (any `message_sent`
+  where `agent_id === "human"` or `to === "human"`, i.e. the human
+  using the EnvPane Messages composer to talk to this agent).
+- **Tier 2 — peer ↔ peer dialogue.** Accent-blue body text + 5%-alpha
+  blue tint on the card background. Applies to
+  `.event.message_sent.peer-thread` (any other `message_sent`,
+  including broadcasts and inter-Player chatter). Distinct from
+  Tier 1 at a glance without competing for attention.
+- **Tier 3 — work narration.** Muted (`--muted`) body text. Applies
+  to `.event.tool_use`, `.event.tool_result`, `.event.thinking`,
+  `.event.sys`, `.event.result`, and lifecycle markers
+  (`.agent_started`, `.agent_stopped`, `.connected`). Tool-specific
+  colors (Read/Edit/Bash/Grep/etc.) stay on the **left border** as
+  identity markers — only the body content dims, so cards remain
+  distinguishable by tool type.
+
+Errors and asks ignore the tiering and stay loud regardless: `.event.error`
+red, `.event.tool_result.error` red, plus AskUserQuestion / plan-mode
+/ truth-proposal / human_attention escalations.
+
+Routing logic for `message_sent` lives in [server/static/app.js](../server/static/app.js)'s
+event renderer — it adds `.human-thread` or `.peer-thread` based on
+`from`/`to` ids before the CSS tiering takes over.
+
 Input:
 
 - Textarea.

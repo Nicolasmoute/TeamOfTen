@@ -627,9 +627,10 @@ async def test_compose_tick_prompt_base_when_objectives_present(
     pp.project_objectives.write_text("Be brilliant.\n", encoding="utf-8")
     out = await recmod.compose_tick_prompt("misc")
     assert out.startswith("Routine tick.")
-    assert "(1) inbox" in out
-    assert "(2) outstanding coach-todos" in out
-    assert "(3) advance project objectives" in out
+    # Priority order spelled out in the prompt — inbox, todos, objectives.
+    assert "Inbox" in out
+    assert "coach-todos" in out
+    assert "Project objectives" in out
     # Elicitation note must NOT appear when objectives exist.
     assert "missing or empty" not in out
 
@@ -710,13 +711,24 @@ async def test_compose_tick_prompt_resets_after_objectives_saved(
 
 
 def test_tick_base_prompt_constant_matches_spec() -> None:
-    # Spec §4 verbatim — locks the contract so future edits can't
-    # silently drift away from the documented wording.
-    assert recmod.TICK_BASE_PROMPT == (
-        "Routine tick. Priority: (1) inbox, (2) outstanding "
-        "coach-todos, (3) advance project objectives. If all three "
-        "are empty, end the turn without calling tools."
-    )
+    # Spec §4 — the tick prompt orients Coach to a priority order:
+    # inbox → coach-todos → objectives → end-quietly. The empty-state
+    # branch (objectives) explicitly directs Coach to take a concrete
+    # action rather than just "advance" something vague. Tests pin
+    # the structural pieces, not the verbatim string, so wording can
+    # be tuned without breaking unrelated tests.
+    p = recmod.TICK_BASE_PROMPT
+    assert p.startswith("Routine tick.")
+    assert "Inbox" in p
+    assert "coord_read_inbox" in p
+    assert "coach-todos" in p
+    assert "Project objectives" in p
+    # Concrete action language for the empty-state branch — not just
+    # "advance objectives" which is what the original wording said.
+    assert "concrete action" in p
+    # Empty-state guard preserved: do not invent work.
+    assert "Don't invent work" in p
+    assert "without calling tools" in p
 
 
 async def test_scheduler_uses_compose_tick_prompt(

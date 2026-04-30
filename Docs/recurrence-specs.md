@@ -129,9 +129,27 @@ The composed prompt is sent as a normal user-role message. The system prompt
 already contains the project objectives + open todos (see §6), so the user
 prompt is short — it just orients Coach to the priority order:
 
-> Routine tick. Priority: (1) inbox, (2) outstanding coach-todos, (3) advance
-> project objectives. If all three are empty, end the turn without calling
-> tools.
+> Routine tick. Priority order:
+>
+> (1) Inbox — call coord_read_inbox and respond to anything pending from the
+> human or your teammates.
+> (2) Outstanding coach-todos — pick the one most aligned with current
+> priorities and act on it (assign it, break it down, or do the work).
+> (3) Project objectives — if inbox and todos are both empty, take one
+> concrete action that pushes the project closer to its objectives:
+> propose a useful next step and execute it, break a goal into a new
+> coach-todo for the operator to refine, or send a status update to the
+> team.
+>
+> Don't invent work. If there's genuinely nothing useful to do, end the
+> turn without calling tools.
+
+The objectives branch is intentionally directive — earlier wording ("advance
+project objectives") was too vague to push Coach off the fence on a quiet
+day. The current wording asks for **one concrete action** with three
+example shapes (execute a step, capture a coach-todo, share a status
+update), so an empty-inbox tick produces visible forward motion when there
+*is* useful work, and end-quietly when there isn't.
 
 This replaces today's `COACH_TICK_PROMPT`.
 

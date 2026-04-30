@@ -323,9 +323,21 @@ async def _emit(event: dict[str, Any]) -> None:
 # already contains project objectives + open coach todos, so the user
 # prompt just tells Coach the priority order.
 TICK_BASE_PROMPT = (
-    "Routine tick. Priority: (1) inbox, (2) outstanding coach-todos, "
-    "(3) advance project objectives. If all three are empty, end the "
-    "turn without calling tools."
+    "Routine tick. Priority order:\n"
+    "\n"
+    "(1) Inbox — call coord_read_inbox and respond to anything pending "
+    "from the human or your teammates.\n"
+    "(2) Outstanding coach-todos — pick the one most aligned with "
+    "current priorities and act on it (assign it, break it down, or "
+    "do the work).\n"
+    "(3) Project objectives — if inbox and todos are both empty, take "
+    "one concrete action that pushes the project closer to its "
+    "objectives: propose a useful next step and execute it, break a "
+    "goal into a new coach-todo for the operator to refine, or send "
+    "a status update to the team.\n"
+    "\n"
+    "Don't invent work. If there's genuinely nothing useful to do, "
+    "end the turn without calling tools."
 )
 
 
