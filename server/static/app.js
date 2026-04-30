@@ -8977,6 +8977,18 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
   //   - If a `spawn_rejected` arrives matching a "sending" entry,
   //     flip it to "queued" and surface a notice in the pane.
   const [pending, setPending] = useState([]);
+  // Optimistic lock-state mirror. Set to true/false on click; cleared
+  // (set to null) once the parent's `agent.locked` prop catches up
+  // with our intent. Without this the click feels broken — the WS
+  // round-trip can take a moment, and authFetch doesn't surface
+  // failures, so a 4xx leaves the icon stuck on "open".
+  const [lockedOptimistic, setLockedOptimistic] = useState(null);
+  const [lockBusy, setLockBusy] = useState(false);
+  const lockedEffective = lockedOptimistic !== null ? lockedOptimistic : !!agent?.locked;
+  useEffect(() => {
+    if (lockedOptimistic === null) return;
+    if (!!agent?.locked === lockedOptimistic) setLockedOptimistic(null);
+  }, [agent?.locked, lockedOptimistic]);
   const [roleDefaultRuntime, setRoleDefaultRuntime] = useState(null);
   const [roleDefaultModels, setRoleDefaultModels] = useState(null);
   const runtimeOverride = (agent?.runtime_override || "").toLowerCase();
@@ -10132,18 +10144,37 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
           : null}
         ${slot !== "coach"
           ? html`<button
-              class=${"pane-lock" + (agent?.locked ? " locked" : " unlocked")}
+              class=${"pane-lock" + (lockedEffective ? " locked" : " unlocked") + (lockBusy ? " busy" : "")}
+              disabled=${lockBusy}
               onClick=${async () => {
-                await authFetch("/api/agents/" + slot + "/locked", {
-                  method: "PUT",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ locked: !agent?.locked }),
-                });
+                if (lockBusy) return;
+                const next = !lockedEffective;
+                setLockedOptimistic(next);
+                setLockBusy(true);
+                try {
+                  const res = await authFetch("/api/agents/" + slot + "/locked", {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ locked: next }),
+                  });
+                  if (!res.ok) {
+                    console.error("lock toggle failed", res.status, await res.text().catch(() => ""));
+                    setLockedOptimistic(null); // revert to server truth
+                  }
+                  // On success: leave lockedOptimistic set; the
+                  // useEffect above clears it once the WS-driven
+                  // refresh delivers the new agent.locked prop.
+                } catch (e) {
+                  console.error("lock toggle network error", e);
+                  setLockedOptimistic(null);
+                } finally {
+                  setLockBusy(false);
+                }
               }}
-              title=${agent?.locked
+              title=${lockedEffective
                 ? "LOCKED — Coach cannot assign tasks or message this agent; agent skips Coach broadcasts. Click to unlock."
                 : "Unlocked — Coach can assign work and broadcast. Click to lock (this agent becomes human-only)."}
-              dangerouslySetInnerHTML=${{ __html: agent?.locked
+              dangerouslySetInnerHTML=${{ __html: lockedEffective
                 ? `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="9" width="11" height="8" rx="1.2"/><path d="M7 9V6.5a3 3 0 0 1 6 0V9"/></svg>`
                 : `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="9" width="11" height="8" rx="1.2"/><path d="M13 9V6 A3 3 0 0 0 6 4.5"/></svg>` }}
             ></button>`

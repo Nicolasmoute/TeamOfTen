@@ -1786,6 +1786,8 @@ body {
 .pane-lock.unlocked { color: var(--ok); }
 .pane-lock.locked   { color: var(--err); }
 .pane-lock:hover    { filter: brightness(1.2); }
+.pane-lock.busy     { opacity: 0.6; cursor: progress; }
+.pane-lock[disabled] { cursor: progress; }
 .pane-session-clear {
   background: transparent;
   border: 0;
