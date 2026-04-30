@@ -10378,7 +10378,14 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
               ? "Model: per-pane override (click to change)"
               : "Model: inheriting role default (click to change)"}
           >
-            ${modelLabelFor(effectiveModelId || "", effectiveRuntime)}
+            ${(() => {
+              const label = modelLabelFor(effectiveModelId || "", effectiveRuntime);
+              // modelLabelFor falls back to "default" when the resolved
+              // id is empty — replace with "auto" since the user just
+              // wants to see the running model name, never the word
+              // "default".
+              return (!effectiveModelId || label === "default") ? "auto" : label;
+            })()}
           </button>
           <button
             class=${"pane-mode-chip" + (paneSettings.planMode ? " active" : "")}
@@ -10387,18 +10394,18 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
               ? "Plan mode ON — agent drafts a plan first (click to turn off)"
               : "Plan mode OFF — agent acts directly (click to turn on)"}
           >
-            ${paneSettings.planMode ? "plan: on" : "plan: off"}
+            ${paneSettings.planMode ? "plan" : "no plan"}
           </button>
           <button
             class=${"pane-mode-chip" + (paneSettings.effort ? " active" : "")}
             onClick=${() => setSettingsOpen(true)}
             title=${paneSettings.effort
               ? "Effort tier (click to change)"
-              : "Effort: model default (click to override)"}
+              : "Effort: model default — click to override (low/med/high/max)"}
           >
-            effort: ${paneSettings.effort
+            ${paneSettings.effort
               ? EFFORT_LABELS[paneSettings.effort - 1]
-              : "default"}
+              : "auto"}
           </button>
           <${ContextBar} slot=${slot} liveEvents=${liveEvents} model=${paneSettings.model || ""} />
           <span class="pane-modes-spacer"></span>

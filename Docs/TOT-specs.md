@@ -2438,15 +2438,19 @@ Input:
 
 - Textarea.
 - Image paste/upload strip.
-- Mode chips for model, plan, effort, context. Each chip shows its
-  **resolved value** rather than just a label — e.g. the model chip
-  says "Sonnet 4.6" not "default", resolving via paneSettings.model →
-  `/api/team/models[role|role_codex]` → suggested fallback. Plan chip
-  reads "plan: on" / "plan: off" so the off state is unambiguous.
-  Effort chip reads "effort: default" when no override is set,
-  "effort: low|med|high|max" when one is. The Settings drawer's role-
-  default save dispatches a `team-models-updated` window event so all
-  open panes refresh their resolved model labels live.
+- Mode chips for model, plan, effort, context. Each chip shows the
+  **currently running parameter**, no labels or `key:` prefix:
+    - **Model chip** — actual model name ("Sonnet 4.6", "Opus 4.7",
+      "GPT-5.1 Codex"), resolved via paneSettings.model →
+      `/api/team/models[role|role_codex]` → suggested fallback. The
+      word "default" is never shown — when nothing resolves the chip
+      reads `auto`.
+    - **Plan chip** — `plan` or `no plan`. Toggle on click.
+    - **Effort chip** — `low` / `med` / `high` / `max` when overridden,
+      `auto` when not (no `effort:` prefix; "default" is never shown).
+  The Settings drawer's role-default save dispatches a
+  `team-models-updated` window event so all open panes refresh their
+  resolved model labels live.
 - Slash command autocomplete.
 - Prompt history.
 - Ctrl/Cmd+Enter sends.
