@@ -431,6 +431,52 @@ async def test_close_all_clients(monkeypatch, tmp_path) -> None:
     assert codex_mod._codex_clients == {}
 
 
+async def test_evict_client_idle_closes_subprocess(monkeypatch, tmp_path) -> None:
+    """Idle slot: evict_client should fully close the cached subprocess
+    so the next turn rebuilds it with fresh MCP config."""
+    _install_fake_sdk(monkeypatch)
+    monkeypatch.setattr("server.agents.is_agent_running", lambda _slot: False)
+    from server.runtimes.codex import get_client, evict_client
+    from server.runtimes import codex as codex_mod
+
+    client = await get_client("p1", cwd=str(tmp_path))
+    await evict_client("p1")
+    assert client.closed == 1
+    assert "p1" not in codex_mod._codex_clients
+
+
+async def test_evict_client_running_pops_without_close(monkeypatch, tmp_path) -> None:
+    """In-flight turn: evict_client should pop the cache entry but
+    leave the subprocess alive so the live turn can finish."""
+    _install_fake_sdk(monkeypatch)
+    monkeypatch.setattr("server.agents.is_agent_running", lambda _slot: True)
+    from server.runtimes.codex import get_client, evict_client
+    from server.runtimes import codex as codex_mod
+
+    client = await get_client("p1", cwd=str(tmp_path))
+    await evict_client("p1")
+    assert client.closed == 0, "in-flight subprocess must NOT be closed"
+    assert "p1" not in codex_mod._codex_clients, "cache entry must be popped"
+
+
+async def test_evict_all_clients_mixes_idle_and_running(monkeypatch, tmp_path) -> None:
+    """evict_all_clients should close idle slots and pop running ones."""
+    _install_fake_sdk(monkeypatch)
+    from server.runtimes.codex import get_client, evict_all_clients
+    from server.runtimes import codex as codex_mod
+
+    a = await get_client("p1", cwd=str(tmp_path))
+    b = await get_client("p2", cwd=str(tmp_path))
+    monkeypatch.setattr(
+        "server.agents.is_agent_running",
+        lambda slot: slot == "p1",
+    )
+    await evict_all_clients()
+    assert a.closed == 0, "p1 has a live turn — must stay open"
+    assert b.closed == 1, "p2 idle — must close"
+    assert codex_mod._codex_clients == {}
+
+
 async def test_failed_handshake_does_not_poison_cache(
     monkeypatch, tmp_path,
 ) -> None:

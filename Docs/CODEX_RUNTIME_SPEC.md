@@ -407,6 +407,21 @@ satisfying the SDK's "one active turn consumer per client" constraint.
 Close (`await client.close()`) and re-open on auth-error / transport
 error.
 
+**Cache invalidation on config change.** `mcp_servers` is captured at
+subprocess spawn time via `_codex_config_overrides` → `_build_mcp_servers`,
+so a UI-side MCP server add / patch / delete won't propagate into the
+running subprocess. Two helpers handle this:
+
+- `evict_client(slot)` — full close on idle slots; cache-pop only when
+  a turn is in flight (lets the live turn finish on its own client
+  reference; next turn rebuilds with current MCP config).
+- `evict_all_clients()` — same, applied to every cached slot.
+
+`evict_client(slot)` is called from `DELETE /api/agents/{id}/session`
+(single + batch). `evict_all_clients()` is called from
+`POST/PATCH/DELETE /api/mcp/servers/...`. Result: MCP server changes
+take effect on the agent's next turn without a server restart.
+
 ### E.2 Thread start vs resume
 
 Real signatures (confirmed live, see Docs/CODEX_PROBE_OUTPUT.md):

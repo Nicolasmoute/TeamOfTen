@@ -355,6 +355,49 @@ async def close_all_clients() -> None:
         await close_client(slot)
 
 
+async def evict_client(slot: str) -> None:
+    """Drop the cached app-server client so the next turn rebuilds it.
+
+    Use case: MCP config / session state changed and the long-lived
+    subprocess (which captured `mcp_servers` at spawn time via
+    `_codex_config_overrides`) needs to be replaced before the agent
+    can see the new tool surface.
+
+    Behavior splits on whether a turn is in flight:
+    - Idle slot → full `close_client` (closes subprocess, revokes token).
+    - In-flight turn → pop from `_codex_clients` only; leave the running
+      subprocess + its token intact so the live turn can complete. The
+      next turn's `get_client` lookup creates a fresh subprocess that
+      picks up current MCP config. The orphaned subprocess is a small
+      leak until container restart — acceptable trade-off vs killing a
+      live turn from an admin-side config change.
+    """
+    try:
+        from server.agents import is_agent_running
+    except Exception:
+        is_agent_running = lambda _slot: False  # noqa: E731
+
+    if is_agent_running(slot):
+        async with _slot_lock(slot):
+            _codex_clients.pop(slot, None)
+        logger.info(
+            "CodexRuntime: evicted cache entry for slot=%s "
+            "(turn in flight; subprocess kept alive)", slot,
+        )
+        return
+    await close_client(slot)
+
+
+async def evict_all_clients() -> None:
+    """Evict every cached client. Idle slots get a full close; slots
+    with an in-flight turn get cache-popped only. Called from MCP
+    server save/patch/delete so config changes propagate without a
+    full server restart."""
+    slots = list(_codex_clients.keys())
+    for slot in slots:
+        await evict_client(slot)
+
+
 # ---------------------------------------------------------------------
 # Thread persistence (audit item #9 — Docs/CODEX_RUNTIME_SPEC.md §E.2)
 #

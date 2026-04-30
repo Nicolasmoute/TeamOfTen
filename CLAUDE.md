@@ -622,6 +622,26 @@ UI:
   The DELETE endpoint was already runtime-agnostic (drops the whole
   `agent_sessions` row), so no server change beyond the SELECT.
 
+**Recent (2026-04-30) — Codex MCP cache invalidation:**
+
+- **`evict_client` / `evict_all_clients`** in
+  [server/runtimes/codex.py](server/runtimes/codex.py). The Codex
+  app-server subprocess captures `mcp_servers` at spawn time, so a
+  newly-added MCP server in the UI was invisible to any agent whose
+  Codex client was already cached. Symptom: smoke-test green, agent
+  reports "no Zeabur MCP tool exposed in this session." Fix: the
+  session-clear endpoints (`DELETE /api/agents/{id}/session` and
+  `POST /api/agents/sessions/clear`) and the MCP CRUD endpoints
+  (`POST/PATCH/DELETE /api/mcp/servers/...`) now invalidate the
+  cache. Idle slots get a full `close_client`; in-flight turns get
+  cache-popped only so the live turn can finish on its own client
+  reference. Next turn rebuilds the subprocess with the current MCP
+  list. ClaudeRuntime is unaffected (it builds `ClaudeAgentOptions`
+  fresh per turn). Tests in
+  [server/tests/test_codex_runtime_gate.py](server/tests/test_codex_runtime_gate.py)
+  cover idle-close, in-flight-pop, and the mixed `evict_all_clients`
+  case. Spec mirror in [Docs/CODEX_RUNTIME_SPEC.md](Docs/CODEX_RUNTIME_SPEC.md) §E.1.
+
 **Next likely:**
 - **Mobile UI polish** — touch-drag doesn't work with HTML5 DnD;
    layout breakpoints for < 900 px need a rethink.

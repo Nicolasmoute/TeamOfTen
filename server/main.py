@@ -1712,6 +1712,15 @@ async def save_mcp_server(
             "actor": actor,
         }
     )
+    # MCP server list is captured at Codex app-server subprocess spawn
+    # time. Drop every cached client so each agent's next turn rebuilds
+    # the subprocess with the new server list. Idle slots get a clean
+    # close; in-flight turns are cache-popped only (see evict_client).
+    try:
+        from server.runtimes.codex import evict_all_clients as _codex_evict_all
+        await _codex_evict_all()
+    except Exception:
+        logger.exception("codex evict_all_clients failed after mcp save")
     return {"ok": True, "saved": saved, "secret_warnings": warnings}
 
 
@@ -1765,6 +1774,11 @@ async def patch_mcp_server(
             "actor": actor,
         }
     )
+    try:
+        from server.runtimes.codex import evict_all_clients as _codex_evict_all
+        await _codex_evict_all()
+    except Exception:
+        logger.exception("codex evict_all_clients failed after mcp patch")
     return {"ok": True}
 
 
@@ -1794,6 +1808,11 @@ async def delete_mcp_server(
             "actor": actor,
         }
     )
+    try:
+        from server.runtimes.codex import evict_all_clients as _codex_evict_all
+        await _codex_evict_all()
+    except Exception:
+        logger.exception("codex evict_all_clients failed after mcp delete")
     return {"ok": True}
 
 
@@ -2851,6 +2870,14 @@ async def clear_session(
             "actor": actor,
         }
     )
+    # Drop any cached Codex app-server subprocess for this slot so the
+    # next turn spawns a fresh one (picking up current MCP server list,
+    # env, etc). No-op for slots running the Claude runtime.
+    try:
+        from server.runtimes.codex import evict_client as _codex_evict
+        await _codex_evict(agent_id)
+    except Exception:
+        logger.exception("codex evict_client failed for slot=%s", agent_id)
     return {"ok": True, "agent_id": agent_id}
 
 
@@ -2953,6 +2980,13 @@ async def clear_sessions_batch(
                 "actor": actor,
             }
         )
+    # Same Codex subprocess eviction as the single-slot endpoint.
+    try:
+        from server.runtimes.codex import evict_client as _codex_evict
+        for sid in targets:
+            await _codex_evict(sid)
+    except Exception:
+        logger.exception("codex evict_client failed during batch session clear")
     return {"ok": True, "cleared": targets, "updated": updated}
 
 
