@@ -6,13 +6,57 @@
 
 ![TeamOfTen multi-pane UI](Docs/Screenshot%202026-04-26%20232144.jpg)
 
-I couldn't find a multi-agent setup that felt right — most were either heavy frameworks or black-box products. This is the opposite: a single-container web app where **1 Coach + 10 Players** share a task board, message each other, and work directly on your GitHub repo via per-Player git worktrees. They produce documents at every level (scratchpad memory, knowledge artifacts, immutable decisions, binary deliverables) that mirror to your cloud drive in real time. They can plug into third-party **MCP servers** (Notion, Slack, Linear, Sentry — anything that speaks MCP) for the work that lives outside the codebase. Everything is visible in a tileable multi-pane UI: intervene on any agent directly, watch the inter-agent chatter unfold live, or just sit back and steer through Coach. You're part of the team — even though the main idea is to keep Coach as the single entry point.
+I couldn't find a multi-agent setup that felt right — most were either heavy frameworks or black-box products. This is the opposite: a single-container web app where **1 Coach + 10 Players** share memory, a task board, and a tileable multi-pane UI. Coach plans, Players execute in their own git worktrees and push straight to your repo, and everything human-readable mirrors to a WebDAV-compatible cloud drive (kDrive, Nextcloud, ownCloud, Fastmail). Intervene on any agent live, or steer through Coach.
 
-Set it up once on a VPS and it runs 24/7. Send goals to Coach from your phone via the mobile UI or a Telegram bridge. Read the team's output from your kDrive folder anywhere. Open Obsidian on the same folder and you have a live second-brain the agents write into.
+Set it up once on a VPS and it runs 24/7. Drive Coach from your phone via Telegram or the mobile UI. Open Obsidian on the synced folder and you have a live second-brain the agents write into. Nice little project. Have fun, improve it.
 
-The code is intentionally simple. The storage backend assumes a **WebDAV-compatible cloud drive** — kDrive, Nextcloud, ownCloud, Fastmail, whatever — because plain WebDAV was the shortest path from "runs in Docker" to "I can read the agents' output from my phone". If you need something else, swap [server/webdav.py](server/webdav.py) — it's ~10 methods.
+---
 
-Nice little project. Have fun, improve it.
+## At a glance
+
+A personal AI engineering harness for people who want to *manage* a team of agents — not chat with a single one.
+
+### Team & coordination
+A real team that breaks down goals, divides work in parallel, names its members, and talks to itself — instead of one chatbot you keep prompting.
+
+### SDD-ready (specs-based development)
+Your specs are protected. Agents *propose* changes to a `truth/` folder; you approve or deny in the UI. The source of truth doesn't drift behind your back.
+
+### Runs Claude Code and OpenAI Codex
+Mix Claude and Codex agents on the same team — pick the right model per slot. Switch active project and the whole team follows: workspaces, repos, objectives, costs.
+
+### Coach automation — recurrences
+Coach keeps the team moving while you're away. Smart ticks compose their own prompts from inbox + todos + objectives, so you don't write "what's next" every time.
+
+### Web UI
+All 11 agents visible at once. Drag panes to rearrange, paste screenshots, real diff views, click-through to files. Dense and quiet — no spinner soup.
+
+### Environment panel
+Tasks, cost, project objectives, coach todos, memory, decisions, urgent escalations — project state one panel away.
+
+### Cost tracking
+Daily caps per agent and team, enforced before each turn. Per-project breakdown. Reset for fresh headroom when you choose. Spend stays predictable.
+
+### Git integration
+Eleven Players, eleven isolated branches — no merge conflicts between them. One tool call to commit and push.
+
+### Cloud-drive durability
+Memory, decisions, and snapshots mirrored as readable markdown to whatever cloud drive you already use (kDrive, Nextcloud, ownCloud — WebDAV-compatible).
+
+### Remote use optimization
+Drive Coach from your phone via Telegram (whitelisted, urgent escalations push to your lock screen) and a mobile-tuned UI that reflows panes for one-finger swipe — the harness is usable away from your desk, not just compatible with it.
+
+### Extensibility
+Plug in any MCP tool. Store credentials encrypted, referenced by `${VAR}` placeholders. Tune each agent's brief, model, runtime, and effort independently.
+
+### Reliability & observability
+Auto-compaction, auto-retry, auto-recovery, health probe. The harness heals routine failures itself rather than waking you.
+
+### Security
+Optional bearer-token gate on UI and API, encrypted secrets store, audit trail on every destructive action. Safe to leave running and exposed.
+
+### Single-VPS deploy
+One Docker container, one small server. Deploy once; ops stays minimal.
 
 ---
 
