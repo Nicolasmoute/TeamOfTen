@@ -3109,25 +3109,15 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
       : "";
     const lockHint = showLocked ? " — LOCKED (Coach can't assign / message)" : "";
     const tooltip = baseTip + dotHint + lockHint + " — shift-click to stack in last column";
-    // PR 6: Runtime badge. Only painted when an explicit
-    // runtime_override is set so the default all-Claude deploy isn't
-    // visually noisy. Claude → filled disc; Codex → filled square.
-    const runtimeOverride = (a.runtime_override || "").toLowerCase();
-    const runtimeBadge = runtimeOverride === "codex"
-      ? "slot-runtime-codex"
-      : runtimeOverride === "claude"
-      ? "slot-runtime-claude"
-      : "";
     return html`
       <button
         key=${a.id}
         class=${classes}
-        title=${tooltip + (runtimeBadge ? ` — runtime: ${runtimeOverride}` : "")}
+        title=${tooltip}
         onClick=${(e) => (e.shiftKey ? onStackInLast(a.id) : onOpen(a.id))}
       >
         <span class="slot-label">${slotShortLabel(a.id)}</span>
         ${dot ? html`<span class=${"slot-dot dot-" + dot}></span>` : null}
-        ${runtimeBadge ? html`<span class=${"slot-runtime " + runtimeBadge} aria-hidden="true"></span>` : null}
         ${showLocked
           ? html`<span
               class="slot-lock"

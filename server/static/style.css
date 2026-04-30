@@ -439,30 +439,6 @@ body {
   opacity: 0.75;
 }
 .slot.locked:hover { filter: grayscale(0.65) brightness(1); opacity: 1; }
-/* Runtime badge — bottom-LEFT (lock owns bottom-right). Only painted
-   when agents.runtime_override is set, to keep the default all-Claude
-   deploy uncluttered. CSS-drawn per the no-emoji invariant.
-   Claude  = filled disc (round)  in accent blue.
-   Codex   = filled square        in OpenAI green-ish (#10a37f). */
-.slot-runtime {
-  position: absolute;
-  left: 2px;
-  bottom: 2px;
-  width: 6px;
-  height: 6px;
-  pointer-events: none;
-}
-.slot-runtime-claude {
-  background: var(--accent);
-  border-radius: 50%;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
-}
-.slot-runtime-codex {
-  background: #10a37f;
-  border-radius: 1px;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
-}
-
 .slot-lock {
   position: absolute;
   bottom: 1px;
@@ -3008,13 +2984,22 @@ body {
 
 /* Tier 3: muted work narration. The tool's identity color stays on
    the left border (set via .event.tool_use { border-color: var(--tool) }
-   and similar) so cards remain scannable by tool type — only the
-   body content dims. */
+   and similar) plus the small dot drawn by `summary::before` so cards
+   remain scannable by tool type — only the body text dims.
+
+   The per-category `.tool-name` color rules below (3277+) and the
+   `.tool-name.tool-phrase` rule (3285+) used to set `color: var(--fg)`
+   which made the friendly tool phrases ("Reading inbox", "Listing
+   tasks", …) render in full white — defeating the tier-3 muting.
+   These overrides are stronger than the tier-3 selectors below, so
+   we override them HERE with !important to keep tier-3 truly muted. */
 .event.tool_use { border-color: var(--tool); padding: 4px 10px; }
 .event.tool_use .event-body,
 .event.tool_use .tool-card-body,
-.event.tool_use .tool-summary {
-  color: var(--muted);
+.event.tool_use .tool-summary,
+.event.tool_use .tool-card .tool-name,
+.event.tool_use .tool-card .tool-name.tool-phrase {
+  color: var(--muted) !important;
 }
 .event.tool_result .tool-result-body { color: var(--muted); }
 
@@ -3089,7 +3074,28 @@ body {
 .event.result { border-color: var(--ok); color: var(--muted); font-size: 12px; }
 .event.error { border-color: var(--err); color: var(--err); }
 .event.task_created { border-color: var(--warn); }
-.event.task_assigned { border-color: var(--warn); color: var(--muted); font-size: 12px; }
+/* task_assigned is an inter-agent comm act — same Tier-2 treatment as
+   peer-thread message_sent so the eye groups them. */
+.event.task_assigned {
+  border-color: var(--accent);
+  background: rgba(88, 166, 255, 0.05);
+  color: var(--accent);
+  font-size: 12px;
+}
+.event.task_assigned .event-meta { color: var(--accent); }
+.event.task_assigned .event-body { color: var(--accent); }
+/* coord_send_message and coord_assign_task tool_use cards are the
+   moments the agent makes an inter-agent call. Tier-2 blue, overriding
+   the tier-3 muted defaults set above. The `summary::before` dot keeps
+   its category color (var(--ok) for coord) as the identity marker. */
+.event.tool_use .tool-card.comm-tool {
+  background: rgba(88, 166, 255, 0.05);
+}
+.event.tool_use .tool-card.comm-tool .tool-name,
+.event.tool_use .tool-card.comm-tool .tool-name.tool-phrase,
+.event.tool_use .tool-card.comm-tool .tool-summary {
+  color: var(--accent) !important;
+}
 /* `.event.message_sent` styling lives in the tiering block above —
    modifier classes `.human-thread` (Tier 1) and `.peer-thread`
    (Tier 2) are added by the renderer based on from/to ids. */

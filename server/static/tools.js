@@ -719,6 +719,15 @@ function renderReadImageCard(name, input, result) {
 // generic card used by every tool that doesn't have a custom renderer
 // ------------------------------------------------------------------
 
+// Tools that ARE inter-agent communication acts (the moment the agent
+// sends a message / hands a task to a peer). Tagged so the renderer
+// can tier-2 them (blue) instead of tier-3 (muted) — keeps the eye's
+// thread when scrolling through a peer dialogue.
+const COMM_TOOLS = new Set([
+  "coord_send_message",
+  "coord_assign_task",
+]);
+
 function renderGenericCard(name, input, result) {
   const cat = category(name);
   const friendlyFn = FRIENDLY[name];
@@ -730,8 +739,9 @@ function renderGenericCard(name, input, result) {
   // Raw tool name moves to a tooltip + stays in the expanded JSON.
   const primary = phrase || name;
   const secondary = phrase ? "" : summarize(name, input);
+  const commCls = COMM_TOOLS.has(name) ? " comm-tool" : "";
   return html`
-    <details class=${"tool-card category-" + cat}>
+    <details class=${"tool-card category-" + cat + commCls}>
       <summary title=${name}>
         <span class=${phrase ? "tool-name tool-phrase" : "tool-name"}>${primary}</span>
         ${secondary ? html`<span class="tool-summary">${secondary}</span>` : null}

@@ -2406,15 +2406,22 @@ above peer chatter and tool narration):
 - **Tier 2 — peer ↔ peer dialogue.** Accent-blue body text + 5%-alpha
   blue tint on the card background. Applies to
   `.event.message_sent.peer-thread` (any other `message_sent`,
-  including broadcasts and inter-Player chatter). Distinct from
-  Tier 1 at a glance without competing for attention.
+  including broadcasts and inter-Player chatter), to
+  `.event.task_assigned` (a task hand-off is an inter-agent comm act),
+  and to `tool_use` cards for tools tagged `comm-tool`
+  (`coord_send_message`, `coord_assign_task` — the *moment* the agent
+  makes an inter-agent call). Distinct from Tier 1 at a glance without
+  competing for attention.
 - **Tier 3 — work narration.** Muted (`--muted`) body text. Applies
-  to `.event.tool_use`, `.event.tool_result`, `.event.thinking`,
-  `.event.sys`, `.event.result`, and lifecycle markers
-  (`.agent_started`, `.agent_stopped`, `.connected`). Tool-specific
-  colors (Read/Edit/Bash/Grep/etc.) stay on the **left border** as
-  identity markers — only the body content dims, so cards remain
-  distinguishable by tool type.
+  to `.event.tool_use` (non-comm), `.event.tool_result`,
+  `.event.thinking`, `.event.sys`, `.event.result`, and lifecycle
+  markers (`.agent_started`, `.agent_stopped`, `.connected`). The
+  per-category `.tool-name` rules used to set `var(--fg)` (white)
+  and beat the tier-3 muted intent — fixed via `!important` on the
+  tier-3 selectors. Tool-specific colors (Read/Edit/Bash/Grep/etc.)
+  stay on the **left border** + the small dot drawn by
+  `summary::before` as identity markers — only the body content dims,
+  so cards remain distinguishable by tool type.
 
 Errors and asks ignore the tiering and stay loud regardless: `.event.error`
 red, `.event.tool_result.error` red, plus AskUserQuestion / plan-mode
@@ -2422,7 +2429,10 @@ red, `.event.tool_result.error` red, plus AskUserQuestion / plan-mode
 
 Routing logic for `message_sent` lives in [server/static/app.js](../server/static/app.js)'s
 event renderer — it adds `.human-thread` or `.peer-thread` based on
-`from`/`to` ids before the CSS tiering takes over.
+`from`/`to` ids before the CSS tiering takes over. The `comm-tool`
+class for `coord_send_message` / `coord_assign_task` is added in
+[server/static/tools.js](../server/static/tools.js)'s
+`renderGenericCard` via the `COMM_TOOLS` set.
 
 Input:
 
