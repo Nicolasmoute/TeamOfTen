@@ -303,9 +303,22 @@ Without server-side identity binding, a compromised proxy or any
 process that learns the token could forge requests as any caller_id —
 agent X could send messages as Coach. The token-to-identity map closes
 that hole. Tokens live in a small in-memory dict keyed by token →
-`{caller_id, expires_at}`, no DB write needed; the per-slot
-`_codex_client_tokens` map in [server/runtimes/codex.py](../server/runtimes/codex.py)
-holds the back-reference so `close_client` knows what to revoke.
+`{caller_id, expires_at, ttl_seconds}`, no DB write needed; the
+per-slot `_codex_client_tokens` map in
+[server/runtimes/codex.py](../server/runtimes/codex.py) holds the
+back-reference so `close_client` knows what to revoke.
+
+**TTL is sliding-window.** Each successful `resolve()` extends
+`expires_at` to `now + ttl_seconds` (default `ttl_seconds = 7 days`).
+Active subprocesses never expire. Truly dormant ones (no coord call
+for >TTL) eventually do; the next turn's `get_client` then routes
+through `close_client → mint`, rebuilding the subprocess with a
+fresh token. The previous fixed 2h TTL bit when Coach went idle
+between recurrence ticks longer than 2h: the cached subprocess kept
+using the now-expired token in env, every coord call 401'd, and the
+turn aborted with "Routine tick is blocked: all coord calls returned
+HTTP 401: invalid or expired token." Recovery from that state is
+session-clear on the affected slot — closes + revokes + respawns.
 
 ### C.5 ClaudeRuntime continues working
 

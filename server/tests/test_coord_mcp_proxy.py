@@ -401,6 +401,28 @@ def test_spawn_token_expiry() -> None:
     assert st.resolve(token) is None
 
 
+def test_spawn_token_sliding_window_extends_on_resolve() -> None:
+    # Sliding-window expiry: each successful resolve() pushes the
+    # deadline forward by ttl_seconds. Without this, a long-lived
+    # Codex subprocess that captured the token at spawn would 401 the
+    # first time it makes a coord call after the initial TTL elapses
+    # (the bug fixed in this change). The test simulates a subprocess
+    # that calls resolve() at a regular cadence shorter than the TTL,
+    # for a total span LONGER than the original TTL — and expects the
+    # token to remain alive throughout.
+    import time
+    token = st.mint("p2", ttl_seconds=2)
+    deadline = time.monotonic() + 4.0  # walk past the original 2s TTL
+    while time.monotonic() < deadline:
+        assert st.resolve(token) == "p2", (
+            "sliding window should keep the token alive while in use"
+        )
+        time.sleep(0.5)
+    # Now stop using it; after ttl_seconds it must expire.
+    time.sleep(2.1)
+    assert st.resolve(token) is None
+
+
 # ---------------- HTTP endpoint coverage ----------------
 
 

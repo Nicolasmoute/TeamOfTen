@@ -28,10 +28,16 @@ from threading import Lock
 _tokens: dict[str, dict[str, object]] = {}
 _lock = Lock()
 
-# Default lifetime — generous enough to cover the longest turn we've
-# observed (~30 min auto-compact + heavy work). Cleaner solutions
-# would tie expiry to "turn ended"; we revoke explicitly there too.
-DEFAULT_TTL_SECONDS = 60 * 60 * 2  # 2h
+# Default lifetime — sized to cover idle gaps for a long-running
+# Codex subprocess (Coach can sit between recurrence ticks for hours
+# overnight; a vacation can stretch it longer). The previous 2h ceiling
+# expired tokens out from under live subprocesses, so a Coach tick the
+# morning after silence 401'd on every coord call. We now combine a
+# generous floor TTL with sliding-window refresh on resolve() — active
+# subprocesses never expire; truly dormant ones eventually do, at which
+# point the next turn rebuilds the subprocess via close_client →
+# fresh mint.
+DEFAULT_TTL_SECONDS = 60 * 60 * 24 * 7  # 7 days
 
 
 def mint(caller_id: str, ttl_seconds: int = DEFAULT_TTL_SECONDS) -> str:
@@ -45,6 +51,7 @@ def mint(caller_id: str, ttl_seconds: int = DEFAULT_TTL_SECONDS) -> str:
         _tokens[token] = {
             "caller_id": caller_id,
             "expires_at": time.monotonic() + ttl_seconds,
+            "ttl_seconds": ttl_seconds,
         }
     return token
 
@@ -53,7 +60,12 @@ def resolve(token: str) -> str | None:
     """Return the bound `caller_id` for `token`, or None if missing /
     expired.
 
-    Lazy expiry — we don't background-sweep, just check on lookup.
+    Sliding-window expiry: every successful resolve extends the token's
+    deadline by its original ttl_seconds. The Codex app-server
+    subprocess captures `HARNESS_COORD_PROXY_TOKEN` at spawn time and
+    cannot rotate it; without sliding refresh, a subprocess that stays
+    cached longer than the initial TTL would 401 forever even though
+    it's still legitimately in use.
     """
     with _lock:
         rec = _tokens.get(token)
@@ -62,6 +74,9 @@ def resolve(token: str) -> str | None:
         if time.monotonic() >= float(rec["expires_at"]):  # type: ignore[arg-type]
             _tokens.pop(token, None)
             return None
+        # Sliding window — extend on every authenticated use.
+        ttl = float(rec.get("ttl_seconds", DEFAULT_TTL_SECONDS))  # type: ignore[arg-type]
+        rec["expires_at"] = time.monotonic() + ttl
         return str(rec["caller_id"])
 
 
