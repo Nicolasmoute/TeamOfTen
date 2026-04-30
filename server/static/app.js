@@ -6111,12 +6111,16 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, active
   // Collapsible env-pane sections. Same UX as the Settings drawer
   // (CSS-drawn chevron, h3 click toggles, persisted per-section in
   // localStorage). Only sections marked `.env-section.collapsible`
-  // participate — message/stream sections (Attention, KDrive errors,
-  // Messages/Inbox, Timeline) stay expanded by default since they
-  // carry actionable / live state. Default for collapsibles: open
-  // unless previously closed.
+  // participate — warning banners (Attention, kDrive errors) stay
+  // always-expanded since they carry actionable signal that must not
+  // be hidden. Everything else (parameters, messages, timeline) is
+  // collapsible. Default state: ALL collapsed; user opens what they
+  // need. Key is bumped to v2 because the v1 persisted shape encoded
+  // "open by default unless explicitly closed" — under the new
+  // default-closed semantics, an absent v1 entry would have meant
+  // "open" but should now mean "closed."
   useLayoutEffect(() => {
-    const KEY = "harness_env_collapsed_v1";
+    const KEY = "harness_env_collapsed_v2";
     let stored = {};
     try {
       stored = JSON.parse(localStorage.getItem(KEY) || "{}");
@@ -6146,7 +6150,9 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, active
         if (!h3) return;
         sec.dataset.collapseInit = "1";
         const t = titleOf(h3);
-        if (stored[t] === true) sec.classList.add("collapsed");
+        // Default: collapsed. User explicitly opens what they want
+        // visible (stored[t] === false) — anything else collapses.
+        if (stored[t] !== false) sec.classList.add("collapsed");
       });
     };
     apply();
@@ -6855,7 +6861,7 @@ function EnvInboxSection({ conversations }) {
   }, [to, subject, body, priority]);
 
   return html`
-    <section class="env-section">
+    <section class="env-section collapsible">
       <h3 class="env-section-title">
         Messages <span class="env-count">${msgs.length}</span>
         <button
@@ -8129,7 +8135,7 @@ function EnvTimelineSection({ conversations }) {
   }, [events.length]);
 
   return html`
-    <section class="env-section env-timeline-section">
+    <section class="env-section env-timeline-section collapsible">
       <h3 class="env-section-title">
         Timeline <span class="env-count">${events.length}</span>
       </h3>
@@ -8961,6 +8967,23 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const bodyRef = useRef(null);
+
+  // Pending prompts: optimistic local list of prompts the user has
+  // submitted but which haven't fully landed yet. Each entry has:
+  //   { id, prompt, ts, body (full prompt incl. attachments), status,
+  //     opts (cached reqBody overrides for retry) }
+  // status:
+  //   "sending" — POST in flight or just landed; awaiting agent_started
+  //   "queued"  — server emitted spawn_rejected (agent already busy);
+  //               will auto-retry when agent.status flips to idle
+  //   "failed"  — POST hard-errored (network etc.); user can retry/X
+  // Two reconciliation rules (driven by allEvents updates):
+  //   - If an `agent_started` arrives whose prompt matches a pending
+  //     entry's `body` (and ts >= pending.ts), drop the pending entry
+  //     — the real turn header now renders the prompt.
+  //   - If a `spawn_rejected` arrives matching a "sending" entry,
+  //     flip it to "queued" and surface a notice in the pane.
+  const [pending, setPending] = useState([]);
   const [roleDefaultRuntime, setRoleDefaultRuntime] = useState(null);
   const runtimeOverride = (agent?.runtime_override || "").toLowerCase();
   const effectiveRuntime = runtimeOverride || roleDefaultRuntime || "claude";
@@ -9230,6 +9253,102 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
           : e
       );
   }, [mergedEvents]);
+
+  // Reconcile pending entries against the latest events. Runs whenever
+  // allEvents grows. The effect is idempotent: it returns the same list
+  // reference when nothing changes, so React skips a re-render.
+  //
+  // ts comparison: parse both sides to ms and allow a 5-second
+  // backward tolerance for clock skew. Direct ISO-string compare is
+  // unsafe here — Python's microsecond precision (`...123456Z`) sorts
+  // *before* the JS-side millisecond precision (`...123Z`) at equal
+  // instants because `Z` > `4` in ASCII, so ev.ts >= p.ts would be
+  // false and we'd never reconcile.
+  //
+  // Each event can resolve at most ONE pending entry. Without this,
+  // submitting the same prompt twice in quick succession would have
+  // both pending entries match the same agent_started (find() returns
+  // the first hit), dropping both even though only one turn ran. The
+  // `consumed` set tracks which event __ids have already been claimed
+  // by a prior pending in this pass.
+  useEffect(() => {
+    if (pending.length === 0) return;
+    setPending((prev) => {
+      if (prev.length === 0) return prev;
+      let changed = false;
+      const next = [];
+      const consumed = new Set();
+      for (const p of prev) {
+        const pMs = Date.parse(p.ts);
+        const matches = (ev, type) => {
+          if (ev.type !== type) return false;
+          if ((ev.prompt || "") !== p.body) return false;
+          const evId = ev.__id;
+          if (evId != null && consumed.has(evId)) return false;
+          const evMs = Date.parse(ev.ts || "");
+          if (!Number.isFinite(evMs) || !Number.isFinite(pMs)) return true;
+          return evMs >= pMs - 5_000;
+        };
+        const started = allEvents.find((ev) => matches(ev, "agent_started"));
+        if (started) {
+          changed = true;
+          if (started.__id != null) consumed.add(started.__id);
+          continue; // drop — real turn header now renders the prompt
+        }
+        const rejected = allEvents.find((ev) => matches(ev, "spawn_rejected"));
+        if (rejected && p.status === "sending") {
+          changed = true;
+          if (rejected.__id != null) consumed.add(rejected.__id);
+          next.push({ ...p, status: "queued" });
+          continue;
+        }
+        // cost_capped: server emits this when daily-cap blocks the
+        // spawn. The prompt won't run; don't leave the entry
+        // dangling as "sending" forever. Mark "failed" with the
+        // reason so the user understands and can dismiss.
+        const capped = allEvents.find((ev) => matches(ev, "cost_capped"));
+        if (capped && p.status !== "failed") {
+          changed = true;
+          if (capped.__id != null) consumed.add(capped.__id);
+          next.push({ ...p, status: "failed", failReason: capped.reason || "cost cap reached" });
+          continue;
+        }
+        next.push(p);
+      }
+      return changed ? next : prev;
+    });
+  }, [allEvents, pending.length]);
+
+  // Auto-retry queued prompts when the agent becomes idle. Fires the
+  // OLDEST queued entry first (FIFO). Guarded so we only fire once
+  // per idle transition: while the entry is "retrying" it isn't
+  // "queued" anymore, and reconciliation will either resolve it
+  // (agent_started → drop) or re-queue it (spawn_rejected → queued
+  // again, which can happen if the agent flipped working again before
+  // we got there). The retry uses the cached reqBody so per-pane
+  // overrides (model / plan_mode / effort) match the original submit.
+  useEffect(() => {
+    if (agent?.status === "working") return;
+    const next = pending.find((p) => p.status === "queued");
+    if (!next) return;
+    let cancelled = false;
+    setPending((prev) =>
+      prev.map((p) => (p.id === next.id ? { ...p, status: "sending" } : p))
+    );
+    (async () => {
+      const outcome = await postStart(next.reqBody);
+      if (cancelled) return;
+      if (outcome === "failed") {
+        setPending((prev) =>
+          prev.map((p) => (p.id === next.id ? { ...p, status: "failed" } : p))
+        );
+      }
+      // "ok" / "aborted" → leave as "sending"; reconciliation will
+      // either drop it (agent_started arrived) or flip back to "queued"
+      // if the lock raced and the agent was busy again.
+    })();
+    return () => { cancelled = true; };
+  }, [agent?.status, pending, postStart]);
 
   // Auto-scroll to bottom as new content arrives. Two modes:
   //   - Normal (between turns): respect user scroll position — if they
@@ -9715,6 +9834,39 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
     }
   }, [slot, paneSettings]);
 
+  // POST a prompt to /api/agents/start. Returns "ok" / "aborted" /
+  // "failed". Doesn't touch the textarea or pending list — those are
+  // managed by the callers (submit, auto-retry).
+  const postStart = useCallback(async (reqBody) => {
+    const controller = new AbortController();
+    const startTimeout = setTimeout(() => controller.abort(), 60_000);
+    try {
+      try {
+        const res = await authFetch("/api/agents/start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(reqBody),
+          signal: controller.signal,
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return "ok";
+      } catch (err) {
+        if (err && err.name === "AbortError") {
+          // The server almost certainly received and queued the request
+          // before we gave up (the handler is fire-and-forget). Treat
+          // as ok — the next agent_started event will reconcile our
+          // pending entry; if it really didn't land, the pending entry
+          // stays as "sending" until the user notices and retries.
+          return "aborted";
+        }
+        console.error("postStart failed", err);
+        return "failed";
+      }
+    } finally {
+      clearTimeout(startTimeout);
+    }
+  }, []);
+
   const submit = useCallback(async () => {
     const text = input.trim();
     if (!text && attachments.length === 0) return;
@@ -9730,7 +9882,6 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
       // CLI, which we don't currently intercept).
     }
     setSubmitting(true);
-    let startTimeout = null;
     try {
       // Compose prompt string: include image paths the agent can Read.
       // The upload endpoint stores under /data/projects/<slug>/attachments/
@@ -9757,52 +9908,40 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
       }
       if (paneSettings.planMode) reqBody.plan_mode = true;
       if (paneSettings.effort) reqBody.effort = paneSettings.effort;
-      // /api/agents/start is fire-and-forget on the server: the request
-      // handler queues a BackgroundTask and returns immediately, so the
-      // round-trip is fast under normal conditions. The timeout here
-      // exists only to recover from a wedged proxy / network — bump it
-      // generously so cold spawns (MCP server warmup, slow worktree
-      // provisioning) don't trip it under healthy conditions.
-      const controller = new AbortController();
-      startTimeout = setTimeout(() => controller.abort(), 60_000);
-      let aborted = false;
-      try {
-        const res = await authFetch("/api/agents/start", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(reqBody),
-          signal: controller.signal,
-        });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      } catch (err) {
-        if (err && err.name === "AbortError") {
-          // The server almost certainly received and queued the request
-          // before we gave up (the handler is fire-and-forget). Don't
-          // strand the user's text in the textarea — proceed as if the
-          // start succeeded and surface a soft notice. If it really
-          // didn't land, the next agent_started event simply won't show
-          // and the user can resubmit.
-          aborted = true;
-        } else {
-          throw err;
-        }
-      }
+
+      // Optimistic insert BEFORE the network roundtrip so the prompt is
+      // visible in the pane immediately (issue 1: lag before display).
+      // The reconciliation effect below drops the entry once the real
+      // `agent_started` event arrives — or flips it to "queued" if the
+      // agent was busy (issue 2: prompt-loss on busy spawn).
+      const id =
+        (typeof crypto !== "undefined" && crypto.randomUUID
+          ? crypto.randomUUID()
+          : "p-" + Date.now() + "-" + Math.random().toString(36).slice(2));
+      const ts = new Date().toISOString();
+      setPending((prev) => [
+        ...prev,
+        { id, ts, body: prompt, status: "sending", reqBody },
+      ]);
+
       const nextHistory = pushPromptHistory(slot, text);
       setPromptHistory(nextHistory);
       setPromptHistoryIdx(null);
       setInput("");
       setAttachments([]);
-      if (aborted) {
+
+      const outcome = await postStart(reqBody);
+      if (outcome === "failed") {
+        setPending((prev) =>
+          prev.map((p) => (p.id === id ? { ...p, status: "failed" } : p))
+        );
+      } else if (outcome === "aborted") {
         setInfoText(
           "start request timed out, but the agent likely received it — " +
           "watch the timeline for an agent_started event."
         );
       }
-    } catch (err) {
-      console.error("submit failed", err);
-      setInfoText("start failed: " + String(err));
     } finally {
-      if (startTimeout) clearTimeout(startTimeout);
       setSubmitting(false);
     }
   }, [
@@ -9812,6 +9951,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
     paneSettings,
     effectiveRuntimeKnown,
     paneModelValidForRuntime,
+    postStart,
   ]);
 
   // slashOpen: show autocomplete when the input is a single-line "/…"
@@ -10077,6 +10217,32 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
           ? html`<div class="pane-empty-hint">No events match "${searchQuery}".</div>`
           : null}
         <${EventList} events=${visibleEvents} />
+        ${pending.length > 0
+          ? html`<div class="pane-pending-list">
+              ${pending.map(
+                (p) => html`<div
+                  class=${"pane-pending pane-pending-" + p.status}
+                  key=${p.id}
+                >
+                  <div class="pane-pending-meta">
+                    ${p.status === "sending"
+                      ? "sending…"
+                      : p.status === "queued"
+                      ? "queued — will fire when agent is idle"
+                      : p.failReason
+                      ? "failed — " + p.failReason
+                      : "send failed"}
+                    <button
+                      class="pane-pending-cancel"
+                      onClick=${() => setPending((prev) => prev.filter((x) => x.id !== p.id))}
+                      title="Discard this pending prompt"
+                    >×</button>
+                  </div>
+                  <div class="pane-pending-body">${p.body}</div>
+                </div>`
+              )}
+            </div>`
+          : null}
         ${streaming && streaming.thinking
           ? html`<div class="event thinking streaming">
               <div class="event-meta">💭 thinking…</div>
@@ -10662,7 +10828,14 @@ function EventItem({ event }) {
     const truncatedSuffix = event.body_truncated
       ? `\n\n… (${event.body_full_len} chars total — open Inbox in env panel for full text)`
       : "";
-    return html`<div class="event message_sent">
+    // Tier-1 styling when the human is on either end (direct dialogue
+    // with this agent, just via the messages channel rather than the
+    // pane's inline composer). Otherwise tier-2 (peer ↔ peer chatter).
+    const fromHuman = event.agent_id === "human";
+    const toHuman = event.to === "human";
+    const isHumanThread = fromHuman || toHuman;
+    const cls = "event message_sent" + (isHumanThread ? " human-thread" : " peer-thread");
+    return html`<div class=${cls}>
       <div class="event-meta">
         ${ts}  ${event.agent_id} → ${event.to}${urgent}${subj}
       </div>

@@ -2405,6 +2405,35 @@ Input:
 - Ctrl/Cmd+Up/Down cycles prompt history.
 - Escape clears slash menu.
 
+Pending-prompt queue (optimistic local echo + auto-retry):
+
+- Each submitted prompt is added to a per-pane `pending` list before
+  the network roundtrip and rendered as a card just above the
+  composer, so the user sees their prompt instantly — display lag is
+  zero, leaving only the agent's own response time.
+- States: `sending` (POST in flight or waiting for `agent_started`),
+  `queued` (server emitted `spawn_rejected` because the agent was
+  already mid-turn — entry will auto-retry when `agent.status` leaves
+  `working`), `failed` (POST hard-errored, or a `cost_capped` event
+  resolved the entry; `failReason` is surfaced verbatim).
+- Reconciliation: an effect watches `allEvents`. For each pending
+  entry, it looks for `agent_started` (drop), `spawn_rejected` (flip
+  to `queued`), or `cost_capped` (flip to `failed`) — matched by exact
+  `prompt` body. Each event resolves at most one pending entry (a
+  consumed-id set prevents two same-body entries from collapsing onto
+  the same `agent_started`). ts comparison is numeric-ms with a 5s
+  backward tolerance for clock skew, since Python's microsecond ISO
+  timestamps and JS's millisecond ones don't compare correctly as
+  strings.
+- Auto-retry: a separate effect watches `agent.status`. When it leaves
+  `working`, the oldest `queued` entry is flipped to `sending` and
+  re-POSTed with the original cached `reqBody` (model / plan_mode /
+  effort overrides preserved). FIFO order; one retry per idle
+  transition.
+- Cancel: each pending card has an `×` button to discard.
+- Per-pane state, in-memory only (lost on refresh — acceptable since
+  prompts not yet started leave no server-side trace anyway).
+
 Pane settings:
 
 - Model override.
@@ -2501,15 +2530,16 @@ the active project changes — both are stored on disk under the
 project's slug (`/data/projects/<slug>/project-objectives.md` and
 `/data/projects/<slug>/coach-todos.md`).
 
-**Collapsible parameter sections.** A subset is wrapped in
-`.env-section.collapsible`: Tasks, Cost, Project objectives, Coach
-todos, Memory, Decisions, Truth proposals. Click the section title to
+**Collapsible sections.** Every section except the warning banners
+(Attention, kDrive errors) is wrapped in `.env-section.collapsible`:
+Tasks, Cost, Project objectives, Coach todos, Messages, Memory,
+Decisions, Truth proposals, Timeline. Click the section title to
 toggle; state persists per-section in `localStorage` under
-`harness_env_collapsed_v1`. Default is open. The remaining sections
-(Attention, kDrive errors, Inbox, Timeline) are messages-/stream-style
-content and stay always-expanded since collapsing them would hide
-live signal. The collapse mechanic is the same shared pattern as the
-Settings drawer (§16.7) — CSS-drawn chevron, h3 click handler that
+`harness_env_collapsed_v2`. Default state is **closed** — the user
+opens what they need, like the Settings drawer (§16.7). Warning
+banners are always-expanded since collapsing them would hide
+actionable signal. The collapse mechanic is the same shared pattern as
+the Settings drawer — CSS-drawn chevron, h3 click handler that
 ignores interactive children (buttons, inputs, etc.) so inline
 controls in section titles still work.
 

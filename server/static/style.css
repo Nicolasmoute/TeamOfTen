@@ -2771,6 +2771,62 @@ body {
   border-radius: 3px;
 }
 
+/* Pending prompts: optimistic local echo of the user's just-submitted
+   prompt before the real `agent_started` event lands. Renders below
+   the timeline, above any streaming text, just above the composer.
+   Three states:
+     - sending: dashed border, dim, "sending…"
+     - queued:  amber accent, "queued — will fire when agent is idle"
+     - failed:  red accent
+   The card is removed automatically by the reconciliation effect once
+   the matching agent_started arrives (or by the user via the × button).
+*/
+.pane-pending-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0;
+}
+.pane-pending {
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  padding: 6px 10px;
+  background: var(--card);
+  font-size: 12px;
+}
+.pane-pending-sending { border-color: var(--muted); opacity: 0.85; }
+.pane-pending-queued  { border-color: var(--warn); border-style: solid; }
+.pane-pending-failed  { border-color: var(--err); border-style: solid; }
+.pane-pending-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 3px;
+}
+.pane-pending-queued .pane-pending-meta { color: var(--warn); }
+.pane-pending-failed .pane-pending-meta { color: var(--err); }
+.pane-pending-cancel {
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 3px;
+  padding: 0 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.pane-pending-cancel:hover { color: var(--err); border-color: var(--err); }
+.pane-pending-body {
+  color: var(--fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* ---- events ---- */
 .event {
   padding: 6px 10px;
@@ -2903,8 +2959,64 @@ body {
    code reads cleanly inside italicized prose. */
 .event.thinking .thinking-body.markdown code,
 .event.thinking .thinking-body.markdown pre { font-style: normal; }
-.event.text { border-color: var(--accent); }
+
+/* ----------------------------------------------------------------
+   Three-tier visual language for the agent pane timeline.
+
+   Tier 1 — direct dialogue with the human (this agent's text reply
+            to the human, plus messages where human is on either end).
+            Brightest content in the pane, full --fg contrast.
+
+   Tier 2 — inter-agent dialogue (peer ↔ peer messages, broadcasts).
+            Same shape as Tier 1 but accent-blue for body text + rail
+            so the eye can sort "talking to me" from "talking to peer"
+            at a glance.
+
+   Tier 3 — narration of work (tool_use / tool_result / thinking /
+            sys / lifecycle). Muted body so it fades into the
+            background. Tool-specific colors (Read/Edit/Bash/Grep…)
+            are kept on the LEFT BORDER as identity markers — only
+            the body text dims.
+
+   Errors and asks (red events, pending action) ignore the tiering
+   and stay loud regardless.
+   ---------------------------------------------------------------- */
+
+/* Tier 1: agent's text reply + human-thread messages */
+.event.text {
+  border-color: var(--accent);
+  color: var(--fg);
+}
+.event.text .event-body { color: var(--fg); }
+.event.message_sent.human-thread {
+  border-color: var(--accent);
+  font-size: 13px;
+}
+.event.message_sent.human-thread .event-body {
+  color: var(--fg);
+  font-size: 13px;
+}
+
+/* Tier 2: peer-to-peer dialogue */
+.event.message_sent.peer-thread {
+  border-color: var(--accent);
+  background: rgba(88, 166, 255, 0.05);
+  font-size: 12px;
+}
+.event.message_sent.peer-thread .event-meta { color: var(--accent); }
+.event.message_sent.peer-thread .event-body { color: var(--accent); }
+
+/* Tier 3: muted work narration. The tool's identity color stays on
+   the left border (set via .event.tool_use { border-color: var(--tool) }
+   and similar) so cards remain scannable by tool type — only the
+   body content dims. */
 .event.tool_use { border-color: var(--tool); padding: 4px 10px; }
+.event.tool_use .event-body,
+.event.tool_use .tool-card-body,
+.event.tool_use .tool-summary {
+  color: var(--muted);
+}
+.event.tool_result .tool-result-body { color: var(--muted); }
 
 /* Streaming bubble: same shape as a normal text event but tinted to
    read as "in progress" plus a blinking caret at the end so the eye
@@ -2978,8 +3090,9 @@ body {
 .event.error { border-color: var(--err); color: var(--err); }
 .event.task_created { border-color: var(--warn); }
 .event.task_assigned { border-color: var(--warn); color: var(--muted); font-size: 12px; }
-.event.message_sent { border-color: var(--tool); font-size: 12px; }
-.event.message_sent .event-body { color: var(--fg); margin-top: 2px; }
+/* `.event.message_sent` styling lives in the tiering block above —
+   modifier classes `.human-thread` (Tier 1) and `.peer-thread`
+   (Tier 2) are added by the renderer based on from/to ids. */
 
 /* System / progress events — single line, muted so they fade into
    the background vs. the main assistant text. Same shape as other
