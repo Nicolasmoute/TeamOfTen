@@ -654,6 +654,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         finally:
             await c.close()
 
+        # Body cap — keep events from carrying multi-MB tool dumps
+        # while still showing the user enough to read the message in
+        # context. The full text always lives in the `messages` table
+        # and surfaces in EnvPane → Inbox; this preview is just the
+        # in-pane render. 4000 chars covers practically every agent
+        # message without bloating the events stream.
+        body_preview = body[:4000]
+        body_truncated = len(body) > 4000
         await bus.publish(
             {
                 "ts": _now_iso(),
@@ -662,7 +670,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "message_id": msg_id,
                 "to": to,
                 "subject": subject,
-                "body_preview": body[:120],
+                "body_preview": body_preview,
+                "body_full_len": len(body),
+                "body_truncated": body_truncated,
                 "priority": priority,
             }
         )

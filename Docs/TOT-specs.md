@@ -768,7 +768,17 @@ Indexes:
 Rows are inserted for completed SDK result messages. Turns that crash before a
 result are represented in events, not here.
 
-Cost caps are currently based on this table through `_today_spend()`.
+Cost caps are currently based on this table through `_today_spend(agent_id?,
+project_id?)`. The function aggregates `cost_usd` for rows where
+`ended_at >= MAX(today_utc_start, cost_reset_at,
+cost_reset_at_<project_id>)`. The two reset timestamps live in
+`team_config` and can be moved forward via `POST /api/turns/reset` —
+that gives the team fresh headroom for the rest of the UTC day without
+deleting historical rows. When no `project_id` is passed,
+`_today_spend()` honors per-project resets per row (each turn picks its
+project's reset timestamp via a SQL CASE), so the team total equals the
+sum of per-project today values — clicking "Reset" on a single project
+reduces the team total by exactly that project's pre-reset spend.
 
 ### 6.11 `team_config`
 
@@ -2013,6 +2023,8 @@ Message body max 5000 chars. Subject max 200 chars.
 | `GET /api/events` | Active-project event history with filters |
 | `GET /api/turns` | Active-project turn rows (full token + runtime detail) |
 | `GET /api/turns/summary?hours=24` | Per-agent spend/turn aggregate |
+| `GET /api/turns/by-project` | Per-project today/total spend, plus team totals (sum of projects). Honors cost_reset_at and cost_reset_at_<project_id>. Used by the EnvPane Cost section's project dropdown. |
+| `POST /api/turns/reset` | Body `{scope: "all" \| "<project_id>"}`. Writes `cost_reset_at` (global) or `cost_reset_at_<project_id>` to `team_config` so today_usd zeroes for the affected scope. Caps re-enforce from this point — historical rows are not deleted. Emits `cost_reset` event with actor metadata. |
 
 `GET /api/events` supports:
 
@@ -2211,6 +2223,7 @@ Agent lifecycle:
 - `spawn_rejected`
 - `paused`
 - `cost_capped`
+- `cost_reset` (manual reset of today_usd via `POST /api/turns/reset`)
 - `session_cleared`
 - `session_resume_failed`
 - `session_compact_requested`

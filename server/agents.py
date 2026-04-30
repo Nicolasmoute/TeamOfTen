@@ -95,7 +95,9 @@ async def _deliver_system_message(
             "message_id": msg_id,
             "to": to_id,
             "subject": subject,
-            "body_preview": body[:120],
+            "body_preview": body[:4000],
+            "body_full_len": len(body),
+            "body_truncated": len(body) > 4000,
             "priority": priority,
         })
     except Exception:
@@ -1265,21 +1267,100 @@ def _today_utc_start_iso() -> str:
     return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 
-async def _today_spend(agent_id: str | None = None) -> float:
+async def _load_cost_resets() -> tuple[str, dict[str, str]]:
+    """Read cost-reset timestamps from team_config.
+
+    Returns `(global_reset, per_project_reset_map)` where each value
+    is an ISO timestamp string (or "" if unset). The semantics: a
+    turn row counts toward "today" when ended_at >=
+    MAX(today_utc_start, global_reset, per_project_reset[row.project_id]).
+
+    `cost_reset_at` (global) — set by POST /api/turns/reset {scope:"all"}.
+    `cost_reset_at_<project_id>` — set by POST /api/turns/reset
+    {scope:"<project_id>"}.
+    """
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT key, value FROM team_config WHERE key = 'cost_reset_at' "
+            "OR key LIKE 'cost_reset_at_%'"
+        )
+        rows = await cur.fetchall()
+    finally:
+        await c.close()
+    global_reset = ""
+    per_project: dict[str, str] = {}
+    for r in rows:
+        d = dict(r)
+        k, v = d["key"], d["value"] or ""
+        if k == "cost_reset_at":
+            global_reset = v
+        elif k.startswith("cost_reset_at_"):
+            per_project[k[len("cost_reset_at_"):]] = v
+    return global_reset, per_project
+
+
+async def _today_spend(
+    agent_id: str | None = None,
+    project_id: str | None = None,
+) -> float:
     """Sum `turns.cost_usd` for rows that ended today (UTC). Pass
-    agent_id to scope to one slot, or None for the whole team.
+    agent_id to scope to one slot. Pass project_id to scope to one
+    project. Both can be combined.
+
+    Honors `cost_reset_at` (global) and `cost_reset_at_<project>`
+    (per-project) timestamps from team_config — a row only counts
+    when its `ended_at` is >= the latest applicable reset (or the
+    UTC day start, whichever is later). The reset is a "give myself
+    fresh budget for the rest of today" knob; historical turn rows
+    stay intact.
 
     Uses the turns ledger (indexed on agent_id + ended_at) rather
     than the events table (which would require JSON extraction on
     every row). Same answer, single-index lookup. The ledger is
     populated by every ResultMessage via _insert_turn_row.
     """
-    start_ts = _today_utc_start_iso()
-    where = "WHERE ended_at >= ?"
-    params: list[Any] = [start_ts]
+    today_start = _today_utc_start_iso()
+    global_reset, per_project = await _load_cost_resets()
+
+    base_window = max(today_start, global_reset) if global_reset else today_start
+    where_parts: list[str] = []
+    params: list[Any] = []
+
+    if project_id:
+        # Single-project query: compute that project's effective
+        # window directly. No CASE needed since the WHERE filter
+        # excludes every other project's rows anyway.
+        pp = per_project.get(project_id) or ""
+        window = pp if pp and pp > base_window else base_window
+        where_parts.append("ended_at >= ?")
+        params.append(window)
+        where_parts.append("project_id = ?")
+        params.append(project_id)
+    else:
+        # Team-wide query (with or without agent_id filter): per-row
+        # CASE picks each row's project's effective window so the
+        # team total naturally equals the sum of per-project today
+        # values. Per-project reset only contributes a CASE branch
+        # when LATER than base_window (otherwise base wins anyway).
+        case_branches: list[str] = []
+        for pid, ts in per_project.items():
+            if ts and ts > base_window:
+                case_branches.append("WHEN project_id = ? THEN ?")
+                params.extend([pid, ts])
+        if case_branches:
+            window_expr = "CASE " + " ".join(case_branches) + " ELSE ? END"
+            params.append(base_window)
+        else:
+            window_expr = "?"
+            params.append(base_window)
+        where_parts.append(f"ended_at >= {window_expr}")
+
     if agent_id:
-        where += " AND agent_id = ?"
+        where_parts.append("agent_id = ?")
         params.append(agent_id)
+    where = "WHERE " + " AND ".join(where_parts)
+
     c = await configured_conn()
     try:
         cur = await c.execute(

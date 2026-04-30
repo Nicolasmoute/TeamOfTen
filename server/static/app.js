@@ -5419,8 +5419,18 @@ function SettingsDrawer({ onClose, serverStatus }) {
     ).find((db) => db.querySelector(".drawer-section"));
     if (!drawer) return;
 
-    const titleOf = (h3) =>
-      (h3.textContent || "").trim().replace(/\s+/g, " ");
+    // First non-empty text node only — stable across inline state
+    // changes (e.g. Health's "↻" / "…" refresh button text) so the
+    // collapsed-state localStorage key doesn't drift on every probe.
+    const titleOf = (h3) => {
+      for (const n of h3.childNodes) {
+        if (n.nodeType === 3 /* Node.TEXT_NODE */) {
+          const t = (n.textContent || "").trim();
+          if (t) return t;
+        }
+      }
+      return (h3.textContent || "").trim().replace(/\s+/g, " ");
+    };
 
     const apply = () => {
       const sections = drawer.querySelectorAll(".drawer-section");
@@ -5831,6 +5841,18 @@ function RecurrencePane({ rows, onClose, onRefresh, onError }) {
       <div class="rec-body">
         <section class="rec-section">
           <h3 class="rec-section-title">Tick</h3>
+          <p class="rec-help">
+            Wakes Coach every N minutes with a prompt the harness
+            composes from project state — no wording from you. Priority
+            order: (1) Coach's unread inbox, (2) open coach-todos,
+            (3) advance project objectives. If all three are empty the
+            tick ends without calling any tool. Singleton: one tick per
+            project, off by default.
+            <br /><br />
+            Edit <em>Coach todos</em> and <em>Objectives</em> in the
+            env pane (<code>⌘/Ctrl+B</code>) — they also feed Coach's
+            system prompt on every turn, not just tick fires.
+          </p>
           ${tick
             ? html`
                 <div class="rec-card">
@@ -5875,6 +5897,13 @@ function RecurrencePane({ rows, onClose, onRefresh, onError }) {
 
         <section class="rec-section">
           <h3 class="rec-section-title">Repeats <span style="margin-left:auto;font-weight:400">${repeats.length}</span></h3>
+          <p class="rec-help">
+            Fires Coach every N minutes with <em>your</em> prompt
+            (verbatim, no smart composition). Use for routine checks
+            with fixed wording — "summarize new commits", "scan
+            inbox". Many per project. Skipped if Coach is mid-turn
+            when due; not retried.
+          </p>
           ${repeats.length === 0
             ? html`<div class="rec-empty">No repeats.</div>`
             : repeats.map((r) => html`
@@ -5939,6 +5968,15 @@ function RecurrencePane({ rows, onClose, onRefresh, onError }) {
 
         <section class="rec-section">
           <h3 class="rec-section-title">Crons <span style="margin-left:auto;font-weight:400">${crons.length}</span></h3>
+          <p class="rec-help">
+            Wall-clock schedule with <em>your</em> prompt. Friendly
+            DSL — examples: <code>daily 09:00</code>,
+            <code>weekdays 14:30</code>, <code>mon,wed,fri 10:00</code>,
+            <code>weekly mon 09:00</code>, <code>monthly 1 09:00</code>,
+            <code>2026-05-01 12:00</code>. Anchored to the timezone
+            shown on each row (captured from your browser at create
+            time). Many per project.
+          </p>
           ${crons.length === 0
             ? html`<div class="rec-empty">No crons.</div>`
             : crons.map((r) => html`
@@ -6069,6 +6107,82 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, active
       setExporting(false);
     }
   }, [exporting, openSlots, agents]);
+
+  // Collapsible env-pane sections. Same UX as the Settings drawer
+  // (CSS-drawn chevron, h3 click toggles, persisted per-section in
+  // localStorage). Only sections marked `.env-section.collapsible`
+  // participate — message/stream sections (Attention, KDrive errors,
+  // Messages/Inbox, Timeline) stay expanded by default since they
+  // carry actionable / live state. Default for collapsibles: open
+  // unless previously closed.
+  useLayoutEffect(() => {
+    const KEY = "harness_env_collapsed_v1";
+    let stored = {};
+    try {
+      stored = JSON.parse(localStorage.getItem(KEY) || "{}");
+    } catch (_) { stored = {}; }
+
+    const root = document.querySelector(".env-pane > .env-body");
+    if (!root) return;
+
+    // Use the first non-empty text node only — stable across inline
+    // count/button text changes ("Memory 5 + write" vs "Memory 6 +
+    // write" both yield "Memory" so the localStorage key doesn't
+    // drift when the count updates).
+    const titleOf = (h3) => {
+      for (const n of h3.childNodes) {
+        if (n.nodeType === 3 /* Node.TEXT_NODE */) {
+          const t = (n.textContent || "").trim();
+          if (t) return t;
+        }
+      }
+      return (h3.textContent || "").trim().replace(/\s+/g, " ");
+    };
+
+    const apply = () => {
+      root.querySelectorAll(".env-section.collapsible").forEach((sec) => {
+        if (sec.dataset.collapseInit === "1") return;
+        const h3 = sec.querySelector(":scope > h3");
+        if (!h3) return;
+        sec.dataset.collapseInit = "1";
+        const t = titleOf(h3);
+        if (stored[t] === true) sec.classList.add("collapsed");
+      });
+    };
+    apply();
+
+    const observer = new MutationObserver(apply);
+    observer.observe(root, { childList: true, subtree: true });
+
+    const onClick = (e) => {
+      const h3 = e.target.closest("h3");
+      if (!h3) return;
+      const sec = h3.parentElement;
+      if (
+        !sec ||
+        !sec.classList.contains("env-section") ||
+        !sec.classList.contains("collapsible")
+      ) return;
+      // Don't toggle when clicking interactive children (filters,
+      // refresh buttons, the dismiss-all button on Messages, etc.).
+      const interactive = e.target.closest(
+        "button, input, select, textarea, a"
+      );
+      if (interactive && interactive !== h3 && h3.contains(interactive)) {
+        return;
+      }
+      sec.classList.toggle("collapsed");
+      const t = titleOf(h3);
+      stored[t] = sec.classList.contains("collapsed");
+      try { localStorage.setItem(KEY, JSON.stringify(stored)); } catch (_) {}
+    };
+    root.addEventListener("click", onClick);
+
+    return () => {
+      observer.disconnect();
+      root.removeEventListener("click", onClick);
+    };
+  }, []);
 
   return html`
     <aside class="env-pane">
@@ -6945,9 +7059,9 @@ function EnvObjectivesSection({ conversations, activeProjectId }) {
   const dirty = pending != null && pending !== text;
 
   return html`
-    <section class="env-section">
+    <section class="env-section collapsible">
       <h3 class="env-section-title">
-        Objectives
+        Project objectives
       </h3>
       <textarea
         class="env-msg-composer-body"
@@ -6958,15 +7072,20 @@ function EnvObjectivesSection({ conversations, activeProjectId }) {
       ></textarea>
       ${error ? html`<div class="rec-error">${error}</div>` : null}
       <div class="rec-actions">
-        ${dirty
-          ? html`
-              <button onClick=${save} disabled=${saving || !activeProjectId}>
-                ${saving ? "saving…" : "save"}
-              </button>
-              <button onClick=${() => setPending(null)} disabled=${saving}>
-                discard
-              </button>`
-          : null}
+        <button
+          onClick=${save}
+          disabled=${saving || !dirty || !activeProjectId}
+          title=${dirty ? "Save changes" : "No changes to save"}
+        >
+          ${saving ? "saving…" : "save"}
+        </button>
+        <button
+          onClick=${() => setPending(null)}
+          disabled=${saving || !dirty}
+          title=${dirty ? "Discard changes" : "Nothing to discard"}
+        >
+          discard
+        </button>
       </div>
     </section>
   `;
@@ -7106,7 +7225,7 @@ function EnvCoachTodosSection({ conversations, activeProjectId }) {
   }, [newTitle, newDue, newDesc, activeProjectId, load]);
 
   return html`
-    <section class="env-section">
+    <section class="env-section collapsible">
       <h3 class="env-section-title">
         Coach todos <span class="env-count">${todos.length}</span>
         <button
@@ -7281,7 +7400,7 @@ function EnvMemorySection({ conversations }) {
   }, [newTopic, newBody, load]);
 
   return html`
-    <section class="env-section">
+    <section class="env-section collapsible">
       <h3 class="env-section-title">
         Memory <span class="env-count">${docs.length}</span>
         <button
@@ -7397,7 +7516,7 @@ function EnvDecisionsSection({ conversations }) {
   }, [openFile]);
 
   return html`
-    <section class="env-section">
+    <section class="env-section collapsible">
       <h3 class="env-section-title">
         Decisions <span class="env-count">${decisions.length}</span>
       </h3>
@@ -7500,7 +7619,7 @@ function EnvTruthProposalsSection({ conversations }) {
   }, [openId]);
 
   return html`
-    <section class="env-section">
+    <section class="env-section collapsible">
       <h3 class="env-section-title">
         Truth proposals <span class="env-count">${proposals.length}</span>
       </h3>
@@ -7622,7 +7741,7 @@ function EnvTasksSection({ tasks, onCreate }) {
   const sorted = flatWithDepth;
 
   return html`
-    <section class="env-section">
+    <section class="env-section collapsible">
       <h3 class="env-section-title">
         Tasks <span class="env-count">${sorted.length}/${tasks.length}</span>
         <span class="env-task-filter-group" style="margin-left: auto; display: flex; gap: 3px;">
@@ -7705,7 +7824,146 @@ function EnvTasksSection({ tasks, onCreate }) {
 }
 
 function EnvCostSection({ agents, serverStatus }) {
-  const total = agents.reduce((s, a) => s + (a.cost_estimate_usd || 0), 0);
+  // Per-project breakdown + scope dropdown + reset button. Source of
+  // truth is /api/turns/by-project (polled). The agents[]
+  // cost_estimate_usd is a per-session running tally (resets when
+  // session is cleared) — useful as a per-agent secondary view but
+  // not authoritative for the today-vs-cap meter.
+  const caps = serverStatus?.caps;
+  const teamCap = caps?.team_daily_usd ?? 0;
+  const agentCap = caps?.agent_daily_usd ?? 0;
+
+  // "all" or a project id. Persisted across reloads so the user's
+  // chosen scope sticks.
+  const [scope, setScope] = useState(() => {
+    try { return localStorage.getItem("harness_cost_scope_v1") || "all"; }
+    catch (_) { return "all"; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("harness_cost_scope_v1", scope); } catch (_) {}
+  }, [scope]);
+
+  const [byProject, setByProject] = useState(null); // {projects, team, resets}
+  const [loadErr, setLoadErr] = useState("");
+
+  const refresh = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/turns/by-project");
+      if (!res.ok) {
+        setLoadErr("HTTP " + res.status);
+        return;
+      }
+      setLoadErr("");
+      setByProject(await res.json());
+    } catch (e) {
+      setLoadErr(String(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const t = setInterval(refresh, 30_000);
+    return () => clearInterval(t);
+  }, [refresh]);
+
+  // Refresh when serverStatus.caps.team_today_usd ticks (a turn just
+  // landed) so the per-project view doesn't lag the cap bar.
+  const teamToday = caps?.team_today_usd ?? 0;
+  useEffect(() => { refresh(); }, [teamToday, refresh]);
+
+  // If scope was restored from localStorage but the project no
+  // longer exists (deleted/renamed/archived), fall back to "all" so
+  // the dropdown matches the visible state instead of silently
+  // showing zero.
+  useEffect(() => {
+    if (!byProject || scope === "all") return;
+    const exists = (byProject.projects || []).some((p) => p.id === scope);
+    if (!exists) setScope("all");
+  }, [byProject, scope]);
+
+  // Plan-included token meter (ChatGPT-auth Codex turns where
+  // cost_usd is $0 by design). Same poll cadence as before.
+  const [planTokens, setPlanTokens] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    const r = async () => {
+      try {
+        const res = await authFetch("/api/turns/summary?hours=24");
+        if (!res.ok || cancelled) return;
+        const d = await res.json();
+        if (cancelled) return;
+        setPlanTokens(Number(d.plan_included_token_total) || 0);
+      } catch (_) {}
+    };
+    r();
+    const t = setInterval(r, 60_000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+  const formatTokens = (n) => {
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + "M";
+    if (n >= 1_000) return (n / 1_000).toFixed(1) + "k";
+    return String(n);
+  };
+
+  // Resolve the selected scope's totals from the by-project payload.
+  // Falls back to serverStatus.caps when the endpoint hasn't loaded
+  // yet so the cap bar isn't blank on first paint.
+  const selectedProj = scope === "all"
+    ? null
+    : (byProject?.projects || []).find((p) => p.id === scope);
+  const scopeLabel = scope === "all"
+    ? "All projects"
+    : (selectedProj?.name || scope);
+  const todayUsd = scope === "all"
+    ? (byProject?.team?.today_usd ?? teamToday)
+    : (selectedProj?.today_usd ?? 0);
+  const totalUsd = scope === "all"
+    ? (byProject?.team?.total_usd ?? 0)
+    : (selectedProj?.total_usd ?? 0);
+
+  const showCaps = caps && (teamCap > 0 || agentCap > 0);
+  // The cap bar always reflects the team-wide cap (caps are team-wide
+  // per spec decision A) — even when the dropdown is on a single
+  // project. Show a hint so the user understands.
+  const capTeamToday = byProject?.team?.today_usd ?? teamToday;
+  const teamPct = teamCap > 0 ? Math.min(100, Math.round((capTeamToday / teamCap) * 100)) : 0;
+  const teamBarClass =
+    teamPct >= 100 ? " over" : teamPct >= 80 ? " warn" : "";
+
+  const onReset = useCallback(async () => {
+    const label = scope === "all"
+      ? "ALL projects"
+      : `project '${selectedProj?.name || scope}'`;
+    const ok = window.confirm(
+      `Reset today's spend counter for ${label}?\n\n` +
+      "This zeroes the displayed today's spend AND gives the team " +
+      "fresh headroom against the daily cap for the rest of today.\n\n" +
+      "Historical turn rows are NOT deleted — only the 'since when' " +
+      "window moves forward. This is auditable: a `cost_reset` event " +
+      "is published.\n\nProceed?"
+    );
+    if (!ok) return;
+    try {
+      const res = await authFetch("/api/turns/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scope }),
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => "");
+        alert(`Reset failed: HTTP ${res.status}\n${body.slice(0, 200)}`);
+        return;
+      }
+      await refresh();
+    } catch (e) {
+      alert("Reset failed: " + String(e));
+    }
+  }, [scope, selectedProj, refresh]);
+
+  // Per-agent rows: only meaningful when scope == "all" (the
+  // endpoint doesn't break agents down by project). For a project
+  // view, show that project's pre-reset spend separately so the user
+  // sees what was zeroed.
   const working = agents.filter((a) => a.status === "working").length;
   const active = agents
     .filter(
@@ -7717,54 +7975,43 @@ function EnvCostSection({ agents, serverStatus }) {
     .sort(
       (a, b) => (b.cost_estimate_usd || 0) - (a.cost_estimate_usd || 0)
     );
-  const caps = serverStatus?.caps;
-  const teamToday = caps?.team_today_usd ?? 0;
-  const teamCap = caps?.team_daily_usd ?? 0;
-  const agentCap = caps?.agent_daily_usd ?? 0;
-  const showCaps = caps && (teamCap > 0 || agentCap > 0);
-  const teamPct = teamCap > 0 ? Math.min(100, Math.round((teamToday / teamCap) * 100)) : 0;
-  const teamBarClass =
-    teamPct >= 100 ? " over" : teamPct >= 80 ? " warn" : "";
 
-  // Audit-item-23: plan-included token meter for ChatGPT-auth Codex
-  // turns. cost_usd is $0 by design for those, so the USD bar above
-  // wouldn't catch them; surface tokens used today instead. Polled
-  // every 60s via /api/turns/summary?hours=24. Hidden when zero so
-  // pure-Claude deployments don't see an empty meter.
-  const [planTokens, setPlanTokens] = useState(0);
-  useEffect(() => {
-    let cancelled = false;
-    const refresh = async () => {
-      try {
-        const res = await authFetch("/api/turns/summary?hours=24");
-        if (!res.ok || cancelled) return;
-        const d = await res.json();
-        if (cancelled) return;
-        setPlanTokens(Number(d.plan_included_token_total) || 0);
-      } catch (_) {
-        // Silent — endpoint optional; bar just stays at last value.
-      }
-    };
-    refresh();
-    const t = setInterval(refresh, 60_000);
-    return () => { cancelled = true; clearInterval(t); };
-  }, []);
-  const formatTokens = (n) => {
-    if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + "M";
-    if (n >= 1_000) return (n / 1_000).toFixed(1) + "k";
-    return String(n);
-  };
+  const projOptions = byProject?.projects || [];
+
   return html`
-    <section class="env-section">
+    <section class="env-section collapsible">
       <h3 class="env-section-title">
-        Cost <span class="env-count">$${total.toFixed(3)}</span>
+        Cost <span class="env-count">$${todayUsd.toFixed(3)}</span>
       </h3>
+      <div class="env-cost-controls">
+        <select
+          class="env-cost-scope"
+          value=${scope}
+          onChange=${(e) => setScope(e.target.value)}
+          title="View scope"
+        >
+          <option value="all">All projects</option>
+          ${projOptions.map(
+            (p) => html`<option value=${p.id} key=${p.id}>
+              ${p.archived ? p.name + " (archived)" : p.name}
+            </option>`
+          )}
+        </select>
+        <button
+          class="env-cost-reset"
+          onClick=${onReset}
+          title=${"Reset today's spend for " + scopeLabel}
+        >Reset</button>
+      </div>
+      ${loadErr
+        ? html`<p class="muted" style="font-size: 11px; margin: 0 0 4px;">probe: ${loadErr}</p>`
+        : null}
       ${showCaps
         ? html`<div class="env-cap-bar">
             <div class="env-cap-bar-label">
               ${teamCap > 0
-                ? html`today: $${teamToday.toFixed(3)} / $${teamCap.toFixed(2)}`
-                : html`today: $${teamToday.toFixed(3)} (team cap off)`}
+                ? html`today (team): $${capTeamToday.toFixed(3)} / $${teamCap.toFixed(2)}`
+                : html`today (team): $${capTeamToday.toFixed(3)} (team cap off)`}
               ${agentCap > 0 ? html` · per-agent cap $${agentCap.toFixed(2)}` : null}
             </div>
             ${teamCap > 0
@@ -7772,6 +8019,12 @@ function EnvCostSection({ agents, serverStatus }) {
                   <div class=${"env-cap-bar-fill" + teamBarClass} style=${"width:" + teamPct + "%"}></div>
                 </div>`
               : null}
+          </div>`
+        : null}
+      ${scope !== "all"
+        ? html`<div class="env-cost-sub">
+            ${scopeLabel}: $${todayUsd.toFixed(3)} today
+            <span class="muted"> · $${totalUsd.toFixed(3)} all-time</span>
           </div>`
         : null}
       ${planTokens > 0
@@ -7782,12 +8035,27 @@ function EnvCostSection({ agents, serverStatus }) {
             </div>
           </div>`
         : null}
-      ${working > 0
+      ${scope === "all" && working > 0
         ? html`<div class="env-cost-sub">${working} agent${working === 1 ? "" : "s"} working now</div>`
         : null}
-      ${active.length === 0
+      ${scope === "all" && byProject?.projects?.length
+        ? html`<div class="env-cost-list">
+            ${byProject.projects
+              .filter((p) => p.today_usd > 0 || p.total_usd > 0)
+              .sort((a, b) => b.today_usd - a.today_usd)
+              .map(
+                (p) => html`<div class="env-cost-row" key=${"p-" + p.id}>
+                  <span class="env-cost-id">P</span>
+                  <span class="env-cost-name">${p.name}</span>
+                  <span class="env-cost-value">$${p.today_usd.toFixed(3)}</span>
+                </div>`
+              )}
+          </div>`
+        : null}
+      ${scope === "all" && active.length === 0
         ? html`<div class="env-empty">(no agents have spent yet)</div>`
-        : html`
+        : scope === "all"
+        ? html`
             <div class="env-cost-list">
               ${active.map(
                 (a) => html`
@@ -7802,7 +8070,8 @@ function EnvCostSection({ agents, serverStatus }) {
                 `
               )}
             </div>
-          `}
+          `
+        : null}
     </section>
   `;
 }
@@ -10034,8 +10303,33 @@ class EventList extends Component {
   }
 
   render({ events }) {
-    return events.map((ev, i) =>
-      html`<${EventItem} key=${ev.__id ?? "live-" + i} event=${ev} />`
+    // Group consecutive events into per-turn sections — each section
+    // begins with an `agent_started` and runs until the next
+    // `agent_started`. The wrapping `.turn-section` bounds the sticky
+    // `.turn-header` to its own turn so scrolling past one turn's
+    // bottom releases its header instead of stacking with the next
+    // turn's header at the top of the pane (the "two last prompts
+    // floating at top" bug). Events that arrive before the first
+    // agent_started (e.g. a session_cleared marker, or an inbound
+    // message that woke the agent) go into a leading "preamble"
+    // section with no sticky header.
+    const groups = [];
+    let current = null;
+    for (let i = 0; i < events.length; i++) {
+      const ev = events[i];
+      if (ev.type === "agent_started" || current === null) {
+        current = { key: ev.__id ?? "g" + i, events: [ev] };
+        groups.push(current);
+      } else {
+        current.events.push(ev);
+      }
+    }
+    return groups.map((g) =>
+      html`<div class="turn-section" key=${g.key}>
+        ${g.events.map((ev, i) =>
+          html`<${EventItem} key=${ev.__id ?? "live-" + i} event=${ev} />`
+        )}
+      </div>`
     );
   }
 }
@@ -10358,12 +10652,21 @@ function EventItem({ event }) {
   if (type === "message_sent") {
     const subj = event.subject ? `  (${event.subject})` : "";
     const urgent = event.priority === "interrupt" ? " ⚠" : "";
-    const preview = (event.body_preview || "").slice(0, 160);
+    // Server includes up to 4000 chars in body_preview — render the
+    // whole thing instead of re-truncating client-side. body_truncated
+    // is set when the original message exceeded the cap; surface that
+    // explicitly so the reader doesn't think the agent sent a cut-off
+    // message (the full text always lives in the `messages` table and
+    // is visible in EnvPane → Inbox).
+    const preview = event.body_preview || "";
+    const truncatedSuffix = event.body_truncated
+      ? `\n\n… (${event.body_full_len} chars total — open Inbox in env panel for full text)`
+      : "";
     return html`<div class="event message_sent">
       <div class="event-meta">
         ${ts}  ${event.agent_id} → ${event.to}${urgent}${subj}
       </div>
-      <div class="event-body">${preview}</div>
+      <div class="event-body">${preview}${truncatedSuffix}</div>
     </div>`;
   }
 

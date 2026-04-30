@@ -749,7 +749,36 @@ body {
   color: var(--muted);
   display: flex;
   align-items: center;
+  gap: 6px;
 }
+/* Collapsible env sections — same chevron + click pattern as the
+   Settings drawer. Only sections marked `.env-section.collapsible`
+   participate; messages/streams (Attention, Inbox, Timeline,
+   KDrive errors) keep their existing layout. */
+.env-section.collapsible > .env-section-title {
+  cursor: pointer;
+  user-select: none;
+}
+.env-section.collapsible > .env-section-title:hover { color: var(--fg); }
+.env-section.collapsible > .env-section-title::before {
+  content: "";
+  display: inline-block;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 4px 0 4px 6px;
+  border-color: transparent transparent transparent currentColor;
+  transition: transform 120ms ease;
+  flex-shrink: 0;
+}
+.env-section.collapsible:not(.collapsed) > .env-section-title::before {
+  transform: rotate(90deg);
+}
+.env-section.collapsible.collapsed > *:not(.env-section-title) {
+  display: none !important;
+}
+.env-section.collapsible.collapsed > .env-section-title { margin-bottom: 0; }
+.env-section.collapsible.collapsed { padding-bottom: 8px; }
 .env-count {
   margin-left: auto;
   font-weight: 400;
@@ -775,6 +804,40 @@ body {
   font-size: 11px;
   margin-bottom: 6px;
 }
+/* Cost section: scope dropdown + reset button row sits between the
+   section title and the cap bar. */
+.env-cost-controls {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+.env-cost-scope {
+  flex: 1 1 auto;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 2px 6px;
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+}
+.env-cost-scope:hover { border-color: var(--accent); }
+.env-cost-reset {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.env-cost-reset:hover {
+  border-color: var(--err);
+  color: var(--err);
+}
+
 .env-cost-list {
   display: flex;
   flex-direction: column;
@@ -2316,6 +2379,24 @@ body {
   font-size: 12px;
   padding: 4px 0;
 }
+.rec-help {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+  margin: 0 0 10px;
+  padding: 6px 8px;
+  background: var(--card);
+  border-left: 2px solid var(--border);
+  border-radius: 0 3px 3px 0;
+}
+.rec-help code {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  padding: 0 4px;
+  font-size: 10px;
+}
+.rec-help em { color: var(--fg); font-style: normal; font-weight: 600; }
 .rec-card {
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -2941,12 +3022,24 @@ body {
 .event.connected { color: var(--muted); font-size: 12px; }
 .event .prompt { color: var(--fg); margin-top: 4px; }
 
+/* Turn section — wraps each agent_started + its child events. Acts
+   as the containing block for the sticky turn header so scrolling
+   past one turn's bottom releases its sticky header before the next
+   turn's header reaches top:0. Without this wrapper, two sticky
+   headers stack at the top of the pane (visible as "two last prompts
+   floating" when scrolled to the boundary between turns). */
+.turn-section { display: block; }
+
 /* Turn header — renders each agent_started event as a one-line
    collapsible bar that uses position: sticky to hover at the top of
    the scrolled pane-body. As the user scrolls further back in history,
    the next agent_started pushes the current one out of the sticky
    position, so the visible header always matches the prompt of the
-   turn you're currently reading (Claude Code's pattern). */
+   turn you're currently reading (Claude Code's pattern). The sticky
+   element's containing block is the surrounding `.turn-section`, so
+   when you scroll past the section's bottom the sticky behavior
+   naturally exits instead of stacking with the next section's
+   header. */
 .event.agent_started.turn-header {
   position: sticky;
   top: 0;

@@ -3347,6 +3347,7 @@ async def send_human_message(req: HumanMessageRequest) -> dict[str, Any]:
     finally:
         await c.close()
 
+    _msg_body = req.body or ""
     await bus.publish(
         {
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -3355,7 +3356,9 @@ async def send_human_message(req: HumanMessageRequest) -> dict[str, Any]:
             "message_id": msg_id,
             "to": to,
             "subject": req.subject,
-            "body_preview": (req.body or "")[:120],
+            "body_preview": _msg_body[:4000],
+            "body_full_len": len(_msg_body),
+            "body_truncated": len(_msg_body) > 4000,
             "priority": req.priority,
         }
     )
@@ -3866,6 +3869,205 @@ async def turns_summary(hours: int = 24) -> dict[str, Any]:
         "by_cost_basis": by_cost_basis,
         "plan_included_token_total": plan_included_token_total,
     }
+
+
+@app.get("/api/turns/by-project", dependencies=[Depends(require_token)])
+async def turns_by_project() -> dict[str, Any]:
+    """Per-project today/total spend breakdown for the EnvPane cost
+    section's project dropdown. Honors `cost_reset_at` (global) and
+    `cost_reset_at_<project_id>` (per-project) timestamps from
+    team_config so a "reset" zeroes the displayed today_usd for
+    affected projects.
+
+    `today_usd` and `today_turns` reflect rows since the latest
+    applicable reset (or UTC day start, whichever is later).
+    `total_usd` and `total_turns` are unfiltered all-time figures.
+
+    Returns:
+      {
+        "projects": [
+          {"id": "...", "name": "...",
+           "today_usd": 1.23, "today_turns": 5,
+           "total_usd": 12.34, "total_turns": 87},
+          ...
+        ],
+        "team": {"today_usd": 1.23, "today_turns": 5,
+                 "total_usd": 12.34, "total_turns": 87},
+        "resets": {"all": "<iso>"|"", "<project_id>": "<iso>", ...},
+      }
+
+    The `team` block is the SUM of project today_usd values (so a
+    project reset reduces team today_usd correspondingly), matching
+    the spec the user asked for: "ALL is the sum of the projects."
+    """
+    from server.agents import _today_utc_start_iso, _load_cost_resets
+    today_start = _today_utc_start_iso()
+    global_reset, per_project_resets = await _load_cost_resets()
+    base_window = max(today_start, global_reset) if global_reset else today_start
+
+    c = await configured_conn()
+    try:
+        # Include archived projects: their historical turn rows still
+        # contribute to the team-wide `_today_spend()` used by the
+        # cap check, so excluding them here would make
+        # `byProject.team.today_usd` < `serverStatus.caps.team_today_usd`
+        # whenever an archived project had pre-reset spend. The
+        # `archived` flag is surfaced per row so the UI can dim
+        # archived options if it wants to.
+        cur = await c.execute(
+            "SELECT id, name, archived FROM projects "
+            "ORDER BY archived ASC, name COLLATE NOCASE"
+        )
+        proj_rows = [dict(r) for r in await cur.fetchall()]
+
+        cur = await c.execute(
+            "SELECT project_id, "
+            "COUNT(*) AS turns, "
+            "COALESCE(SUM(cost_usd), 0) AS cost_usd "
+            "FROM turns GROUP BY project_id"
+        )
+        totals_by_project = {
+            (dict(r)["project_id"] or ""): dict(r)
+            for r in await cur.fetchall()
+        }
+
+        # Per-project today_usd: each project gets its own window
+        # (max of base_window and its per-project reset). One query
+        # per project keeps the SQL simple — count is bounded
+        # (~handful of projects).
+        today_by_project: dict[str, dict[str, float]] = {}
+        for p in proj_rows:
+            pid = p["id"]
+            window = base_window
+            ppr = per_project_resets.get(pid) or ""
+            if ppr and ppr > window:
+                window = ppr
+            cur = await c.execute(
+                "SELECT COUNT(*) AS turns, "
+                "COALESCE(SUM(cost_usd), 0) AS cost_usd "
+                "FROM turns WHERE project_id = ? AND ended_at >= ?",
+                (pid, window),
+            )
+            today_by_project[pid] = dict(await cur.fetchone())
+    finally:
+        await c.close()
+
+    projects_out = []
+    team_today_usd = 0.0
+    team_today_turns = 0
+    team_total_usd = 0.0
+    team_total_turns = 0
+    for p in proj_rows:
+        pid = p["id"]
+        today = today_by_project.get(pid) or {"turns": 0, "cost_usd": 0.0}
+        total = totals_by_project.get(pid) or {"turns": 0, "cost_usd": 0.0}
+        today_usd = float(today["cost_usd"] or 0)
+        today_turns = int(today["turns"] or 0)
+        total_usd = float(total["cost_usd"] or 0)
+        total_turns = int(total["turns"] or 0)
+        projects_out.append({
+            "id": pid,
+            "name": p["name"],
+            "archived": bool(p.get("archived")),
+            "today_usd": today_usd,
+            "today_turns": today_turns,
+            "total_usd": total_usd,
+            "total_turns": total_turns,
+        })
+        team_today_usd += today_usd
+        team_today_turns += today_turns
+        team_total_usd += total_usd
+        team_total_turns += total_turns
+
+    resets = {"all": global_reset}
+    for pid, ts in per_project_resets.items():
+        if ts:
+            resets[pid] = ts
+    return {
+        "projects": projects_out,
+        "team": {
+            "today_usd": round(team_today_usd, 6),
+            "today_turns": team_today_turns,
+            "total_usd": round(team_total_usd, 6),
+            "total_turns": team_total_turns,
+        },
+        "resets": resets,
+    }
+
+
+class TurnsResetRequest(BaseModel):
+    scope: str = Field(
+        ...,
+        description=(
+            "'all' to reset the team-wide today counter (and shadow every "
+            "per-project reset), or a project id to reset just that project."
+        ),
+    )
+
+
+@app.post("/api/turns/reset", dependencies=[Depends(require_token)])
+async def reset_turns_today(
+    req: TurnsResetRequest,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, Any]:
+    """Move the "since when" timestamp used by today_usd / cap-check
+    queries to NOW. Historical turn rows are NOT deleted — only the
+    display window shifts forward.
+
+    Scope semantics:
+    - "all" → writes `cost_reset_at` (global). Every project shows
+      today_usd=0 immediately. Per-project reset rows older than the
+      new global reset become inert (MAX wins) but are not deleted —
+      a future per-project reset can still override the global.
+    - "<project_id>" → writes `cost_reset_at_<project_id>`. Only that
+      project's display zeroes; the team total drops by that
+      project's pre-reset spend (since "team = sum of projects").
+
+    Effect on caps: yes — a reset gives the team / agent fresh
+    headroom for the rest of the UTC day. Use deliberately.
+    """
+    scope = (req.scope or "").strip()
+    if not scope:
+        raise HTTPException(400, detail="scope is required")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if scope == "all":
+        key = "cost_reset_at"
+    else:
+        # Per-project reset — verify the project exists so we don't
+        # write garbage keys.
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT 1 FROM projects WHERE id = ? LIMIT 1",
+                (scope,),
+            )
+            if not await cur.fetchone():
+                raise HTTPException(
+                    404, detail=f"project '{scope}' not found"
+                )
+        finally:
+            await c.close()
+        key = f"cost_reset_at_{scope}"
+
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO team_config (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, now_iso),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    await bus.publish({
+        "ts": now_iso,
+        "agent_id": "system",
+        "type": "cost_reset",
+        "scope": scope,
+        "actor": actor,
+    })
+    return {"ok": True, "scope": scope, "reset_at": now_iso}
 
 
 @app.get("/api/events", dependencies=[Depends(require_token)])
