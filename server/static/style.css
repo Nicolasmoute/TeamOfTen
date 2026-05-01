@@ -3534,7 +3534,11 @@ body {
    background, never a foreground replacement. No strikethrough,
    no border accents, no font-weight changes, no row separators —
    the chromatic subtlety is the whole point. */
-.tool-card.edit-card .diff {
+/* Diff renderer — used by the Edit-tool diff card AND by the
+   File-write proposal review (server/static/app.js:ProposalDiffView).
+   Selectors target `.diff.diff-split` so both contexts get identical
+   styling without duplicated rules. */
+.diff.diff-split {
   margin-top: 6px;
   border-radius: 4px;
   overflow: hidden;
@@ -3551,11 +3555,11 @@ body {
   container-type: inline-size;
   container-name: edit-diff;
 }
-.tool-card.edit-card .diff-row {
+.diff.diff-split .diff-row {
   display: flex;
   align-items: stretch;
 }
-.tool-card.edit-card .diff-half {
+.diff.diff-split .diff-half {
   flex: 1 1 50%;
   min-width: 0;
   padding: 1px 8px;
@@ -3563,11 +3567,11 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
 }
-.tool-card.edit-card .diff-half:last-child { border-right: 0; }
+.diff.diff-split .diff-half:last-child { border-right: 0; }
 /* Unchanged context rows span both columns — identical text twice
    would just be noise. Only changed rows keep the side-by-side
    split. */
-.tool-card.edit-card .diff-half.diff-full {
+.diff.diff-split .diff-half.diff-full {
   flex: 1 1 100%;
   border-right: 0;
 }
@@ -3575,16 +3579,16 @@ body {
    legible. Paired and pure changes get the SAME line tint; Monaco
    makes no distinction. The two-tier signal comes from the optional
    word band on top, not from differentiating the line. */
-.tool-card.edit-card .diff-add {
+.diff.diff-split .diff-add {
   background: rgba(63, 185, 80, 0.15);
 }
-.tool-card.edit-card .diff-del {
+.diff.diff-split .diff-del {
   background: rgba(248, 81, 73, 0.15);
 }
-.tool-card.edit-card .diff-ctx {
+.diff.diff-split .diff-ctx {
   opacity: 0.62;
 }
-.tool-card.edit-card .diff-blank {
+.diff.diff-split .diff-blank {
   /* Diagonal hatch on empty halves — Monaco's `diagonalFill`. Low
      alpha so it doesn't compete with content on the other side. */
   background: repeating-linear-gradient(
@@ -3601,13 +3605,13 @@ body {
    no border, no padding pill — just a brighter rectangle, exactly
    like Monaco. The contained text is already syntax-highlighted by
    hljs (per-segment). */
-.tool-card.edit-card .diff-chg {
+.diff.diff-split .diff-chg {
   background: rgba(255, 255, 255, 0); /* base; per-side overrides below */
 }
-.tool-card.edit-card .diff-del .diff-chg {
+.diff.diff-split .diff-del .diff-chg {
   background: rgba(248, 81, 73, 0.40);
 }
-.tool-card.edit-card .diff-add .diff-chg {
+.diff.diff-split .diff-add .diff-chg {
   background: rgba(63, 185, 80, 0.40);
 }
 /* Stacked layout: when the diff container itself is narrow (e.g. a
@@ -3616,22 +3620,22 @@ body {
    the side-by-side columns. Each half goes full-width and the
    between-halves divider becomes a horizontal rule. */
 @container edit-diff (max-width: 520px) {
-  .tool-card.edit-card .diff-row {
+  .diff.diff-split .diff-row {
     flex-direction: column;
   }
-  .tool-card.edit-card .diff-half {
+  .diff.diff-split .diff-half {
     flex: 1 1 100%;
     border-right: 0;
     border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
   }
-  .tool-card.edit-card .diff-half:last-child {
+  .diff.diff-split .diff-half:last-child {
     border-bottom: 0;
   }
   /* Empty placeholders read as wasted vertical space when stacked.
      Hide them so a pure add reads as one green block, a pure remove
      as one red block. Side-by-side mode keeps them so the row align
      hint survives. */
-  .tool-card.edit-card .diff-half.diff-blank {
+  .diff.diff-split .diff-half.diff-blank {
     display: none;
   }
 }
