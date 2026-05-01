@@ -29,6 +29,8 @@ project's `agent_project_roles` rows.
 
 The split: `decisions/`, `truth/`, `outputs/`, `uploads/` are the "permanent / canonical" lanes. Of those, `truth/` is the **only one** that is read-only for agents — the rest are agent-writable through their normal tools. Everything that evolves (memory, knowledge, conversations, handoffs, plans, workspace) lives under `working/`.
 
+**Reading project files: `coord_read_file(path)`.** Available to every agent (Coach AND Players). Path is relative to the active project's root (e.g. `'CLAUDE.md'`, `'truth/specs.md'`, `'decisions/0001-foo.md'`, `'working/knowledge/notes.md'`). Use this whenever you need the current body of any project file — especially in Codex where the native `shell` tool can fail in nested-container deploys. 200 KB cap, UTF-8 only. Project CLAUDE.md is also auto-injected into your system prompt every turn, so re-reading it is only useful mid-turn.
+
 ## Global resources (cross-project)
 
 - `/data/CLAUDE.md`        — these rules

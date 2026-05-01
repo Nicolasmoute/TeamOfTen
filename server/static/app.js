@@ -1086,6 +1086,13 @@ function App() {
   const [serverStatus, setServerStatus] = useState(null);
   const [paused, setPaused] = useState(false);
   const [authChallenge, setAuthChallenge] = useState(false);
+  // Live count of pending file-write proposals across the active
+  // project. Refreshed on mount and on every related event so the
+  // env-toggle notification dot stays accurate without polling.
+  // Lives at App scope (not inside EnvPane) so the dot renders even
+  // when EnvPane is closed — the whole point is to surface pending
+  // human review when the user can't see the EnvPane sections.
+  const [pendingFileWriteCount, setPendingFileWriteCount] = useState(0);
   // conversations: Map<slotId, Event[]>  (events ordered oldest → newest)
   const [conversations, setConversations] = useState(new Map());
   // streamingText: Map<slotId, {text, thinking}> — partial-token deltas
@@ -1363,6 +1370,25 @@ function App() {
     }
   }, [authedFetch]);
 
+  // Pending file-write proposals — fetch on mount and refresh on
+  // every related event so the env-toggle notification dot stays
+  // accurate. The fetch backstops the conversations-derived view in
+  // case relevant events pre-date the per-agent 50-event history
+  // window (rare but possible after a long session).
+  const refreshPendingFileWrite = useCallback(async () => {
+    try {
+      const res = await authedFetch(
+        "/api/file-write-proposals?status=pending"
+      );
+      if (!res.ok) return;
+      const data = await res.json();
+      const arr = Array.isArray(data.proposals) ? data.proposals : [];
+      setPendingFileWriteCount(arr.length);
+    } catch (e) {
+      console.error("refreshPendingFileWrite failed", e);
+    }
+  }, [authedFetch]);
+
   const togglePause = useCallback(async () => {
     try {
       const res = await authedFetch("/api/pause", {
@@ -1385,10 +1411,33 @@ function App() {
     loadPause();
     loadFileRoots();
     loadProjects();
+    refreshPendingFileWrite();
     seedConversationsFromHistory();
     const statusTimer = setInterval(loadStatus, 30_000);
     return () => clearInterval(statusTimer);
-  }, [loadAgents, loadTasks, loadStatus, loadPause, loadFileRoots, loadProjects, seedConversationsFromHistory]);
+  }, [loadAgents, loadTasks, loadStatus, loadPause, loadFileRoots, loadProjects, refreshPendingFileWrite, seedConversationsFromHistory]);
+
+  // Refresh the pending file-write count whenever a related event
+  // arrives — keyed off the running count of those events in
+  // `conversations` so a steady stream of events triggers re-fetches.
+  const fileWriteEventCount = useMemo(() => {
+    let n = 0;
+    for (const list of conversations.values()) {
+      for (const ev of list) {
+        if (
+          ev.type === "file_write_proposal_created" ||
+          ev.type === "file_write_proposal_approved" ||
+          ev.type === "file_write_proposal_denied" ||
+          ev.type === "file_write_proposal_cancelled" ||
+          ev.type === "file_write_proposal_superseded"
+        ) n++;
+      }
+    }
+    return n;
+  }, [conversations]);
+  useEffect(() => {
+    if (fileWriteEventCount > 0) refreshPendingFileWrite();
+  }, [fileWriteEventCount, refreshPendingFileWrite]);
 
   // Click-handler for in-app file links. Marked + DOMPurify tag any
   // markdown link whose href is an absolute path (`/data/...`,
@@ -2531,6 +2580,7 @@ function App() {
         wsConnected=${wsConnected}
         envOpen=${envOpen}
         onToggleEnv=${() => setEnvOpen((v) => !v)}
+        pendingFileWriteCount=${pendingFileWriteCount}
         recurrenceOpen=${recurrenceOpen}
         onToggleRecurrence=${() => setRecurrenceOpen((v) => !v)}
         onOpenSettings=${() => setSettingsOpen(true)}
@@ -3092,7 +3142,7 @@ function ProjectSwitchBusyModal({ busy, onDismiss, onRetry }) {
   `;
 }
 
-function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, activeProjectId, switchingProject, onActivateProject, onCreateProject, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, recurrenceOpen, onToggleRecurrence, onOpenSettings, paused, onTogglePause, onLayoutPreset, onCancelAll }) {
+function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, activeProjectId, switchingProject, onActivateProject, onCreateProject, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, pendingFileWriteCount = 0, recurrenceOpen, onToggleRecurrence, onOpenSettings, paused, onTogglePause, onLayoutPreset, onCancelAll }) {
   const workingCount = agents.filter((a) => a.status === "working").length;
   const grouped = useMemo(() => {
     const coach = agents.find((a) => a.kind === "coach");
@@ -3278,12 +3328,22 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
             `}</span>
           </button>
           <button
-            class=${"gear env-toggle" + (envOpen ? " active" : "")}
-            title=${(envOpen ? "Collapse environment panel" : "Open environment panel") + " (⌘/Ctrl+B)"}
+            class=${"gear env-toggle" + (envOpen ? " active" : "")
+              + (pendingFileWriteCount > 0 ? " has-pending" : "")}
+            title=${(envOpen ? "Collapse environment panel" : "Open environment panel") + " (⌘/Ctrl+B)"
+              + (pendingFileWriteCount > 0
+                ? ` — ${pendingFileWriteCount} file-write proposal${pendingFileWriteCount === 1 ? "" : "s"} awaiting your review`
+                : "")}
             onClick=${onToggleEnv}
           >
             <span class="env-icon-desktop">▦</span>
             <span class="env-icon-mobile">E</span>
+            ${pendingFileWriteCount > 0
+              ? html`<span
+                  class="env-toggle-pending-dot"
+                  aria-label=${`${pendingFileWriteCount} pending`}
+                ></span>`
+              : null}
           </button>
           <button class="gear settings-toggle" title="Settings" onClick=${onOpenSettings}>⚙</button>
         </div>
@@ -6196,20 +6256,51 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, active
 
     const apply = () => {
       root.querySelectorAll(".env-section.collapsible").forEach((sec) => {
-        if (sec.dataset.collapseInit === "1") return;
         const h3 = sec.querySelector(":scope > h3");
         if (!h3) return;
-        sec.dataset.collapseInit = "1";
         const t = titleOf(h3);
-        // Default: collapsed. User explicitly opens what they want
-        // visible (stored[t] === false) — anything else collapses.
-        if (stored[t] !== false) sec.classList.add("collapsed");
+
+        // Auto-open exception: File-write proposals defaults to OPEN
+        // when there's at least one pending item AND the user has
+        // never explicitly toggled the section (stored entry absent).
+        // This makes Coach's proposal review visible the moment the
+        // user opens the EnvPane, without requiring a section-level
+        // click in addition to the row-level diff expand.
+        const autoOpenable =
+          t === "File-write proposals" && stored[t] === undefined;
+        const pendingHere = autoOpenable
+          ? parseInt(sec.dataset.pendingCount || "0", 10)
+          : 0;
+        const shouldCollapse = autoOpenable
+          ? pendingHere === 0
+          : stored[t] !== false;
+
+        if (sec.dataset.collapseInit === "1") {
+          // Already initialised — re-evaluate ONLY for auto-openable
+          // sections so a freshly-arrived proposal expands the section
+          // even after the initial mount. Other sections keep their
+          // current state (user clicks own them after init).
+          if (autoOpenable) sec.classList.toggle("collapsed", shouldCollapse);
+          return;
+        }
+        sec.dataset.collapseInit = "1";
+        sec.classList.toggle("collapsed", shouldCollapse);
       });
     };
     apply();
 
     const observer = new MutationObserver(apply);
-    observer.observe(root, { childList: true, subtree: true });
+    // childList catches new sections; subtree extends both reach and
+    // attributeFilter to nested elements. attributeFilter is needed so
+    // the auto-open re-evaluation fires when EnvFileWriteProposalsSection
+    // updates its `data-pending-count` (e.g. a fresh proposal arrives
+    // after mount).
+    observer.observe(root, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["data-pending-count"],
+    });
 
     const onClick = (e) => {
       const h3 = e.target.closest("h3");
@@ -7793,7 +7884,10 @@ function EnvFileWriteProposalsSection({ conversations }) {
   }, [openId]);
 
   return html`
-    <section class="env-section collapsible">
+    <section
+      class="env-section collapsible"
+      data-pending-count=${String(proposals.length)}
+    >
       <h3 class="env-section-title">
         File-write proposals <span class="env-count">${proposals.length}</span>
       </h3>

@@ -928,10 +928,32 @@ proposal lane), §12.7.5 (the `coord_propose_file_write` tool), and
 §14.7.5 (HTTP API).
 
 **Migration**: this table is the renamed successor to
-`truth_proposals` (the rename happens pre-`executescript(SCHEMA)`
-in `init_db()` if the legacy table exists; `_ensure_columns` adds
-the `scope` column with default `'truth'` so existing rows
-preserve their semantic). Idempotent on re-run.
+`truth_proposals`. Three migration steps in `init_db()` cover the
+upgrade path:
+
+1. **Pre-SCHEMA rename** (before `executescript(SCHEMA)`):
+   `ALTER TABLE truth_proposals RENAME TO file_write_proposals` if
+   the old table exists and the new doesn't. Drops the old index
+   so SCHEMA's `CREATE INDEX IF NOT EXISTS` lands cleanly.
+2. **`_ensure_columns`** adds the `scope` column with default
+   `'truth'` so existing pending rows are queryable as truth scope
+   without a manual `UPDATE`.
+3. **CHECK-constraint rebuild** (`_rebuild_file_write_proposals_if_check_outdated`):
+   the legacy `truth_proposals` shipped with a 4-value status CHECK
+   (`pending/approved/denied/cancelled`) and SQLite's
+   `ALTER TABLE … RENAME TO` preserves the original CHECK clause
+   verbatim. So even after the rename, an `INSERT` with
+   `status='superseded'` would fail until the table is rebuilt
+   under the new 5-value CHECK. The rebuild detects the gap by
+   scanning `sqlite_master` for the literal `'superseded'` token,
+   and only fires when missing. Pattern (per SQLite §7 guidance):
+   `PRAGMA foreign_keys = OFF`, `BEGIN`, `CREATE TABLE
+   file_write_proposals_new` with the right CHECK, copy rows over,
+   `DROP` old, `ALTER … RENAME`, `CREATE INDEX`, `PRAGMA
+   foreign_key_check` (rolls back on any orphan), `COMMIT`,
+   `PRAGMA foreign_keys = ON`. No-op on fresh installs.
+
+All three steps are idempotent on re-run.
 
 ---
 
@@ -1983,6 +2005,39 @@ The resolver in `server/truth.py` handles approve/deny:
   `FileWriteProposalConflict("approved")` / `("denied")` /
   `("cancelled")` / `("superseded")` → 409.
 
+### 12.7.6 Project File Reads
+
+`coord_read_file(path)`
+
+- **Available to all agents** (Coach AND Players). Reads are
+  inherently safe; the read-handle invariant only constrains writes.
+- `path` is relative to the active project's root
+  (`/data/projects/<active>/`). Examples: `'CLAUDE.md'`,
+  `'truth/specs.md'`, `'decisions/0001-foo.md'`,
+  `'working/knowledge/notes.md'`, `'outputs/report.md'`.
+- Rejects leading `/` and any `..` segment; resolves the target
+  with `Path.resolve()` and re-anchors under the project root so a
+  symlink / weird-casing trick can't escape the lane.
+- 200 KB size cap (matches the propose tool's write cap). Files
+  that aren't valid UTF-8 are rejected with a clear error rather
+  than returning garbage; binary deliverables under `outputs/`
+  cannot be read through this tool.
+- Why this exists alongside Claude's native `Read`: Codex's
+  `read-only` sandbox in nested containers (Zeabur Docker-in-
+  Docker) breaks bubblewrap, which kills `shell cat`. Codex Coach
+  has no native filesystem read tool besides `shell`, and
+  app-server's `view` action is also bwrap-routed. `coord_read_file`
+  goes through the in-process MCP (Claude) / loopback proxy (Codex),
+  bypassing bwrap entirely. On Claude this overlaps with `Read` —
+  agents can use either; the harness doesn't restrict.
+- Project CLAUDE.md note: it's also auto-injected into every
+  agent's system prompt via `server/context.py`, so calling
+  `coord_read_file('CLAUDE.md')` is redundant for read-only
+  inspection at turn start. Use it when you want the *current*
+  body during a long turn (the system-prompt copy is frozen at
+  turn start; a manual file edit since the turn began is invisible
+  until the next turn unless you re-read).
+
 ### 12.8 Team Identity
 
 `coord_list_team()`
@@ -2971,6 +3026,21 @@ Shows (top-to-bottom):
   (fetched lazily from `GET /api/file-write-proposals/{id}/diff`;
   new files fall back to a plain proposed-content render), and
   approve / deny buttons.
+  **Discoverability surfaces** for pending proposals (so the user
+  doesn't have to remember to check):
+    1. A pulsing red dot on the env-toggle button (left rail) lights
+       up whenever there's at least one pending proposal — visible
+       even when the EnvPane is closed. Title attribute spells out
+       the count.
+    2. The "File-write proposals" section auto-expands when there's
+       at least one pending row AND the user has never explicitly
+       collapsed it (i.e. no localStorage entry for the section). Once
+       the user toggles the section, that explicit choice wins on
+       future opens. The auto-expand is driven by a
+       `data-pending-count` attribute on the section root; the
+       collapse-init `MutationObserver` watches that attribute via
+       `attributeFilter` so a fresh proposal arriving after mount
+       still re-opens the section.
 - Timeline of important events.
 
 It scopes project-sensitive sections to the active project through the

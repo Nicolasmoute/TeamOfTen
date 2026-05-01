@@ -473,8 +473,29 @@ body {
   line-height: 1;
 }
 .gear:hover { color: var(--fg); }
-.gear.env-toggle { font-size: 16px; }
+.gear.env-toggle { font-size: 16px; position: relative; }
 .gear.env-toggle.active { color: var(--accent); }
+/* Pending-review notification dot on the env-toggle button. Lights
+   up whenever there's at least one pending file-write proposal so
+   the user knows to open the EnvPane (Ctrl+B) and review. Pulses
+   gently to read as "actionable", not "passive status". Sized and
+   positioned to sit at the top-right corner of the gear icon. */
+.gear.env-toggle .env-toggle-pending-dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--err, #f85149);
+  box-shadow: 0 0 0 2px var(--bg);
+  pointer-events: none;
+  animation: env-toggle-pending-pulse 1.6s ease-in-out infinite;
+}
+@keyframes env-toggle-pending-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
 .env-icon-mobile { display: none; }
 /* Project switcher (Phase 3) — replaces the dashed `P` placeholder
    with a working dropdown. Pill shows the first 2 letters of the

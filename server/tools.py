@@ -1533,6 +1533,93 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         )
 
     @tool(
+        "coord_read_file",
+        (
+            "Read a text file from the **currently active** project's "
+            "tree at `/data/projects/<active-slug>/`. Available to all "
+            "agents (Coach AND Players) — the read path bypasses the "
+            "Codex sandbox / bwrap layer that breaks `shell cat` in "
+            "nested-container deploys, so this is the canonical way "
+            "for any agent to inspect project files at any time, "
+            "even when their native read tool is unavailable.\n"
+            "\n"
+            "Path is RELATIVE to the active project's root. Examples: "
+            "`'CLAUDE.md'`, `'truth/specs.md'`, `'decisions/0001-foo.md'`, "
+            "`'working/knowledge/notes.md'`, `'outputs/report.md'`. "
+            "Absolute paths and `..` segments are rejected.\n"
+            "\n"
+            "Project CLAUDE.md is also auto-injected into your system "
+            "prompt every turn — calling this for `CLAUDE.md` is fine "
+            "but redundant for read-only inspection. Use it when you "
+            "want the latest body during a long turn (the system-"
+            "prompt copy is frozen at turn start).\n"
+            "\n"
+            "Limits:\n"
+            "- Returns up to 200 KB of file content; larger files are "
+            "  rejected with a size error (use `coord_list_knowledge` / "
+            "  the Files pane for an index of large trees).\n"
+            "- Text-only: files that aren't valid UTF-8 are rejected. "
+            "  Binary deliverables under `outputs/` cannot be read "
+            "  through this tool.\n"
+            "\n"
+            "Params:\n"
+            "- path: relative path under the active project root "
+            "  (required, no leading slash, no `..`)."
+        ),
+        {"path": str},
+    )
+    async def read_file(args: dict[str, Any]) -> dict[str, Any]:
+        rel = (args.get("path") or "").strip()
+        if not rel:
+            return _err("path is required")
+        if rel.startswith("/"):
+            return _err(
+                "path must be relative under the active project's "
+                "root (no leading slash)"
+            )
+        if ".." in rel.split("/"):
+            return _err("path must not contain '..' segments")
+        # Anchor + re-validate so a clever path that resolves outside
+        # the project root (symlink, weird casing) is rejected even
+        # if the literal-segment check above passes.
+        from server.paths import project_paths
+        project_id = await resolve_active_project()
+        project_root = project_paths(project_id).root.resolve()
+        target = (project_root / rel).resolve()
+        try:
+            target.relative_to(project_root)
+        except ValueError:
+            return _err(
+                f"resolved path '{rel}' escapes the active project's "
+                "root — refusing read"
+            )
+        if not target.exists():
+            return _err(f"file not found: {rel}")
+        if not target.is_file():
+            return _err(f"not a regular file: {rel}")
+        try:
+            size = target.stat().st_size
+        except OSError as e:
+            return _err(f"stat failed: {e}")
+        if size > 200_000:
+            return _err(
+                f"file too large ({size} chars, max 200000); use the "
+                "Files pane or chunk via Read tool / shell"
+            )
+        try:
+            body = target.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return _err(
+                f"file is not valid UTF-8: {rel} (binary files cannot "
+                "be read through this tool)"
+            )
+        except OSError as e:
+            return _err(f"read failed: {e}")
+        return _ok(
+            f"file[{rel}] ({len(body)} chars):\n\n{body}"
+        )
+
+    @tool(
         "coord_list_team",
         (
             "Read the current team roster: slot id, name, role, brief, "
@@ -2343,6 +2430,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         commit_push,
         write_decision,
         propose_file_write,
+        read_file,
         write_knowledge,
         read_knowledge,
         list_knowledge,
@@ -2395,6 +2483,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_commit_push",
     "mcp__coord__coord_write_decision",
     "mcp__coord__coord_propose_file_write",
+    "mcp__coord__coord_read_file",
     "mcp__coord__coord_write_knowledge",
     "mcp__coord__coord_read_knowledge",
     "mcp__coord__coord_list_knowledge",

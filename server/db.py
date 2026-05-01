@@ -537,6 +537,19 @@ async def init_db() -> None:
                 "file_write_proposals",
                 [("scope", "scope TEXT NOT NULL DEFAULT 'truth'")],
             )
+            # CHECK-constraint upgrade for file_write_proposals:
+            # the old `truth_proposals` table shipped with a 4-value
+            # CHECK (pending/approved/denied/cancelled). The 'superseded'
+            # value was added later via SCHEMA, but SQLite's
+            # `ALTER TABLE … RENAME TO` preserves the original CHECK
+            # clause, so the rename carries the OLD constraint forward
+            # and any INSERT with status='superseded' fails on upgraded
+            # DBs. The only fix is a table rebuild: SQLite has no
+            # `ALTER TABLE DROP/ADD CHECK`. Detect the mismatch by
+            # scanning sqlite_master for the constraint text; rebuild
+            # only when 'superseded' is missing so this is a no-op on
+            # fresh installs (which already have the right constraint).
+            await _rebuild_file_write_proposals_if_check_outdated(db)
 
             logger.info("init_db: schema ok, ensuring misc project")
             # Ensure the fallback project + active-project pointer
@@ -590,6 +603,115 @@ async def init_db() -> None:
     except Exception:
         logger.exception("init_db: sqlite operations failed")
         raise
+
+
+async def _rebuild_file_write_proposals_if_check_outdated(
+    db: aiosqlite.Connection,
+) -> None:
+    """Upgrade `file_write_proposals.status` CHECK to include
+    'superseded' on deployments that started life as
+    `truth_proposals` with the older 4-value CHECK.
+
+    Detection: read the table's CREATE statement from `sqlite_master`
+    and look for the literal `'superseded'` token. Rebuild only when
+    it's missing — fresh DBs created from the current SCHEMA already
+    have the 5-value CHECK, so this is a no-op there.
+
+    Rebuild pattern (SQLite-canonical):
+      1. CREATE the new table under a temp name with the right CHECK.
+      2. Copy rows over (existing statuses are all in the 4-value set,
+         which is a strict subset of the 5-value set, so no row is
+         rejected).
+      3. DROP the old table (which auto-drops the dependent index).
+      4. RENAME the new table into place.
+      5. CREATE the index under the canonical name.
+
+    Wrapped in a transaction so a crash mid-rebuild leaves the old
+    table intact.
+    """
+    cur = await db.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type='table' AND name='file_write_proposals'"
+    )
+    row = await cur.fetchone()
+    if not row:
+        return  # table doesn't exist yet — fresh install path
+    create_sql = row[0] or ""
+    if "'superseded'" in create_sql:
+        return  # already on the new constraint
+
+    logger.info(
+        "init_db: rebuilding file_write_proposals to add 'superseded' "
+        "status to CHECK constraint (legacy truth_proposals upgrade)"
+    )
+    # Per SQLite's canonical table-rebuild guidance
+    # (sqlite.org/lang_altertable.html §7): disable FK enforcement
+    # for the duration of the rebuild, do the rename dance, run a
+    # `foreign_key_check` to confirm the new table's FKs are still
+    # consistent, then re-enable. Without the OFF, the
+    # `INSERT … SELECT` step trips FK enforcement on the temporary
+    # name even though the data is logically valid.
+    await db.execute("PRAGMA foreign_keys = OFF")
+    try:
+        await db.execute("BEGIN")
+        try:
+            await db.execute(
+                """
+                CREATE TABLE file_write_proposals_new (
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    proposer_id       TEXT NOT NULL,
+                    scope             TEXT NOT NULL DEFAULT 'truth',
+                    path              TEXT NOT NULL,
+                    proposed_content  TEXT NOT NULL,
+                    summary           TEXT NOT NULL,
+                    status            TEXT NOT NULL DEFAULT 'pending'
+                                      CHECK (status IN ('pending', 'approved', 'denied', 'cancelled', 'superseded')),
+                    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    resolved_at       TEXT,
+                    resolved_by       TEXT,
+                    resolved_note     TEXT
+                )
+                """
+            )
+            await db.execute(
+                """
+                INSERT INTO file_write_proposals_new
+                    (id, project_id, proposer_id, scope, path,
+                     proposed_content, summary, status, created_at,
+                     resolved_at, resolved_by, resolved_note)
+                SELECT id, project_id, proposer_id, scope, path,
+                       proposed_content, summary, status, created_at,
+                       resolved_at, resolved_by, resolved_note
+                  FROM file_write_proposals
+                """
+            )
+            await db.execute("DROP TABLE file_write_proposals")
+            await db.execute(
+                "ALTER TABLE file_write_proposals_new "
+                "RENAME TO file_write_proposals"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                "idx_file_write_proposals_project_status "
+                "ON file_write_proposals(project_id, status)"
+            )
+            # Catch any FK violation that the disabled enforcement
+            # masked. Returns one row per orphan ref; empty result =
+            # all good.
+            cur = await db.execute("PRAGMA foreign_key_check")
+            violations = await cur.fetchall()
+            if violations:
+                raise RuntimeError(
+                    f"file_write_proposals rebuild left {len(violations)} "
+                    f"FK violations: {violations}"
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    finally:
+        await db.execute("PRAGMA foreign_keys = ON")
 
 
 async def _seed_recurrence_from_env(db: aiosqlite.Connection) -> None:

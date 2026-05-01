@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import server.paths as pathsmod
 from server.db import (
     MISC_PROJECT_ID,
@@ -1673,3 +1675,257 @@ def test_resolve_target_path_dispatches_by_scope() -> None:
         "path": "CLAUDE.md",
     })
     assert pcm_target == pp.claude_md
+
+
+# ---------- coord_read_file (universal project-file reader) -------
+
+
+async def _read_via_handler(caller_id: str, path: str) -> dict[str, Any]:
+    from server.tools import build_coord_server
+    srv = build_coord_server(caller_id, include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_read_file"]
+    return await handler({"path": path})
+
+
+async def test_coord_read_file_in_allowlist(fresh_db) -> None:
+    """coord_read_file is registered + in the MCP allowlist so the
+    SDK actually accepts calls."""
+    from server.tools import ALLOWED_COORD_TOOLS
+    assert "mcp__coord__coord_read_file" in ALLOWED_COORD_TOOLS
+
+
+async def test_coord_read_file_coach_reads_truth(fresh_db) -> None:
+    """Coach can read a truth file even though Coach has no `Read`
+    tool on Codex (the whole reason this tool exists). Body comes
+    back verbatim with size annotation in the wrapper text."""
+    await init_db()
+    from server.paths import ensure_project_scaffold, project_paths
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    pp = project_paths(MISC_PROJECT_ID)
+    target = pp.truth / "specs.md"
+    target.write_text("# Specs\nbody\n", encoding="utf-8")
+
+    out = await _read_via_handler("coach", "truth/specs.md")
+    assert out.get("isError") is not True
+    text = out["content"][0]["text"]
+    assert "# Specs" in text
+    assert "body" in text
+
+
+async def test_coord_read_file_player_reads_truth(fresh_db) -> None:
+    """Players can call coord_read_file too — same handler, no
+    caller_is_coach gate."""
+    await init_db()
+    from server.paths import ensure_project_scaffold, project_paths
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    pp = project_paths(MISC_PROJECT_ID)
+    target = pp.truth / "brand.md"
+    target.write_text("brand\n", encoding="utf-8")
+
+    out = await _read_via_handler("p1", "truth/brand.md")
+    assert out.get("isError") is not True
+    assert "brand" in out["content"][0]["text"]
+
+
+async def test_coord_read_file_reads_decisions_knowledge_outputs(
+    fresh_db,
+) -> None:
+    """Any file under the project root is readable: decisions/,
+    working/knowledge/, outputs/. A single tool covers the whole tree
+    so agents don't have to learn lane-specific tools just to read."""
+    await init_db()
+    from server.paths import ensure_project_scaffold, project_paths
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    pp = project_paths(MISC_PROJECT_ID)
+    cases = [
+        (pp.decisions / "0001-foo.md", "## Decision 0001\nfoo\n", "decisions/0001-foo.md"),
+        (pp.knowledge / "notes.md", "knowledge body\n", "working/knowledge/notes.md"),
+        (pp.outputs / "report.md", "report body\n", "outputs/report.md"),
+        (pp.claude_md, "# Project body\n", "CLAUDE.md"),
+    ]
+    for target, body, rel in cases:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+        out = await _read_via_handler("coach", rel)
+        assert out.get("isError") is not True, f"failed for {rel}: {out}"
+        assert body.strip() in out["content"][0]["text"]
+
+
+async def test_coord_read_file_rejects_traversal(fresh_db) -> None:
+    """A path that resolves outside the project root via `..` is
+    rejected by both the literal-segment check and the resolved-
+    path anchoring (defense-in-depth)."""
+    await init_db()
+    from server.paths import ensure_project_scaffold
+    ensure_project_scaffold(MISC_PROJECT_ID)
+
+    for bad in ("../etc/passwd", "truth/../../../etc/passwd"):
+        out = await _read_via_handler("coach", bad)
+        assert out.get("isError") is True, f"path {bad!r} should be rejected"
+
+
+async def test_coord_read_file_rejects_absolute_path(fresh_db) -> None:
+    """Leading slash means the caller is trying to read a global
+    path; rejected so this tool stays project-scoped."""
+    await init_db()
+    from server.paths import ensure_project_scaffold
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    out = await _read_via_handler("coach", "/data/CLAUDE.md")
+    assert out.get("isError") is True
+    assert "leading slash" in out["content"][0]["text"].lower()
+
+
+async def test_coord_read_file_missing_file(fresh_db) -> None:
+    """A path under the project root that doesn't exist returns a
+    clear 'file not found' error rather than a stack trace."""
+    await init_db()
+    from server.paths import ensure_project_scaffold
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    out = await _read_via_handler("coach", "truth/nonexistent.md")
+    assert out.get("isError") is True
+    assert "not found" in out["content"][0]["text"].lower()
+
+
+async def test_coord_read_file_oversize_rejected(fresh_db) -> None:
+    """Files over 200 KB are refused — the tool isn't a streaming
+    reader, and the surrounding system prompt has a budget."""
+    await init_db()
+    from server.paths import ensure_project_scaffold, project_paths
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    pp = project_paths(MISC_PROJECT_ID)
+    big = pp.knowledge / "big.md"
+    big.parent.mkdir(parents=True, exist_ok=True)
+    big.write_text("x" * 200_001, encoding="utf-8")
+    out = await _read_via_handler("coach", "working/knowledge/big.md")
+    assert out.get("isError") is True
+    assert "too large" in out["content"][0]["text"].lower()
+
+
+async def test_coord_read_file_rejects_binary(fresh_db) -> None:
+    """Non-UTF-8 files (binary outputs, images) are rejected with a
+    clear error rather than returning garbage characters."""
+    await init_db()
+    from server.paths import ensure_project_scaffold, project_paths
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    pp = project_paths(MISC_PROJECT_ID)
+    binary = pp.outputs / "logo.png"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe\xfd")
+    out = await _read_via_handler("coach", "outputs/logo.png")
+    assert out.get("isError") is True
+    assert "utf-8" in out["content"][0]["text"].lower()
+
+
+async def test_coord_read_file_directory_rejected(fresh_db) -> None:
+    """A path that points to a directory (not a file) returns a
+    clear error."""
+    await init_db()
+    from server.paths import ensure_project_scaffold
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    out = await _read_via_handler("coach", "truth")
+    assert out.get("isError") is True
+    assert "not a regular file" in out["content"][0]["text"].lower() \
+        or "not found" in out["content"][0]["text"].lower()
+
+
+# ---------- CHECK-constraint upgrade for legacy DBs --------------
+
+
+async def test_init_db_rebuilds_file_write_proposals_check_constraint(
+    fresh_db,
+) -> None:
+    """Simulate the historical truth_proposals table shape on disk
+    (4-value status CHECK, no scope column, no `file_write_proposals`
+    name), call init_db(), and verify the rebuild migration ran:
+      - table is now `file_write_proposals` with 'superseded' in CHECK
+      - existing row preserved with scope='truth' default
+      - `superseded` insert succeeds (was the trip-wire from
+        production where the rename had carried the old CHECK forward)
+    """
+    import aiosqlite
+    from server.db import DB_PATH
+
+    # First do a real init_db so the projects/agents tables and the
+    # `misc` project row exist (mirrors production: legacy proposal
+    # rows ALWAYS reference projects that already exist, because the
+    # FK was enforced when those rows were originally inserted).
+    await init_db()
+
+    # Then nuke the proposal table and replant it under the legacy
+    # shape: name=truth_proposals, no scope column, 4-value CHECK.
+    # This is the precise on-disk shape Zeabur deploys hit before the
+    # rebuild migration shipped.
+    async with aiosqlite.connect(DB_PATH, timeout=10.0) as db:
+        await db.execute("PRAGMA foreign_keys = ON")
+        await db.execute("DROP TABLE IF EXISTS file_write_proposals")
+        await db.execute("DROP TABLE IF EXISTS truth_proposals")
+        await db.execute(
+            """
+            CREATE TABLE truth_proposals (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                proposer_id       TEXT NOT NULL,
+                path              TEXT NOT NULL,
+                proposed_content  TEXT NOT NULL,
+                summary           TEXT NOT NULL,
+                status            TEXT NOT NULL DEFAULT 'pending'
+                                  CHECK (status IN ('pending', 'approved', 'denied', 'cancelled')),
+                created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                resolved_at       TEXT,
+                resolved_by       TEXT,
+                resolved_note     TEXT
+            )
+            """
+        )
+        await db.execute(
+            "INSERT INTO truth_proposals "
+            "(project_id, proposer_id, path, proposed_content, summary) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (MISC_PROJECT_ID, "coach", "specs.md", "old body", "legacy"),
+        )
+        await db.commit()
+
+    # Run the boot sequence — should rename, ensure scope, then rebuild
+    # to add 'superseded' to CHECK.
+    await init_db()
+
+    async with aiosqlite.connect(DB_PATH, timeout=10.0) as db:
+        # Table renamed.
+        cur = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('truth_proposals', 'file_write_proposals')"
+        )
+        names = {r[0] for r in await cur.fetchall()}
+        assert "file_write_proposals" in names
+        assert "truth_proposals" not in names
+
+        # CHECK constraint includes the new value.
+        cur = await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='file_write_proposals'"
+        )
+        create_sql = (await cur.fetchone())[0]
+        assert "'superseded'" in create_sql
+
+        # Legacy row preserved with scope auto-defaulted to 'truth'.
+        cur = await db.execute(
+            "SELECT scope, status, path FROM file_write_proposals "
+            "ORDER BY id ASC"
+        )
+        rows = await cur.fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == "truth"
+        assert rows[0][1] == "pending"
+        assert rows[0][2] == "specs.md"
+
+        # Trip-wire: 'superseded' status now accepted.
+        await db.execute(
+            "UPDATE file_write_proposals SET status='superseded' WHERE id=?",
+            (rows[0][0] if False else 1,),  # legacy row id is 1
+        )
+        await db.commit()
+
+        cur = await db.execute(
+            "SELECT status FROM file_write_proposals WHERE id=1"
+        )
+        assert (await cur.fetchone())[0] == "superseded"
