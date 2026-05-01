@@ -922,6 +922,43 @@ body {
   border-color: var(--ok, #56d364);
   color: var(--ok, #56d364);
 }
+
+/* Loud-by-design status banners inside the expanded proposal card.
+   Each variant is a one-line strip with a left accent border; the
+   user reads the strip first and gets the file metadata before
+   scrolling into the diff body. The verbose phrasing is deliberate:
+   it tells the human exactly what state the diff is in, which makes
+   "no diff renders" trivial to self-diagnose. */
+.env-fw-status {
+  margin: 4px 0 4px 16px;
+  padding: 6px 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  border-left: 3px solid var(--border);
+  background: var(--card);
+  color: var(--muted);
+  border-radius: 0 3px 3px 0;
+}
+.env-fw-status code {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 10px;
+  color: var(--fg);
+  background: var(--bg);
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+.env-fw-status-loading { border-left-color: var(--muted); }
+.env-fw-status-err {
+  border-left-color: var(--err, #f85149);
+  color: var(--err, #f85149);
+}
+.env-fw-status-new { border-left-color: var(--coach); color: var(--coach); }
+.env-fw-status-nochange { border-left-color: var(--muted); font-style: italic; }
+.env-fw-status-diff {
+  border-left-color: var(--ok, #56d364);
+  color: var(--ok, #56d364);
+  font-variant-numeric: tabular-nums;
+}
 .env-decision-body {
   margin: 4px 0 8px 16px;
   padding: 8px 10px;

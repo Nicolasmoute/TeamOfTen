@@ -7785,29 +7785,51 @@ function ProposalDiffView({ proposal }) {
   }, [proposal.id]);
 
   if (state.status === "loading") {
-    return html`<div class="env-empty">loading diff…</div>`;
+    return html`<div class="env-fw-status env-fw-status-loading">loading diff…</div>`;
   }
   if (state.status === "err") {
     return html`
-      <div class="env-cost-hint">diff failed: ${state.error}</div>
+      <div class="env-fw-status env-fw-status-err">⚠ diff fetch failed: ${state.error}</div>
       <pre class="env-decision-body">${proposal.proposed_content}</pre>
     `;
   }
   const { before, after, path } = state.data;
   // No diff for new files — render proposed content as plain text per
-  // the file-write-proposal v1 design.
+  // the file-write-proposal v1 design. Loud banner so the user knows
+  // the file doesn't yet exist on disk at the resolved path (which
+  // can also mean: project_id mismatch, scaffold incomplete, etc.).
   if (before === null || before === undefined) {
     return html`
-      <div class="env-empty">(new file — no prior content)</div>
+      <div class="env-fw-status env-fw-status-new">
+        new file — no current content on disk for
+        <code>${path || "?"}</code> (proposed file will be created)
+      </div>
       <pre class="env-decision-body">${after || ""}</pre>
     `;
   }
   if (before === after) {
-    return html`<div class="env-empty">(no changes — proposal matches current file)</div>`;
+    return html`
+      <div class="env-fw-status env-fw-status-nochange">
+        no changes — proposed content matches current
+        <code>${path || "?"}</code> exactly (${before.length} chars)
+      </div>
+    `;
   }
   const lang = langForFile(path || "");
   const rows = buildSideBySideRows(before, after, lang);
-  return renderDiffBody(rows, lang);
+  // Tiny header so the user can confirm the diff actually rendered
+  // and see at a glance how many lines changed.
+  const addCount = rows.filter((r) => r.right && r.right.kind === "add").length;
+  const delCount = rows.filter((r) => r.left && r.left.kind === "del").length;
+  const headerHtml = html`
+    <div class="env-fw-status env-fw-status-diff">
+      diff for <code>${path || "?"}</code> · ${before.length} → ${after.length} chars · −${delCount} +${addCount}
+    </div>
+  `;
+  return html`
+    ${headerHtml}
+    ${renderDiffBody(rows, lang)}
+  `;
 }
 
 // File-write proposals section — Coach proposes via
