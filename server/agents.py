@@ -31,6 +31,7 @@ from server.db import configured_conn, resolve_active_project
 from server.events import bus
 from server.webdav import webdav
 from server.mcp_config import load_external_servers
+from server.models_catalog import MODEL_GUIDANCE
 from server.tools import ALLOWED_COACH_TOOLS, ALLOWED_PLAYER_TOOLS
 from server.workspaces import workspace_dir
 
@@ -1418,8 +1419,8 @@ async def _add_cost(agent_id: str, cost_usd: float | None) -> None:
 
 
 async def _get_agent_identity(agent_id: str) -> dict[str, str | None]:
-    """Read (name, role, brief) from agent_project_roles for the
-    active project. Returns {} for system. Missing row → all None.
+    """Read (name, role, brief, model_override) from agent_project_roles
+    for the active project. Returns {} for system. Missing row → all None.
     """
     if agent_id == "system":
         return {}
@@ -1428,7 +1429,7 @@ async def _get_agent_identity(agent_id: str) -> dict[str, str | None]:
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT name, role, brief FROM agent_project_roles "
+                "SELECT name, role, brief, model_override FROM agent_project_roles "
                 "WHERE slot = ? AND project_id = ?",
                 (agent_id, project_id),
             )
@@ -1439,9 +1440,14 @@ async def _get_agent_identity(agent_id: str) -> dict[str, str | None]:
         logger.exception("get_agent_identity failed: agent=%s", agent_id)
         return {}
     if not row:
-        return {"name": None, "role": None, "brief": None}
+        return {"name": None, "role": None, "brief": None, "model_override": None}
     d = dict(row)
-    return {"name": d.get("name"), "role": d.get("role"), "brief": d.get("brief")}
+    return {
+        "name": d.get("name"),
+        "role": d.get("role"),
+        "brief": d.get("brief"),
+        "model_override": d.get("model_override"),
+    }
 
 
 async def _ensure_session_row(c: Any, agent_id: str, project_id: str) -> None:
@@ -1522,6 +1528,62 @@ async def _get_agent_brief(agent_id: str) -> str | None:
     ident = await _get_agent_identity(agent_id)
     v = ident.get("brief") if ident else None
     return v if v else None
+
+
+async def _get_agent_model_override(agent_id: str) -> str | None:
+    """Read agent_project_roles.model_override for the active project.
+
+    Coach-set per-(slot, project) model preference. Sits between the
+    per-pane override (request `model` arg) and the runtime-aware role
+    default in the resolution chain. None when unset / cleared.
+
+    Dedicated query (does not piggyback on `_get_agent_identity`) so a
+    SQLite hiccup logs against this lookup specifically rather than
+    being attributed to the broader identity read.
+    """
+    if agent_id == "system":
+        return None
+    project_id = await resolve_active_project()
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT model_override FROM agent_project_roles "
+                "WHERE slot = ? AND project_id = ?",
+                (agent_id, project_id),
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception(
+            "get_agent_model_override failed: agent=%s project=%s",
+            agent_id, project_id,
+        )
+        return None
+    if not row:
+        return None
+    v = dict(row).get("model_override")
+    return v if v else None
+
+
+def _model_fits_runtime(model: str, runtime_name: str) -> bool:
+    """True when `model` belongs to `runtime_name`'s family.
+
+    Positive enumeration via `models_catalog.model_is_claude` /
+    `model_is_codex` so a future Anthropic id without the `claude-`
+    prefix isn't silently misclassified. Used at spawn time to drop a
+    Coach-set override that no longer matches the player's current
+    runtime — a soft fallback rather than a hard error.
+    """
+    from server.models_catalog import model_is_claude, model_is_codex
+    if not model:
+        return False
+    if runtime_name == "claude":
+        return model_is_claude(model)
+    if runtime_name == "codex":
+        return model_is_codex(model)
+    return False
 
 
 async def _get_continuity_note(agent_id: str) -> str | None:
@@ -2334,6 +2396,11 @@ def _system_prompt_for(agent_id: str) -> str:
             "Player their name + role (e.g. p3 → 'Alice' / 'Frontend developer'). "
             "Do this once per Player when forming the team — the UI labels "
             "their pane from these values.\n"
+            "  - coord_set_player_model(player_id, model): set or clear a "
+            "Player's model override (e.g. 'claude-opus-4-7', 'gpt-5.4-mini'). "
+            "Empty string clears. Read the 'Model selection policy' section "
+            "below BEFORE calling this — model changes are the exception, "
+            "not the rule.\n"
             "  - AskUserQuestion (built-in): ask the human a structured "
             "multiple-choice question. Your turn PAUSES until they submit "
             "the form in the UI, then resumes with the answers in the tool "
@@ -2371,7 +2438,9 @@ def _system_prompt_for(agent_id: str) -> str:
             "  - Only you can create top-level tasks — Players can only subtask.\n"
             "  - You are the sole source of assignments; Players claim them.\n"
             "  - Start every turn by reading your inbox for new human goals.\n"
-            "  - Be terse."
+            "  - Be terse.\n"
+            "\n"
+            + MODEL_GUIDANCE
         )
     return (
         f"You are Player {agent_id} on the TeamOfTen team. Your name and role "
@@ -3349,12 +3418,33 @@ async def run_agent(
 
     # Model resolution precedence (highest → lowest):
     #   1. per-pane override (`model` arg from the gear popover)
-    #   2. runtime-aware per-role team default, set in Settings
-    #   3. SDK default (no kwarg)
+    #   2. Coach-set per-(slot, project) override
+    #      (`agent_project_roles.model_override`, written via
+    #      `coord_set_player_model`)
+    #   3. runtime-aware per-role team default, set in Settings
+    #   4. SDK default (no kwarg)
     # Resolved here in the dispatcher because the turn ledger row
     # (turns.model) records what we actually told the SDK to use.
+    # The Coach override is silently dropped if it doesn't fit the
+    # current runtime — protects against the case where Coach picked a
+    # Claude model and the player later flipped to Codex.
+    #
+    # The fit-check happens BEFORE alias resolution because aliases
+    # carry runtime info (`latest_opus` is unambiguously Claude); the
+    # SDK call below sees the post-resolution concrete id.
+    if not model:
+        slot_override = await _get_agent_model_override(agent_id)
+        if slot_override and _model_fits_runtime(slot_override, _runtime_name):
+            model = slot_override
     if not model:
         model = await _get_role_default_model(agent_id, _runtime_name)
+    # Resolve tier alias → concrete id. No-op for concrete inputs and
+    # for None/empty (returns "" which the SDK reads as "no override").
+    # All downstream consumers — turns ledger, runtime fit checks,
+    # context-window estimates — see the concrete id.
+    from server.models_catalog import resolve_model_alias
+    if model:
+        model = resolve_model_alias(model)
 
     # Per-turn context the ResultMessage handler appends to the turns
     # ledger. The runtime stamps started_at on each iterate call so

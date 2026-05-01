@@ -17,6 +17,12 @@
          so cold loads don't depend on jsdelivr. -->
     <link rel="stylesheet" href="/static/vendor/hljs-github-dark.css" />
     <link rel="stylesheet" href="/static/style.css" />
+    <!-- Compass dashboard — harness-styled v1. Loaded after style.css
+         so its rules can override base pane chrome where needed.
+         The script is loaded as an ES module by app.js (re-exports the
+         CompassPane component); no separate <script> tag here keeps
+         the load order deterministic. -->
+    <link rel="stylesheet" href="/static/compass.css" />
   </head>
   <body>
     <div id="app"></div>

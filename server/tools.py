@@ -1554,6 +1554,123 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         return _ok(f"{pid} → {name or '(no name)'} — {role or '(no role)'}")
 
     @tool(
+        "coord_set_player_model",
+        (
+            "Coach-only. Set or clear the model a Player runs on. "
+            "Stored as a per-(slot, project) override on "
+            "`agent_project_roles.model_override`.\n"
+            "\n"
+            "Prefer TIER ALIASES over version-pinned ids — they survive "
+            "model bumps without rewriting your overrides:\n"
+            "  Claude runtime: 'latest_opus', 'latest_sonnet', "
+            "'latest_haiku'\n"
+            "  Codex runtime:  'latest_gpt' (top-tier), 'latest_mini'\n"
+            "Concrete ids (e.g. 'claude-opus-4-7', 'gpt-5.4-mini') are "
+            "still accepted for cases where you specifically need a "
+            "version pin, but aliases should be your default.\n"
+            "\n"
+            "Resolution order at spawn time (highest first): per-pane "
+            "human override → this Coach override → per-role team "
+            "default → SDK default. The override is silently dropped "
+            "if it doesn't match the Player's current runtime "
+            "(Claude vs Codex), so a stale value never breaks a turn. "
+            "Aliases are resolved to the current concrete id at spawn "
+            "time, so a stored 'latest_sonnet' picks up the next "
+            "Sonnet release without re-running the tool.\n"
+            "\n"
+            "Read the 'Model selection policy' section of your system "
+            "prompt FIRST — model changes are the exception, not the "
+            "rule. Pass an empty `model` to clear and revert to the "
+            "role default. Emits an 'agent_model_set' event so the UI "
+            "refreshes immediately.\n"
+            "\n"
+            "Params:\n"
+            "- player_id: one of p1..p10 (required)\n"
+            "- model: tier alias ('latest_opus' etc.) or concrete id. "
+            "Empty string clears."
+        ),
+        {"player_id": str, "model": str},
+    )
+    async def set_player_model(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("Only Coach sets Player models.")
+        pid = (args.get("player_id") or "").strip()
+        model = (args.get("model") or "").strip()
+        if not re.fullmatch(r"p([1-9]|10)", pid):
+            return _err(f"invalid player_id '{pid}' — expected p1..p10")
+
+        # Lazy import to avoid a top-level cycle: server.agents already
+        # imports from this module at startup.
+        from server.agents import _resolve_runtime_for
+        from server.models_catalog import (
+            _CLAUDE_MODEL_WHITELIST,
+            _CODEX_MODEL_WHITELIST,
+        )
+
+        if model:
+            runtime = await _resolve_runtime_for(pid)
+            whitelist = (
+                _CODEX_MODEL_WHITELIST if runtime == "codex"
+                else _CLAUDE_MODEL_WHITELIST
+            )
+            if model not in whitelist:
+                family = "Codex" if runtime == "codex" else "Claude"
+                allowed = sorted(m for m in whitelist if m)
+                return _err(
+                    f"unknown {family} model '{model}' for {pid} "
+                    f"(runtime={runtime}). Allowed: {', '.join(allowed)}"
+                )
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute("SELECT 1 FROM agents WHERE id = ?", (pid,))
+            if not await cur.fetchone():
+                return _err(f"player '{pid}' not found")
+            # Empty-string clear on a player that has never had a row
+            # is a no-op — don't create an all-NULL orphan. Any other
+            # combination (existing row OR setting a non-empty value)
+            # falls through to the upsert.
+            cur = await c.execute(
+                "SELECT 1 FROM agent_project_roles "
+                "WHERE slot = ? AND project_id = ?",
+                (pid, project_id),
+            )
+            row_exists = await cur.fetchone() is not None
+            if not model and not row_exists:
+                pass  # nothing to clear
+            else:
+                await c.execute(
+                    "INSERT INTO agent_project_roles "
+                    "(slot, project_id, model_override) VALUES (?, ?, ?) "
+                    "ON CONFLICT(slot, project_id) DO UPDATE SET "
+                    "  model_override = excluded.model_override",
+                    (pid, project_id, model or None),
+                )
+                await c.commit()
+        finally:
+            await c.close()
+
+        # `to: pid` lets the UI fan-out machinery render this event in
+        # the target Player's pane too — Coach changing my model is
+        # context I want to see when watching p3, not just buried in
+        # Coach's timeline. Mirrors the message_sent / task_assigned
+        # shape that the existing fan-out filter already understands.
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "agent_model_set",
+                "player_id": pid,
+                "to": pid,
+                "model": model,
+            }
+        )
+        if model:
+            return _ok(f"{pid} model override → {model}")
+        return _ok(f"{pid} model override cleared (will use role default)")
+
+    @tool(
         "coord_answer_question",
         (
             "Coach-only. Resolve a pending AskUserQuestion from a Player. "
@@ -1886,6 +2003,224 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         })
         return _ok(f"todo {todo.id} updated: {todo.title}")
 
+    # ============================================================
+    # Compass tools — Coach-only strategy-engine surface.
+    # All four reject Player calls with the same canonical message
+    # so coach-only behavior is discoverable from any error reply.
+    # Each tool also rejects when Compass is disabled for the active
+    # project (team_config['compass_enabled_<id>'] not truthy).
+    # ============================================================
+
+    async def _compass_gate(project_id: str) -> str | None:
+        """Return None if Compass is enabled for this project, else
+        an error message. Lazy import to dodge the tools↔compass.api
+        back-edge."""
+        if not caller_is_coach:
+            return (
+                "Compass tools are Coach-only. "
+                "Players read Compass via the CLAUDE.md block."
+            )
+        from server.compass import config as cmp_config  # noqa: PLC0415
+
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT value FROM team_config WHERE key = ?",
+                (cmp_config.enabled_key(project_id),),
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+        val = (dict(row).get("value") if row else "") or ""
+        if val.strip().lower() not in ("1", "true", "yes"):
+            return (
+                "Compass is disabled for this project. "
+                "Enable it from the Compass dashboard before using "
+                "compass_ask / compass_audit / compass_brief / compass_status."
+            )
+        return None
+
+    @tool(
+        "compass_ask",
+        (
+            "Coach-only. Interrogate Compass on any project topic. "
+            "Compass answers based strictly on its lattice and "
+            "truth-protected facts, citing statement ids and weights. "
+            "Treats >0.8 as confirmed YES, <0.2 as confirmed NO "
+            "(negation is binding), 0.4–0.6 as genuinely uncertain. "
+            "Read-only — does not modify the lattice.\n"
+            "\n"
+            "Params:\n"
+            "- query: free-text question, e.g. "
+            "'should we build for usage or flat pricing?'"
+        ),
+        {"query": str},
+    )
+    async def compass_ask(args: dict[str, Any]) -> dict[str, Any]:
+        query_text = (args.get("query") or "").strip()
+        if not query_text:
+            return _err("query is required")
+        project_id = await resolve_active_project()
+        gate = await _compass_gate(project_id)
+        if gate:
+            return _err(gate)
+        from server.compass import llm as cmp_llm  # noqa: PLC0415
+        from server.compass import prompts as cmp_prompts  # noqa: PLC0415
+        from server.compass import store as cmp_store  # noqa: PLC0415
+
+        state = cmp_store.load_state(project_id)
+        try:
+            res = await cmp_llm.call(
+                cmp_prompts.COACH_QUERY_SYSTEM,
+                cmp_prompts.coach_query_user(state, query_text),
+                project_id=project_id,
+                label="compass:ask",
+            )
+        except Exception as e:
+            return _err(f"compass_ask LLM call failed: {type(e).__name__}: {e}")
+        body = (res.text or "").strip()
+        if not body:
+            return _ok("(Compass had no response — lattice may be empty.)")
+        return _ok(body)
+
+    @tool(
+        "compass_audit",
+        (
+            "Coach-only. Submit a work artifact (commit message, "
+            "decision, worker output, design choice) for audit "
+            "against the lattice. Compass returns one of three "
+            "verdicts: 'aligned' (proceed silently), "
+            "'confident_drift' (work clearly contradicts a high-"
+            "confidence statement), or 'uncertain_drift' (work "
+            "seems off but the relevant statements are mid-weight; "
+            "a question is queued for the human). Audits are "
+            "advisory — they never block work.\n"
+            "\n"
+            "Params:\n"
+            "- artifact: the work to audit, e.g. "
+            "'worker-4 implemented per-second billing instead of "
+            "per-task as originally scoped'"
+        ),
+        {"artifact": str},
+    )
+    async def compass_audit(args: dict[str, Any]) -> dict[str, Any]:
+        artifact = (args.get("artifact") or "").strip()
+        if not artifact:
+            return _err("artifact is required")
+        project_id = await resolve_active_project()
+        gate = await _compass_gate(project_id)
+        if gate:
+            return _err(gate)
+        from server.compass import audit as cmp_audit  # noqa: PLC0415
+
+        try:
+            verdict = await cmp_audit.audit_work(project_id, artifact)
+        except Exception as e:
+            return _err(f"compass_audit failed: {type(e).__name__}: {e}")
+        # Render as a compact markdown block — Coach is reading this.
+        lines = [f"**Verdict:** `{verdict['verdict']}`"]
+        if verdict.get("summary"):
+            lines.append(f"**Summary:** {verdict['summary']}")
+        if verdict.get("contradicting_ids"):
+            lines.append(
+                "**Contradicts:** " + ", ".join(verdict["contradicting_ids"])
+            )
+        if verdict.get("message_to_coach"):
+            lines.append("")
+            lines.append(verdict["message_to_coach"])
+        if verdict.get("question_id"):
+            lines.append("")
+            lines.append(
+                f"_A question for the human has been queued ({verdict['question_id']})._"
+            )
+        return _ok("\n".join(lines))
+
+    @tool(
+        "compass_brief",
+        (
+            "Coach-only. Fetch the most recent daily briefing — a "
+            "structured markdown digest with sections: CONFIRMED "
+            "YES, CONFIRMED NO, LEANING, OPEN, COVERAGE, DRIFT, "
+            "RECOMMENDATION. Read-only. If no briefing has been "
+            "generated yet (fresh project pre-bootstrap), returns "
+            "an explanatory placeholder."
+        ),
+        {},
+    )
+    async def compass_brief(args: dict[str, Any]) -> dict[str, Any]:
+        del args  # no-arg tool; signature is part of the SDK contract
+        project_id = await resolve_active_project()
+        gate = await _compass_gate(project_id)
+        if gate:
+            return _err(gate)
+        from server.compass import store as cmp_store  # noqa: PLC0415
+
+        text = cmp_store.latest_briefing_text(project_id)
+        if not text:
+            return _ok(
+                "_No Compass briefing exists for this project yet. "
+                "Either Compass hasn't run, or this is a bootstrap-only "
+                "project. The dashboard's RUN button generates one._"
+            )
+        return _ok(text)
+
+    @tool(
+        "compass_status",
+        (
+            "Coach-only. Quick status snapshot of Compass for the "
+            "active project. Returns counts of active and archived "
+            "statements, regions, pending questions, pending "
+            "settle/stale/dupe proposals, and the timestamp of the "
+            "last run + last briefing. Read-only."
+        ),
+        {},
+    )
+    async def compass_status(args: dict[str, Any]) -> dict[str, Any]:
+        del args  # no-arg tool; signature is part of the SDK contract
+        project_id = await resolve_active_project()
+        gate = await _compass_gate(project_id)
+        if gate:
+            return _err(gate)
+        from server.compass import config as cmp_config  # noqa: PLC0415
+        from server.compass import store as cmp_store  # noqa: PLC0415
+
+        state = cmp_store.load_state(project_id)
+        briefing_dates = cmp_store.list_briefing_dates(project_id)
+        c2 = await configured_conn()
+        try:
+            cur = await c2.execute(
+                "SELECT value FROM team_config WHERE key = ?",
+                (cmp_config.last_run_key(project_id),),
+            )
+            row = await cur.fetchone()
+        finally:
+            await c2.close()
+        last_run = (dict(row).get("value") if row else "") or "(never)"
+        active = state.active_statements()
+        archived = state.archived_statements()
+        regions = [r.name for r in state.active_regions()]
+        pending_qs = [
+            q for q in state.questions
+            if not q.digested and not q.contradicted and not q.ambiguity_accepted
+        ]
+        unanswered_qs = [q for q in pending_qs if q.answer is None]
+
+        lines = [
+            "**Compass status**",
+            f"- active statements: {len(active)}",
+            f"- archived: {len(archived)}",
+            f"- regions ({len(regions)}): "
+            + (", ".join(regions) if regions else "—"),
+            f"- pending questions: {len(pending_qs)} "
+            f"({len(unanswered_qs)} unanswered)",
+            f"- pending settle proposals: {len(state.settle_proposals)}",
+            f"- pending stale proposals: {len(state.stale_proposals)}",
+            f"- pending dupe proposals: {len(state.duplicate_proposals)}",
+            f"- last run: {last_run}",
+            f"- last briefing: {briefing_dates[0] if briefing_dates else '(none)'}",
+        ]
+        return _ok("\n".join(lines))
+
     _tools = [
         list_tasks,
         create_task,
@@ -1905,12 +2240,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         list_knowledge,
         list_team,
         set_player_role,
+        set_player_model,
         answer_question,
         answer_plan,
         request_human,
         add_todo,
         complete_todo,
         update_todo,
+        compass_ask,
+        compass_audit,
+        compass_brief,
+        compass_status,
     ]
     server = create_sdk_mcp_server(name="coord", version="0.8.0", tools=_tools)
     # Stash a name → handler map so the coord_mcp proxy endpoint
@@ -1953,12 +2293,21 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_save_output",
     "mcp__coord__coord_list_team",
     "mcp__coord__coord_set_player_role",
+    "mcp__coord__coord_set_player_model",
     "mcp__coord__coord_answer_question",
     "mcp__coord__coord_answer_plan",
     "mcp__coord__coord_request_human",
     "mcp__coord__coord_add_todo",
     "mcp__coord__coord_complete_todo",
     "mcp__coord__coord_update_todo",
+    # Compass — Coach-only at runtime; included in the allowlist for
+    # both roles so the SDK doesn't pre-reject the call. The
+    # caller_is_coach gate inside each handler is what enforces the
+    # Coach-only invariant.
+    "mcp__coord__compass_ask",
+    "mcp__coord__compass_audit",
+    "mcp__coord__compass_brief",
+    "mcp__coord__compass_status",
 ]
 
 MEMORY_TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")

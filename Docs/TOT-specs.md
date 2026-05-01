@@ -509,6 +509,7 @@ CREATE TABLE agent_project_roles (
   name TEXT,
   role TEXT,
   brief TEXT,
+  model_override TEXT,
   PRIMARY KEY (slot, project_id)
 );
 ```
@@ -520,6 +521,12 @@ Notes:
 - Brief max from API: 8000 chars.
 - Name/role can be written by Coach (`coord_set_player_role`) or human
   (`PUT /api/agents/{id}/identity`).
+- `model_override` is Coach-set via `coord_set_player_model`. NULL when
+  unset. Sits between the per-pane human override and the runtime-aware
+  per-role default in `run_agent`'s resolution chain. The tool validates
+  against the player's current runtime (Claude vs Codex); a stored
+  override that no longer matches the runtime is silently dropped at
+  spawn time so a runtime flip can't break a turn.
 
 ### 6.4 `agent_sessions`
 
@@ -1731,6 +1738,52 @@ Current implementation gap:
 - Role max 300 chars.
 - Upserts active project's `agent_project_roles`.
 - Emits `player_assigned`.
+
+`coord_set_player_model(player_id, model)`
+
+- Coach only.
+- `player_id`: `p1` to `p10`.
+- `model`: a TIER ALIAS (`latest_opus`, `latest_sonnet`,
+  `latest_haiku` for Claude; `latest_gpt`, `latest_mini` for Codex)
+  OR a concrete version id (`claude-opus-4-7`, `gpt-5.4-mini`, …) on
+  the runtime-appropriate whitelist. Aliases are preferred — the
+  harness resolves them to the current concrete id at spawn time, so
+  a stored `latest_sonnet` automatically picks up the next Sonnet
+  release. Concrete ids stay accepted for cases where a specific
+  version pin matters. Empty string clears the override.
+- Validated against the player's currently-resolved runtime — a Codex
+  model id on a Claude-runtime player is rejected at SET time. If the
+  runtime later flips, the stored override that no longer fits is
+  silently dropped at spawn time and resolution falls through to the
+  role default.
+- Upserts `agent_project_roles.model_override` for the active project.
+  Empty-clear on a player that has no row is a no-op (no orphan row
+  is created).
+- Emits `agent_model_set` with `to: <player_id>` so the WS / history
+  fan-out renders the event in the target Player's pane as well as
+  Coach's.
+- Coach's system prompt includes a `MODEL_GUIDANCE` block (see
+  [server/models_catalog.py]) that tells Coach: model changes are the
+  exception, Sonnet is the Player default, Opus is for hard reasoning
+  only, Haiku is for trivial mechanical work, Codex is the rate-limit
+  fallback (`gpt-5.4-mini` as the Sonnet equivalent, top Codex tier
+  reserved for heavy work).
+
+Resolution chain in `run_agent` (highest → lowest):
+
+1. Per-turn `model` arg from the request body (per-pane gear popover).
+2. Coach-set `agent_project_roles.model_override` (this tool). Dropped
+   silently at spawn time if it no longer fits the player's current
+   runtime (e.g. a stored Claude id with `runtime_override='codex'`).
+3. Runtime-aware per-role default in `team_config`
+   (`coach_default_model` / `players_default_model` and their
+   `_codex` counterparts).
+4. SDK default (no `model` kwarg).
+
+Project-switch behavior: the override is keyed by `(slot,
+project_id)`. Switching the active project automatically swaps which
+override is read, so Coach can run different model configurations on
+different projects without cross-talk.
 
 ### 12.9 Interactive Question/Plan Tools
 

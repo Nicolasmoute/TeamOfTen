@@ -271,6 +271,11 @@ async def lifespan(app: FastAPI):
     trim_task = asyncio.create_task(events_trim_loop())
     att_trim_task = asyncio.create_task(attachments_trim_loop())
     sessions_trim_task = asyncio.create_task(sessions_trim_loop())
+    # Compass — fires daily / bootstrap runs on every project where
+    # team_config['compass_enabled_<id>'] is truthy. See
+    # Docs/compass-specs.md and server/compass/scheduler.py.
+    from server.compass.scheduler import compass_scheduler_loop
+    compass_task = asyncio.create_task(compass_scheduler_loop())
     from server.telegram import start_telegram_bridge, stop_telegram_bridge
     # Telegram bridge owns its own task handle (so the UI can reload it
     # live via /api/team/telegram). Lifespan only kicks it off + tears
@@ -279,7 +284,7 @@ async def lifespan(app: FastAPI):
         await start_telegram_bridge()
     except Exception:
         logger.exception("telegram bridge failed to start (non-fatal)")
-    bg_tasks = (snapshot_task, project_sync_task, global_sync_task, recurrence_task, stale_task_task, trim_task, att_trim_task, sessions_trim_task)
+    bg_tasks = (snapshot_task, project_sync_task, global_sync_task, recurrence_task, stale_task_task, trim_task, att_trim_task, sessions_trim_task, compass_task)
     try:
         yield
     finally:
@@ -324,6 +329,14 @@ else:
 # above (avoids circular imports).
 from server.projects_api import build_router as _build_projects_router
 app.include_router(_build_projects_router(
+    require_token=require_token, audit_actor=audit_actor,
+))
+
+# Compass — strategy-engine HTTP API. Same lazy-build pattern as the
+# projects router (passes in the auth + audit_actor deps to avoid
+# circular imports). The router lives under /api/compass/*.
+from server.compass.api import build_router as _build_compass_router
+app.include_router(_build_compass_router(
     require_token=require_token, audit_actor=audit_actor,
 ))
 
@@ -771,6 +784,7 @@ async def list_agents() -> dict[str, list[dict[str, Any]]]:
         cur = await c.execute(
             "SELECT a.id, a.kind, "
             "       r.name AS name, r.role AS role, r.brief AS brief, "
+            "       r.model_override AS model_override, "
             "       a.status, a.current_task_id, a.model, a.workspace_path, "
             "       s.session_id AS session_id, "
             "       s.codex_thread_id AS codex_thread_id, "
@@ -1228,39 +1242,16 @@ async def get_team_tools() -> dict[str, object]:
     }
 
 
-# Per-role default models — one per role (coach, players). Per-pane
-# overrides still win; these kick in only when the pane hasn't chosen
-# a specific model.
-_ROLE_MODEL_DEFAULTS = {
-    "coach": "claude-opus-4-7",
-    "players": "claude-sonnet-4-6",
-}
-_ROLE_CODEX_MODEL_DEFAULTS = {
-    "coach": "",
-    "players": "",
-}
-_CLAUDE_MODEL_WHITELIST = {
-    "",
-    "claude-opus-4-7",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001",
-}
-_CODEX_MODEL_WHITELIST = {
-    "",
-    "gpt-5.5",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.4-nano",
-    "gpt-5.3-codex",
-    "gpt-5.2-codex",
-    "gpt-5.1-codex-max",
-    "gpt-5.1-codex",
-    "gpt-5.1-codex-mini",
-    "gpt-5-codex",
-}
-# Model names we let the UI pick. Keep in sync with MODEL_OPTIONS and
-# CODEX_MODEL_OPTIONS in app.js. Empty string means "SDK default".
-_MODEL_WHITELIST = _CLAUDE_MODEL_WHITELIST | _CODEX_MODEL_WHITELIST
+# Per-role defaults + allowlists are owned by `server.models_catalog`
+# so `server.tools` can validate without a circular lazy import.
+from server.models_catalog import (
+    _CLAUDE_AVAILABLE,
+    _CLAUDE_MODEL_WHITELIST,
+    _CODEX_AVAILABLE,
+    _CODEX_MODEL_WHITELIST,
+    role_codex_defaults_concrete,
+    role_defaults_concrete,
+)
 
 
 class TeamModelsWrite(BaseModel):
@@ -1320,10 +1311,17 @@ async def get_team_models() -> dict[str, object]:
         "players": await _read_team_config_str("players_default_model"),
         "coach_codex": await _read_team_config_str("coach_default_model_codex"),
         "players_codex": await _read_team_config_str("players_default_model_codex"),
-        "suggested": _ROLE_MODEL_DEFAULTS,
-        "suggested_codex": _ROLE_CODEX_MODEL_DEFAULTS,
-        "available": sorted(_CLAUDE_MODEL_WHITELIST - {""}),
-        "available_codex": sorted(_CODEX_MODEL_WHITELIST - {""}),
+        # Role-default dicts internally store tier aliases
+        # (`latest_opus`, …) so they auto-track new model versions.
+        # Resolve to concrete ids before returning so the UI hint
+        # ("suggested: claude-opus-4-7") matches the dropdown options.
+        "suggested": role_defaults_concrete(),
+        "suggested_codex": role_codex_defaults_concrete(),
+        # `available` exposes concrete ids only — humans pick versions
+        # from the dropdown; tier aliases are an LLM-facing convenience
+        # for `coord_set_player_model`.
+        "available": _CLAUDE_AVAILABLE,
+        "available_codex": _CODEX_AVAILABLE,
     }
 
 
@@ -4124,9 +4122,10 @@ async def list_events(
             "))"
             " OR (type = 'task_assigned' AND payload_to = ?)"
             " OR (type = 'task_updated' AND payload_owner = ?)"
+            " OR (type = 'agent_model_set' AND payload_to = ?)"
             ")"
         )
-        params.extend([agent, agent, agent, agent])
+        params.extend([agent, agent, agent, agent, agent])
     if type:
         where_parts.append("type = ?")
         params.append(type)

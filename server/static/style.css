@@ -1140,6 +1140,66 @@ body {
 }
 .env-attention-dismiss-all:hover { background: rgba(227, 160, 58, 0.12); }
 
+/* Per-Player model overrides set by Coach via coord_set_player_model.
+   Same amber treatment as .env-attention because the team policy
+   says model changes should be the exception — having any active
+   override is a soft warning the human should glance at. Renders
+   nothing when the team is on defaults (overrides.length === 0). */
+.env-section.env-model-overrides {
+  background: #2a1d0e;
+  border: 1px solid #e3a03a;
+  border-radius: 6px;
+  padding: 8px 10px 10px;
+  margin-bottom: 10px;
+}
+.env-section.env-model-overrides .env-section-title { color: #e3a03a; }
+.env-section.env-model-overrides .env-count {
+  background: #e3a03a;
+  color: #1d1f26;
+  border-radius: 8px;
+  font-size: 10px;
+  padding: 1px 6px;
+  margin-left: 4px;
+  font-weight: 600;
+}
+.env-section.env-model-overrides .env-warn {
+  font-size: 11px;
+  color: #cdb98e;
+  margin: 4px 0 6px;
+  line-height: 1.4;
+}
+.env-section.env-model-overrides .env-model-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.env-section.env-model-overrides .env-model-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--fg);
+}
+.env-section.env-model-overrides .env-model-slot {
+  font-weight: 600;
+  min-width: 28px;
+}
+.env-section.env-model-overrides .env-model-arrow { color: #999; }
+.env-section.env-model-overrides .env-model-list code {
+  background: #1d1f26;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 10px;
+}
+.env-section.env-model-overrides .env-model-runtime {
+  color: #888;
+  font-size: 10px;
+  margin-left: 2px;
+}
+
 /* kDrive sync failure banner — emitted by server/project_sync.py
    when retries exhaust. Same amber tone as .env-attention so it
    blends visually but with its own header so the user knows it's

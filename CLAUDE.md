@@ -622,6 +622,234 @@ UI:
   The DELETE endpoint was already runtime-agnostic (drops the whole
   `agent_sessions` row), so no server change beyond the SELECT.
 
+**Recent (2026-05-01, follow-up) — Tier aliases for model selection:**
+
+The Coach-facing surface for `coord_set_player_model` now leads with
+TIER ALIASES (`latest_opus`, `latest_sonnet`, `latest_haiku`,
+`latest_gpt`, `latest_mini`) rather than version-pinned concrete ids.
+The whole point: when Anthropic ships Sonnet 4.7 (or OpenAI ships
+GPT 5.6), the only file that needs editing is
+[server/models_catalog.py](server/models_catalog.py)'s
+`_ALIAS_TO_CONCRETE` map. `MODEL_GUIDANCE`, the tool description,
+Coach's stored overrides, and the role defaults all stay correct
+without touching prompts or migrating DB rows.
+
+- **`_ALIAS_TO_CONCRETE`** maps each alias to today's concrete id.
+  Update only this when a new top-tier model ships in any family.
+- **`resolve_model_alias(value)`** — pure function, handles aliases /
+  concrete ids / empty string uniformly. Called by `run_agent` after
+  the resolution chain finalizes the model so downstream consumers
+  (turns ledger, runtime fit, context-window estimate, the SDK call
+  itself) see a concrete id.
+- **Whitelists** include both aliases and concrete ids so the tool
+  accepts either. The runtime split (`_ALIAS_RUNTIME`) gates aliases
+  to the right runtime — `latest_opus` on a Codex-runtime player is
+  rejected at SET time, same as a concrete Claude id would be.
+- **`MODEL_GUIDANCE`** rewritten to use aliases exclusively. A new
+  test (`test_model_guidance_uses_aliases_not_concrete_ids`)
+  enforces that no concrete version number leaks into the prompt
+  text — future maintainers can't backslide.
+- **`_ROLE_MODEL_DEFAULTS` / `_ROLE_CODEX_MODEL_DEFAULTS`** also now
+  alias-keyed (`coach: latest_opus`, `players: latest_sonnet`, Codex
+  Players: `latest_mini`). `/api/team/models` resolves them to
+  concrete ids in the `suggested` field so the UI hint matches its
+  dropdown options. New helpers `role_defaults_concrete()` and
+  `role_codex_defaults_concrete()` do the resolution at API time.
+- **`available` / `available_codex`** in `/api/team/models` now
+  exposes concrete ids only (`_CLAUDE_AVAILABLE` / `_CODEX_AVAILABLE`)
+  — humans pick versions; aliases are an LLM convenience.
+- New tests (6 total): `test_resolve_model_alias_round_trip`,
+  `test_tool_accepts_alias_for_claude_player`,
+  `test_tool_rejects_claude_alias_on_codex_player`,
+  `test_tool_accepts_codex_alias_on_codex_player`,
+  `test_role_defaults_resolved_for_api`, plus the
+  forbidden-concrete-ids enforcer above. Suite at 562/562.
+
+**Recent (2026-05-01) — Compass module shipped:**
+
+Compass is an autonomous strategy engine that runs **alongside** the
+team — it maintains a per-project lattice of weighted statements
+about the project, asks the human focused questions, and exposes its
+current best guess to Coach via four MCP tools. It never dispatches
+work, never amends truth without human approval, and never blocks
+Players. Spec: [Docs/compass-specs.md](Docs/compass-specs.md).
+
+- **Per-project, opt-in.** State lives at
+  `/data/projects/<id>/working/compass/` (mirrored synchronously to
+  `kDrive:projects/<id>/compass/`). Enable per project via the
+  Compass dashboard; flag stored in
+  `team_config['compass_enabled_<id>']`. Switching active project
+  switches the visible Compass — every code path resolves
+  `compass_paths(project_id)` against the live active project, so
+  per-project state is fully isolated and reloaded on switch.
+- **MCP tools (Coach-only)** in
+  [server/tools.py:build_coord_server](server/tools.py):
+  `compass_ask(query)` returns a terse markdown answer citing
+  statement ids/weights; `compass_audit(artifact)` runs an audit and
+  returns one of `aligned` / `confident_drift` / `uncertain_drift`;
+  `compass_brief()` returns the latest daily briefing;
+  `compass_status()` returns counts + last-run timestamps. All four
+  reject Players with the documented "Coach-only — Players read
+  Compass via the CLAUDE.md block" error and short-circuit when the
+  per-project enable flag is unset.
+- **State files (JSON, kDrive-mirrored)** in
+  [server/compass/store.py](server/compass/store.py):
+  `lattice.json`, `truth.json`, `regions.json`, `questions.json`,
+  `audits.jsonl`, `runs.jsonl`, `claude_md_block.md`,
+  `briefings/briefing-YYYY-MM-DD.md`, and three proposal files
+  (`proposals/settle.json`, `proposals/stale.json`,
+  `proposals/duplicates.json`). Atomic writes via tempfile +
+  `os.replace`; synchronous kDrive mirror per write.
+- **Pipeline stages** under
+  [server/compass/pipeline/](server/compass/pipeline/) — pure
+  functions that take state and return proposed updates:
+  `digest.passive` / `digest.answer` (with delta clamping),
+  `questions.generate_batch` / `generate_single` (predict-before-
+  ask discipline; entries without prediction dropped per §10.18),
+  `reviews.propose` (settle + stale candidates pre-filtered in pure
+  Python before the LLM phrases questions), `reviews.detect_duplicates`,
+  `regions.auto_merge` (only fires above
+  `REGION_SOFT_CAP=15`; re-tags active AND archived statements per
+  §10.11), `truth_check.check`, `briefing.generate`,
+  `claude_md.generate` + `inject` (marker-delimited, idempotent).
+- **Runner**
+  ([server/compass/runner.py](server/compass/runner.py)) orchestrates
+  spec §3.1-§3.10 in order: digest answers (truth-check first), passive
+  digest, region merge, reviews + duplicate detection, generate
+  questions, briefing (skipped on bootstrap), CLAUDE.md block. Daily
+  mode requires `presence.human_reachable` (recent
+  `messages.from_id='human'` row OR a heartbeat from
+  `/api/compass/heartbeat` within
+  `HARNESS_COMPASS_PRESENCE_HOURS`, default 24h). Per-project
+  asyncio.Lock prevents concurrent runs.
+- **Audit** ([server/compass/audit.py](server/compass/audit.py))
+  appends to `audits.jsonl`, queues a question on `uncertain_drift`
+  (with prediction; `confident_drift` does NOT queue per §10.5), and
+  runs a §5.4 rollup safety net every `AUDIT_ROLLUP_INTERVAL=5`
+  audits — if ≥3 recent drifts cluster in one region, queues a meta-
+  question asking whether the lattice itself is wrong.
+- **Scheduler**
+  ([server/compass/scheduler.py](server/compass/scheduler.py)) is a
+  background task in `lifespan` next to `recurrence_scheduler_loop`.
+  Polls every `HARNESS_COMPASS_SCHEDULER_TICK=300s`, walks every
+  project where `compass_enabled_<id>` is truthy, fires `bootstrap`
+  on first activation and `daily` once per UTC day after
+  `DAILY_RUN_HOUR_UTC=9`. One project per iteration to avoid spawning
+  storms.
+- **HTTP API** under `/api/compass/*`
+  ([server/compass/api.py](server/compass/api.py)) — `GET /state`,
+  `POST /enable` / `/disable`, `POST /run`, `POST /heartbeat`,
+  `POST /qa/{start,next,answer,end}` (Q&A session with immediate
+  digest), `POST /questions/{id}/answer`,
+  `POST /proposals/{settle,stale,dupe}/{id}`,
+  `POST /statements/{id}/{weight,restore}`, `POST /truth`,
+  `POST /ask`, `POST /audit`, `POST /inputs`, `GET /briefings/{date}`,
+  `GET /runs`, `GET /audits`, `POST /reset`. Phase events stream via
+  the existing `/ws` channel (`compass_phase`,
+  `compass_run_completed`, `compass_question_queued`,
+  `compass_question_digested`, `compass_proposal_resolved`,
+  `compass_truth_changed`, `compass_truth_contradiction`,
+  `compass_audit_logged`, `compass_reset`, `compass_llm_call`).
+- **Dashboard** at slot `__compass`
+  ([server/static/compass.js](server/static/compass.js) + 
+  [server/static/compass.css](server/static/compass.css)) — paper-
+  free harness-styled v1 (deferred the navigator's-logbook treatment).
+  Three-column workspace: Lattice (capacity bar, statement rows with
+  weight bars + NO/½/YES override buttons routed through a
+  confirmation modal, archived `<details>`, settle/stale/dupe
+  proposal cards), Inputs+Questions (kind-typed input row;
+  question cards with hidden-by-default prediction reveal), Briefing
+  (renders via the existing `marked + dompurify` pipeline) +
+  CLAUDE.md block + Ask Compass. Plus Audits section, Run history
+  footer, OverrideModal, TruthConflictModal, and a sticky-bottom
+  QASessionOverlay (Q&A session with immediate digest, per §4 + §14.11).
+  All glyphs are CSS-drawn or inline SVG per the no-emoji rule.
+  LeftRail entry: a CSS-drawn compass-rose SVG button next to the
+  files-open icon.
+- **Cost tracking.** Compass calls
+  `claude_agent_sdk.query()` directly with a one-shot prompt (no MCP,
+  no resume) and inserts a row into the existing `turns` ledger
+  under `agent_id="compass"`, `runtime="claude"`, with
+  `cost_basis="compass:passive"` / `compass:answer` /
+  `compass:audit` / etc. so usage rolls up alongside agent turns.
+  No `ANTHROPIC_API_KEY` path — Max-OAuth invariant preserved.
+- **Tests** — 117 new Compass tests across
+  [test_compass_paths.py](server/tests/test_compass_paths.py),
+  [test_compass_store.py](server/tests/test_compass_store.py),
+  [test_compass_llm.py](server/tests/test_compass_llm.py),
+  [test_compass_mutate.py](server/tests/test_compass_mutate.py),
+  [test_compass_pipeline.py](server/tests/test_compass_pipeline.py),
+  [test_compass_claude_md_inject.py](server/tests/test_compass_claude_md_inject.py),
+  [test_compass_audit.py](server/tests/test_compass_audit.py),
+  [test_compass_runner.py](server/tests/test_compass_runner.py),
+  [test_compass_presence.py](server/tests/test_compass_presence.py),
+  [test_compass_mcp_tools.py](server/tests/test_compass_mcp_tools.py),
+  [test_compass_api.py](server/tests/test_compass_api.py). All 587
+  harness tests pass.
+
+**Recent (2026-05-01) — Coach can set Player models:**
+
+- **`coord_set_player_model(player_id, model)`** — Coach-only MCP
+  tool ([server/tools.py](server/tools.py)). Stores a per-(slot,
+  project) model preference on a new `agent_project_roles.model_override`
+  column. Empty string clears (no orphan row is created when
+  clearing on a never-touched Player). Validated against the player's
+  currently-resolved runtime (Claude vs Codex); a Codex id on a
+  Claude-runtime player is rejected at SET time. Emits
+  `agent_model_set` with `to: <player_id>` so the event lands in
+  both Coach's pane (actor) and the target Player's pane (fan-out).
+  Tool added to `_tools` registry + `ALLOWED_COORD_TOOLS`.
+- **Catalog refactor** — model whitelists, role defaults, and the
+  new `MODEL_GUIDANCE` policy block live in a dedicated
+  [server/models_catalog.py](server/models_catalog.py); both `main.py`
+  and `tools.py` import from there (no more lazy import inside the
+  tool body). `_model_fits_runtime` now uses positive enumeration via
+  `model_is_claude` / `model_is_codex` instead of a `claude-*` prefix
+  heuristic, so a hypothetical future Anthropic id without that prefix
+  isn't silently misclassified.
+- **Coach's system prompt** ([server/agents.py:_system_prompt_for])
+  gets two additions: (a) a bullet listing `coord_set_player_model`
+  in the tool catalogue with a "read the policy below first" pointer;
+  (b) a `MODEL_GUIDANCE` block at the bottom that codifies the team
+  rule: **model change is the EXCEPTION**, Sonnet is the Player default,
+  Opus only for hard reasoning, Haiku only for trivial mechanical work,
+  Codex is the rate-limit fallback (`gpt-5.4-mini` as the Sonnet
+  equivalent, top tier reserved for heavy work). Players don't get
+  the policy block — they can't call the tool.
+- **Default Codex model for Players** changed from "" (SDK default) to
+  `gpt-5.4-mini` so a deployment that flips a Player to Codex without
+  setting an override gets the mini tier, not the top tier — same
+  cost-discipline shape as the Claude side.
+- **Resolution chain** in [server/agents.py:run_agent](server/agents.py)
+  is now: per-pane request `model` → `agent_project_roles.model_override`
+  (Coach-set) → runtime-aware per-role default in `team_config` →
+  SDK default. The Coach override is silently dropped at spawn time
+  if it no longer fits the current runtime — protects against the
+  case where Coach picked a Claude model and the player later flipped
+  to Codex (or vice-versa).
+- **Project-switch correctness**: overrides are keyed by `(slot,
+  project_id)`, so switching active projects swaps overrides
+  automatically. New test exercises set-on-misc, switch-to-alpha
+  (override gone), set-different-on-alpha, switch-back-to-misc
+  (original override restored).
+- **EnvPane warning** — when any Player has a non-NULL `model_override`,
+  a new `EnvModelOverridesSection` renders an amber-tinted card listing
+  the slots and their picked models with the policy reminder
+  ("review and clear any that aren't load-bearing"). Hidden when no
+  overrides are active.
+- **`GET /api/agents`** now returns `model_override`. The
+  `agent_model_set` event is included in `/api/events` fan-out for
+  the target slot so opening the Player's pane after a refresh
+  shows the historical event.
+- Tests in
+  [server/tests/test_player_model_override.py](server/tests/test_player_model_override.py)
+  (17 tests, all passing): registration, schema migration, Coach-only
+  enforcement, invalid-id / unknown-model / runtime-mismatch
+  rejection, set-clear round-trip, runtime-fit positive enumeration,
+  project-isolation across project switches, the full `run_agent`
+  resolution chain, runtime-mismatch silent drop, empty-clear
+  no-orphan-row, and `MODEL_GUIDANCE` injection into Coach's prompt.
+
 **Recent (2026-04-30) — Codex MCP cache invalidation:**
 
 - **`evict_client` / `evict_all_clients`** in

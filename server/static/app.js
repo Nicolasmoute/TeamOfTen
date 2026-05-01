@@ -25,8 +25,13 @@ import hljsTs from "/static/vendor/hljs-typescript.js";
 import hljsXml from "/static/vendor/hljs-xml.js";
 import hljsYaml from "/static/vendor/hljs-yaml.js";
 import { renderToolCall, setAgentDirectory, langForFile } from "/static/tools.js";
+import { CompassPane, createCompassEventRouter } from "/static/compass.js";
 
 const html = htm.bind(h);
+// Module-level event router for compass events. CompassPane(s) subscribe;
+// the WS handler below publishes incoming compass_* events. The router
+// is per-window — multiple panes can mount and unmount cleanly.
+const compassEvents = createCompassEventRouter();
 
 // ------------------------------------------------------------------
 // markdown rendering: marked (GFM) + highlight.js + DOMPurify
@@ -139,6 +144,13 @@ function renderMarkdown(md) {
   return DOMPurify.sanitize(raw, {
     ADD_ATTR: ["target", "rel", "data-lang"],
   });
+}
+
+// Expose for compass.js (and other module-loaded panes that want
+// the harness's existing markdown pipeline). Cheap one-liner; avoids
+// re-vendoring marked + dompurify + hljs in every pane file.
+if (typeof window !== "undefined") {
+  window.__harness_renderMarkdown = renderMarkdown;
 }
 
 // FilesPane helpers — extension allowlist for what we'll inline-preview
@@ -1515,6 +1527,15 @@ function App() {
       // Heartbeat ping is an implementation detail — don't surface it
       // in conversations or refresh any state based on it.
       if (ev.type === "ping") return;
+      // Compass dashboard live updates. Forward every compass_* event
+      // to the module-level router so any open CompassPane reacts.
+      // CompassPane handles its own debouncing; multiple subscribers
+      // are fine. Compass events still flow through the rest of the
+      // dispatch (e.g. for activity/cost rollup) — we don't return
+      // here, just publish + continue.
+      if (ev.type && typeof ev.type === "string" && ev.type.startsWith("compass_")) {
+        try { compassEvents.publish(ev); } catch (_) {}
+      }
       // Pending interactions targeted at the human (AskUserQuestion or
       // ExitPlanMode with route=human) are blocking the agent right
       // now; auto-open the env pane so the form is visible without
@@ -1574,6 +1595,11 @@ function App() {
         // cancelling / blocking a task assigned to p3) should show up
         // in the owner's pane too.
         if (ev.owner && ev.owner !== ev.agent_id) fanoutTargets.add(ev.owner);
+      } else if (ev.type === "agent_model_set") {
+        // Coach changing my model is context I want to see in my own
+        // pane, not just buried in Coach's timeline. Server emits
+        // {to: pid, player_id: pid} so either field is safe to read.
+        if (ev.to) fanoutTargets.add(ev.to);
       }
       setConversations((prev) => {
         const next = new Map(prev);
@@ -2525,7 +2551,6 @@ function App() {
                   >
                     ${col.map((slot) => {
                       // Special slots (prefix __) render a non-agent pane.
-                      // Currently just __files; room to add __knowledge etc.
                       if (slot === "__files") {
                         return html`<${FilesPane}
                           key=${slot}
@@ -2541,6 +2566,20 @@ function App() {
                           rootsFromApp=${fileRoots}
                           pendingFileOpen=${pendingFileOpen}
                           clearPendingFileOpen=${clearPendingFileOpen}
+                        />`;
+                      }
+                      if (slot === "__compass") {
+                        return html`<${CompassPane}
+                          key=${slot}
+                          slot=${slot}
+                          authedFetch=${authedFetch}
+                          onClose=${() => closePane(slot)}
+                          onDropEdge=${dropOnPaneEdge}
+                          onPopOut=${moveToNewColumn}
+                          stacked=${col.length > 1}
+                          isMaximized=${maximizedSlot === slot}
+                          onToggleMaximize=${() => toggleMaximize(slot)}
+                          compassEvents=${compassEvents}
                         />`;
                       }
                       const agent = agents.find((a) => a.id === slot);
@@ -3170,6 +3209,19 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
             onActivate=${onActivateProject}
             onCreate=${onCreateProject}
           />
+          <button
+            class=${"gear compass-open" + (openSlots.includes("__compass") ? " active" : "")}
+            title="Open the Compass dashboard — strategy engine, lattice of weighted statements"
+            onClick=${() => onOpen("__compass")}
+          >
+            <span class="compass-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="20" height="20">
+                <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.6"/>
+                <path d="M12 4 L13.4 12 L12 20 L10.6 12 Z" fill="currentColor"/>
+                <path d="M4 12 L12 10.6 L20 12 L12 13.4 Z" fill="currentColor" opacity="0.55"/>
+              </svg>
+            </span>
+          </button>
         </div>
         <div class="rail-group rail-controls">
           ${openSlots.length >= 2
@@ -6203,6 +6255,7 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, active
       </header>
       <div class="env-body">
         <${EnvAttentionSection} conversations=${conversations} />
+        <${EnvModelOverridesSection} agents=${agents} />
         <${EnvKDriveStatusSection} conversations=${conversations} />
         <${EnvTasksSection} tasks=${tasks} onCreate=${onCreateTask} />
         <${EnvCostSection} agents=${agents} serverStatus=${serverStatus} />
@@ -6223,6 +6276,51 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, active
     </aside>
   `;
 }
+
+// Surfaces Coach-set per-Player model overrides. These come from
+// `coord_set_player_model` and live on `agent_project_roles.model_override`
+// for the active project; `GET /api/agents` returns the column.
+// Renders nothing when no overrides are active — the team is on
+// defaults, no warning needed.
+function EnvModelOverridesSection({ agents }) {
+  const overrides = useMemo(() => {
+    if (!Array.isArray(agents)) return [];
+    return agents
+      .filter((a) => a && a.model_override)
+      .map((a) => ({
+        id: a.id,
+        model: a.model_override,
+        runtime: (a.runtime_override || "").toLowerCase(),
+      }));
+  }, [agents]);
+
+  if (overrides.length === 0) return null;
+
+  return html`
+    <section class="env-section env-model-overrides">
+      <h3 class="env-section-title">
+        Model overrides <span class="env-count">${overrides.length}</span>
+      </h3>
+      <div class="env-warn">
+        Coach has set non-default models on
+        ${" "}${overrides.length} Player${overrides.length > 1 ? "s" : ""}.
+        Per the team policy, model changes should be the exception —
+        review the list and clear any that aren't load-bearing.
+      </div>
+      <ul class="env-model-list">
+        ${overrides.map((o) => html`
+          <li key=${o.id}>
+            <span class="env-model-slot">${o.id}</span>
+            <span class="env-model-arrow">→</span>
+            <code>${o.model}</code>
+            ${o.runtime ? html`<span class="env-model-runtime">[${o.runtime}]</span>` : null}
+          </li>
+        `)}
+      </ul>
+    </section>
+  `;
+}
+
 
 // Human-attention escalations emitted by coord_request_human. The UI
 // surfaces them prominently until the user clicks "dismiss" — dismissal
@@ -8093,6 +8191,7 @@ const TIMELINE_TYPES = new Set([
   "decision_written",
   "human_attention",
   "player_assigned",
+  "agent_model_set",
   "agent_cancelled",
   "paused",
   "pause_toggled",
@@ -8264,6 +8363,19 @@ function EnvTimelineItem({ event }) {
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
       <span class="env-tl-body">☻ ${summary}</span>
+    </div>`;
+  }
+  if (event.type === "agent_model_set") {
+    // Coach set or cleared a per-Player model override. Empty model =>
+    // cleared (revert to role default). Mirrors the player_assigned
+    // shape.
+    const summary = event.model
+      ? `${event.player_id} model → ${event.model}`
+      : `${event.player_id} model override cleared`;
+    return html`<div class="env-tl-item env-tl-assigned">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">${summary}</span>
     </div>`;
   }
   if (event.type === "cost_capped") {
@@ -10782,6 +10894,19 @@ function EventItem({ event }) {
     const src = event.auto ? " (auto)" : "";
     return html`<div class="event sys">
       <div class="event-meta">${ts} · ${event.agent_id}: ${bits.join(" ") || "cleared"}${src}</div>
+    </div>`;
+  }
+
+  if (type === "agent_model_set") {
+    // Coach set or cleared a per-Player model override. Renders in
+    // both Coach's pane (actor) and the target Player's pane (via
+    // fan-out). `event.model === ""` => cleared, fall back to role
+    // default at next spawn.
+    const summary = event.model
+      ? `model → ${event.model}`
+      : "model override cleared";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ${event.player_id}: ${summary} (by ${event.agent_id})</div>
     </div>`;
   }
 

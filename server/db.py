@@ -273,11 +273,12 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
 );
 
 CREATE TABLE IF NOT EXISTS agent_project_roles (
-    slot         TEXT NOT NULL,
-    project_id   TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    name         TEXT,
-    role         TEXT,
-    brief        TEXT,
+    slot           TEXT NOT NULL,
+    project_id     TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name           TEXT,
+    role           TEXT,
+    brief          TEXT,
+    model_override TEXT,
     PRIMARY KEY (slot, project_id)
 );
 
@@ -477,6 +478,17 @@ async def init_db() -> None:
                 db,
                 "agent_sessions",
                 [("codex_thread_id", "codex_thread_id TEXT")],
+            )
+            # Coach-set per-(slot, project) model override. NULL = no
+            # override (fall through to per-pane / role-default / SDK).
+            # Validated at SET time and re-validated at SPAWN time
+            # against the player's current runtime, so a stale value
+            # (set when the player was on Claude, then flipped to
+            # Codex) silently no-ops instead of breaking the spawn.
+            await _ensure_columns(
+                db,
+                "agent_project_roles",
+                [("model_override", "model_override TEXT")],
             )
             await _ensure_columns(
                 db,

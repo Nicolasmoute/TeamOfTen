@@ -45,11 +45,19 @@ def test_memory_topic_regex_rejects_bad_names() -> None:
         assert MEMORY_TOPIC_RE.fullmatch(b) is None, f"should reject: {b!r}"
 
 
-def test_coord_tools_are_all_coord_prefixed() -> None:
-    # If this ever breaks, the allowlist probably includes a non-coord
-    # tool and the Coach/Player split is no longer meaningful.
+def test_coord_tools_are_all_in_coord_namespace() -> None:
+    # Two families now live in the `coord` MCP server:
+    #  - `coord_*` — original coordination/task/memory/etc. tools.
+    #  - `compass_*` — Compass strategy-engine tools (Coach-only at
+    #    runtime; included in the allowlist for both roles so the SDK
+    #    doesn't pre-reject the call before the in-handler gate fires).
+    # The shared `mcp__coord__` namespace prefix means the MCP server
+    # name stays singular; the second segment discriminates families.
     for name in ALLOWED_COORD_TOOLS:
-        assert name.startswith("mcp__coord__coord_"), name
+        assert name.startswith("mcp__coord__"), name
+        assert name.startswith("mcp__coord__coord_") or name.startswith(
+            "mcp__coord__compass_"
+        ), f"unrecognized tool family: {name}"
 
 
 def test_coach_has_read_tools_but_no_write_tools() -> None:
