@@ -73,7 +73,18 @@ function renderBriefing(text) {
 // ---------------------------------------------------------------- API
 
 async function apiFetch(authedFetch, path, opts) {
-  const res = await authedFetch(`/api/compass${path}`, opts);
+  // Whenever a string body is supplied (always JSON-stringified in
+  // this module), set Content-Type so FastAPI's Body parser routes
+  // to the JSON path. Without the header it falls through to the
+  // text decoder and Pydantic validates the raw string against the
+  // endpoint's dict type → 422 dict_type. Caller-provided headers
+  // win so callers can override if needed.
+  const finalOpts = { ...(opts || {}) };
+  if (finalOpts.body !== undefined && typeof finalOpts.body === "string") {
+    const headers = { "Content-Type": "application/json", ...(finalOpts.headers || {}) };
+    finalOpts.headers = headers;
+  }
+  const res = await authedFetch(`/api/compass${path}`, finalOpts);
   if (!res.ok) {
     let body = "";
     try { body = await res.text(); } catch (_) {}
