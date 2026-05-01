@@ -123,12 +123,36 @@ try:
             return f"{int((STATIC_DIR / filename).stat().st_mtime)}"
         except Exception:
             return "1"
+    # Cache-bust the ES-module import of compass.js inside app.js
+    # FIRST — browsers cache module URLs aggressively, and a stale
+    # compass.js produces hard-to-reproduce bugs (e.g. dashboard
+    # hitting an old API contract). We rewrite the import path in
+    # app.js with compass.js's mtime; then app.js's own mtime is
+    # captured for _v_app AFTER that write. The regex matches both
+    # the first-boot form (no query) and re-boots (already stamped).
+    _v_compass = _stamp("compass.js")
+    try:
+        import re as _re
+        app_path = STATIC_DIR / "app.js"
+        _app_raw = app_path.read_text(encoding="utf-8")
+        _app_busted = _re.sub(
+            r'from\s+"/static/compass\.js(?:\?v=\d+)?"',
+            f'from "/static/compass.js?v={_v_compass}"',
+            _app_raw,
+        )
+        if _app_busted != _app_raw:
+            app_path.write_text(_app_busted, encoding="utf-8")
+    except Exception:
+        logger.exception("compass.js cache-bust rewrite failed (non-fatal)")
+
     _v_app = _stamp("app.js")
     _v_css = _stamp("style.css")
+    _v_compass_css = _stamp("compass.css")
     INDEX_HTML = (
         _index_raw
         .replace('"/static/app.js"', f'"/static/app.js?v={_v_app}"')
         .replace('"/static/style.css"', f'"/static/style.css?v={_v_css}"')
+        .replace('"/static/compass.css"', f'"/static/compass.css?v={_v_compass_css}"')
     )
 except Exception as e:
     logger.error("static/index.html missing (%s): UI will show a fallback page", e)

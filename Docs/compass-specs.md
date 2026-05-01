@@ -203,7 +203,7 @@ The reconciliation pass fires immediately after truth-derive (§3.0), only when 
 4. The human resolves on the dashboard:
    - **Update lattice** — the corpus is right, the lattice is wrong. Choices: un-archive (returning the row to the active lattice with a lower starting weight, e.g. 0.5, so subsequent runs re-evaluate); flip-archive (re-archive at the opposite `settled_as`); reformulate; or replace with the truth-derived equivalent.
    - **Update truth** — the lattice is right, the corpus is lagging. Routes the human to the Files pane on the offending truth file. Compass re-reads truth on the next run and the conflict resolves automatically (or surfaces again if the edit didn't actually fix it).
-   - **Accept ambiguity** — leave both. Marks the conflict `ambiguityAccepted` so it won't re-propose for a while; behaves like §3.5 stale-keep.
+   - **Accept ambiguity** — leave both. Marks the row `reconciliation_ambiguity=True` and clears the open proposal. The flag suppresses re-detection until the corpus changes again — at the start of the next run where the corpus hash has shifted, the flag is cleared automatically and the row is re-evaluated. The LLM may re-flag (and the human can accept ambiguity again) or stay silent (still ambiguous, no change). This is stricter than §3.5 stale-keep, which suppresses indefinitely; reconciliation ties the suppression to the corpus rather than to time.
 5. Until the human resolves a reconciliation proposal, it stays open and is re-displayed on every dashboard load. Like settle/stale/dupe, it expires after `PROPOSAL_EXPIRY_RUNS` runs of being ignored — clears the flag, and on the next run with a still-conflicting corpus it returns fresh.
 
 **Why this lives in §3.0.1, not §3.7**: §3.7 is a per-Q&A-answer subroutine that gates digest. §3.0.1 is a per-run scan that gates the world model's coherence with the corpus. Different triggers, different scopes, but the same principle (the corpus is the floor; the lattice can't silently drift below it).
@@ -406,11 +406,12 @@ memory/compass/
             "region": "pricing",
             "weight": 0.55,                    # current P(true)
             "history": [                       # list of deltas applied over time
-                {"run_id": "r3", "delta": 0.05, "rationale": "...", "source": "passive|answer:q12|manual|merge|reformulation"}
+                {"run_id": "r3", "delta": 0.05, "rationale": "...",
+                 "source": "passive|answer:q12|manual|merge|reformulation|truth_derive|reconcile:unarchive|reconcile:flip|reconcile:reformulate|reconcile:replace"}
             ],
             "archived": false,
             "archived_at": null,               # ISO timestamp when archived
-            "settled_as": null,                # "yes" | "no" | "partial" | null
+            "settled_as": null,                # "yes" | "no" | "partial" | "merged" | "retired" | "reconciled" | null
             "settled_by_human": false,
             "manually_set": false,             # true if human used override
             "merged": false,                   # true if this is the result of a merge
@@ -419,9 +420,11 @@ memory/compass/
             "settle_proposed": false,
             "stale_proposed": false,
             "dupe_proposed": false,
+            "reconciliation_proposed": false,  # has an open §3.0.1 reconciliation proposal
+            "reconciliation_ambiguity": false, # human accepted ambiguity; clears on corpus change
             "kept_stale": false,               # human said "keep, still important"
             "created_at": "...",
-            "created_by": "compass|human"
+            "created_by": "compass|compass-truth|human"  # compass-truth = derived from corpus (§3.0)
         }
     ]
 }
@@ -524,6 +527,7 @@ One JSON object per line:
 {
     "run_id": "r12",
     "started_at": "...",
+    "finished_at": "...",                 # set when completed; null on skipped runs
     "mode": "bootstrap" | "daily" | "on_demand",
     "completed": true,
     "passive": {"updates": 4, "new_statements": 1, "summary": "..."},
@@ -533,9 +537,16 @@ One JSON object per line:
     "settle_proposed": 1,
     "stale_proposed": 0,
     "dupe_proposed": 1,
+    "reconcile_proposed": 0,              # pending §3.0.1 proposals at run end
     "questions_generated": 3,
     "truth_candidates": ["..."],
-    "briefing_path": "memory/compass/briefings/briefing-2025-05-01.md"
+    "briefing_path": "memory/compass/briefings/briefing-2025-05-01.md",
+    "notes": [                            # human-readable Stage 0 notes
+        "truth_derive: 3 new statement(s)",
+        "reconciliation: 1 ambiguity flag(s) cleared on corpus change"
+    ],
+    "skipped": false,                     # true when daily presence-gated
+    "skipped_reason": null
 }
 ```
 
@@ -2180,3 +2191,25 @@ The hash is persisted at the END of Stage 0, after both sub-stages complete, so 
   - **bootstrap** — first run with non-empty truth → lattice is seeded immediately. The human can ask Coach `compass_ask` and get corpus-grounded answers before answering any question.
   - **daily / on_demand** with **unchanged** truth → both 0a and 0b are no-ops (idempotent). The rest of the pipeline runs.
   - **daily / on_demand** with **changed** truth → 0a re-derives (skipping duplicates) AND 0b re-scans for conflicts. New corpus content can both add lattice rows AND surface contradictions with existing rows on the same run.
+
+#### A.14.7 Ambiguity lifetime — clear on corpus change
+
+When the human resolves a reconciliation proposal as `accept_ambiguity`, the cited row is marked `reconciliation_ambiguity=True` and the proposal is removed from `reconciliation.json`. The runner's Stage 0 setup (before 0b runs) clears every `reconciliation_ambiguity` flag whenever `corpus_changed` is true, so the row is eligible for re-detection on the next corpus shift:
+
+```
+corpus_hash unchanged → flags survive, suppressed rows stay suppressed → 0b skipped
+corpus_hash changed   → all ambiguity flags cleared → rows eligible again
+                       → detect_conflicts may re-flag (or not)
+```
+
+`pipeline.reconciliation.detect_conflicts` no longer filters by `reconciliation_ambiguity` itself — it only filters by `reconciliation_proposed` (open proposal already exists). The ambiguity-clearing rule lives in `runner.run`, gated by `corpus_changed`, so the eligibility decision is centralized at the run level and trivially auditable. This is the implementation of the §3.0.1 step-4 phrase "until the corpus changes".
+
+#### A.14.8 `update_truth` resolution clears the proposal flag
+
+The "lattice is right, corpus is lagging" path is informational — no lattice mutation, the dashboard routes the human at the offending truth file via the Files pane. But the API endpoint MUST clear `Statement.reconciliation_proposed` on the cited row when this resolution is chosen, otherwise:
+
+  - The next run sees the corpus has changed (hash differs) → Stage 0b runs.
+  - `detect_conflicts` filters out the row because `reconciliation_proposed=True` is still set from the prior detection.
+  - If the human's edit didn't actually fix the conflict (typo, wrong file, partial edit), Compass would silently miss it.
+
+Implementation: `api.py:resolve_reconciliation` clears the flag explicitly on `action="update_truth"`. The `update_lattice` sub-actions (unarchive / flip / reformulate / replace) clear it via their respective `mutate.reconcile_*` helpers; `accept_ambiguity` clears it via `mutate.reconcile_accept_ambiguity` (which sets `reconciliation_ambiguity=True` simultaneously).
