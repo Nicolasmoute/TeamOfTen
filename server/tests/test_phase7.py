@@ -957,3 +957,378 @@ async def test_resolve_truth_proposal_idempotent_conflict(fresh_db) -> None:
         assert False, "second resolve should have raised TruthProposalConflict"
     except TruthProposalConflict as e:
         assert e.status == "approved"
+
+
+# ---------- Auto-supersede on duplicate path -----------------------
+
+
+async def _insert_pending_proposal(
+    project_id: str, path: str, content: str = "x", summary: str = "s",
+    proposer: str = "coach",
+) -> int:
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "INSERT INTO truth_proposals "
+            "(project_id, proposer_id, path, proposed_content, summary) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (project_id, proposer, path, content, summary),
+        )
+        await c.commit()
+        return cur.lastrowid
+    finally:
+        await c.close()
+
+
+async def _row_status(proposal_id: int) -> tuple[str, str | None]:
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT status, resolved_note FROM truth_proposals WHERE id = ?",
+            (proposal_id,),
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    return row[0], row[1]
+
+
+async def test_supersede_status_accepted_by_check_constraint(
+    fresh_db,
+) -> None:
+    """The schema CHECK now allows the new 'superseded' value."""
+    await init_db()
+    pid = await _insert_pending_proposal(MISC_PROJECT_ID, "specs.md")
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE truth_proposals SET status='superseded' WHERE id=?",
+            (pid,),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    status, _ = await _row_status(pid)
+    assert status == "superseded"
+
+
+def test_propose_truth_update_in_coord_allowlist_unchanged(fresh_db) -> None:
+    """Sanity: the supersede refactor didn't drop the tool from the
+    allow list."""
+    from server.tools import ALLOWED_COORD_TOOLS
+    assert "mcp__coord__coord_propose_truth_update" in ALLOWED_COORD_TOOLS
+
+
+# ---------- truth-index.md template + scaffold --------------------
+
+
+def test_truth_index_seeded_on_scaffold(fresh_db) -> None:
+    """ensure_project_scaffold writes truth/truth-index.md from the
+    checked-in template, and the file lists the default specs.md
+    bullet."""
+    from server.paths import ensure_project_scaffold
+
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    target = pp.truth / "truth-index.md"
+    assert target.is_file(), "truth-index.md must be seeded"
+    body = target.read_text(encoding="utf-8")
+    assert "`specs.md`" in body
+    assert "Expected files" in body
+
+
+def test_truth_index_first_write_only(fresh_db) -> None:
+    """Re-running scaffold doesn't clobber user edits to
+    truth-index.md."""
+    from server.paths import ensure_project_scaffold
+
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    target = pp.truth / "truth-index.md"
+    target.write_text("# my edits\n", encoding="utf-8")
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    assert target.read_text(encoding="utf-8") == "# my edits\n"
+
+
+def test_truth_index_seeded_when_truth_dir_missing(fresh_db) -> None:
+    """Boot rescue scenario: a project that was created before
+    truth/ shipped has no truth/ directory; running scaffold creates
+    both the directory and truth-index.md."""
+    from server.paths import ensure_project_scaffold, project_paths
+
+    # Simulate "project created without truth/" — wipe the folder
+    # the first scaffold call creates, then re-run.
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    import shutil
+    shutil.rmtree(pp.truth)
+    assert not pp.truth.exists()
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    assert (project_paths(MISC_PROJECT_ID).truth / "truth-index.md").is_file()
+
+
+# ---------- Manifest parser ---------------------------------------
+
+
+def test_parse_truth_manifest_extracts_default_specs_bullet(fresh_db) -> None:
+    """The seeded template's specs.md bullet parses correctly."""
+    from server.paths import ensure_project_scaffold
+    from server.truth import parse_truth_manifest
+
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    entries = parse_truth_manifest(MISC_PROJECT_ID)
+    files = [e["filename"] for e in entries]
+    assert "specs.md" in files
+    # Manifest file itself is filtered out of the listing.
+    assert "truth-index.md" not in files
+    specs = next(e for e in entries if e["filename"] == "specs.md")
+    assert specs["exists"] is False
+    assert "abs_path" in specs and specs["abs_path"].endswith("specs.md")
+
+
+def test_parse_truth_manifest_marks_existing_files(fresh_db) -> None:
+    """Once an expected file exists on disk, parser flips exists=True."""
+    from server.paths import ensure_project_scaffold
+    from server.truth import parse_truth_manifest
+
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    (pp.truth / "specs.md").write_text("# specs", encoding="utf-8")
+    entries = parse_truth_manifest(MISC_PROJECT_ID)
+    specs = next(e for e in entries if e["filename"] == "specs.md")
+    assert specs["exists"] is True
+    assert specs["size"] == len("# specs")
+
+
+def test_parse_truth_manifest_returns_empty_when_missing(fresh_db) -> None:
+    """No truth-index.md → empty list (not an error)."""
+    from server.paths import ensure_project_scaffold
+    from server.truth import parse_truth_manifest
+
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    (pp.truth / "truth-index.md").unlink()
+    assert parse_truth_manifest(MISC_PROJECT_ID) == []
+
+
+def test_parse_truth_manifest_accepts_ascii_dash(fresh_db) -> None:
+    """ASCII ' - ' separator works alongside em-dash for users on
+    keyboards that don't make em-dash easy."""
+    from server.paths import ensure_project_scaffold
+    from server.truth import parse_truth_manifest
+
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    (pp.truth / "truth-index.md").write_text(
+        "# Truth\n\n## Expected files\n\n"
+        "- `specs.md` — em-dash desc\n"
+        "- `brand.yaml` - ascii-dash desc\n",
+        encoding="utf-8",
+    )
+    entries = parse_truth_manifest(MISC_PROJECT_ID)
+    files = {e["filename"] for e in entries}
+    assert files == {"specs.md", "brand.yaml"}
+
+
+# ---------- create_empty_truth_file --------------------------------
+
+
+def test_create_empty_truth_file_writes_zero_bytes(fresh_db) -> None:
+    from server.paths import ensure_project_scaffold
+    from server.truth import create_empty_truth_file
+
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    res = create_empty_truth_file(MISC_PROJECT_ID, "specs.md")
+    assert res["size"] == 0
+    target = pp.truth / "specs.md"
+    assert target.is_file()
+    assert target.read_text(encoding="utf-8") == ""
+
+
+def test_create_empty_truth_file_409_on_existing(fresh_db) -> None:
+    from server.paths import ensure_project_scaffold
+    from server.truth import (
+        TruthProposalConflict, create_empty_truth_file,
+    )
+
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    (pp.truth / "specs.md").write_text("existing", encoding="utf-8")
+    try:
+        create_empty_truth_file(MISC_PROJECT_ID, "specs.md")
+        assert False, "should have raised TruthProposalConflict"
+    except TruthProposalConflict:
+        pass
+    # Existing content untouched.
+    assert (pp.truth / "specs.md").read_text(encoding="utf-8") == "existing"
+
+
+def test_create_empty_truth_file_rejects_traversal(fresh_db) -> None:
+    from server.paths import ensure_project_scaffold
+    from server.truth import (
+        TruthProposalBadRequest, create_empty_truth_file,
+    )
+
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    try:
+        create_empty_truth_file(MISC_PROJECT_ID, "../decisions/oops.md")
+        assert False, "should have raised TruthProposalBadRequest"
+    except TruthProposalBadRequest:
+        pass
+
+
+def test_create_empty_truth_file_creates_subdirs(fresh_db) -> None:
+    """A nested path like 'brand/colors.yaml' creates the brand/
+    subdirectory in truth/ before writing."""
+    from server.paths import ensure_project_scaffold
+    from server.truth import create_empty_truth_file
+
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    create_empty_truth_file(MISC_PROJECT_ID, "brand/colors.yaml")
+    assert (pp.truth / "brand" / "colors.yaml").is_file()
+
+
+def test_create_empty_truth_file_strips_leading_truth_prefix(fresh_db) -> None:
+    """Symmetric with the propose tool — `truth/specs.md` and
+    `specs.md` both resolve to the same file. A bullet in
+    truth-index.md authored with the prefix shouldn't double-nest."""
+    from server.paths import ensure_project_scaffold
+    from server.truth import create_empty_truth_file
+
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    create_empty_truth_file(MISC_PROJECT_ID, "truth/foo.md")
+    assert (pp.truth / "foo.md").is_file()
+    assert not (pp.truth / "truth").exists(), \
+        "must not have created a nested truth/ folder"
+
+
+# ---------- Supersede SQL flow (mirrors propose tool's body) ------
+
+
+async def test_supersede_invariant_at_most_one_pending_per_path(
+    fresh_db,
+) -> None:
+    """End-to-end SQL test of the supersede sequence the tool uses:
+    SELECT pending → INSERT new pending → UPDATE matched ones to
+    'superseded'. Asserts the resulting state matches the documented
+    invariant: at most one pending proposal per (project, path)."""
+    await init_db()
+    pid_v1 = await _insert_pending_proposal(MISC_PROJECT_ID, "specs.md", "v1")
+    pid_other = await _insert_pending_proposal(
+        MISC_PROJECT_ID, "brand.yaml", "other"
+    )
+
+    # Mirror the tool's body: SELECT, INSERT, UPDATE all in one txn.
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT id FROM truth_proposals "
+            "WHERE project_id = ? AND path = ? AND status = 'pending'",
+            (MISC_PROJECT_ID, "specs.md"),
+        )
+        ids = [r[0] for r in await cur.fetchall()]
+        cur = await c.execute(
+            "INSERT INTO truth_proposals "
+            "(project_id, proposer_id, path, proposed_content, summary) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (MISC_PROJECT_ID, "coach", "specs.md", "v2", "s"),
+        )
+        pid_v2 = cur.lastrowid
+        for sid in ids:
+            await c.execute(
+                "UPDATE truth_proposals SET status = 'superseded', "
+                "resolved_at = ?, resolved_by = 'system', "
+                "resolved_note = ? WHERE id = ? AND status = 'pending'",
+                ("2026-04-30T00:00:00Z", f"superseded by #{pid_v2}", sid),
+            )
+        await c.commit()
+    finally:
+        await c.close()
+
+    # v1 (same path) is now superseded; v2 is the sole pending for specs.md.
+    assert (await _row_status(pid_v1)) == (
+        "superseded", f"superseded by #{pid_v2}"
+    )
+    assert (await _row_status(pid_v2))[0] == "pending"
+    # An unrelated path's pending proposal is untouched.
+    assert (await _row_status(pid_other))[0] == "pending"
+
+    # Pending count for specs.md is exactly 1.
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT COUNT(*) FROM truth_proposals "
+            "WHERE project_id = ? AND path = ? AND status = 'pending'",
+            (MISC_PROJECT_ID, "specs.md"),
+        )
+        (count,) = await cur.fetchone()
+    finally:
+        await c.close()
+    assert count == 1, f"invariant broken: {count} pending for specs.md"
+
+
+async def test_supersede_does_not_touch_resolved_rows(fresh_db) -> None:
+    """A previously approved/denied proposal for the same path must NOT
+    be flipped to superseded — the UPDATE has WHERE status='pending'
+    so resolved rows are protected."""
+    await init_db()
+    # Insert a row already in 'approved' state (simulate a past
+    # approval), then run the supersede SELECT/UPDATE pattern.
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "INSERT INTO truth_proposals "
+            "(project_id, proposer_id, path, proposed_content, summary, "
+            "status, resolved_at, resolved_by) "
+            "VALUES (?, ?, ?, ?, ?, 'approved', ?, 'human')",
+            (
+                MISC_PROJECT_ID, "coach", "specs.md", "v0", "s",
+                "2026-04-29T00:00:00Z",
+            ),
+        )
+        await c.commit()
+        pid_approved = cur.lastrowid
+    finally:
+        await c.close()
+
+    pid_v1 = await _insert_pending_proposal(MISC_PROJECT_ID, "specs.md", "v1")
+
+    # Simulate a fresh propose: the supersede UPDATE should only flip
+    # pid_v1 (the pending row), not pid_approved.
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT id FROM truth_proposals "
+            "WHERE project_id = ? AND path = ? AND status = 'pending'",
+            (MISC_PROJECT_ID, "specs.md"),
+        )
+        ids = [r[0] for r in await cur.fetchall()]
+        for sid in ids:
+            await c.execute(
+                "UPDATE truth_proposals SET status = 'superseded' "
+                "WHERE id = ? AND status = 'pending'",
+                (sid,),
+            )
+        await c.commit()
+    finally:
+        await c.close()
+
+    assert (await _row_status(pid_approved))[0] == "approved", \
+        "approved row must NOT have been flipped to superseded"
+    assert (await _row_status(pid_v1))[0] == "superseded"
+
+
+# ---------- Per-project CLAUDE.md stub gains truth section --------
+
+
+def test_project_claude_md_stub_includes_truth_section(fresh_db) -> None:
+    """New projects' per-project CLAUDE.md mentions the truth/ lane and
+    the proposal-flow tool name, so a fresh Coach has the project-scoped
+    reminder on every turn."""
+    from server.paths import write_project_claude_md_stub, project_paths
+
+    pp = project_paths(MISC_PROJECT_ID)
+    if pp.claude_md.exists():
+        pp.claude_md.unlink()
+    pp.root.mkdir(parents=True, exist_ok=True)
+    write_project_claude_md_stub(
+        MISC_PROJECT_ID, "Misc", "test desc", None,
+    )
+    body = pp.claude_md.read_text(encoding="utf-8")
+    assert "## truth/" in body
+    assert "coord_propose_truth_update" in body
+    assert "truth-index.md" in body
+    assert MISC_PROJECT_ID in body  # slug interpolated

@@ -157,7 +157,36 @@ def ensure_project_scaffold(project_id: str) -> ProjectPaths:
         (pp.root / sub).mkdir(parents=True, exist_ok=True)
     # Wiki sub-folder lives in the global wiki tree.
     (global_paths().wiki / project_id).mkdir(parents=True, exist_ok=True)
+    # Seed truth/truth-index.md if missing. First-write-only — once
+    # the file exists, Coach proposals + user edits own it. Body comes
+    # from the checked-in template in server/templates/. Empty body
+    # means the template is missing on disk, surface as None and let
+    # the user create it later (no point writing an empty manifest).
+    _write_truth_index_stub(pp)
     return pp
+
+
+def _write_truth_index_stub(pp: ProjectPaths) -> None:
+    """First-write-only seed for truth/truth-index.md. The file is the
+    manifest of expected truth files; `_PROJECT_SUBDIRS` already creates
+    the parent `truth/` directory. Body comes from
+    `server/templates/truth_index.md` (template name uses underscore per
+    file-naming convention; on disk the file is `truth-index.md`)."""
+    target = pp.truth / "truth-index.md"
+    if target.exists():
+        return
+    body = _read_template("truth_index.md")
+    if not body:
+        # Template missing — leave the directory empty rather than
+        # write a misleading stub. Surfaces in /api/health later.
+        return
+    try:
+        target.write_text(body, encoding="utf-8")
+    except OSError:
+        # Don't fail scaffolding on a transient write error; the
+        # boot-rescue loop or the user's next "create empty" click
+        # will get another chance.
+        pass
 
 
 def ensure_global_scaffold() -> GlobalPaths:
@@ -216,6 +245,25 @@ reconstruct why each Player was named what they were named>
 
 ## Conventions
 <project-specific rules, code style, terminology, do/don't lists>
+
+## truth/
+
+User-validated source-of-truth for this project lives at
+`/data/projects/{slug}/truth/`. Specs, brand guidelines, contracts,
+hard invariants the user has signed off on. **You CANNOT write to
+truth/ directly** — the harness's PreToolUse hook hard-denies any
+`Write` / `Edit` / `MultiEdit` / `NotebookEdit` / `Bash` against this
+tree, regardless of agent. To propose a change, call
+`coord_propose_truth_update(path, content, summary)` (Coach-only —
+Players ask Coach to relay). The user reviews and approves in the
+EnvPane "Truth proposals" section. Approved proposals auto-write the
+file; older pending proposals for the same path are auto-superseded
+by newer ones.
+
+The manifest of expected files lives in `truth-index.md` (itself a
+normal truth file — propose edits the same way). New projects start
+with one bullet for `specs.md`; add or split files by updating
+`truth-index.md` and proposing the new files.
 """
 
 
@@ -244,6 +292,7 @@ def write_project_claude_md_stub(
         name=name,
         goal=goal,
         repo=repo,
+        slug=project_id,
     )
     try:
         pp.root.mkdir(parents=True, exist_ok=True)

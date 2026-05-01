@@ -29,7 +29,10 @@ Public surface:
   - `load_state(project_id) -> LatticeState` — read all state into one
     dataclass tree. Missing files become empty defaults.
   - `save_lattice(project_id, statements)` — atomic write + kDrive.
-  - `save_truth(project_id, facts)` — same.
+  - **Truth has no `save_*` here** — Compass reads truth from the
+    project's `truth/` folder via `compass.truth.read_truth_facts`.
+    Humans edit truth files via the Files pane; Coach proposes via
+    `coord_propose_truth_update`. Compass is a pure consumer.
   - `save_regions(project_id, regions, merge_history)` — same.
   - `save_questions(project_id, questions)` — same.
   - `save_proposals(project_id, settle, stale, dupes)` — write all
@@ -375,19 +378,6 @@ def _statement_from_jsonable(raw: dict[str, Any]) -> Statement:
     )
 
 
-def _truth_to_jsonable(t: TruthFact) -> dict[str, Any]:
-    return asdict(t)
-
-
-def _truth_from_jsonable(raw: dict[str, Any]) -> TruthFact:
-    return TruthFact(
-        index=int(raw.get("index") or 0),
-        text=str(raw.get("text") or ""),
-        added_at=str(raw.get("added_at") or ""),
-        added_by=str(raw.get("added_by") or "human"),
-    )
-
-
 def _region_to_jsonable(r: Region) -> dict[str, Any]:
     return asdict(r)
 
@@ -563,9 +553,13 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 async def bootstrap_state(project_id: str) -> CompassPaths:
-    """Create the per-project directory tree and seed the four
-    canonical state files with empty `compass_schema_version: "0.2"`
-    payloads. Idempotent — existing files are left alone.
+    """Create the per-project directory tree and seed the canonical
+    state files with empty `compass_schema_version: "0.2"` payloads.
+    Idempotent — existing files are left alone.
+
+    Truth is NOT seeded here — Compass reads truth from the project's
+    `<project>/truth/` folder (managed by humans + Coach proposals
+    elsewhere in the harness). See `server/compass/truth.py`.
 
     The bootstrap step is distinct from `runner.run(mode='bootstrap')`,
     which performs the actual question-generation pipeline. Calling
@@ -575,8 +569,6 @@ async def bootstrap_state(project_id: str) -> CompassPaths:
     cp = ensure_compass_scaffold(project_id)
     if not cp.lattice.exists():
         await save_lattice(project_id, [])
-    if not cp.truth.exists():
-        await save_truth(project_id, [])
     if not cp.regions.exists():
         await save_regions(project_id, [], [])
     if not cp.questions.exists():
@@ -602,21 +594,6 @@ async def save_lattice(project_id: str, statements: list[Statement]) -> None:
     text = _dump_json(payload)
     _atomic_write_text(cp.lattice, text)
     await _kdrive_mirror_text_async(remote_path(project_id, "lattice.json"), text)
-
-
-async def save_truth(project_id: str, facts: list[TruthFact]) -> None:
-    cp = ensure_compass_scaffold(project_id)
-    # Re-index 1..N so deletion / reorder leaves clean indices.
-    renumbered: list[TruthFact] = []
-    for i, t in enumerate(facts, start=1):
-        renumbered.append(TruthFact(index=i, text=t.text, added_at=t.added_at, added_by=t.added_by))
-    payload = {
-        "compass_schema_version": config.COMPASS_SCHEMA_VERSION,
-        "facts": [_truth_to_jsonable(t) for t in renumbered],
-    }
-    text = _dump_json(payload)
-    _atomic_write_text(cp.truth, text)
-    await _kdrive_mirror_text_async(remote_path(project_id, "truth.json"), text)
 
 
 async def save_regions(
@@ -760,8 +737,12 @@ def load_state(project_id: str) -> LatticeState:
     lattice_raw = _read_json_or({}, cp.lattice)
     statements = [_statement_from_jsonable(s) for s in (lattice_raw.get("statements") or [])]
 
-    truth_raw = _read_json_or({}, cp.truth)
-    truth = [_truth_from_jsonable(t) for t in (truth_raw.get("facts") or [])]
+    # Truth is folder-backed: read fresh from `<project>/truth/` on
+    # every call so an edit to a truth file is picked up immediately.
+    # Lazy import dodges a tiny circular: `compass.truth` imports
+    # `TruthFact` from this module.
+    from server.compass.truth import read_truth_facts  # noqa: PLC0415
+    truth = read_truth_facts(project_id)
 
     regions_raw = _read_json_or({}, cp.regions)
     regions = [_region_from_jsonable(r) for r in (regions_raw.get("regions") or [])]
@@ -913,9 +894,12 @@ async def wipe_project(project_id: str) -> None:
     # whole subtree. We don't depend on remote delete-of-collection
     # support; per-file removes are universal.
     if webdav.enabled:
+        # Note: we don't remove truth files — they're owned by the
+        # project's `truth/` lane, not by Compass. A reset wipes
+        # Compass's view (lattice, regions, audits, runs, briefings,
+        # proposals, claude_md_block) but leaves truth in place.
         names = [
             "lattice.json",
-            "truth.json",
             "regions.json",
             "questions.json",
             "audits.jsonl",
@@ -950,7 +934,6 @@ __all__ = [
     "LatticeState",
     "bootstrap_state",
     "save_lattice",
-    "save_truth",
     "save_regions",
     "save_questions",
     "save_proposals",

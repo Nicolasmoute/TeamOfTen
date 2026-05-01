@@ -15,11 +15,9 @@ import pytest
 
 from server.compass import mutate
 from server.compass.store import (
-    DuplicateProposal,
     LatticeState,
     Region,
     Statement,
-    TruthFact,
 )
 
 
@@ -329,33 +327,6 @@ def test_manual_weight_override_marks_manually_set() -> None:
     assert s.history[-1]["source"] == "manual"
     # Critical: override must NOT archive (spec §10.2 + §14.17.2).
     assert s.archived is False
-
-
-# ------------------------------------------------------------- truth
-
-
-def test_truth_helpers_round_trip() -> None:
-    state = _make_state()
-    i = mutate.add_truth(state, "TeamOfTen runs on a single VPS")
-    assert i == 1
-    j = mutate.add_truth(state, "There is one human operator")
-    assert j == 2
-    assert [t.text for t in state.truth] == [
-        "TeamOfTen runs on a single VPS",
-        "There is one human operator",
-    ]
-    ok = mutate.update_truth(state, 1, "TeamOfTen runs on a single VPS with kDrive")
-    assert ok
-    assert state.truth[0].text.endswith("kDrive")
-    rm = mutate.remove_truth(state, 1)
-    assert rm
-    assert len(state.truth) == 1
-
-
-def test_remove_truth_invalid_index() -> None:
-    state = _make_state()
-    assert mutate.remove_truth(state, 1) is False
-    assert mutate.remove_truth(state, 0) is False
 
 
 # ----------------------------------------------------- restore

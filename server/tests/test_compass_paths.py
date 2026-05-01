@@ -18,7 +18,6 @@ def test_compass_paths_resolve_under_project_working_tree(fresh_db: str) -> None
     pp_root = pathsmod.project_paths("alpha").working
     assert cp.root == pp_root / "compass"
     assert cp.lattice == cp.root / "lattice.json"
-    assert cp.truth == cp.root / "truth.json"
     assert cp.regions == cp.root / "regions.json"
     assert cp.questions == cp.root / "questions.json"
     assert cp.audits == cp.root / "audits.jsonl"
@@ -29,6 +28,8 @@ def test_compass_paths_resolve_under_project_working_tree(fresh_db: str) -> None
     assert cp.settle_proposals == cp.proposals_dir / "settle.json"
     assert cp.stale_proposals == cp.proposals_dir / "stale.json"
     assert cp.duplicate_proposals == cp.proposals_dir / "duplicates.json"
+    # Truth lives outside compass/ entirely (in the project's truth/ lane).
+    assert not hasattr(cp, "truth")
 
 
 def test_compass_paths_isolated_per_project(fresh_db: str) -> None:
@@ -66,7 +67,6 @@ def test_ensure_compass_scaffold_does_not_seed_state(fresh_db: str) -> None:
     distinguish "never bootstrapped" from "empty lattice"."""
     cp = cpaths.ensure_compass_scaffold("alpha")
     assert not cp.lattice.exists()
-    assert not cp.truth.exists()
     assert not cp.regions.exists()
     assert not cp.questions.exists()
     assert not cp.audits.exists()

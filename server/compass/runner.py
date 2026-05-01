@@ -37,8 +37,9 @@ from server.compass.pipeline import (
     regions as pl_regions,
     reviews as pl_reviews,
     truth_check as pl_truth_check,
+    truth_derive as pl_truth_derive,
 )
-from server.compass.store import Question, RunLog
+from server.compass.store import Question, RunLog, Statement
 
 logger = logging.getLogger("harness.compass.runner")
 if not logger.handlers:
@@ -141,6 +142,74 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
     await _emit_phase(project_id, run_id, "started", mode=mode)
 
     state = store.load_state(project_id)
+
+    # ============================================================
+    # 0. Truth-derive — read truth/ folder, infer lattice statements.
+    #    Idempotent: skip the LLM call when the truth corpus hash
+    #    is unchanged AND the lattice already has truth-derived
+    #    content. The user's principle: "if truth doesn't change,
+    #    don't infer new statements."
+    # ============================================================
+    truth_hash = pl_truth_derive.truth_corpus_hash(state.truth)
+    last_hash = await _read_team_config(_truth_hash_key(project_id))
+    has_truth_grounded = any(
+        s.created_by == "compass-truth" for s in state.statements
+    )
+    should_derive = bool(state.truth) and (
+        truth_hash != last_hash or not has_truth_grounded
+    )
+    if should_derive:
+        await _emit_phase(
+            project_id, run_id, "truth_derive",
+            truth_files=len(state.truth),
+        )
+        try:
+            td_res = await pl_truth_derive.derive_from_truth(state)
+        except Exception:
+            logger.exception("compass.runner: truth_derive raised")
+            td_res = None
+        if td_res and td_res.statements:
+            now = _now_iso()
+            added: list[Statement] = []
+            for proposal in td_res.statements:
+                mutate.ensure_region(state, proposal["region"])
+                sid = store.next_statement_id(state)
+                stmt = Statement(
+                    id=sid,
+                    text=proposal["text"],
+                    region=proposal["region"],
+                    weight=pl_truth_derive.TRUTH_DERIVED_WEIGHT,
+                    created_at=now,
+                    created_by="compass-truth",
+                    history=[{
+                        "run_id": run_id,
+                        "delta": 0.0,
+                        "rationale": proposal.get("rationale") or "derived from truth",
+                        "source": "truth_derive",
+                    }],
+                )
+                state.statements.append(stmt)
+                added.append(stmt)
+            log.notes.append(f"truth_derive: {len(added)} new statement(s)")
+            if added:
+                await store.save_lattice(project_id, state.statements)
+                await store.save_regions(
+                    project_id, state.regions, state.region_merge_history,
+                )
+                await bus.publish({
+                    "ts": _now_iso(),
+                    "agent_id": "compass",
+                    "project_id": project_id,
+                    "type": "compass_truth_derived",
+                    "added": [s.id for s in added],
+                    "run_id": run_id,
+                })
+        # Always persist the new truth hash on a successful pass —
+        # even when the LLM returned zero statements (the corpus has
+        # been considered; nothing new to add). Skips next run.
+        await _write_team_config(_truth_hash_key(project_id), truth_hash)
+    elif not state.truth:
+        log.notes.append("truth_derive: skipped (truth/ folder empty)")
 
     # ============================================================
     # 1. Digest answered questions (with truth-check)
@@ -461,6 +530,7 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
         "questions_generated": log.questions_generated,
         "truth_candidates": log.truth_candidates,
         "briefing_path": log.briefing_path,
+        "notes": log.notes,
         "skipped": log.skipped,
         "skipped_reason": log.skipped_reason,
     }
@@ -531,6 +601,49 @@ async def _collect_signals(project_id: str, *, since_iso: str | None) -> list[di
     except Exception:
         logger.exception("compass.runner: signal collection failed")
     return out
+
+
+def _truth_hash_key(project_id: str) -> str:
+    """team_config key for the most recent truth corpus hash. Stage 0
+    short-circuits when this matches the live truth."""
+    return f"compass_truth_hash_{project_id}"
+
+
+async def _read_team_config(key: str) -> str:
+    """Tiny helper around team_config — returns "" on missing or DB
+    error so the caller can short-circuit without try/except."""
+    from server.db import configured_conn  # lazy
+
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT value FROM team_config WHERE key = ?", (key,)
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        return ""
+    return (dict(row).get("value") if row else "") or ""
+
+
+async def _write_team_config(key: str, value: str) -> None:
+    from server.db import configured_conn  # lazy
+
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "INSERT INTO team_config (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("compass.runner: team_config write failed (%s)", key)
 
 
 async def _record_last_run(

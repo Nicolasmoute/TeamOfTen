@@ -113,6 +113,57 @@ def _json_block(obj: Any) -> str:
     return json.dumps(obj, indent=2, ensure_ascii=False)
 
 
+# ----------------------------------------------------- truth-derive
+# Adapter prompt for the harness's truth/ folder integration. Not in
+# the original spec §8 — added when Compass was adapted to read truth
+# from the project's existing truth/ lane (see Appendix A.13). Goal:
+# seed the lattice from truth-derived statements on bootstrap, and
+# enrich it when truth changes between runs. Idempotent w.r.t.
+# unchanged truth via the runner's hash check.
+
+TRUTH_DERIVE_SYSTEM = _system("""\
+You are Compass. The project has a set of TRUTH-PROTECTED FACTS — the
+unmovable floor of the world model. Your job: propose lattice
+statements that REPRESENT what truth implies for the project, at
+moderate granularity. Each statement is a falsifiable YES/NO claim.
+
+Rules:
+- Phrase so YES = the affirmative reading.
+- Each new statement starts at weight 0.75 (truth-grounded but
+  compass-INTERPRETED — the human can override; the weight can drift
+  if subsequent evidence disagrees).
+- Pick a region from the existing list if any fits; only invent a
+  new region when truly none does.
+- DO NOT propose a statement that is already represented in the
+  active lattice. Read the existing statements carefully; skip
+  duplicates or near-duplicates. The point is to ENRICH, not pad.
+- Cap at 8 statements — over-proposing makes the lattice noisy. Pick
+  the most actionable, project-defining claims first.
+- Cite which truth-fact index/file each statement is derived from in
+  `rationale` (e.g. "from T2: brand-tone.md").
+
+Output ONLY:
+{
+  "statements": [
+    {"text": string, "region": string, "rationale": string}
+  ]
+}
+
+If truth implies nothing new beyond the existing lattice, return
+{"statements": []}.""")
+
+
+def truth_derive_user(state: LatticeState, truth: list[TruthFact]) -> str:
+    return (
+        "## Truth-protected facts\n"
+        f"{_json_block([{'index': t.index, 'text': t.text} for t in truth])}\n\n"
+        "## Existing active lattice (DO NOT duplicate)\n"
+        f"{_json_block(_statements_brief(state.active_statements()))}\n\n"
+        "## Existing regions (prefer reusing these)\n"
+        f"{_json_block(_regions_brief(state))}\n"
+    )
+
+
 # ----------------------------------------------------- 8.2 passive digest
 
 
@@ -538,6 +589,8 @@ def coach_query_user(state: LatticeState, query_text: str) -> str:
 
 __all__ = [
     "SHARED_SEMANTICS",
+    "TRUTH_DERIVE_SYSTEM",
+    "truth_derive_user",
     "PASSIVE_DIGEST_SYSTEM",
     "passive_digest_user",
     "QUESTION_BATCH_SYSTEM",

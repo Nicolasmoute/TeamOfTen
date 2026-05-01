@@ -39,12 +39,18 @@ from server.paths import project_paths
 
 @dataclass(frozen=True)
 class CompassPaths:
-    """All filesystem paths Compass uses for one project."""
+    """All filesystem paths Compass uses for one project.
+
+    Note: there is NO `truth` path here — truth lives in the
+    project-level `<project>/truth/` folder (resolved via
+    `server.paths.project_paths(project_id).truth`), not under
+    `working/compass/`. Compass reads truth via
+    `server.compass.truth.read_truth_facts` and never writes it.
+    """
 
     project_id: str
     root: Path
     lattice: Path
-    truth: Path
     regions: Path
     questions: Path
     audits: Path
@@ -77,7 +83,6 @@ def compass_paths(project_id: str) -> CompassPaths:
         project_id=project_id,
         root=root,
         lattice=root / "lattice.json",
-        truth=root / "truth.json",
         regions=root / "regions.json",
         questions=root / "questions.json",
         audits=root / "audits.jsonl",

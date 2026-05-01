@@ -1298,12 +1298,27 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "\n"
             "What happens:\n"
             "  1. The proposal is queued (status=pending).\n"
-            "  2. The user reviews the diff in the UI and clicks "
+            "  2. ANY prior pending proposal for the same path is "
+            "auto-superseded — only your latest proposal is offered to "
+            "the user for approval. So your new proposal must include "
+            "EVERY change you still want for that file (the prior "
+            "proposal's content is discarded). If unsure what's "
+            "currently pending, look for `truth_proposal_*` events in "
+            "your timeline before composing.\n"
+            "  3. The user reviews the diff in the UI and clicks "
             "approve or deny.\n"
-            "  3. On approve, the harness writes the file with the "
+            "  4. On approve, the harness writes the file with the "
             "proposed content. On deny, the file is left as-is.\n"
-            "  4. A `truth_proposal_resolved` event fires so you'll "
+            "  5. A `truth_proposal_resolved` event fires so you'll "
             "see the outcome on your next turn.\n"
+            "\n"
+            "Reorganizing the truth folder (e.g. splitting a growing "
+            "specs.md into specs.md + architecture.md + scope.md): "
+            "send the changes as a SERIES of proposals — (1) the new "
+            "dependency files with their content, (2) the original "
+            "file with extracted content removed, (3) "
+            "`truth-index.md` updated to list the new files. Each is "
+            "a separate call; the user approves them in order.\n"
             "\n"
             "Params:\n"
             "- path: relative path WITHIN the active project's truth/ "
@@ -1393,33 +1408,73 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             return _err(f"summary too long ({len(summary)} chars, max 200)")
 
         project_id = await resolve_active_project()
+        # Supersede + insert in one transaction so a crash mid-flight
+        # leaves the table coherent (either both old superseded + new
+        # pending, or no change at all). Auto-supersede guarantees the
+        # invariant "at most one pending proposal per (project, path)"
+        # so the EnvPane never shows a stale stack of duplicates.
+        now_iso = _now_iso()
         c = await configured_conn()
         try:
+            cur = await c.execute(
+                "SELECT id FROM truth_proposals "
+                "WHERE project_id = ? AND path = ? AND status = 'pending'",
+                (project_id, rel),
+            )
+            superseded_ids = [row[0] for row in await cur.fetchall()]
             cur = await c.execute(
                 "INSERT INTO truth_proposals "
                 "(project_id, proposer_id, path, proposed_content, summary) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (project_id, caller_id, rel, content, summary),
             )
-            await c.commit()
             proposal_id = cur.lastrowid
+            for sid in superseded_ids:
+                await c.execute(
+                    "UPDATE truth_proposals SET status = 'superseded', "
+                    "resolved_at = ?, resolved_by = 'system', "
+                    "resolved_note = ? "
+                    "WHERE id = ? AND status = 'pending'",
+                    (now_iso, f"superseded by #{proposal_id}", sid),
+                )
+            await c.commit()
         finally:
             await c.close()
 
+        for sid in superseded_ids:
+            await bus.publish(
+                {
+                    "ts": now_iso,
+                    "agent_id": "system",
+                    "type": "truth_proposal_superseded",
+                    "proposal_id": sid,
+                    "superseded_by": proposal_id,
+                    "path": rel,
+                }
+            )
         await bus.publish(
             {
-                "ts": _now_iso(),
+                "ts": now_iso,
                 "agent_id": caller_id,
                 "type": "truth_proposal_created",
                 "proposal_id": proposal_id,
                 "path": rel,
                 "summary": summary,
                 "size": len(content),
+                "superseded": superseded_ids,
             }
         )
+        if superseded_ids:
+            note = (
+                f" (superseded {len(superseded_ids)} prior pending "
+                f"proposal{'s' if len(superseded_ids) > 1 else ''} for "
+                f"the same path: #{', #'.join(str(i) for i in superseded_ids)})"
+            )
+        else:
+            note = ""
         return _ok(
             f"proposal #{proposal_id} queued for truth/{rel} "
-            f"({len(content)} chars). The user will review and "
+            f"({len(content)} chars){note}. The user will review and "
             f"approve or deny in the UI; you'll see "
             f"`truth_proposal_resolved` on your next turn."
         )

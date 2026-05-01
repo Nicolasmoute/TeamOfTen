@@ -935,6 +935,72 @@ body {
   cursor: default;
 }
 
+/* Expected-files manifest list (EnvTruthExpectedSection). One row per
+   bullet from truth-index.md. Existing files muted; missing rows
+   highlight the create button. */
+.env-truth-expected {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.env-truth-expected-row {
+  padding: 6px 10px;
+  border-left: 2px solid var(--border);
+  background: var(--card);
+  border-radius: 0 3px 3px 0;
+}
+.env-truth-expected-row.exists { border-left-color: var(--ok, #56d364); }
+.env-truth-expected-row.missing { border-left-color: var(--accent); }
+.env-truth-expected-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.env-truth-expected-name {
+  font-family: ui-monospace, Menlo, Consolas, "Fira Code", monospace;
+  font-size: 11px;
+  color: var(--fg);
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: transparent;
+  padding: 0;
+}
+.env-truth-expected-action {
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--fg);
+  cursor: pointer;
+  text-decoration: none;
+  flex-shrink: 0;
+}
+.env-truth-expected-action:hover:not(:disabled) {
+  background: var(--border);
+}
+.env-truth-expected-create {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.env-truth-expected-create:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--bg);
+}
+.env-truth-expected-create:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.env-truth-expected-desc {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
 /* ---- env timeline ---- */
 .env-timeline-section .env-timeline {
   display: flex;

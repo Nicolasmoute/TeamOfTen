@@ -13,6 +13,7 @@ of the test suite already follows (see comments in
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -165,3 +166,103 @@ async def resolve_truth_proposal(
         "status": new_status,
         "size": write_size,
     }
+
+
+# ---------- Manifest (truth-index.md) parsing ----------------------
+
+# Bullet shape (matches the seeded template):
+#   - `filename` — description
+# Em-dash separator is preferred but we accept ASCII " - " too so users
+# editing on a stripped keyboard layout aren't punished. The first
+# segment must be a backtick-wrapped filename so we don't pick up
+# unrelated bullets.
+_MANIFEST_LINE_RE = re.compile(
+    r"^\s*[-*]\s+`(?P<file>[^`]+)`\s*[—–-]\s*(?P<desc>.+?)\s*$",
+    re.MULTILINE,
+)
+TRUTH_INDEX_FILENAME = "truth-index.md"
+
+
+def parse_truth_manifest(project_id: str) -> list[dict[str, Any]]:
+    """Read truth/truth-index.md and return the expected-files list.
+
+    Each entry: `{filename, description, exists, size}`. `exists` is a
+    direct stat call; `size` is bytes (None if missing). The manifest
+    file itself (`truth-index.md`) is filtered out of the results so it
+    doesn't list itself as expected.
+
+    Returns [] when the manifest file is missing OR when it has no
+    bullet lines that match the documented shape — both are normal
+    states (an empty manifest is a valid state for a brand-new project
+    where the user hasn't customized it yet, but our seeded template
+    always has at least the `specs.md` bullet).
+    """
+    pp = project_paths(project_id)
+    manifest_path = pp.truth / TRUTH_INDEX_FILENAME
+    try:
+        body = manifest_path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for m in _MANIFEST_LINE_RE.finditer(body):
+        filename = m.group("file").strip()
+        if not filename or filename == TRUTH_INDEX_FILENAME:
+            continue
+        if filename in seen:
+            continue
+        seen.add(filename)
+        target = pp.truth / filename
+        exists = target.is_file()
+        try:
+            size = target.stat().st_size if exists else None
+        except OSError:
+            size = None
+        out.append({
+            "filename": filename,
+            "description": m.group("desc").strip(),
+            "exists": exists,
+            "size": size,
+            "abs_path": str(target),
+        })
+    return out
+
+
+def create_empty_truth_file(project_id: str, rel_path: str) -> dict[str, Any]:
+    """Write a zero-byte file under <project>/truth/<rel_path>.
+
+    Refuses if the target already exists (caller maps to HTTP 409).
+    Validates the resolved path stays inside truth/ (caller maps to
+    400). Bypasses the Files-pane `.md`/`.txt` extension restriction
+    on purpose — humans approving the manifest wrote any extension
+    they wanted in `truth-index.md`, so creating it as an empty file
+    is no looser than what they already accepted.
+    """
+    rel = (rel_path or "").lstrip("/")
+    if not rel:
+        raise TruthProposalBadRequest("path is required")
+    # Defensive symmetry with the propose tool: accept "truth/specs.md"
+    # and "specs.md" both. A bullet authored with a `truth/` prefix
+    # in `truth-index.md` would otherwise land at truth/truth/<file>.
+    if rel.startswith("truth/"):
+        rel = rel[len("truth/"):]
+    if ".." in rel.split("/"):
+        raise TruthProposalBadRequest(
+            "path must be relative under truth/, no '..' segments"
+        )
+    truth_root = project_paths(project_id).truth.resolve()
+    target = (truth_root / rel).resolve()
+    try:
+        target.relative_to(truth_root)
+    except ValueError:
+        raise TruthProposalBadRequest(
+            "resolved target escapes truth/ — refusing write"
+        )
+    if target.exists():
+        raise TruthProposalConflict("exists")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("", encoding="utf-8")
+    except OSError as e:
+        raise TruthProposalBadRequest(f"write failed: {e}")
+    return {"ok": True, "path": rel, "size": 0}

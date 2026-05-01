@@ -66,14 +66,38 @@ Why regions matter:
 
 ### 1.4 Truth
 
-A small list of human-authored facts about the project that compass treats as ground truth. Truth is **sacred**: compass never amends it, never reweights based on input that contradicts it, and surfaces all conflicts to the human for resolution.
+### 1.4.1 The world model and its sources
 
-Truth examples (real TeamOfTen):
-- "TeamOfTen runs on a single VPS with kDrive-backed shared state"
-- "There is one human operator"
-- "Workers are billed-by-Anthropic, not billed by us"
+Compass maintains a single **world model**: the lattice of weighted statements plus the archive of finalized ones. From the perspective of downstream consumers — Coach calling `compass_ask`, the audit subsystem checking worker output, the daily briefing, the CLAUDE.md block — the world model **is the operative truth**. They don't separately consult original source documents per query; they consult what compass currently believes.
 
-Truth is the floor of the world model. Statements can move; truth doesn't.
+The world model is built from multiple **sources**, each treated differently when ingested:
+
+- **Truth corpus** — long-form human-vetted reference material in `<project>/truth/` (specs, goals, brand guidelines, contracts, scope docs, role definitions). Authored or approved by the human directly. Compass **never modifies** the corpus; it only reads it. On every run, Compass reads the corpus and derives atomic short claims for the lattice (Stage 0 truth-derive, §3.0 / Appendix A.14). Idempotent via a corpus hash — unchanged corpus → no fresh derivation.
+- **Human Q&A answers** — the human answers Compass's targeted questions. Each answer reweights statements (digest, §3.1). Larger deltas (±0.5 max) than passive signals because the human is replying with intent.
+- **Passive signals** — human messages to Coach in the inbox since the last run, recent commits, manually-recorded notes. Smaller deltas (±0.15 max) because the signal is incidental.
+- **Audit drift** — work artifacts that contradict mid-confidence statements queue uncertain-drift questions back to the human for clarification (§5).
+
+Compass differentiates the sources at **build time** — distinct prompts, delta caps, idempotency rules, and history `source` markers (`truth_derive`, `answer:qN`, `passive`, `merge`, `manual`, …). But once a source's contribution lands in the lattice, it's just a weighted statement: indistinguishable downstream from a Q&A-derived row, indistinguishable from a passive-digest row. The lattice IS the world model — the operative truth from `compass_ask`'s point of view.
+
+### 1.4.2 Why the corpus is still special
+
+Two narrow ways the truth corpus differs from other sources, despite the world model being the operative reference:
+
+1. **Compass never amends it.** The human edits truth files via the Files pane; Coach proposes via `coord_propose_truth_update` (human-approved); agents are blocked by a PreToolUse hook from writing under `truth/`. Compass reads only — it derives lattice statements but never writes back to the corpus.
+2. **The truth-check subroutine** (§3.7) consults the corpus directly when digesting a human's Q&A answer. This catches the case where an answer would push the lattice into contradiction with the human-authored floor — protecting the lattice from drifting away via mistakenly-digested answers. It's NOT a per-query check that downstream consumers run.
+
+Truth-corpus examples (real TeamOfTen):
+- `truth/specs.md` — "TeamOfTen is a personal harness for one Coach + ten Players over Max-OAuth. State persists on a single VPS with kDrive-backed cloud sync. There is one human operator…"
+- `truth/billing.md` — "Workers consume Anthropic billing under the human's Max plan; the harness does not bill end-users…"
+
+Lattice statements derived from those (Stage 0 truth-derive, weight 0.75, region-tagged, `created_by="compass-truth"`):
+- s1 (architecture, 0.75) — "TeamOfTen runs on a single VPS." [from specs.md]
+- s2 (ops, 0.75) — "There is exactly one human operator." [from specs.md]
+- s3 (pricing, 0.75) — "Players are billed via the operator's Max plan, not the customer." [from billing.md]
+
+After a few rounds of Q&A, those same statements might sit at 0.92 (eligible to settle), or have drifted to 0.55 (a Q&A answer surprised compass), or been merged with a duplicate, or been reformulated. They're lattice rows — the world model — and downstream consumers see them at whatever weight compass currently believes. The corpus hasn't changed; the lattice's representation has.
+
+> **Implementation note (TeamOfTen):** The truth corpus is **folder-backed** — it lives in the project's existing `<project>/truth/` lane (see Appendix A.13 for the full integration spec). The original spec §6.2 modeled truth as a Compass-managed `truth.json` of short atomic statements; in the harness implementation those atomic statements live in the LATTICE as truth-grounded rows, and the corpus holds the long-form vetted documents instead.
 
 ### 1.5 The actors
 
@@ -145,6 +169,45 @@ Audits are a separate path, not part of the daily/bootstrap run. Coach calls `co
 
 A `daily` or `bootstrap` run executes the following stages in order. Each stage may be skipped if it has nothing to do, but the order is strict.
 
+### 3.0 Truth-derive (seed / enrich the lattice from the corpus)
+
+Runs FIRST on every mode (`bootstrap`, `daily`, `on_demand`), before any answer digest. The user's principle: as long as truth-corpus material exists, the lattice should have an immediate basis — the world model isn't gated on the human running a Q&A session.
+
+1. Read the truth corpus (the project's `truth/` folder; see §1.4 + Appendix A.13). Each allowed file → one synthesized truth fact.
+2. Compute a stable hash over the corpus content. Compare against the previous run's hash, persisted out-of-band (in TeamOfTen, `team_config['compass_truth_hash_<id>']`).
+3. **Short-circuit** the LLM call when the hash is unchanged AND the lattice already contains truth-derived rows. Idempotent — "if truth doesn't change, no new statements are inferred."
+4. Otherwise, feed the LLM the corpus AND the existing active lattice. The prompt asks for atomic short YES/NO claims that REPRESENT what the corpus implies, **explicitly skipping statements already present**. Capped at 8 per run to avoid noise.
+5. Materialize each proposal as a lattice row with:
+   - `weight = 0.75` — well-grounded but compass-INTERPRETED. Sits in the LEANING-YES band so the settle proposal flow ignores it until it earns confidence; not pinned at 1.0 because the corpus is the floor, the lattice's representation is the working layer.
+   - `created_by = "compass-truth"` — distinguishes from Q&A / passive / merge origins in the audit trail.
+   - One history entry with `source = "truth_derive"` and a rationale citing the corpus file.
+6. Persist the new corpus hash regardless of how many statements landed (the corpus has been considered).
+7. Emit a `compass_truth_derived` event so the dashboard can highlight the new rows.
+
+If the corpus is empty (no truth files), the stage is a no-op — Compass continues with the rest of the pipeline (Q&A digest, passive, etc.) and the lattice stays free-form. The world model just lacks a corpus-grounded floor until truth files appear.
+
+### 3.0.1 Reconciliation (truth ↔ lattice)
+
+The world model can drift away from the corpus over time even when the corpus is the project's authoritative source. Two scenarios make this real:
+
+- **Specs evolved.** A truth file was edited (or a new one was added) and the new content contradicts something the lattice already settled or weighted highly. The compass-grounded statement is now wrong; the human needs to know.
+- **Specs were lagging.** Q&A answers and passive signals nudged the lattice toward a position the human eventually wrote into truth — but in the opposite direction from where the lattice landed. Same outcome: lattice and corpus disagree.
+
+Either way, **a conflict between the corpus and a settled statement is a high-stakes signal** — settled rows are what Coach treats as binding, what the audit subsystem checks against, and what the CLAUDE.md block surfaces to workers. Compass must not silently leave them inconsistent with truth.
+
+The reconciliation pass fires immediately after truth-derive (§3.0), only when the corpus hash changed since the last successful run (cheap idempotency: an unchanged corpus can't have introduced new conflicts).
+
+1. Feed the LLM: the full corpus + the active lattice (with weights) + the archived lattice (with `settled_as` markers).
+2. Ask: "For each lattice row that the corpus contradicts, list the row id, the conflicting truth file(s), and a one-sentence explanation. Be conservative — only flag clear contradictions, not topical overlap."
+3. For each conflict the LLM returns, create a **reconciliation proposal**. Persist alongside settle/stale/dupe proposals.
+4. The human resolves on the dashboard:
+   - **Update lattice** — the corpus is right, the lattice is wrong. Choices: un-archive (returning the row to the active lattice with a lower starting weight, e.g. 0.5, so subsequent runs re-evaluate); flip-archive (re-archive at the opposite `settled_as`); reformulate; or replace with the truth-derived equivalent.
+   - **Update truth** — the lattice is right, the corpus is lagging. Routes the human to the Files pane on the offending truth file. Compass re-reads truth on the next run and the conflict resolves automatically (or surfaces again if the edit didn't actually fix it).
+   - **Accept ambiguity** — leave both. Marks the conflict `ambiguityAccepted` so it won't re-propose for a while; behaves like §3.5 stale-keep.
+5. Until the human resolves a reconciliation proposal, it stays open and is re-displayed on every dashboard load. Like settle/stale/dupe, it expires after `PROPOSAL_EXPIRY_RUNS` runs of being ignored — clears the flag, and on the next run with a still-conflicting corpus it returns fresh.
+
+**Why this lives in §3.0.1, not §3.7**: §3.7 is a per-Q&A-answer subroutine that gates digest. §3.0.1 is a per-run scan that gates the world model's coherence with the corpus. Different triggers, different scopes, but the same principle (the corpus is the floor; the lattice can't silently drift below it).
+
 ### 3.1 Digest answered questions
 
 For each pending question that has a fresh human answer:
@@ -198,11 +261,11 @@ This stage is essential: with 50+ statements and active spawning during digests,
 
 This is not a stage but a subroutine called inside §3.1 (and inside `submitQa`, see §4). When a human answer is being digested:
 
-1. Before reweighting, ask the LLM: "does this answer contradict any truth?"
+1. Before reweighting, ask the LLM: "does this answer contradict the truth corpus?" The full corpus (long-form vetted material from §1.4) is fed to the prompt, so contradictions are judged against the human-authored material directly — NOT against compass's truth-grounded lattice rows, which can drift.
 2. If yes: halt the digest. Surface the conflict to the human via a modal with three resolution paths:
    - **Amend answer** — human restates; resume digest with the new answer
-   - **Amend truth** — human edits the protected fact (the only way truth ever changes); the original answer can then be digested
-   - **Leave both** — accept the ambiguity; discard the answer, keep truth as-is. Question is marked `ambiguityAccepted`.
+   - **Amend truth** — human edits the relevant truth file (the only way the corpus ever changes); the original answer can then be digested. In TeamOfTen, "amend truth" routes the human at the offending file via the Files pane (and the existing `coord_propose_truth_update` flow stays available for Coach-driven amendments).
+   - **Leave both** — accept the ambiguity; discard the answer, keep the corpus as-is. Question is marked `ambiguityAccepted`.
 
 Compass never silently reweights in the face of a truth contradiction.
 
@@ -327,7 +390,8 @@ memory/compass/
 ├── proposals/
 │   ├── settle.json            # pending settle proposals awaiting human
 │   ├── stale.json             # pending stale proposals awaiting human
-│   └── duplicates.json        # pending duplicate-merge proposals awaiting human
+│   ├── duplicates.json        # pending duplicate-merge proposals awaiting human
+│   └── reconciliation.json    # pending corpus↔lattice conflicts (§3.0.1)
 └── claude_md_block.md         # last-rendered block (for harness to inject into CLAUDE.md)
 ```
 
@@ -365,7 +429,16 @@ memory/compass/
 
 ### 6.2 `truth.json` schema
 
+> **Superseded for TeamOfTen** — the harness uses folder-backed truth at
+> `<project>/truth/` instead of a Compass-managed `truth.json`. The
+> reference shape below is preserved for projects that want the
+> simpler list model; see Appendix A.13 for the canonical TeamOfTen
+> integration spec, including the synthesized `TruthFact` shape, the
+> `truth-index.md` manifest, allowed file types, the corpus hash,
+> and the read interface.
+
 ```python
+# Reference design only — NOT used in TeamOfTen.
 {
     "facts": [
         {
@@ -465,6 +538,31 @@ One JSON object per line:
     "briefing_path": "memory/compass/briefings/briefing-2025-05-01.md"
 }
 ```
+
+### 6.7 `proposals/reconciliation.json` schema
+
+One pending corpus↔lattice conflict per entry. Created by §3.0.1. Survives across runs until the human resolves via `POST /api/proposals/reconcile/:id`; expires after `PROPOSAL_EXPIRY_RUNS` runs of being ignored.
+
+```python
+{
+    "compass_schema_version": "0.2",
+    "proposals": [
+        {
+            "id": "rec1",                       # monotonic per project
+            "statement_id": "s7",               # the lattice row in conflict
+            "statement_archived": true,         # true if the row is settled
+            "corpus_paths": ["specs.md"],       # truth file(s) cited
+            "explanation": "specs.md says per-task billing; s7 was settled at 1.0 for per-second billing.",
+            "suggested_resolution": "update_lattice",  # "update_lattice" | "update_truth" | "either"
+            "proposed_at": "...",
+            "proposed_in_run": "r42",
+            "pending_runs": 0
+        }
+    ]
+}
+```
+
+The human's resolution PATCHes the entry — `action: "update_lattice"` (un-archive / flip-archive / reformulate / replace), `action: "update_truth"` (informational; routes to Files pane), or `action: "accept_ambiguity"` (mark resolved without changes; the row keeps its current state and the `ambiguityAccepted` flag prevents immediate re-proposal).
 
 ---
 
@@ -1283,6 +1381,7 @@ POST   /api/questions/:id/answer  → queue an answer for next-run digest
 POST   /api/proposals/settle/:id  → resolve settle proposal
 POST   /api/proposals/stale/:id   → resolve stale proposal
 POST   /api/proposals/dupe/:id    → resolve duplicate proposal
+POST   /api/proposals/reconcile/:id → resolve corpus↔lattice conflict (§3.0.1)
 POST   /api/statements/:id/weight → manual override (with confirmation flag)
 POST   /api/truth                  → add/update/remove truth fact
 POST   /api/audit                  → submit work artifact for audit (also exposed as MCP tool to coach)
@@ -1888,12 +1987,15 @@ Compass is disabled for the active project.
 
 ### A.4 · Storage: JSON files, not SQLite tables
 
-State files (`lattice.json`, `truth.json`, `regions.json`,
-`questions.json`, proposals/, briefings/) follow spec §6 verbatim —
-JSON on disk, kDrive-mirrored synchronously. SQLite is reserved for
-the events bus, the `turns` cost ledger, and `team_config` (per-
-project enable flag, last-run timestamp, heartbeat). Audits and run
-logs are append-only JSONL.
+State files (`lattice.json`, `regions.json`, `questions.json`,
+proposals/, briefings/) follow spec §6 verbatim — JSON on disk, kDrive-
+mirrored synchronously. SQLite is reserved for the events bus, the
+`turns` cost ledger, and `team_config` (per-project enable flag,
+last-run timestamp, heartbeat, truth-corpus hash). Audits and run logs
+are append-only JSONL.
+
+**There is NO `truth.json` here** — see Appendix A.13. Truth lives in
+the project's `truth/` folder; Compass is a pure consumer.
 
 Atomic writes via tempfile + `os.replace`. On corrupt JSON, load falls
 back to empty defaults with a warning log — a botched edit doesn't
@@ -1968,3 +2070,79 @@ verdicts whose `contradicting_ids` cluster (≥3 hits) in the same
 region. Conservative — false positives are expensive (they bother the
 human). Deduplicates against pending meta-questions for the same
 region so the queue doesn't grow unbounded.
+
+### A.13 · Truth is the project's `truth/` folder, not a Compass file
+
+Spec §1.4 / §6.2 modeled truth as a Compass-managed list (`truth.json`
+with `{index, text, added_at, added_by}` rows the human edits via the
+dashboard). The TeamOfTen harness already has a canonical truth lane:
+`<project>/truth/` is a directory of files, with the existing flow
+(humans edit via the Files pane, Coach proposes via
+`coord_propose_truth_update` → human approval, agents are blocked by a
+PreToolUse hook from writing under `truth/`). Maintaining a parallel
+list inside Compass would create two sources of truth, and there can
+be only one.
+
+Compass therefore **reads** truth from `<project>/truth/` on every run
+and **never writes** it.
+
+  - Local source-of-truth: `/data/projects/<id>/truth/`. Walked
+    recursively for `.md` and `.txt` files; other formats accepted by
+    `truth/` (yaml/json/toml/csv) are reference docs, not lattice
+    truth-check candidates, and are skipped.
+  - Each file → one synthesized `TruthFact` with 1-based `index`
+    (sorted by relpath), `text` prefixed with `(<relpath>) <body>`
+    so the LLM has a name handle, `added_at` from file mtime,
+    `added_by="human"`. Long files (> `MAX_FACT_CHARS=8000`) are
+    truncated with a marker.
+  - The adapter is `server.compass.truth.read_truth_facts(project_id)`,
+    called from `compass.store.load_state` on every load — no caching
+    across runs.
+  - There is no `POST /api/compass/truth` endpoint. The dashboard
+    surfaces a **read-only** `TruthReference` card (count + expand-to-
+    view) and a "open Files pane" button for editing. The
+    truth-conflict modal's "Amend truth" path now points the human at
+    the offending file path (resolved via `read_truth_index_to_path`)
+    rather than offering an in-modal edit — the harness's existing
+    truth-edit flow is the authoritative path.
+  - **Reset preserves truth.** `POST /api/compass/reset` wipes
+    Compass's view (lattice, regions, audits, runs, briefings,
+    proposals, claude_md_block, truth-corpus hash); it leaves the
+    `truth/` folder untouched.
+
+### A.14 · Stage 0 — truth-derive seeds the lattice
+
+The user's principle (added during implementation): "as long as there
+is truth data, there will be immediately a first basis for world
+model." The runner now executes a Stage 0 BEFORE answer digest:
+
+  1. Read truth facts (folder-backed, fresh).
+  2. Compute SHA-256 over the corpus and compare against the previous
+     run's hash, stored in `team_config['compass_truth_hash_<id>']`.
+  3. **Skip the LLM call** when the hash is unchanged AND the lattice
+     already has truth-derived statements (idempotent w.r.t. unchanged
+     truth — exactly the user's "if truth doesn't change, no new
+     statements" rule).
+  4. Otherwise, call the LLM via
+     `pipeline.truth_derive.derive_from_truth` with the
+     `TRUTH_DERIVE_SYSTEM` prompt. The prompt instructs the model to
+     propose lattice statements representing what truth implies,
+     EXPLICITLY skipping statements already present, capped at 8.
+  5. Materialize each proposal as a `Statement` with
+     `weight=0.75` (between 0.5 ignorance and 0.85 settle threshold —
+     truth-grounded but compass-INTERPRETED, so still subject to
+     override / drift / settle confirmation), `created_by="compass-truth"`,
+     and a history entry with `source="truth_derive"`.
+  6. Persist the new corpus hash regardless of how many statements
+     the LLM produced (the corpus has been considered).
+
+Net effect on every mode:
+  - **bootstrap** — first run with truth → lattice is seeded
+    immediately, even before the human answers any question.
+  - **daily / on_demand** — re-reads truth; derives new statements
+    only if files changed (added, edited, deleted) AND those changes
+    imply new claims. The rest of the pipeline (passive digest,
+    Q&A, audit, reviews) enriches on top.
+
+A `compass_truth_derived` event is published on the bus so the
+dashboard can highlight the new statements in real time.

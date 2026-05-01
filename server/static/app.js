@@ -6270,6 +6270,7 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, active
         <${EnvInboxSection} conversations=${conversations} />
         <${EnvMemorySection} conversations=${conversations} />
         <${EnvDecisionsSection} conversations=${conversations} />
+        <${EnvTruthExpectedSection} conversations=${conversations} />
         <${EnvTruthProposalsSection} conversations=${conversations} />
         <${EnvTimelineSection} conversations=${conversations} />
       </div>
@@ -7641,6 +7642,111 @@ function EnvDecisionsSection({ conversations }) {
                 </div>
               `
             )}
+          </div>`}
+    </section>
+  `;
+}
+
+// Expected truth files section — reads truth/truth-index.md and shows
+// the manifest as a checklist. Each row: filename + description, plus
+// either an "open" link (existing file → in-app file-link to FilesPane)
+// or a "create empty" button (missing → POSTs the create endpoint).
+// Refreshes on truth_proposal_approved (Coach may have just edited
+// truth-index.md or created a listed file) and on file_written under
+// truth/ (human edits via the Files pane).
+function EnvTruthExpectedSection({ conversations }) {
+  const [entries, setEntries] = useState([]);
+  const [busyPath, setBusyPath] = useState(null);
+  const [err, setErr] = useState("");
+
+  const load = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/truth/manifest");
+      if (!res.ok) return;
+      const data = await res.json();
+      setEntries(Array.isArray(data.entries) ? data.entries : []);
+    } catch (e) {
+      console.error("load truth manifest failed", e);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Re-fetch on relevant events: an approved proposal may have edited
+  // the manifest itself or created a listed file; file_written fires
+  // when the user creates an empty file via this section's button.
+  const eventCount = useMemo(() => {
+    let n = 0;
+    for (const list of conversations.values()) {
+      for (const ev of list) {
+        if (
+          ev.type === "truth_proposal_approved" ||
+          (ev.type === "file_written" && typeof ev.path === "string"
+           && ev.path.startsWith("truth/"))
+        ) n++;
+      }
+    }
+    return n;
+  }, [conversations]);
+  useEffect(() => {
+    if (eventCount > 0) load();
+  }, [eventCount, load]);
+
+  const createEmpty = useCallback(async (filename) => {
+    setBusyPath(filename);
+    setErr("");
+    try {
+      const res = await authFetch("/api/truth/files/create_empty", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: filename }),
+      });
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error("HTTP " + res.status + ": " + body.slice(0, 200));
+      }
+      await load();
+    } catch (e) {
+      setErr("create failed: " + String(e));
+    } finally {
+      setBusyPath(null);
+    }
+  }, [load]);
+
+  return html`
+    <section class="env-section">
+      <h3 class="env-section-title">
+        Expected truth files <span class="env-count">${entries.length}</span>
+      </h3>
+      ${err ? html`<div class="env-cost-hint">${err}</div>` : null}
+      ${entries.length === 0
+        ? html`<div class="env-cost-hint">
+            (no manifest yet — truth/truth-index.md is missing or has no
+            bullets in the expected shape)
+          </div>`
+        : html`<div class="env-truth-expected">
+            ${entries.map((e) => html`
+              <div
+                class=${"env-truth-expected-row" + (e.exists ? " exists" : " missing")}
+                key=${e.filename}
+              >
+                <div class="env-truth-expected-head">
+                  <code class="env-truth-expected-name">${e.filename}</code>
+                  ${e.exists
+                    ? html`<a
+                        class="env-truth-expected-action"
+                        data-harness-path=${e.abs_path}
+                        href="#"
+                      >open</a>`
+                    : html`<button
+                        class="env-truth-expected-action env-truth-expected-create"
+                        disabled=${busyPath === e.filename}
+                        onClick=${() => createEmpty(e.filename)}
+                      >${busyPath === e.filename ? "…" : "create empty"}</button>`}
+                </div>
+                <div class="env-truth-expected-desc">${e.description}</div>
+              </div>
+            `)}
           </div>`}
     </section>
   `;

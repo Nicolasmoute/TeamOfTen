@@ -196,6 +196,35 @@ async def lifespan(app: FastAPI):
         update_wiki_index()
     except Exception:
         logger.exception("update_wiki_index failed (non-fatal)")
+    # Boot rescue: re-run ensure_project_scaffold for every project so
+    # directories added to _PROJECT_SUBDIRS after a project's creation
+    # (e.g. truth/ + the truth-index.md seed) are materialized
+    # retroactively. Idempotent — only mkdir+write where missing.
+    try:
+        from server.paths import ensure_project_scaffold
+
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id FROM projects WHERE archived = 0"
+            )
+            project_rows = await cur.fetchall()
+        finally:
+            await c.close()
+        rescued = 0
+        for (pid,) in project_rows:
+            try:
+                pp = ensure_project_scaffold(pid)
+                if (pp.truth / "truth-index.md").exists():
+                    rescued += 1
+            except Exception:
+                logger.exception("scaffold rescue failed for %s", pid)
+        logger.info(
+            "scaffold rescue: %d projects scanned, %d have truth-index.md",
+            len(project_rows), rescued,
+        )
+    except Exception:
+        logger.exception("scaffold rescue loop failed (non-fatal)")
     # Crash recovery — reset orphaned state left over from an unclean
     # shutdown. Happens right after init_db so subsequent reads see
     # consistent status. Cheap no-op on a clean DB.
@@ -3728,6 +3757,65 @@ async def deny_truth_proposal(
     return await _resolve_truth_proposal_http(
         proposal_id, new_status="denied", note=note, actor=actor,
     )
+
+
+class TruthCreateEmptyBody(BaseModel):
+    path: str = Field(..., min_length=1, max_length=400)
+
+
+@app.get("/api/truth/manifest", dependencies=[Depends(require_token)])
+async def get_truth_manifest() -> dict[str, Any]:
+    """Parsed expected-files list from truth/truth-index.md.
+
+    Each entry: filename, description, exists (on disk), size (bytes
+    when exists). The manifest file itself is filtered out. Empty
+    list when truth-index.md is missing or has no parseable bullets.
+    """
+    project_id = await resolve_active_project()
+    return {
+        "project_id": project_id,
+        "entries": truthmod.parse_truth_manifest(project_id),
+    }
+
+
+@app.post(
+    "/api/truth/files/create_empty",
+    dependencies=[Depends(require_token)],
+)
+async def create_empty_truth_file(
+    body: TruthCreateEmptyBody,
+    actor: dict[str, Any] = Depends(audit_actor),
+) -> dict[str, Any]:
+    """Create a zero-byte file under the active project's truth/.
+
+    Used by the EnvPane "create empty" button on missing manifest
+    entries. Refuses if the target already exists (409); rejects path
+    traversal (400); bypasses the Files-pane `.md`/`.txt` restriction
+    so the user can create whatever extension they listed in the
+    manifest.
+    """
+    project_id = await resolve_active_project()
+    try:
+        result = truthmod.create_empty_truth_file(project_id, body.path)
+    except truthmod.TruthProposalConflict as e:
+        if e.status == "exists":
+            raise HTTPException(409, detail="file already exists")
+        raise HTTPException(409, detail=str(e))
+    except truthmod.TruthProposalBadRequest as e:
+        raise HTTPException(400, detail=str(e))
+    rel = result["path"]
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "human",
+            "type": "file_written",
+            "root": "project",
+            "path": "truth/" + rel,
+            "size": 0,
+            "actor": actor,
+        }
+    )
+    return {"ok": True, "path": rel, "size": 0}
 
 
 @app.post("/api/wiki/reindex", dependencies=[Depends(require_token)])

@@ -175,13 +175,71 @@
   50%      { opacity: 0.3; transform: scale(1.4); }
 }
 
-/* truth row */
-.cmp-truth-row {
+/* truth reference (read-only) */
+.cmp-truth-ref {
   border: 1px solid var(--warn);
   background: var(--cmp-soft-warn);
   border-radius: 4px;
-  padding: 12px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
+.cmp-truth-ref-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.cmp-truth-ref-empty {
+  font-size: 12px;
+  color: var(--muted);
+  font-style: italic;
+}
+.cmp-truth-ref-empty code {
+  font-family: ui-monospace, Menlo, monospace;
+  background: rgba(255,255,255,0.06);
+  padding: 1px 4px;
+  border-radius: 2px;
+  font-size: 11px;
+  font-style: normal;
+}
+.cmp-truth-ref-toggle {
+  align-self: flex-start;
+  background: transparent;
+  border: 0;
+  color: var(--warn);
+  cursor: pointer;
+  font-size: 11px;
+  font-family: ui-monospace, Menlo, monospace;
+  padding: 0;
+  text-decoration: underline;
+}
+.cmp-truth-ref-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.cmp-truth-ref-item {
+  display: flex;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--cmp-border);
+  font-size: 12px;
+}
+.cmp-truth-ref-text {
+  flex: 1;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--fg);
+  opacity: 0.85;
+}
+/* legacy truth-row styles kept for the conflict modal which still
+   re-uses .cmp-truth-idx; everything else in this block is unused
+   but harmless. */
 .cmp-truth-header { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }
 .cmp-section-kicker {
   font-size: 10px;

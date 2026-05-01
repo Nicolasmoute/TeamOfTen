@@ -694,12 +694,36 @@ Players. Spec: [Docs/compass-specs.md](Docs/compass-specs.md).
   per-project enable flag is unset.
 - **State files (JSON, kDrive-mirrored)** in
   [server/compass/store.py](server/compass/store.py):
-  `lattice.json`, `truth.json`, `regions.json`, `questions.json`,
+  `lattice.json`, `regions.json`, `questions.json`,
   `audits.jsonl`, `runs.jsonl`, `claude_md_block.md`,
   `briefings/briefing-YYYY-MM-DD.md`, and three proposal files
   (`proposals/settle.json`, `proposals/stale.json`,
   `proposals/duplicates.json`). Atomic writes via tempfile +
-  `os.replace`; synchronous kDrive mirror per write.
+  `os.replace`; synchronous kDrive mirror per write. **No
+  `truth.json`** — see "Truth is folder-backed" below.
+- **Truth is folder-backed.** Compass reads truth from the project's
+  existing `<project>/truth/` lane (managed by humans via the Files
+  pane and by Coach via `coord_propose_truth_update`). Each `.md` /
+  `.txt` file is one truth fact; the adapter
+  ([server/compass/truth.py](server/compass/truth.py)) walks the
+  folder fresh on every `load_state` call. The dashboard shows a
+  read-only `TruthReference` card; there is no
+  `POST /api/compass/truth` for adding/editing/removing — that lives
+  in the harness's existing truth-edit flow. Truth-conflict modal's
+  "amend truth" path points the human at the offending file path
+  rather than offering an in-modal edit.
+- **Stage 0 — truth-derive (per the user's "truth seeds world-model"
+  principle).** Before the answer-digest stage, the runner reads the
+  truth corpus and asks the LLM to propose lattice statements
+  representing what truth implies. New statements start at
+  `weight=0.75`, `created_by="compass-truth"`. Idempotent via a
+  SHA-256 hash stored in `team_config['compass_truth_hash_<id>']`:
+  unchanged hash → skip the LLM call entirely; changed hash → run
+  derive (and the LLM is also told to skip statements already
+  represented). Net effect: as long as truth exists, the lattice has
+  an immediate basis on the very first run; subsequent runs only
+  re-derive when truth files actually change. See
+  [server/compass/pipeline/truth_derive.py](server/compass/pipeline/truth_derive.py).
 - **Pipeline stages** under
   [server/compass/pipeline/](server/compass/pipeline/) — pure
   functions that take state and return proposed updates:

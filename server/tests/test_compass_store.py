@@ -28,7 +28,6 @@ from server.compass.paths import compass_paths
 async def test_bootstrap_creates_empty_state(fresh_db: str) -> None:
     cp = await store.bootstrap_state("alpha")
     assert cp.lattice.exists()
-    assert cp.truth.exists()
     assert cp.regions.exists()
     assert cp.questions.exists()
     assert cp.settle_proposals.exists()
@@ -37,6 +36,7 @@ async def test_bootstrap_creates_empty_state(fresh_db: str) -> None:
 
     state = store.load_state("alpha")
     assert state.statements == []
+    # Truth is folder-backed — empty when no files in <project>/truth/.
     assert state.truth == []
     assert state.regions == []
     assert state.questions == []
@@ -101,18 +101,46 @@ async def test_lattice_round_trip(fresh_db: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_truth_round_trip_and_renumbering(fresh_db: str) -> None:
-    """Truth is stored with 1-based stable indices. Saving renumbers
-    so deletes / reorders produce a clean 1..N sequence."""
-    facts = [
-        store.TruthFact(index=99, text="A", added_at="t1", added_by="human"),
-        store.TruthFact(index=99, text="B", added_at="t2", added_by="human"),
-        store.TruthFact(index=99, text="C", added_at="t3", added_by="human"),
-    ]
-    await store.save_truth("alpha", facts)
+async def test_truth_loads_from_project_folder(fresh_db: str) -> None:
+    """Truth is folder-backed — `<project>/truth/*.md` becomes the
+    truth corpus on every `load_state`. Indices are 1-based by sort
+    order. Compass never writes truth; the harness's existing flow
+    owns it (Files pane edit, Coach `coord_propose_truth_update`)."""
+    from server.paths import project_paths
+
+    pp = project_paths("alpha")
+    pp.truth.mkdir(parents=True, exist_ok=True)
+    (pp.truth / "00-pricing.md").write_text(
+        "Per-task billing is a hard constraint.", encoding="utf-8",
+    )
+    (pp.truth / "10-customers.md").write_text(
+        "Initial customers are technical (engineers).", encoding="utf-8",
+    )
+    # Non-allowed extensions are ignored (json/yaml are reference docs,
+    # not truth-check candidates).
+    (pp.truth / "schema.json").write_text('{"x": 1}', encoding="utf-8")
+
     state = store.load_state("alpha")
-    assert [t.index for t in state.truth] == [1, 2, 3]
-    assert [t.text for t in state.truth] == ["A", "B", "C"]
+    assert [t.index for t in state.truth] == [1, 2]
+    # Filename is prefixed onto the text so the LLM has a name handle.
+    assert "00-pricing.md" in state.truth[0].text
+    assert "Per-task billing" in state.truth[0].text
+    assert "10-customers.md" in state.truth[1].text
+    # Compass treats truth as human-authored.
+    assert all(t.added_by == "human" for t in state.truth)
+
+
+@pytest.mark.asyncio
+async def test_truth_empty_when_folder_absent(fresh_db: str) -> None:
+    state = store.load_state("alpha")
+    assert state.truth == []
+
+
+@pytest.mark.asyncio
+async def test_save_truth_no_longer_exists() -> None:
+    """`save_truth` was removed when truth became folder-backed.
+    Truth is a pure consumer for Compass."""
+    assert not hasattr(store, "save_truth")
 
 
 @pytest.mark.asyncio

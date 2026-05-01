@@ -782,52 +782,37 @@ def build_router(
         await cmp_store.save_lattice(project_id, state.statements)
         return JSONResponse({"ok": True, "id": out.id})
 
-    # ---------------------------------------- truth
+    # Truth management — NOT in this API. Truth lives in the project's
+    # `<project>/truth/` folder, owned by the harness's existing flow:
+    # humans edit via the Files pane, Coach proposes via
+    # `coord_propose_truth_update` for human approval. Compass reads
+    # truth via `server.compass.truth.read_truth_facts` on every run
+    # (Stage 0 truth-derive seeds the lattice). The dashboard surfaces
+    # a read-only summary; edits happen elsewhere.
 
-    @router.post("/truth", dependencies=deps)
-    async def manage_truth(
-        request: Request,
-        body: dict[str, Any] = Body(...),
-    ) -> JSONResponse:
-        action = (body.get("action") or "").strip().lower()
-        actor = audit_actor(request)
+    @router.get("/truth", dependencies=deps)
+    async def list_truth() -> JSONResponse:
+        """Read-only view of the project's truth corpus, as Compass
+        sees it. The dashboard renders this so the human can see what
+        the truth-derive prompt is fed without leaving the Compass
+        pane. Editing truth happens via the Files pane."""
+        from server.compass.truth import read_truth_facts, read_truth_index_to_path  # noqa: PLC0415
+
         project_id = await resolve_active_project()
-        await presence.update_heartbeat(project_id)
-        state = cmp_store.load_state(project_id)
-        if action == "add":
-            text = (body.get("text") or "").strip()
-            if not text:
-                raise HTTPException(400, "text required")
-            mutate.add_truth(state, text)
-        elif action == "update":
-            try:
-                index = int(body.get("index"))
-            except (TypeError, ValueError):
-                raise HTTPException(400, "index required for update")
-            text = (body.get("text") or "").strip()
-            if not text:
-                raise HTTPException(400, "text required")
-            ok = mutate.update_truth(state, index, text)
-            if not ok:
-                raise HTTPException(404, f"no truth at index {index}")
-        elif action == "remove":
-            try:
-                index = int(body.get("index"))
-            except (TypeError, ValueError):
-                raise HTTPException(400, "index required for remove")
-            ok = mutate.remove_truth(state, index)
-            if not ok:
-                raise HTTPException(404, f"no truth at index {index}")
-        else:
-            raise HTTPException(400, "action must be add/update/remove")
-        await cmp_store.save_truth(project_id, state.truth)
-        await bus.publish({
-            "ts": _now_iso(), "agent_id": "compass", "project_id": project_id,
-            "type": "compass_truth_changed", "action": action, "actor": actor,
+        facts = read_truth_facts(project_id)
+        idx_to_path = read_truth_index_to_path(project_id)
+        return JSONResponse({
+            "facts": [
+                {
+                    "index": t.index,
+                    "text": t.text,
+                    "path": idx_to_path.get(t.index),
+                    "added_at": t.added_at,
+                }
+                for t in facts
+            ],
+            "project_id": project_id,
         })
-        return JSONResponse({"ok": True, "truth": [
-            {"index": t.index, "text": t.text} for t in state.truth
-        ]})
 
     # ---------------------------------------- ask (read-only LLM query)
 
@@ -910,14 +895,17 @@ def build_router(
         project_id = await resolve_active_project()
         await cmp_store.wipe_project(project_id)
         # Clear flags too — the project is now "freshly disabled".
+        # Includes the truth-derive hash so the next run re-derives
+        # from the truth/ folder (truth itself is untouched by reset).
         c = await configured_conn()
         try:
             await c.execute(
-                "DELETE FROM team_config WHERE key IN (?, ?, ?)",
+                "DELETE FROM team_config WHERE key IN (?, ?, ?, ?)",
                 (
                     cmp_config.bootstrapped_key(project_id),
                     cmp_config.last_run_key(project_id),
                     cmp_config.heartbeat_key(project_id),
+                    f"compass_truth_hash_{project_id}",
                 ),
             )
             await c.commit()

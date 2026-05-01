@@ -197,81 +197,50 @@ function EnableBanner({ onEnable, busy }) {
   `;
 }
 
-// ---------------------------------------------------------------- truth row
+// ---------------------------------------------------------------- truth reference (read-only)
 
-function TruthRow({ truth, onAdd, onUpdate, onRemove }) {
-  const [draft, setDraft] = useState("");
-  const [editIdx, setEditIdx] = useState(null);
-  const [editText, setEditText] = useState("");
+// Truth lives in the project's `truth/` folder, NOT in Compass. Compass
+// reads it on every run (Stage 0 truth-derive seeds the lattice). The
+// dashboard surfaces a small read-only summary so the human can see
+// what's fed to the prompts; editing happens in the Files pane.
 
-  const submit = () => {
-    const t = draft.trim();
-    if (!t) return;
-    onAdd(t);
-    setDraft("");
-  };
-  const submitEdit = () => {
-    if (editIdx === null) return;
-    if (!editText.trim()) {
-      setEditIdx(null);
-      return;
-    }
-    onUpdate(editIdx, editText.trim());
-    setEditIdx(null);
-  };
-
+function TruthReference({ truth, onOpenFiles }) {
+  const [expanded, setExpanded] = useState(false);
+  const count = truth.length;
   return html`
-    <section class="cmp-truth-row">
-      <div class="cmp-truth-header">
-        <div class="cmp-section-kicker">TRUTH-PROTECTED · ONLY HUMANS MODIFY</div>
-        <div class="cmp-section-title">Truth (${truth.length})</div>
+    <section class="cmp-truth-ref">
+      <div class="cmp-truth-ref-head">
+        <div>
+          <div class="cmp-section-kicker">TRUTH · READ FROM ${`<project>/truth/`} ON EVERY RUN</div>
+          <div class="cmp-section-title">${count} truth ${count === 1 ? "fact" : "facts"}</div>
+        </div>
+        <button class="cmp-btn-mini cmp-btn-ghost" onClick=${onOpenFiles}>open Files pane</button>
       </div>
-      <ul class="cmp-truth-list">
-        ${truth.map(
-          (t) => html`
-            <li class="cmp-truth-item" key=${t.index}>
-              <span class="cmp-truth-idx">T${t.index}</span>
-              ${editIdx === t.index
-                ? html`
-                    <input
-                      class="cmp-input cmp-truth-edit-input"
-                      value=${editText}
-                      onInput=${(e) => setEditText(e.target.value)}
-                      onKeyDown=${(e) => e.key === "Enter" ? submitEdit() : (e.key === "Escape" ? setEditIdx(null) : null)}
-                      autofocus
-                    />
-                    <button class="cmp-btn-mini" onClick=${submitEdit}>save</button>
-                    <button class="cmp-btn-mini cmp-btn-ghost" onClick=${() => setEditIdx(null)}>cancel</button>
-                  `
-                : html`
-                    <span class="cmp-truth-text" onClick=${() => { setEditIdx(t.index); setEditText(t.text); }}>${t.text}</span>
-                    <button
-                      class="cmp-btn-mini cmp-btn-danger"
-                      title="Remove this truth fact"
-                      onClick=${() => {
-                        if (confirm(`Remove truth T${t.index}?\n\n"${t.text}"`)) {
-                          onRemove(t.index);
-                        }
-                      }}
-                    >×</button>
-                  `}
-            </li>
-          `,
-        )}
-        ${truth.length === 0
-          ? html`<li class="cmp-truth-empty">No truth facts yet. Add one — these are the unmovable floor of the world model.</li>`
-          : null}
-      </ul>
-      <div class="cmp-truth-add">
-        <input
-          class="cmp-input"
-          placeholder="add a truth-protected fact (e.g. &quot;there is one human operator&quot;)"
-          value=${draft}
-          onInput=${(e) => setDraft(e.target.value)}
-          onKeyDown=${(e) => e.key === "Enter" ? submit() : null}
-        />
-        <button class="cmp-btn cmp-btn-mini" onClick=${submit}>+</button>
-      </div>
+      ${count === 0
+        ? html`<div class="cmp-truth-ref-empty">
+            No truth files yet. Drop <code>.md</code> or <code>.txt</code> files
+            into the project's <code>truth/</code> folder; Compass will derive
+            initial lattice statements from them on the next run.
+          </div>`
+        : html`
+            <button
+              class="cmp-truth-ref-toggle"
+              onClick=${() => setExpanded((x) => !x)}
+            >
+              ${expanded ? "hide" : "show"} truth corpus (${count})
+            </button>
+            ${expanded
+              ? html`
+                  <ul class="cmp-truth-ref-list">
+                    ${truth.map((t) => html`
+                      <li class="cmp-truth-ref-item" key=${t.index}>
+                        <span class="cmp-truth-idx">T${t.index}</span>
+                        <span class="cmp-truth-ref-text">${(t.text || "").slice(0, 240)}${(t.text || "").length > 240 ? "…" : ""}</span>
+                      </li>
+                    `)}
+                  </ul>`
+              : null}
+          `}
     </section>
   `;
 }
@@ -1134,30 +1103,9 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
     } catch (err) { setError(err.message); }
   }, [authedFetch, refresh]);
 
-  const truthAdd = useCallback(async (text) => {
-    try {
-      await apiFetch(authedFetch, "/truth", {
-        method: "POST", body: JSON.stringify({ action: "add", text }),
-      });
-      await refresh();
-    } catch (err) { setError(err.message); }
-  }, [authedFetch, refresh]);
-  const truthUpdate = useCallback(async (index, text) => {
-    try {
-      await apiFetch(authedFetch, "/truth", {
-        method: "POST", body: JSON.stringify({ action: "update", index, text }),
-      });
-      await refresh();
-    } catch (err) { setError(err.message); }
-  }, [authedFetch, refresh]);
-  const truthRemove = useCallback(async (index) => {
-    try {
-      await apiFetch(authedFetch, "/truth", {
-        method: "POST", body: JSON.stringify({ action: "remove", index }),
-      });
-      await refresh();
-    } catch (err) { setError(err.message); }
-  }, [authedFetch, refresh]);
+  // Truth has no mutation callbacks — it's owned by the project's
+  // `truth/` folder (edited via the Files pane, proposed by Coach via
+  // `coord_propose_truth_update`). Compass reads it on every run.
 
   const ask = useCallback(async (query) => {
     // Hits /api/compass/ask — same prompt pipeline that backs the
@@ -1247,18 +1195,28 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
 
   const conflictAmendTruth = useCallback(async () => {
     if (!truthConflict?.conflicts?.length) return;
+    // Truth is owned by the project's truth/ folder, not by Compass.
+    // The "amend truth" path can't write directly anymore; instead
+    // we surface the file path so the human knows which truth file
+    // to edit (via the Files pane or any text editor with kDrive
+    // sync). Fetch the current truth list to map index → path.
     const idx = truthConflict.conflicts[0].truth_index;
-    const current = state?.truth?.find((t) => t.index === idx)?.text || "";
-    const updated = prompt(`Update truth T${idx}:`, current);
-    if (updated === null || !updated.trim()) return;
-    await truthUpdate(idx, updated.trim());
+    let path = null;
+    try {
+      const tr = await apiFetch(authedFetch, "/truth");
+      const fact = (tr.facts || []).find((f) => f.index === idx);
+      path = fact?.path || null;
+    } catch (_) {}
+    alert(
+      `Truth T${idx} — to amend, edit the file directly:\n\n` +
+      (path
+        ? `<project>/truth/${path}\n\nThe Files pane lets you edit it. ` +
+          `Compass re-reads truth on every run, so the next run picks ` +
+          `up the change.`
+        : `(file path unavailable; truth corpus may have shifted).`)
+    );
     setTruthConflict(null);
-    // Re-attempt the original answer.
-    if (truthConflict.question_id) {
-      if (qaActive) qaSubmit(truthConflict.answer);
-      else submitAnswer(truthConflict.question_id, truthConflict.answer);
-    }
-  }, [truthConflict, state, truthUpdate, qaActive, qaSubmit, submitAnswer]);
+  }, [truthConflict, authedFetch]);
 
   const conflictLeaveBoth = useCallback(async () => {
     // Mark question as ambiguity_accepted via the API: the simplest
@@ -1322,11 +1280,23 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
           onQAEnd=${qaEnd}
           onReset=${reset}
         />
-        <${TruthRow}
+        <${TruthReference}
           truth=${state.truth}
-          onAdd=${truthAdd}
-          onUpdate=${truthUpdate}
-          onRemove=${truthRemove}
+          onOpenFiles=${() => {
+            // The Files pane handles in-app file links via
+            // pendingFileOpen + a custom MIME drop. We don't have a
+            // reference to its setter from inside the Compass pane,
+            // so we just emit a synthetic click on a known root path
+            // — the Files pane's document-level click listener picks
+            // it up (see app.js handler that listens for
+            // [data-harness-path] anchors).
+            const a = document.createElement("a");
+            a.setAttribute("data-harness-path", "/data/projects/" + (state.project_id || "") + "/truth");
+            a.setAttribute("href", "#");
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+          }}
         />
         <${RegionsStrip}
           regions=${state.regions}

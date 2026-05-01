@@ -312,7 +312,7 @@ CREATE TABLE IF NOT EXISTS truth_proposals (
     proposed_content  TEXT NOT NULL,                 -- full new file body
     summary           TEXT NOT NULL,                 -- one-line "why" the user reads
     status            TEXT NOT NULL DEFAULT 'pending'
-                      CHECK (status IN ('pending', 'approved', 'denied', 'cancelled')),
+                      CHECK (status IN ('pending', 'approved', 'denied', 'cancelled', 'superseded')),
     created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     resolved_at       TEXT,
     resolved_by       TEXT,                          -- 'human' (only legal value today)

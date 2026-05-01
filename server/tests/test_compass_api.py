@@ -380,23 +380,35 @@ def test_weight_override_requires_confirm(client: TestClient) -> None:
     assert state2.find_statement("s1").weight == pytest.approx(0.83)
 
 
-# ---------------------------------------------------- /truth
+# ---------------------------------------------------- /truth (read-only)
 
 
-def test_truth_add_update_remove(client: TestClient) -> None:
+def test_truth_get_reads_project_folder(client: TestClient) -> None:
+    """`/api/compass/truth` is read-only — Compass doesn't manage
+    truth. The project's `truth/` folder is the source of truth."""
+    from server.paths import project_paths
+
+    pp = project_paths("misc")
+    pp.truth.mkdir(parents=True, exist_ok=True)
+    (pp.truth / "one.md").write_text("Truth fact one.", encoding="utf-8")
+    (pp.truth / "two.md").write_text("Truth fact two.", encoding="utf-8")
+
     client.post("/api/compass/enable")
-    r = client.post("/api/compass/truth",
-                    json={"action": "add", "text": "One operator"})
+    r = client.get("/api/compass/truth")
     assert r.status_code == 200
-    assert len(r.json()["truth"]) == 1
-    r = client.post("/api/compass/truth",
-                    json={"action": "update", "index": 1, "text": "Single op"})
-    assert r.status_code == 200
-    assert r.json()["truth"][0]["text"] == "Single op"
-    r = client.post("/api/compass/truth",
-                    json={"action": "remove", "index": 1})
-    assert r.status_code == 200
-    assert r.json()["truth"] == []
+    body = r.json()
+    assert len(body["facts"]) == 2
+    assert body["facts"][0]["path"] == "one.md"
+    assert "Truth fact one." in body["facts"][0]["text"]
+
+
+def test_truth_post_endpoint_removed(client: TestClient) -> None:
+    """The legacy POST /truth (add/update/remove) was removed when
+    truth became folder-backed. Routes that don't accept POST should
+    return 405 Method Not Allowed."""
+    client.post("/api/compass/enable")
+    r = client.post("/api/compass/truth", json={"action": "add", "text": "x"})
+    assert r.status_code in (404, 405)
 
 
 # ---------------------------------------------------- /audit

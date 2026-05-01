@@ -406,40 +406,10 @@ def manual_weight_override(
     return s
 
 
-# --------------------------------------------------------- truth
-
-
-def add_truth(state: LatticeState, text: str) -> int:
-    """Append a truth fact. Returns its 1-based index. Compass never
-    calls this — only humans add truth (spec §1.4)."""
-    text = (text or "").strip()
-    if not text:
-        raise ValueError("truth text required")
-    from server.compass.store import TruthFact
-
-    new_idx = len(state.truth) + 1
-    state.truth.append(TruthFact(index=new_idx, text=text, added_at=_now_iso()))
-    return new_idx
-
-
-def update_truth(state: LatticeState, index: int, text: str) -> bool:
-    """Replace the text of an existing truth fact. Index is 1-based."""
-    text = (text or "").strip()
-    if not text:
-        raise ValueError("truth text required")
-    if index < 1 or index > len(state.truth):
-        return False
-    t = state.truth[index - 1]
-    t.text = text
-    return True
-
-
-def remove_truth(state: LatticeState, index: int) -> bool:
-    """Delete a truth fact. Indices renumber on save (see store.save_truth)."""
-    if index < 1 or index > len(state.truth):
-        return False
-    del state.truth[index - 1]
-    return True
+# Truth has no mutate helpers — Compass never writes truth. Truth
+# lives in the project's `truth/` folder, edited by humans via the
+# Files pane and proposed by Coach via `coord_propose_truth_update`.
+# Compass reads it via `server.compass.truth.read_truth_facts`.
 
 
 # --------------------------------------------------- restore (un-archive)
@@ -470,8 +440,5 @@ __all__ = [
     "retire_statement",
     "merge_duplicate_cluster",
     "manual_weight_override",
-    "add_truth",
-    "update_truth",
-    "remove_truth",
     "restore_statement",
 ]

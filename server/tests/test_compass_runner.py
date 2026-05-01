@@ -29,6 +29,7 @@ from server.compass.pipeline import (
     regions as pl_regions,
     reviews as pl_reviews,
     truth_check as pl_truth_check,
+    truth_derive as pl_truth_derive,
 )
 
 
@@ -172,6 +173,19 @@ def _stub_pipeline(
         invocations["claude_md_inject"].append((project_id, body))
         return True
 
+    # Default: truth-derive returns nothing (most existing tests have
+    # an empty truth/ folder, so the runner short-circuits; even when
+    # truth is present, the dedicated truth-derive tests below
+    # override this with their own fixture data).
+    @dataclass
+    class _TDRes:
+        statements: list[dict[str, Any]] = field(default_factory=list)
+        summary: str = ""
+
+    async def _truth_derive_stub(state: Any) -> _TDRes:
+        invocations.setdefault("truth_derive", []).append(state.project_id)
+        return _TDRes()
+
     monkeypatch.setattr(pl_digest, "passive", _passive)
     monkeypatch.setattr(pl_digest, "answer", _answer)
     monkeypatch.setattr(pl_questions, "generate_batch", _questions)
@@ -182,6 +196,7 @@ def _stub_pipeline(
     monkeypatch.setattr(pl_briefing, "generate", _briefing_gen)
     monkeypatch.setattr(pl_claude_md, "generate", _claude_md_generate)
     monkeypatch.setattr(pl_claude_md, "inject", _claude_md_inject)
+    monkeypatch.setattr(pl_truth_derive, "derive_from_truth", _truth_derive_stub)
     return invocations
 
 
@@ -290,9 +305,18 @@ async def test_truth_contradiction_marks_question(
     finally:
         await c.close()
 
+    # Truth is folder-backed: drop a file in the project's truth/
+    # folder and Compass picks it up on `load_state`.
+    from server.paths import project_paths
+    pp = project_paths("misc")
+    pp.truth.mkdir(parents=True, exist_ok=True)
+    (pp.truth / "operator.md").write_text(
+        "There is one human operator.", encoding="utf-8",
+    )
+
     await store.bootstrap_state("misc")
     state = store.load_state("misc")
-    state.truth.append(store.TruthFact(index=1, text="One operator", added_at="t"))
+    assert len(state.truth) == 1  # confirm truth was read from folder
     state.questions.append(store.Question(
         id="q1",
         q="?",
@@ -304,7 +328,6 @@ async def test_truth_contradiction_marks_question(
         answer="contradicts truth",
         answered_at="t",
     ))
-    await store.save_truth("misc", state.truth)
     await store.save_questions("misc", state.questions)
 
     inv = _stub_pipeline(monkeypatch, truth_contradicts=True)
@@ -390,3 +413,166 @@ async def test_run_records_last_run_and_bootstrapped_flags(
 async def test_run_invalid_mode_raises(fresh_db: str) -> None:
     with pytest.raises(ValueError):
         await runner.run("misc", mode="not-a-mode")
+
+
+# ============================================================
+# Truth-derive (Stage 0) — folder-backed truth seeds the lattice
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_truth_derive_seeds_lattice_on_first_run(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drop a truth file in the project's truth/ folder; the runner's
+    Stage 0 should pick it up and derive lattice statements at weight
+    0.75 with `created_by='compass-truth'`."""
+    from server.db import init_db, set_active_project
+    from server.paths import project_paths
+    await init_db()
+    await set_active_project("misc")
+
+    pp = project_paths("misc")
+    pp.truth.mkdir(parents=True, exist_ok=True)
+    (pp.truth / "pricing.md").write_text(
+        "Per-task billing is a hard constraint from legal.",
+        encoding="utf-8",
+    )
+
+    inv = _stub_pipeline(monkeypatch)
+
+    @dataclass
+    class _TDRes:
+        statements: list[dict[str, Any]] = field(default_factory=list)
+        summary: str = ""
+
+    async def _truth_derive(state: Any) -> _TDRes:
+        return _TDRes(statements=[
+            {"text": "Pricing is per-task", "region": "pricing",
+             "rationale": "from T1: pricing.md"},
+            {"text": "Legal sign-off is required for billing changes",
+             "region": "compliance", "rationale": "from T1: pricing.md"},
+        ])
+
+    monkeypatch.setattr(pl_truth_derive, "derive_from_truth", _truth_derive)
+
+    log = await runner.run("misc", mode="bootstrap")
+    assert log["completed"] is True
+    state = store.load_state("misc")
+    truth_grounded = [s for s in state.statements if s.created_by == "compass-truth"]
+    assert len(truth_grounded) == 2
+    assert all(abs(s.weight - 0.75) < 1e-9 for s in truth_grounded)
+    # Truth-derive note recorded in the run log.
+    assert any("truth_derive" in n for n in (log.get("notes") or []))
+
+
+@pytest.mark.asyncio
+async def test_truth_derive_idempotent_on_unchanged_truth(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If truth doesn't change between runs and the lattice already
+    has truth-derived statements, Stage 0 must NOT call the LLM
+    again. The user's explicit principle: 'if the truth does not
+    change, then it will not infer new statement.'"""
+    from server.db import init_db, set_active_project
+    from server.paths import project_paths
+    await init_db()
+    await set_active_project("misc")
+
+    pp = project_paths("misc")
+    pp.truth.mkdir(parents=True, exist_ok=True)
+    (pp.truth / "pricing.md").write_text("Stable truth.", encoding="utf-8")
+
+    inv = _stub_pipeline(monkeypatch)
+    call_count = {"n": 0}
+
+    @dataclass
+    class _TDRes:
+        statements: list[dict[str, Any]] = field(default_factory=list)
+        summary: str = ""
+
+    async def _truth_derive(state: Any) -> _TDRes:
+        call_count["n"] += 1
+        return _TDRes(statements=[
+            {"text": "Stable claim", "region": "x", "rationale": "from T1"},
+        ])
+
+    monkeypatch.setattr(pl_truth_derive, "derive_from_truth", _truth_derive)
+
+    # Run #1 — derives.
+    await runner.run("misc", mode="bootstrap")
+    assert call_count["n"] == 1
+    # Run #2 — same truth, should short-circuit.
+    await runner.run("misc", mode="on_demand")
+    assert call_count["n"] == 1, "second run with unchanged truth must skip derive"
+
+
+@pytest.mark.asyncio
+async def test_truth_derive_re_runs_when_truth_changes(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Editing a truth file should produce a new corpus hash and
+    trigger Stage 0 again on the next run."""
+    from server.db import init_db, set_active_project
+    from server.paths import project_paths
+    await init_db()
+    await set_active_project("misc")
+
+    pp = project_paths("misc")
+    pp.truth.mkdir(parents=True, exist_ok=True)
+    target = pp.truth / "pricing.md"
+    target.write_text("Original truth.", encoding="utf-8")
+
+    inv = _stub_pipeline(monkeypatch)
+    call_count = {"n": 0}
+
+    @dataclass
+    class _TDRes:
+        statements: list[dict[str, Any]] = field(default_factory=list)
+        summary: str = ""
+
+    async def _truth_derive(state: Any) -> _TDRes:
+        call_count["n"] += 1
+        return _TDRes(statements=[
+            {"text": f"Claim v{call_count['n']}", "region": "x", "rationale": "from T1"},
+        ])
+
+    monkeypatch.setattr(pl_truth_derive, "derive_from_truth", _truth_derive)
+
+    await runner.run("misc", mode="bootstrap")
+    assert call_count["n"] == 1
+    # Edit truth file — corpus hash changes.
+    target.write_text("Updated truth — different content.", encoding="utf-8")
+    await runner.run("misc", mode="on_demand")
+    assert call_count["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_truth_derive_skips_when_truth_folder_empty(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Empty truth/ folder → no LLM call, no statements added, log
+    notes record the skip."""
+    from server.db import init_db, set_active_project
+    await init_db()
+    await set_active_project("misc")
+
+    inv = _stub_pipeline(monkeypatch)
+    call_count = {"n": 0}
+
+    @dataclass
+    class _TDRes:
+        statements: list[dict[str, Any]] = field(default_factory=list)
+        summary: str = ""
+
+    async def _truth_derive(state: Any) -> _TDRes:
+        call_count["n"] += 1
+        return _TDRes()
+
+    monkeypatch.setattr(pl_truth_derive, "derive_from_truth", _truth_derive)
+
+    log = await runner.run("misc", mode="bootstrap")
+    assert call_count["n"] == 0
+    state = store.load_state("misc")
+    assert all(s.created_by != "compass-truth" for s in state.statements)
+    assert any("truth/" in n for n in (log.get("notes") or []))

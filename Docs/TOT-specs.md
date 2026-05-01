@@ -980,7 +980,7 @@ or override flag — the deny is unconditional for every agent
 
 **Proposal flow** (the only path through which `truth/` ever changes):
 
-1. Coach calls the new MCP tool `coord_propose_truth_update(path,
+1. Coach calls the MCP tool `coord_propose_truth_update(path,
    content, summary)`. Players cannot — the tool body rejects any
    non-Coach caller. The tool inserts a row in `truth_proposals`
    (`status='pending'`) with the full proposed content and a one-line
@@ -992,19 +992,71 @@ or override flag — the deny is unconditional for every agent
    tells Coach to switch active project first. This catches the
    recurrent mistake of encoding a sibling project slug in the path
    when truth/ is per-active-project by design.
-2. The harness emits a `truth_proposal_created` event; the
+2. **Auto-supersede**: before insert, the tool scans for any pending
+   row on the same `(project_id, path)` and marks each as
+   `status='superseded'`, `resolved_by='system'`,
+   `resolved_note='superseded by #<new_id>'`. One
+   `truth_proposal_superseded` event fires per superseded row.
+   Invariant: at most one pending proposal per (project, path) at any
+   time. Coach's tool description explicitly tells Coach the new
+   proposal REPLACES the old (full content replace, not a merge), so
+   Coach must include any prior pending content it still wants. Both
+   updates run in the same DB transaction with the new INSERT so a
+   crash mid-flight leaves the table coherent.
+3. The harness emits a `truth_proposal_created` event; the
    `EnvTruthProposalsSection` of the Environment pane shows the
    pending proposal with summary + full proposed content + approve /
    deny buttons.
-3. The user clicks **approve** or **deny**. Approve calls
+4. The user clicks **approve** or **deny**. Approve calls
    `POST /api/truth/proposals/{id}/approve` which (a) writes the
-   proposed content to `truth/<path>` via the Files-pane write path
-   (so the same path-resolution sandbox + extension rules apply),
-   then (b) marks the row `approved` with timestamp + `resolved_by =
-   "human"` + actor metadata. Deny only marks the row.
-4. Approve emits `truth_proposal_approved`; deny emits
+   proposed content to `truth/<path>` directly (the truth resolver
+   uses its own write — broader extension allowlist + 200 KB cap —
+   not the Files-pane write_text endpoint), then (b) marks the row
+   `approved` with timestamp + `resolved_by = "human"` + actor
+   metadata. Deny only marks the row.
+5. Approve emits `truth_proposal_approved`; deny emits
    `truth_proposal_denied`. Either is visible in the agent timeline,
    so Coach sees the outcome on its next turn.
+
+**Manifest (`truth-index.md`).** Every project's `truth/` is seeded
+on scaffold with a `truth-index.md` template (from
+`server/templates/truth_index.md`) that explains the lane and lists
+the expected files. Bullets follow `` - `filename` — description ``;
+the harness's `parse_truth_manifest()` (in `server/truth.py`)
+extracts them and surfaces the list via
+`GET /api/truth/manifest`. Default seeded bullet: `specs.md` (project
+goals, scope, structure). The user OR Coach can edit
+`truth-index.md` to add bullets when the folder needs to grow (Coach
+proposes via the same `coord_propose_truth_update` flow). The
+`truth-index.md` file itself is filtered out of the manifest output
+so it doesn't list itself as expected.
+
+**Boot-time scaffold rescue.** `lifespan` in `server/main.py` runs
+`ensure_project_scaffold(id)` for every non-archived project after
+`init_db`, so directories or templates added to `_PROJECT_SUBDIRS` /
+`_write_truth_index_stub` after a project's creation (e.g. the truth
+lane retro-fitted to existing projects) materialize on next boot.
+First-write-only — user edits and Coach proposals own each file
+once it exists.
+
+**Empty-file creation.**
+`POST /api/truth/files/create_empty` writes a zero-byte file under
+the active project's truth/, refusing if the target already exists
+(409). Same path-traversal sandbox as the resolver. Used by the
+EnvPane's `EnvTruthExpectedSection` "create empty" button on missing
+manifest entries — the typical flow when the user is starting from a
+fresh template and wants to begin authoring `specs.md` directly in
+the Files pane.
+
+**EnvPane sections.**
+`EnvTruthExpectedSection` shows the manifest as a checklist (one
+row per bullet in `truth-index.md`); existing rows have an "open"
+link (in-app file-link → FilesPane), missing rows have "create
+empty" buttons. Auto-refreshes on `truth_proposal_approved` (Coach
+may have just edited the manifest or created a listed file) and on
+`file_written` for any `truth/...` path.
+`EnvTruthProposalsSection` lists pending proposals with the same
+approve/deny mechanics as before.
 
 Players whose work needs a truth update message Coach (via
 `coord_send_message`); Coach decides whether to relay as a proposal.
