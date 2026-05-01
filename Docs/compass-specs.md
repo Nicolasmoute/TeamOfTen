@@ -83,7 +83,7 @@ Compass differentiates the sources at **build time** — distinct prompts, delta
 
 Two narrow ways the truth corpus differs from other sources, despite the world model being the operative reference:
 
-1. **Compass never amends it.** The human edits truth files via the Files pane; Coach proposes via `coord_propose_truth_update` (human-approved); agents are blocked by a PreToolUse hook from writing under `truth/`. Compass reads only — it derives lattice statements but never writes back to the corpus.
+1. **Compass never amends it.** The human edits truth files via the Files pane; Coach proposes via `coord_propose_file_write` (human-approved); agents are blocked by a PreToolUse hook from writing under `truth/`. Compass reads only — it derives lattice statements but never writes back to the corpus.
 2. **The truth-check subroutine** (§3.7) consults the corpus directly when digesting a human's Q&A answer. This catches the case where an answer would push the lattice into contradiction with the human-authored floor — protecting the lattice from drifting away via mistakenly-digested answers. It's NOT a per-query check that downstream consumers run.
 
 Truth-corpus examples (real TeamOfTen):
@@ -264,7 +264,7 @@ This is not a stage but a subroutine called inside §3.1 (and inside `submitQa`,
 1. Before reweighting, ask the LLM: "does this answer contradict the truth corpus?" The full corpus (long-form vetted material from §1.4) is fed to the prompt, so contradictions are judged against the human-authored material directly — NOT against compass's truth-grounded lattice rows, which can drift.
 2. If yes: halt the digest. Surface the conflict to the human via a modal with three resolution paths:
    - **Amend answer** — human restates; resume digest with the new answer
-   - **Amend truth** — human edits the relevant truth file (the only way the corpus ever changes); the original answer can then be digested. In TeamOfTen, "amend truth" routes the human at the offending file via the Files pane (and the existing `coord_propose_truth_update` flow stays available for Coach-driven amendments).
+   - **Amend truth** — human edits the relevant truth file (the only way the corpus ever changes); the original answer can then be digested. In TeamOfTen, "amend truth" routes the human at the offending file via the Files pane (and the existing `coord_propose_file_write` flow stays available for Coach-driven amendments).
    - **Leave both** — accept the ambiguity; discard the answer, keep the corpus as-is. Question is marked `ambiguityAccepted`.
 
 Compass never silently reweights in the face of a truth contradiction.
@@ -2071,78 +2071,112 @@ region. Conservative — false positives are expensive (they bother the
 human). Deduplicates against pending meta-questions for the same
 region so the queue doesn't grow unbounded.
 
-### A.13 · Truth is the project's `truth/` folder, not a Compass file
+### A.13 · Truth corpus integration (TeamOfTen)
 
-Spec §1.4 / §6.2 modeled truth as a Compass-managed list (`truth.json`
-with `{index, text, added_at, added_by}` rows the human edits via the
-dashboard). The TeamOfTen harness already has a canonical truth lane:
-`<project>/truth/` is a directory of files, with the existing flow
-(humans edit via the Files pane, Coach proposes via
-`coord_propose_truth_update` → human approval, agents are blocked by a
-PreToolUse hook from writing under `truth/`). Maintaining a parallel
-list inside Compass would create two sources of truth, and there can
-be only one.
+Spec §1.4 / §6.2 modeled truth as a Compass-managed list (`truth.json` with `{index, text, added_at, added_by}` rows of short atomic claims). The TeamOfTen harness already has a canonical truth lane that holds **long-form vetted documents** (specs, goals, brand guidelines, contracts, role docs). Maintaining a parallel list inside Compass would create two sources of truth, and there can be only one. So Compass adapts: it reads the harness's truth corpus and synthesizes `TruthFact`s on demand, with a small set of well-defined rules.
 
-Compass therefore **reads** truth from `<project>/truth/` on every run
-and **never writes** it.
+#### A.13.1 Where truth lives
 
-  - Local source-of-truth: `/data/projects/<id>/truth/`. Walked
-    recursively for `.md` and `.txt` files; other formats accepted by
-    `truth/` (yaml/json/toml/csv) are reference docs, not lattice
-    truth-check candidates, and are skipped.
-  - Each file → one synthesized `TruthFact` with 1-based `index`
-    (sorted by relpath), `text` prefixed with `(<relpath>) <body>`
-    so the LLM has a name handle, `added_at` from file mtime,
-    `added_by="human"`. Long files (> `MAX_FACT_CHARS=8000`) are
-    truncated with a marker.
-  - The adapter is `server.compass.truth.read_truth_facts(project_id)`,
-    called from `compass.store.load_state` on every load — no caching
-    across runs.
-  - There is no `POST /api/compass/truth` endpoint. The dashboard
-    surfaces a **read-only** `TruthReference` card (count + expand-to-
-    view) and a "open Files pane" button for editing. The
-    truth-conflict modal's "Amend truth" path now points the human at
-    the offending file path (resolved via `read_truth_index_to_path`)
-    rather than offering an in-modal edit — the harness's existing
-    truth-edit flow is the authoritative path.
-  - **Reset preserves truth.** `POST /api/compass/reset` wipes
-    Compass's view (lattice, regions, audits, runs, briefings,
-    proposals, claude_md_block, truth-corpus hash); it leaves the
-    `truth/` folder untouched.
+  - **Local**: `/data/projects/<project_id>/truth/` (walked recursively).
+  - **kDrive mirror**: `projects/<project_id>/truth/` — same shape on the cloud drive. Edits via the Files pane sync up; out-of-band edits via the kDrive web UI sync down on the next project-sync tick.
+  - **Manifest**: every project's `truth/` is auto-seeded with `truth-index.md` (template at `server/templates/truth_index.md`). The manifest is a bullet list of which files SHOULD live in this folder, with one-line descriptions; the EnvPane's Truth section renders it as a checklist with create / open buttons. Coach proposes edits to it (and to the listed files) via `coord_propose_file_write`.
 
-### A.14 · Stage 0 — truth-derive seeds the lattice
+The manifest is **just another truth file** from Compass's perspective — it's ingested verbatim alongside the listed files. The LLM receives the relpath as a prefix, so it can recognize `truth-index.md` as a manifest from the filename and treat it as context rather than as a list of project claims. We don't filter or special-case it; the per-file ingestion rule applies uniformly.
 
-The user's principle (added during implementation): "as long as there
-is truth data, there will be immediately a first basis for world
-model." The runner now executes a Stage 0 BEFORE answer digest:
+#### A.13.2 Authoring rules (existing harness flow)
 
-  1. Read truth facts (folder-backed, fresh).
-  2. Compute SHA-256 over the corpus and compare against the previous
-     run's hash, stored in `team_config['compass_truth_hash_<id>']`.
-  3. **Skip the LLM call** when the hash is unchanged AND the lattice
-     already has truth-derived statements (idempotent w.r.t. unchanged
-     truth — exactly the user's "if truth doesn't change, no new
-     statements" rule).
-  4. Otherwise, call the LLM via
-     `pipeline.truth_derive.derive_from_truth` with the
-     `TRUTH_DERIVE_SYSTEM` prompt. The prompt instructs the model to
-     propose lattice statements representing what truth implies,
-     EXPLICITLY skipping statements already present, capped at 8.
-  5. Materialize each proposal as a `Statement` with
-     `weight=0.75` (between 0.5 ignorance and 0.85 settle threshold —
-     truth-grounded but compass-INTERPRETED, so still subject to
-     override / drift / settle confirmation), `created_by="compass-truth"`,
-     and a history entry with `source="truth_derive"`.
-  6. Persist the new corpus hash regardless of how many statements
-     the LLM produced (the corpus has been considered).
+  - **Humans** edit truth files directly via the Files pane (or any text editor with kDrive sync). Truth files behave like any other markdown — the Files pane allowlist accepts the wider set of formats `truth/` is documented to hold (`.md`, `.txt`, `.yaml`, `.json`, `.toml`, `.csv`).
+  - **Coach** proposes truth edits via `coord_propose_file_write(scope='truth', path, content, summary)`. The proposal lands in the `file_write_proposals` table; the human approves / denies / cancels in the EnvPane's "File-write proposals" section (which also handles project-CLAUDE.md proposals via the same flow). On approval, the file is written and the proposal row is marked resolved (`server/truth.py:resolve_file_write_proposal`).
+  - **Players** are blocked from writing under `truth/` by a `PreToolUse` hook in `server/agents.py`. A Player attempting `Write` / `Edit` / `Bash` against a truth path gets a deny; the agent surface tells them to route via Coach.
+  - **Compass** has no write path. It only reads.
 
-Net effect on every mode:
-  - **bootstrap** — first run with truth → lattice is seeded
-    immediately, even before the human answers any question.
-  - **daily / on_demand** — re-reads truth; derives new statements
-    only if files changed (added, edited, deleted) AND those changes
-    imply new claims. The rest of the pipeline (passive digest,
-    Q&A, audit, reviews) enriches on top.
+#### A.13.3 What Compass ingests
 
-A `compass_truth_derived` event is published on the bus so the
-dashboard can highlight the new statements in real time.
+  - **Allowed extensions**: `.md`, `.markdown`, `.txt`. Other formats accepted by `truth/` (`.yaml`, `.json`, `.toml`, `.csv`) are reference / structured docs and are skipped — they're not natural truth-check candidates and would bloat prompts. The dashboard's Files pane is the right place to view them.
+  - **Walk order**: recursive under `<project>/truth/`. Sorted by POSIX relpath so indexing is deterministic across calls (a file rename or addition shifts indices on the next read; that's fine because indices are only stable within one run).
+  - **Per-file synthesis**: each file becomes one `TruthFact` (`server/compass/store.py`):
+    - `index`: 1-based, monotonic by sort order.
+    - `text`: `(<relpath>) <file body>` — prefixing the relpath gives the LLM a name handle so when it answers `truth_index: 2` we can map back to a file path.
+    - `added_at`: file mtime, ISO-8601 UTC.
+    - `added_by`: `"human"` (Compass's perspective — the harness owns authoring).
+  - **Truncation**: bodies longer than `MAX_FACT_CHARS=8000` are truncated with a marker like `[truncated — file is N chars total]`. Long truth files are usually reference material; the head captures the salient claims.
+  - **Empty / blank files**: skipped entirely. Avoids a fact that's just a path with no body.
+
+#### A.13.4 Read interface
+
+  - `read_truth_facts(project_id) -> list[TruthFact]` — the canonical reader. Called from `compass.store.load_state`, which itself is called fresh on every Compass call site (runner stage entries, MCP tool handlers, dashboard `/api/compass/state`). No in-process caching — file mtimes drive correctness.
+  - `read_truth_index_to_path(project_id) -> dict[int, str]` — the same 1-based ordering, exposed as an index → relpath map. Used by the dashboard's truth-conflict modal to resolve `truth_index` (from the LLM) to a file path the human can be pointed at.
+  - `MAX_FACT_CHARS` and `ALLOWED_SUFFIXES` are public constants for tests + UI introspection.
+
+#### A.13.5 Idempotency: the corpus hash
+
+A SHA-256 over the concatenated corpus text (`text` field, file-by-file, with a separator). Stored in `team_config['compass_truth_hash_<project_id>']` after every successful Stage 0 run. The hash drives two short-circuits:
+
+  - **Stage 0 truth-derive (§3.0 / Appendix A.14)** — skip the LLM call when the hash is unchanged AND the lattice already has rows with `created_by="compass-truth"`.
+  - **Stage 0.1 reconciliation (§3.0.1)** — only fire when the hash changed since the last run; an unchanged corpus can't have introduced new conflicts.
+
+The hash is cleared on `POST /api/compass/reset` so the next run does a fresh full-corpus ingestion (the `truth/` folder itself is left intact — reset wipes Compass's view, not the floor).
+
+#### A.13.6 What's "special" about the corpus, restated
+
+Per §1.4, the corpus is special in only two narrow ways. Implementation specifics:
+
+  1. **Compass never amends it.** Verified by the absence of `save_truth` / `mutate.add_truth` / `mutate.update_truth` / `mutate.remove_truth` (all removed during the folder-backed migration). The legacy `POST /api/compass/truth` was deleted; only `GET /api/compass/truth` remains for the dashboard to render the read-only `TruthReference` card.
+  2. **The truth-check subroutine** (`server/compass/pipeline/truth_check.py`) feeds the LLM the corpus directly when digesting a Q&A answer. The conflict report cites `truth_index`; the dashboard maps that back to a relpath via `read_truth_index_to_path`.
+
+#### A.13.7 Dashboard surface
+
+  - **`TruthReference` card** on the Compass dashboard: shows the count of truth files, an expand-to-view list (path + 240-char preview per file), and an "open Files pane" button. No edit controls.
+  - **Truth-conflict modal** (`§3.7`) "Amend truth" path: routes the human at the offending file via the Files pane (resolved through `read_truth_index_to_path`); the existing `coord_propose_file_write` flow remains available for Coach-driven amendments. There is no in-modal text editor for truth.
+  - **Reconciliation proposals** (`§3.0.1` + §6.7): rendered alongside settle / stale / dupe proposals on the lattice column. Each shows the lattice row, the cited corpus file(s), the explanation, and three resolution buttons (update lattice / update truth / accept ambiguity).
+
+#### A.13.8 Reset semantics
+
+`POST /api/compass/reset` clears Compass's view but preserves the corpus:
+  - **Wiped**: `data/projects/<id>/working/compass/` (lattice, regions, questions, audits, runs, briefings, proposals, claude_md_block) plus `team_config` keys `compass_bootstrapped_<id>`, `compass_last_run_<id>`, `compass_heartbeat_<id>`, `compass_truth_hash_<id>`.
+  - **Untouched**: `data/projects/<id>/truth/` and the kDrive mirror at `projects/<id>/truth/`. Truth is the floor; reset is a Compass-side operation.
+
+After a reset, the next Compass run sees `corpus_hash` as missing, runs Stage 0 truth-derive fresh, and re-seeds the lattice from the corpus — restoring the truth-grounded floor automatically.
+
+### A.14 · Stage 0 mechanics — derive + reconcile
+
+This appendix entry covers the Stage 0 implementation glue, complementing the conceptual specs in §3.0 + §3.0.1. The two sub-stages share the corpus hash (A.13.5) and are sequenced together because they both require a fresh corpus read.
+
+#### A.14.1 Pipeline order
+
+```
+Stage 0   Read truth corpus, compute hash.
+Stage 0a  Truth-derive (§3.0)         → propose new lattice rows from corpus.
+Stage 0b  Reconciliation (§3.0.1)     → flag corpus↔lattice conflicts.
+Stage 1   Digest answered questions   (the original §3.1).
+…
+```
+
+Sub-stages 0a and 0b both read the same `state.truth` populated by `load_state`. 0a writes new lattice rows; 0b writes pending reconciliation proposals (no lattice change). They run independently — 0a doesn't gate 0b — so newly-derived statements aren't accidentally flagged by 0b on the same run.
+
+#### A.14.2 Idempotency
+
+Both sub-stages short-circuit when `corpus_hash == previous_hash`. 0a additionally requires `lattice_has_rows_with(created_by="compass-truth")` — if a reset cleared compass-truth rows but the corpus didn't change, we still want to re-seed.
+
+The hash is persisted at the END of Stage 0, after both sub-stages complete, so a partial failure (e.g. LLM error in 0b) doesn't mark the corpus "considered" and skip the next run.
+
+#### A.14.3 Initial weight (truth-derived rows)
+
+`weight=0.75`. Sits in the LEANING-YES band (between 0.5 ignorance and 0.85 settle threshold). The settle proposal flow ignores rows in this band, so truth-derived statements aren't auto-promoted to settled — they have to earn it via subsequent Q&A reinforcement. This keeps the corpus as the floor and the lattice as the working layer above it.
+
+#### A.14.4 LLM caps
+
+  - **Truth-derive**: max 8 statements per run. Caps prompt + reduces noise on a fresh project. The LLM is also told to skip statements already represented in the lattice — so re-runs against an unchanged-but-larger lattice don't re-propose duplicates.
+  - **Reconciliation**: no hard cap on the LLM's output; we expect 0–2 conflicts in practice. Every flagged conflict becomes a proposal; the human decides scope.
+
+#### A.14.5 Bus events
+
+  - `compass_truth_derived` — emitted after 0a if any rows were added. Payload: `{added: [statement_ids], run_id}`. Dashboard highlights the new rows.
+  - `compass_reconciliation_proposed` — emitted after 0b if any proposals were created. Payload: `{count, conflicting_statement_ids, run_id}`. Dashboard surfaces the proposals card.
+  - `compass_phase` — emitted at stage entry/exit so the run-button pulse text reads `truth-derive…` / `reconciliation…`.
+
+#### A.14.6 Net effect
+
+  - **bootstrap** — first run with non-empty truth → lattice is seeded immediately. The human can ask Coach `compass_ask` and get corpus-grounded answers before answering any question.
+  - **daily / on_demand** with **unchanged** truth → both 0a and 0b are no-ops (idempotent). The rest of the pipeline runs.
+  - **daily / on_demand** with **changed** truth → 0a re-derives (skipping duplicates) AND 0b re-scans for conflicts. New corpus content can both add lattice rows AND surface contradictions with existing rows on the same run.

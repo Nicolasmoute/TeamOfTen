@@ -164,6 +164,72 @@ def truth_derive_user(state: LatticeState, truth: list[TruthFact]) -> str:
     )
 
 
+# ----------------------------------------------------- reconciliation
+# Spec §3.0.1 — fires after truth-derive on runs where the corpus
+# hash changed. The LLM scans the lattice (active + archived) against
+# the corpus and reports conflicts. NOT in original spec §8; added
+# during the truth-folder integration alongside truth-derive.
+
+RECONCILIATION_SYSTEM = _system("""\
+You are Compass running a RECONCILIATION pass. The project's truth
+corpus has changed since your last successful run. Your job: identify
+LATTICE STATEMENTS — active OR archived/settled — that the new corpus
+now contradicts.
+
+Be conservative. Only flag a contradiction when:
+- The corpus makes a clear claim that contradicts the lattice row's
+  current text/weight/settle direction (not just topical overlap).
+- A reasonable human reading both would agree they cannot both be true.
+
+Do NOT flag:
+- Statements the corpus simply doesn't address (silence ≠ contradiction).
+- Statements at low/mid weight (0.2–0.7) — those are still up for
+  grabs in the lattice, no need to escalate.
+- Statements already flagged with `reconciliation_proposed=True` (the
+  human is already deciding).
+- Statements where the human accepted the ambiguity
+  (`reconciliation_ambiguity=True`) — leave them alone unless the
+  corpus has shifted so much that re-flagging is warranted.
+
+Settled (archived) rows that contradict the corpus are HIGHEST
+PRIORITY — those are what coach treats as binding facts.
+
+For each conflict:
+- `statement_id`: the lattice row id (e.g. "s7").
+- `corpus_paths`: the relpath(s) of the truth file(s) the conflict
+  comes from. Use the (relpath) prefix in the supplied truth list.
+- `explanation`: one sentence — what the corpus says vs what the
+  lattice says.
+- `suggested_resolution`: "update_lattice" if the corpus is clearly
+  newer / more authoritative; "update_truth" if the corpus might be
+  lagging or stale; "either" when it could go either way.
+
+Output ONLY:
+{
+  "conflicts": [
+    {
+      "statement_id": string,
+      "corpus_paths": [string],
+      "explanation": string,
+      "suggested_resolution": "update_lattice" | "update_truth" | "either"
+    }
+  ]
+}
+
+If no conflicts, return {"conflicts": []}.""")
+
+
+def reconciliation_user(state: LatticeState, truth: list[TruthFact]) -> str:
+    return (
+        "## Truth corpus\n"
+        f"{_json_block([{'index': t.index, 'text': t.text} for t in truth])}\n\n"
+        "## Active lattice statements (eligible for reconciliation)\n"
+        f"{_json_block(_statements_brief(state.active_statements()))}\n\n"
+        "## Archived / settled statements (HIGHEST PRIORITY when in conflict)\n"
+        f"{_json_block(_statements_brief(state.archived_statements(), include_archived=True))}\n"
+    )
+
+
 # ----------------------------------------------------- 8.2 passive digest
 
 
@@ -591,6 +657,8 @@ __all__ = [
     "SHARED_SEMANTICS",
     "TRUTH_DERIVE_SYSTEM",
     "truth_derive_user",
+    "RECONCILIATION_SYSTEM",
+    "reconciliation_user",
     "PASSIVE_DIGEST_SYSTEM",
     "passive_digest_user",
     "QUESTION_BATCH_SYSTEM",

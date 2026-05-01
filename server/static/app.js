@@ -24,7 +24,13 @@ import hljsSql from "/static/vendor/hljs-sql.js";
 import hljsTs from "/static/vendor/hljs-typescript.js";
 import hljsXml from "/static/vendor/hljs-xml.js";
 import hljsYaml from "/static/vendor/hljs-yaml.js";
-import { renderToolCall, setAgentDirectory, langForFile } from "/static/tools.js";
+import {
+  renderToolCall,
+  setAgentDirectory,
+  langForFile,
+  buildSideBySideRows,
+  renderDiffBody,
+} from "/static/tools.js";
 import { CompassPane, createCompassEventRouter } from "/static/compass.js";
 
 const html = htm.bind(h);
@@ -6270,8 +6276,7 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, active
         <${EnvInboxSection} conversations=${conversations} />
         <${EnvMemorySection} conversations=${conversations} />
         <${EnvDecisionsSection} conversations=${conversations} />
-        <${EnvTruthExpectedSection} conversations=${conversations} />
-        <${EnvTruthProposalsSection} conversations=${conversations} />
+        <${EnvFileWriteProposalsSection} conversations=${conversations} />
         <${EnvTimelineSection} conversations=${conversations} />
       </div>
     </aside>
@@ -7647,116 +7652,79 @@ function EnvDecisionsSection({ conversations }) {
   `;
 }
 
-// Expected truth files section — reads truth/truth-index.md and shows
-// the manifest as a checklist. Each row: filename + description, plus
-// either an "open" link (existing file → in-app file-link to FilesPane)
-// or a "create empty" button (missing → POSTs the create endpoint).
-// Refreshes on truth_proposal_approved (Coach may have just edited
-// truth-index.md or created a listed file) and on file_written under
-// truth/ (human edits via the Files pane).
-function EnvTruthExpectedSection({ conversations }) {
-  const [entries, setEntries] = useState([]);
-  const [busyPath, setBusyPath] = useState(null);
-  const [err, setErr] = useState("");
-
-  const load = useCallback(async () => {
-    try {
-      const res = await authFetch("/api/truth/manifest");
-      if (!res.ok) return;
-      const data = await res.json();
-      setEntries(Array.isArray(data.entries) ? data.entries : []);
-    } catch (e) {
-      console.error("load truth manifest failed", e);
-    }
-  }, []);
-
-  useEffect(() => { load(); }, [load]);
-
-  // Re-fetch on relevant events: an approved proposal may have edited
-  // the manifest itself or created a listed file; file_written fires
-  // when the user creates an empty file via this section's button.
-  const eventCount = useMemo(() => {
-    let n = 0;
-    for (const list of conversations.values()) {
-      for (const ev of list) {
-        if (
-          ev.type === "truth_proposal_approved" ||
-          (ev.type === "file_written" && typeof ev.path === "string"
-           && ev.path.startsWith("truth/"))
-        ) n++;
-      }
-    }
-    return n;
-  }, [conversations]);
-  useEffect(() => {
-    if (eventCount > 0) load();
-  }, [eventCount, load]);
-
-  const createEmpty = useCallback(async (filename) => {
-    setBusyPath(filename);
-    setErr("");
-    try {
-      const res = await authFetch("/api/truth/files/create_empty", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: filename }),
-      });
-      if (!res.ok) {
-        const body = await res.text();
-        throw new Error("HTTP " + res.status + ": " + body.slice(0, 200));
-      }
-      await load();
-    } catch (e) {
-      setErr("create failed: " + String(e));
-    } finally {
-      setBusyPath(null);
-    }
-  }, [load]);
-
-  return html`
-    <section class="env-section">
-      <h3 class="env-section-title">
-        Expected truth files <span class="env-count">${entries.length}</span>
-      </h3>
-      ${err ? html`<div class="env-cost-hint">${err}</div>` : null}
-      ${entries.length === 0
-        ? html`<div class="env-cost-hint">
-            (no manifest yet — truth/truth-index.md is missing or has no
-            bullets in the expected shape)
-          </div>`
-        : html`<div class="env-truth-expected">
-            ${entries.map((e) => html`
-              <div
-                class=${"env-truth-expected-row" + (e.exists ? " exists" : " missing")}
-                key=${e.filename}
-              >
-                <div class="env-truth-expected-head">
-                  <code class="env-truth-expected-name">${e.filename}</code>
-                  ${e.exists
-                    ? html`<a
-                        class="env-truth-expected-action"
-                        data-harness-path=${e.abs_path}
-                        href="#"
-                      >open</a>`
-                    : html`<button
-                        class="env-truth-expected-action env-truth-expected-create"
-                        disabled=${busyPath === e.filename}
-                        onClick=${() => createEmpty(e.filename)}
-                      >${busyPath === e.filename ? "…" : "create empty"}</button>`}
-                </div>
-                <div class="env-truth-expected-desc">${e.description}</div>
-              </div>
-            `)}
-          </div>`}
-    </section>
-  `;
+// Display label for a proposal scope (small badge in the header).
+function _scopeLabel(scope) {
+  if (scope === "truth") return "truth";
+  if (scope === "project_claude_md") return "project CLAUDE.md";
+  return scope || "?";
 }
 
-// Truth proposals section — Coach proposes via coord_propose_truth_update,
-// the human approves or denies here. The approve action writes the file
-// server-side; the deny action just marks the row. Pending proposals are
-// the only ones rendered (resolved ones become events in the timeline).
-function EnvTruthProposalsSection({ conversations }) {
+// Display the proposal's target path in the header. Scope-aware:
+// 'truth' shows 'truth/<path>'; 'project_claude_md' shows 'CLAUDE.md'.
+function _proposalDisplayPath(p) {
+  if (p.scope === "truth") return "truth/" + (p.path || "");
+  if (p.scope === "project_claude_md") return "CLAUDE.md";
+  return p.path || "";
+}
+
+// Per-proposal diff fetch + render. Lazy: only fires when the parent
+// row is expanded (avoids hammering /diff for proposals the user
+// never opens). Falls back to a plain <pre> when the file doesn't
+// exist yet (before === null).
+function ProposalDiffView({ proposal }) {
+  const [state, setState] = useState({ status: "loading" });
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await authFetch(
+          "/api/file-write-proposals/" + proposal.id + "/diff"
+        );
+        if (!res.ok) {
+          const body = await res.text();
+          throw new Error("HTTP " + res.status + ": " + body.slice(0, 200));
+        }
+        const data = await res.json();
+        if (!cancelled) setState({ status: "ok", data });
+      } catch (e) {
+        if (!cancelled) setState({ status: "err", error: String(e) });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [proposal.id]);
+
+  if (state.status === "loading") {
+    return html`<div class="env-empty">loading diff…</div>`;
+  }
+  if (state.status === "err") {
+    return html`
+      <div class="env-cost-hint">diff failed: ${state.error}</div>
+      <pre class="env-decision-body">${proposal.proposed_content}</pre>
+    `;
+  }
+  const { before, after, path } = state.data;
+  // No diff for new files — render proposed content as plain text per
+  // the file-write-proposal v1 design.
+  if (before === null || before === undefined) {
+    return html`
+      <div class="env-empty">(new file — no prior content)</div>
+      <pre class="env-decision-body">${after || ""}</pre>
+    `;
+  }
+  if (before === after) {
+    return html`<div class="env-empty">(no changes — proposal matches current file)</div>`;
+  }
+  const lang = langForFile(path || "");
+  const rows = buildSideBySideRows(before, after, lang);
+  return renderDiffBody(rows, lang);
+}
+
+// File-write proposals section — Coach proposes via
+// coord_propose_file_write, the human approves or denies here. Approve
+// writes the file server-side; deny just marks the row. Two scopes
+// today: 'truth' and 'project_claude_md'. Pending proposals are the
+// only ones rendered (resolved ones become events in the timeline).
+function EnvFileWriteProposalsSection({ conversations }) {
   const [proposals, setProposals] = useState([]);
   const [openId, setOpenId] = useState(null);
   const [busyId, setBusyId] = useState(null);
@@ -7764,12 +7732,14 @@ function EnvTruthProposalsSection({ conversations }) {
 
   const load = useCallback(async () => {
     try {
-      const res = await authFetch("/api/truth/proposals?status=pending");
+      const res = await authFetch(
+        "/api/file-write-proposals?status=pending"
+      );
       if (!res.ok) return;
       const data = await res.json();
       setProposals(Array.isArray(data.proposals) ? data.proposals : []);
     } catch (e) {
-      console.error("load truth proposals failed", e);
+      console.error("load file-write proposals failed", e);
     }
   }, []);
 
@@ -7782,10 +7752,11 @@ function EnvTruthProposalsSection({ conversations }) {
     for (const list of conversations.values()) {
       for (const ev of list) {
         if (
-          ev.type === "truth_proposal_created" ||
-          ev.type === "truth_proposal_approved" ||
-          ev.type === "truth_proposal_denied" ||
-          ev.type === "truth_proposal_cancelled"
+          ev.type === "file_write_proposal_created" ||
+          ev.type === "file_write_proposal_approved" ||
+          ev.type === "file_write_proposal_denied" ||
+          ev.type === "file_write_proposal_cancelled" ||
+          ev.type === "file_write_proposal_superseded"
         ) n++;
       }
     }
@@ -7800,7 +7771,7 @@ function EnvTruthProposalsSection({ conversations }) {
     setErr("");
     try {
       const res = await authFetch(
-        "/api/truth/proposals/" + id + "/" + action,
+        "/api/file-write-proposals/" + id + "/" + action,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -7824,7 +7795,7 @@ function EnvTruthProposalsSection({ conversations }) {
   return html`
     <section class="env-section collapsible">
       <h3 class="env-section-title">
-        Truth proposals <span class="env-count">${proposals.length}</span>
+        File-write proposals <span class="env-count">${proposals.length}</span>
       </h3>
       ${err ? html`<div class="env-cost-hint">${err}</div>` : null}
       ${proposals.length === 0
@@ -7839,13 +7810,15 @@ function EnvTruthProposalsSection({ conversations }) {
                     onClick=${() => setOpenId(isOpen ? null : p.id)}
                   >
                     <span class="env-decision-arrow">${isOpen ? "▾" : "▸"}</span>
-                    <span class="env-decision-title">truth/${p.path}</span>
+                    <span class=${"env-fw-scope env-fw-scope-" + p.scope}
+                    >${_scopeLabel(p.scope)}</span>
+                    <span class="env-decision-title">${_proposalDisplayPath(p)}</span>
                     <span class="env-decision-meta">${p.proposer_id}</span>
                   </button>
                   ${isOpen
                     ? html`
                         <div class="env-truth-summary">${p.summary}</div>
-                        <pre class="env-decision-body">${p.proposed_content}</pre>
+                        <${ProposalDiffView} proposal=${p} />
                         <div class="env-truth-actions">
                           <button
                             class="env-truth-approve"
@@ -8811,6 +8784,69 @@ function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, 
     }
   }, [authedFetch, selected, activeRootMeta, draft, loadTree, activeRoot]);
 
+  // "+ new file" button: prompts for a relative path under the active
+  // root, posts an empty body to the same write endpoint, refreshes
+  // the tree and opens the new file in the editor. Disabled when no
+  // root is active or the active root is read-only. The endpoint
+  // applies the standard editable-extension allowlist, so trying to
+  // create `foo.bin` returns 400 — for binary files, drop them via
+  // kDrive instead.
+  const onNewFile = useCallback(async () => {
+    if (!activeRoot || !activeRootMeta?.writable) return;
+    const rootLabel = activeRootMeta?.label || activeRoot;
+    const raw = window.prompt(
+      "New file path (relative to " + rootLabel + ")\n\n" +
+      "Examples: truth/specs.md, working/notes.md, brand/colors.yaml"
+    );
+    if (raw == null) return;
+    const path = raw.trim().replace(/^[/\\]+/, "");
+    if (!path) return;
+    setSaving(true);
+    setErr("");
+    try {
+      // create_only=1 makes the server refuse to overwrite an existing
+      // file (409). Without it, an empty body would silently truncate
+      // a file at the same path — exactly the wrong UX for a button
+      // labeled "+ new file".
+      const res = await authedFetch(
+        "/api/files/write/" + activeRoot +
+          "?path=" + encodeURIComponent(path) + "&create_only=1",
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: "" }),
+        }
+      );
+      if (!res.ok) {
+        if (res.status === 409) {
+          setErr("'" + path + "' already exists. Click it in the tree to open.");
+          return;
+        }
+        const body = await res.text();
+        throw new Error("HTTP " + res.status + ": " + body.slice(0, 200));
+      }
+      // Expand parent folders so the new file is visible in the tree
+      // immediately, then refresh + open it.
+      if (path.includes("/")) {
+        setExpanded((prev) => {
+          const next = new Set(prev);
+          let cur = path;
+          while (cur.includes("/")) {
+            cur = cur.slice(0, cur.lastIndexOf("/"));
+            next.add(activeRoot + ":" + cur);
+          }
+          return next;
+        });
+      }
+      await loadTree(activeRoot);
+      openFile(activeRoot, path);
+    } catch (e) {
+      setErr("create failed: " + String(e));
+    } finally {
+      setSaving(false);
+    }
+  }, [activeRoot, activeRootMeta, authedFetch, loadTree, openFile]);
+
   const dirty = content !== null && draft !== content;
   const isMd = selected?.path?.toLowerCase().endsWith(".md");
   // Code preview applies to non-markdown text files where hljs has a
@@ -8844,6 +8880,14 @@ function FilesPane({ slot, authedFetch, fsEpoch, onClose, onDropEdge, onPopOut, 
               title="Save (⌘/Ctrl+S)"
             >${saving ? "saving…" : "save"}</button>`
           : null}
+        <button
+          class="pane-files-new"
+          onClick=${onNewFile}
+          disabled=${saving || !activeRoot || !activeRootMeta?.writable}
+          title=${activeRootMeta?.writable
+            ? "Create a new empty file under " + (activeRootMeta?.label || activeRoot)
+            : "Pick a writable root to create a new file"}
+        >+ new file</button>
         ${stacked
           ? html`<button class="pane-pop-out" onClick=${() => onPopOut(slot)}
               title="Pop out to its own column">⇱</button>`

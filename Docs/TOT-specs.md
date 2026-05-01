@@ -876,6 +876,63 @@ CREATE TABLE sync_state (
 
 Global rows use `misc` as the FK target.
 
+### 6.15 `file_write_proposals`
+
+Coach's queue for human-approved writes to harness-managed files
+(truth/* and the per-project CLAUDE.md). Two scopes share one
+table; resolver dispatches on `scope`.
+
+```sql
+CREATE TABLE file_write_proposals (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  proposer_id       TEXT NOT NULL,                 -- 'coach' (enforced at tool layer)
+  scope             TEXT NOT NULL DEFAULT 'truth', -- 'truth' | 'project_claude_md'
+  path              TEXT NOT NULL,                 -- scope-relative (truth: under truth/; pcm: 'CLAUDE.md')
+  proposed_content  TEXT NOT NULL,                 -- full new file body
+  summary           TEXT NOT NULL,                 -- one-line "why" the user reads
+  status            TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'approved', 'denied', 'cancelled', 'superseded')),
+  created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  resolved_at       TEXT,
+  resolved_by       TEXT,                          -- 'human' (only legal value today)
+  resolved_note     TEXT
+);
+
+CREATE INDEX idx_file_write_proposals_project_status
+  ON file_write_proposals(project_id, status);
+```
+
+Scopes:
+
+- `truth` — `path` is relative under `/data/projects/<slug>/truth/`.
+  Created via `coord_propose_file_write(scope='truth', path,
+  content, summary)`. Resolver writes through `server/truth.py:
+  resolve_target_path` which anchors and re-validates the path
+  under the truth root.
+- `project_claude_md` — `path` must be exactly `'CLAUDE.md'`.
+  Targets `/data/projects/<slug>/CLAUDE.md`. Resolver re-validates
+  the path on approve so a tampered row can't write to a sibling
+  file.
+
+The schema's `scope` `CHECK` is intentionally absent — new scopes
+can be added without a table rebuild; the propose tool and the
+resolver are the validation layers (a row with an unknown scope
+raises `FileWriteProposalBadRequest` on resolve, no silent skip).
+
+The auto-supersede invariant filters by `(project_id, scope, path)`
+so a hypothetical `truth/CLAUDE.md` proposal and a
+`project_claude_md`/`CLAUDE.md` proposal cannot supersede each
+other. See §8.3 (truth proposal flow), §8.3a (project CLAUDE.md
+proposal lane), §12.7.5 (the `coord_propose_file_write` tool), and
+§14.7.5 (HTTP API).
+
+**Migration**: this table is the renamed successor to
+`truth_proposals` (the rename happens pre-`executescript(SCHEMA)`
+in `init_db()` if the legacy table exists; `_ensure_columns` adds
+the `scope` column with default `'truth'` so existing rows
+preserve their semantic). Idempotent on re-run.
+
 ---
 
 ## 7. Schema Bootstrap
@@ -971,65 +1028,80 @@ hard invariants). Distinct from `decisions/` (immutable agent-written
 ADRs) and `knowledge/` (agent-written research that evolves).
 
 **Direct agent writes are blocked.** A `PreToolUse` hook in
-`server/agents.py` (`_pretool_truth_guard_hook`) hard-denies any
+`server/agents.py` (`_pretool_file_guard_hook`) hard-denies any
 agent `Write` / `Edit` / `MultiEdit` / `NotebookEdit` whose path
 resolves under any project's `truth/`, plus any `Bash` command
-containing `truth/` as a path component. There is **no** allow-list
-or override flag — the deny is unconditional for every agent
-(Players AND Coach), every tool, every project.
+containing `truth/` as a path component. The same hook also blocks
+writes to each project's top-level `CLAUDE.md` at
+`/data/projects/<slug>/CLAUDE.md` (a separate protected category —
+see §8.3a). There is **no** allow-list or override flag — the deny
+is unconditional for every agent (Players AND Coach), every tool,
+every project.
 
-**Proposal flow** (the only path through which `truth/` ever changes):
+**Proposal flow** (the only path through which `truth/` ever
+changes; the same flow also covers project CLAUDE.md edits — see
+§8.3a). The unified MCP tool is `coord_propose_file_write(scope,
+path, content, summary)` with `scope='truth'` selecting this lane:
 
-1. Coach calls the MCP tool `coord_propose_truth_update(path,
+1. Coach calls `coord_propose_file_write(scope='truth', path,
    content, summary)`. Players cannot — the tool body rejects any
-   non-Coach caller. The tool inserts a row in `truth_proposals`
-   (`status='pending'`) with the full proposed content and a one-line
-   summary; it does NOT touch the file. The `path` argument is a
-   relative path *within the currently active project's truth/
-   folder* — it is NOT a path anywhere under `/data/projects/`. The
-   harness rejects paths starting with `projects/` or with a known
-   project slug as the first segment, with an error message that
-   tells Coach to switch active project first. This catches the
-   recurrent mistake of encoding a sibling project slug in the path
-   when truth/ is per-active-project by design.
+   non-Coach caller. The tool inserts a row in
+   `file_write_proposals` (`status='pending'`, `scope='truth'`) with
+   the full proposed content and a one-line summary; it does NOT
+   touch the file. The `path` argument is a relative path *within
+   the currently active project's truth/ folder* — it is NOT a path
+   anywhere under `/data/projects/`. The harness rejects paths
+   starting with `projects/` or with a known project slug as the
+   first segment, with an error message that tells Coach to switch
+   active project first. This catches the recurrent mistake of
+   encoding a sibling project slug in the path when truth/ is
+   per-active-project by design.
 2. **Auto-supersede**: before insert, the tool scans for any pending
-   row on the same `(project_id, path)` and marks each as
+   row on the same `(project_id, scope, path)` and marks each as
    `status='superseded'`, `resolved_by='system'`,
    `resolved_note='superseded by #<new_id>'`. One
-   `truth_proposal_superseded` event fires per superseded row.
-   Invariant: at most one pending proposal per (project, path) at any
-   time. Coach's tool description explicitly tells Coach the new
-   proposal REPLACES the old (full content replace, not a merge), so
-   Coach must include any prior pending content it still wants. Both
-   updates run in the same DB transaction with the new INSERT so a
-   crash mid-flight leaves the table coherent.
-3. The harness emits a `truth_proposal_created` event; the
-   `EnvTruthProposalsSection` of the Environment pane shows the
-   pending proposal with summary + full proposed content + approve /
-   deny buttons.
+   `file_write_proposal_superseded` event fires per superseded row.
+   Invariant: at most one pending proposal per (project, scope,
+   path) at any time. The scope filter prevents a hypothetical
+   `truth/CLAUDE.md` and a `project_claude_md/CLAUDE.md` proposal
+   from supersede-colliding. Coach's tool description explicitly
+   tells Coach the new proposal REPLACES the old (full content
+   replace, not a merge), so Coach must include any prior pending
+   content it still wants. Both updates run in the same DB
+   transaction with the new INSERT so a crash mid-flight leaves the
+   table coherent.
+3. The harness emits a `file_write_proposal_created` event (payload
+   carries `scope`); the `EnvFileWriteProposalsSection` of the
+   Environment pane shows the pending proposal with a scope badge,
+   summary, and a side-by-side diff between the current file
+   content and the proposed content (fetched lazily on expand from
+   `GET /api/file-write-proposals/{id}/diff`). New files (no
+   `before` content) fall back to a plain proposed-content render.
 4. The user clicks **approve** or **deny**. Approve calls
-   `POST /api/truth/proposals/{id}/approve` which (a) writes the
-   proposed content to `truth/<path>` directly (the truth resolver
-   uses its own write — broader extension allowlist + 200 KB cap —
-   not the Files-pane write_text endpoint), then (b) marks the row
-   `approved` with timestamp + `resolved_by = "human"` + actor
-   metadata. Deny only marks the row.
-5. Approve emits `truth_proposal_approved`; deny emits
-   `truth_proposal_denied`. Either is visible in the agent timeline,
-   so Coach sees the outcome on its next turn.
+   `POST /api/file-write-proposals/{id}/approve` which (a) writes
+   the proposed content to `truth/<path>` directly (the truth-scope
+   resolver uses its own write — broader extension allowlist +
+   200 KB cap — not the Files-pane write_text endpoint), then (b)
+   marks the row `approved` with timestamp + `resolved_by =
+   "human"` + actor metadata. Deny only marks the row.
+5. Approve emits `file_write_proposal_approved`; deny emits
+   `file_write_proposal_denied`. Either is visible in the agent
+   timeline, so Coach sees the outcome on its next turn.
 
-**Manifest (`truth-index.md`).** Every project's `truth/` is seeded
+**Seed file (`truth-index.md`).** Every project's `truth/` is seeded
 on scaffold with a `truth-index.md` template (from
-`server/templates/truth_index.md`) that explains the lane and lists
-the expected files. Bullets follow `` - `filename` — description ``;
-the harness's `parse_truth_manifest()` (in `server/truth.py`)
-extracts them and surfaces the list via
-`GET /api/truth/manifest`. Default seeded bullet: `specs.md` (project
-goals, scope, structure). The user OR Coach can edit
-`truth-index.md` to add bullets when the folder needs to grow (Coach
-proposes via the same `coord_propose_truth_update` flow). The
-`truth-index.md` file itself is filtered out of the manifest output
-so it doesn't list itself as expected.
+`server/templates/truth_index.md`) that explains what the lane is
+and how the proposal flow works. **No expected-files manifest is
+imposed by default** — the seeded file is explanation only, no
+bullets. The user / Coach maintains the file's contents per project
+(specs, brand guidelines, contracts — whatever fits *this* project).
+This was a deliberate course-correction: an earlier iteration seeded
+a `specs.md` bullet and rendered a derived "Expected truth files"
+section in EnvPane, but seeing it concrete revealed it was making
+the harness pick a project type — graphic-design projects want
+`brand-guidelines.md`, contract projects want `vendor-agreements.md`,
+research projects want `research-questions.md`. The honest default is
+no presupposition.
 
 **Boot-time scaffold rescue.** `lifespan` in `server/main.py` runs
 `ensure_project_scaffold(id)` for every non-archived project after
@@ -1039,24 +1111,18 @@ lane retro-fitted to existing projects) materialize on next boot.
 First-write-only — user edits and Coach proposals own each file
 once it exists.
 
-**Empty-file creation.**
-`POST /api/truth/files/create_empty` writes a zero-byte file under
-the active project's truth/, refusing if the target already exists
-(409). Same path-traversal sandbox as the resolver. Used by the
-EnvPane's `EnvTruthExpectedSection` "create empty" button on missing
-manifest entries — the typical flow when the user is starting from a
-fresh template and wants to begin authoring `specs.md` directly in
-the Files pane.
+**File creation from the UI** — see §16.5 for the generic "+ new
+file" button on the Files pane. Works under any writable root, not
+just `truth/`. Replaces the dedicated truth-empty-file endpoint and
+EnvPane checklist of an earlier iteration.
 
-**EnvPane sections.**
-`EnvTruthExpectedSection` shows the manifest as a checklist (one
-row per bullet in `truth-index.md`); existing rows have an "open"
-link (in-app file-link → FilesPane), missing rows have "create
-empty" buttons. Auto-refreshes on `truth_proposal_approved` (Coach
-may have just edited the manifest or created a listed file) and on
-`file_written` for any `truth/...` path.
-`EnvTruthProposalsSection` lists pending proposals with the same
-approve/deny mechanics as before.
+**EnvPane sections.** `EnvFileWriteProposalsSection` lists pending
+proposals with approve/deny buttons. There is no separate
+"Expected truth files" section — the Files pane is the canonical
+view of what's actually in `truth/`, and `truth-index.md` (a normal
+truth file edited via the proposal flow or the Files-pane editor)
+is where the user / Coach records what *should* be there in plain
+markdown, no derived UI needed.
 
 Players whose work needs a truth update message Coach (via
 `coord_send_message`); Coach decides whether to relay as a proposal.
@@ -1066,13 +1132,13 @@ approval queue.
 The resolver logic lives in `server/truth.py` (FastAPI-free) so the
 HTTP wrappers in `server/main.py` can be thin and the test suite
 doesn't need to import FastAPI to exercise approve/deny. Resolver
-exceptions (`TruthProposalNotFound` / `TruthProposalConflict` /
-`TruthProposalBadRequest`) translate 1:1 to 404 / 409 / 400.
+exceptions (`FileWriteProposalNotFound` / `FileWriteProposalConflict` /
+`FileWriteProposalBadRequest`) translate 1:1 to 404 / 409 / 400.
 
 The folder is mirrored to kDrive by the regular project sync loop
 (sibling of `decisions/`), so spec PDFs dropped into the cloud drive
 surface in the Files pane on the next pull. There is no git tracking
-on `truth/` — kDrive's own file versioning + the `truth_proposals`
+on `truth/` — kDrive's own file versioning + the `file_write_proposals`
 table (every approve/deny is a permanent row with timestamps,
 proposer, resolver, optional note) are the audit trail.
 
@@ -1088,7 +1154,9 @@ Actual current caveats:
 
 ### 8.3 Project CLAUDE.md Stub
 
-Created on project creation if missing:
+Created on project creation if missing — first-write-only, so existing
+projects' CLAUDE.md files are not overwritten when this template
+changes (see also "Migration: existing projects" further down):
 
 ```markdown
 # Project: <name>
@@ -1110,7 +1178,69 @@ Created on project creation if missing:
 
 ## Conventions
 <project-specific rules>
+
+## truth/
+<reminder of the truth/ lane: read-only for agents, proposal flow via
+`coord_propose_file_write(scope='truth', ...)`, seeded
+`truth-index.md` (freeform, no enforced manifest structure), slug
+interpolated into the absolute path>
+
+## Updating this CLAUDE.md
+<reminder that this file is also read-only for agents, and Coach
+proposes changes via
+`coord_propose_file_write(scope='project_claude_md', path='CLAUDE.md',
+content, summary)`; the harness-wide /data/CLAUDE.md is not
+proposeable>
 ```
+
+The trailing `## truth/` and `## Updating this CLAUDE.md` sections are
+fixed paragraphs (template literal in `_PROJECT_CLAUDE_MD_STUB`) that
+interpolate the project's slug and explain both proposal scopes.
+Coach in fresh projects reads this on every turn via
+`build_system_prompt_suffix`.
+
+**Migration: existing projects.** Because the stub is first-write-only,
+projects created before this template change still have CLAUDE.md
+files without the new sections. To add them, Coach calls
+`coord_propose_file_write(scope='project_claude_md', path='CLAUDE.md',
+content=<full updated body>, summary=<one-line why>)`; the user
+reviews the diff and approves in the EnvPane "File-write proposals"
+section. The harness then writes the file. (Earlier iterations of
+this spec assumed Coach could `Write` to the project CLAUDE.md
+directly, which was never actually true: Coach has no Write tool, and
+since the file-guard hook now also covers `<slug>/CLAUDE.md`, the
+proposal flow is the only path in.)
+
+### 8.3a Project CLAUDE.md Proposal Lane
+
+The same proposal flow that protects `truth/` (see §8.3 above) also
+covers the per-project instruction file at
+`/data/projects/<slug>/CLAUDE.md`. The unified MCP tool
+`coord_propose_file_write(scope, path, content, summary)` selects
+the lane via `scope`; for project CLAUDE.md edits Coach passes
+`scope='project_claude_md'` and `path='CLAUDE.md'` (the only legal
+path for this scope — the resolver re-validates and refuses to
+write anywhere else if a row is tampered with).
+
+The `_pretool_file_guard_hook` in `server/agents.py` denies any
+direct `Write` / `Edit` / `MultiEdit` / `NotebookEdit` whose path
+resolves to `<projects-root>/<slug>/CLAUDE.md` (matching exactly two
+parts under projects/ — so a Player's worktree-internal repo
+CLAUDE.md at `<slug>/repo/<slot>/CLAUDE.md` is **not** caught and
+remains writable). It also denies any `Bash` command containing
+`projects/<slug>/CLAUDE.md` as a substring. The deny reason names
+the right tool call so Coach learns the proposal flow on first
+attempt.
+
+The diff endpoint (`GET /api/file-write-proposals/{id}/diff`) reads
+the current CLAUDE.md fresh from disk on every request, so a manual
+edit (Files pane, kDrive sync) between propose and approve is
+visible to the human reviewer rather than baked into a stale
+`before` snapshot.
+
+The harness-wide `/data/CLAUDE.md` is **not** a valid scope. Only
+the user edits that file (via the Files pane); there is no agent
+path to it.
 
 ### 8.4 File Browser Roots
 
@@ -1134,9 +1264,13 @@ Read rules:
 
 Write rules:
 
-- Only `.md` and `.txt`.
+- Editable extensions defined in `server.files.EDITABLE_EXTS` —
+  text + common code/config formats (mirrors the FilesPane's
+  `FILES_TEXT_EXTENSIONS`). Plus an extensionless basename allowlist
+  for `Dockerfile`, `Makefile`, `README`, etc.
 - Max body 100,000 chars.
-- Plain disk write.
+- Plain disk write. Empty body is accepted (used by the Files-pane
+  "+ new file" button to create a stub).
 - WebDAV mirroring happens later through project/global sync loops.
 - `file_written` event emitted by API.
 - Wiki writes trigger `update_wiki_index()` unless writing `INDEX.md` itself.
@@ -1775,6 +1909,80 @@ Current implementation gap:
   otherwise local fallback under `/data/projects/<active>/decisions/`.
 - Emits `decision_written`.
 
+### 12.7.5 File-write Proposals
+
+`coord_propose_file_write(scope, path, content, summary)`
+
+- **Coach only.** Players get an explicit error directing them to
+  message Coach for relay. Listed in `ALLOWED_COORD_TOOLS`; the body
+  rejects non-Coach callers.
+- **Two scopes today**:
+  - `scope='truth'` — `path` is relative to the *currently active*
+    project's `truth/` folder. Existing path validation rules apply:
+    a leading `truth/` is stripped defensively; no leading slash, no
+    `..` segments; first segment must not be `projects/` or a known
+    sibling project slug (catches the recurrent Coach mistake of
+    encoding cross-project paths when truth/ is per-active-project
+    by design).
+  - `scope='project_claude_md'` — `path` must be exactly `'CLAUDE.md'`.
+    Targets `/data/projects/<active>/CLAUDE.md`. Any other path is
+    rejected at propose time AND re-validated at approve time (the
+    resolver refuses to write if the row's path was tampered with).
+  - The harness-wide `/data/CLAUDE.md` is NOT a valid scope; only
+    the user edits that file.
+- `content` is a full file body (max 200,000 chars). This is a full
+  REPLACE — Coach must include the parts being kept verbatim. The
+  user reviews a side-by-side diff against the current file content
+  in the UI before approving.
+- `summary` is a single-line "why" (max 200 chars) shown next to the
+  approve/deny buttons.
+- **Auto-supersede invariant**: at most one `pending` proposal per
+  `(project_id, scope, path)`. The tool's body runs
+  SELECT-INSERT-UPDATE in one transaction:
+  1. SELECT pending IDs for the same `(project, scope, path)`.
+  2. INSERT the new row as `pending`.
+  3. For each prior pending ID: UPDATE to `status='superseded'`,
+     `resolved_by='system'`, `resolved_note='superseded by #<new_id>'`.
+     The UPDATE has `WHERE status='pending'` so already-resolved rows
+     can never be flipped to superseded.
+  The scope filter prevents a hypothetical `truth/CLAUDE.md` and a
+  `project_claude_md`/`CLAUDE.md` proposal from supersede-colliding.
+- Emits one `file_write_proposal_superseded` event per superseded
+  row, then one `file_write_proposal_created` event for the new
+  pending row (with the `superseded` ID list and `scope` in its
+  payload).
+- Reorganization pattern (truth scope) documented in the tool
+  description: split a growing file by sending three proposals in
+  sequence — (1) new dependency files with content, (2) original
+  file with content removed, (3) `truth-index.md` updated to list
+  the new files. Each proposal supersedes any prior pending one for
+  that (scope, path).
+
+The MCP tool is the ONLY agent-accessible mechanism for changing
+`truth/` or per-project `CLAUDE.md`. The PreToolUse
+`_pretool_file_guard_hook` in `server/agents.py` denies any agent
+`Write` / `Edit` / `MultiEdit` / `NotebookEdit` whose path resolves
+to either protected target (any project's `truth/*` or its
+`<slug>/CLAUDE.md`), plus any `Bash` command containing those path
+components. The deny is unconditional: every agent (including
+Coach), every tool, every project. A Player's worktree-internal
+`<slug>/repo/<slot>/CLAUDE.md` is NOT caught (different position in
+the path) and remains writable for the Player whose repo it is.
+
+The resolver in `server/truth.py` handles approve/deny:
+- Approve: validates the path lands under `project_paths(slug).truth`
+  with a `relative_to` check (rejects traversal as
+  `FileWriteProposalBadRequest`), `mkdir(parents=True, exist_ok=True)` on
+  the parent, then `write_text(content, encoding="utf-8")`. Caps at
+  200 KB. Bypasses the Files-pane endpoint's `.md`/`.txt` restriction
+  on purpose — text-of-any-extension is the right policy for truth
+  (specs, brand YAML, JSON contracts) since the user is the gate at
+  approval time.
+- Deny: marks the row, no file write.
+- Idempotency: re-resolving a non-pending row raises
+  `FileWriteProposalConflict("approved")` / `("denied")` /
+  `("cancelled")` / `("superseded")` → 409.
+
 ### 12.8 Team Identity
 
 `coord_list_team()`
@@ -2112,6 +2320,35 @@ Message body max 5000 chars. Subject max 200 chars.
 | `GET /api/decisions` | List local active-project decisions |
 | `GET /api/decisions/{filename}` | Read decision file |
 
+### 14.7.5 File-write proposals
+
+Two scopes share one table and one set of routes: `truth` (writes
+to `/data/projects/<slug>/truth/<path>`) and `project_claude_md`
+(writes to `/data/projects/<slug>/CLAUDE.md`). Coach proposes via
+`coord_propose_file_write(scope, path, content, summary)`; the
+user reviews a diff and approves/denies here.
+
+| Endpoint | Notes |
+| --- | --- |
+| `GET /api/file-write-proposals?status=&scope=&limit=` | List file-write proposals for the active project, newest first. Status filter ∈ `pending` / `approved` / `denied` / `cancelled` / `superseded`; scope filter ∈ `truth` / `project_claude_md`; omit either for all. Default limit 50, cap 200. |
+| `GET /api/file-write-proposals/{id}/diff` | Returns `{id, scope, path, before, after}` so the UI can render a side-by-side diff. `before` is the current file content read fresh from disk (or `null` if the file doesn't exist yet — UI falls back to a plain proposed-content render). `after` is the proposed content. 404 if proposal missing; 400 if the row's scope/path is malformed. |
+| `POST /api/file-write-proposals/{id}/approve` | Resolve a pending proposal as approved. Dispatches on scope: `truth` writes to `truth/<path>` (broader extension allowlist than the Files-pane endpoint, 200 KB cap); `project_claude_md` writes to the project's `CLAUDE.md`. Then marks the row. Body `{note}` optional. Emits `file_write_proposal_approved`. |
+| `POST /api/file-write-proposals/{id}/deny` | Resolve a pending proposal as denied. No file write. Body `{note}` optional. Emits `file_write_proposal_denied`. |
+
+All file-write-proposal endpoints are token-gated; the resolve endpoints carry an `audit_actor` payload on emitted events.
+
+Empty-file creation under `truth/` (or anywhere else under a writable
+root) goes through the standard `PUT /api/files/write/<root>?path=…`
+endpoint with `content: ""` — the Files-pane "+ new file" button
+(§16.5) is the UI affordance.
+
+The resolver lives in `server/truth.py` (FastAPI-free) so the test
+suite can exercise approve/deny/create flows without importing
+FastAPI. Resolver exception classes
+(`FileWriteProposalNotFound` / `FileWriteProposalConflict` /
+`FileWriteProposalBadRequest`) translate 1:1 to 404 / 409 / 400 in the
+HTTP wrappers.
+
 ### 14.8 Files
 
 | Endpoint | Notes |
@@ -2119,7 +2356,7 @@ Message body max 5000 chars. Subject max 200 chars.
 | `GET /api/files/roots` | Two roots: global and project |
 | `GET /api/files/tree/{root}` | Recursive tree |
 | `GET /api/files/read/{root}?path=` | Read text |
-| `PUT /api/files/write/{root}?path=` | Write `.md`/`.txt` |
+| `PUT /api/files/write/{root}?path=` | Write text (extension allowlist in `server.files.EDITABLE_EXTS`); empty body acceptable for "create stub" flows |
 
 ### 14.9 Events and Turns
 
@@ -2408,9 +2645,31 @@ Interactions:
 - `plan_decided`
 - `interaction_extended`
 
+File-write proposals (covers both `truth` and `project_claude_md`
+scopes — payloads carry `scope`):
+
+- `file_write_proposal_created` (emitted by
+  `coord_propose_file_write` — `agent_id=coach`; payload includes
+  `proposal_id`, `scope`, `path`, `summary`, `size`, and
+  `superseded` listing any prior pending IDs that this proposal
+  auto-superseded for the same `(scope, path)`)
+- `file_write_proposal_superseded` (emitted once per old row when
+  `coord_propose_file_write` fires for a `(scope, path)` with a
+  pending proposal — `agent_id=system`; payload `proposal_id`,
+  `superseded_by`, `scope`, `path`)
+- `file_write_proposal_approved` (emitted by
+  `POST /api/file-write-proposals/{id}/approve` — `agent_id=human`;
+  payload includes the proposer, `scope`, `path`, summary, written
+  byte size, optional note, and `actor` audit metadata)
+- `file_write_proposal_denied` (parallel to approved; `size=0`)
+- `file_write_proposal_cancelled` (parallel; reserved for the
+  cancel resolver path)
+
 File/browser:
 
-- `file_written`
+- `file_written` (emitted by `PUT /api/files/write/<root>?path=…`,
+  including via the Files-pane "+ new file" button which posts an
+  empty body)
 
 ---
 
@@ -2530,7 +2789,7 @@ above peer chatter and tool narration):
 
 Errors and asks ignore the tiering and stay loud regardless: `.event.error`
 red, `.event.tool_result.error` red, plus AskUserQuestion / plan-mode
-/ truth-proposal / human_attention escalations.
+/ file-write-proposal / human_attention escalations.
 
 Routing logic for `message_sent` lives in [server/static/app.js](../server/static/app.js)'s
 event renderer — it adds `.human-thread` or `.peer-thread` based on
@@ -2657,7 +2916,25 @@ Features:
   preview not supported" placeholder card and the body fetch is
   skipped entirely. Saves bandwidth and avoids rendering mojibake
   when an agent drops a PDF or image into the project tree.
-- Textarea editor for `.md`/`.txt` and unrecognized text.
+- Textarea editor for any extension in the editable allowlist
+  (`server.files.EDITABLE_EXTS` — `.md` / `.txt` plus common code +
+  config formats: `.py`, `.js`, `.ts`, `.json`, `.yaml` / `.yml`,
+  `.toml`, `.css`, `.html`, `.xml`, `.svg`, `.go`, `.rs`, `.sh`,
+  `.sql`, `.csv`, `.tsv`, `.ini`, `.cfg`, etc.) and an extensionless
+  basename allowlist (`Dockerfile`, `Makefile`, `README`, `LICENSE`,
+  `CHANGELOG`, `.gitignore`, `.gitattributes`, …). The list mirrors
+  the FilesPane's `FILES_TEXT_EXTENSIONS` / `FILES_TEXT_BASENAMES`
+  so previewable files are also editable. Body cap: 100,000 chars.
+- **"+ new file" button** in the pane header — prompts (HTML5
+  `prompt`) for a relative path under the currently active root.
+  Path is normalized (trim, strip leading `/`), then `PUT
+  /api/files/write/<root>?path=…` with `content: ""`. After 200 OK
+  the tree refreshes and the file opens automatically. Disabled
+  when no root is active or the active root is read-only. The
+  endpoint is the same one used for save, so the editable-extension
+  allowlist applies — try to create `foo.bin` and you'll get a 400
+  with the allowlist hint. For binary files, drop them via kDrive
+  (project-sync pulls them down on next cycle).
 - **Resizable tree/editor splitter**: a 6 px vertical drag handle
   between the tree and the editor; pointer-down captures the start
   width and updates flex-basis on move (clamped 140–600 px). State
@@ -2683,7 +2960,17 @@ Shows (top-to-bottom):
 - Inbox/recent messages.
 - Memory list/content.
 - Decisions list/content.
-- Truth proposals queue (Coach proposes → human approves/denies).
+- File-write proposals queue (Coach proposes → human approves/denies).
+  Two scopes share one section: `truth` (writes under
+  `truth/`) and `project_claude_md` (writes the project's
+  CLAUDE.md). Each row carries a scope badge. Auto-supersede
+  invariant means at most one pending row per `(scope, path)` —
+  duplicates from earlier proposals simply disappear when a new
+  one comes in. The expanded card shows the summary, a side-by-side
+  diff between current file content and the proposed content
+  (fetched lazily from `GET /api/file-write-proposals/{id}/diff`;
+  new files fall back to a plain proposed-content render), and
+  approve / deny buttons.
 - Timeline of important events.
 
 It scopes project-sensitive sections to the active project through the
@@ -2695,7 +2982,7 @@ project's slug (`/data/projects/<slug>/project-objectives.md` and
 **Collapsible sections.** Every section except the warning banners
 (Attention, kDrive errors) is wrapped in `.env-section.collapsible`:
 Tasks, Cost, Project objectives, Coach todos, Messages, Memory,
-Decisions, Truth proposals, Timeline. Click the section title to
+Decisions, File-write proposals, Timeline. Click the section title to
 toggle; state persists per-section in `localStorage` under
 `harness_env_collapsed_v2`. Default state is **closed** — the user
 opens what they need, like the Settings drawer (§16.7). Warning
@@ -3196,11 +3483,12 @@ Snapshots:
 
 ## 22. Tests
 
-As of the audit, the repo contains 21 test files and 182 test functions.
+The full suite is 649/649 green (Python 3.12, pytest-asyncio).
 
 Test areas include:
 
-- DB init and schema.
+- DB init and schema (incl. the legacy `truth_proposals` →
+  `file_write_proposals` rename migration).
 - Task state machine.
 - Event bus and batched persistence behavior.
 - Turn ledger.
@@ -3216,7 +3504,17 @@ Test areas include:
 - Projects API.
 - Project isolation.
 - Project sync.
-- Phase 7 project prompt/wiki behavior.
+- Phase 7 project prompt/wiki behavior, including:
+  - Truth + project-CLAUDE.md PreToolUse hook coverage
+    (`_pretool_file_guard_hook`).
+  - `coord_propose_file_write` scope validation (truth scope path
+    rules, project_claude_md exact-path enforcement, unknown-scope
+    rejection, scope-isolated supersede).
+  - Resolver scope dispatch (`resolve_file_write_proposal` writes
+    truth files OR project CLAUDE.md based on scope; tampered-path
+    and unknown-scope defenses).
+  - `resolve_target_path` export verification (the `/diff` endpoint
+    in `main.py` depends on it).
 
 Run locally:
 
@@ -3261,9 +3559,14 @@ and the desired architecture are still not perfectly aligned.
 
 6. `.env.example` still lists several pre-projects flat-dir vars.
 
-7. Coach cannot edit CLAUDE.md through `Write` because Coach baseline excludes
-   write tools, even though comments mention Coach editing global/project
-   CLAUDE.md via standard Write. Human file editor is the reliable path today.
+7. (Resolved 2026-05-01.) Coach edits the per-project CLAUDE.md via
+   `coord_propose_file_write(scope='project_claude_md', path='CLAUDE.md',
+   content, summary)`; the user reviews a diff and approves in the EnvPane
+   "File-write proposals" section. Direct `Write` / `Edit` / `Bash` against
+   `/data/projects/<slug>/CLAUDE.md` is hard-denied by the
+   `_pretool_file_guard_hook` (the same hook that protects `truth/`), so
+   the proposal flow is the only path in. The harness-wide
+   `/data/CLAUDE.md` remains user-only (no proposal scope for it).
 
 8. Project activation rejects any in-flight agent instead of implementing a
    full "cancel turns and switch" server path. The UI has modal language for
@@ -3295,6 +3598,13 @@ and the desired architecture are still not perfectly aligned.
 11. `CLAUDE_CONFIG_DIR` should live on persistent `/data`.
 12. Coach baseline must not include standard write tools unless the governance
     model is intentionally changed.
+13. `/data/projects/<slug>/truth/*` and `/data/projects/<slug>/CLAUDE.md`
+    are agent-read-only. The only mutation path is
+    `coord_propose_file_write` (Coach-only) followed by an explicit
+    human approve in the EnvPane "File-write proposals" section. The
+    `_pretool_file_guard_hook` enforces this for all agents and tools.
+14. The harness-wide `/data/CLAUDE.md` is human-only — there is no
+    proposal scope for it; it cannot be changed by any agent action.
 
 ---
 
@@ -3309,8 +3619,10 @@ and the desired architecture are still not perfectly aligned.
 - Direct WebDAV JSON state as source of truth: replaced by SQLite hot state.
 - Lock tools as primary concurrency control: worktrees are the main isolation.
 - `/data/context` root and `coord_write_context`: dropped — context
-  lives in `/data/CLAUDE.md` + `/data/projects/<active>/CLAUDE.md`,
-  edited via the Files pane or the standard `Write` tool.
+  lives in `/data/CLAUDE.md` (human-only, edited via Files pane) +
+  `/data/projects/<active>/CLAUDE.md` (agent-read-only; Coach
+  proposes via `coord_propose_file_write(scope='project_claude_md',
+  …)` and the human approves with diff review).
 - Multiple layout presets and command palette: not implemented.
 - PWA push notifications: not implemented.
 - Record/replay tooling for events: event log supports it, UI tooling does not.
@@ -3331,8 +3643,10 @@ For a normal deployment:
 7. Configure repo URLs either in a project card or legacy Project repo section,
    remembering worktree isolation is still global `/workspaces`.
 8. Use Coach as the main entry point; intervene in any pane when needed.
-9. Use Files pane for global/project CLAUDE.md, wiki, knowledge, decisions, and
-   project working files.
+9. Use Files pane to edit the harness-wide `/data/CLAUDE.md`, wiki entries,
+   knowledge, and project working files. Project CLAUDE.md and `truth/*`
+   are agent-read-only — Coach proposes via `coord_propose_file_write`
+   and you review/approve in the EnvPane "File-write proposals" section.
 10. Watch health, context, spend, pending interactions, and kDrive failures in
     Settings/Env panes.
 

@@ -26,6 +26,7 @@ from server.compass.pipeline import (
     claude_md as pl_claude_md,
     digest as pl_digest,
     questions as pl_questions,
+    reconciliation as pl_reconciliation,
     regions as pl_regions,
     reviews as pl_reviews,
     truth_check as pl_truth_check,
@@ -197,6 +198,16 @@ def _stub_pipeline(
     monkeypatch.setattr(pl_claude_md, "generate", _claude_md_generate)
     monkeypatch.setattr(pl_claude_md, "inject", _claude_md_inject)
     monkeypatch.setattr(pl_truth_derive, "derive_from_truth", _truth_derive_stub)
+
+    async def _detect_conflicts_stub(
+        state: Any, *, run_id: str, run_iso: str,
+    ) -> list[Any]:
+        invocations.setdefault("reconciliation", []).append(
+            (state.project_id, run_id),
+        )
+        return []
+
+    monkeypatch.setattr(pl_reconciliation, "detect_conflicts", _detect_conflicts_stub)
     return invocations
 
 
@@ -576,3 +587,193 @@ async def test_truth_derive_skips_when_truth_folder_empty(
     state = store.load_state("misc")
     assert all(s.created_by != "compass-truth" for s in state.statements)
     assert any("truth/" in n for n in (log.get("notes") or []))
+
+
+# ============================================================
+# Reconciliation (Stage 0b) — corpus↔lattice conflict scan
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_skipped_on_first_bootstrap_with_empty_lattice(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-derive lattice empty → Stage 0b is a no-op. Otherwise the
+    LLM would see Stage 0a's brand-new rows and might flag them as
+    conflicting with the corpus they came from."""
+    from server.db import init_db, set_active_project
+    from server.paths import project_paths
+    await init_db()
+    await set_active_project("misc")
+
+    pp = project_paths("misc")
+    pp.truth.mkdir(parents=True, exist_ok=True)
+    (pp.truth / "specs.md").write_text("Initial spec.", encoding="utf-8")
+
+    inv = _stub_pipeline(monkeypatch)
+    reconcile_calls = {"n": 0}
+
+    async def _detect(state: Any, *, run_id: str, run_iso: str) -> list[Any]:
+        reconcile_calls["n"] += 1
+        return []
+
+    monkeypatch.setattr(pl_reconciliation, "detect_conflicts", _detect)
+
+    await runner.run("misc", mode="bootstrap")
+    assert reconcile_calls["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_runs_when_corpus_changes_with_existing_lattice(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.db import init_db, set_active_project
+    from server.paths import project_paths
+    await init_db()
+    await set_active_project("misc")
+
+    pp = project_paths("misc")
+    pp.truth.mkdir(parents=True, exist_ok=True)
+    target = pp.truth / "specs.md"
+    target.write_text("Initial spec.", encoding="utf-8")
+
+    # Seed an existing lattice (settled) BEFORE the run so Stage 0b
+    # has something to reconcile against.
+    await store.bootstrap_state("misc")
+    pre_state = store.load_state("misc")
+    pre_state.statements.append(store.Statement(
+        id="s1", text="Pricing is per-second", region="pricing",
+        weight=1.0, created_at="t", archived=True, settled_as="yes",
+    ))
+    await store.save_lattice("misc", pre_state.statements)
+
+    inv = _stub_pipeline(monkeypatch)
+    reconcile_calls: list[str] = []
+
+    async def _detect(state: Any, *, run_id: str, run_iso: str) -> list[store.ReconciliationProposal]:
+        reconcile_calls.append(run_id)
+        return [store.ReconciliationProposal(
+            id=store.next_reconciliation_id(state),
+            statement_id="s1",
+            statement_archived=True,
+            corpus_paths=["specs.md"],
+            explanation="corpus says per-task; s1 settled as per-second",
+            suggested_resolution="update_lattice",
+            proposed_at=run_iso,
+            proposed_in_run=run_id,
+        )]
+
+    monkeypatch.setattr(pl_reconciliation, "detect_conflicts", _detect)
+
+    # First run — corpus is "fresh" from the runner's perspective
+    # (no prior hash), so Stage 0b fires and finds the conflict.
+    log = await runner.run("misc", mode="on_demand")
+    assert log["completed"] is True
+    assert len(reconcile_calls) == 1
+    state = store.load_state("misc")
+    assert len(state.reconciliation_proposals) == 1
+    assert state.reconciliation_proposals[0].statement_id == "s1"
+    # Cited statement is flagged so the next run skips it.
+    s1 = state.find_statement("s1")
+    assert s1.reconciliation_proposed is True
+
+    # Second run — same corpus → Stage 0b short-circuits via the
+    # corpus hash. Existing proposal's pending_runs ticks.
+    log2 = await runner.run("misc", mode="on_demand")
+    assert log2["completed"] is True
+    assert len(reconcile_calls) == 1  # no new call
+    state2 = store.load_state("misc")
+    assert state2.reconciliation_proposals[0].pending_runs == 1
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_re_fires_when_corpus_changes(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.db import init_db, set_active_project
+    from server.paths import project_paths
+    await init_db()
+    await set_active_project("misc")
+
+    pp = project_paths("misc")
+    pp.truth.mkdir(parents=True, exist_ok=True)
+    target = pp.truth / "specs.md"
+    target.write_text("Original.", encoding="utf-8")
+
+    await store.bootstrap_state("misc")
+    pre = store.load_state("misc")
+    pre.statements.append(store.Statement(
+        id="s1", text="x", region="r", weight=0.9, created_at="t",
+    ))
+    await store.save_lattice("misc", pre.statements)
+
+    inv = _stub_pipeline(monkeypatch)
+    reconcile_calls = {"n": 0}
+
+    async def _detect(state: Any, *, run_id: str, run_iso: str) -> list[Any]:
+        reconcile_calls["n"] += 1
+        return []
+
+    monkeypatch.setattr(pl_reconciliation, "detect_conflicts", _detect)
+
+    await runner.run("misc", mode="on_demand")
+    assert reconcile_calls["n"] == 1
+
+    # Edit the corpus → hash changes → Stage 0b re-fires.
+    target.write_text("Different content.", encoding="utf-8")
+    await runner.run("misc", mode="on_demand")
+    assert reconcile_calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_proposals_expire_after_threshold(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pending proposal that's ignored for PROPOSAL_EXPIRY_RUNS
+    runs gets cleared so it can be re-detected fresh."""
+    from server.compass import config as cmp_config
+    from server.db import init_db, set_active_project
+    from server.paths import project_paths
+    await init_db()
+    await set_active_project("misc")
+
+    pp = project_paths("misc")
+    pp.truth.mkdir(parents=True, exist_ok=True)
+    (pp.truth / "specs.md").write_text("stable.", encoding="utf-8")
+
+    await store.bootstrap_state("misc")
+    pre = store.load_state("misc")
+    pre.statements.append(store.Statement(
+        id="s1", text="x", region="r", weight=0.92, created_at="t",
+        archived=True, settled_as="yes", reconciliation_proposed=True,
+    ))
+    pre.reconciliation_proposals.append(store.ReconciliationProposal(
+        id="rec1",
+        statement_id="s1",
+        statement_archived=True,
+        corpus_paths=["specs.md"],
+        explanation="x",
+        proposed_at="t", proposed_in_run="r0",
+        pending_runs=cmp_config.PROPOSAL_EXPIRY_RUNS - 1,  # one short of expiry
+    ))
+    await store.save_lattice("misc", pre.statements)
+    await store.save_proposals(
+        "misc", settle=None, stale=None, dupes=None,
+        reconcile=pre.reconciliation_proposals,
+    )
+
+    _stub_pipeline(monkeypatch)
+    reconcile_calls = {"n": 0}
+
+    async def _detect(state: Any, *, run_id: str, run_iso: str) -> list[Any]:
+        reconcile_calls["n"] += 1
+        return []
+
+    monkeypatch.setattr(pl_reconciliation, "detect_conflicts", _detect)
+
+    await runner.run("misc", mode="on_demand")
+    state = store.load_state("misc")
+    # Proposal hit the expiry threshold → cleared. Statement flag too.
+    assert state.reconciliation_proposals == []
+    s1 = state.find_statement("s1")
+    assert s1.reconciliation_proposed is False

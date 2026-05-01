@@ -410,6 +410,73 @@ function StaleProposalCard({ p, statement, onResolve }) {
   `;
 }
 
+function ReconciliationProposalCard({ p, statement, onResolve }) {
+  if (!statement) return null;
+  const corpusList = (p.corpus_paths || []).join(", ") || "(unspecified)";
+  const directional = statement.archived
+    && (statement.settled_as === "yes" || statement.settled_as === "no");
+  return html`
+    <div class="cmp-prop-card cmp-prop-reconcile">
+      <div class="cmp-prop-head">
+        <span class="cmp-stmt-id">${statement.id}</span>
+        ${statement.archived
+          ? html`<span class="cmp-badge cmp-badge-${statement.settled_as === "yes" ? "yes" : statement.settled_as === "no" ? "no" : "merged"}">SETTLED${statement.settled_as ? ` · ${statement.settled_as.toUpperCase()}` : ""}</span>`
+          : null}
+        <${RegionPill} name=${statement.region} />
+        <span class="cmp-stmt-text">${statement.text}</span>
+        <span class="cmp-prop-weight">${fmtWeight(statement.weight)}</span>
+      </div>
+      <div class="cmp-prop-q">
+        <span class="cmp-section-kicker">CORPUS↔LATTICE CONFLICT (from ${corpusList})</span>
+      </div>
+      <div class="cmp-prop-reasoning">${p.explanation}</div>
+      ${p.suggested_resolution && p.suggested_resolution !== "either"
+        ? html`<div class="cmp-prop-reasoning cmp-italic">
+            Compass suggests: ${p.suggested_resolution.replace("_", " ")}
+          </div>`
+        : null}
+      <div class="cmp-prop-actions">
+        <button
+          class="cmp-btn-mini"
+          title="Lattice is wrong — un-archive at weight 0.5 so the next runs re-evaluate"
+          onClick=${() => onResolve("update_lattice", { lattice_action: "unarchive", weight: 0.5 })}
+        >Lattice wrong · un-archive</button>
+        ${directional
+          ? html`<button
+              class="cmp-btn-mini"
+              title="Re-settle in the opposite direction"
+              onClick=${() => {
+                if (confirm(`Flip the settle direction for ${statement.id}? It's currently ${statement.settled_as.toUpperCase()}; this will re-settle as the opposite.`)) {
+                  onResolve("update_lattice", { lattice_action: "flip" });
+                }
+              }}
+            >Flip settle</button>`
+          : null}
+        <button
+          class="cmp-btn-mini"
+          title="Replace the row's text with a new framing"
+          onClick=${() => {
+            const t = prompt("Reformulate as:", statement.text);
+            if (t === null || !t.trim()) return;
+            onResolve("update_lattice", { lattice_action: "reformulate", text: t.trim() });
+          }}
+        >Reformulate…</button>
+        <button
+          class="cmp-btn-mini cmp-btn-warn"
+          title="Open the Files pane on the truth file(s) — the corpus is wrong / lagging"
+          onClick=${() => onResolve("update_truth", { corpus_paths: p.corpus_paths })}
+        >Truth wrong · edit file</button>
+        <button
+          class="cmp-btn-mini cmp-btn-ghost"
+          title="Leave both — accept ambiguity for now"
+          onClick=${() => onResolve("accept_ambiguity")}
+        >Accept ambiguity</button>
+      </div>
+    </div>
+  `;
+}
+
+
 function DupeProposalCard({ p, statementsById, onResolve }) {
   const losers = p.cluster_ids.map((id) => statementsById.get(id)).filter(Boolean);
   if (losers.length < 2) return null;
@@ -445,7 +512,7 @@ function DupeProposalCard({ p, statementsById, onResolve }) {
 
 function LatticeColumn({
   state, regionFilter, capacity, onOverride, onRestore,
-  onResolveSettle, onResolveStale, onResolveDupe,
+  onResolveSettle, onResolveStale, onResolveDupe, onResolveReconcile,
 }) {
   const all = state.statements || [];
   const active = all.filter((s) => !s.archived);
@@ -516,6 +583,21 @@ function LatticeColumn({
                   p=${p}
                   statementsById=${stmtById}
                   onResolve=${(action) => onResolveDupe(p.id, action)}
+                />`)}
+            </div>`
+        : null}
+      ${(state.reconciliation_proposals || []).length > 0
+        ? html`
+            <div class="cmp-prop-section">
+              <div class="cmp-section-kicker">
+                ${state.reconciliation_proposals.length} corpus↔lattice conflict(s) · resolve
+              </div>
+              ${state.reconciliation_proposals.map((p) => html`
+                <${ReconciliationProposalCard}
+                  key=${p.id}
+                  p=${p}
+                  statement=${stmtById.get(p.statement_id)}
+                  onResolve=${(action, extra) => onResolveReconcile(p.id, action, extra)}
                 />`)}
             </div>`
         : null}
@@ -1085,6 +1167,34 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
     } catch (err) { setError(err.message); }
   }, [authedFetch, refresh]);
 
+  const resolveReconcile = useCallback(async (pid, action, extra) => {
+    try {
+      // "update_truth" is informational — open the Files pane on the
+      // first cited corpus path, then close the proposal so it stops
+      // re-displaying. The actual edit happens via the Files pane's
+      // existing flow.
+      if (action === "update_truth") {
+        const path = (extra?.corpus_paths || [])[0];
+        if (path) {
+          const a = document.createElement("a");
+          a.setAttribute(
+            "data-harness-path",
+            "/data/projects/" + (state?.project_id || "") + "/truth/" + path,
+          );
+          a.setAttribute("href", "#");
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        }
+      }
+      const body = { action, ...(extra || {}) };
+      await apiFetch(authedFetch, `/proposals/reconcile/${pid}`, {
+        method: "POST", body: JSON.stringify(body),
+      });
+      await refresh();
+    } catch (err) { setError(err.message); }
+  }, [authedFetch, refresh, state]);
+
   const submitInput = useCallback(async (kind, body) => {
     try {
       await apiFetch(authedFetch, "/inputs", {
@@ -1105,7 +1215,8 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
 
   // Truth has no mutation callbacks — it's owned by the project's
   // `truth/` folder (edited via the Files pane, proposed by Coach via
-  // `coord_propose_truth_update`). Compass reads it on every run.
+  // `coord_propose_file_write(scope='truth', ...)`). Compass reads it
+  // on every run.
 
   const ask = useCallback(async (query) => {
     // Hits /api/compass/ask — same prompt pipeline that backs the
@@ -1316,6 +1427,7 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
             onResolveSettle=${resolveSettle}
             onResolveStale=${resolveStale}
             onResolveDupe=${resolveDupe}
+            onResolveReconcile=${resolveReconcile}
           />
           <${InputsAndQuestionsColumn}
             state=${state}

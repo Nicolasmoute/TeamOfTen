@@ -105,7 +105,7 @@ async def test_truth_loads_from_project_folder(fresh_db: str) -> None:
     """Truth is folder-backed — `<project>/truth/*.md` becomes the
     truth corpus on every `load_state`. Indices are 1-based by sort
     order. Compass never writes truth; the harness's existing flow
-    owns it (Files pane edit, Coach `coord_propose_truth_update`)."""
+    owns it (Files pane edit, Coach `coord_propose_file_write(scope='truth', ...)`)."""
     from server.paths import project_paths
 
     pp = project_paths("alpha")

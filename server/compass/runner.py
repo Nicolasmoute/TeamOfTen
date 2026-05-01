@@ -34,6 +34,7 @@ from server.compass.pipeline import (
     claude_md as pl_claude_md,
     digest as pl_digest,
     questions as pl_questions,
+    reconciliation as pl_reconciliation,
     regions as pl_regions,
     reviews as pl_reviews,
     truth_check as pl_truth_check,
@@ -144,20 +145,26 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
     state = store.load_state(project_id)
 
     # ============================================================
-    # 0. Truth-derive — read truth/ folder, infer lattice statements.
-    #    Idempotent: skip the LLM call when the truth corpus hash
-    #    is unchanged AND the lattice already has truth-derived
-    #    content. The user's principle: "if truth doesn't change,
-    #    don't infer new statements."
+    # 0. Truth ingestion (Stage 0a derive + Stage 0b reconcile).
+    #    Both sub-stages share the corpus hash for idempotency:
+    #    - 0a fires when hash changed OR lattice has no truth-grounded
+    #      rows (covers the post-reset case).
+    #    - 0b fires when hash changed AND the pre-derive lattice was
+    #      non-empty (nothing to reconcile against on first bootstrap).
+    #    Hash is persisted at the END of Stage 0 so a partial failure
+    #    doesn't mark the corpus "considered" and skip the next run.
     # ============================================================
     truth_hash = pl_truth_derive.truth_corpus_hash(state.truth)
     last_hash = await _read_team_config(_truth_hash_key(project_id))
+    corpus_changed = truth_hash != last_hash
     has_truth_grounded = any(
         s.created_by == "compass-truth" for s in state.statements
     )
-    should_derive = bool(state.truth) and (
-        truth_hash != last_hash or not has_truth_grounded
-    )
+    pre_derive_statement_count = len(state.statements)
+    stage_0_ok = True
+
+    # ---------- 0a: Truth-derive ----------
+    should_derive = bool(state.truth) and (corpus_changed or not has_truth_grounded)
     if should_derive:
         await _emit_phase(
             project_id, run_id, "truth_derive",
@@ -168,6 +175,7 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
         except Exception:
             logger.exception("compass.runner: truth_derive raised")
             td_res = None
+            stage_0_ok = False
         if td_res and td_res.statements:
             now = _now_iso()
             added: list[Statement] = []
@@ -204,12 +212,108 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
                     "added": [s.id for s in added],
                     "run_id": run_id,
                 })
-        # Always persist the new truth hash on a successful pass —
-        # even when the LLM returned zero statements (the corpus has
-        # been considered; nothing new to add). Skips next run.
-        await _write_team_config(_truth_hash_key(project_id), truth_hash)
     elif not state.truth:
         log.notes.append("truth_derive: skipped (truth/ folder empty)")
+
+    # ---------- 0b: Reconciliation ----------
+    # Run when: corpus changed AND there was something in the lattice
+    # BEFORE truth-derive (so Stage 0a's brand-new rows aren't flagged
+    # as conflicting with the corpus they came from). Also bump
+    # pending_runs on existing proposals + drop expired ones each run
+    # — same treatment as settle/stale/dupe.
+    pre_existing_reconciles = list(state.reconciliation_proposals)
+    pl_reconciliation.increment_pending_runs(pre_existing_reconciles)
+    pre_existing_kept = pl_reconciliation.expire_old_proposals(pre_existing_reconciles)
+    expired = len(pre_existing_reconciles) - len(pre_existing_kept)
+    if expired:
+        # Clear flags on statements whose proposals just expired so
+        # detection can re-fire.
+        kept_sids = {p.statement_id for p in pre_existing_kept}
+        expired_sids = {
+            p.statement_id for p in pre_existing_reconciles if p.statement_id not in kept_sids
+        }
+        for s in state.statements:
+            if s.id in expired_sids:
+                s.reconciliation_proposed = False
+        log.notes.append(f"reconciliation: {expired} expired proposal(s) cleared")
+
+    should_reconcile = (
+        bool(state.truth)
+        and corpus_changed
+        and pre_derive_statement_count > 0
+    )
+    new_reconciles: list[store.ReconciliationProposal] = []
+    if should_reconcile:
+        await _emit_phase(project_id, run_id, "reconciliation")
+        try:
+            new_reconciles = await pl_reconciliation.detect_conflicts(
+                state, run_id=run_id, run_iso=_now_iso(),
+            )
+        except Exception:
+            logger.exception("compass.runner: reconciliation raised")
+            new_reconciles = []
+            stage_0_ok = False
+        if new_reconciles:
+            log.notes.append(
+                f"reconciliation: {len(new_reconciles)} new conflict(s) flagged"
+            )
+
+    # Combine kept (incremented, non-expired) + freshly detected.
+    # Dedupe on statement_id + corpus_paths so a re-detection of the
+    # same conflict before resolution doesn't double-count.
+    existing_keys = {
+        (p.statement_id, tuple(sorted(p.corpus_paths))) for p in pre_existing_kept
+    }
+    fresh_unique = [
+        p for p in new_reconciles
+        if (p.statement_id, tuple(sorted(p.corpus_paths))) not in existing_keys
+    ]
+    final_reconciles = pre_existing_kept + fresh_unique
+    state.reconciliation_proposals = final_reconciles
+
+    # Persist whenever there was anything to save — fresh detections,
+    # expired drops, OR pre-existing proposals whose pending_runs
+    # counter just ticked. The in-memory increment from
+    # `pl_reconciliation.increment_pending_runs` is otherwise lost.
+    if (
+        new_reconciles
+        or expired
+        or pre_existing_reconciles
+    ):
+        mutate.mark_reconciliation_proposed(
+            state, [p.statement_id for p in final_reconciles]
+        )
+        await store.save_proposals(
+            project_id,
+            settle=None, stale=None, dupes=None,
+            reconcile=final_reconciles,
+        )
+        await store.save_lattice(project_id, state.statements)
+
+    if fresh_unique:
+        try:
+            await bus.publish({
+                "ts": _now_iso(),
+                "agent_id": "compass",
+                "project_id": project_id,
+                "type": "compass_reconciliation_proposed",
+                "count": len(fresh_unique),
+                "conflicting_statement_ids": [p.statement_id for p in fresh_unique],
+                "run_id": run_id,
+            })
+        except Exception:
+            logger.exception(
+                "compass.runner: compass_reconciliation_proposed publish failed",
+            )
+
+    # Persist the corpus hash AT THE END of Stage 0 — only after both
+    # sub-stages completed cleanly. A partial failure leaves the old
+    # hash so the next run re-attempts derive + reconcile against the
+    # same corpus.
+    if state.truth and stage_0_ok:
+        await _write_team_config(_truth_hash_key(project_id), truth_hash)
+
+    log.reconcile_proposed = len(state.reconciliation_proposals)
 
     # ============================================================
     # 1. Digest answered questions (with truth-check)
@@ -527,6 +631,7 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
         "settle_proposed": log.settle_proposed,
         "stale_proposed": log.stale_proposed,
         "dupe_proposed": log.dupe_proposed,
+        "reconcile_proposed": log.reconcile_proposed,
         "questions_generated": log.questions_generated,
         "truth_candidates": log.truth_candidates,
         "briefing_path": log.briefing_path,

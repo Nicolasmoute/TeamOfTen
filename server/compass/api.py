@@ -152,6 +152,9 @@ def _state_snapshot_dict(project_id: str) -> dict[str, Any]:
         "settle_proposals": [_settle_dict(p) for p in state.settle_proposals],
         "stale_proposals": [_stale_dict(p) for p in state.stale_proposals],
         "duplicate_proposals": [_dupe_dict(p) for p in state.duplicate_proposals],
+        "reconciliation_proposals": [
+            _reconcile_dict(p) for p in state.reconciliation_proposals
+        ],
         "claude_md_block": cmp_store.read_claude_md_block(project_id),
         "latest_briefing": cmp_store.latest_briefing_text(project_id),
         "briefing_dates": cmp_store.list_briefing_dates(project_id),
@@ -236,6 +239,20 @@ def _dupe_dict(p: cmp_store.DuplicateProposal) -> dict[str, Any]:
         "merged_weight": p.merged_weight,
         "region": p.region,
         "reasoning": p.reasoning,
+        "proposed_at": p.proposed_at,
+        "proposed_in_run": p.proposed_in_run,
+        "pending_runs": p.pending_runs,
+    }
+
+
+def _reconcile_dict(p: cmp_store.ReconciliationProposal) -> dict[str, Any]:
+    return {
+        "id": p.id,
+        "statement_id": p.statement_id,
+        "statement_archived": p.statement_archived,
+        "corpus_paths": p.corpus_paths,
+        "explanation": p.explanation,
+        "suggested_resolution": p.suggested_resolution,
         "proposed_at": p.proposed_at,
         "proposed_in_run": p.proposed_in_run,
         "pending_runs": p.pending_runs,
@@ -749,6 +766,114 @@ def build_router(
         })
         return JSONResponse({"ok": True})
 
+    @router.post("/proposals/reconcile/{proposal_id}", dependencies=deps)
+    async def resolve_reconciliation(
+        proposal_id: str,
+        body: dict[str, Any] = Body(...),
+    ) -> JSONResponse:
+        """Resolve a corpus↔lattice conflict (spec §3.0.1).
+
+        Body:
+          - `action`: required, one of:
+              "update_lattice"  — sub-action via `lattice_action`
+              "update_truth"    — informational; no lattice change
+              "accept_ambiguity" — keep lattice and corpus, suppress
+                                    re-detection until they shift
+          - `lattice_action`: required when action=update_lattice. One
+            of "unarchive" (return to active at moderate weight),
+            "flip" (re-settle at the opposite direction), "reformulate"
+            (replace text + reset), "replace" (archive the row, insert
+            corpus-grounded equivalent).
+          - `text`, `region`, `weight`: lattice_action-specific params.
+        """
+        action = (body.get("action") or "").strip().lower()
+        if action not in ("update_lattice", "update_truth", "accept_ambiguity"):
+            raise HTTPException(
+                400,
+                "action must be update_lattice / update_truth / accept_ambiguity",
+            )
+        project_id = await resolve_active_project()
+        await presence.update_heartbeat(project_id)
+        state = cmp_store.load_state(project_id)
+        proposal = next(
+            (p for p in state.reconciliation_proposals if p.id == proposal_id),
+            None,
+        )
+        if proposal is None:
+            raise HTTPException(404, f"no reconciliation proposal {proposal_id}")
+        sid = proposal.statement_id
+
+        if action == "update_lattice":
+            la = (body.get("lattice_action") or "").strip().lower()
+            if la == "unarchive":
+                try:
+                    weight = float(body.get("weight") or 0.5)
+                except (TypeError, ValueError):
+                    weight = 0.5
+                if mutate.reconcile_unarchive(
+                    state, sid, run_id="human", new_weight=weight,
+                ) is None:
+                    raise HTTPException(404, f"statement {sid} missing")
+            elif la == "flip":
+                if mutate.reconcile_flip_archive(
+                    state, sid, run_id="human",
+                ) is None:
+                    raise HTTPException(
+                        409,
+                        f"statement {sid} can't be flipped (not directionally settled)",
+                    )
+            elif la == "reformulate":
+                text = (body.get("text") or "").strip()
+                if not text:
+                    raise HTTPException(400, "reformulate requires text")
+                region = (body.get("region") or None)
+                if mutate.reconcile_reformulate(
+                    state, sid, text, run_id="human", new_region=region,
+                ) is None:
+                    raise HTTPException(404, f"statement {sid} missing")
+            elif la == "replace":
+                text = (body.get("text") or "").strip()
+                region = (body.get("region") or "").strip()
+                if not text or not region:
+                    raise HTTPException(400, "replace requires text + region")
+                if mutate.reconcile_replace(
+                    state, sid, new_text=text, region=region, run_id="human",
+                ) is None:
+                    raise HTTPException(404, f"statement {sid} missing")
+            else:
+                raise HTTPException(
+                    400,
+                    "lattice_action must be unarchive / flip / reformulate / replace",
+                )
+        elif action == "accept_ambiguity":
+            mutate.reconcile_accept_ambiguity(state, sid)
+        # action="update_truth" is informational — the dashboard
+        # routes the human at the truth file via the Files pane and
+        # the existing harness flow handles the actual edit. No
+        # lattice change here; the proposal is dropped so it doesn't
+        # re-display, and re-detection on the next corpus-changed run
+        # picks up whatever the human's edit produced.
+
+        state.reconciliation_proposals = [
+            p for p in state.reconciliation_proposals if p.id != proposal_id
+        ]
+        await cmp_store.save_lattice(project_id, state.statements)
+        await cmp_store.save_proposals(
+            project_id,
+            settle=None, stale=None, dupes=None,
+            reconcile=state.reconciliation_proposals,
+        )
+        await bus.publish({
+            "ts": _now_iso(), "agent_id": "compass", "project_id": project_id,
+            "type": "compass_proposal_resolved",
+            "kind": "reconcile",
+            "proposal_id": proposal_id,
+            "statement_id": sid,
+            "action": action,
+            "lattice_action": body.get("lattice_action"),
+        })
+        return JSONResponse({"ok": True})
+
     # ---------------------------------------- statements
 
     @router.post("/statements/{statement_id}/weight", dependencies=deps)
@@ -785,7 +910,7 @@ def build_router(
     # Truth management — NOT in this API. Truth lives in the project's
     # `<project>/truth/` folder, owned by the harness's existing flow:
     # humans edit via the Files pane, Coach proposes via
-    # `coord_propose_truth_update` for human approval. Compass reads
+    # `coord_propose_file_write(scope='truth', ...)` for human approval. Compass reads
     # truth via `server.compass.truth.read_truth_facts` on every run
     # (Stage 0 truth-derive seeds the lattice). The dashboard surfaces
     # a read-only summary; edits happen elsewhere.

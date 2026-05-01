@@ -434,6 +434,98 @@ def test_audit_endpoint_runs_audit_and_returns_verdict(
 # ---------------------------------------------------- /reset
 
 
+def test_resolve_reconciliation_unarchive(client: TestClient) -> None:
+    """`POST /api/compass/proposals/reconcile/{id}` with action=update_lattice
+    + lattice_action=unarchive returns the row to active state."""
+    client.post("/api/compass/enable")
+    state = cmp_store.load_state("misc")
+    state.statements.append(cmp_store.Statement(
+        id="s1", text="claim", region="x", weight=1.0, created_at="t",
+        archived=True, settled_as="yes", settled_by_human=True,
+        reconciliation_proposed=True,
+    ))
+    state.reconciliation_proposals.append(cmp_store.ReconciliationProposal(
+        id="rec1", statement_id="s1", statement_archived=True,
+        corpus_paths=["specs.md"], explanation="x",
+        suggested_resolution="update_lattice",
+        proposed_at="t", proposed_in_run="r1",
+    ))
+    import asyncio as _asyncio
+
+    async def _seed() -> None:
+        await cmp_store.save_lattice("misc", state.statements)
+        await cmp_store.save_proposals(
+            "misc", settle=None, stale=None, dupes=None,
+            reconcile=state.reconciliation_proposals,
+        )
+    _asyncio.get_event_loop().run_until_complete(_seed())
+
+    r = client.post(
+        "/api/compass/proposals/reconcile/rec1",
+        json={"action": "update_lattice", "lattice_action": "unarchive", "weight": 0.5},
+    )
+    assert r.status_code == 200
+    state2 = cmp_store.load_state("misc")
+    s = state2.find_statement("s1")
+    assert s.archived is False
+    assert s.weight == pytest.approx(0.5)
+    assert s.reconciliation_proposed is False
+    assert state2.reconciliation_proposals == []
+
+
+def test_resolve_reconciliation_accept_ambiguity(client: TestClient) -> None:
+    client.post("/api/compass/enable")
+    state = cmp_store.load_state("misc")
+    state.statements.append(cmp_store.Statement(
+        id="s1", text="claim", region="x", weight=0.92, created_at="t",
+        reconciliation_proposed=True,
+    ))
+    state.reconciliation_proposals.append(cmp_store.ReconciliationProposal(
+        id="rec1", statement_id="s1", statement_archived=False,
+        corpus_paths=["specs.md"], explanation="x",
+        proposed_at="t", proposed_in_run="r1",
+    ))
+    import asyncio as _asyncio
+    _asyncio.get_event_loop().run_until_complete(cmp_store.save_lattice(
+        "misc", state.statements,
+    ))
+    _asyncio.get_event_loop().run_until_complete(cmp_store.save_proposals(
+        "misc", settle=None, stale=None, dupes=None,
+        reconcile=state.reconciliation_proposals,
+    ))
+
+    r = client.post(
+        "/api/compass/proposals/reconcile/rec1",
+        json={"action": "accept_ambiguity"},
+    )
+    assert r.status_code == 200
+    state2 = cmp_store.load_state("misc")
+    s = state2.find_statement("s1")
+    assert s.reconciliation_ambiguity is True
+    assert s.reconciliation_proposed is False
+    assert state2.reconciliation_proposals == []
+
+
+def test_resolve_reconciliation_rejects_invalid_action(client: TestClient) -> None:
+    client.post("/api/compass/enable")
+    state = cmp_store.load_state("misc")
+    state.reconciliation_proposals.append(cmp_store.ReconciliationProposal(
+        id="rec1", statement_id="s1", statement_archived=False,
+        corpus_paths=[], explanation="x",
+        proposed_at="t", proposed_in_run="r1",
+    ))
+    import asyncio as _asyncio
+    _asyncio.get_event_loop().run_until_complete(cmp_store.save_proposals(
+        "misc", settle=None, stale=None, dupes=None,
+        reconcile=state.reconciliation_proposals,
+    ))
+    r = client.post(
+        "/api/compass/proposals/reconcile/rec1",
+        json={"action": "totally-bogus"},
+    )
+    assert r.status_code == 400
+
+
 def test_reset_wipes_state(client: TestClient) -> None:
     client.post("/api/compass/enable")
     state = cmp_store.load_state("misc")

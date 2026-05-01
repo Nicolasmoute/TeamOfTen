@@ -2556,79 +2556,123 @@ async def _pretool_continue_hook(
     return {"continue_": True}
 
 
-def _path_is_under_truth(path_str: str) -> bool:
-    """Return True if `path_str` resolves under any project's truth/.
+def _classify_protected_path(path_str: str) -> str | None:
+    """Classify a write target against the harness's protected paths.
 
-    Used by the truth-guard hook to short-circuit agent writes regardless
-    of which project is currently active, since an agent could in theory
-    pass an absolute path into another project's tree.
+    Returns:
+      - 'truth'             — `path_str` resolves under any project's
+                              `truth/` lane.
+      - 'project_claude_md' — `path_str` resolves to a project's
+                              top-level `CLAUDE.md`
+                              (`/data/projects/<slug>/CLAUDE.md`).
+      - None                — unprotected; the hook lets the write
+                              through.
+
+    Used by the file-guard hook to short-circuit agent writes
+    regardless of which project is currently active, since an agent
+    could in theory pass an absolute path into another project's tree.
     """
     if not path_str:
-        return False
+        return None
     try:
         target = Path(path_str).resolve()
     except OSError:
-        return False
+        return None
     from server.paths import DATA_ROOT
 
     projects_root = (DATA_ROOT / "projects").resolve()
     try:
         rel = target.relative_to(projects_root)
     except ValueError:
-        return False
+        return None
     parts = rel.parts
     # `<slug>/truth/...` — at least 2 parts and second is exactly "truth".
-    return len(parts) >= 2 and parts[1] == "truth"
+    if len(parts) >= 2 and parts[1] == "truth":
+        return "truth"
+    # `<slug>/CLAUDE.md` — exactly two parts, second is the literal
+    # filename. Anything deeper (e.g. `<slug>/repo/CLAUDE.md` inside the
+    # worktree) is not the project-instruction file and stays writable.
+    if len(parts) == 2 and parts[1] == "CLAUDE.md":
+        return "project_claude_md"
+    return None
 
 
-# Bash heuristic — match a "truth/" path component anywhere in the
-# command string. Conservative: false-positive on a literal mention
-# (e.g. an `echo "truth/foo"` log line) is acceptable because (a)
-# agents have no reason to type that, and (b) over-deny just makes
-# the agent ask Coach for help, which is exactly the intended flow.
+# Bash heuristics — match path components anywhere in the command
+# string. Conservative: false-positive on a literal mention (e.g. an
+# `echo "truth/foo"` log line) is acceptable because (a) agents have
+# no reason to type these, and (b) over-deny just makes the agent ask
+# Coach for help, which is exactly the intended flow.
 _BASH_TRUTH_PATTERN = re.compile(r"(?:^|[\s/=:'\"])truth/")
+# Project CLAUDE.md: match `projects/<anything>/CLAUDE.md` so abs and
+# rel paths both trip. The `[^/\s'"]+` segment matches the slug.
+_BASH_PROJECT_CLAUDE_MD_PATTERN = re.compile(
+    r"projects/[^/\s'\"]+/CLAUDE\.md"
+)
 
 
-async def _pretool_truth_guard_hook(
+async def _pretool_file_guard_hook(
     input_data: dict[str, Any],
     tool_use_id: str | None,
     context: Any,
 ) -> dict[str, Any]:
-    """Block any agent write to /data/projects/<slug>/truth/.
+    """Block any agent write to harness-managed files.
 
-    The truth/ tree is the user's validated source-of-truth (specs,
-    brand guidelines, etc.). It must NEVER be mutated by an agent
-    without explicit human approval — the only approval channel is the
-    user editing the file themselves through the Files pane UI. Coach
-    can propose changes by messaging the user; Players cannot propose
-    truth changes at all. See `server/templates/global_claude_md.md`.
+    Two protected categories, each routed through its own approval
+    flow (`coord_propose_file_write`, Coach-only):
+
+      - **truth/** — `/data/projects/<slug>/truth/*`. The user's
+        validated source-of-truth (specs, brand guidelines, etc.).
+      - **project CLAUDE.md** — `/data/projects/<slug>/CLAUDE.md`.
+        The project's instruction file, read fresh into every agent's
+        system prompt every turn.
+
+    These files must NEVER be mutated by an agent without explicit
+    human approval. Coach proposes via `coord_propose_file_write`
+    (scope='truth' or 'project_claude_md'); Players cannot propose
+    directly — they message Coach. See
+    `server/templates/global_claude_md.md`.
     """
     try:
         tool_name = input_data.get("tool_name") or ""
         tool_input = input_data.get("tool_input") or {}
-        violator = False
+        category: str | None = None
         if tool_name in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
             path_str = (
                 tool_input.get("file_path")
                 or tool_input.get("notebook_path")
                 or ""
             )
-            if _path_is_under_truth(path_str):
-                violator = True
+            category = _classify_protected_path(path_str)
         elif tool_name == "Bash":
             cmd = str(tool_input.get("command") or "")
             if _BASH_TRUTH_PATTERN.search(cmd):
-                violator = True
-        if not violator:
+                category = "truth"
+            elif _BASH_PROJECT_CLAUDE_MD_PATTERN.search(cmd):
+                category = "project_claude_md"
+        if category is None:
             return {}
-        reason = (
-            "truth/ is read-only for agents. The user maintains it as "
-            "the source-of-truth for the project (specs, brand "
-            "guidelines, etc.). To propose a change, message the user "
-            "(Coach: coord_send_message to=human; Players: ask Coach "
-            "to relay) describing the proposed update; the user will "
-            "edit truth/ themselves through the Files pane."
-        )
+        if category == "truth":
+            reason = (
+                "truth/ is read-only for agents. The user maintains "
+                "it as the source-of-truth for the project (specs, "
+                "brand guidelines, etc.). To propose a change, Coach "
+                "calls coord_propose_file_write(scope='truth', path, "
+                "content, summary); Players ask Coach to relay. The "
+                "user reviews the diff and approves in the EnvPane's "
+                "'File-write proposals' section."
+            )
+        else:
+            reason = (
+                "Project CLAUDE.md is read-only for agents. It's the "
+                "project's instruction file (read fresh into every "
+                "agent's system prompt every turn) and must only "
+                "change with explicit human approval. To propose a "
+                "change, Coach calls coord_propose_file_write("
+                "scope='project_claude_md', path='CLAUDE.md', "
+                "content, summary); Players ask Coach to relay. The "
+                "user reviews the diff and approves in the EnvPane's "
+                "'File-write proposals' section."
+            )
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -2637,7 +2681,7 @@ async def _pretool_truth_guard_hook(
             }
         }
     except Exception:
-        logger.exception("truth-guard hook error (failing open)")
+        logger.exception("file-guard hook error (failing open)")
         return {}
 
 

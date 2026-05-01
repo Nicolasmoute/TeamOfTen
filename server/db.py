@@ -296,18 +296,22 @@ CREATE TABLE IF NOT EXISTS sync_state (
     PRIMARY KEY (project_id, tree, path)
 );
 
--- truth/ proposals — Coach proposes changes to user-validated source-of-
--- truth files, the human approves/denies, the harness applies the
--- approved write server-side. Players cannot propose; the
--- `coord_propose_truth_update` MCP tool is Coach-only. The PreToolUse
--- truth-guard hook denies any direct agent Write/Edit/Bash on truth/
--- regardless of role, so this table is the only path through which
--- truth/ ever changes.
-CREATE TABLE IF NOT EXISTS truth_proposals (
+-- File-write proposals — Coach proposes changes to harness-managed
+-- files, the human approves/denies, the harness applies the approved
+-- write server-side. Players cannot propose; the
+-- `coord_propose_file_write` MCP tool is Coach-only. The PreToolUse
+-- file-guard hook denies any direct agent Write/Edit/Bash on the
+-- protected paths regardless of role, so this table is the only path
+-- through which they ever change. Scopes:
+--   'truth'              — relative `path` under /data/projects/<slug>/truth/
+--   'project_claude_md'  — `path` must be 'CLAUDE.md'; target is
+--                          /data/projects/<slug>/CLAUDE.md.
+CREATE TABLE IF NOT EXISTS file_write_proposals (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id        TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     proposer_id       TEXT NOT NULL,                 -- 'coach' (enforced at tool layer)
-    -- relative path under /data/projects/<slug>/truth/
+    scope             TEXT NOT NULL DEFAULT 'truth', -- see header for valid values; validated at tool/resolver layer
+    -- scope-relative path (truth: under truth/; project_claude_md: 'CLAUDE.md')
     path              TEXT NOT NULL,
     proposed_content  TEXT NOT NULL,                 -- full new file body
     summary           TEXT NOT NULL,                 -- one-line "why" the user reads
@@ -319,8 +323,8 @@ CREATE TABLE IF NOT EXISTS truth_proposals (
     resolved_note     TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_truth_proposals_project_status
-    ON truth_proposals(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_file_write_proposals_project_status
+    ON file_write_proposals(project_id, status);
 
 -- Coach recurrences (recurrence-specs.md §10). Three flavors share one
 -- table: tick (singleton per project, harness-composed prompt), repeat
@@ -460,6 +464,32 @@ async def init_db() -> None:
             await db.execute("PRAGMA journal_mode = DELETE")
             await db.execute("PRAGMA foreign_keys = ON")
             logger.info("init_db: pragmas set, running schema")
+
+            # Pre-schema rename: truth_proposals → file_write_proposals.
+            # Has to run BEFORE executescript(SCHEMA) — otherwise the
+            # CREATE TABLE IF NOT EXISTS file_write_proposals would
+            # leave us with both tables on an upgraded DB. Only renames
+            # when the old table exists and the new one does not, so
+            # it's idempotent and a no-op on fresh installs.
+            cur = await db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('truth_proposals', 'file_write_proposals')"
+            )
+            existing_proposal_tables = {row[0] for row in await cur.fetchall()}
+            if (
+                "truth_proposals" in existing_proposal_tables
+                and "file_write_proposals" not in existing_proposal_tables
+            ):
+                await db.execute(
+                    "ALTER TABLE truth_proposals RENAME TO file_write_proposals"
+                )
+                # The old index follows the renamed table but keeps its
+                # own old name; drop it so the new SCHEMA's CREATE INDEX
+                # IF NOT EXISTS lands cleanly under the new name.
+                await db.execute(
+                    "DROP INDEX IF EXISTS idx_truth_proposals_project_status"
+                )
+
             await db.executescript(SCHEMA)
 
             # Inline migration runner — CREATE TABLE IF NOT EXISTS
@@ -497,6 +527,15 @@ async def init_db() -> None:
                     ("runtime", "runtime TEXT NOT NULL DEFAULT 'claude'"),
                     ("cost_basis", "cost_basis TEXT"),
                 ],
+            )
+            # Existing rows from the old truth_proposals table get
+            # scope='truth' automatically via the DEFAULT, so the rename
+            # path keeps existing pending proposals queryable as truth
+            # scope without a manual UPDATE.
+            await _ensure_columns(
+                db,
+                "file_write_proposals",
+                [("scope", "scope TEXT NOT NULL DEFAULT 'truth'")],
             )
 
             logger.info("init_db: schema ok, ensuring misc project")

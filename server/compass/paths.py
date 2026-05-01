@@ -61,6 +61,7 @@ class CompassPaths:
     settle_proposals: Path
     stale_proposals: Path
     duplicate_proposals: Path
+    reconciliation_proposals: Path
 
     def briefing_for(self, date_iso: str) -> Path:
         """Path to a single day's briefing. `date_iso` should be
@@ -93,6 +94,7 @@ def compass_paths(project_id: str) -> CompassPaths:
         settle_proposals=proposals / "settle.json",
         stale_proposals=proposals / "stale.json",
         duplicate_proposals=proposals / "duplicates.json",
+        reconciliation_proposals=proposals / "reconciliation.json",
     )
 
 

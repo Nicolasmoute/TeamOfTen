@@ -5,8 +5,9 @@ canonical, human-managed `truth/` directory under
 `/data/projects/<id>/truth/`. The harness's existing flow:
 
   - Humans edit truth files via the Files pane.
-  - Coach proposes new / updated truth via `coord_propose_truth_update`,
-    which queues a row in `truth_proposals` for human approval.
+  - Coach proposes new / updated truth via
+    `coord_propose_file_write(scope='truth', ...)`, which queues a row
+    in `file_write_proposals` for human approval.
   - Agents are blocked from writing under `truth/` by a PreToolUse hook
     in `server/agents.py`.
 

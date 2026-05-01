@@ -32,7 +32,7 @@ Public surface:
   - **Truth has no `save_*` here** — Compass reads truth from the
     project's `truth/` folder via `compass.truth.read_truth_facts`.
     Humans edit truth files via the Files pane; Coach proposes via
-    `coord_propose_truth_update`. Compass is a pure consumer.
+    `coord_propose_file_write(scope='truth', ...)`. Compass is a pure consumer.
   - `save_regions(project_id, regions, merge_history)` — same.
   - `save_questions(project_id, questions)` — same.
   - `save_proposals(project_id, settle, stale, dupes)` — write all
@@ -108,6 +108,8 @@ class Statement:
     settle_proposed: bool = False
     stale_proposed: bool = False
     dupe_proposed: bool = False
+    reconciliation_proposed: bool = False
+    reconciliation_ambiguity: bool = False  # set when human chose "accept ambiguity" on a corpus↔lattice conflict
     kept_stale: bool = False
 
 
@@ -201,6 +203,7 @@ class RunLog:
     settle_proposed: int = 0
     stale_proposed: int = 0
     dupe_proposed: int = 0
+    reconcile_proposed: int = 0
     questions_generated: int = 0
     truth_candidates: list[str] = field(default_factory=list)
     briefing_path: str | None = None
@@ -245,6 +248,24 @@ class DuplicateProposal:
 
 
 @dataclass
+class ReconciliationProposal:
+    """Spec §3.0.1 / §6.7 — a corpus↔lattice conflict awaiting the
+    human's call. Created by `pipeline.reconciliation.detect_conflicts`
+    when the truth corpus changes and an existing lattice row (active
+    OR settled/archived) contradicts the new corpus content."""
+
+    id: str  # "rec1", "rec2", … monotonic per project
+    statement_id: str
+    statement_archived: bool
+    corpus_paths: list[str]  # truth file relpaths cited by the LLM
+    explanation: str
+    suggested_resolution: str = "either"  # "update_lattice" | "update_truth" | "either"
+    proposed_at: str = ""
+    proposed_in_run: str = ""
+    pending_runs: int = 0
+
+
+@dataclass
 class LatticeState:
     project_id: str
     schema_version: str = config.COMPASS_SCHEMA_VERSION
@@ -256,6 +277,7 @@ class LatticeState:
     settle_proposals: list[SettleProposal] = field(default_factory=list)
     stale_proposals: list[StaleProposal] = field(default_factory=list)
     duplicate_proposals: list[DuplicateProposal] = field(default_factory=list)
+    reconciliation_proposals: list[ReconciliationProposal] = field(default_factory=list)
 
     # Convenience views
 
@@ -374,6 +396,8 @@ def _statement_from_jsonable(raw: dict[str, Any]) -> Statement:
         settle_proposed=bool(raw.get("settle_proposed") or False),
         stale_proposed=bool(raw.get("stale_proposed") or False),
         dupe_proposed=bool(raw.get("dupe_proposed") or False),
+        reconciliation_proposed=bool(raw.get("reconciliation_proposed") or False),
+        reconciliation_ambiguity=bool(raw.get("reconciliation_ambiguity") or False),
         kept_stale=bool(raw.get("kept_stale") or False),
     )
 
@@ -449,6 +473,7 @@ def _run_from_jsonable(raw: dict[str, Any]) -> RunLog:
         settle_proposed=int(raw.get("settle_proposed") or 0),
         stale_proposed=int(raw.get("stale_proposed") or 0),
         dupe_proposed=int(raw.get("dupe_proposed") or 0),
+        reconcile_proposed=int(raw.get("reconcile_proposed") or 0),
         questions_generated=int(raw.get("questions_generated") or 0),
         truth_candidates=list(raw.get("truth_candidates") or []),
         briefing_path=raw.get("briefing_path"),
@@ -486,6 +511,24 @@ def _stale_from_jsonable(raw: dict[str, Any]) -> StaleProposal:
         proposed_at=str(raw.get("proposed_at") or ""),
         proposed_in_run=str(raw.get("proposed_in_run") or ""),
         reformulation=raw.get("reformulation"),
+        pending_runs=int(raw.get("pending_runs") or 0),
+    )
+
+
+def _reconcile_to_jsonable(p: ReconciliationProposal) -> dict[str, Any]:
+    return asdict(p)
+
+
+def _reconcile_from_jsonable(raw: dict[str, Any]) -> ReconciliationProposal:
+    return ReconciliationProposal(
+        id=str(raw.get("id") or ""),
+        statement_id=str(raw.get("statement_id") or ""),
+        statement_archived=bool(raw.get("statement_archived") or False),
+        corpus_paths=list(raw.get("corpus_paths") or []),
+        explanation=str(raw.get("explanation") or ""),
+        suggested_resolution=str(raw.get("suggested_resolution") or "either"),
+        proposed_at=str(raw.get("proposed_at") or ""),
+        proposed_in_run=str(raw.get("proposed_in_run") or ""),
         pending_runs=int(raw.get("pending_runs") or 0),
     )
 
@@ -574,11 +617,13 @@ async def bootstrap_state(project_id: str) -> CompassPaths:
     if not cp.questions.exists():
         await save_questions(project_id, [])
     if not cp.settle_proposals.exists():
-        await save_proposals(project_id, settle=[], stale=None, dupes=None)
+        await save_proposals(project_id, settle=[], stale=None, dupes=None, reconcile=None)
     if not cp.stale_proposals.exists():
-        await save_proposals(project_id, settle=None, stale=[], dupes=None)
+        await save_proposals(project_id, settle=None, stale=[], dupes=None, reconcile=None)
     if not cp.duplicate_proposals.exists():
-        await save_proposals(project_id, settle=None, stale=None, dupes=[])
+        await save_proposals(project_id, settle=None, stale=None, dupes=[], reconcile=None)
+    if not cp.reconciliation_proposals.exists():
+        await save_proposals(project_id, settle=None, stale=None, dupes=None, reconcile=[])
     return cp
 
 
@@ -629,8 +674,9 @@ async def save_proposals(
     settle: list[SettleProposal] | None,
     stale: list[StaleProposal] | None,
     dupes: list[DuplicateProposal] | None,
+    reconcile: list[ReconciliationProposal] | None = None,
 ) -> None:
-    """Save any subset of the three proposal lists. Pass `None` for a
+    """Save any subset of the four proposal lists. Pass `None` for a
     list to leave the corresponding file untouched. Pass `[]` to write
     an empty list (which clears prior pending proposals)."""
     cp = ensure_compass_scaffold(project_id)
@@ -663,6 +709,16 @@ async def save_proposals(
         _atomic_write_text(cp.duplicate_proposals, text)
         await _kdrive_mirror_text_async(
             remote_path(project_id, "proposals", "duplicates.json"), text
+        )
+    if reconcile is not None:
+        payload = {
+            "compass_schema_version": config.COMPASS_SCHEMA_VERSION,
+            "proposals": [_reconcile_to_jsonable(p) for p in reconcile],
+        }
+        text = _dump_json(payload)
+        _atomic_write_text(cp.reconciliation_proposals, text)
+        await _kdrive_mirror_text_async(
+            remote_path(project_id, "proposals", "reconciliation.json"), text
         )
 
 
@@ -762,6 +818,11 @@ def load_state(project_id: str) -> LatticeState:
     dupes_raw = _read_json_or({}, cp.duplicate_proposals)
     dupes = [_dupe_from_jsonable(p) for p in (dupes_raw.get("proposals") or [])]
 
+    reconcile_raw = _read_json_or({}, cp.reconciliation_proposals)
+    reconciliations = [
+        _reconcile_from_jsonable(p) for p in (reconcile_raw.get("proposals") or [])
+    ]
+
     return LatticeState(
         project_id=project_id,
         schema_version=str(lattice_raw.get("compass_schema_version") or config.COMPASS_SCHEMA_VERSION),
@@ -773,6 +834,7 @@ def load_state(project_id: str) -> LatticeState:
         settle_proposals=settle,
         stale_proposals=stale,
         duplicate_proposals=dupes,
+        reconciliation_proposals=reconciliations,
     )
 
 
@@ -875,6 +937,14 @@ def next_dupe_proposal_id(state: LatticeState) -> str:
     return f"dupe{n + 1}"
 
 
+def next_reconciliation_id(state: LatticeState) -> str:
+    """Monotonic per project, scoped to current pending list. Spec §6.7
+    uses `recN`; we follow that convention so ids are short + readable
+    in the dashboard."""
+    n = _max_numeric_suffix("rec", (p.id for p in state.reconciliation_proposals))
+    return f"rec{n + 1}"
+
+
 # --------------------------------------------------------------- wipe
 
 
@@ -908,6 +978,7 @@ async def wipe_project(project_id: str) -> None:
             "proposals/settle.json",
             "proposals/stale.json",
             "proposals/duplicates.json",
+            "proposals/reconciliation.json",
         ]
         for name in names:
             await _kdrive_remove_async(remote_path(project_id, name))
@@ -931,6 +1002,7 @@ __all__ = [
     "SettleProposal",
     "StaleProposal",
     "DuplicateProposal",
+    "ReconciliationProposal",
     "LatticeState",
     "bootstrap_state",
     "save_lattice",
@@ -953,5 +1025,6 @@ __all__ = [
     "next_audit_id",
     "next_run_id",
     "next_dupe_proposal_id",
+    "next_reconciliation_id",
     "wipe_project",
 ]

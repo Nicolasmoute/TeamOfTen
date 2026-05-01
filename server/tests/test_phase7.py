@@ -505,12 +505,12 @@ def test_truth_folder_in_project_paths(fresh_db) -> None:
 
 async def test_truth_guard_denies_write_under_truth(fresh_db) -> None:
     """Agent Write to /data/projects/<slug>/truth/anything must be denied."""
-    from server.agents import _pretool_truth_guard_hook
+    from server.agents import _pretool_file_guard_hook
     from server.paths import ensure_project_scaffold
 
     pp = ensure_project_scaffold(MISC_PROJECT_ID)
     target = pp.truth / "specs.md"
-    res = await _pretool_truth_guard_hook(
+    res = await _pretool_file_guard_hook(
         {"tool_name": "Write", "tool_input": {"file_path": str(target)}},
         "tu_1",
         None,
@@ -522,7 +522,7 @@ async def test_truth_guard_denies_write_under_truth(fresh_db) -> None:
 
 async def test_truth_guard_allows_writes_outside_truth(fresh_db) -> None:
     """Writes to non-truth paths (working/, knowledge/, etc.) pass through."""
-    from server.agents import _pretool_truth_guard_hook
+    from server.agents import _pretool_file_guard_hook
     from server.paths import ensure_project_scaffold
 
     pp = ensure_project_scaffold(MISC_PROJECT_ID)
@@ -532,7 +532,7 @@ async def test_truth_guard_allows_writes_outside_truth(fresh_db) -> None:
         pp.decisions / "0001-something.md",
         pp.outputs / "deck.pdf",
     ):
-        res = await _pretool_truth_guard_hook(
+        res = await _pretool_file_guard_hook(
             {"tool_name": "Write", "tool_input": {"file_path": str(safe)}},
             "tu_1",
             None,
@@ -542,14 +542,14 @@ async def test_truth_guard_allows_writes_outside_truth(fresh_db) -> None:
 
 async def test_truth_guard_denies_edit_and_multiedit(fresh_db) -> None:
     """All four file-mutating tools route through file_path the same way."""
-    from server.agents import _pretool_truth_guard_hook
+    from server.agents import _pretool_file_guard_hook
     from server.paths import ensure_project_scaffold
 
     pp = ensure_project_scaffold(MISC_PROJECT_ID)
     target = str(pp.truth / "brand.md")
     for tool_name in ("Edit", "MultiEdit", "NotebookEdit"):
         key = "notebook_path" if tool_name == "NotebookEdit" else "file_path"
-        res = await _pretool_truth_guard_hook(
+        res = await _pretool_file_guard_hook(
             {"tool_name": tool_name, "tool_input": {key: target}},
             "tu_1",
             None,
@@ -561,7 +561,7 @@ async def test_truth_guard_denies_edit_and_multiedit(fresh_db) -> None:
 
 async def test_truth_guard_denies_bash_writing_into_truth(fresh_db) -> None:
     """Bash redirects into truth/ are caught by the substring heuristic."""
-    from server.agents import _pretool_truth_guard_hook
+    from server.agents import _pretool_file_guard_hook
     from server.paths import ensure_project_scaffold
 
     ensure_project_scaffold(MISC_PROJECT_ID)
@@ -571,7 +571,7 @@ async def test_truth_guard_denies_bash_writing_into_truth(fresh_db) -> None:
         "cp deck.pdf truth/deck.pdf",
     ]
     for cmd in cases:
-        res = await _pretool_truth_guard_hook(
+        res = await _pretool_file_guard_hook(
             {"tool_name": "Bash", "tool_input": {"command": cmd}},
             "tu_1",
             None,
@@ -582,7 +582,7 @@ async def test_truth_guard_denies_bash_writing_into_truth(fresh_db) -> None:
 
 async def test_truth_guard_lets_innocuous_bash_through(fresh_db) -> None:
     """Bash commands that don't reference truth/ pass through (no false-deny)."""
-    from server.agents import _pretool_truth_guard_hook
+    from server.agents import _pretool_file_guard_hook
 
     for cmd in (
         "ls -la",
@@ -590,7 +590,7 @@ async def test_truth_guard_lets_innocuous_bash_through(fresh_db) -> None:
         "echo trustworthy",       # contains 'trust' but not 'truth/'
         "cat /data/projects/misc/working/notes.md",
     ):
-        res = await _pretool_truth_guard_hook(
+        res = await _pretool_file_guard_hook(
             {"tool_name": "Bash", "tool_input": {"command": cmd}},
             "tu_1",
             None,
@@ -601,19 +601,23 @@ async def test_truth_guard_lets_innocuous_bash_through(fresh_db) -> None:
 # ---------- Truth proposals (Coach proposes → human approves) -----
 
 
-def test_coord_propose_truth_update_in_coord_allowlist() -> None:
+def test_coord_propose_file_write_in_coord_allowlist() -> None:
     """The new tool is registered so the SDK will actually accept calls.
     Coach-only enforcement is in the tool body (caller_is_coach
     rejection); the tool is in the shared coord allowlist alongside
     other Coach-rejecting tools like coord_write_decision."""
     from server.tools import ALLOWED_COORD_TOOLS
 
-    assert "mcp__coord__coord_propose_truth_update" in ALLOWED_COORD_TOOLS
+    assert "mcp__coord__coord_propose_file_write" in ALLOWED_COORD_TOOLS
 
 
 async def _propose_truth(handler, **kwargs):
-    """Test helper — wraps a coord_propose_truth_update handler call."""
-    args = {"path": kwargs.get("path", ""),
+    """Test helper — wraps a coord_propose_file_write handler call
+    with scope='truth' (the truth-scope-specific tests in this file
+    keep using this helper; project_claude_md scope tests pass scope
+    explicitly)."""
+    args = {"scope": kwargs.get("scope", "truth"),
+            "path": kwargs.get("path", ""),
             "content": kwargs.get("content", "body"),
             "summary": kwargs.get("summary", "why")}
     return await handler(args)
@@ -630,7 +634,7 @@ async def test_propose_truth_update_rejects_projects_prefix(fresh_db) -> None:
     ensure_project_scaffold("misc")
     from server.tools import build_coord_server
     srv = build_coord_server("coach", include_proxy_metadata=True)
-    handler = srv["_handlers"]["coord_propose_truth_update"]
+    handler = srv["_handlers"]["coord_propose_file_write"]
 
     out = await _propose_truth(
         handler,
@@ -667,7 +671,7 @@ async def test_propose_truth_update_rejects_known_project_slug_prefix(
 
     from server.tools import build_coord_server
     srv = build_coord_server("coach", include_proxy_metadata=True)
-    handler = srv["_handlers"]["coord_propose_truth_update"]
+    handler = srv["_handlers"]["coord_propose_file_write"]
 
     out = await _propose_truth(
         handler,
@@ -689,7 +693,7 @@ async def test_propose_truth_update_accepts_bare_filename(fresh_db) -> None:
     ensure_project_scaffold("misc")
     from server.tools import build_coord_server
     srv = build_coord_server("coach", include_proxy_metadata=True)
-    handler = srv["_handlers"]["coord_propose_truth_update"]
+    handler = srv["_handlers"]["coord_propose_file_write"]
 
     out = await _propose_truth(
         handler,
@@ -702,14 +706,14 @@ async def test_propose_truth_update_accepts_bare_filename(fresh_db) -> None:
     assert "queued" in text or "proposal" in text.lower()
 
 
-async def test_truth_proposals_schema_smoke(fresh_db) -> None:
-    """truth_proposals table exists, accepts an insert, status defaults
+async def test_file_write_proposals_schema_smoke(fresh_db) -> None:
+    """file_write_proposals table exists, accepts an insert, status defaults
     to 'pending', and the CHECK constraint rejects bad statuses."""
     await init_db()
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "INSERT INTO truth_proposals "
+            "INSERT INTO file_write_proposals "
             "(project_id, proposer_id, path, proposed_content, summary) "
             "VALUES (?, ?, ?, ?, ?)",
             (MISC_PROJECT_ID, "coach", "specs.md", "body", "summary"),
@@ -717,7 +721,7 @@ async def test_truth_proposals_schema_smoke(fresh_db) -> None:
         await c.commit()
         row_id = cur.lastrowid
         cur = await c.execute(
-            "SELECT status FROM truth_proposals WHERE id = ?", (row_id,),
+            "SELECT status FROM file_write_proposals WHERE id = ?", (row_id,),
         )
         row = await cur.fetchone()
         assert row[0] == "pending"
@@ -725,7 +729,7 @@ async def test_truth_proposals_schema_smoke(fresh_db) -> None:
         import sqlite3
         try:
             await c.execute(
-                "INSERT INTO truth_proposals "
+                "INSERT INTO file_write_proposals "
                 "(project_id, proposer_id, path, proposed_content, "
                 "summary, status) VALUES (?, ?, ?, ?, ?, ?)",
                 (
@@ -740,12 +744,12 @@ async def test_truth_proposals_schema_smoke(fresh_db) -> None:
         await c.close()
 
 
-async def test_resolve_truth_proposal_approve_writes_file_and_marks_row(
+async def test_resolve_file_write_proposal_approve_writes_file_and_marks_row(
     fresh_db,
 ) -> None:
     """Approve flow: pending row → file written under truth/ → row
     marked approved. The actor goes into the event payload."""
-    from server.truth import resolve_truth_proposal
+    from server.truth import resolve_file_write_proposal
     from server.paths import ensure_project_scaffold
 
     await init_db()
@@ -753,7 +757,7 @@ async def test_resolve_truth_proposal_approve_writes_file_and_marks_row(
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "INSERT INTO truth_proposals "
+            "INSERT INTO file_write_proposals "
             "(project_id, proposer_id, path, proposed_content, summary) "
             "VALUES (?, ?, ?, ?, ?)",
             (
@@ -767,7 +771,7 @@ async def test_resolve_truth_proposal_approve_writes_file_and_marks_row(
     finally:
         await c.close()
 
-    res = await resolve_truth_proposal(
+    res = await resolve_file_write_proposal(
         proposal_id,
         new_status="approved",
         note="LGTM",
@@ -783,7 +787,7 @@ async def test_resolve_truth_proposal_approve_writes_file_and_marks_row(
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT status, resolved_by, resolved_note FROM truth_proposals "
+            "SELECT status, resolved_by, resolved_note FROM file_write_proposals "
             "WHERE id = ?", (proposal_id,),
         )
         row = await cur.fetchone()
@@ -794,9 +798,9 @@ async def test_resolve_truth_proposal_approve_writes_file_and_marks_row(
     assert row[2] == "LGTM"
 
 
-async def test_resolve_truth_proposal_deny_does_not_write(fresh_db) -> None:
+async def test_resolve_file_write_proposal_deny_does_not_write(fresh_db) -> None:
     """Deny: row marked denied, NO file write under truth/."""
-    from server.truth import resolve_truth_proposal
+    from server.truth import resolve_file_write_proposal
     from server.paths import ensure_project_scaffold
 
     await init_db()
@@ -804,7 +808,7 @@ async def test_resolve_truth_proposal_deny_does_not_write(fresh_db) -> None:
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "INSERT INTO truth_proposals "
+            "INSERT INTO file_write_proposals "
             "(project_id, proposer_id, path, proposed_content, summary) "
             "VALUES (?, ?, ?, ?, ?)",
             (
@@ -817,7 +821,7 @@ async def test_resolve_truth_proposal_deny_does_not_write(fresh_db) -> None:
     finally:
         await c.close()
 
-    res = await resolve_truth_proposal(
+    res = await resolve_file_write_proposal(
         proposal_id, new_status="denied", note="not now",
         actor={"source": "ui", "ip": "127.0.0.1", "ua": "test"},
     )
@@ -828,7 +832,7 @@ async def test_resolve_truth_proposal_deny_does_not_write(fresh_db) -> None:
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT status, resolved_note FROM truth_proposals WHERE id = ?",
+            "SELECT status, resolved_note FROM file_write_proposals WHERE id = ?",
             (proposal_id,),
         )
         row = await cur.fetchone()
@@ -838,7 +842,7 @@ async def test_resolve_truth_proposal_deny_does_not_write(fresh_db) -> None:
     assert row[1] == "not now"
 
 
-async def test_resolve_truth_proposal_approves_yaml_and_oversize_md(
+async def test_resolve_file_write_proposal_approves_yaml_and_oversize_md(
     fresh_db,
 ) -> None:
     """Regression: the resolver originally delegated to filesmod.write_text
@@ -846,7 +850,7 @@ async def test_resolve_truth_proposal_approves_yaml_and_oversize_md(
     brand guidelines, contracts — often .yaml/.json/.toml, sometimes
     >100 KB. Both must approve cleanly now that truth.py does its own
     write."""
-    from server.truth import resolve_truth_proposal
+    from server.truth import resolve_file_write_proposal
     from server.paths import ensure_project_scaffold
 
     await init_db()
@@ -863,7 +867,7 @@ async def test_resolve_truth_proposal_approves_yaml_and_oversize_md(
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "INSERT INTO truth_proposals "
+                "INSERT INTO file_write_proposals "
                 "(project_id, proposer_id, path, proposed_content, summary) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (MISC_PROJECT_ID, "coach", path, content, "test"),
@@ -873,7 +877,7 @@ async def test_resolve_truth_proposal_approves_yaml_and_oversize_md(
         finally:
             await c.close()
 
-        res = await resolve_truth_proposal(
+        res = await resolve_file_write_proposal(
             proposal_id, new_status="approved", note=None,
             actor={"source": "ui", "ip": "127.0.0.1", "ua": "test"},
         )
@@ -890,7 +894,7 @@ async def test_truth_proposal_path_traversal_rejected(fresh_db) -> None:
     time, but defense-in-depth: a manual sqlite insert / migration
     bug shouldn't be able to bypass.)"""
     from server.truth import (
-        TruthProposalBadRequest, resolve_truth_proposal,
+        FileWriteProposalBadRequest, resolve_file_write_proposal,
     )
     from server.paths import ensure_project_scaffold
 
@@ -899,7 +903,7 @@ async def test_truth_proposal_path_traversal_rejected(fresh_db) -> None:
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "INSERT INTO truth_proposals "
+            "INSERT INTO file_write_proposals "
             "(project_id, proposer_id, path, proposed_content, summary) "
             "VALUES (?, ?, ?, ?, ?)",
             (
@@ -914,19 +918,19 @@ async def test_truth_proposal_path_traversal_rejected(fresh_db) -> None:
         await c.close()
 
     try:
-        await resolve_truth_proposal(
+        await resolve_file_write_proposal(
             proposal_id, new_status="approved", note=None,
             actor={"source": "ui", "ip": "127.0.0.1", "ua": "test"},
         )
-        assert False, "traversal should have raised TruthProposalBadRequest"
-    except TruthProposalBadRequest as e:
+        assert False, "traversal should have raised FileWriteProposalBadRequest"
+    except FileWriteProposalBadRequest as e:
         assert "truth/" in str(e)
 
 
-async def test_resolve_truth_proposal_idempotent_conflict(fresh_db) -> None:
+async def test_resolve_file_write_proposal_idempotent_conflict(fresh_db) -> None:
     """A non-pending proposal can't be re-resolved — raises Conflict."""
     from server.truth import (
-        TruthProposalConflict, resolve_truth_proposal,
+        FileWriteProposalConflict, resolve_file_write_proposal,
     )
     from server.paths import ensure_project_scaffold
 
@@ -935,7 +939,7 @@ async def test_resolve_truth_proposal_idempotent_conflict(fresh_db) -> None:
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "INSERT INTO truth_proposals "
+            "INSERT INTO file_write_proposals "
             "(project_id, proposer_id, path, proposed_content, summary, "
             "status, resolved_at, resolved_by) "
             "VALUES (?, ?, ?, ?, ?, 'approved', ?, 'human')",
@@ -950,12 +954,12 @@ async def test_resolve_truth_proposal_idempotent_conflict(fresh_db) -> None:
         await c.close()
 
     try:
-        await resolve_truth_proposal(
+        await resolve_file_write_proposal(
             proposal_id, new_status="denied", note=None,
             actor={"source": "ui", "ip": "127.0.0.1", "ua": "test"},
         )
-        assert False, "second resolve should have raised TruthProposalConflict"
-    except TruthProposalConflict as e:
+        assert False, "second resolve should have raised FileWriteProposalConflict"
+    except FileWriteProposalConflict as e:
         assert e.status == "approved"
 
 
@@ -969,7 +973,7 @@ async def _insert_pending_proposal(
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "INSERT INTO truth_proposals "
+            "INSERT INTO file_write_proposals "
             "(project_id, proposer_id, path, proposed_content, summary) "
             "VALUES (?, ?, ?, ?, ?)",
             (project_id, proposer, path, content, summary),
@@ -984,7 +988,7 @@ async def _row_status(proposal_id: int) -> tuple[str, str | None]:
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT status, resolved_note FROM truth_proposals WHERE id = ?",
+            "SELECT status, resolved_note FROM file_write_proposals WHERE id = ?",
             (proposal_id,),
         )
         row = await cur.fetchone()
@@ -1002,7 +1006,7 @@ async def test_supersede_status_accepted_by_check_constraint(
     c = await configured_conn()
     try:
         await c.execute(
-            "UPDATE truth_proposals SET status='superseded' WHERE id=?",
+            "UPDATE file_write_proposals SET status='superseded' WHERE id=?",
             (pid,),
         )
         await c.commit()
@@ -1016,7 +1020,7 @@ def test_propose_truth_update_in_coord_allowlist_unchanged(fresh_db) -> None:
     """Sanity: the supersede refactor didn't drop the tool from the
     allow list."""
     from server.tools import ALLOWED_COORD_TOOLS
-    assert "mcp__coord__coord_propose_truth_update" in ALLOWED_COORD_TOOLS
+    assert "mcp__coord__coord_propose_file_write" in ALLOWED_COORD_TOOLS
 
 
 # ---------- truth-index.md template + scaffold --------------------
@@ -1024,16 +1028,21 @@ def test_propose_truth_update_in_coord_allowlist_unchanged(fresh_db) -> None:
 
 def test_truth_index_seeded_on_scaffold(fresh_db) -> None:
     """ensure_project_scaffold writes truth/truth-index.md from the
-    checked-in template, and the file lists the default specs.md
-    bullet."""
+    checked-in template. The seeded body explains the lane and the
+    proposal flow but imposes no expected-files manifest — the user
+    populates it per project."""
     from server.paths import ensure_project_scaffold
 
     pp = ensure_project_scaffold(MISC_PROJECT_ID)
     target = pp.truth / "truth-index.md"
     assert target.is_file(), "truth-index.md must be seeded"
     body = target.read_text(encoding="utf-8")
-    assert "`specs.md`" in body
-    assert "Expected files" in body
+    # The template explains the lane and the propose flow.
+    assert "coord_propose_file_write" in body
+    # Crucially: NO `specs.md` (or any other) bullet — a hardcoded
+    # default would make the harness pick a project type. The body
+    # ships intentionally bullet-free.
+    assert "`specs.md`" not in body
 
 
 def test_truth_index_first_write_only(fresh_db) -> None:
@@ -1064,135 +1073,101 @@ def test_truth_index_seeded_when_truth_dir_missing(fresh_db) -> None:
     assert (project_paths(MISC_PROJECT_ID).truth / "truth-index.md").is_file()
 
 
-# ---------- Manifest parser ---------------------------------------
+# ---------- Files-pane write_text editable allowlist --------------
 
 
-def test_parse_truth_manifest_extracts_default_specs_bullet(fresh_db) -> None:
-    """The seeded template's specs.md bullet parses correctly."""
+async def test_write_text_accepts_editable_extensions(fresh_db) -> None:
+    """The broadened EDITABLE_EXTS set lets users author code/config
+    files (yaml, json, py, etc.) through the standard write endpoint —
+    not just .md / .txt as the prior allowlist allowed."""
+    from server import files as filesmod
     from server.paths import ensure_project_scaffold
-    from server.truth import parse_truth_manifest
 
+    await init_db()
     ensure_project_scaffold(MISC_PROJECT_ID)
-    entries = parse_truth_manifest(MISC_PROJECT_ID)
-    files = [e["filename"] for e in entries]
-    assert "specs.md" in files
-    # Manifest file itself is filtered out of the listing.
-    assert "truth-index.md" not in files
-    specs = next(e for e in entries if e["filename"] == "specs.md")
-    assert specs["exists"] is False
-    assert "abs_path" in specs and specs["abs_path"].endswith("specs.md")
+    for rel, body in (
+        ("working/workspace/notes.yaml", "primary: '#0066cc'\n"),
+        ("working/workspace/config.json", "{\"k\": 1}"),
+        ("working/workspace/snippet.py", "x = 1\n"),
+        ("working/workspace/Dockerfile", "FROM python:3.12\n"),
+        ("truth/brand-colors.yaml", "primary: '#0066cc'\n"),
+    ):
+        result = await filesmod.write_text("project", rel, body)
+        assert result["size"] == len(body.encode("utf-8"))
 
 
-def test_parse_truth_manifest_marks_existing_files(fresh_db) -> None:
-    """Once an expected file exists on disk, parser flips exists=True."""
+async def test_write_text_rejects_binary_extensions(fresh_db) -> None:
+    """Binary formats stay out of the allowlist so a textarea write
+    can't corrupt them. Users drop binary via kDrive instead."""
+    import pytest
+
+    from server import files as filesmod
     from server.paths import ensure_project_scaffold
-    from server.truth import parse_truth_manifest
 
-    pp = ensure_project_scaffold(MISC_PROJECT_ID)
-    (pp.truth / "specs.md").write_text("# specs", encoding="utf-8")
-    entries = parse_truth_manifest(MISC_PROJECT_ID)
-    specs = next(e for e in entries if e["filename"] == "specs.md")
-    assert specs["exists"] is True
-    assert specs["size"] == len("# specs")
-
-
-def test_parse_truth_manifest_returns_empty_when_missing(fresh_db) -> None:
-    """No truth-index.md → empty list (not an error)."""
-    from server.paths import ensure_project_scaffold
-    from server.truth import parse_truth_manifest
-
-    pp = ensure_project_scaffold(MISC_PROJECT_ID)
-    (pp.truth / "truth-index.md").unlink()
-    assert parse_truth_manifest(MISC_PROJECT_ID) == []
+    await init_db()
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    for rel in (
+        "truth/contract.pdf",
+        "outputs/logo.png",
+        "working/workspace/archive.zip",
+    ):
+        with pytest.raises(ValueError, match="not in editable allowlist"):
+            await filesmod.write_text("project", rel, "x")
 
 
-def test_parse_truth_manifest_accepts_ascii_dash(fresh_db) -> None:
-    """ASCII ' - ' separator works alongside em-dash for users on
-    keyboards that don't make em-dash easy."""
-    from server.paths import ensure_project_scaffold
-    from server.truth import parse_truth_manifest
+async def test_write_text_accepts_empty_body_for_stub_creation(
+    fresh_db,
+) -> None:
+    """The Files-pane '+ new file' button posts an empty body to
+    create a stub. write_text must accept this."""
+    from server import files as filesmod
+    from server.paths import ensure_project_scaffold, project_paths
 
-    pp = ensure_project_scaffold(MISC_PROJECT_ID)
-    (pp.truth / "truth-index.md").write_text(
-        "# Truth\n\n## Expected files\n\n"
-        "- `specs.md` — em-dash desc\n"
-        "- `brand.yaml` - ascii-dash desc\n",
-        encoding="utf-8",
-    )
-    entries = parse_truth_manifest(MISC_PROJECT_ID)
-    files = {e["filename"] for e in entries}
-    assert files == {"specs.md", "brand.yaml"}
-
-
-# ---------- create_empty_truth_file --------------------------------
-
-
-def test_create_empty_truth_file_writes_zero_bytes(fresh_db) -> None:
-    from server.paths import ensure_project_scaffold
-    from server.truth import create_empty_truth_file
-
-    pp = ensure_project_scaffold(MISC_PROJECT_ID)
-    res = create_empty_truth_file(MISC_PROJECT_ID, "specs.md")
-    assert res["size"] == 0
-    target = pp.truth / "specs.md"
+    await init_db()
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    await filesmod.write_text("project", "truth/specs.md", "")
+    target = project_paths(MISC_PROJECT_ID).truth / "specs.md"
     assert target.is_file()
     assert target.read_text(encoding="utf-8") == ""
 
 
-def test_create_empty_truth_file_409_on_existing(fresh_db) -> None:
-    from server.paths import ensure_project_scaffold
-    from server.truth import (
-        TruthProposalConflict, create_empty_truth_file,
-    )
+async def test_write_text_create_only_refuses_existing(fresh_db) -> None:
+    """Regression for the 'silent overwrite' footgun: with
+    create_only=True, write_text raises FileAlreadyExists rather than
+    truncating an existing file to the new (possibly empty) content.
+    The Files-pane '+ new file' button passes create_only=True so a
+    user typing the path of an existing file gets a 409 + error
+    instead of losing their content."""
+    import pytest
 
-    pp = ensure_project_scaffold(MISC_PROJECT_ID)
-    (pp.truth / "specs.md").write_text("existing", encoding="utf-8")
-    try:
-        create_empty_truth_file(MISC_PROJECT_ID, "specs.md")
-        assert False, "should have raised TruthProposalConflict"
-    except TruthProposalConflict:
-        pass
-    # Existing content untouched.
-    assert (pp.truth / "specs.md").read_text(encoding="utf-8") == "existing"
+    from server import files as filesmod
+    from server.paths import ensure_project_scaffold, project_paths
 
-
-def test_create_empty_truth_file_rejects_traversal(fresh_db) -> None:
-    from server.paths import ensure_project_scaffold
-    from server.truth import (
-        TruthProposalBadRequest, create_empty_truth_file,
-    )
-
+    await init_db()
     ensure_project_scaffold(MISC_PROJECT_ID)
-    try:
-        create_empty_truth_file(MISC_PROJECT_ID, "../decisions/oops.md")
-        assert False, "should have raised TruthProposalBadRequest"
-    except TruthProposalBadRequest:
-        pass
+    pp = project_paths(MISC_PROJECT_ID)
+    target = pp.working_workspace / "existing.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("important content\n", encoding="utf-8")
 
+    with pytest.raises(filesmod.FileAlreadyExists):
+        await filesmod.write_text(
+            "project",
+            "working/workspace/existing.md",
+            "",
+            create_only=True,
+        )
+    # Existing content untouched.
+    assert target.read_text(encoding="utf-8") == "important content\n"
 
-def test_create_empty_truth_file_creates_subdirs(fresh_db) -> None:
-    """A nested path like 'brand/colors.yaml' creates the brand/
-    subdirectory in truth/ before writing."""
-    from server.paths import ensure_project_scaffold
-    from server.truth import create_empty_truth_file
-
-    pp = ensure_project_scaffold(MISC_PROJECT_ID)
-    create_empty_truth_file(MISC_PROJECT_ID, "brand/colors.yaml")
-    assert (pp.truth / "brand" / "colors.yaml").is_file()
-
-
-def test_create_empty_truth_file_strips_leading_truth_prefix(fresh_db) -> None:
-    """Symmetric with the propose tool — `truth/specs.md` and
-    `specs.md` both resolve to the same file. A bullet in
-    truth-index.md authored with the prefix shouldn't double-nest."""
-    from server.paths import ensure_project_scaffold
-    from server.truth import create_empty_truth_file
-
-    pp = ensure_project_scaffold(MISC_PROJECT_ID)
-    create_empty_truth_file(MISC_PROJECT_ID, "truth/foo.md")
-    assert (pp.truth / "foo.md").is_file()
-    assert not (pp.truth / "truth").exists(), \
-        "must not have created a nested truth/ folder"
+    # Default (create_only=False) still overwrites — the save button's
+    # contract is unchanged.
+    await filesmod.write_text(
+        "project",
+        "working/workspace/existing.md",
+        "new content\n",
+    )
+    assert target.read_text(encoding="utf-8") == "new content\n"
 
 
 # ---------- Supersede SQL flow (mirrors propose tool's body) ------
@@ -1212,24 +1187,29 @@ async def test_supersede_invariant_at_most_one_pending_per_path(
     )
 
     # Mirror the tool's body: SELECT, INSERT, UPDATE all in one txn.
+    # The scope filter is load-bearing: a hypothetical truth/CLAUDE.md
+    # proposal must NOT supersede a project_claude_md proposal at path
+    # 'CLAUDE.md' (and vice versa). Tool body adds `AND scope = ?` for
+    # exactly this reason.
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT id FROM truth_proposals "
-            "WHERE project_id = ? AND path = ? AND status = 'pending'",
-            (MISC_PROJECT_ID, "specs.md"),
+            "SELECT id FROM file_write_proposals "
+            "WHERE project_id = ? AND scope = ? AND path = ? "
+            "AND status = 'pending'",
+            (MISC_PROJECT_ID, "truth", "specs.md"),
         )
         ids = [r[0] for r in await cur.fetchall()]
         cur = await c.execute(
-            "INSERT INTO truth_proposals "
-            "(project_id, proposer_id, path, proposed_content, summary) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (MISC_PROJECT_ID, "coach", "specs.md", "v2", "s"),
+            "INSERT INTO file_write_proposals "
+            "(project_id, proposer_id, scope, path, proposed_content, summary) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (MISC_PROJECT_ID, "coach", "truth", "specs.md", "v2", "s"),
         )
         pid_v2 = cur.lastrowid
         for sid in ids:
             await c.execute(
-                "UPDATE truth_proposals SET status = 'superseded', "
+                "UPDATE file_write_proposals SET status = 'superseded', "
                 "resolved_at = ?, resolved_by = 'system', "
                 "resolved_note = ? WHERE id = ? AND status = 'pending'",
                 ("2026-04-30T00:00:00Z", f"superseded by #{pid_v2}", sid),
@@ -1250,9 +1230,10 @@ async def test_supersede_invariant_at_most_one_pending_per_path(
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT COUNT(*) FROM truth_proposals "
-            "WHERE project_id = ? AND path = ? AND status = 'pending'",
-            (MISC_PROJECT_ID, "specs.md"),
+            "SELECT COUNT(*) FROM file_write_proposals "
+            "WHERE project_id = ? AND scope = ? AND path = ? "
+            "AND status = 'pending'",
+            (MISC_PROJECT_ID, "truth", "specs.md"),
         )
         (count,) = await cur.fetchone()
     finally:
@@ -1270,7 +1251,7 @@ async def test_supersede_does_not_touch_resolved_rows(fresh_db) -> None:
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "INSERT INTO truth_proposals "
+            "INSERT INTO file_write_proposals "
             "(project_id, proposer_id, path, proposed_content, summary, "
             "status, resolved_at, resolved_by) "
             "VALUES (?, ?, ?, ?, ?, 'approved', ?, 'human')",
@@ -1291,14 +1272,14 @@ async def test_supersede_does_not_touch_resolved_rows(fresh_db) -> None:
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT id FROM truth_proposals "
+            "SELECT id FROM file_write_proposals "
             "WHERE project_id = ? AND path = ? AND status = 'pending'",
             (MISC_PROJECT_ID, "specs.md"),
         )
         ids = [r[0] for r in await cur.fetchall()]
         for sid in ids:
             await c.execute(
-                "UPDATE truth_proposals SET status = 'superseded' "
+                "UPDATE file_write_proposals SET status = 'superseded' "
                 "WHERE id = ? AND status = 'pending'",
                 (sid,),
             )
@@ -1329,6 +1310,366 @@ def test_project_claude_md_stub_includes_truth_section(fresh_db) -> None:
     )
     body = pp.claude_md.read_text(encoding="utf-8")
     assert "## truth/" in body
-    assert "coord_propose_truth_update" in body
+    assert "coord_propose_file_write" in body
     assert "truth-index.md" in body
     assert MISC_PROJECT_ID in body  # slug interpolated
+    # New `## Updating this CLAUDE.md` section explaining the
+    # project_claude_md scope; agents reading the stub on first turn
+    # learn the proposal flow for editing CLAUDE.md itself.
+    assert "## Updating this CLAUDE.md" in body
+    assert "project_claude_md" in body
+
+
+# ---------- File-guard hook covers project CLAUDE.md too -----------
+
+
+async def test_file_guard_denies_write_to_project_claude_md(fresh_db) -> None:
+    """The hook now hard-denies any agent Write/Edit/MultiEdit/
+    NotebookEdit whose path resolves to a project's top-level
+    CLAUDE.md, with a deny reason that names the right tool."""
+    from server.agents import _pretool_file_guard_hook
+    from server.paths import ensure_project_scaffold
+
+    pp = ensure_project_scaffold(MISC_PROJECT_ID)
+    target = pp.claude_md
+    res = await _pretool_file_guard_hook(
+        {"tool_name": "Write", "tool_input": {"file_path": str(target)}},
+        "tu_1",
+        None,
+    )
+    out = res.get("hookSpecificOutput") or {}
+    assert out.get("permissionDecision") == "deny"
+    reason = out.get("permissionDecisionReason") or ""
+    assert "Project CLAUDE.md" in reason or "project CLAUDE.md" in reason.lower()
+    assert "coord_propose_file_write" in reason
+    assert "project_claude_md" in reason
+
+
+async def test_file_guard_allows_worktree_internal_claude_md(fresh_db) -> None:
+    """A Player's worktree-internal repo CLAUDE.md
+    (`<slug>/repo/<slot>/CLAUDE.md`) lives in the project tree but
+    isn't the protected instruction file; the hook must let it
+    through. Players' own repo files stay writable."""
+    from server.agents import _pretool_file_guard_hook
+    from server.paths import ensure_project_scaffold, project_paths
+
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    pp = project_paths(MISC_PROJECT_ID)
+    worktree_claude = pp.repo / "p1" / "CLAUDE.md"
+    worktree_claude.parent.mkdir(parents=True, exist_ok=True)
+    res = await _pretool_file_guard_hook(
+        {"tool_name": "Write",
+         "tool_input": {"file_path": str(worktree_claude)}},
+        "tu_1",
+        None,
+    )
+    assert res == {}, f"unexpected deny for {worktree_claude}: {res}"
+
+
+async def test_file_guard_denies_bash_against_project_claude_md(
+    fresh_db,
+) -> None:
+    """Bash commands containing `projects/<slug>/CLAUDE.md` are caught
+    by the substring heuristic, mirroring the existing truth/ pattern."""
+    from server.agents import _pretool_file_guard_hook
+    from server.paths import ensure_project_scaffold
+
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    cases = [
+        "echo hello > /data/projects/misc/CLAUDE.md",
+        "sed -i 's/foo/bar/' projects/misc/CLAUDE.md",
+        "cp draft.md /data/projects/misc/CLAUDE.md",
+    ]
+    for cmd in cases:
+        res = await _pretool_file_guard_hook(
+            {"tool_name": "Bash", "tool_input": {"command": cmd}},
+            "tu_1",
+            None,
+        )
+        out = res.get("hookSpecificOutput") or {}
+        assert out.get("permissionDecision") == "deny", \
+            f"cmd not denied: {cmd}"
+
+
+# ---------- coord_propose_file_write — project_claude_md scope -----
+
+
+async def test_propose_file_write_project_claude_md_accepts_canonical_path(
+    fresh_db,
+) -> None:
+    """scope='project_claude_md' with path='CLAUDE.md' queues a
+    proposal with the right scope recorded."""
+    await init_db()
+    from server.paths import ensure_project_scaffold
+    ensure_project_scaffold("misc")
+    from server.tools import build_coord_server
+    srv = build_coord_server("coach", include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_propose_file_write"]
+
+    out = await _propose_truth(
+        handler,
+        scope="project_claude_md",
+        path="CLAUDE.md",
+        content="# Project: misc\n\n## Goal\nrebuilt body\n",
+        summary="rebuild project CLAUDE.md",
+    )
+    assert out.get("isError") is not True
+    text = out["content"][0]["text"]
+    assert "scope=project_claude_md" in text
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT scope, path FROM file_write_proposals "
+            "WHERE project_id = ? AND status = 'pending' "
+            "ORDER BY id DESC LIMIT 1",
+            (MISC_PROJECT_ID,),
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    assert row is not None
+    assert row[0] == "project_claude_md"
+    assert row[1] == "CLAUDE.md"
+
+
+async def test_propose_file_write_project_claude_md_rejects_other_path(
+    fresh_db,
+) -> None:
+    """For scope='project_claude_md' the only legal path is exactly
+    'CLAUDE.md'. Anything else is rejected at propose time so a
+    malformed call can't write to a sibling file."""
+    await init_db()
+    from server.paths import ensure_project_scaffold
+    ensure_project_scaffold("misc")
+    from server.tools import build_coord_server
+    srv = build_coord_server("coach", include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_propose_file_write"]
+
+    for bad in ("specs.md", "../truth/specs.md", "subdir/CLAUDE.md", ""):
+        out = await _propose_truth(
+            handler,
+            scope="project_claude_md",
+            path=bad,
+            content="x",
+            summary="s",
+        )
+        assert out.get("isError") is True, f"path {bad!r} should be rejected"
+
+
+async def test_propose_file_write_rejects_unknown_scope(fresh_db) -> None:
+    """Unknown scopes (incl. 'global_claude_md', which is not a valid
+    proposal scope) are rejected at propose time."""
+    await init_db()
+    from server.paths import ensure_project_scaffold
+    ensure_project_scaffold("misc")
+    from server.tools import build_coord_server
+    srv = build_coord_server("coach", include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_propose_file_write"]
+
+    for bad_scope in ("global_claude_md", "knowledge", "decisions", ""):
+        out = await _propose_truth(
+            handler,
+            scope=bad_scope,
+            path="CLAUDE.md",
+            content="x",
+            summary="s",
+        )
+        assert out.get("isError") is True, \
+            f"scope {bad_scope!r} should be rejected"
+
+
+async def test_propose_file_write_supersede_isolated_by_scope(
+    fresh_db,
+) -> None:
+    """A truth-scope proposal at path 'CLAUDE.md' (hypothetical) and a
+    project_claude_md-scope proposal at path 'CLAUDE.md' must NOT
+    supersede each other — the scope filter is load-bearing."""
+    await init_db()
+    from server.paths import ensure_project_scaffold
+    ensure_project_scaffold("misc")
+    from server.tools import build_coord_server
+    srv = build_coord_server("coach", include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_propose_file_write"]
+
+    # Truth-scope proposal at path 'CLAUDE.md' (oddly named truth file).
+    out_truth = await _propose_truth(
+        handler,
+        scope="truth",
+        path="CLAUDE.md",
+        content="# Truth-side claude.md\n",
+        summary="truth-side",
+    )
+    assert out_truth.get("isError") is not True
+
+    # project_claude_md proposal at the canonical CLAUDE.md path.
+    out_pcm = await _propose_truth(
+        handler,
+        scope="project_claude_md",
+        path="CLAUDE.md",
+        content="# Project: misc\n",
+        summary="pcm",
+    )
+    assert out_pcm.get("isError") is not True
+
+    # Both proposals should still be pending — neither superseded the
+    # other since their scopes differ.
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT scope, status FROM file_write_proposals "
+            "WHERE project_id = ? ORDER BY id ASC",
+            (MISC_PROJECT_ID,),
+        )
+        rows = await cur.fetchall()
+    finally:
+        await c.close()
+    assert len(rows) == 2
+    statuses = {(r[0], r[1]) for r in rows}
+    assert ("truth", "pending") in statuses
+    assert ("project_claude_md", "pending") in statuses
+
+
+# ---------- Resolver: scope-aware writes --------------------------
+
+
+async def test_resolve_file_write_proposal_project_claude_md_writes_target(
+    fresh_db,
+) -> None:
+    """Approve flow for project_claude_md scope writes the project's
+    CLAUDE.md (not anything under truth/) and marks the row."""
+    from server.truth import resolve_file_write_proposal
+    from server.paths import ensure_project_scaffold, project_paths
+
+    await init_db()
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    pp = project_paths(MISC_PROJECT_ID)
+    # Make the file already exist with old content so we verify a true
+    # overwrite (the typical edit case).
+    pp.claude_md.write_text("old body\n", encoding="utf-8")
+
+    new_body = "# Project: misc\n\n## Goal\nnew\n"
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "INSERT INTO file_write_proposals "
+            "(project_id, proposer_id, scope, path, "
+            "proposed_content, summary) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (MISC_PROJECT_ID, "coach", "project_claude_md",
+             "CLAUDE.md", new_body, "rebuild"),
+        )
+        await c.commit()
+        proposal_id = cur.lastrowid
+    finally:
+        await c.close()
+
+    res = await resolve_file_write_proposal(
+        proposal_id, new_status="approved", note=None,
+        actor={"source": "ui", "ip": "127.0.0.1", "ua": "test"},
+    )
+    assert res["status"] == "approved"
+    assert res["scope"] == "project_claude_md"
+    assert pp.claude_md.read_text(encoding="utf-8") == new_body
+
+
+async def test_resolve_file_write_proposal_rejects_tampered_pcm_path(
+    fresh_db,
+) -> None:
+    """If a row was tampered with so a project_claude_md proposal has
+    a path other than 'CLAUDE.md', the resolver refuses the write
+    (defense-in-depth even though the propose tool also rejects)."""
+    from server.truth import (
+        FileWriteProposalBadRequest, resolve_file_write_proposal,
+    )
+    from server.paths import ensure_project_scaffold
+
+    await init_db()
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "INSERT INTO file_write_proposals "
+            "(project_id, proposer_id, scope, path, "
+            "proposed_content, summary) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (MISC_PROJECT_ID, "coach", "project_claude_md",
+             "../truth/specs.md", "tampered", "x"),
+        )
+        await c.commit()
+        proposal_id = cur.lastrowid
+    finally:
+        await c.close()
+
+    try:
+        await resolve_file_write_proposal(
+            proposal_id, new_status="approved", note=None,
+            actor={"source": "ui", "ip": "127.0.0.1", "ua": "test"},
+        )
+        assert False, "tampered path should have raised"
+    except FileWriteProposalBadRequest as e:
+        assert "CLAUDE.md" in str(e)
+
+
+async def test_resolve_file_write_proposal_unknown_scope_rejected(
+    fresh_db,
+) -> None:
+    """A row whose scope column was set to an unknown value (e.g. via
+    a future schema migration that adds a scope, then is rolled back)
+    raises rather than silently skipping the write."""
+    from server.truth import (
+        FileWriteProposalBadRequest, resolve_file_write_proposal,
+    )
+    from server.paths import ensure_project_scaffold
+
+    await init_db()
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "INSERT INTO file_write_proposals "
+            "(project_id, proposer_id, scope, path, "
+            "proposed_content, summary) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (MISC_PROJECT_ID, "coach", "future_scope",
+             "anywhere", "x", "s"),
+        )
+        await c.commit()
+        proposal_id = cur.lastrowid
+    finally:
+        await c.close()
+
+    try:
+        await resolve_file_write_proposal(
+            proposal_id, new_status="approved", note=None,
+            actor={"source": "ui", "ip": "127.0.0.1", "ua": "test"},
+        )
+        assert False, "unknown scope should have raised"
+    except FileWriteProposalBadRequest as e:
+        assert "scope" in str(e).lower()
+
+
+# ---------- resolve_target_path is exported ------------------------
+
+
+def test_resolve_target_path_dispatches_by_scope() -> None:
+    """The diff endpoint in main.py imports resolve_target_path
+    from server.truth — verify it's exposed and dispatches correctly
+    without going through the full resolver path."""
+    from server.truth import resolve_target_path
+    from server.paths import project_paths
+
+    pp = project_paths(MISC_PROJECT_ID)
+    truth_target = resolve_target_path({
+        "scope": "truth",
+        "project_id": MISC_PROJECT_ID,
+        "path": "specs.md",
+    })
+    assert truth_target == (pp.truth / "specs.md").resolve()
+
+    pcm_target = resolve_target_path({
+        "scope": "project_claude_md",
+        "project_id": MISC_PROJECT_ID,
+        "path": "CLAUDE.md",
+    })
+    assert pcm_target == pp.claude_md

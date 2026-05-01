@@ -877,6 +877,30 @@ body {
 .env-decision-arrow { color: var(--muted); width: 10px; flex-shrink: 0; }
 .env-decision-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .env-decision-meta { color: var(--muted); font-size: 10px; flex-shrink: 0; }
+
+/* File-write proposal scope badge — small pill that lives left of the
+   decision-title in the row header. Each scope gets its own accent so
+   the human can scan a list of pending proposals and immediately see
+   which are truth-lane edits vs. project CLAUDE.md edits. */
+.env-fw-scope {
+  flex-shrink: 0;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  background: var(--card);
+}
+.env-fw-scope-truth {
+  border-color: var(--coach);
+  color: var(--coach);
+}
+.env-fw-scope-project_claude_md {
+  border-color: var(--ok, #56d364);
+  color: var(--ok, #56d364);
+}
 .env-decision-body {
   margin: 4px 0 8px 16px;
   padding: 8px 10px;
@@ -933,72 +957,6 @@ body {
 .env-truth-deny:disabled {
   opacity: 0.5;
   cursor: default;
-}
-
-/* Expected-files manifest list (EnvTruthExpectedSection). One row per
-   bullet from truth-index.md. Existing files muted; missing rows
-   highlight the create button. */
-.env-truth-expected {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.env-truth-expected-row {
-  padding: 6px 10px;
-  border-left: 2px solid var(--border);
-  background: var(--card);
-  border-radius: 0 3px 3px 0;
-}
-.env-truth-expected-row.exists { border-left-color: var(--ok, #56d364); }
-.env-truth-expected-row.missing { border-left-color: var(--accent); }
-.env-truth-expected-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.env-truth-expected-name {
-  font-family: ui-monospace, Menlo, Consolas, "Fira Code", monospace;
-  font-size: 11px;
-  color: var(--fg);
-  flex: 1 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  background: transparent;
-  padding: 0;
-}
-.env-truth-expected-action {
-  font: inherit;
-  font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 3px;
-  border: 1px solid var(--border);
-  background: var(--card);
-  color: var(--fg);
-  cursor: pointer;
-  text-decoration: none;
-  flex-shrink: 0;
-}
-.env-truth-expected-action:hover:not(:disabled) {
-  background: var(--border);
-}
-.env-truth-expected-create {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-.env-truth-expected-create:hover:not(:disabled) {
-  background: var(--accent);
-  color: var(--bg);
-}
-.env-truth-expected-create:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-.env-truth-expected-desc {
-  margin-top: 2px;
-  font-size: 11px;
-  color: var(--muted);
-  line-height: 1.4;
 }
 
 /* ---- env timeline ---- */
@@ -2358,6 +2316,27 @@ body {
   cursor: pointer;
 }
 .pane-files-save:disabled { opacity: 0.5; cursor: wait; }
+
+/* "+ new file" button — secondary action, neutral until hover, sits
+   alongside save in the FilesPane header. */
+.pane-files-new {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.pane-files-new:hover:not(:disabled) {
+  color: var(--fg);
+  border-color: var(--accent);
+}
+.pane-files-new:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
 
 /* Files icon in LeftRail — file-tree glyph (a vertical trunk with
    three small horizontal "rows" branching off it). Drawn in pure CSS

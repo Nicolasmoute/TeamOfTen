@@ -3633,9 +3633,21 @@ async def files_write(
     root: str,
     req: FileWrite,
     path: str = Query(..., description="relative to root"),
+    create_only: bool = Query(
+        False,
+        description=(
+            "If true, refuse to overwrite an existing file (409). Used "
+            "by the Files-pane '+ new file' button so an empty body "
+            "doesn't silently truncate an existing file."
+        ),
+    ),
 ) -> dict[str, Any]:
     try:
-        result = await filesmod.write_text(root, path, req.content)
+        result = await filesmod.write_text(
+            root, path, req.content, create_only=create_only,
+        )
+    except filesmod.FileAlreadyExists as e:
+        raise HTTPException(409, detail=str(e))
     except PermissionError as e:
         raise HTTPException(403, detail=str(e))
     except ValueError as e:
@@ -3666,32 +3678,49 @@ async def files_write(
     return {"ok": True, **result}
 
 
-class TruthProposalResolution(BaseModel):
+class FileWriteProposalResolution(BaseModel):
     note: str | None = Field(default=None, max_length=400)
 
 
-@app.get("/api/truth/proposals", dependencies=[Depends(require_token)])
-async def list_truth_proposals(
-    status: str | None = None, limit: int = 50,
-) -> dict[str, Any]:
-    """List truth/ proposals for the active project, newest first.
+_VALID_SCOPES = ("truth", "project_claude_md")
 
-    Filter by status (`pending` | `approved` | `denied` | `cancelled`)
-    or omit to get all. Default limit 50; cap 200.
+
+@app.get(
+    "/api/file-write-proposals", dependencies=[Depends(require_token)],
+)
+async def list_file_write_proposals(
+    status: str | None = None,
+    scope: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """List file-write proposals for the active project, newest first.
+
+    Filters:
+      - status: `pending` | `approved` | `denied` | `cancelled` |
+        `superseded`. Omit for all.
+      - scope: `truth` | `project_claude_md`. Omit for all.
+    Default limit 50; cap 200.
     """
     limit = max(1, min(limit, 200))
     project_id = await resolve_active_project()
     where = ["project_id = ?"]
     params: list[Any] = [project_id]
     if status:
-        if status not in ("pending", "approved", "denied", "cancelled"):
+        if status not in (
+            "pending", "approved", "denied", "cancelled", "superseded",
+        ):
             raise HTTPException(400, detail="invalid status filter")
         where.append("status = ?")
         params.append(status)
+    if scope:
+        if scope not in _VALID_SCOPES:
+            raise HTTPException(400, detail="invalid scope filter")
+        where.append("scope = ?")
+        params.append(scope)
     sql = (
-        "SELECT id, project_id, proposer_id, path, proposed_content, "
-        "summary, status, created_at, resolved_at, resolved_by, "
-        "resolved_note FROM truth_proposals WHERE "
+        "SELECT id, project_id, proposer_id, scope, path, "
+        "proposed_content, summary, status, created_at, resolved_at, "
+        "resolved_by, resolved_note FROM file_write_proposals WHERE "
         + " AND ".join(where) + " ORDER BY id DESC LIMIT ?"
     )
     params.append(limit)
@@ -3703,119 +3732,109 @@ async def list_truth_proposals(
         await c.close()
     return {
         "proposals": [
-            truthmod.truth_proposal_row_to_dict(r) for r in rows
+            truthmod.file_write_proposal_row_to_dict(r) for r in rows
         ],
     }
 
 
-async def _resolve_truth_proposal_http(
+@app.get(
+    "/api/file-write-proposals/{proposal_id}/diff",
+    dependencies=[Depends(require_token)],
+)
+async def file_write_proposal_diff(proposal_id: int) -> dict[str, Any]:
+    """Return `{scope, path, before, after}` for a proposal so the UI
+    can render a side-by-side diff.
+
+    `before` is the current file content read fresh from disk (or
+    `None` if the file doesn't exist yet — Step 6 UI suppresses the
+    diff and falls back to a plain proposed-content render in that
+    case). `after` is the proposed content. The fresh read avoids
+    DB-cached staleness if the file was edited (Files pane, manual
+    kDrive sync, etc.) between propose and approve.
+    """
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            truthmod.SELECT_PROPOSAL_SQL, (proposal_id,),
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    if not row:
+        raise HTTPException(404, detail=f"proposal {proposal_id} not found")
+    proposal = truthmod.file_write_proposal_row_to_dict(row)
+    try:
+        target = truthmod.resolve_target_path(proposal)
+    except truthmod.FileWriteProposalBadRequest as e:
+        # Row references a scope/path the resolver can't honour. The UI
+        # still wants a render, so surface the bad-request as 400 and
+        # let it fall back to plain proposed-content view.
+        raise HTTPException(400, detail=str(e))
+    try:
+        before: str | None = target.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        before = None
+    except OSError as e:
+        raise HTTPException(500, detail=f"read failed: {e}")
+    return {
+        "id": proposal_id,
+        "scope": proposal["scope"],
+        "path": proposal["path"],
+        "before": before,
+        "after": proposal["proposed_content"],
+    }
+
+
+async def _resolve_file_write_proposal_http(
     proposal_id: int,
     *,
     new_status: str,
     note: str | None,
     actor: dict[str, Any],
 ) -> dict[str, Any]:
-    """Thin HTTP wrapper around `truthmod.resolve_truth_proposal` —
-    translates the resolver's exception types into HTTP status codes."""
+    """Thin HTTP wrapper around
+    `truthmod.resolve_file_write_proposal` — translates the resolver's
+    exception types into HTTP status codes."""
     try:
-        return await truthmod.resolve_truth_proposal(
+        return await truthmod.resolve_file_write_proposal(
             proposal_id, new_status=new_status, note=note, actor=actor,
         )
-    except truthmod.TruthProposalNotFound as e:
+    except truthmod.FileWriteProposalNotFound as e:
         raise HTTPException(404, detail=str(e))
-    except truthmod.TruthProposalConflict as e:
+    except truthmod.FileWriteProposalConflict as e:
         raise HTTPException(409, detail=str(e))
-    except truthmod.TruthProposalBadRequest as e:
+    except truthmod.FileWriteProposalBadRequest as e:
         raise HTTPException(400, detail=str(e))
 
 
 @app.post(
-    "/api/truth/proposals/{proposal_id}/approve",
+    "/api/file-write-proposals/{proposal_id}/approve",
     dependencies=[Depends(require_token)],
 )
-async def approve_truth_proposal(
+async def approve_file_write_proposal(
     proposal_id: int,
-    body: TruthProposalResolution | None = None,
+    body: FileWriteProposalResolution | None = None,
     actor: dict[str, Any] = Depends(audit_actor),
 ) -> dict[str, Any]:
     note = body.note if body else None
-    return await _resolve_truth_proposal_http(
+    return await _resolve_file_write_proposal_http(
         proposal_id, new_status="approved", note=note, actor=actor,
     )
 
 
 @app.post(
-    "/api/truth/proposals/{proposal_id}/deny",
+    "/api/file-write-proposals/{proposal_id}/deny",
     dependencies=[Depends(require_token)],
 )
-async def deny_truth_proposal(
+async def deny_file_write_proposal(
     proposal_id: int,
-    body: TruthProposalResolution | None = None,
+    body: FileWriteProposalResolution | None = None,
     actor: dict[str, Any] = Depends(audit_actor),
 ) -> dict[str, Any]:
     note = body.note if body else None
-    return await _resolve_truth_proposal_http(
+    return await _resolve_file_write_proposal_http(
         proposal_id, new_status="denied", note=note, actor=actor,
     )
-
-
-class TruthCreateEmptyBody(BaseModel):
-    path: str = Field(..., min_length=1, max_length=400)
-
-
-@app.get("/api/truth/manifest", dependencies=[Depends(require_token)])
-async def get_truth_manifest() -> dict[str, Any]:
-    """Parsed expected-files list from truth/truth-index.md.
-
-    Each entry: filename, description, exists (on disk), size (bytes
-    when exists). The manifest file itself is filtered out. Empty
-    list when truth-index.md is missing or has no parseable bullets.
-    """
-    project_id = await resolve_active_project()
-    return {
-        "project_id": project_id,
-        "entries": truthmod.parse_truth_manifest(project_id),
-    }
-
-
-@app.post(
-    "/api/truth/files/create_empty",
-    dependencies=[Depends(require_token)],
-)
-async def create_empty_truth_file(
-    body: TruthCreateEmptyBody,
-    actor: dict[str, Any] = Depends(audit_actor),
-) -> dict[str, Any]:
-    """Create a zero-byte file under the active project's truth/.
-
-    Used by the EnvPane "create empty" button on missing manifest
-    entries. Refuses if the target already exists (409); rejects path
-    traversal (400); bypasses the Files-pane `.md`/`.txt` restriction
-    so the user can create whatever extension they listed in the
-    manifest.
-    """
-    project_id = await resolve_active_project()
-    try:
-        result = truthmod.create_empty_truth_file(project_id, body.path)
-    except truthmod.TruthProposalConflict as e:
-        if e.status == "exists":
-            raise HTTPException(409, detail="file already exists")
-        raise HTTPException(409, detail=str(e))
-    except truthmod.TruthProposalBadRequest as e:
-        raise HTTPException(400, detail=str(e))
-    rel = result["path"]
-    await bus.publish(
-        {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "agent_id": "human",
-            "type": "file_written",
-            "root": "project",
-            "path": "truth/" + rel,
-            "size": 0,
-            "actor": actor,
-        }
-    )
-    return {"ok": True, "path": rel, "size": 0}
 
 
 @app.post("/api/wiki/reindex", dependencies=[Depends(require_token)])

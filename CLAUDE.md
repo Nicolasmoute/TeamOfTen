@@ -703,7 +703,7 @@ Players. Spec: [Docs/compass-specs.md](Docs/compass-specs.md).
   `truth.json`** — see "Truth is folder-backed" below.
 - **Truth is folder-backed.** Compass reads truth from the project's
   existing `<project>/truth/` lane (managed by humans via the Files
-  pane and by Coach via `coord_propose_truth_update`). Each `.md` /
+  pane and by Coach via `coord_propose_file_write(scope='truth', ...)`). Each `.md` /
   `.txt` file is one truth fact; the adapter
   ([server/compass/truth.py](server/compass/truth.py)) walks the
   folder fresh on every `load_state` call. The dashboard shows a
@@ -712,18 +712,43 @@ Players. Spec: [Docs/compass-specs.md](Docs/compass-specs.md).
   in the harness's existing truth-edit flow. Truth-conflict modal's
   "amend truth" path points the human at the offending file path
   rather than offering an in-modal edit.
-- **Stage 0 — truth-derive (per the user's "truth seeds world-model"
-  principle).** Before the answer-digest stage, the runner reads the
-  truth corpus and asks the LLM to propose lattice statements
-  representing what truth implies. New statements start at
-  `weight=0.75`, `created_by="compass-truth"`. Idempotent via a
-  SHA-256 hash stored in `team_config['compass_truth_hash_<id>']`:
-  unchanged hash → skip the LLM call entirely; changed hash → run
-  derive (and the LLM is also told to skip statements already
-  represented). Net effect: as long as truth exists, the lattice has
-  an immediate basis on the very first run; subsequent runs only
-  re-derive when truth files actually change. See
-  [server/compass/pipeline/truth_derive.py](server/compass/pipeline/truth_derive.py).
+- **Stage 0 — truth ingestion (two sub-stages).** Before the answer-
+  digest stage, the runner reads the truth corpus fresh and runs:
+  - **0a Truth-derive** — propose lattice statements representing
+    what truth implies. New statements start at `weight=0.75`,
+    `created_by="compass-truth"`. Idempotent via SHA-256 over the
+    corpus stored in `team_config['compass_truth_hash_<id>']`:
+    unchanged hash → skip the LLM entirely; changed hash → run derive
+    (LLM is also told to skip statements already represented).
+    See [server/compass/pipeline/truth_derive.py](server/compass/pipeline/truth_derive.py).
+  - **0b Reconciliation** — when the corpus hash changes AND the
+    pre-derive lattice was non-empty, scan active + archived/settled
+    rows against the corpus for contradictions. Each conflict becomes
+    a `ReconciliationProposal` (a fourth proposal type alongside
+    settle/stale/dupe) with three resolution paths: `update_lattice`
+    (sub-actions: unarchive / flip / reformulate / replace),
+    `update_truth` (informational; routes the human to the Files
+    pane), `accept_ambiguity` (sets `reconciliation_ambiguity`
+    flag, suppresses re-detection until the corpus shifts).
+    Pending proposals expire after `PROPOSAL_EXPIRY_RUNS=5` runs of
+    being ignored. See
+    [server/compass/pipeline/reconciliation.py](server/compass/pipeline/reconciliation.py).
+  Net effect: as long as truth exists, the lattice has an immediate
+  basis on the very first run; on subsequent runs an edited truth
+  file both adds new lattice rows AND surfaces any rows the new
+  corpus contradicts (especially settled ones, which Coach treats as
+  binding). The corpus hash is persisted only after BOTH sub-stages
+  complete cleanly so a partial failure re-attempts next run.
+- **`POST /api/compass/proposals/reconcile/{id}`** resolves a
+  reconciliation proposal. Mutate helpers in
+  [server/compass/mutate.py](server/compass/mutate.py):
+  `reconcile_unarchive`, `reconcile_flip_archive`,
+  `reconcile_reformulate`, `reconcile_replace`,
+  `reconcile_accept_ambiguity`. Dashboard renders the
+  `ReconciliationProposalCard` in the lattice column under the dupe
+  cards. The `compass_reconciliation_proposed` bus event emits when
+  fresh conflicts appear; `compass_proposal_resolved` (with
+  `kind="reconcile"`) emits on resolution.
 - **Pipeline stages** under
   [server/compass/pipeline/](server/compass/pipeline/) — pure
   functions that take state and return proposed updates:

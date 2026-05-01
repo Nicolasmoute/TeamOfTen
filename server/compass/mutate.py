@@ -408,7 +408,8 @@ def manual_weight_override(
 
 # Truth has no mutate helpers — Compass never writes truth. Truth
 # lives in the project's `truth/` folder, edited by humans via the
-# Files pane and proposed by Coach via `coord_propose_truth_update`.
+# Files pane and proposed by Coach via
+# `coord_propose_file_write(scope='truth', ...)`.
 # Compass reads it via `server.compass.truth.read_truth_facts`.
 
 
@@ -429,6 +430,207 @@ def restore_statement(state: LatticeState, sid: str) -> Statement | None:
     return s
 
 
+# --------------------------------------------------- reconciliation
+
+
+def reconcile_unarchive(
+    state: LatticeState,
+    sid: str,
+    *,
+    run_id: str,
+    new_weight: float = 0.5,
+) -> Statement | None:
+    """Resolution path #1a — corpus contradicts a settled row, human
+    chose "lattice is wrong". Restore to active at a moderate weight
+    so subsequent runs re-evaluate. Records a history entry tying the
+    move back to the reconciliation."""
+    s = state.find_statement(sid)
+    if s is None:
+        return None
+    new_weight = max(0.0, min(1.0, float(new_weight)))
+    delta = new_weight - float(s.weight)
+    s.archived = False
+    s.archived_at = None
+    s.settled_as = None
+    s.settled_by_human = False
+    s.weight = new_weight
+    s.reconciliation_proposed = False
+    s.reconciliation_ambiguity = False
+    s.history.append({
+        "run_id": run_id,
+        "delta": round(delta, 4),
+        "rationale": "reconciled — un-archived for re-evaluation",
+        "source": "reconcile:unarchive",
+    })
+    return s
+
+
+def reconcile_flip_archive(
+    state: LatticeState,
+    sid: str,
+    *,
+    run_id: str,
+) -> Statement | None:
+    """Resolution path #1b — corpus says the OPPOSITE direction.
+    Settle at the flipped value, by-human, so the row stays archived
+    but with the corrected polarity."""
+    s = state.find_statement(sid)
+    if s is None:
+        return None
+    if s.settled_as not in ("yes", "no"):
+        # Can't flip if it wasn't directionally settled. Caller should
+        # use unarchive + manual override instead.
+        return None
+    new_dir = "no" if s.settled_as == "yes" else "yes"
+    new_weight = 1.0 if new_dir == "yes" else 0.0
+    delta = new_weight - float(s.weight)
+    s.weight = new_weight
+    s.archived = True
+    s.archived_at = _now_iso()
+    s.settled_as = new_dir
+    s.settled_by_human = True
+    s.reconciliation_proposed = False
+    s.reconciliation_ambiguity = False
+    s.history.append({
+        "run_id": run_id,
+        "delta": round(delta, 4),
+        "rationale": f"reconciled — flipped settle from prior to {new_dir}",
+        "source": "reconcile:flip",
+    })
+    return s
+
+
+def reconcile_reformulate(
+    state: LatticeState,
+    sid: str,
+    new_text: str,
+    *,
+    run_id: str,
+    new_region: str | None = None,
+) -> Statement | None:
+    """Resolution path #1c — corpus implies a different framing.
+    Replace text and reset weight to 0.5; if the row was archived,
+    un-archive it. Weight history is reset (the framing is new)."""
+    s = state.find_statement(sid)
+    if s is None:
+        return None
+    new_text = (new_text or "").strip()
+    if not new_text:
+        return None
+    s.text = new_text
+    if new_region:
+        ensure_region(state, new_region)
+        s.region = new_region
+    s.weight = 0.5
+    s.archived = False
+    s.archived_at = None
+    s.settled_as = None
+    s.settled_by_human = False
+    s.history = [{
+        "run_id": run_id,
+        "delta": 0.0,
+        "rationale": "reconciled — reformulated against corpus",
+        "source": "reconcile:reformulate",
+    }]
+    s.reformulated = True
+    s.reconciliation_proposed = False
+    s.reconciliation_ambiguity = False
+    return s
+
+
+def reconcile_replace(
+    state: LatticeState,
+    sid: str,
+    *,
+    new_text: str,
+    region: str,
+    run_id: str,
+) -> tuple[Statement, Statement] | None:
+    """Resolution path #1d — archive the old row as merged-out and
+    insert a fresh truth-grounded equivalent in its place. Returns
+    (old_archived, new_active) on success.
+
+    The new row uses `created_by="compass-truth"` and weight 0.75 so
+    it reads identically to a Stage 0 truth-derive row. The old row
+    keeps its history but is archived with `settled_as="reconciled"`.
+    """
+    s = state.find_statement(sid)
+    if s is None:
+        return None
+    new_text = (new_text or "").strip()
+    region = (region or "").strip()
+    if not new_text or not region:
+        return None
+    ensure_region(state, region)
+    now = _now_iso()
+    # Archive the loser.
+    s.archived = True
+    s.archived_at = now
+    s.settled_as = "reconciled"
+    s.settled_by_human = True
+    s.reconciliation_proposed = False
+    s.reconciliation_ambiguity = False
+    s.history.append({
+        "run_id": run_id,
+        "delta": 0.0,
+        "rationale": "reconciled — replaced by corpus-grounded equivalent",
+        "source": "reconcile:replace",
+    })
+    # Insert the survivor.
+    from server.compass.store import next_statement_id  # noqa: PLC0415
+    new_id = next_statement_id(state)
+    new_stmt = Statement(
+        id=new_id,
+        text=new_text,
+        region=region,
+        weight=0.75,
+        created_at=now,
+        created_by="compass-truth",
+        merged=True,
+        merged_from=[s.id],
+        history=[{
+            "run_id": run_id,
+            "delta": 0.0,
+            "rationale": f"reconciled — replaces {s.id} per corpus",
+            "source": "reconcile:replace",
+        }],
+    )
+    state.statements.append(new_stmt)
+    return s, new_stmt
+
+
+def reconcile_accept_ambiguity(
+    state: LatticeState,
+    sid: str,
+) -> Statement | None:
+    """Resolution path #3 — leave the row as-is, acknowledge the
+    contradiction, suppress re-detection until the row or the corpus
+    moves. Same shape as `keep_stale` for stale proposals."""
+    s = state.find_statement(sid)
+    if s is None:
+        return None
+    s.reconciliation_proposed = False
+    s.reconciliation_ambiguity = True
+    return s
+
+
+def mark_reconciliation_proposed(
+    state: LatticeState,
+    statement_ids: list[str],
+) -> None:
+    """After persisting reconciliation proposals, set the in-state
+    flag on each cited statement so the next run's detection skips
+    them. Mirrors `pipeline.reviews.mark_proposed_flags` in shape.
+    Also clears `reconciliation_ambiguity` for any of the listed
+    statements where the corpus has shifted enough to re-trigger
+    detection (the LLM only flags re-conflicts after a corpus change)."""
+    sids = set(statement_ids)
+    for s in state.statements:
+        if s.id in sids:
+            s.reconciliation_proposed = True
+            s.reconciliation_ambiguity = False
+
+
 __all__ = [
     "apply_statement_updates",
     "apply_new_statements",
@@ -441,4 +643,10 @@ __all__ = [
     "merge_duplicate_cluster",
     "manual_weight_override",
     "restore_statement",
+    "reconcile_unarchive",
+    "reconcile_flip_archive",
+    "reconcile_reformulate",
+    "reconcile_replace",
+    "reconcile_accept_ambiguity",
+    "mark_reconciliation_proposed",
 ]

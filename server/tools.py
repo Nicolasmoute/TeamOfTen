@@ -1273,44 +1273,57 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             f"decision '{title}' saved to {location} ({len(body)} chars of body)"
         )
 
-    # Coach edits the global CLAUDE.md at /data/CLAUDE.md and
-    # per-project CLAUDE.md at /data/projects/<active>/CLAUDE.md via
-    # the standard Write tool; both files are read fresh on every
-    # agent turn (server/context.py).
+    # Coach proposes edits to harness-managed files (truth/* and the
+    # per-project CLAUDE.md) via `coord_propose_file_write` below; the
+    # human reviews a diff and approves in the UI. The global
+    # /data/CLAUDE.md is NOT proposeable — only the user edits the
+    # harness-wide instructions. All these files are read fresh on
+    # every agent turn (server/context.py).
 
     @tool(
-        "coord_propose_truth_update",
+        "coord_propose_file_write",
         (
-            "Coach-only. Propose an update to a file under the **currently "
-            "active** project's truth/ folder. The path is rooted at "
-            "`/data/projects/<active-slug>/truth/` — it is NOT a path "
-            "anywhere under `/data/projects/`. To target a different "
-            "project, ask the user to switch the active project first; "
-            "do not encode the project slug in the path.\n"
+            "Coach-only. Propose a write to a harness-managed file in "
+            "the **currently active** project. The user reviews a diff "
+            "and approves/denies in the UI's 'File-write proposals' "
+            "section; on approve the harness writes the file. To "
+            "target a different project, ask the user to switch the "
+            "active project first.\n"
             "\n"
-            "truth/ is the user's signed-off source-of-truth (specs, "
-            "brand guidelines, contracts); agents NEVER write to it "
-            "directly — the harness's PreToolUse guard hook denies any "
-            "direct Write/Edit/Bash to truth/. This tool is the ONLY "
-            "path to change truth/, and approval is gated on an explicit "
-            "human click in the UI's 'Truth proposals' section. Players "
-            "cannot call this tool — they must ask Coach to relay.\n"
+            "Two scopes:\n"
+            "  - 'truth': `path` is relative under the active project's "
+            "    `truth/` folder (e.g. 'specs.md', 'brand/colors.md'). "
+            "    truth/ is the user's signed-off source-of-truth "
+            "    (specs, brand guidelines, contracts); agents NEVER "
+            "    write to it directly — the harness's PreToolUse guard "
+            "    hook denies any direct Write/Edit/Bash to truth/.\n"
+            "  - 'project_claude_md': `path` must be exactly 'CLAUDE.md'. "
+            "    Targets `/data/projects/<active-slug>/CLAUDE.md` — the "
+            "    project's instruction file, read fresh into every "
+            "    agent's system prompt. Use this to keep the project's "
+            "    Goal / Stakeholders / Team / Glossary / Conventions / "
+            "    truth-section paragraphs current.\n"
+            "\n"
+            "Players cannot call this tool — they must ask Coach to "
+            "relay. The global /data/CLAUDE.md (harness-wide) is NOT a "
+            "valid scope; only the user edits that file directly.\n"
             "\n"
             "What happens:\n"
             "  1. The proposal is queued (status=pending).\n"
-            "  2. ANY prior pending proposal for the same path is "
-            "auto-superseded — only your latest proposal is offered to "
-            "the user for approval. So your new proposal must include "
-            "EVERY change you still want for that file (the prior "
-            "proposal's content is discarded). If unsure what's "
-            "currently pending, look for `truth_proposal_*` events in "
-            "your timeline before composing.\n"
+            "  2. ANY prior pending proposal for the same (scope, "
+            "path) is auto-superseded — only your latest proposal is "
+            "offered to the user for approval. So your new proposal "
+            "must include EVERY change you still want for that file "
+            "(the prior proposal's content is discarded). If unsure "
+            "what's currently pending, look for "
+            "`file_write_proposal_*` events in your timeline before "
+            "composing.\n"
             "  3. The user reviews the diff in the UI and clicks "
             "approve or deny.\n"
             "  4. On approve, the harness writes the file with the "
             "proposed content. On deny, the file is left as-is.\n"
-            "  5. A `truth_proposal_resolved` event fires so you'll "
-            "see the outcome on your next turn.\n"
+            "  5. A `file_write_proposal_resolved` event fires so "
+            "you'll see the outcome on your next turn.\n"
             "\n"
             "Reorganizing the truth folder (e.g. splitting a growing "
             "specs.md into specs.md + architecture.md + scope.md): "
@@ -1321,81 +1334,110 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "a separate call; the user approves them in order.\n"
             "\n"
             "Params:\n"
-            "- path: relative path WITHIN the active project's truth/ "
-            "  (e.g. 'specs.md' or 'brand/colors.md', NOT "
-            "  'projects/<slug>/...' or '/data/...'). Required. No "
-            "  leading slash, no '..' segments, no leading project "
-            "  slug.\n"
+            "- scope: 'truth' or 'project_claude_md' (required).\n"
+            "- path: scope-relative path. For 'truth': relative under "
+            "  the active project's truth/ (e.g. 'specs.md' or "
+            "  'brand/colors.md'; NOT 'projects/<slug>/...' or "
+            "  '/data/...'). For 'project_claude_md': must be exactly "
+            "  'CLAUDE.md'. Required.\n"
             "- content: full new file body (required). This is a full "
             "  REPLACE — include the parts you're keeping verbatim, "
-            "  not just a diff.\n"
+            "  not just a diff. The user reviews a diff against the "
+            "  current file content in the UI.\n"
             "- summary: one-line 'why' the user reads next to "
             "  approve/deny (required, ≤ 200 chars). Be specific: "
             "  'Add launch-date constraint to specs.md §3' beats "
             "  'update specs'."
         ),
-        {"path": str, "content": str, "summary": str},
+        {"scope": str, "path": str, "content": str, "summary": str},
     )
-    async def propose_truth_update(args: dict[str, Any]) -> dict[str, Any]:
+    async def propose_file_write(args: dict[str, Any]) -> dict[str, Any]:
         if not caller_is_coach:
             return _err(
-                "Only Coach can propose truth/ updates. Players: send "
-                "a coord_send_message to coach describing the proposed "
+                "Only Coach can propose file writes. Players: send a "
+                "coord_send_message to coach describing the proposed "
                 "change; Coach will relay it as a proposal."
             )
+        scope = (args.get("scope") or "").strip()
         rel = (args.get("path") or "").strip()
         content = args.get("content")
         summary = (args.get("summary") or "").strip()
+
+        if scope not in ("truth", "project_claude_md"):
+            return _err(
+                f"scope must be 'truth' or 'project_claude_md' (got "
+                f"{scope!r}). The global /data/CLAUDE.md is not a "
+                "valid scope."
+            )
         if not rel:
             return _err("path is required")
-        # Defensive strip: Coach is told to pass paths relative to truth/
-        # (e.g. "specs.md", not "truth/specs.md"), but accept the prefixed
-        # form too rather than fail confusingly. Strip a single leading
-        # "truth/" so "truth/specs.md" and "specs.md" both resolve to
-        # /data/projects/<slug>/truth/specs.md.
-        if rel.startswith("truth/"):
-            rel = rel[len("truth/"):]
-        if rel.startswith("/") or ".." in rel.split("/"):
-            return _err(
-                "path must be relative under the active project's "
-                "truth/ folder, no leading slash, no '..' segments"
-            )
-        # Catch a recurrent Coach mistake: encoding the target project
-        # slug in the path (e.g. "projects/dynamichypergraph/CLAUDE.md").
-        # truth/ is rooted at the active project — there's no way to
-        # cross-project from the path. Detect when the first segment
-        # matches an existing project slug and tell Coach to switch
-        # active project instead. Also catches a literal "projects/"
-        # prefix even when the second segment isn't a known slug.
-        first_seg = rel.split("/", 1)[0]
-        if first_seg == "projects":
-            return _err(
-                f"path '{rel}' starts with 'projects/' — truth/ is rooted "
-                "at the active project's truth folder, not anywhere under "
-                "/data/projects/. To target a different project, ask the "
-                "user to switch the active project first, then pass the "
-                "path relative to that project's truth/ (e.g. "
-                "'CLAUDE.md', not 'projects/<slug>/CLAUDE.md')."
-            )
-        c_slug_check = await configured_conn()
-        try:
-            cur = await c_slug_check.execute(
-                "SELECT 1 FROM projects WHERE id = ? LIMIT 1",
-                (first_seg,),
-            )
-            slug_match = await cur.fetchone()
-        finally:
-            await c_slug_check.close()
-        if slug_match:
-            return _err(
-                f"path '{rel}' starts with project slug '{first_seg}' — "
-                "the path is rooted at the *currently active* project's "
-                "truth/ folder, not anywhere under /data/projects/. To "
-                f"target the '{first_seg}' project, ask the user to "
-                "switch active project to it first, then pass the path "
-                "relative to its truth/ (e.g. drop the leading "
-                f"'{first_seg}/')."
-            )
+
+        if scope == "truth":
+            # Defensive strip: Coach is told to pass paths relative to
+            # truth/ (e.g. "specs.md", not "truth/specs.md"), but
+            # accept the prefixed form too rather than fail
+            # confusingly. Strip a single leading "truth/" so
+            # "truth/specs.md" and "specs.md" both resolve to
+            # /data/projects/<slug>/truth/specs.md.
+            if rel.startswith("truth/"):
+                rel = rel[len("truth/"):]
+            if rel.startswith("/") or ".." in rel.split("/"):
+                return _err(
+                    "path must be relative under the active project's "
+                    "truth/ folder, no leading slash, no '..' segments"
+                )
+            # Catch a recurrent Coach mistake: encoding the target
+            # project slug in the path (e.g.
+            # "projects/dynamichypergraph/CLAUDE.md"). truth/ is
+            # rooted at the active project — there's no way to
+            # cross-project from the path. Detect when the first
+            # segment matches an existing project slug and tell Coach
+            # to switch active project instead. Also catches a literal
+            # "projects/" prefix even when the second segment isn't a
+            # known slug.
+            first_seg = rel.split("/", 1)[0]
+            if first_seg == "projects":
+                return _err(
+                    f"path '{rel}' starts with 'projects/' — truth/ "
+                    "is rooted at the active project's truth folder, "
+                    "not anywhere under /data/projects/. To target a "
+                    "different project, ask the user to switch the "
+                    "active project first, then pass the path "
+                    "relative to that project's truth/ (e.g. "
+                    "'CLAUDE.md', not 'projects/<slug>/CLAUDE.md')."
+                )
+            c_slug_check = await configured_conn()
+            try:
+                cur = await c_slug_check.execute(
+                    "SELECT 1 FROM projects WHERE id = ? LIMIT 1",
+                    (first_seg,),
+                )
+                slug_match = await cur.fetchone()
+            finally:
+                await c_slug_check.close()
+            if slug_match:
+                return _err(
+                    f"path '{rel}' starts with project slug "
+                    f"'{first_seg}' — the path is rooted at the "
+                    "*currently active* project's truth/ folder, not "
+                    "anywhere under /data/projects/. To target the "
+                    f"'{first_seg}' project, ask the user to switch "
+                    "active project to it first, then pass the path "
+                    "relative to its truth/ (e.g. drop the leading "
+                    f"'{first_seg}/')."
+                )
+        else:
+            # project_claude_md: the only legal path is the project's
+            # CLAUDE.md at the project root. Reject anything else so a
+            # malformed call can't write to a sibling file.
+            if rel != "CLAUDE.md":
+                return _err(
+                    f"for scope 'project_claude_md', path must be "
+                    f"exactly 'CLAUDE.md' (got {rel!r}). The target "
+                    "is the active project's "
+                    "/data/projects/<slug>/CLAUDE.md."
+                )
+
         if not isinstance(content, str):
             return _err("content is required (string)")
         if len(content) > 200_000:
@@ -1411,27 +1453,32 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         # Supersede + insert in one transaction so a crash mid-flight
         # leaves the table coherent (either both old superseded + new
         # pending, or no change at all). Auto-supersede guarantees the
-        # invariant "at most one pending proposal per (project, path)"
-        # so the EnvPane never shows a stale stack of duplicates.
+        # invariant "at most one pending proposal per (project, scope,
+        # path)" so the EnvPane never shows a stale stack of
+        # duplicates. The scope filter is load-bearing: a hypothetical
+        # truth/CLAUDE.md and a project_claude_md proposal at path
+        # 'CLAUDE.md' must not supersede each other.
         now_iso = _now_iso()
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT id FROM truth_proposals "
-                "WHERE project_id = ? AND path = ? AND status = 'pending'",
-                (project_id, rel),
+                "SELECT id FROM file_write_proposals "
+                "WHERE project_id = ? AND scope = ? AND path = ? "
+                "AND status = 'pending'",
+                (project_id, scope, rel),
             )
             superseded_ids = [row[0] for row in await cur.fetchall()]
             cur = await c.execute(
-                "INSERT INTO truth_proposals "
-                "(project_id, proposer_id, path, proposed_content, summary) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (project_id, caller_id, rel, content, summary),
+                "INSERT INTO file_write_proposals "
+                "(project_id, proposer_id, scope, path, "
+                "proposed_content, summary) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (project_id, caller_id, scope, rel, content, summary),
             )
             proposal_id = cur.lastrowid
             for sid in superseded_ids:
                 await c.execute(
-                    "UPDATE truth_proposals SET status = 'superseded', "
+                    "UPDATE file_write_proposals SET status = 'superseded', "
                     "resolved_at = ?, resolved_by = 'system', "
                     "resolved_note = ? "
                     "WHERE id = ? AND status = 'pending'",
@@ -1446,9 +1493,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 {
                     "ts": now_iso,
                     "agent_id": "system",
-                    "type": "truth_proposal_superseded",
+                    "type": "file_write_proposal_superseded",
                     "proposal_id": sid,
                     "superseded_by": proposal_id,
+                    "scope": scope,
                     "path": rel,
                 }
             )
@@ -1456,8 +1504,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             {
                 "ts": now_iso,
                 "agent_id": caller_id,
-                "type": "truth_proposal_created",
+                "type": "file_write_proposal_created",
                 "proposal_id": proposal_id,
+                "scope": scope,
                 "path": rel,
                 "summary": summary,
                 "size": len(content),
@@ -1472,11 +1521,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             )
         else:
             note = ""
+        if scope == "truth":
+            display_path = f"truth/{rel}"
+        else:
+            display_path = "CLAUDE.md"
         return _ok(
-            f"proposal #{proposal_id} queued for truth/{rel} "
-            f"({len(content)} chars){note}. The user will review and "
-            f"approve or deny in the UI; you'll see "
-            f"`truth_proposal_resolved` on your next turn."
+            f"proposal #{proposal_id} queued for {display_path} "
+            f"({len(content)} chars, scope={scope}){note}. The user "
+            f"will review and approve or deny in the UI; you'll see "
+            f"`file_write_proposal_resolved` on your next turn."
         )
 
     @tool(
@@ -2289,7 +2342,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         update_memory,
         commit_push,
         write_decision,
-        propose_truth_update,
+        propose_file_write,
         write_knowledge,
         read_knowledge,
         list_knowledge,
@@ -2341,7 +2394,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_update_memory",
     "mcp__coord__coord_commit_push",
     "mcp__coord__coord_write_decision",
-    "mcp__coord__coord_propose_truth_update",
+    "mcp__coord__coord_propose_file_write",
     "mcp__coord__coord_write_knowledge",
     "mcp__coord__coord_read_knowledge",
     "mcp__coord__coord_list_knowledge",

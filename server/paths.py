@@ -253,17 +253,32 @@ User-validated source-of-truth for this project lives at
 hard invariants the user has signed off on. **You CANNOT write to
 truth/ directly** — the harness's PreToolUse hook hard-denies any
 `Write` / `Edit` / `MultiEdit` / `NotebookEdit` / `Bash` against this
-tree, regardless of agent. To propose a change, call
-`coord_propose_truth_update(path, content, summary)` (Coach-only —
-Players ask Coach to relay). The user reviews and approves in the
-EnvPane "Truth proposals" section. Approved proposals auto-write the
-file; older pending proposals for the same path are auto-superseded
-by newer ones.
+tree, regardless of agent. To propose a change, Coach calls
+`coord_propose_file_write(scope='truth', path, content, summary)`
+(Coach-only — Players ask Coach to relay). The user reviews a diff
+and approves/denies in the EnvPane "File-write proposals" section.
+Approved proposals auto-write the file; older pending proposals for
+the same path are auto-superseded by newer ones.
 
-The manifest of expected files lives in `truth-index.md` (itself a
-normal truth file — propose edits the same way). New projects start
-with one bullet for `specs.md`; add or split files by updating
-`truth-index.md` and proposing the new files.
+Each project's `truth/` ships seeded with `truth-index.md` —
+explanation only, no expected-files manifest. The user / Coach
+populates that file (and any others) per project: software projects
+might want `specs.md`, brand projects `brand-guidelines.md`, contract
+projects `vendor-agreements.md`. New files: humans use the Files
+pane's "+ new file" button; Coach proposes them via
+`coord_propose_file_write(scope='truth', path, content, summary)`
+and the user approves.
+
+## Updating this CLAUDE.md
+
+This file is **also** read-only for agents (the same PreToolUse hook
+denies direct Write/Edit/Bash on `/data/projects/{slug}/CLAUDE.md`).
+To change it, Coach calls
+`coord_propose_file_write(scope='project_claude_md', path='CLAUDE.md',
+content, summary)` with the FULL new file content; the user reviews
+the diff and approves in the same "File-write proposals" section.
+Players ask Coach to relay. The harness-wide `/data/CLAUDE.md` cannot
+be proposed at all — only the user edits that one directly.
 """
 
 

@@ -466,6 +466,7 @@
 }
 .cmp-prop-stale { border-left-color: var(--muted); }
 .cmp-prop-dupe  { border-left-color: var(--err); background: var(--cmp-soft-err); }
+.cmp-prop-reconcile { border-left-color: var(--accent); background: var(--cmp-soft-accent); }
 .cmp-prop-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .cmp-prop-q { margin-top: 6px; font-style: italic; color: var(--fg); font-size: 12px; }
 .cmp-prop-reasoning { color: var(--muted); font-size: 11px; margin-top: 4px; font-style: italic; }

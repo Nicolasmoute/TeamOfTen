@@ -548,6 +548,40 @@ function _isCtxRow(r) {
   );
 }
 
+// Render the inner body of a side-by-side diff. `rows` comes from
+// `buildSideBySideRows`. Returns the `<div class="diff diff-split ...">`
+// wrapper with one `.diff-row` per line. Empty `rows` becomes a single
+// "(no change)" row.
+//
+// Exported so consumers outside the tool-result pipeline (file-write
+// proposal review modal, eventually any other diff use) can reuse the
+// exact same renderer instead of re-implementing the row layout.
+export function renderDiffBody(rows, lang) {
+  const langClass = lang ? " language-" + lang : "";
+  return html`
+    <div class=${"diff diff-split hljs" + langClass}>
+      ${rows.length === 0
+        ? html`<div class="diff-row">
+            ${_renderHalf({ kind: "ctx", text: "(no change)" }, "", true)}
+          </div>`
+        : rows.map((r, i) => _isCtxRow(r)
+            ? html`<div key=${i} class="diff-row diff-row-full">
+                ${_renderHalf(r.left, lang, true)}
+              </div>`
+            : html`<div key=${i} class="diff-row">
+                ${_renderHalf(r.left, lang)}
+                ${_renderHalf(r.right, lang)}
+              </div>`)}
+    </div>
+  `;
+}
+
+// Build aligned rows for a side-by-side diff between two strings. Use
+// when caller has the file extension (or other lang hint) and wants to
+// render a custom wrapper around the result. For the common case use
+// `renderDiffBody(buildSideBySideRows(...), lang)`.
+export { buildSideBySideRows, diffStats };
+
 function renderEditCard(name, input, result) {
   const filePath = input.file_path || input.path || "";
   const oldStr = typeof input.old_string === "string" ? input.old_string : "";
@@ -556,7 +590,6 @@ function renderEditCard(name, input, result) {
   const rows = buildSideBySideRows(oldStr, newStr, lang);
   const { add, del } = diffStats(rows);
   const delta = ` (-${del} +${add})`;
-  const langClass = lang ? " language-" + lang : "";
   return html`
     <details class="tool-card category-write edit-card" open>
       <summary>
@@ -564,20 +597,7 @@ function renderEditCard(name, input, result) {
         <span class="tool-summary">${filePath}${delta}</span>
         ${lang ? html`<span class="tool-lang">${lang}</span>` : null}
       </summary>
-      <div class=${"diff diff-split hljs" + langClass}>
-        ${rows.length === 0
-          ? html`<div class="diff-row">
-              ${_renderHalf({ kind: "ctx", text: "(no change)" }, "", true)}
-            </div>`
-          : rows.map((r, i) => _isCtxRow(r)
-              ? html`<div key=${i} class="diff-row diff-row-full">
-                  ${_renderHalf(r.left, lang, true)}
-                </div>`
-              : html`<div key=${i} class="diff-row">
-                  ${_renderHalf(r.left, lang)}
-                  ${_renderHalf(r.right, lang)}
-                </div>`)}
-      </div>
+      ${renderDiffBody(rows, lang)}
       ${result && result.is_error ? renderResultBlock(result) : null}
     </details>
   `;

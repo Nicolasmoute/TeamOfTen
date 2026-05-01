@@ -41,6 +41,44 @@ READ_MAX_BYTES = 256_000
 # and in some cases security-relevant (.git config, SQLite's WAL sidecars).
 SKIP_DIRNAMES = {".git", "__pycache__", ".venv", "node_modules"}
 
+# Editable extension allowlist for write_text. Mirrors the FilesPane's
+# FILES_TEXT_EXTENSIONS + FILES_TEXT_BASENAMES so anything previewable
+# is also editable. Binary formats (PDF, images, archives) stay out so
+# a textarea write can't corrupt them.
+EDITABLE_EXTS: set[str] = {
+    ".md", ".markdown", ".mdx",
+    ".txt", ".log", ".text",
+    ".py", ".pyi",
+    ".js", ".mjs", ".cjs", ".jsx",
+    ".ts", ".tsx",
+    ".json", ".jsonc", ".jsonl",
+    ".yaml", ".yml",
+    ".toml",
+    ".css", ".scss", ".sass", ".less",
+    ".html", ".htm", ".xml", ".svg",
+    ".go", ".rs",
+    ".sh", ".bash", ".zsh",
+    ".sql",
+    ".ini", ".cfg", ".conf",
+    ".csv", ".tsv",
+    ".env", ".gitignore", ".gitattributes", ".dockerignore",
+}
+# Extensionless text basenames (Dockerfile, Makefile, etc).
+EDITABLE_BASENAMES: set[str] = {
+    "Dockerfile", "Makefile", "Justfile", "Procfile",
+    "README", "LICENSE", "CHANGELOG", "AUTHORS", "CONTRIBUTING",
+    ".gitignore", ".gitattributes", ".dockerignore", ".env",
+}
+
+
+def _is_editable(target: Path) -> bool:
+    """Whether write_text accepts this path. Mirrors the FilesPane's
+    `filesIsPreviewableText()` so any file previewable in the UI is
+    also editable through the same endpoint."""
+    if target.name in EDITABLE_BASENAMES:
+        return True
+    return target.suffix.lower() in EDITABLE_EXTS
+
 
 @dataclass(frozen=True)
 class Root:
@@ -296,11 +334,31 @@ def read_text(root_key: str, relative: str) -> dict[str, Any]:
     }
 
 
-async def write_text(root_key: str, relative: str, content: str) -> dict[str, Any]:
+class FileAlreadyExists(Exception):
+    """Raised when write_text is called with `create_only=True` and the
+    target file is already on disk. The HTTP layer maps to 409. Lets
+    the Files-pane "+ new file" button refuse to silently overwrite a
+    user's existing content with an empty stub."""
+
+
+async def write_text(
+    root_key: str,
+    relative: str,
+    content: str,
+    *,
+    create_only: bool = False,
+) -> dict[str, Any]:
     """Save `content` to the target file under `root_key`.
 
     Plain disk write — the two roots (`global`, `project`) cover every
     editable path; per-project sync handles the kDrive mirror.
+
+    `create_only=True` makes the call refuse to overwrite an existing
+    file (raises `FileAlreadyExists` → HTTP 409). The Files-pane
+    "+ new file" button passes this so a user typing the path of an
+    existing file doesn't silently truncate it to empty content. The
+    save button leaves it False (the default) — it's specifically the
+    operation that overwrites.
     """
     roots = _roots()
     if root_key not in roots or not roots[root_key].writable:
@@ -309,15 +367,23 @@ async def write_text(root_key: str, relative: str, content: str) -> dict[str, An
     target = _resolve(root_key, relative)
 
     # Refuse non-text writes — binary through a textarea would corrupt.
-    # Size cap aligns with knowmod.MAX_BODY_CHARS so an agent writing
-    # via the MCP tool and a human writing via the file browser hit the
-    # same ceiling.
-    if target.suffix.lower() not in {".md", ".txt"}:
-        raise ValueError("only .md and .txt files are editable through this endpoint")
+    # The allowlist (`EDITABLE_EXTS` + `EDITABLE_BASENAMES`) mirrors the
+    # FilesPane's previewable-text set so anything renderable is also
+    # editable. Empty content is accepted (used by the Files-pane
+    # "+ new file" button to create a stub). Size cap aligns with
+    # knowmod.MAX_BODY_CHARS so an agent writing via the MCP tool and
+    # a human writing via the file browser hit the same ceiling.
+    if not _is_editable(target):
+        raise ValueError(
+            f"extension '{target.suffix}' not in editable allowlist; "
+            "see server.files.EDITABLE_EXTS / EDITABLE_BASENAMES"
+        )
     if len(content) > knowmod.MAX_BODY_CHARS:
         raise ValueError(
             f"body too long ({len(content)} chars, max {knowmod.MAX_BODY_CHARS})"
         )
+    if create_only and target.exists():
+        raise FileAlreadyExists(f"{relative} already exists")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
     return {
