@@ -506,6 +506,50 @@ def test_resolve_reconciliation_accept_ambiguity(client: TestClient) -> None:
     assert state2.reconciliation_proposals == []
 
 
+def test_resolve_reconciliation_update_truth_clears_flag(client: TestClient) -> None:
+    """`update_truth` is informational — no lattice mutation, but the
+    statement's `reconciliation_proposed` flag MUST clear so the next
+    corpus-changed run can re-detect if the human's edit didn't
+    actually resolve the conflict."""
+    client.post("/api/compass/enable")
+    state = cmp_store.load_state("misc")
+    state.statements.append(cmp_store.Statement(
+        id="s1", text="claim", region="x", weight=0.92, created_at="t",
+        archived=True, settled_as="yes",
+        reconciliation_proposed=True,
+    ))
+    state.reconciliation_proposals.append(cmp_store.ReconciliationProposal(
+        id="rec1", statement_id="s1", statement_archived=True,
+        corpus_paths=["specs.md"], explanation="x",
+        suggested_resolution="update_truth",
+        proposed_at="t", proposed_in_run="r1",
+    ))
+    import asyncio as _asyncio
+    _asyncio.get_event_loop().run_until_complete(cmp_store.save_lattice(
+        "misc", state.statements,
+    ))
+    _asyncio.get_event_loop().run_until_complete(cmp_store.save_proposals(
+        "misc", settle=None, stale=None, dupes=None,
+        reconcile=state.reconciliation_proposals,
+    ))
+
+    r = client.post(
+        "/api/compass/proposals/reconcile/rec1",
+        json={"action": "update_truth"},
+    )
+    assert r.status_code == 200
+    state2 = cmp_store.load_state("misc")
+    s = state2.find_statement("s1")
+    # Lattice content / archive state preserved (informational only).
+    assert s.archived is True
+    assert s.settled_as == "yes"
+    assert s.weight == pytest.approx(0.92)
+    # But the proposal flag is cleared so the next corpus-changed run
+    # passes s1 to detect_conflicts again.
+    assert s.reconciliation_proposed is False
+    assert state2.reconciliation_proposals == []
+
+
 def test_resolve_reconciliation_rejects_invalid_action(client: TestClient) -> None:
     client.post("/api/compass/enable")
     state = cmp_store.load_state("misc")

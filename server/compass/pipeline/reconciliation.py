@@ -48,11 +48,15 @@ async def detect_conflicts(
     if not state.truth or not state.statements:
         return []
 
-    # Skip detection entirely if the lattice has zero rows that aren't
-    # already flagged — saves a token round-trip.
+    # Skip detection entirely if every lattice row already has an
+    # open proposal — no point re-flagging what the human is already
+    # deciding on. The runner clears `reconciliation_ambiguity` on
+    # corpus_changed before this is called, so we don't need to
+    # filter it here; ambiguity-accepted rows are eligible again
+    # whenever truth shifts.
     eligible = [
         s for s in state.statements
-        if not s.reconciliation_proposed and not s.reconciliation_ambiguity
+        if not s.reconciliation_proposed
     ]
     if not eligible:
         return []

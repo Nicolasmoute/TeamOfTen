@@ -18,10 +18,12 @@ Endpoints (all require_token; destructive ones tag actor):
   - POST /proposals/settle/{id}    resolve settle proposal
   - POST /proposals/stale/{id}     resolve stale proposal
   - POST /proposals/dupe/{id}      resolve duplicate proposal
+  - POST /proposals/reconcile/{id} resolve corpus↔lattice conflict (§3.0.1)
   - POST /statements/{id}/weight   manual weight override
   - POST /statements/{id}/restore  un-archive
-  - POST /truth                    add/update/remove
+  - GET  /truth                    read-only view of project's truth/ corpus
   - POST /audit                    submit artifact for audit
+  - POST /ask                      free-text query against the world model
   - POST /inputs                   record a human signal
   - GET  /briefings/{date}         specific briefing
   - GET  /runs?limit=N             run history
@@ -31,10 +33,11 @@ Endpoints (all require_token; destructive ones tag actor):
 WebSocket events the dashboard listens for: `compass_phase`,
 `compass_run_completed`, `compass_question_queued`,
 `compass_question_digested`, `compass_question_answered`,
-`compass_proposal_resolved`, `compass_truth_changed`,
-`compass_audit_logged`, `compass_truth_contradiction`,
-`compass_reset`, `compass_llm_call`. The bus is the existing
-`server.events.bus`; no separate channel.
+`compass_proposal_resolved`, `compass_truth_derived`,
+`compass_truth_contradiction`, `compass_audit_logged`,
+`compass_reconciliation_proposed`, `compass_reset`,
+`compass_llm_call`. The bus is the existing `server.events.bus`;
+no separate channel.
 
 Q&A session memory is in-process (one per project). Auto-ends if
 the project is switched (the dashboard's project-switch flow calls
@@ -847,12 +850,18 @@ def build_router(
                 )
         elif action == "accept_ambiguity":
             mutate.reconcile_accept_ambiguity(state, sid)
-        # action="update_truth" is informational — the dashboard
-        # routes the human at the truth file via the Files pane and
-        # the existing harness flow handles the actual edit. No
-        # lattice change here; the proposal is dropped so it doesn't
-        # re-display, and re-detection on the next corpus-changed run
-        # picks up whatever the human's edit produced.
+        elif action == "update_truth":
+            # Informational — the dashboard routes the human at the
+            # truth file via the Files pane and the existing harness
+            # flow handles the actual edit. No lattice change here.
+            # We DO clear `reconciliation_proposed` on the cited
+            # statement so the next corpus-changed run can re-detect
+            # if the human's edit didn't actually resolve the
+            # conflict (otherwise the row would be filtered out by
+            # the eligibility check in `detect_conflicts`).
+            stmt = state.find_statement(sid)
+            if stmt is not None:
+                stmt.reconciliation_proposed = False
 
         state.reconciliation_proposals = [
             p for p in state.reconciliation_proposals if p.id != proposal_id

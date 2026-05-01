@@ -110,19 +110,46 @@ async def test_detect_conflicts_returns_empty_without_lattice(
 
 
 @pytest.mark.asyncio
-async def test_detect_conflicts_skips_already_flagged_statements(
+async def test_detect_conflicts_skips_rows_with_open_proposals(
     fresh_db: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Rows whose `reconciliation_proposed` flag is already set are
+    excluded from detection — the human is already deciding on them
+    and a duplicate proposal would be noise. The runner is responsible
+    for clearing the flag when the human resolves or when the proposal
+    expires."""
     state = _make_state()
     _add_truth(state)
     _add(state, id="s1", weight=0.9, reconciliation_proposed=True)
-    _add(state, id="s2", weight=0.9, reconciliation_ambiguity=True)
     invocations = _stub_llm(monkeypatch, '{"conflicts": []}')
     out = await pl_reconcile.detect_conflicts(
         state, run_id="r1", run_iso="t",
     )
     assert out == []
-    assert invocations == []  # all eligible rows already in human-resolution state
+    assert invocations == []  # only flagged row → no LLM call
+
+
+@pytest.mark.asyncio
+async def test_detect_conflicts_includes_ambiguity_accepted_rows(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec §3.0.1: a corpus shift can warrant re-flagging a row the
+    human previously accepted as ambiguous. The runner clears the
+    ambiguity flag on corpus_changed; `detect_conflicts` itself does
+    NOT filter by `reconciliation_ambiguity`. (Earlier implementation
+    was buggy and excluded these rows even when corpus had shifted.)
+    """
+    state = _make_state()
+    _add_truth(state)
+    _add(state, id="s1", weight=0.9, reconciliation_ambiguity=True)
+    invocations = _stub_llm(monkeypatch, '{"conflicts": []}')
+    out = await pl_reconcile.detect_conflicts(
+        state, run_id="r1", run_iso="t",
+    )
+    # No conflicts in the stubbed reply, but the LLM WAS asked —
+    # the eligibility filter no longer drops ambiguity-flagged rows.
+    assert out == []
+    assert len(invocations) == 1
 
 
 @pytest.mark.asyncio

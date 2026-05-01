@@ -237,6 +237,23 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
                 s.reconciliation_proposed = False
         log.notes.append(f"reconciliation: {expired} expired proposal(s) cleared")
 
+    # Corpus shifted → previously-accepted ambiguity decisions are
+    # potentially obsolete. Clear the flags so detect_conflicts
+    # re-evaluates against the new corpus; if the same conflict
+    # still holds the LLM will re-flag and the human can accept
+    # ambiguity again or pick a different resolution.
+    ambiguity_cleared = 0
+    if corpus_changed:
+        for s in state.statements:
+            if s.reconciliation_ambiguity:
+                s.reconciliation_ambiguity = False
+                ambiguity_cleared += 1
+        if ambiguity_cleared:
+            log.notes.append(
+                f"reconciliation: {ambiguity_cleared} ambiguity flag(s) cleared "
+                f"on corpus change"
+            )
+
     should_reconcile = (
         bool(state.truth)
         and corpus_changed
@@ -272,13 +289,15 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
     state.reconciliation_proposals = final_reconciles
 
     # Persist whenever there was anything to save — fresh detections,
-    # expired drops, OR pre-existing proposals whose pending_runs
-    # counter just ticked. The in-memory increment from
+    # expired drops, pre-existing proposals whose pending_runs
+    # counter just ticked, or ambiguity flags cleared by the corpus
+    # shift. The in-memory increment from
     # `pl_reconciliation.increment_pending_runs` is otherwise lost.
     if (
         new_reconciles
         or expired
         or pre_existing_reconciles
+        or ambiguity_cleared
     ):
         mutate.mark_reconciliation_proposed(
             state, [p.statement_id for p in final_reconciles]

@@ -726,6 +726,77 @@ async def test_reconciliation_re_fires_when_corpus_changes(
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_clears_ambiguity_on_corpus_change(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row the human marked ambiguity-accepted must become eligible
+    again the next time the corpus shifts. Otherwise a stale ambiguity
+    decision could permanently mask a genuinely new conflict."""
+    from server.db import init_db, set_active_project
+    from server.paths import project_paths
+    await init_db()
+    await set_active_project("misc")
+
+    pp = project_paths("misc")
+    pp.truth.mkdir(parents=True, exist_ok=True)
+    target = pp.truth / "specs.md"
+    target.write_text("First version.", encoding="utf-8")
+
+    await store.bootstrap_state("misc")
+    pre = store.load_state("misc")
+    pre.statements.append(store.Statement(
+        id="s1", text="x", region="r", weight=0.92, created_at="t",
+        archived=True, settled_as="yes",
+        # Already accepted ambiguity from a previous run.
+        reconciliation_ambiguity=True,
+    ))
+    await store.save_lattice("misc", pre.statements)
+
+    inv = _stub_pipeline(monkeypatch)
+
+    # Detect_conflicts records which statement_ids it received as
+    # eligible (the in-memory state filters happen inside the real
+    # function — we stub it here to inspect the runner's setup).
+    seen_eligible: list[list[str]] = []
+
+    async def _detect(state: Any, *, run_id: str, run_iso: str) -> list[Any]:
+        seen_eligible.append([
+            s.id for s in state.statements
+            if not s.reconciliation_proposed
+        ])
+        return []
+
+    monkeypatch.setattr(pl_reconciliation, "detect_conflicts", _detect)
+
+    # First run with the existing corpus — corpus_changed is True
+    # (no prior hash), so Stage 0b runs and ambiguity should clear.
+    await runner.run("misc", mode="on_demand")
+    assert len(seen_eligible) == 1
+    assert "s1" in seen_eligible[0]
+    state_after = store.load_state("misc")
+    s1 = state_after.find_statement("s1")
+    assert s1.reconciliation_ambiguity is False  # cleared by corpus_changed branch
+
+    # Re-set ambiguity to simulate the human accepting again, then
+    # run with UNCHANGED corpus → Stage 0b skipped → flag survives.
+    s1.reconciliation_ambiguity = True
+    await store.save_lattice("misc", state_after.statements)
+    await runner.run("misc", mode="on_demand")
+    state_after2 = store.load_state("misc")
+    assert state_after2.find_statement("s1").reconciliation_ambiguity is True
+
+    # Edit the truth file → corpus_changed → flag clears and the row
+    # is again eligible.
+    target.write_text("Second version — different.", encoding="utf-8")
+    await runner.run("misc", mode="on_demand")
+    state_after3 = store.load_state("misc")
+    assert state_after3.find_statement("s1").reconciliation_ambiguity is False
+    # Stage 0b ran a second time, with s1 eligible again.
+    assert len(seen_eligible) >= 2
+    assert "s1" in seen_eligible[-1]
+
+
+@pytest.mark.asyncio
 async def test_reconciliation_proposals_expire_after_threshold(
     fresh_db: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
