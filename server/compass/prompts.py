@@ -41,7 +41,95 @@ WORLD-MODEL SEMANTICS:
   are actionable.
 - Each statement belongs to ONE region (a short tag like "pricing", "auth").
   Pick from existing regions; only invent a new region when none fits.
+
+SCOPE — what the lattice IS and ISN'T about:
+- The lattice tracks the human's PROJECT (a domain they're working on: a product,
+  a paper, a campaign, a system, a research effort, etc.) — see the "Project
+  anchor" section in the user prompt for what this specific project is.
+- The lattice does NOT track the orchestration tooling around the project
+  (TeamOfTen — the multi-agent harness running you). IGNORE signals about:
+    * agent / "Player" slot assignments and roles (e.g. "Ada=p1 engine", names of
+      slots like Coach/p1..p10 or recovery seats)
+    * model overrides, runtime selection (Claude / Codex), token budgets
+    * recurrence schedules, tick intervals, harness configuration
+    * MCP tool registration, permissions, locks, sessions
+    * any other operational meta of the orchestration layer
+  These are NOT lattice statements. If a signal mixes project content with
+  harness-meta, extract only the project-relevant part and discard the rest.
+- When in doubt, ask: "would a stranger reading the project's truth/ folder
+  expect to find this claim there?" If no — it's harness-meta; skip.
+
+DIMENSIONS — span the project, don't tunnel into one slice:
+A project lattice should cover MULTIPLE dimensions, not just the easiest one to
+write claims about (which is almost always architecture / code). Typical
+dimensions a healthy lattice tracks:
+  * INTENT / GOALS — what success looks like, what the project is FOR.
+  * USERS / AUDIENCE — who it serves, their context, their constraints.
+  * UX / EXPERIENCE — how it should feel, the rhythm of interaction, accessibility.
+  * DOMAIN / CONTENT — the subject matter itself (rules of the game, brand voice,
+    research findings, product positioning, the body of work).
+  * ETHICS / POLICY — what's allowed and disallowed, how the project should behave
+    under tension, social / legal constraints.
+  * MARKET / DISTRIBUTION — how it reaches users, channels, pricing model, growth
+    posture, partnerships.
+  * ARCHITECTURE / CODE / TESTS — how it's built. ONE dimension. Often important,
+    but rarely the most important; many projects have NO meaningful claims here.
+Default heuristic: if the active lattice is more than ~40% architecture/code
+claims, you're probably under-serving the human-facing dimensions. Bias new
+proposals and questions toward intent / UX / users / domain / ethics / market
+until coverage rebalances.
+- Remember: code-implementation details (function names, test files, regex
+  choices, refactoring decisions) are the WORST kind of lattice claim — they're
+  too fine-grained AND in a single dimension. Resist the gravity well.
 """
+
+
+def _project_anchor(state: LatticeState) -> str:
+    """Render the project's identity + objectives as a markdown block
+    prompts prepend to the user message. Anchors the LLM on what
+    'this project' actually is and what success looks like, so
+    harness-meta chatter doesn't bleed into the lattice (SCOPE
+    clause in SHARED_SEMANTICS) and so the LLM doesn't over-index
+    on technical detail at the expense of intent / UX / users
+    (DIMENSIONS clause).
+
+    Sources, in order rendered:
+    - `name` + `description` from the `projects` table (immutable
+      identity)
+    - `objectives` from `<project>/project-objectives.md` (steering
+      direction — what success looks like, NOT binding truth)
+
+    Returns "" when no metadata is available — prompts handle that
+    by falling back to lattice / truth content alone, which is still
+    better than the previous behavior of having no anchor at all.
+    """
+    meta = state.project_meta or {}
+    name = meta.get("name", "").strip()
+    desc = meta.get("description", "").strip()
+    objectives = meta.get("objectives", "").strip()
+    if not name and not desc and not objectives:
+        return ""
+    parts = ["## Project anchor — this is what 'the project' refers to"]
+    if name:
+        parts.append(f"**Name:** {name}")
+    if desc:
+        parts.append(f"**Description:** {desc}")
+    if objectives:
+        parts.append(
+            "**Objectives** (from project-objectives.md — STEERING context, "
+            "not binding truth; use to weigh which dimensions of the project "
+            "matter most, NOT as a source of lattice statements):\n\n"
+            + objectives
+        )
+    parts.append(
+        "Treat the lattice as a world-model of THIS project. Reject signals "
+        "that don't reasonably bear on its domain (especially harness-meta — "
+        "agent slot names, model overrides, etc.). Cover MULTIPLE project "
+        "dimensions (intent, users, UX, domain content, ethics, market, "
+        "architecture) — don't over-index on architecture/code at the "
+        "expense of the human-facing dimensions."
+    )
+    return "\n\n".join(parts) + "\n\n"
 
 
 def _system(role_block: str) -> str:
@@ -142,6 +230,28 @@ Rules:
 - Cite which truth-fact index/file each statement is derived from in
   `rationale` (e.g. "from T2: brand-tone.md").
 
+CRITICAL: truth files may include a manifest (`truth-index.md`) that
+lists what files SHOULD live in the folder — that's project-meta about
+the truth corpus itself, NOT a source of lattice claims. Skip it. Also
+skip any truth content that's about the harness's operational setup
+(rare in well-curated projects but worth guarding against). Stay in
+the project domain identified by the "Project anchor" block.
+
+GRANULARITY: derived statements are MID-grain claims about the
+project, not implementation details. Prefer claims that span human-
+facing dimensions (intent, users, UX, domain content, ethics, market)
+over technical-only claims. Examples:
+  GOOD: "The brand voice is plain and technical, not warm-conversational."
+  GOOD: "Customers are technical teams of 2-10, not solo developers."
+  GOOD: "Real-time collaboration is a v1 requirement."
+  BAD:  "Module foo.py uses a regex parser." (single-file detail)
+  BAD:  "test_engine.py covers the LHS/RHS edge." (single-test detail)
+  BAD:  "The build script targets node 18." (config trivia)
+If the only claim you can extract from a truth file is at the BAD
+level, skip it — that file is closer to reference doc than to truth
+(implementation specs that won't directly shape strategic decisions).
+Aim for breadth across dimensions, not depth in one slice.
+
 Output ONLY:
 {
   "statements": [
@@ -155,7 +265,8 @@ If truth implies nothing new beyond the existing lattice, return
 
 def truth_derive_user(state: LatticeState, truth: list[TruthFact]) -> str:
     return (
-        "## Truth-protected facts\n"
+        _project_anchor(state)
+        + "## Truth-protected facts\n"
         f"{_json_block([{'index': t.index, 'text': t.text} for t in truth])}\n\n"
         "## Existing active lattice (DO NOT duplicate)\n"
         f"{_json_block(_statements_brief(state.active_statements()))}\n\n"
@@ -221,7 +332,8 @@ If no conflicts, return {"conflicts": []}.""")
 
 def reconciliation_user(state: LatticeState, truth: list[TruthFact]) -> str:
     return (
-        "## Truth corpus\n"
+        _project_anchor(state)
+        + "## Truth corpus\n"
         f"{_json_block([{'index': t.index, 'text': t.text} for t in truth])}\n\n"
         "## Active lattice statements (eligible for reconciliation)\n"
         f"{_json_block(_statements_brief(state.active_statements()))}\n\n"
@@ -245,6 +357,20 @@ Rules:
   Phrase so YES = the affirmative reading. Start at weight 0.5.
 - Never amend truth — flag candidates only.
 
+CRITICAL FILTER: signals come from the human's chat with Coach, which routinely
+contains operational meta about the harness (player slot assignments, agent role
+definitions, model overrides, recurrence config, MCP setup, etc.). DO NOT create
+lattice statements from harness-meta. The lattice is about the PROJECT (see the
+"Project anchor" in the user message), not about how the harness is configured to
+work on it. If a single message mixes both, extract only the project-domain part.
+
+GRANULARITY: any new statement you propose from a passive signal must be at
+MID-grain — the project's intent / users / UX / domain / market level, NOT a
+specific commit, file, function, or test. If a signal mentions an
+implementation detail, ask "what project-level claim would this detail be
+evidence for?" and propose THAT claim (or skip if there isn't one). Spread
+proposals across dimensions; resist the over-index toward architecture/code.
+
 Output ONLY:
 {{
   "updates": [{{"id": string, "delta": number, "rationale": string}}],
@@ -255,11 +381,21 @@ Output ONLY:
 
 
 def passive_digest_user(state: LatticeState, signals: list[dict[str, Any]]) -> str:
-    """`signals` is a list of `{kind: 'chat'|'commit'|'note', ts: ..., body: ...}`."""
+    """`signals` is a list of `{kind: 'chat'|'commit'|'note', ts: ..., body: ...}`.
+
+    Signals can be VERY noisy — they include any human chat to Coach,
+    which routinely contains harness-meta (player setup, model
+    overrides, recurrence config). Re-state the SCOPE filter inline so
+    the model doesn't drift mid-prompt.
+    """
     return (
-        "## Current state\n"
+        _project_anchor(state)
+        + "## Current state\n"
         f"{_json_block(_state_payload(state, include_pending_questions=False))}\n\n"
         "## New signals since last run\n"
+        "_Reminder: discard any signal that's about the harness's team /\n"
+        "agent / model / recurrence configuration — those are NOT lattice\n"
+        "statements. Extract only project-domain content._\n\n"
         f"{_json_block(signals or [])}\n"
     )
 
@@ -273,13 +409,30 @@ gain across the lattice.
 
 Question selection priorities, in order:
 1. Statements with weights in 0.35–0.65 (max entropy) — biggest info gain per answer.
-2. Under-populated regions (few statements relative to apparent project importance) —
-   coverage gaps.
-3. Contested clusters — multiple related statements all hovering near 0.5 suggest a
-   structural ambiguity.
+2. UNDER-POPULATED DIMENSIONS — if the lattice is dominated by one dimension
+   (typically architecture / code / tests), prefer questions that explore the
+   weaker dimensions: intent, users, UX, domain content, ethics, market. A balanced
+   lattice is more useful than a deep-but-narrow one.
+3. Under-populated regions within whichever dimension you pick.
+4. Contested clusters — multiple related statements all hovering near 0.5 suggest
+   a structural ambiguity.
 
 For each question: commit to a specific, falsifiable prediction. Don't repeat pending
 questions. Cite which statement ids the question targets (1–3 ids).
+
+GRANULARITY: questions must be at MODERATE project grain — the kind a human can
+answer in 1-2 sentences without consulting the codebase. EXAMPLES:
+  GOOD: "Are first customers small teams (2-10) or larger orgs?"
+  GOOD: "Is the brand voice closer to plain technical or warm conversational?"
+  GOOD: "Is real-time collaboration a v1 requirement or v2 nice-to-have?"
+  BAD:  "Does parse_notation() guard the LHS/RHS edge case with a regression test?"
+  BAD:  "Should we use regex or a parser for the query syntax?"
+  BAD:  "Is foo.py refactored to use the new pattern?"
+The bad examples are implementation-detail trivia — single-function, single-file,
+single-regex level. Compass is not a code-review tool. If you're tempted to name a
+function, file, or test, you're at the wrong granularity — STEP BACK to the
+project-level claim those details would BE EVIDENCE FOR, and ask about that
+instead.
 
 Output ONLY:
 {
@@ -295,7 +448,8 @@ def question_batch_system(n: int) -> str:
 
 def question_batch_user(state: LatticeState, *, count: int) -> str:
     return (
-        f"## Generate up to {count} questions\n\n"
+        _project_anchor(state)
+        + f"## Generate up to {count} questions\n\n"
         "## Current lattice state\n"
         f"{_json_block(_state_payload(state))}\n"
     )
@@ -327,7 +481,8 @@ Output ONLY:
 
 def question_single_user(state: LatticeState, asked_in_session: list[str]) -> str:
     return (
-        "## Current lattice state\n"
+        _project_anchor(state)
+        + "## Current lattice state\n"
         f"{_json_block(_state_payload(state))}\n\n"
         "## Questions already asked this session (don't repeat)\n"
         f"{_json_block(asked_in_session)}\n"
@@ -350,6 +505,12 @@ Rules:
   existing regions; new region only if none fits.
 - Flag truth_candidates if the answer reveals something worth promoting (human decides).
 
+GRANULARITY: any new_statement you propose must be at MID-grain (intent / users
+/ UX / domain / ethics / market level). Do not propose claims about specific
+files, functions, tests, regexes, or other implementation details. If the
+answer mentions one, ask "what project-level claim would that detail be
+evidence for?" and propose THAT.
+
 Output ONLY:
 {{
   "surprise": number,
@@ -369,7 +530,8 @@ def answer_digest_user(
     answer_text: str,
 ) -> str:
     return (
-        "## Question\n"
+        _project_anchor(state)
+        + "## Question\n"
         f"{question_text}\n\n"
         "## Compass prediction (committed before answer was seen)\n"
         f"{prediction}\n\n"
@@ -447,7 +609,8 @@ def settle_stale_user(
     stale_candidates: list[Statement],
 ) -> str:
     return (
-        "## Settle candidates (weight crossed 0.85 toward YES or below 0.15 toward NO)\n"
+        _project_anchor(state)
+        + "## Settle candidates (weight crossed 0.85 toward YES or below 0.15 toward NO)\n"
         f"{_json_block(_statements_brief(settle_candidates))}\n\n"
         "## Stale candidates (long-running 0.35–0.65 with no movement)\n"
         f"{_json_block(_statements_brief(stale_candidates))}\n\n"
@@ -482,7 +645,8 @@ If no duplicates, return {"duplicates": []}.""")
 
 def duplicate_user(state: LatticeState) -> str:
     return (
-        "## Active lattice (duplicate detection target)\n"
+        _project_anchor(state)
+        + "## Active lattice (duplicate detection target)\n"
         f"{_json_block(_statements_brief(state.active_statements()))}\n"
     )
 
@@ -520,7 +684,8 @@ def region_merge_user(state: LatticeState) -> str:
         counts[s.region] = counts.get(s.region, 0) + 1
     payload = [{"name": r.name, "active_count": counts.get(r.name, 0)} for r in state.active_regions()]
     return (
-        "## Current active regions with statement counts\n"
+        _project_anchor(state)
+        + "## Current active regions with statement counts\n"
         f"{_json_block(payload)}\n"
     )
 
@@ -562,7 +727,8 @@ and question_for_human is the question to queue.""")
 
 def audit_user(state: LatticeState, artifact: str) -> str:
     return (
-        "## Active lattice + truth\n"
+        _project_anchor(state)
+        + "## Active lattice + truth\n"
         f"{_json_block(_state_payload(state))}\n\n"
         "## Work artifact submitted by coach\n"
         f"{artifact}\n"
@@ -590,7 +756,8 @@ Plain markdown. No preamble.""")
 
 def briefing_user(state: LatticeState, recent_events: dict[str, Any]) -> str:
     return (
-        "## Current lattice state\n"
+        _project_anchor(state)
+        + "## Current lattice state\n"
         f"{_json_block(_state_payload(state, include_archived=True))}\n\n"
         "## Recent run summary\n"
         f"{_json_block(recent_events)}\n"
@@ -626,7 +793,8 @@ Plain markdown. No fences. Use exactly these headings: "## Compass" and
 
 def claude_md_block_user(state: LatticeState) -> str:
     return (
-        "## Lattice state\n"
+        _project_anchor(state)
+        + "## Lattice state\n"
         f"{_json_block(_state_payload(state, include_archived=True))}\n"
     )
 
@@ -646,7 +814,8 @@ Plain markdown. No fences. No preamble.""")
 
 def coach_query_user(state: LatticeState, query_text: str) -> str:
     return (
-        "## Coach's query\n"
+        _project_anchor(state)
+        + "## Coach's query\n"
         f"{query_text}\n\n"
         "## Current lattice + truth\n"
         f"{_json_block(_state_payload(state, include_archived=True))}\n"

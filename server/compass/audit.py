@@ -57,7 +57,11 @@ async def audit_work(project_id: str, artifact: str) -> dict[str, Any]:
     Raises only on configuration errors; LLM/parse failures degrade
     to an `aligned` verdict with a diagnostic in `summary`.
     """
-    state = store.load_state(project_id)
+    # Use load_with_meta so the audit prompt is anchored on the
+    # project's identity (not the harness's). Without this, audit
+    # output would happily reason about agent slot names and other
+    # harness chatter as if they were project-domain content.
+    state = await store.load_with_meta(project_id)
     artifact = (artifact or "").strip()
     if not artifact:
         return _empty_audit_response("empty artifact")

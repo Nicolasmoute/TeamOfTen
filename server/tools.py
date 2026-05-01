@@ -2263,7 +2263,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         from server.compass import prompts as cmp_prompts  # noqa: PLC0415
         from server.compass import store as cmp_store  # noqa: PLC0415
 
-        state = cmp_store.load_state(project_id)
+        # load_with_meta — anchors the prompt on the project's
+        # identity so harness chatter (player slot names, model
+        # overrides) doesn't pollute Coach's view via compass_ask.
+        state = await cmp_store.load_with_meta(project_id)
         try:
             res = await cmp_llm.call(
                 cmp_prompts.COACH_QUERY_SYSTEM,

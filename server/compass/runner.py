@@ -142,7 +142,22 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
 
     await _emit_phase(project_id, run_id, "started", mode=mode)
 
-    state = store.load_state(project_id)
+    # Project metadata anchors every prompt on what THIS project is —
+    # name + description from the `projects` table. Fetched once,
+    # reused across all stage reloads. Without this anchor, harness
+    # chatter (player slot assignments, model overrides) bleeds into
+    # the lattice (e.g. spec issue 2026-05-02).
+    project_meta = await store.read_project_meta(project_id)
+
+    def _reload_state() -> "store.LatticeState":
+        """Re-read state between stages with project_meta attached.
+        Used in place of bare `store.load_state(project_id)` so every
+        prompt the pipeline issues has the project anchor."""
+        s = store.load_state(project_id)
+        s.project_meta = project_meta
+        return s
+
+    state = _reload_state()
 
     # ============================================================
     # 0. Truth ingestion (Stage 0a derive + Stage 0b reconcile).
@@ -425,7 +440,7 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
     # ============================================================
     # 2. Passive digest (if any signals)
     # ============================================================
-    state = store.load_state(project_id)
+    state = _reload_state()
     signals = await _collect_signals(project_id, since_iso=_last_run_iso(project_id))
     await _emit_phase(project_id, run_id, "passive_digest", signals=len(signals))
     try:
@@ -454,7 +469,7 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
     # ============================================================
     # 3. Region auto-merge (if over soft cap)
     # ============================================================
-    state = store.load_state(project_id)
+    state = _reload_state()
     if len(state.active_regions()) > config.REGION_SOFT_CAP:
         await _emit_phase(project_id, run_id, "region_merge",
                           active=len(state.active_regions()))
@@ -477,7 +492,7 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
     # ============================================================
     # 4-6. Reviews + duplicate detection
     # ============================================================
-    state = store.load_state(project_id)
+    state = _reload_state()
     # Increment pending counters BEFORE re-detection — so a fresh
     # detection can re-add cleared proposals if they're still due.
     pl_reviews.increment_pending_runs(
@@ -541,7 +556,7 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
     # ============================================================
     # 7. Generate new questions
     # ============================================================
-    state = store.load_state(project_id)
+    state = _reload_state()
     n_q = (
         config.QUESTIONS_PER_BOOTSTRAP_RUN
         if mode == "bootstrap"
@@ -572,7 +587,7 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
     # 8. Briefing — skip on bootstrap
     # ============================================================
     if mode != "bootstrap":
-        state = store.load_state(project_id)
+        state = _reload_state()
         await _emit_phase(project_id, run_id, "briefing")
         try:
             briefing_md = await pl_briefing.generate(state, recent={
@@ -594,7 +609,7 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
     # ============================================================
     # 9. CLAUDE.md block
     # ============================================================
-    state = store.load_state(project_id)
+    state = _reload_state()
     await _emit_phase(project_id, run_id, "claude_md_block")
     try:
         block_body = await pl_claude_md.generate(state)

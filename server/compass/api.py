@@ -440,7 +440,7 @@ def build_router(
             raise HTTPException(404, "no active Q&A session — start one first")
         if sess.answered_count >= cmp_config.QA_HARD_CAP:
             return JSONResponse({"q": None, "reason": "hard cap reached"})
-        state = cmp_store.load_state(project_id)
+        state = await cmp_store.load_with_meta(project_id)
         try:
             proposal = await pl_questions.generate_single(
                 state, asked_in_session=list(sess.asked_ids),
@@ -495,7 +495,7 @@ def build_router(
             raise HTTPException(400, "answer is required")
         await presence.update_heartbeat(project_id)
 
-        state = cmp_store.load_state(project_id)
+        state = await cmp_store.load_with_meta(project_id)
         # Truth-check first.
         try:
             tc = await pl_truth_check.check(
@@ -966,7 +966,7 @@ def build_router(
         from server.compass import llm as cmp_llm  # noqa: PLC0415
         from server.compass import prompts as cmp_prompts  # noqa: PLC0415
 
-        state = cmp_store.load_state(project_id)
+        state = await cmp_store.load_with_meta(project_id)
         try:
             res = await cmp_llm.call(
                 cmp_prompts.COACH_QUERY_SYSTEM,

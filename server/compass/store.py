@@ -278,6 +278,13 @@ class LatticeState:
     stale_proposals: list[StaleProposal] = field(default_factory=list)
     duplicate_proposals: list[DuplicateProposal] = field(default_factory=list)
     reconciliation_proposals: list[ReconciliationProposal] = field(default_factory=list)
+    # Project metadata (name + description from the `projects` table)
+    # — anchors the LLM on what THIS project is, so signals mentioning
+    # the harness's team / agent / model meta don't bleed into the
+    # lattice. Populated by `read_project_meta` at run-start; prompts
+    # read it via `_project_anchor`. Empty when uninitialized — the
+    # prompts handle that gracefully.
+    project_meta: dict[str, str] = field(default_factory=dict)
 
     # Convenience views
 
@@ -937,6 +944,91 @@ def next_dupe_proposal_id(state: LatticeState) -> str:
     return f"dupe{n + 1}"
 
 
+async def load_with_meta(project_id: str) -> LatticeState:
+    """`load_state(project_id)` + populate `project_meta` from the
+    `projects` table. Use this wherever the loaded state will feed
+    an LLM prompt — bare `load_state` is fine for read-only rendering
+    paths (the dashboard's /state snapshot, /runs, /audits, etc.).
+
+    Single round-trip per call site. Failure to read meta downgrades
+    to empty dict (the prompts handle that gracefully) rather than
+    blocking the whole load."""
+    state = load_state(project_id)
+    state.project_meta = await read_project_meta(project_id)
+    return state
+
+
+async def read_project_meta(project_id: str) -> dict[str, str]:
+    """Look up the project's name + description from the `projects`
+    table AND read `project-objectives.md` from disk. Used by the
+    runner to populate `LatticeState.project_meta` before any LLM
+    call, so prompts can anchor on what THIS project actually is
+    and ignore harness meta (player slot assignments, model
+    overrides, recurrence config, etc.) that would otherwise
+    pollute the lattice.
+
+    `objectives` is the human's project-objectives.md file — kept
+    separate from the truth corpus because objectives are usually
+    aspirational ("ship X by Q3", "satisfy stakeholder Y") whereas
+    truth is binding ("there is one operator", "per-task billing").
+    Compass treats objectives as STEERING context (what to track,
+    what to prioritize) rather than as truth. Truth-derive does NOT
+    create lattice rows from objectives; only the anchor block
+    surfaces them so question generation and digest weigh them as
+    soft direction.
+
+    Returns an empty dict on DB error or missing row — prompts
+    degrade to "no project anchor" gracefully (still better than
+    treating harness chatter as project content).
+    """
+    from server.db import configured_conn  # noqa: PLC0415 — lazy
+    from server.paths import project_paths  # noqa: PLC0415 — lazy
+
+    out: dict[str, str] = {"id": project_id}
+
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT name, description, repo_url FROM projects WHERE id = ?",
+                (project_id,),
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("compass: read_project_meta query failed: %s", project_id)
+        row = None
+
+    if row:
+        d = dict(row)
+        if d.get("name"):
+            out["name"] = str(d["name"]).strip()
+        if d.get("description"):
+            out["description"] = str(d["description"]).strip()
+        if d.get("repo_url"):
+            out["repo_url"] = str(d["repo_url"]).strip()
+
+    # project-objectives.md — read best-effort. Capped at 6000 chars
+    # to keep the anchor block sane in long prompts; the human is
+    # always free to keep a longer file on disk and Compass will
+    # truncate the head.
+    try:
+        pp = project_paths(project_id)
+        target = pp.project_objectives
+        if target.exists() and target.is_file():
+            body = target.read_text(encoding="utf-8").strip()
+            if body:
+                cap = 6000
+                if len(body) > cap:
+                    body = body[:cap] + f"\n\n[truncated — file is {len(body)} chars total]"
+                out["objectives"] = body
+    except Exception:
+        logger.exception("compass: project-objectives.md read failed: %s", project_id)
+
+    return out
+
+
 def next_reconciliation_id(state: LatticeState) -> str:
     """Monotonic per project, scoped to current pending list. Spec §6.7
     uses `recN`; we follow that convention so ids are short + readable
@@ -1026,5 +1118,7 @@ __all__ = [
     "next_run_id",
     "next_dupe_proposal_id",
     "next_reconciliation_id",
+    "read_project_meta",
+    "load_with_meta",
     "wipe_project",
 ]

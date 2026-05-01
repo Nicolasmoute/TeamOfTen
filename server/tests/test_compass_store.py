@@ -144,6 +144,143 @@ async def test_save_truth_no_longer_exists() -> None:
 
 
 @pytest.mark.asyncio
+async def test_read_project_meta_pulls_name_and_description(fresh_db: str) -> None:
+    """Compass anchors prompts on the project's name + description so
+    harness-meta chatter (player slots, model overrides) doesn't bleed
+    into the lattice."""
+    from server.db import configured_conn, init_db
+    await init_db()
+
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO projects (id, name, description, repo_url) "
+            "VALUES (?, ?, ?, ?)",
+            ("alpha", "Stripe Billing", "Usage-based for SaaS.", "git@x:y.git"),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    meta = await store.read_project_meta("alpha")
+    assert meta["id"] == "alpha"
+    assert meta["name"] == "Stripe Billing"
+    assert meta["description"] == "Usage-based for SaaS."
+    assert meta["repo_url"] == "git@x:y.git"
+
+
+@pytest.mark.asyncio
+async def test_read_project_meta_missing_project_returns_id_only(fresh_db: str) -> None:
+    """No projects row + no project-objectives.md → meta has only the
+    `id` key. The anchor block correctly suppresses itself when none
+    of `name` / `description` / `objectives` is set."""
+    from server.compass.prompts import _project_anchor
+    from server.db import init_db
+    await init_db()
+    meta = await store.read_project_meta("does-not-exist")
+    assert meta == {"id": "does-not-exist"}
+    state = store.LatticeState(project_id="does-not-exist", project_meta=meta)
+    assert _project_anchor(state) == ""  # no anchor rendered
+
+
+@pytest.mark.asyncio
+async def test_read_project_meta_includes_objectives(fresh_db: str) -> None:
+    """`project-objectives.md` (a separate file under project root) is
+    pulled into project_meta as soft steering context — distinct from
+    the truth corpus, which holds binding facts. The anchor block
+    surfaces it so prompts know what the human cares about."""
+    from server.db import configured_conn, init_db
+    from server.paths import project_paths
+    await init_db()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO projects (id, name, description) VALUES (?, ?, ?)",
+            ("alpha", "Stripe Billing", "x"),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    pp = project_paths("alpha")
+    pp.root.mkdir(parents=True, exist_ok=True)
+    pp.project_objectives.write_text(
+        "## Objectives\n\n- Land per-task billing v1 by Q3.\n- Win 5 design partners.\n",
+        encoding="utf-8",
+    )
+
+    meta = await store.read_project_meta("alpha")
+    assert "objectives" in meta
+    assert "per-task billing" in meta["objectives"]
+    assert "design partners" in meta["objectives"]
+
+
+@pytest.mark.asyncio
+async def test_read_project_meta_truncates_giant_objectives(fresh_db: str) -> None:
+    from server.db import init_db
+    from server.paths import project_paths
+    await init_db()
+    pp = project_paths("alpha")
+    pp.root.mkdir(parents=True, exist_ok=True)
+    pp.project_objectives.write_text("X" * 10_000, encoding="utf-8")
+    meta = await store.read_project_meta("alpha")
+    assert "[truncated" in meta.get("objectives", "")
+
+
+def test_project_anchor_renders_objectives() -> None:
+    """End-to-end: the anchor block surfaces the objectives so every
+    LLM call gets steered toward the human's stated priorities."""
+    from server.compass.prompts import _project_anchor
+
+    state = store.LatticeState(project_id="alpha", project_meta={
+        "id": "alpha",
+        "name": "Stripe Billing",
+        "description": "Usage-based pricing for SaaS.",
+        "objectives": "- Land per-task billing v1 by Q3.\n- Win 5 design partners.",
+    })
+    anchor = _project_anchor(state)
+    assert "Stripe Billing" in anchor
+    assert "Objectives" in anchor
+    assert "per-task billing" in anchor
+    assert "STEERING context" in anchor or "steering" in anchor.lower()
+    assert "MULTIPLE project dimensions" in anchor or "multiple project" in anchor.lower()
+
+
+def test_project_anchor_skips_objectives_when_absent() -> None:
+    from server.compass.prompts import _project_anchor
+
+    state = store.LatticeState(project_id="alpha", project_meta={
+        "id": "alpha", "name": "Stripe Billing",
+    })
+    anchor = _project_anchor(state)
+    assert "Stripe Billing" in anchor
+    assert "Objectives" not in anchor
+
+
+@pytest.mark.asyncio
+async def test_load_with_meta_attaches_to_state(fresh_db: str) -> None:
+    """`load_with_meta` is the LLM-feeding load path — must populate
+    `project_meta` so prompts can render the anchor block."""
+    from server.db import configured_conn, init_db
+    await init_db()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO projects (id, name, description) VALUES (?, ?, ?)",
+            ("alpha", "Stripe Billing", "Pricing for SaaS"),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    state = await store.load_with_meta("alpha")
+    assert state.project_meta.get("name") == "Stripe Billing"
+    # Bare load_state — meta stays empty (read-only paths don't need it).
+    bare = store.load_state("alpha")
+    assert bare.project_meta == {}
+
+
+@pytest.mark.asyncio
 async def test_regions_round_trip_with_merge_history(fresh_db: str) -> None:
     regions = [
         store.Region(name="pricing", created_at="t", created_by="compass"),
