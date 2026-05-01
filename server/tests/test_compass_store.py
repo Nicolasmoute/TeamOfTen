@@ -183,78 +183,33 @@ async def test_read_project_meta_missing_project_returns_id_only(fresh_db: str) 
     assert _project_anchor(state) == ""  # no anchor rendered
 
 
-@pytest.mark.asyncio
-async def test_read_project_meta_includes_objectives(fresh_db: str) -> None:
-    """`project-objectives.md` (a separate file under project root) is
-    pulled into project_meta as soft steering context — distinct from
-    the truth corpus, which holds binding facts. The anchor block
-    surfaces it so prompts know what the human cares about."""
-    from server.db import configured_conn, init_db
-    from server.paths import project_paths
-    await init_db()
-    c = await configured_conn()
-    try:
-        await c.execute(
-            "INSERT INTO projects (id, name, description) VALUES (?, ?, ?)",
-            ("alpha", "Stripe Billing", "x"),
-        )
-        await c.commit()
-    finally:
-        await c.close()
-
-    pp = project_paths("alpha")
-    pp.root.mkdir(parents=True, exist_ok=True)
-    pp.project_objectives.write_text(
-        "## Objectives\n\n- Land per-task billing v1 by Q3.\n- Win 5 design partners.\n",
-        encoding="utf-8",
-    )
-
-    meta = await store.read_project_meta("alpha")
-    assert "objectives" in meta
-    assert "per-task billing" in meta["objectives"]
-    assert "design partners" in meta["objectives"]
-
-
-@pytest.mark.asyncio
-async def test_read_project_meta_truncates_giant_objectives(fresh_db: str) -> None:
-    from server.db import init_db
-    from server.paths import project_paths
-    await init_db()
-    pp = project_paths("alpha")
-    pp.root.mkdir(parents=True, exist_ok=True)
-    pp.project_objectives.write_text("X" * 10_000, encoding="utf-8")
-    meta = await store.read_project_meta("alpha")
-    assert "[truncated" in meta.get("objectives", "")
-
-
-def test_project_anchor_renders_objectives() -> None:
-    """End-to-end: the anchor block surfaces the objectives so every
-    LLM call gets steered toward the human's stated priorities."""
+def test_project_anchor_excludes_objectives_section() -> None:
+    """Objectives moved from steering context (project_meta) to the
+    truth corpus. The anchor block surfaces only name + description +
+    the dimensions guidance; it must NOT have a separate Objectives
+    section because that would duplicate what's in the truth listing."""
     from server.compass.prompts import _project_anchor
 
     state = store.LatticeState(project_id="alpha", project_meta={
         "id": "alpha",
         "name": "Stripe Billing",
         "description": "Usage-based pricing for SaaS.",
-        "objectives": "- Land per-task billing v1 by Q3.\n- Win 5 design partners.",
     })
     anchor = _project_anchor(state)
     assert "Stripe Billing" in anchor
-    assert "Objectives" in anchor
-    assert "per-task billing" in anchor
-    assert "STEERING context" in anchor or "steering" in anchor.lower()
+    assert "Usage-based pricing" in anchor
+    # Anchor mentions objectives only as a pointer, not a duplicated body.
+    assert "Objectives" not in anchor.split("**Description:**", 1)[-1].split(
+        "Treat the lattice", 1
+    )[0]
     assert "MULTIPLE project dimensions" in anchor or "multiple project" in anchor.lower()
 
 
-def test_project_anchor_skips_objectives_when_absent() -> None:
+def test_project_anchor_returns_empty_without_metadata() -> None:
     from server.compass.prompts import _project_anchor
 
-    state = store.LatticeState(project_id="alpha", project_meta={
-        "id": "alpha", "name": "Stripe Billing",
-    })
-    anchor = _project_anchor(state)
-    assert "Stripe Billing" in anchor
-    assert "Objectives" not in anchor
+    state = store.LatticeState(project_id="alpha", project_meta={"id": "alpha"})
+    assert _project_anchor(state) == ""
 
 
 @pytest.mark.asyncio

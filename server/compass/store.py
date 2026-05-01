@@ -959,30 +959,27 @@ async def load_with_meta(project_id: str) -> LatticeState:
 
 
 async def read_project_meta(project_id: str) -> dict[str, str]:
-    """Look up the project's name + description from the `projects`
-    table AND read `project-objectives.md` from disk. Used by the
-    runner to populate `LatticeState.project_meta` before any LLM
-    call, so prompts can anchor on what THIS project actually is
-    and ignore harness meta (player slot assignments, model
-    overrides, recurrence config, etc.) that would otherwise
-    pollute the lattice.
+    """Look up the project's name + description + repo_url from the
+    `projects` table. Used by the runner to populate
+    `LatticeState.project_meta` before any LLM call, so prompts can
+    anchor on what THIS project actually is and ignore harness meta
+    (player slot assignments, model overrides, recurrence config,
+    etc.) that would otherwise pollute the lattice.
 
-    `objectives` is the human's project-objectives.md file — kept
-    separate from the truth corpus because objectives are usually
-    aspirational ("ship X by Q3", "satisfy stakeholder Y") whereas
-    truth is binding ("there is one operator", "per-task billing").
-    Compass treats objectives as STEERING context (what to track,
-    what to prioritize) rather than as truth. Truth-derive does NOT
-    create lattice rows from objectives; only the anchor block
-    surfaces them so question generation and digest weigh them as
-    soft direction.
+    Note: `project-objectives.md` is NOT read here. It's part of the
+    truth corpus (read by `compass.truth.read_truth_facts` alongside
+    `<project>/truth/*.md`), not a steering layer. The human's
+    authored objectives are vetted source-of-truth-like documents
+    and Compass treats them with the same authority as the truth/
+    folder — they drive truth-derive (lattice seeding) and
+    truth-check (contradiction detection).
 
-    Returns an empty dict on DB error or missing row — prompts
-    degrade to "no project anchor" gracefully (still better than
-    treating harness chatter as project content).
+    Returns `{"id": project_id}` on DB error or missing row — prompts
+    `_project_anchor` only renders an anchor when at least one of
+    name/description is set, so missing project rows degrade to
+    "no anchor" rather than confusing the LLM.
     """
     from server.db import configured_conn  # noqa: PLC0415 — lazy
-    from server.paths import project_paths  # noqa: PLC0415 — lazy
 
     out: dict[str, str] = {"id": project_id}
 
@@ -998,7 +995,7 @@ async def read_project_meta(project_id: str) -> dict[str, str]:
             await c.close()
     except Exception:
         logger.exception("compass: read_project_meta query failed: %s", project_id)
-        row = None
+        return out
 
     if row:
         d = dict(row)
@@ -1008,23 +1005,6 @@ async def read_project_meta(project_id: str) -> dict[str, str]:
             out["description"] = str(d["description"]).strip()
         if d.get("repo_url"):
             out["repo_url"] = str(d["repo_url"]).strip()
-
-    # project-objectives.md — read best-effort. Capped at 6000 chars
-    # to keep the anchor block sane in long prompts; the human is
-    # always free to keep a longer file on disk and Compass will
-    # truncate the head.
-    try:
-        pp = project_paths(project_id)
-        target = pp.project_objectives
-        if target.exists() and target.is_file():
-            body = target.read_text(encoding="utf-8").strip()
-            if body:
-                cap = 6000
-                if len(body) > cap:
-                    body = body[:cap] + f"\n\n[truncated — file is {len(body)} chars total]"
-                out["objectives"] = body
-    except Exception:
-        logger.exception("compass: project-objectives.md read failed: %s", project_id)
 
     return out
 

@@ -385,21 +385,30 @@ def test_weight_override_requires_confirm(client: TestClient) -> None:
 
 def test_truth_get_reads_project_folder(client: TestClient) -> None:
     """`/api/compass/truth` is read-only — Compass doesn't manage
-    truth. The project's `truth/` folder is the source of truth."""
+    truth. The corpus is the union of `<project>/truth/*` and
+    `<project>/project-objectives.md`. Paths returned by the API are
+    project-root-relative so the dashboard can compose them with
+    `/data/projects/<id>/<path>` directly."""
     from server.paths import project_paths
 
     pp = project_paths("misc")
     pp.truth.mkdir(parents=True, exist_ok=True)
     (pp.truth / "one.md").write_text("Truth fact one.", encoding="utf-8")
     (pp.truth / "two.md").write_text("Truth fact two.", encoding="utf-8")
+    pp.root.mkdir(parents=True, exist_ok=True)
+    pp.project_objectives.write_text("Land v1 by Q3.", encoding="utf-8")
 
     client.post("/api/compass/enable")
     r = client.get("/api/compass/truth")
     assert r.status_code == 200
     body = r.json()
-    assert len(body["facts"]) == 2
-    assert body["facts"][0]["path"] == "one.md"
-    assert "Truth fact one." in body["facts"][0]["text"]
+    paths = [f["path"] for f in body["facts"]]
+    assert "truth/one.md" in paths
+    assert "truth/two.md" in paths
+    assert "project-objectives.md" in paths
+    by_path = {f["path"]: f for f in body["facts"]}
+    assert "Truth fact one." in by_path["truth/one.md"]["text"]
+    assert "Land v1 by Q3." in by_path["project-objectives.md"]["text"]
 
 
 def test_truth_post_endpoint_removed(client: TestClient) -> None:

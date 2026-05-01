@@ -85,49 +85,41 @@ until coverage rebalances.
 
 
 def _project_anchor(state: LatticeState) -> str:
-    """Render the project's identity + objectives as a markdown block
-    prompts prepend to the user message. Anchors the LLM on what
-    'this project' actually is and what success looks like, so
-    harness-meta chatter doesn't bleed into the lattice (SCOPE
-    clause in SHARED_SEMANTICS) and so the LLM doesn't over-index
-    on technical detail at the expense of intent / UX / users
-    (DIMENSIONS clause).
+    """Render the project's identity as a short markdown block prompts
+    prepend to the user message. Anchors the LLM on what 'this
+    project' actually is so harness-meta chatter doesn't bleed into
+    the lattice (SCOPE clause in SHARED_SEMANTICS) and so the LLM
+    doesn't over-index on technical detail at the expense of intent
+    / UX / users (DIMENSIONS clause).
 
-    Sources, in order rendered:
-    - `name` + `description` from the `projects` table (immutable
-      identity)
-    - `objectives` from `<project>/project-objectives.md` (steering
-      direction — what success looks like, NOT binding truth)
+    Sources `name` + `description` from the `projects` table.
+    Objectives are NOT here — they live in the truth corpus alongside
+    `<project>/truth/`, surfaced to prompts via the standard truth
+    listing in `_state_payload`.
 
-    Returns "" when no metadata is available — prompts handle that
-    by falling back to lattice / truth content alone, which is still
-    better than the previous behavior of having no anchor at all.
+    Returns "" when no project metadata is available — prompts
+    handle that by falling back to lattice / truth content alone.
     """
     meta = state.project_meta or {}
     name = meta.get("name", "").strip()
     desc = meta.get("description", "").strip()
-    objectives = meta.get("objectives", "").strip()
-    if not name and not desc and not objectives:
+    if not name and not desc:
         return ""
     parts = ["## Project anchor — this is what 'the project' refers to"]
     if name:
         parts.append(f"**Name:** {name}")
     if desc:
         parts.append(f"**Description:** {desc}")
-    if objectives:
-        parts.append(
-            "**Objectives** (from project-objectives.md — STEERING context, "
-            "not binding truth; use to weigh which dimensions of the project "
-            "matter most, NOT as a source of lattice statements):\n\n"
-            + objectives
-        )
     parts.append(
         "Treat the lattice as a world-model of THIS project. Reject signals "
         "that don't reasonably bear on its domain (especially harness-meta — "
         "agent slot names, model overrides, etc.). Cover MULTIPLE project "
         "dimensions (intent, users, UX, domain content, ethics, market, "
         "architecture) — don't over-index on architecture/code at the "
-        "expense of the human-facing dimensions."
+        "expense of the human-facing dimensions. The project's full truth "
+        "corpus (specs in `truth/` plus `project-objectives.md`) is in the "
+        "truth section of this prompt below — treat the objectives file as "
+        "binding truth, same as any other vetted truth document."
     )
     return "\n\n".join(parts) + "\n\n"
 

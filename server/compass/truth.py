@@ -66,40 +66,78 @@ def _mtime_iso(p: Path) -> str:
         return ""
 
 
+def _collect_truth_files(project_id: str) -> list[tuple[Path, str]]:
+    """Walk every truth-corpus source for the project and return a
+    sorted list of `(path, project_relative_relpath)` pairs.
+
+    Two sources combined into one corpus:
+    1. `<project>/truth/**/*.{md,markdown,txt}` — the dedicated truth
+       lane (specs, brand guidelines, contracts, role docs, etc.).
+    2. `<project>/project-objectives.md` — the human's authored
+       objectives file (sits at project root, surfaced in the EnvPane).
+
+    Both are human-authored / Coach-proposed-then-human-approved, both
+    drive the lattice the same way, and both should anchor truth-check
+    contradictions. Treating them uniformly avoids two parallel "what
+    the human believes" worlds.
+
+    Relative paths are PROJECT-ROOT relative, not truth-root relative —
+    so a file under `truth/` shows as `truth/specs.md` and the
+    objectives file shows as `project-objectives.md`. The dashboard
+    builds links via `/data/projects/<id>/<relpath>` directly, which
+    handles both shapes uniformly.
+    """
+    pp = project_paths(project_id)
+    project_root = pp.root
+    out: list[tuple[Path, str]] = []
+
+    # 1. <project>/truth/**
+    truth_root = pp.truth
+    if truth_root.exists() and truth_root.is_dir():
+        for p in truth_root.rglob("*"):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in ALLOWED_SUFFIXES:
+                continue
+            relpath = str(p.relative_to(project_root)).replace("\\", "/")
+            out.append((p, relpath))
+
+    # 2. <project>/project-objectives.md (canonical, single file)
+    obj = pp.project_objectives
+    if (
+        obj.exists()
+        and obj.is_file()
+        and obj.suffix.lower() in ALLOWED_SUFFIXES
+    ):
+        relpath = str(obj.relative_to(project_root)).replace("\\", "/")
+        out.append((obj, relpath))
+
+    out.sort(key=lambda pair: pair[1])
+    return out
+
+
 def read_truth_facts(project_id: str):
-    """Walk `<project>/truth/` and return a list of `TruthFact` instances,
-    one per allowed file, ordered by relative path.
+    """Read every truth-corpus file (truth/ + project-objectives.md)
+    and return a list of `TruthFact` instances, one per allowed file,
+    ordered by project-root-relative path.
 
     The import is local so this module can be imported without pulling
     `compass.store` into a top-level import cycle.
     """
     from server.compass.store import TruthFact  # noqa: PLC0415
 
-    pp = project_paths(project_id)
-    root = pp.truth
-    if not root.exists() or not root.is_dir():
-        return []
-
-    files: list[Path] = []
-    for p in root.rglob("*"):
-        if not p.is_file():
-            continue
-        if p.suffix.lower() in ALLOWED_SUFFIXES:
-            files.append(p)
-    files.sort(key=lambda x: str(x.relative_to(root)).replace("\\", "/"))
-
+    files = _collect_truth_files(project_id)
     out = []
-    for i, p in enumerate(files, start=1):
+    for i, (p, relpath) in enumerate(files, start=1):
         body = _read_text_safe(p)
         if body is None:
             continue
         body = body.strip()
         if not body:
             continue
-        relpath = str(p.relative_to(root)).replace("\\", "/")
         # Prefix with the file's relpath so the LLM has a name handle —
-        # it makes the reasoning surface ("conflicts with brand-tone.md")
-        # but the LLM still answers with the integer truth_index.
+        # makes the reasoning surface ("conflicts with brand-tone.md")
+        # while the LLM still answers with the integer truth_index.
         text = body
         if len(text) > MAX_FACT_CHARS:
             text = text[:MAX_FACT_CHARS] + f"\n\n[truncated — file is {len(body)} chars total]"
@@ -113,24 +151,21 @@ def read_truth_facts(project_id: str):
 
 
 def read_truth_index_to_path(project_id: str) -> dict[int, str]:
-    """Return the same 1-based index → path mapping `read_truth_facts`
-    uses internally. Useful for the truth-conflict modal so the human
-    can be pointed at the right file when amending."""
-    pp = project_paths(project_id)
-    root = pp.truth
-    if not root.exists() or not root.is_dir():
-        return {}
-    files: list[Path] = []
-    for p in root.rglob("*"):
-        if not p.is_file():
-            continue
-        if p.suffix.lower() in ALLOWED_SUFFIXES:
-            files.append(p)
-    files.sort(key=lambda x: str(x.relative_to(root)).replace("\\", "/"))
-    return {
-        i: str(p.relative_to(root)).replace("\\", "/")
-        for i, p in enumerate(files, start=1)
-    }
+    """Return the same 1-based index → project-root-relative path
+    mapping `read_truth_facts` uses internally. Used by the
+    truth-conflict modal so the human can be pointed at the right
+    file when amending. Path shape:
+      - `truth/<subpath>/<file>.md` for files under truth/
+      - `project-objectives.md` for the objectives file
+    Either form composes correctly with `/data/projects/<id>/<path>`.
+    """
+    files = _collect_truth_files(project_id)
+    return {i: relpath for i, (_, relpath) in enumerate(files, start=1)}
 
 
-__all__ = ["read_truth_facts", "read_truth_index_to_path", "MAX_FACT_CHARS", "ALLOWED_SUFFIXES"]
+__all__ = [
+    "read_truth_facts",
+    "read_truth_index_to_path",
+    "MAX_FACT_CHARS",
+    "ALLOWED_SUFFIXES",
+]

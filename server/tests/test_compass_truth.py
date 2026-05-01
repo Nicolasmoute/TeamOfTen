@@ -52,7 +52,11 @@ def test_read_truth_facts_picks_up_md_and_txt_only(fresh_db: str) -> None:
     facts = cmp_truth.read_truth_facts("alpha")
     assert [t.index for t in facts] == [1, 2]
     paths_in_text = [t.text.split(")", 1)[0].lstrip("(") for t in facts]
-    assert paths_in_text == ["00-pricing.md", "10-customers.txt"]
+    # Project-root-relative paths (commit 2026-05-02 — folded
+    # project-objectives.md into the corpus, switched to project-root
+    # paths so the dashboard can build /data/projects/<id>/<path>
+    # uniformly across both sources).
+    assert paths_in_text == ["truth/00-pricing.md", "truth/10-customers.txt"]
 
 
 def test_read_truth_facts_walks_subdirectories(fresh_db: str) -> None:
@@ -63,10 +67,10 @@ def test_read_truth_facts_walks_subdirectories(fresh_db: str) -> None:
     })
     facts = cmp_truth.read_truth_facts("alpha")
     relpaths = [t.text.split(")", 1)[0].lstrip("(") for t in facts]
-    # POSIX-style paths even on Windows.
-    assert "team/locked.md" in relpaths
-    assert "team/roles.md" in relpaths
-    assert "top.md" in relpaths
+    # POSIX-style paths even on Windows; project-root-relative.
+    assert "truth/team/locked.md" in relpaths
+    assert "truth/team/roles.md" in relpaths
+    assert "truth/top.md" in relpaths
 
 
 def test_read_truth_facts_skips_blank_files(fresh_db: str) -> None:
@@ -121,3 +125,90 @@ def test_truth_corpus_hash_empty_corpus_is_stable(fresh_db: str) -> None:
     h1 = pl_truth_derive.truth_corpus_hash([])
     h2 = pl_truth_derive.truth_corpus_hash([])
     assert h1 == h2
+
+
+# ============================================================
+# project-objectives.md folded into the truth corpus
+# ============================================================
+
+
+def _seed_objectives(project_id: str, body: str) -> None:
+    pp = project_paths(project_id)
+    pp.root.mkdir(parents=True, exist_ok=True)
+    pp.project_objectives.write_text(body, encoding="utf-8")
+
+
+def test_objectives_file_appears_in_truth_corpus(fresh_db: str) -> None:
+    """`project-objectives.md` at the project root is part of the
+    truth corpus alongside files in `<project>/truth/`. Both drive
+    truth-derive and truth-check identically."""
+    _seed("alpha", {"specs.md": "Per-task billing is binding."})
+    _seed_objectives(
+        "alpha",
+        "## Q3 objectives\n\n- Land per-task billing v1.\n- Win 5 design partners.",
+    )
+
+    facts = cmp_truth.read_truth_facts("alpha")
+    relpaths = [
+        t.text.split(")", 1)[0].lstrip("(") for t in facts
+    ]
+    assert "truth/specs.md" in relpaths
+    assert "project-objectives.md" in relpaths
+
+
+def test_truth_corpus_paths_are_project_root_relative(fresh_db: str) -> None:
+    """Compass uses project-root-relative relpaths so the dashboard
+    can build `/data/projects/<id>/<relpath>` for both `truth/foo.md`
+    and `project-objectives.md` without special-casing."""
+    _seed("alpha", {"specs.md": "x", "team/roles.md": "y"})
+    _seed_objectives("alpha", "z")
+
+    idx_to_path = cmp_truth.read_truth_index_to_path("alpha")
+    paths = set(idx_to_path.values())
+    assert "truth/specs.md" in paths
+    assert "truth/team/roles.md" in paths
+    assert "project-objectives.md" in paths
+    # No path should accidentally start with a slash.
+    assert all(not p.startswith("/") for p in paths)
+
+
+def test_objectives_only_no_truth_folder(fresh_db: str) -> None:
+    """Project with NO `truth/` folder but with project-objectives.md
+    still has a non-empty corpus."""
+    _seed_objectives("alpha", "Objectives content.")
+    facts = cmp_truth.read_truth_facts("alpha")
+    assert len(facts) == 1
+    assert "project-objectives.md" in facts[0].text
+    assert "Objectives content." in facts[0].text
+
+
+def test_truth_only_no_objectives_file(fresh_db: str) -> None:
+    """Symmetric — project with truth/ files but no objectives file
+    still works (objectives file is optional)."""
+    _seed("alpha", {"specs.md": "Spec."})
+    facts = cmp_truth.read_truth_facts("alpha")
+    assert len(facts) == 1
+    assert "truth/specs.md" in facts[0].text
+
+
+def test_corpus_hash_changes_when_objectives_change(fresh_db: str) -> None:
+    """Editing project-objectives.md must trigger a fresh truth-derive
+    on the next run — same as editing any other truth file."""
+    _seed("alpha", {"specs.md": "stable spec"})
+    _seed_objectives("alpha", "v1 objectives")
+    h1 = pl_truth_derive.truth_corpus_hash(cmp_truth.read_truth_facts("alpha"))
+
+    _seed_objectives("alpha", "v2 objectives — changed")
+    h2 = pl_truth_derive.truth_corpus_hash(cmp_truth.read_truth_facts("alpha"))
+    assert h1 != h2
+
+
+def test_objectives_blank_file_skipped(fresh_db: str) -> None:
+    """Empty/whitespace-only objectives shouldn't pollute the corpus
+    with a no-content fact."""
+    _seed("alpha", {"specs.md": "real spec"})
+    _seed_objectives("alpha", "   \n\n  ")
+    facts = cmp_truth.read_truth_facts("alpha")
+    relpaths = [t.text.split(")", 1)[0].lstrip("(") for t in facts]
+    assert "project-objectives.md" not in relpaths
+    assert "truth/specs.md" in relpaths

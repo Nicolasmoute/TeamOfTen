@@ -31,7 +31,7 @@ import {
   buildSideBySideRows,
   renderDiffBody,
 } from "/static/tools.js";
-import { CompassPane, createCompassEventRouter } from "/static/compass.js?v=1777667517";
+import { CompassPane, createCompassEventRouter } from "/static/compass.js?v=1777671810";
 
 const html = htm.bind(h);
 // Module-level event router for compass events. CompassPane(s) subscribe;

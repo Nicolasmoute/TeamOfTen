@@ -210,10 +210,15 @@ function EnableBanner({ onEnable, busy }) {
 
 // ---------------------------------------------------------------- truth reference (read-only)
 
-// Truth lives in the project's `truth/` folder, NOT in Compass. Compass
-// reads it on every run (Stage 0 truth-derive seeds the lattice). The
-// dashboard surfaces a small read-only summary so the human can see
-// what's fed to the prompts; editing happens in the Files pane.
+// The truth corpus is the union of two sources, both read on every
+// run:
+//   • <project>/truth/*.{md,txt} — the dedicated truth lane
+//   • <project>/project-objectives.md — the human's authored objectives
+// Compass treats both with the same authority — they drive
+// truth-derive (Stage 0a, lattice seeding) and truth-check (Q&A
+// contradiction detection). The dashboard surfaces a small read-only
+// summary so the human can see exactly what's fed to the prompts;
+// editing happens via the Files pane.
 
 function TruthReference({ truth, onOpenFiles }) {
   const [expanded, setExpanded] = useState(false);
@@ -222,7 +227,9 @@ function TruthReference({ truth, onOpenFiles }) {
     <section class="cmp-truth-ref">
       <div class="cmp-truth-ref-head">
         <div>
-          <div class="cmp-section-kicker">TRUTH · READ FROM ${`<project>/truth/`} ON EVERY RUN</div>
+          <div class="cmp-section-kicker">
+            TRUTH CORPUS · READ FROM ${`<project>/truth/ + project-objectives.md`} ON EVERY RUN
+          </div>
           <div class="cmp-section-title">${count} truth ${count === 1 ? "fact" : "facts"}</div>
         </div>
         <button class="cmp-btn-mini cmp-btn-ghost" onClick=${onOpenFiles}>open Files pane</button>
@@ -230,8 +237,10 @@ function TruthReference({ truth, onOpenFiles }) {
       ${count === 0
         ? html`<div class="cmp-truth-ref-empty">
             No truth files yet. Drop <code>.md</code> or <code>.txt</code> files
-            into the project's <code>truth/</code> folder; Compass will derive
-            initial lattice statements from them on the next run.
+            into the project's <code>truth/</code> folder, OR write
+            <code>project-objectives.md</code> at the project root —
+            Compass will derive initial lattice statements from them on the
+            next run.
           </div>`
         : html`
             <button
@@ -1187,10 +1196,15 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
       if (action === "update_truth") {
         const path = (extra?.corpus_paths || [])[0];
         if (path) {
+          // Paths from the LLM are project-root-relative — either
+          // "truth/<sub>" for the truth lane or "project-objectives.md"
+          // for the objectives file. Compose with /data/projects/<id>
+          // directly; no hardcoded "/truth/" segment.
+          const cleanPath = path.replace(/^\/+/, "");
           const a = document.createElement("a");
           a.setAttribute(
             "data-harness-path",
-            "/data/projects/" + (state?.project_id || "") + "/truth/" + path,
+            "/data/projects/" + (state?.project_id || "") + "/" + cleanPath,
           );
           a.setAttribute("href", "#");
           document.body.appendChild(a);
@@ -1332,9 +1346,9 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
     alert(
       `Truth T${idx} — to amend, edit the file directly:\n\n` +
       (path
-        ? `<project>/truth/${path}\n\nThe Files pane lets you edit it. ` +
-          `Compass re-reads truth on every run, so the next run picks ` +
-          `up the change.`
+        ? `<project>/${path}\n\nThe Files pane lets you edit it. ` +
+          `Compass re-reads the corpus on every run, so the next run ` +
+          `picks up the change.`
         : `(file path unavailable; truth corpus may have shifted).`)
     );
     setTruthConflict(null);
@@ -1408,12 +1422,12 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
             // The Files pane handles in-app file links via
             // pendingFileOpen + a custom MIME drop. We don't have a
             // reference to its setter from inside the Compass pane,
-            // so we just emit a synthetic click on a known root path
-            // — the Files pane's document-level click listener picks
-            // it up (see app.js handler that listens for
-            // [data-harness-path] anchors).
+            // so we emit a synthetic click on the PROJECT ROOT path —
+            // the corpus spans both `truth/` and the root-level
+            // `project-objectives.md`, so opening at the root lets
+            // the human see and edit either source.
             const a = document.createElement("a");
-            a.setAttribute("data-harness-path", "/data/projects/" + (state.project_id || "") + "/truth");
+            a.setAttribute("data-harness-path", "/data/projects/" + (state.project_id || ""));
             a.setAttribute("href", "#");
             document.body.appendChild(a);
             a.click();
