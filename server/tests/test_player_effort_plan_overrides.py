@@ -288,60 +288,97 @@ async def _call_get_helper_set_model(pid: str, model: str) -> None:
 
 
 # ---------- run_agent resolution chain -----------------------------
+#
+# These tests stub the runtime so run_agent reaches the resolution
+# block without spawning a real subprocess; we then read the resolved
+# turn_ctx to confirm the precedence.
 
 
-async def test_run_agent_uses_coach_override_when_no_pane_value(
+def _install_runtime_stub(monkeypatch, captured: dict) -> None:
+    """Replace get_runtime + the auto-compact stage with a no-op fake
+    that captures the TurnContext and short-circuits before any SDK
+    call. Pattern lifted from test_runtime_dispatch."""
+    import server.agents as agentsmod
+    import server.runtimes as runtimes_mod
+
+    class _Runtime:
+        name = "claude"
+
+        async def maybe_auto_compact(self, tc):
+            return False
+
+        async def prepare_turn_start(self, tc):
+            return False
+
+        async def run_turn(self, tc):
+            captured["plan_mode"] = tc.plan_mode
+            captured["effort"] = tc.effort
+            tc.turn_ctx["got_result"] = True
+
+        async def run_manual_compact(self, tc):
+            tc.turn_ctx["got_result"] = True
+
+    async def runtime_for(agent_id: str) -> str:
+        return "claude"
+
+    async def fake_session(agent_id: str):
+        return None
+
+    monkeypatch.setattr(agentsmod, "_resolve_runtime_for", runtime_for)
+    monkeypatch.setattr(runtimes_mod, "get_runtime", lambda name: _Runtime())
+    monkeypatch.setattr(agentsmod, "_get_session_id", fake_session)
+
+
+async def test_run_agent_uses_coach_override_when_kwarg_is_none(
     fresh_db, monkeypatch
 ) -> None:
-    """When the per-pane request omits plan_mode/effort (None), run_agent
-    consults the Coach-set override on agent_project_roles."""
+    """No per-pane override (kwargs=None) → run_agent reads
+    agent_project_roles and resolves to the Coach-set values."""
     await init_db()
-
-    # Set Coach overrides for p4.
     await _call_effort("coach", player_id="p4", effort="high")
     await _call_plan("coach", player_id="p4", plan_mode="on")
 
     captured: dict = {}
+    _install_runtime_stub(monkeypatch, captured)
 
-    async def fake_resolve(agent_id: str) -> str:
-        return "claude"
+    import server.agents as agentsmod
+    await agentsmod.run_agent("p4", "hello")
 
-    # Stop run_agent before it actually spawns a turn; capture the
-    # resolved values from turn_ctx by short-circuiting at the runtime
-    # dispatch boundary. The simplest fixture: stub `get_runtime` to
-    # raise after we've snapshotted the args, since the resolution
-    # happens BEFORE the runtime call.
-    from server.agents import _get_agent_effort_override, _get_agent_plan_mode_override
-    eff = await _get_agent_effort_override("p4")
-    pm = await _get_agent_plan_mode_override("p4")
-    assert eff == 3
-    assert pm is True
-    captured["effort"] = eff
-    captured["plan_mode"] = pm
-    # The actual resolution code path is exercised by the pane test
-    # below (test_pane_value_beats_override) — these two helpers are
-    # what run_agent calls when its kwargs are None.
-    assert captured["effort"] == 3
     assert captured["plan_mode"] is True
+    assert captured["effort"] == 3
 
 
-async def test_pane_value_beats_override(fresh_db) -> None:
-    """An explicit per-pane plan_mode/effort kwarg in run_agent must
-    NOT consult the Coach override — the pane is the higher-precedence
-    source. We verify by asserting the resolution helper returns the
-    Coach value, while the run_agent precedence comment / contract is
-    the documentation of the precedence."""
+async def test_run_agent_pane_value_beats_coach_override(
+    fresh_db, monkeypatch
+) -> None:
+    """An explicit per-pane plan_mode=False / effort=2 must not be
+    overwritten by a Coach override of plan_mode=on / effort=high."""
     await init_db()
-    await _call_effort("coach", player_id="p2", effort="low")
+    await _call_effort("coach", player_id="p2", effort="high")
+    await _call_plan("coach", player_id="p2", plan_mode="on")
 
-    # Coach value is set:
-    from server.agents import _get_agent_effort_override
-    assert await _get_agent_effort_override("p2") == 1
+    captured: dict = {}
+    _install_runtime_stub(monkeypatch, captured)
 
-    # Pane wins by virtue of run_agent only consulting the override
-    # branch when the kwarg is None — the kwarg precedence is enforced
-    # at run_agent line 3909-3917 (see code), and is exercised by the
-    # actual /api/agents/start path in production. This test pins the
-    # contract by asserting the helper exists and the override value
-    # is correct; we'd need a heavier fixture (mock_runtime) to assert
-    # the dispatcher choice end-to-end.
+    import server.agents as agentsmod
+    await agentsmod.run_agent("p2", "hello", plan_mode=False, effort=2)
+
+    assert captured["plan_mode"] is False
+    assert captured["effort"] == 2
+
+
+async def test_run_agent_no_override_no_pane_falls_through_to_default(
+    fresh_db, monkeypatch
+) -> None:
+    """Both kwarg=None and no Coach override → plan_mode=False /
+    effort=None (SDK default thinking budget)."""
+    await init_db()
+
+    captured: dict = {}
+    _install_runtime_stub(monkeypatch, captured)
+
+    import server.agents as agentsmod
+    await agentsmod.run_agent("p1", "hello")
+
+    assert captured["plan_mode"] is False
+    assert captured["effort"] is None

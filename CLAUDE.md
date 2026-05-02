@@ -1302,7 +1302,9 @@ current state. Closed both gaps:
   set/clear round-trip via the new helpers and `_get_agent_identity`,
   empty-clear no-orphan invariant, event emission, Coach-only
   enforcement, and the `coord_get_player_settings` shape (single
-  player + full roster). Suite at 878/878.
+  player + full roster). Resolution-chain integration tests stub the
+  runtime via the `test_runtime_dispatch` pattern to assert pane→Coach
+  override→default precedence end-to-end. Suite at 879/879.
 
 **Next likely:**
 - **Mobile UI polish** — touch-drag doesn't work with HTML5 DnD;

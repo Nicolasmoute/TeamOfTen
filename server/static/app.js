@@ -2812,9 +2812,11 @@ function App() {
       ${recurrenceOpen
         ? html`<${RecurrencePane}
             rows=${recurrenceRows}
+            error=${recurrenceError}
             onClose=${() => setRecurrenceOpen(false)}
             onRefresh=${refreshRecurrences}
             onError=${(msg) => setRecurrenceError(msg)}
+            onClearError=${() => setRecurrenceError(null)}
           />`
         : null}
       ${envOpen
@@ -5905,7 +5907,7 @@ function _filterKind(rows, kind) {
   return rows.filter((r) => r.kind === kind);
 }
 
-function RecurrencePane({ rows, onClose, onRefresh, onError }) {
+function RecurrencePane({ rows, error, onClose, onRefresh, onError, onClearError }) {
   const [tickInput, setTickInput] = useState("");
   const [newRepeat, setNewRepeat] = useState({ cadence: "", prompt: "" });
   const [newCron, setNewCron] = useState({ cadence: "", prompt: "" });
@@ -6099,6 +6101,16 @@ function RecurrencePane({ rows, onClose, onRefresh, onError }) {
         <span class="rec-title">Recurrences</span>
         <button class="rec-close" title="Close" onClick=${onClose}>×</button>
       </div>
+      ${error
+        ? html`<div class="rec-error" style="padding:6px 12px;display:flex;align-items:center;gap:8px;justify-content:space-between">
+            <span>${error}</span>
+            <button
+              class="rec-close"
+              title="Dismiss"
+              onClick=${() => onClearError && onClearError()}
+            >×</button>
+          </div>`
+        : null}
       <div class="rec-body">
         <section class="rec-section">
           <h3 class="rec-section-title">Tick</h3>

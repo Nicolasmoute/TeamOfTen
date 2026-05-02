@@ -282,11 +282,15 @@ CREATE TABLE IF NOT EXISTS agent_project_roles (
     -- Coach-set per-(slot, project) effort tier. NULL = no override
     -- (fall through to per-pane request → no effort override). Values:
     -- 1..4 mapped to "low" | "medium" | "high" | "max" by
-    -- agents.EFFORT_LITERALS at spawn time.
+    -- agents._EFFORT_LEVELS at spawn time. Per-pane request value
+    -- (when non-NULL) wins over this column; this column wins over
+    -- "no thinking-budget override".
     effort_override     INTEGER,
-    -- Coach-set per-(slot, project) plan-mode flag. NULL = no override
-    -- (fall through to per-pane request → False). 1 = plan mode on,
-    -- 0 = plan mode explicitly off (overrides per-pane true → false).
+    -- Coach-set per-(slot, project) plan-mode flag. NULL = no override.
+    -- 1 = plan mode on, 0 = plan mode off. Resolution: per-pane
+    -- request wins when the kwarg is True or False; this column is
+    -- consulted only when the kwarg is None (UI omits it whenever the
+    -- pane toggle is off, so "no per-pane override" is the common case).
     plan_mode_override  INTEGER,
     PRIMARY KEY (slot, project_id)
 );

@@ -553,6 +553,8 @@ CREATE TABLE agent_project_roles (
   role TEXT,
   brief TEXT,
   model_override TEXT,
+  effort_override INTEGER,       -- 1..4 → low/medium/high/max
+  plan_mode_override INTEGER,    -- 0/1 → off/on
   PRIMARY KEY (slot, project_id)
 );
 ```
@@ -570,6 +572,13 @@ Notes:
   against the player's current runtime (Claude vs Codex); a stored
   override that no longer matches the runtime is silently dropped at
   spawn time so a runtime flip can't break a turn.
+- `effort_override` (1..4) and `plan_mode_override` (0/1) are
+  Coach-set via `coord_set_player_effort` / `coord_set_player_plan_mode`.
+  NULL when unset. Both follow the same precedence as `model_override`:
+  per-pane request value (highest) → this column → default. The Coach
+  layer is what makes auto-wake spawns (task assignments, direct
+  messages — which call `run_agent` with the kwargs unset) honor the
+  preference; per-pane settings only apply to direct human prompts.
 
 ### 6.4 `agent_sessions`
 
@@ -1686,8 +1695,12 @@ of the model's max window.
 
 ## 11. Agent Runtime
 
-`run_agent(agent_id, prompt, model=None, plan_mode=False, effort=None, ...)`
-is the central execution path.
+`run_agent(agent_id, prompt, model=None, plan_mode=None, effort=None, ...)`
+is the central execution path. `model` / `plan_mode` / `effort` all
+default to None so a missing per-pane value falls through to the
+Coach-set override on `agent_project_roles` (then to the role / SDK
+default). An explicit per-pane `False` for `plan_mode` is preserved
+as "off" — it does NOT trigger the override lookup.
 
 Pre-spawn checks:
 
@@ -2266,6 +2279,53 @@ project_id)`. Switching the active project automatically swaps which
 override is read, so Coach can run different model configurations on
 different projects without cross-talk.
 
+`coord_set_player_effort(player_id, effort)`
+
+- Coach only.
+- `player_id`: `p1` to `p10` (cannot set Coach's effort via MCP — ask
+  the human).
+- `effort`: one of `low` | `medium` | `high` | `max`. Empty string
+  clears (revert to no override). Friendly aliases (`med` →
+  `medium`) and the numeric tier `1..4` (1=low … 4=max) are also
+  accepted for symmetry with the UI slider.
+- Stored on `agent_project_roles.effort_override` (INTEGER 1..4) for
+  the active project. Empty-clear on a row that doesn't exist is a
+  no-op (no orphan row).
+- Resolution at spawn time: per-pane request value (highest) → this
+  Coach override → no override (SDK default thinking budget).
+- Emits `agent_effort_set` with `to: <player_id>` so the event
+  renders in both Coach's pane and the target Player's pane (history
+  reload uses the same indexed `payload_to` filter).
+
+`coord_set_player_plan_mode(player_id, plan_mode)`
+
+- Coach only.
+- `player_id`: `p1` to `p10`.
+- `plan_mode`: `on` | `off`. Empty string clears (revert to no
+  override). Aliases: `true`/`1`/`yes` → on, `false`/`0`/`no` → off.
+- Stored on `agent_project_roles.plan_mode_override` (INTEGER 0/1)
+  for the active project. Empty-clear no-orphan invariant matches
+  the other override tools.
+- Resolution at spawn time: per-pane request value (highest) → this
+  Coach override → off. Plan mode is heavy (every turn pauses for
+  ExitPlanMode review before any tool use), so leave it off in the
+  common case and use it only on Players doing destructive /
+  hard-to-undo work where the human should review the approach
+  first.
+- Emits `agent_plan_mode_set` with `to: <player_id>`.
+
+`coord_get_player_settings(player_id?)`
+
+- Coach only — read-only.
+- `player_id`: optional. One of `p1..p10` or `coach` to scope to a
+  single agent; omit for the full roster (coach + p1..p10).
+- Returns a compact text table with one row per agent showing both
+  the override value (what Coach set via the four `coord_set_player_*`
+  tools) and the resolved value (what the agent will actually run
+  with on next spawn, after fall-through to role defaults). Coach is
+  expected to call this BEFORE any `coord_set_player_*` so the team
+  doesn't churn already-correct settings.
+
 ### 12.9 Interactive Question/Plan Tools
 
 `coord_answer_question(correlation_id, answers)`
@@ -2823,6 +2883,10 @@ Task and coordination:
 - `decision_written`
 - `commit_pushed`
 - `player_assigned`
+- `agent_model_set` (Coach set/cleared a Player's model_override; carries `{player_id, to: pid, model}`. The empty-string `model` is the cleared marker.)
+- `agent_effort_set` (Coach set/cleared a Player's effort_override; carries `{player_id, to: pid, effort: int|null}`.)
+- `agent_plan_mode_set` (Coach set/cleared a Player's plan_mode_override; carries `{player_id, to: pid, plan_mode: 0|1|null}`.)
+- `runtime_updated` (Coach or human flipped a Player's runtime_override; carries `{player_id, runtime_override: 'claude'|'codex'|null}`.)
 - `brief_updated`
 - `lock_updated`
 - `human_attention`
