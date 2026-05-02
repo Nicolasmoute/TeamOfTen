@@ -9,6 +9,7 @@ Endpoints (all require_token; destructive ones tag actor):
   - POST /enable             flip team_config['compass_enabled_<id>']
   - POST /disable            flip off (does not wipe state)
   - POST /run                trigger an on_demand run (background)
+  - POST /ingest             fast-path: digest pending answered questions only
   - POST /heartbeat          presence ping
   - POST /qa/start           start a Q&A session
   - POST /qa/next            fetch next question (immediate)
@@ -412,6 +413,31 @@ def build_router(
         await presence.update_heartbeat(project_id)
         asyncio.create_task(_safe_run(project_id, mode))
         return JSONResponse({"ok": True, "running": True, "project_id": project_id, "mode": mode})
+
+    @router.post("/ingest", dependencies=deps)
+    async def trigger_ingest() -> JSONResponse:
+        """Fast-path: process pending answered questions without
+        running the rest of the daily pipeline. Use after the human
+        has answered a few questions in the queue and wants the
+        lattice to update immediately, without waiting for the next
+        scheduler tick or paying the cost of a full Run.
+
+        Stages: 0a (truth-derive, idempotent), 0b (reconciliation,
+        idempotent), 1 (digest answered questions). Skipped: passive
+        digest, region auto-merge, settle/stale/dupe reviews,
+        question generation, briefing, CLAUDE.md block.
+        """
+        project_id = await resolve_active_project()
+        if not await _is_enabled(project_id):
+            raise HTTPException(403, "Compass is disabled for this project")
+        if runner.is_running(project_id):
+            return JSONResponse({"ok": False, "running": True, "project_id": project_id})
+        await presence.update_heartbeat(project_id)
+        asyncio.create_task(_safe_run(project_id, "ingest"))
+        return JSONResponse({
+            "ok": True, "running": True,
+            "project_id": project_id, "mode": "ingest",
+        })
 
     # ---------------------------------------- Q&A session
 

@@ -229,6 +229,17 @@ skip any truth content that's about the harness's operational setup
 (rare in well-curated projects but worth guarding against). Stay in
 the project domain identified by the "Project anchor" block.
 
+The corpus may include three flavors of source, all marked with their
+relpath in the `(...)` prefix:
+- `truth/<file>` — vetted truth-lane documents (specs, guidelines, contracts).
+- `project-objectives.md` — the human's authored objectives.
+- `wiki/<file>` — agent-curated project knowledge (gotchas, stakeholder
+  notes, domain rules, glossary). Treat as truth-corpus material with
+  the same authority for derivation purposes — wiki entries capture
+  intent / users / UX / context that the truth lane often omits.
+  Cite the source relpath in `rationale` so the human can trace each
+  derived statement to its origin.
+
 GRANULARITY: derived statements are MID-grain claims about the
 project, not implementation details. Prefer claims that span human-
 facing dimensions (intent, users, UX, domain content, ethics, market)

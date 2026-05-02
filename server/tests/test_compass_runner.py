@@ -427,6 +427,100 @@ async def test_run_invalid_mode_raises(fresh_db: str) -> None:
 
 
 # ============================================================
+# Ingest mode (Stage 0 + Stage 1 only — fast path for queued answers)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_ingest_runs_only_stage_0_and_stage_1(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`mode='ingest'` skips passive digest, region merge, reviews,
+    question generation, briefing, and CLAUDE.md block. Stage 0
+    (truth-derive + reconcile, idempotent) and Stage 1 (digest
+    answered questions) still run."""
+    from server.db import init_db, set_active_project
+    await init_db()
+    await set_active_project("misc")
+
+    inv = _stub_pipeline(monkeypatch)
+    log = await runner.run("misc", mode="ingest")
+
+    assert log["completed"] is True
+    assert log["mode"] == "ingest"
+    # Stages that must NOT have run:
+    assert inv["passive"] == []
+    assert inv["regions"] == []
+    assert inv["reviews"] == []
+    assert inv["duplicates"] == []
+    assert inv["questions"] == []
+    assert inv["briefing"] == []
+    assert inv["claude_md_gen"] == []
+    assert inv["claude_md_inject"] == []
+    # Notes mention ingest mode for traceability:
+    assert any("ingest mode" in n for n in (log.get("notes") or []))
+
+
+@pytest.mark.asyncio
+async def test_ingest_digests_pending_answered_questions(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of ingest: an answered question goes from
+    `digested=False` to `digested=True` after a single ingest run,
+    without paying for the rest of the pipeline."""
+    from server.db import init_db, set_active_project
+    await init_db()
+    await set_active_project("misc")
+
+    await store.bootstrap_state("misc")
+    pre = store.load_state("misc")
+    pre.statements.append(store.Statement(
+        id="s1", text="Customers are technical", region="customers",
+        weight=0.5, created_at="t",
+    ))
+    pre.questions.append(store.Question(
+        id="q1",
+        q="Are customers technical?",
+        prediction="Yes",
+        targets=["s1"],
+        rationale="entropy gap",
+        asked_at="t",
+        asked_in_run="r0",
+        answer="Yes — engineering teams.",
+        answered_at="t2",
+    ))
+    await store.save_lattice("misc", pre.statements)
+    await store.save_questions("misc", pre.questions)
+
+    _stub_pipeline(monkeypatch)
+    log = await runner.run("misc", mode="ingest")
+    assert log["completed"] is True
+    assert log["answered_questions"] == 1
+
+    state_after = store.load_state("misc")
+    q = state_after.find_question("q1")
+    assert q is not None
+    assert q.digested is True
+
+
+@pytest.mark.asyncio
+async def test_ingest_skips_presence_gate(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Daily mode requires a recent human signal; ingest is human-
+    triggered so the gate doesn't apply (a button click IS the signal)."""
+    from server.db import init_db, set_active_project
+    await init_db()
+    await set_active_project("misc")
+
+    inv = _stub_pipeline(monkeypatch)
+    # No `messages` rows seeded → presence would normally fail for daily.
+    log = await runner.run("misc", mode="ingest")
+    assert log["completed"] is True
+    assert log.get("skipped") is False
+
+
+# ============================================================
 # Truth-derive (Stage 0) — folder-backed truth seeds the lattice
 # ============================================================
 

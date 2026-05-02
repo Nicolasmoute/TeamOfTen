@@ -97,7 +97,12 @@ Lattice statements derived from those (Stage 0 truth-derive, weight 0.75, region
 
 After a few rounds of Q&A, those same statements might sit at 0.92 (eligible to settle), or have drifted to 0.55 (a Q&A answer surprised compass), or been merged with a duplicate, or been reformulated. They're lattice rows — the world model — and downstream consumers see them at whatever weight compass currently believes. The corpus hasn't changed; the lattice's representation has.
 
-> **Implementation note (TeamOfTen):** The truth corpus is **folder-backed** — it lives in the project's existing `<project>/truth/` lane (see Appendix A.13 for the full integration spec). The original spec §6.2 modeled truth as a Compass-managed `truth.json` of short atomic statements; in the harness implementation those atomic statements live in the LATTICE as truth-grounded rows, and the corpus holds the long-form vetted documents instead.
+> **Implementation note (TeamOfTen):** The truth corpus is **folder-backed** and spans **three** lanes (see Appendix A.13 for the full integration spec):
+> 1. `<project>/truth/**/*.{md,markdown,txt}` — the dedicated truth lane (specs, brand guidelines, contracts). Strongest authority — fully human-vetted and write-protected from agents.
+> 2. `<project>/project-objectives.md` — the human's authored objectives file at the project root.
+> 3. `/data/wiki/<project_id>/**/*.{md,markdown,txt}` — the per-project wiki tree (agent-curated knowledge that compounds across sessions: gotchas, stakeholder preferences, glossary entries, domain rules). Less vetted than the first two — agents author wiki entries — but the human keeps a curating role and the corpus captures intent / users / UX / context that the truth lane often omits. Folding wiki into the corpus is strictly better than letting Compass run blind to the project's working memory.
+>
+> All three drive truth-derive (Stage 0a) and truth-check (§3.7) identically. The dashboard distinguishes them by relpath prefix — `truth/...`, `project-objectives.md`, and `wiki/...` — for display and link-routing only; the LLM treats them uniformly. The original spec §6.2 modeled truth as a Compass-managed `truth.json` of short atomic statements; in the harness implementation those atomic statements live in the LATTICE as truth-grounded rows, and the corpus holds the long-form vetted documents instead.
 
 ### 1.5 The actors
 
@@ -2084,49 +2089,56 @@ region so the queue doesn't grow unbounded.
 
 ### A.13 · Truth corpus integration (TeamOfTen)
 
-Spec §1.4 / §6.2 modeled truth as a Compass-managed list (`truth.json` with `{index, text, added_at, added_by}` rows of short atomic claims). The TeamOfTen harness already has a canonical truth lane that holds **long-form vetted documents** (specs, goals, brand guidelines, contracts, role docs). Maintaining a parallel list inside Compass would create two sources of truth, and there can be only one. So Compass adapts: it reads the harness's truth corpus and synthesizes `TruthFact`s on demand, with a small set of well-defined rules.
+Spec §1.4 / §6.2 modeled truth as a Compass-managed list (`truth.json` with `{index, text, added_at, added_by}` rows of short atomic claims). The TeamOfTen harness already has a canonical truth lane that holds **long-form vetted documents** (specs, goals, brand guidelines, contracts, role docs), plus an authored objectives file at the project root, plus a per-project wiki tree of agent-curated knowledge. Maintaining a parallel list inside Compass would create yet another source of truth, and there can be only one consolidated corpus. So Compass adapts: it reads the harness's truth-bearing material from these three lanes and synthesizes `TruthFact`s on demand, with a small set of well-defined rules.
 
 #### A.13.1 Where truth lives
 
-  - **Local**: `/data/projects/<project_id>/truth/` (walked recursively).
-  - **kDrive mirror**: `projects/<project_id>/truth/` — same shape on the cloud drive. Edits via the Files pane sync up; out-of-band edits via the kDrive web UI sync down on the next project-sync tick.
-  - **Manifest**: every project's `truth/` is auto-seeded with `truth-index.md` (template at `server/templates/truth_index.md`). The manifest is a bullet list of which files SHOULD live in this folder, with one-line descriptions; the EnvPane's Truth section renders it as a checklist with create / open buttons. Coach proposes edits to it (and to the listed files) via `coord_propose_file_write`.
+Compass treats three on-disk lanes as a single conceptual corpus:
 
-The manifest is **just another truth file** from Compass's perspective — it's ingested verbatim alongside the listed files. The LLM receives the relpath as a prefix, so it can recognize `truth-index.md` as a manifest from the filename and treat it as context rather than as a list of project claims. We don't filter or special-case it; the per-file ingestion rule applies uniformly.
+  - **Truth lane**: `/data/projects/<project_id>/truth/**` (walked recursively). Vetted, write-protected from agents; humans / Coach own it. kDrive mirror at `projects/<project_id>/truth/`. Auto-seeded with `truth-index.md` (template at `server/templates/truth_index.md`) — a manifest of which files should live in the folder. The EnvPane's Truth section renders the manifest as a checklist with create / open buttons.
+  - **Project objectives**: `/data/projects/<project_id>/project-objectives.md` — the human's authored objectives file at the project root. Same authority as truth/. Surfaced in the EnvPane.
+  - **Project wiki**: `/data/wiki/<project_id>/**` — the per-project sub-tree of the global wiki tier (separate from project's own folder; see `server/paths.py:global_paths().wiki / project_id`). Agent-curated knowledge that compounds across sessions: stakeholder preferences, glossary entries, domain rules, non-obvious gotchas, decisions context. Authored via the LLM-Wiki skill (`server/templates/llm_wiki_skill.md`); the human curates by editing in the Files pane. Less vetted than the first two lanes — agents author entries — but the corpus captures intent / users / UX / context that the truth lane often omits, and that's exactly what Compass needs to keep the lattice grounded in the project's working memory. The cross-project wiki root (`/data/wiki/*.md`) is **not** included; only the project sub-tree.
+
+All three lanes are treated identically downstream. The relpath prefix (`truth/...`, `project-objectives.md`, `wiki/...`) is a display label only — it lets the dashboard branch on link composition (truth/ + objectives compose under `/data/projects/<id>/`; wiki composes under `/data/wiki/<id>/`) and lets the LLM cite a specific source in its rationale.
+
+The truth-lane manifest (`truth-index.md`) is **just another truth file** from Compass's perspective — it's ingested verbatim alongside the listed files. The LLM receives the relpath as a prefix, so it can recognize `truth-index.md` as a manifest from the filename and treat it as context rather than as a list of project claims. We don't filter or special-case it; the per-file ingestion rule applies uniformly. Same for any wiki INDEX/log files — they live at the global wiki root, outside the per-project sub-tree, so the walk naturally excludes them.
 
 #### A.13.2 Authoring rules (existing harness flow)
 
-  - **Humans** edit truth files directly via the Files pane (or any text editor with kDrive sync). Truth files behave like any other markdown — the Files pane allowlist accepts the wider set of formats `truth/` is documented to hold (`.md`, `.txt`, `.yaml`, `.json`, `.toml`, `.csv`).
-  - **Coach** proposes truth edits via `coord_propose_file_write(scope='truth', path, content, summary)`. The proposal lands in the `file_write_proposals` table; the human approves / denies / cancels in the EnvPane's "File-write proposals" section (which also handles project-CLAUDE.md proposals via the same flow). On approval, the file is written and the proposal row is marked resolved (`server/truth.py:resolve_file_write_proposal`).
+  - **Humans** edit truth-corpus files directly via the Files pane (or any text editor with kDrive sync). Files behave like any other markdown.
+  - **Coach** proposes truth-lane edits via `coord_propose_file_write(scope='truth', path, content, summary)`. The proposal lands in the `file_write_proposals` table; the human approves / denies / cancels in the EnvPane's "File-write proposals" section (which also handles project-CLAUDE.md proposals via the same flow). On approval, the file is written and the proposal row is marked resolved (`server/truth.py:resolve_file_write_proposal`).
   - **Players** are blocked from writing under `truth/` by a `PreToolUse` hook in `server/agents.py`. A Player attempting `Write` / `Edit` / `Bash` against a truth path gets a deny; the agent surface tells them to route via Coach.
+  - **Wiki entries** are authored via the LLM-Wiki skill — any agent (Coach or Players) can `Write` directly to `/data/wiki/<project_id>/...` per the skill's rules. There's no proposal flow; the human curates after the fact. This is intentional: the wiki tier compounds knowledge fastest when agents can record learnings without ceremony.
   - **Compass** has no write path. It only reads.
 
 #### A.13.3 What Compass ingests
 
-  - **Allowed extensions**: `.md`, `.markdown`, `.txt`. Other formats accepted by `truth/` (`.yaml`, `.json`, `.toml`, `.csv`) are reference / structured docs and are skipped — they're not natural truth-check candidates and would bloat prompts. The dashboard's Files pane is the right place to view them.
-  - **Walk order**: recursive under `<project>/truth/`. Sorted by POSIX relpath so indexing is deterministic across calls (a file rename or addition shifts indices on the next read; that's fine because indices are only stable within one run).
+  - **Allowed extensions**: `.md`, `.markdown`, `.txt` — uniform across all three lanes. Other formats accepted by `truth/` (`.yaml`, `.json`, `.toml`, `.csv`) are reference / structured docs and are skipped — they're not natural truth-check candidates and would bloat prompts. The dashboard's Files pane is the right place to view them.
+  - **Walk order**: each lane walked recursively, then merged + sorted by display relpath. Stable POSIX relpaths so indexing is deterministic across calls (a file rename or addition shifts indices on the next read; that's fine because indices are only stable within one run). With the synthetic prefixes the merged ordering always groups in the same way: `project-objectives.md` (no prefix), then `truth/...`, then `wiki/...`.
   - **Per-file synthesis**: each file becomes one `TruthFact` (`server/compass/store.py`):
     - `index`: 1-based, monotonic by sort order.
-    - `text`: `(<relpath>) <file body>` — prefixing the relpath gives the LLM a name handle so when it answers `truth_index: 2` we can map back to a file path.
+    - `text`: `(<display_relpath>) <file body>` — prefixing the relpath gives the LLM a name handle so when it answers `truth_index: 2` we can map back to a path. The display relpath uses the synthetic `wiki/` prefix for wiki entries (NOT the real on-disk path) so prompts stay short and the LLM can attribute claims by source flavor.
     - `added_at`: file mtime, ISO-8601 UTC.
-    - `added_by`: `"human"` (Compass's perspective — the harness owns authoring).
-  - **Truncation**: bodies longer than `MAX_FACT_CHARS=8000` are truncated with a marker like `[truncated — file is N chars total]`. Long truth files are usually reference material; the head captures the salient claims.
+    - `added_by`: `"human"` (Compass's perspective — the harness's curating layer owns authoring).
+  - **Truncation**: bodies longer than `MAX_FACT_CHARS=8000` are truncated with a marker like `[truncated — file is N chars total]`. Long files (specs, brand guides, lengthy wiki entries) are usually reference material; the head captures the salient claims.
   - **Empty / blank files**: skipped entirely. Avoids a fact that's just a path with no body.
 
 #### A.13.4 Read interface
 
-  - `read_truth_facts(project_id) -> list[TruthFact]` — the canonical reader. Called from `compass.store.load_state`, which itself is called fresh on every Compass call site (runner stage entries, MCP tool handlers, dashboard `/api/compass/state`). No in-process caching — file mtimes drive correctness.
-  - `read_truth_index_to_path(project_id) -> dict[int, str]` — the same 1-based ordering, exposed as an index → relpath map. Used by the dashboard's truth-conflict modal to resolve `truth_index` (from the LLM) to a file path the human can be pointed at.
+  - `read_truth_facts(project_id) -> list[TruthFact]` — the canonical reader. Walks all three lanes (truth/, project-objectives.md, wiki/), merges, sorts, and synthesizes facts. Called from `compass.store.load_state`, which itself is called fresh on every Compass call site (runner stage entries, MCP tool handlers, dashboard `/api/compass/state`). No in-process caching — file mtimes drive correctness.
+  - `read_truth_index_to_path(project_id) -> dict[int, str]` — the same 1-based ordering, exposed as an index → display-relpath map. Used by the dashboard's truth-conflict modal and reconciliation card to resolve `truth_index` (from the LLM) to a file path the human can be pointed at. Returns the display relpath (with `wiki/` prefix where applicable), not the on-disk absolute path — the dashboard composes the absolute path itself based on prefix.
   - `MAX_FACT_CHARS` and `ALLOWED_SUFFIXES` are public constants for tests + UI introspection.
 
 #### A.13.5 Idempotency: the corpus hash
 
-A SHA-256 over the concatenated corpus text (`text` field, file-by-file, with a separator). Stored in `team_config['compass_truth_hash_<project_id>']` after every successful Stage 0 run. The hash drives two short-circuits:
+A SHA-256 over the concatenated corpus text (`text` field, file-by-file, with a separator) — covering all three lanes uniformly. Stored in `team_config['compass_truth_hash_<project_id>']` after every successful Stage 0 run. The hash drives two short-circuits:
 
   - **Stage 0 truth-derive (§3.0 / Appendix A.14)** — skip the LLM call when the hash is unchanged AND the lattice already has rows with `created_by="compass-truth"`.
   - **Stage 0.1 reconciliation (§3.0.1)** — only fire when the hash changed since the last run; an unchanged corpus can't have introduced new conflicts.
 
-The hash is cleared on `POST /api/compass/reset` so the next run does a fresh full-corpus ingestion (the `truth/` folder itself is left intact — reset wipes Compass's view, not the floor).
+A wiki edit changes the hash same as a truth/ edit or an objectives edit. No source has special hash treatment.
+
+The hash is cleared on `POST /api/compass/reset` so the next run does a fresh full-corpus ingestion (the `truth/` folder, objectives file, and wiki tree are all left intact — reset wipes Compass's view, not the source material).
 
 #### A.13.6 What's "special" about the corpus, restated
 
@@ -2137,17 +2149,17 @@ Per §1.4, the corpus is special in only two narrow ways. Implementation specifi
 
 #### A.13.7 Dashboard surface
 
-  - **`TruthReference` card** on the Compass dashboard: shows the count of truth files, an expand-to-view list (path + 240-char preview per file), and an "open Files pane" button. No edit controls.
-  - **Truth-conflict modal** (`§3.7`) "Amend truth" path: routes the human at the offending file via the Files pane (resolved through `read_truth_index_to_path`); the existing `coord_propose_file_write` flow remains available for Coach-driven amendments. There is no in-modal text editor for truth.
-  - **Reconciliation proposals** (`§3.0.1` + §6.7): rendered alongside settle / stale / dupe proposals on the lattice column. Each shows the lattice row, the cited corpus file(s), the explanation, and three resolution buttons (update lattice / update truth / accept ambiguity).
+  - **`TruthReference` card** on the Compass dashboard: shows the count of truth-corpus facts (across all three lanes), an expand-to-view list (display relpath + 240-char preview per file), and an "open Files pane" button. No edit controls. The kicker reads `TRUTH CORPUS · READ FROM <project>/truth/ + project-objectives.md + wiki/<project>/ ON EVERY RUN` so the human knows what's being fed in.
+  - **Truth-conflict modal** (`§3.7`) "Amend truth" path: routes the human at the offending file via the Files pane (resolved through `read_truth_index_to_path`). For wiki-sourced facts (relpath starts with `wiki/`), the displayed path is `/data/wiki/<project_id>/<rest>`; for the other two lanes it's `<project>/<relpath>`. The existing `coord_propose_file_write` flow remains available for Coach-driven amendments to the truth lane; wiki amendments are direct (no proposal flow). There is no in-modal text editor.
+  - **Reconciliation proposals** (`§3.0.1` + §6.7): rendered alongside settle / stale / dupe proposals on the lattice column. Each shows the lattice row, the cited corpus file(s) (with the lane visible from the prefix), the explanation, and three resolution buttons (update lattice / update truth / accept ambiguity). The "update truth" button branches link composition on the `wiki/` prefix the same way the truth-conflict modal does.
 
 #### A.13.8 Reset semantics
 
-`POST /api/compass/reset` clears Compass's view but preserves the corpus:
+`POST /api/compass/reset` clears Compass's view but preserves the source corpus:
   - **Wiped**: `data/projects/<id>/working/compass/` (lattice, regions, questions, audits, runs, briefings, proposals, claude_md_block) plus `team_config` keys `compass_bootstrapped_<id>`, `compass_last_run_<id>`, `compass_heartbeat_<id>`, `compass_truth_hash_<id>`.
-  - **Untouched**: `data/projects/<id>/truth/` and the kDrive mirror at `projects/<id>/truth/`. Truth is the floor; reset is a Compass-side operation.
+  - **Untouched**: `data/projects/<id>/truth/`, `data/projects/<id>/project-objectives.md`, `data/wiki/<id>/**`, and the kDrive mirrors of all three. The corpus is the floor; reset is a Compass-side operation.
 
-After a reset, the next Compass run sees `corpus_hash` as missing, runs Stage 0 truth-derive fresh, and re-seeds the lattice from the corpus — restoring the truth-grounded floor automatically.
+After a reset, the next Compass run sees `corpus_hash` as missing, runs Stage 0 truth-derive fresh against all three lanes, and re-seeds the lattice from the corpus — restoring the truth-grounded floor automatically.
 
 ### A.14 · Stage 0 mechanics — derive + reconcile
 

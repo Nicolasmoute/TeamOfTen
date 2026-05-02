@@ -94,7 +94,7 @@ async def _emit_phase(project_id: str, run_id: str, phase: str, **extra: Any) ->
 
 async def run(project_id: str, mode: str = "daily") -> dict[str, Any]:
     """Execute one Compass run. Returns the run-log dict."""
-    if mode not in ("bootstrap", "daily", "on_demand"):
+    if mode not in ("bootstrap", "daily", "on_demand", "ingest"):
         raise ValueError(f"invalid mode: {mode}")
 
     # Lock per-project. If a run is already running, skip.
@@ -436,6 +436,53 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
             })
         except Exception:
             pass
+
+    # ============================================================
+    # Ingest mode early-exit. The user clicked Ingest specifically to
+    # process pending answered questions; we DON'T want to also pull
+    # passive-digest noise, run reviews, or generate fresh questions.
+    # Stage 0 (truth-derive + reconciliation) is already done above
+    # because it's idempotent and the corpus may have shifted; Stage 1
+    # (answer digest) is the main reason the user clicked. Everything
+    # else waits for the next full run.
+    # ============================================================
+    if mode == "ingest":
+        log.completed = True
+        log.finished_at = _now_iso()
+        log.notes.append(
+            "ingest mode — stopped after answer digest "
+            "(skipped passive digest, region merge, reviews, "
+            "question-gen, briefing, CLAUDE.md block)"
+        )
+        await store.append_run_log(project_id, log)
+        await _record_last_run(project_id, log.finished_at, was_bootstrap=False)
+        try:
+            await bus.publish({
+                "ts": log.finished_at,
+                "agent_id": "compass",
+                "project_id": project_id,
+                "type": "compass_run_completed",
+                "run_id": run_id,
+                "mode": mode,
+                "summary": {
+                    "answered_questions": log.answered_questions,
+                    "contradictions": log.contradictions,
+                },
+            })
+        except Exception:
+            pass
+        return {
+            "run_id": log.run_id,
+            "started_at": log.started_at,
+            "finished_at": log.finished_at,
+            "mode": log.mode,
+            "completed": log.completed,
+            "answered_questions": log.answered_questions,
+            "contradictions": log.contradictions,
+            "notes": log.notes,
+            "skipped": False,
+            "skipped_reason": None,
+        }
 
     # ============================================================
     # 2. Passive digest (if any signals)

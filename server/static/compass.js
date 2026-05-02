@@ -165,7 +165,17 @@ function RegionPill({ name, count, active, onClick }) {
 
 // ---------------------------------------------------------------- header
 
-function CompassHeader({ enabled, running, runningPhase, qaActive, lastRunAt, onRun, onQAStart, onQAEnd, onReset }) {
+function CompassHeader({
+  enabled, running, runningPhase, qaActive, lastRunAt,
+  pendingAnswered,  // count of questions that have an answer but aren't digested yet
+  onRun, onIngest, onQAStart, onQAEnd, onReset,
+}) {
+  const ingestLabel = pendingAnswered > 0
+    ? `Ingest (${pendingAnswered})`
+    : "Ingest";
+  const ingestTitle = pendingAnswered > 0
+    ? `Digest the ${pendingAnswered} answered question${pendingAnswered === 1 ? "" : "s"} now — fast path, runs only the answer-digest stage (skips passive digest, reviews, briefing, etc.)`
+    : "No queued answers to ingest. Answer questions in the queue first; then click Ingest to fold them into the lattice without paying the cost of a full Run.";
   return html`
     <header class="cmp-header">
       <div class="cmp-title">
@@ -185,6 +195,12 @@ function CompassHeader({ enabled, running, runningPhase, qaActive, lastRunAt, on
             ? html`<span class="cmp-pulse"></span> ${runningPhase || "running…"}`
             : html`<span class="cmp-icon cmp-icon-run"></span> Run Compass`}
         </button>
+        <button
+          class=${"cmp-btn" + (pendingAnswered > 0 ? " cmp-btn-warn" : "")}
+          disabled=${!enabled || running || qaActive}
+          onClick=${onIngest}
+          title=${ingestTitle}
+        >${ingestLabel}</button>
         ${qaActive
           ? html`<button class="cmp-btn cmp-btn-warn" onClick=${onQAEnd}>End Q&A</button>`
           : html`<button class="cmp-btn" disabled=${!enabled || running} onClick=${onQAStart}>Start Q&A</button>`}
@@ -210,11 +226,12 @@ function EnableBanner({ onEnable, busy }) {
 
 // ---------------------------------------------------------------- truth reference (read-only)
 
-// The truth corpus is the union of two sources, both read on every
+// The truth corpus is the union of three sources, all read on every
 // run:
 //   • <project>/truth/*.{md,txt} — the dedicated truth lane
 //   • <project>/project-objectives.md — the human's authored objectives
-// Compass treats both with the same authority — they drive
+//   • /data/wiki/<project_id>/*.{md,txt} — per-project wiki entries
+// Compass treats all three with truth-corpus authority — they drive
 // truth-derive (Stage 0a, lattice seeding) and truth-check (Q&A
 // contradiction detection). The dashboard surfaces a small read-only
 // summary so the human can see exactly what's fed to the prompts;
@@ -228,7 +245,7 @@ function TruthReference({ truth, onOpenFiles }) {
       <div class="cmp-truth-ref-head">
         <div>
           <div class="cmp-section-kicker">
-            TRUTH CORPUS · READ FROM ${`<project>/truth/ + project-objectives.md`} ON EVERY RUN
+            TRUTH CORPUS · READ FROM ${`<project>/truth/ + project-objectives.md + wiki/<project>/`} ON EVERY RUN
           </div>
           <div class="cmp-section-title">${count} truth ${count === 1 ? "fact" : "facts"}</div>
         </div>
@@ -236,10 +253,12 @@ function TruthReference({ truth, onOpenFiles }) {
       </div>
       ${count === 0
         ? html`<div class="cmp-truth-ref-empty">
-            No truth files yet. Drop <code>.md</code> or <code>.txt</code> files
-            into the project's <code>truth/</code> folder, OR write
-            <code>project-objectives.md</code> at the project root —
-            Compass will derive initial lattice statements from them on the
+            No truth-corpus files yet. Drop <code>.md</code> or <code>.txt</code>
+            files into the project's <code>truth/</code> folder, write
+            <code>project-objectives.md</code> at the project root, or
+            grow the project wiki under
+            <code>/data/wiki/&lt;project&gt;/</code> — Compass will
+            derive initial lattice statements from any of them on the
             next run.
           </div>`
         : html`
@@ -701,6 +720,11 @@ function InputsAndQuestionsColumn({ state, onSubmitInput, onSubmitAnswer }) {
           ? html`<div class="cmp-empty">No pending questions.</div>`
           : pending.map((q) => html`<${QuestionCard} key=${q.id} q=${q} onSubmit=${onSubmitAnswer} />`)}
       </div>
+      <div class="cmp-q-hint cmp-italic">
+        Answers queue here until you click <strong>Ingest</strong>
+        (header) — that runs only the digest stage and folds them into
+        the lattice. Daily scheduler also picks them up.
+      </div>
     </section>
   `;
 }
@@ -1119,6 +1143,27 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
     setBusy(false);
   }, [authedFetch, state]);
 
+  const triggerIngest = useCallback(async () => {
+    // Fast path — runs Stage 0 (truth-derive + reconciliation,
+    // idempotent) + Stage 1 (digest answered questions) and stops.
+    // Skips passive digest, reviews, question generation, briefing,
+    // CLAUDE.md block. Used after the human answers a few queued
+    // questions and wants the lattice updated immediately, without
+    // waiting for the next scheduler tick or paying the cost of a
+    // full Run.
+    setBusy(true);
+    setPhase("ingesting…");
+    try {
+      await apiFetch(authedFetch, "/ingest", { method: "POST" });
+    } catch (err) {
+      setError(err.message);
+      setBusy(false);
+      setPhase(null);
+    }
+    // running flips off via compass_run_completed event handler
+    setBusy(false);
+  }, [authedFetch]);
+
   const reset = useCallback(async () => {
     if (!confirm("Reset Compass for this project? This wipes the lattice, truth, regions, questions, audits, runs, briefings — locally and on kDrive. Cannot be undone.")) {
       return;
@@ -1196,16 +1241,18 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
       if (action === "update_truth") {
         const path = (extra?.corpus_paths || [])[0];
         if (path) {
-          // Paths from the LLM are project-root-relative — either
-          // "truth/<sub>" for the truth lane or "project-objectives.md"
-          // for the objectives file. Compose with /data/projects/<id>
-          // directly; no hardcoded "/truth/" segment.
+          // Truth-corpus relpaths are display labels:
+          //   - `truth/<sub>` or `project-objectives.md` → composed
+          //     under /data/projects/<id>/
+          //   - `wiki/<sub>` → composed under /data/wiki/<id>/
+          //     (the wiki tree lives outside the project root on disk)
           const cleanPath = path.replace(/^\/+/, "");
+          const isWiki = cleanPath.startsWith("wiki/");
+          const target = isWiki
+            ? "/data/wiki/" + (state?.project_id || "") + "/" + cleanPath.slice(5)
+            : "/data/projects/" + (state?.project_id || "") + "/" + cleanPath;
           const a = document.createElement("a");
-          a.setAttribute(
-            "data-harness-path",
-            "/data/projects/" + (state?.project_id || "") + "/" + cleanPath,
-          );
+          a.setAttribute("data-harness-path", target);
           a.setAttribute("href", "#");
           document.body.appendChild(a);
           a.click();
@@ -1331,11 +1378,11 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
 
   const conflictAmendTruth = useCallback(async () => {
     if (!truthConflict?.conflicts?.length) return;
-    // Truth is owned by the project's truth/ folder, not by Compass.
-    // The "amend truth" path can't write directly anymore; instead
-    // we surface the file path so the human knows which truth file
-    // to edit (via the Files pane or any text editor with kDrive
-    // sync). Fetch the current truth list to map index → path.
+    // Truth is owned by source-of-truth files (truth/, objectives, or
+    // wiki), not by Compass. The "amend truth" path can't write
+    // directly; instead we surface the file path so the human knows
+    // which file to edit (via the Files pane or any text editor with
+    // kDrive sync). Fetch the current truth list to map index → path.
     const idx = truthConflict.conflicts[0].truth_index;
     let path = null;
     try {
@@ -1343,16 +1390,21 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
       const fact = (tr.facts || []).find((f) => f.index === idx);
       path = fact?.path || null;
     } catch (_) {}
+    const display = path
+      ? path.startsWith("wiki/")
+        ? `/data/wiki/${state.project_id || ""}/${path.slice(5)}`
+        : `<project>/${path}`
+      : null;
     alert(
       `Truth T${idx} — to amend, edit the file directly:\n\n` +
-      (path
-        ? `<project>/${path}\n\nThe Files pane lets you edit it. ` +
+      (display
+        ? `${display}\n\nThe Files pane lets you edit it. ` +
           `Compass re-reads the corpus on every run, so the next run ` +
           `picks up the change.`
         : `(file path unavailable; truth corpus may have shifted).`)
     );
     setTruthConflict(null);
-  }, [truthConflict, authedFetch]);
+  }, [truthConflict, authedFetch, state]);
 
   const conflictLeaveBoth = useCallback(async () => {
     // Mark question as ambiguity_accepted via the API: the simplest
@@ -1399,6 +1451,13 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
   }
 
   const lastRun = state.runs?.length ? state.runs[state.runs.length - 1].finished_at : null;
+  // Count of queued answers waiting to be folded into the lattice.
+  // Drives the "Ingest (N)" badge in the header so the human knows
+  // there's something pending. Excludes contradicted (truth-conflict
+  // halted) and ambiguity-accepted (human said "leave both").
+  const pendingAnswered = (state.questions || []).reduce((n, q) => {
+    return n + ((q.answer && !q.digested && !q.contradicted && !q.ambiguity_accepted) ? 1 : 0);
+  }, 0);
 
   return html`
     <article class=${"pane cmp-pane" + (stacked ? " stacked" : "")}>
@@ -1411,7 +1470,9 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
           runningPhase=${phase}
           qaActive=${qaActive}
           lastRunAt=${lastRun}
+          pendingAnswered=${pendingAnswered}
           onRun=${triggerRun}
+          onIngest=${triggerIngest}
           onQAStart=${qaStart}
           onQAEnd=${qaEnd}
           onReset=${reset}

@@ -701,17 +701,33 @@ Players. Spec: [Docs/compass-specs.md](Docs/compass-specs.md).
   `proposals/duplicates.json`). Atomic writes via tempfile +
   `os.replace`; synchronous kDrive mirror per write. **No
   `truth.json`** — see "Truth is folder-backed" below.
-- **Truth is folder-backed.** Compass reads truth from the project's
-  existing `<project>/truth/` lane (managed by humans via the Files
-  pane and by Coach via `coord_propose_file_write(scope='truth', ...)`). Each `.md` /
-  `.txt` file is one truth fact; the adapter
-  ([server/compass/truth.py](server/compass/truth.py)) walks the
-  folder fresh on every `load_state` call. The dashboard shows a
-  read-only `TruthReference` card; there is no
-  `POST /api/compass/truth` for adding/editing/removing — that lives
-  in the harness's existing truth-edit flow. Truth-conflict modal's
-  "amend truth" path points the human at the offending file path
-  rather than offering an in-modal edit.
+- **Truth is folder-backed and spans three lanes.** Compass reads
+  truth-bearing material from THREE sources, all walked fresh on
+  every `load_state` call by the adapter at
+  [server/compass/truth.py](server/compass/truth.py):
+  1. `<project>/truth/**/*.{md,txt}` — the dedicated truth lane,
+     human-vetted (humans edit via the Files pane; Coach proposes via
+     `coord_propose_file_write(scope='truth', ...)`; agents are blocked
+     by a PreToolUse hook).
+  2. `<project>/project-objectives.md` — the human's authored
+     objectives file at the project root.
+  3. `/data/wiki/<project_id>/**/*.{md,txt}` — the per-project wiki
+     tree (agent-curated knowledge: gotchas, stakeholder preferences,
+     glossary entries, domain rules, decisions context). Authored via
+     the LLM-Wiki skill; less vetted than the first two but the human
+     keeps a curating role and the corpus captures intent / users /
+     UX / context the truth lane often omits. Cross-project wiki at
+     `/data/wiki/*.md` is NOT included; only the per-project sub-tree.
+  All three drive truth-derive (Stage 0a) and truth-check (§3.7)
+  identically. The dashboard distinguishes them by relpath prefix
+  (`truth/...`, `project-objectives.md`, `wiki/...`) for display + link
+  routing only — the LLM treats them uniformly. The `TruthReference`
+  card is read-only; there is no `POST /api/compass/truth` for
+  adding/editing/removing — edits happen via the Files pane (and via
+  `coord_propose_file_write` for the truth lane). The truth-conflict
+  modal's "amend truth" path points the human at the offending file
+  path; for wiki sources the displayed path is
+  `/data/wiki/<id>/<rest>` instead of `<project>/<relpath>`.
 - **Stage 0 — truth ingestion (two sub-stages).** Before the answer-
   digest stage, the runner reads the truth corpus fresh and runs:
   - **0a Truth-derive** — propose lattice statements representing

@@ -1,21 +1,42 @@
-"""Adapter from the project's `truth/` folder to Compass `TruthFact`s.
+"""Adapter from the project's truth-corpus sources to Compass `TruthFact`s.
 
 Compass does not own a separate truth list — the project already has a
-canonical, human-managed `truth/` directory under
-`/data/projects/<id>/truth/`. The harness's existing flow:
+canonical, human-managed body of truth-bearing material spread across
+three lanes:
 
-  - Humans edit truth files via the Files pane.
-  - Coach proposes new / updated truth via
-    `coord_propose_file_write(scope='truth', ...)`, which queues a row
-    in `file_write_proposals` for human approval.
-  - Agents are blocked from writing under `truth/` by a PreToolUse hook
-    in `server/agents.py`.
+  1. `<project>/truth/**/*.{md,markdown,txt}` — the dedicated truth
+     directory under `/data/projects/<id>/truth/`. Humans edit via the
+     Files pane; Coach proposes new / updated truth via
+     `coord_propose_file_write(scope='truth', ...)`, which queues a
+     row in `file_write_proposals` for human approval. Agents are
+     blocked from writing under `truth/` by a PreToolUse hook in
+     `server/agents.py`. This is the **strongest** lane — fully vetted.
+  2. `<project>/project-objectives.md` — the human's authored
+     objectives file at the project root. Same authority as truth/.
+  3. `/data/wiki/<id>/**/*.{md,markdown,txt}` — the per-project wiki
+     tree. Agent-curated knowledge that compounds across sessions
+     (gotchas, stakeholder preferences, glossary entries, domain
+     rules). Not as strong as truth/ — wiki entries are written by
+     agents — but the human keeps a curating role and the corpus
+     captures intent / users / UX / context that truth/ rarely covers.
+     Folding it in lets Compass anchor the lattice in the same
+     material the team consults at runtime.
 
-Compass reads truth fresh on every run (no caching) — when truth changes
-on disk between runs, the next run picks it up automatically. Each
-`.md` / `.txt` file becomes one `TruthFact`; the synthesized `index` is
-1-based and stable for the duration of a single read (sorted by path),
-so the LLM's `truth_index` reply can be mapped back to a file path.
+Compass reads the corpus fresh on every run (no caching) — when
+anything changes on disk between runs, the next run picks it up
+automatically. Each `.md` / `.txt` file becomes one `TruthFact`; the
+synthesized `index` is 1-based and stable for the duration of a single
+read (sorted by relpath), so the LLM's `truth_index` reply can be
+mapped back to a file path.
+
+Path-shape contract for the dashboard:
+  - In-project files (truth/ + project-objectives.md): relpath is
+    project-root-relative — e.g. `truth/specs.md`,
+    `project-objectives.md`. Dashboard composes
+    `/data/projects/<id>/<relpath>`.
+  - Wiki files: relpath uses the synthetic `wiki/<sub>/<file>.md`
+    prefix (relative to `/data/wiki/<id>/`). Dashboard branches on
+    the `wiki/` prefix and composes `/data/wiki/<id>/<rest>`.
 
 Other formats accepted by `truth/` (yaml, json, toml, csv per
 `server/truth.py`) are NOT exposed as truth facts — they're reference
@@ -30,7 +51,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from server.paths import project_paths
+from server.paths import global_paths, project_paths
 
 logger = logging.getLogger("harness.compass.truth")
 if not logger.handlers:
@@ -68,24 +89,34 @@ def _mtime_iso(p: Path) -> str:
 
 def _collect_truth_files(project_id: str) -> list[tuple[Path, str]]:
     """Walk every truth-corpus source for the project and return a
-    sorted list of `(path, project_relative_relpath)` pairs.
+    sorted list of `(path, display_relpath)` pairs.
 
-    Two sources combined into one corpus:
+    Three sources combined into one corpus:
     1. `<project>/truth/**/*.{md,markdown,txt}` — the dedicated truth
        lane (specs, brand guidelines, contracts, role docs, etc.).
+       relpath: `truth/<sub>/<file>.md`.
     2. `<project>/project-objectives.md` — the human's authored
        objectives file (sits at project root, surfaced in the EnvPane).
+       relpath: `project-objectives.md`.
+    3. `/data/wiki/<project_id>/**/*.{md,markdown,txt}` — the
+       per-project wiki tree. Agent-curated knowledge that compounds
+       across sessions and captures intent / users / UX / context
+       material that the dedicated truth lane rarely covers.
+       Synthetic relpath: `wiki/<sub>/<file>.md` (NOT under the project
+       root on disk — the prefix is a label that the dashboard branches
+       on to compose links to `/data/wiki/<id>/<rest>`).
 
-    Both are human-authored / Coach-proposed-then-human-approved, both
-    drive the lattice the same way, and both should anchor truth-check
-    contradictions. Treating them uniformly avoids two parallel "what
-    the human believes" worlds.
+    All three drive the lattice the same way, and all three anchor
+    truth-check contradictions. Treating them uniformly avoids parallel
+    "what the team believes" worlds. Wiki entries lean less vetted
+    than truth/ — agents wrote them — but the human's curating role
+    keeps them within the trust envelope, and the alternative (loose
+    side-channel that doesn't drive lattice updates) is strictly worse
+    for keeping the lattice grounded in the project's working memory.
 
-    Relative paths are PROJECT-ROOT relative, not truth-root relative —
-    so a file under `truth/` shows as `truth/specs.md` and the
-    objectives file shows as `project-objectives.md`. The dashboard
-    builds links via `/data/projects/<id>/<relpath>` directly, which
-    handles both shapes uniformly.
+    Sorted by relpath so ordering is deterministic across calls;
+    the synthetic `wiki/...` prefix sorts after `project-objectives.md`
+    and after `truth/...` paths.
     """
     pp = project_paths(project_id)
     project_root = pp.root
@@ -112,14 +143,33 @@ def _collect_truth_files(project_id: str) -> list[tuple[Path, str]]:
         relpath = str(obj.relative_to(project_root)).replace("\\", "/")
         out.append((obj, relpath))
 
+    # 3. /data/wiki/<project_id>/** — synthetic `wiki/...` prefix.
+    #    Wiki INDEX.md (the auto-maintained catalog at the global wiki
+    #    root) is NOT in the per-project tree, so we don't need to
+    #    filter for it here. Per-project wiki only.
+    wiki_root = global_paths().wiki / project_id
+    if wiki_root.exists() and wiki_root.is_dir():
+        for p in wiki_root.rglob("*"):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in ALLOWED_SUFFIXES:
+                continue
+            sub = str(p.relative_to(wiki_root)).replace("\\", "/")
+            out.append((p, f"wiki/{sub}"))
+
     out.sort(key=lambda pair: pair[1])
     return out
 
 
 def read_truth_facts(project_id: str):
-    """Read every truth-corpus file (truth/ + project-objectives.md)
-    and return a list of `TruthFact` instances, one per allowed file,
-    ordered by project-root-relative path.
+    """Read every truth-corpus file (truth/, project-objectives.md, and
+    the per-project wiki tree) and return a list of `TruthFact`
+    instances, one per allowed file, ordered by display relpath.
+
+    Wiki files are folded in alongside `truth/` and `project-objectives.md`.
+    The dashboard distinguishes them by the `wiki/` relpath prefix; the
+    LLM treats them all as truth-corpus material with the relpath visible
+    so it can attribute reasoning to a specific source.
 
     The import is local so this module can be imported without pulling
     `compass.store` into a top-level import cycle.
@@ -136,8 +186,9 @@ def read_truth_facts(project_id: str):
         if not body:
             continue
         # Prefix with the file's relpath so the LLM has a name handle —
-        # makes the reasoning surface ("conflicts with brand-tone.md")
-        # while the LLM still answers with the integer truth_index.
+        # makes the reasoning surface ("conflicts with brand-tone.md"
+        # or "per wiki/customer-personas.md") while the LLM still
+        # answers with the integer truth_index.
         text = body
         if len(text) > MAX_FACT_CHARS:
             text = text[:MAX_FACT_CHARS] + f"\n\n[truncated — file is {len(body)} chars total]"
@@ -151,13 +202,14 @@ def read_truth_facts(project_id: str):
 
 
 def read_truth_index_to_path(project_id: str) -> dict[int, str]:
-    """Return the same 1-based index → project-root-relative path
-    mapping `read_truth_facts` uses internally. Used by the
-    truth-conflict modal so the human can be pointed at the right
-    file when amending. Path shape:
+    """Return the same 1-based index → display relpath mapping that
+    `read_truth_facts` uses internally. Used by the truth-conflict
+    modal and the reconciliation card so the human can be pointed at
+    the right file when amending. Path shapes:
       - `truth/<subpath>/<file>.md` for files under truth/
       - `project-objectives.md` for the objectives file
-    Either form composes correctly with `/data/projects/<id>/<path>`.
+      - `wiki/<subpath>/<file>.md` for wiki entries (NOT under the
+        project root on disk — dashboard handles the prefix specially)
     """
     files = _collect_truth_files(project_id)
     return {i: relpath for i, (_, relpath) in enumerate(files, start=1)}

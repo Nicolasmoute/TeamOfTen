@@ -135,6 +135,33 @@ def test_run_kicks_off_background_task(
     # here since the API contract is "spawned, not awaited".
 
 
+def test_ingest_rejects_when_disabled(client: TestClient) -> None:
+    r = client.post("/api/compass/ingest")
+    assert r.status_code == 403
+
+
+def test_ingest_kicks_off_background_task(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`POST /ingest` spawns a background `runner.run(mode='ingest')`
+    and returns immediately. The endpoint exists so the dashboard's
+    Ingest button can fold queued answers into the lattice without
+    paying the cost of a full run."""
+    client.post("/api/compass/enable")
+    captured: list[str] = []
+
+    async def _fake_run(project_id: str, mode: str = "daily") -> dict[str, Any]:
+        captured.append(f"{project_id}:{mode}")
+        return {"run_id": "r1", "completed": True, "mode": mode}
+
+    monkeypatch.setattr(runner_mod, "run", _fake_run)
+    r = client.post("/api/compass/ingest")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["mode"] == "ingest"
+    assert body["running"] is True
+
+
 def test_run_rejects_invalid_mode(client: TestClient) -> None:
     client.post("/api/compass/enable")
     r = client.post("/api/compass/run", json={"mode": "daily"})
