@@ -1202,18 +1202,51 @@ When the Agent SDK adds `context_management`, migrate:
 ### Frontend deps are vendored — refresh via `scripts/vendor_deps.py`
 
 Most ESM deps the UI uses (htm, split.js, marked, dompurify, diff,
-highlight.js core + 12 language packs, the github-dark theme CSS) live
-under `server/static/vendor/`, not on esm.sh. Cold first load drops
-from ~17 cross-origin module requests to 2 (preact + preact/hooks,
-which stay on esm.sh because they share component-instance state with
-each other and `?bundle`-ing them produces two separate Preact
-instances that break useState).
+highlight.js core + 12 language packs, katex, plus the github-dark +
+katex CSS) live under `server/static/vendor/`, not on esm.sh. Cold
+first load drops from ~17 cross-origin module requests to 2 (preact +
+preact/hooks, which stay on esm.sh because they share component-
+instance state with each other and `?bundle`-ing them produces two
+separate Preact instances that break useState).
 
-To bump versions: edit `DEPS` in `scripts/vendor_deps.py`, run
-`python scripts/vendor_deps.py`, commit the regenerated files.
-The script chases esm.sh's `?bundle` re-export wrapper to grab the
-real self-contained bundle. CI does NOT regenerate vendor files —
-they ship as committed artifacts.
+Three tiers of vendoring:
+- **`DEPS`** — ESM modules fetched with esm.sh's `?bundle` flag (one
+  self-contained file per dep). Sanity-checked for stray `https://esm.sh/`
+  imports on disk.
+- **`NON_ESM_DEPS`** — UMD/IIFE bundles fetched as-is (currently just
+  `mermaid.min.js`, ~3MB). Loaded via dynamic `<script>` tag in
+  `markdown.js` because mermaid's ESM build splits across 30+ chunks.
+- **`CSS_DEPS`** — plain CSS (hljs theme + KaTeX). KaTeX CSS goes
+  through `_CSS_REWRITES` to convert relative `fonts/...` URLs to
+  absolute jsdelivr URLs, so we don't have to vendor 12 binary fonts.
+  Browser fetches them on first use, then caches forever.
+
+To bump versions: edit `DEPS` / `NON_ESM_DEPS` / `CSS_DEPS` in
+`scripts/vendor_deps.py`, run `python scripts/vendor_deps.py`, commit
+the regenerated files. The script chases esm.sh's `?bundle` re-export
+wrapper to grab the real self-contained bundle. CI does NOT regenerate
+vendor files — they ship as committed artifacts.
+
+### Markdown rendering: `server/static/markdown.js`
+
+Single chokepoint for everything markdown-shaped in the UI: agent
+panes, files `.md` preview, compass briefings, decisions, wiki
+entries. Pipeline: `marked` (GFM) → custom code-renderer (hljs for
+known langs; placeholder for `mermaid`) → KaTeX inline+block extension
+(parse-time, `htmlAndMathml` output so equations also paste into Word
+as MathML) → DOMPurify (`html` + `mathMl` profiles, link-rewrite hook
+for in-app file links + external `target=_blank`) → consumer mounts
+via `dangerouslySetInnerHTML`. Post-mount: a single MutationObserver
+rooted at `document.body` (installed once at app boot in `app.js`)
+watches for `<pre class="md-mermaid">` placeholders and lazy-loads
+mermaid (3MB UMD via `<script>` tag; cached after first use). Render
+results cached by source string; WeakSet de-dupes already-processed
+nodes across Preact rerenders.
+
+Adding a new renderer (PlantUML, GraphViz, alternative math engine,
+etc.): drop the parse-time hook into `markdown.js` and either render
+inline at parse time (KaTeX-style) or emit a placeholder + extend the
+observer (mermaid-style). Zero changes to consumers.
 
 ### Post-ResultMessage teardown noise is SDK-version-sensitive
 

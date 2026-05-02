@@ -136,14 +136,14 @@ body {
   .rail-group.rail-files {
     grid-column: 2 / span 2;
     display: grid !important;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     justify-items: center;
   }
   .rail-group.rail-controls { grid-column: 4; }
   .rail-group.rail-env {
     grid-column: 5 / span 2;
     display: grid !important;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     justify-items: center;
   }
   .rail-group.rail-env .settings-toggle { order: 1; }
@@ -2352,6 +2352,75 @@ body {
    single-paragraph replies don't waste vertical space. */
 .event-body.markdown > :first-child { margin-top: 0; }
 .event-body.markdown > :last-child { margin-bottom: 0; }
+
+/* Mermaid diagrams. The placeholder <pre> is what marked emits; the
+   MutationObserver in markdown.js swaps its inner HTML to the rendered
+   <svg>. Both states need styling because the placeholder is briefly
+   visible while mermaid lazy-loads on first use. */
+.md-mermaid {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 8px 0;
+  overflow-x: auto;
+  font-size: 12px;
+  color: var(--muted);
+}
+.md-mermaid > code {
+  /* While the placeholder is showing, render the source as readable
+     text rather than as a code-block (mermaid's output is the goal,
+     not the source). hljs hasn't touched it. */
+  background: transparent;
+  padding: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  white-space: pre;
+}
+.md-mermaid.md-mermaid-rendered {
+  background: transparent;
+  border: 0;
+  padding: 4px 0;
+  text-align: center;
+}
+.md-mermaid.md-mermaid-rendered svg {
+  max-width: 100%;
+  height: auto;
+}
+.md-mermaid.md-mermaid-error {
+  border-color: var(--err, #f85149);
+  color: var(--err, #f85149);
+}
+.md-mermaid-err-title { font-weight: 600; margin-bottom: 6px; }
+.md-mermaid-err-msg, .md-mermaid-err-src {
+  background: rgba(0,0,0,0.25);
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  margin: 4px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* KaTeX overrides. Inherit the harness foreground colour so equations
+   read correctly in both pane chrome and files preview. The vendored
+   katex.css sets explicit `color` on .katex; bumping our rule with
+   higher specificity beats it without !important. */
+.markdown .katex,
+.files-md-preview .katex,
+.event-body.markdown .katex {
+  color: inherit;
+}
+/* Display-mode equations need a bit of breathing room and horizontal
+   scroll for the wide ones (matrices, long alignments). */
+.markdown .katex-display,
+.files-md-preview .katex-display,
+.event-body.markdown .katex-display {
+  margin: 0.6em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 2px 0;
+}
+
 .files-editor-foot {
   display: flex;
   gap: 12px;

@@ -134,6 +134,60 @@ Two special files assist navigation at the wiki root:
   wiki activity (entries created/updated, lint passes, contradictions
   noted). Useful for "what changed lately?" queries.
 
+## Diagrams (Mermaid)
+
+The harness renders fenced ` ```mermaid ` blocks as inline SVG. Use
+diagrams for state machines, sequence flows, decision trees, and
+architecture sketches — anything where the visual structure carries
+meaning that a bullet list flattens. Renders identically in the
+harness UI and in Obsidian (which has built-in Mermaid support too).
+
+````markdown
+```mermaid
+graph TD
+    A[Truth corpus] --> B(Stage 0a: derive)
+    B --> C{Hash changed?}
+    C -->|no| D[Skip]
+    C -->|yes| E(Stage 0b: reconcile)
+    E --> F[Lattice updated]
+```
+````
+
+Common diagram types: `graph TD/LR` (flowcharts), `sequenceDiagram`,
+`stateDiagram-v2`, `classDiagram`, `erDiagram`, `gantt`, `mindmap`.
+Full syntax: see https://mermaid.js.org/intro/.
+
+Mermaid lazy-loads on first diagram (~3MB JS), then caches. Subsequent
+diagrams render instantly. If a diagram fails to parse, the harness
+shows the source + the parser error inline so you can fix it.
+
+## Math (LaTeX)
+
+Inline math with single dollars (`$ ... $`); display math with double
+dollars (`$$ ... $$`):
+
+```markdown
+The Bayesian update is $P(H|E) = P(E|H) P(H) / P(E)$.
+
+For matrices use display mode:
+
+$$
+A = \begin{bmatrix} a & b \\ c & d \end{bmatrix}
+$$
+```
+
+Rendered via KaTeX. The output carries both styled HTML (visual) AND
+hidden MathML (so equations copy-paste into Word and Office apps as
+real equation objects, not as flat text). Most LaTeX from research
+papers works directly — Greek letters, fractions, integrals, sums,
+products, sub/superscripts, matrices, alignment, common environments.
+For exotic packages or TikZ diagrams, use a Mermaid diagram instead
+or store the rendered image alongside the wiki entry.
+
+If KaTeX can't parse the source, the equation renders red inline (the
+rest of the page is unaffected). Common gotchas: a stray single `$`
+in plain text can trigger inline-math mode — escape with `\$`.
+
 ## Don't
 
 - Don't write entries that summarize the codebase — agents read code

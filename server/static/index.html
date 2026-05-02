@@ -16,6 +16,12 @@
          Vendored under /static/vendor/ (see scripts/vendor_deps.py)
          so cold loads don't depend on jsdelivr. -->
     <link rel="stylesheet" href="/static/vendor/hljs-github-dark.css" />
+    <!-- KaTeX font + layout CSS for math rendered by markdown.js.
+         Vendored CSS, but the @font-face URLs point at jsdelivr's
+         /dist/fonts/ directory (rewritten by scripts/vendor_deps.py)
+         so we don't have to vendor 12 binary font files. The browser
+         only fetches a font on first use. -->
+    <link rel="stylesheet" href="/static/vendor/katex.css" />
     <link rel="stylesheet" href="/static/style.css" />
     <!-- Compass dashboard — harness-styled v1. Loaded after style.css
          so its rules can override base pane chrome where needed.

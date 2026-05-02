@@ -7,7 +7,7 @@
 //
 // All glyphs are CSS-drawn or inline SVG per the no-emoji rule from
 // CLAUDE.md. Markdown rendering reuses the harness's marked + dompurify
-// pipeline, exposed by app.js as window.__harness_renderMarkdown.
+// pipeline, exposed by markdown.js as window.__harness_renderMarkdown.
 
 import { h } from "https://esm.sh/preact@10";
 import { useState, useEffect, useCallback, useMemo, useRef } from "https://esm.sh/preact@10/hooks";

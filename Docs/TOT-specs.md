@@ -112,8 +112,12 @@ TeamOfTen/
     static/
       index.html
       app.js
+      markdown.js
       style.css
       tools.js
+      compass.js
+      compass.css
+      files.js
       vendor/
     templates/
       global_claude_md.md
@@ -139,6 +143,14 @@ Main implementation responsibilities:
 - `server/project_sync.py`: active-project and global WebDAV file sync.
 - `server/events.py`: in-process event bus plus batched SQLite event writer.
 - `server/static/app.js`: no-build Preact SPA.
+- `server/static/markdown.js`: single-chokepoint markdown render
+  pipeline (marked GFM → KaTeX inline+block math → DOMPurify with
+  html+mathMl profiles → mermaid post-render via MutationObserver).
+  Every consumer that displays markdown — agent panes, files `.md`
+  preview, compass briefings, decisions, wiki entries — routes
+  through `renderMarkdown` here, so adding a new renderer (PlantUML,
+  GraphViz, alternative math engine) lights it up everywhere with
+  no per-consumer changes.
 
 ---
 
@@ -149,7 +161,7 @@ Main implementation responsibilities:
 | Agent runtime | Claude Agent SDK and Claude Code CLI |
 | Backend | FastAPI, asyncio, WebSocket |
 | Database | SQLite via `aiosqlite`, DELETE journal mode |
-| Frontend | Preact 10, htm, Split.js, vendored markdown/highlight/diff libs |
+| Frontend | Preact 10, htm, Split.js, vendored marked + DOMPurify + highlight.js + diff + KaTeX + mermaid |
 | Durable mirror | WebDAV via `webdav4` |
 | Auth to Claude | Claude CLI OAuth credentials in `CLAUDE_CONFIG_DIR` |
 | UI auth | Optional bearer token from `HARNESS_TOKEN` |
@@ -3143,6 +3155,71 @@ one slot per column. The swipe deck therefore always reads
 Coach → 1 → 2 → … regardless of the order panes were opened. Desktop
 layout keeps the user's 2D `openColumns` structure intact.
 
+### 16.10 Markdown Render Pipeline
+
+`server/static/markdown.js` is the single chokepoint for everything
+markdown-shaped in the UI: agent panes, files `.md` preview,
+compass briefings, decisions, wiki entries. Five-stage pipeline:
+
+1. **Parse** — `marked@12` (GFM) with a custom code-renderer:
+   - fence lang ∈ hljs registry → highlighted `<pre><code>`
+   - fence lang === `mermaid` → `<pre class="md-mermaid">` placeholder
+   - everything else → escaped `<pre><code>`
+2. **Math (parse-time)** — KaTeX inline + block extension (hand-
+   rolled inline; the npm `marked-katex-extension` package's esm.sh
+   stub imports `katex` from the CDN, which 404s when served from
+   our `/static/vendor/` origin). Inline `$...$`, block `$$\n...\n$$`.
+   Output mode `htmlAndMathml` emits both styled HTML (visual) and
+   hidden MathML (so equations copy-paste into Word as real equation
+   objects, not as flat text). `throwOnError: false` → invalid LaTeX
+   renders red inline instead of blowing up the whole message.
+3. **Sanitise** — `DOMPurify@3` with `USE_PROFILES: { html: true,
+   mathMl: true }`. The `afterSanitizeAttributes` hook rewrites
+   `<a>` hrefs: external URLs get `target=_blank` + `rel=noreferrer
+   noopener`; paths starting with `/` are tagged
+   `data-harness-path` and the href is neutralised to `#` so the
+   global click handler in `App` can route them to the Files pane.
+4. **Mount** — consumer drops the sanitised string into Preact via
+   `dangerouslySetInnerHTML`.
+5. **Mermaid post-render** — a single `MutationObserver` rooted at
+   `document.body` (installed once at app boot via
+   `enhanceMarkdownIn`) watches for `<pre class="md-mermaid">`
+   inserts. First hit lazy-loads `mermaid.min.js` (~3MB UMD
+   bundle, fetched via dynamic `<script>` tag because mermaid's
+   ESM build splits into 30+ chunks); subsequent hits reuse the
+   loaded `window.mermaid`. A `WeakSet` de-dupes already-processed
+   nodes; a `Map<source, svg>` cache makes re-renders instant when
+   Preact remounts the same diagram text. Failed renders show the
+   error inline (title + message + source) so authors can fix
+   without opening devtools.
+
+`renderMarkdown` returns the sanitised HTML string. `hljs` and
+`DOMPurify` are re-exported so other modules (`tools.js`, code-
+preview helper in `app.js`) reuse the configured singletons —
+language packs are registered exactly once, the link-rewrite hook
+is installed exactly once. `tools.js` imports `hljs` from
+`markdown.js` (not from `/static/vendor/hljs-core.js`) so module
+evaluation order pins language registration before the first
+code-render call.
+
+Vendor strategy in `scripts/vendor_deps.py` is three-tier:
+- `DEPS` — ESM modules fetched with esm.sh's `?bundle` flag (one
+  self-contained file per dep). Sanity-checked for stray
+  `https://esm.sh/` imports on disk.
+- `NON_ESM_DEPS` — UMD/IIFE bundles fetched as-is (currently
+  `mermaid.min.js`). Loaded via dynamic `<script>` tag, not via
+  the module pipeline.
+- `CSS_DEPS` — plain CSS (hljs theme + KaTeX). KaTeX CSS goes
+  through `_CSS_REWRITES` to convert relative `fonts/...` URLs
+  to absolute jsdelivr URLs — avoids vendoring 12 binary font
+  files; the browser fetches each font on first use and caches
+  forever.
+
+The wiki skill template (`server/templates/llm_wiki_skill.md`)
+documents math + mermaid syntax for agents authoring wiki
+entries; both render identically in the harness UI and in
+Obsidian (kDrive-synced view).
+
 ---
 
 ## 17. Git Workspaces
@@ -3534,6 +3611,12 @@ uv run pytest -ra --strict-markers
 ```
 
 CI runs `.github/workflows/tests.yml` on push and PR.
+
+The frontend has no JS unit tests yet; markdown-pipeline behaviour
+(math rendering, mermaid lazy-load, file-link hook routing) is
+verified by hand in the browser. JS files are syntax-checked with
+`node --check` before commit; logic checks rely on the user
+exercising the relevant pane after a deploy.
 
 ---
 

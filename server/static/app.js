@@ -9086,8 +9086,9 @@ function FileTreeNode({ node, root, path, depth, expanded, setExpanded, selected
   `;
 }
 
-// renderMarkdown lives near the top of the file now (with marked +
-// DOMPurify + highlight.js wiring). Deleted the hand-rolled fallback
+// renderMarkdown is imported from markdown.js (parses GFM + KaTeX
+// math, sanitises with DOMPurify; mermaid is rendered post-mount by
+// the observer installed at boot). Deleted the hand-rolled fallback
 // and its private helpers (_safeHref, renderInline) — the marked
 // pipeline supersedes them.
 

@@ -58,6 +58,33 @@ DEPS: list[tuple[str, str]] = [
     ("hljs-typescript.js", "https://esm.sh/highlight.js@11/lib/languages/typescript?bundle"),
     ("hljs-xml.js", "https://esm.sh/highlight.js@11/lib/languages/xml?bundle"),
     ("hljs-yaml.js", "https://esm.sh/highlight.js@11/lib/languages/yaml?bundle"),
+    # Math: KaTeX (eager, ~280KB). The marked extension that drives
+    # $...$ / $$...$$ rewriting is hand-rolled inline in markdown.js
+    # (it's ~25 lines; the public marked-katex-extension package only
+    # ships an esm.sh stub that imports `katex` from the CDN, which
+    # 404s when served from our /static/vendor/ origin). Output mode
+    # chosen in markdown.js is `htmlAndMathml` so equations render
+    # visually AND carry MathML in the DOM — Word paste ingests the
+    # MathML directly.
+    ("katex.js", "https://esm.sh/katex@0.16?bundle"),
+    # Diagrams: Mermaid UMD bundle (~3MB, self-contained). Loaded
+    # lazily via a dynamic <script> tag in markdown.js (UMD sets
+    # `window.mermaid`); only paid on the first page that contains
+    # a ```mermaid block. Browser caches it forever after.
+    #
+    # NOTE: We can't use mermaid's ESM bundle here because it
+    # splits into 30+ chunks for code-split diagram types (each
+    # `flowchart`, `sequenceDiagram`, etc. is its own .mjs).
+    # esm.sh's `?bundle` flag doesn't inline them, jsdelivr's ESM
+    # entry-point still references the chunk paths. The UMD build
+    # (`dist/mermaid.min.js`) is the only single-file distribution,
+    # and it's the simplest to vendor.
+]
+NON_ESM_DEPS: list[tuple[str, str]] = [
+    (
+        "mermaid.min.js",
+        "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js",
+    ),
 ]
 
 CSS_DEPS: list[tuple[str, str]] = [
@@ -65,7 +92,26 @@ CSS_DEPS: list[tuple[str, str]] = [
         "hljs-github-dark.css",
         "https://cdn.jsdelivr.net/npm/highlight.js@11/styles/github-dark.min.css",
     ),
+    # KaTeX font + layout CSS. The published file references woff2
+    # fonts via relative `fonts/...` paths; we rewrite them in
+    # `_postprocess_css_body` below to point at jsdelivr's
+    # /dist/fonts/ directory so we don't have to vendor 12 binary
+    # font files into the repo.
+    (
+        "katex.css",
+        "https://cdn.jsdelivr.net/npm/katex@0.16/dist/katex.min.css",
+    ),
 ]
+
+# Filename → (regex, replacement) post-processing applied after fetch.
+# Used to rewrite KaTeX's relative font URLs into absolute CDN URLs so
+# the vendored CSS works without us also vendoring the font files.
+_CSS_REWRITES: dict[str, tuple[re.Pattern, str]] = {
+    "katex.css": (
+        re.compile(rb"url\((?P<q>['\"]?)fonts/"),
+        rb"url(\g<q>https://cdn.jsdelivr.net/npm/katex@0.16/dist/fonts/",
+    ),
+}
 
 
 _UA = (
@@ -131,7 +177,10 @@ def main() -> int:
             print(f"  WARN {fname}: contains external imports — bundle may be incomplete", file=sys.stderr)
         out.write_bytes(body)
         print(f"  OK   {fname:<24}  ({len(body):>7} bytes)")
-    for fname, url in CSS_DEPS:
+    # Non-ESM bundles (UMD/IIFE etc.) — fetched as-is. No bundle-chase,
+    # no ESM-import sanity check. Loaded via <script> tag at runtime,
+    # not via the module pipeline.
+    for fname, url in NON_ESM_DEPS:
         out = VENDOR_DIR / fname
         try:
             body = _fetch(url)
@@ -145,10 +194,29 @@ def main() -> int:
             continue
         out.write_bytes(body)
         print(f"  OK   {fname:<24}  ({len(body):>7} bytes)")
+    for fname, url in CSS_DEPS:
+        out = VENDOR_DIR / fname
+        try:
+            body = _fetch(url)
+        except Exception as exc:
+            print(f"  FAIL {fname}: {exc}", file=sys.stderr)
+            failures.append(fname)
+            continue
+        if not body or len(body) < 256:
+            print(f"  FAIL {fname}: response too small ({len(body)} bytes)", file=sys.stderr)
+            failures.append(fname)
+            continue
+        rewrite = _CSS_REWRITES.get(fname)
+        if rewrite is not None:
+            pattern, replacement = rewrite
+            body = pattern.sub(replacement, body)
+        out.write_bytes(body)
+        print(f"  OK   {fname:<24}  ({len(body):>7} bytes)")
     if failures:
         print(f"\n{len(failures)} failure(s): {', '.join(failures)}", file=sys.stderr)
         return 1
-    print(f"\nVendored {len(DEPS) + len(CSS_DEPS)} files into {VENDOR_DIR}")
+    total = len(DEPS) + len(NON_ESM_DEPS) + len(CSS_DEPS)
+    print(f"\nVendored {total} files into {VENDOR_DIR}")
     return 0
 
 

@@ -28,7 +28,6 @@
 import { Marked } from "/static/vendor/marked.js";
 import DOMPurify from "/static/vendor/dompurify.js";
 import katex from "/static/vendor/katex.js";
-import markedKatex from "/static/vendor/marked-katex-extension.js";
 import hljs from "/static/vendor/hljs-core.js";
 import hljsBash from "/static/vendor/hljs-bash.js";
 import hljsCss from "/static/vendor/hljs-css.js";
@@ -119,20 +118,84 @@ marked.use({
   },
 });
 
-// KaTeX extension. Output mode `htmlAndMathml` (the default) emits both
-// the styled HTML (for crisp visual rendering) AND a hidden
-// <annotation>-wrapped MathML representation (for screen readers AND
-// for copy-paste into Word, which ingests MathML directly). That
-// covers the "render LaTeX in the harness" + "paste into Word"
-// workflow without a second tool.
+// KaTeX marked extension (hand-rolled inline; the npm package's esm.sh
+// stub imports `katex` from the CDN, which 404s when served from our
+// /static/vendor/ origin). Logic mirrors marked-katex-extension@5.
 //
-// throwOnError: false → invalid LaTeX renders red instead of throwing,
-// so a stray `$` in plain text never blanks a chat message.
-marked.use(markedKatex({
+// Inline:  $...$    (no whitespace adjacent to the $; standard rule)
+// Block:   $$...$$  (on a line, surrounded by blank lines)
+//
+// Output mode `htmlAndMathml` emits the styled HTML (for crisp visual
+// rendering) AND a hidden <annotation>-wrapped MathML representation —
+// MathML is what Word ingests on paste, so this single config covers
+// "render LaTeX in the harness" + "paste into Word" without a second
+// tool. `throwOnError: false` → invalid LaTeX renders red inline
+// instead of blowing up the whole message.
+const _katexOpts = {
   throwOnError: false,
   errorColor: "#cc6666",
   output: "htmlAndMathml",
-}));
+};
+const _katexInlineRule = /^(\${1,2})(?!\$)((?:\\.|[^\\\n])*?(?:\\.|[^\\\n\$]))\1(?=[\s?!\.,:？！。，：]|$)/;
+const _katexBlockRule = /^(\${1,2})\n((?:\\[^]|[^\\])+?)\n\1(?:\n|$)/;
+
+function _renderKatex(text, displayMode) {
+  return katex.renderToString(text, { ..._katexOpts, displayMode });
+}
+
+marked.use({
+  extensions: [
+    {
+      name: "inlineKatex",
+      level: "inline",
+      start(src) {
+        let i = 0;
+        while (i < src.length) {
+          const idx = src.indexOf("$", i);
+          if (idx === -1) return;
+          // Same start-condition as marked-katex-extension: $ must be
+          // at start of slice or preceded by whitespace.
+          if ((idx === 0 || src.charAt(idx - 1) === " ") &&
+              src.substring(idx).match(_katexInlineRule)) {
+            return idx;
+          }
+          i = idx + 1;
+          // Skip past adjacent dollar signs to avoid false matches
+          // like `$$$`.
+          while (i < src.length && src.charAt(i) === "$") i++;
+        }
+      },
+      tokenizer(src) {
+        const m = src.match(_katexInlineRule);
+        if (m) return {
+          type: "inlineKatex",
+          raw: m[0],
+          text: m[2].trim(),
+          displayMode: m[1].length === 2,
+        };
+      },
+      renderer(token) {
+        return _renderKatex(token.text, token.displayMode);
+      },
+    },
+    {
+      name: "blockKatex",
+      level: "block",
+      tokenizer(src) {
+        const m = src.match(_katexBlockRule);
+        if (m) return {
+          type: "blockKatex",
+          raw: m[0],
+          text: m[2].trim(),
+          displayMode: m[1].length === 2,
+        };
+      },
+      renderer(token) {
+        return _renderKatex(token.text, token.displayMode) + "\n";
+      },
+    },
+  ],
+});
 
 // Link handling for sanitised markdown:
 //   - external URL (http/https/mailto) → open in new tab
@@ -206,8 +269,26 @@ const _mermaidCache = new Map(); // source → svg html
 let _mermaidPromise = null;
 function _loadMermaid() {
   if (_mermaidPromise) return _mermaidPromise;
-  _mermaidPromise = import("/static/vendor/mermaid.js").then((mod) => {
-    const mermaid = mod.default || mod;
+  // UMD bundle (mermaid.min.js) — sets `window.mermaid` on load.
+  // We can't use `import("/static/vendor/mermaid.js")` here because
+  // mermaid's official ESM build splits into 30+ chunks for code-
+  // split diagram types and we'd have to vendor every chunk file.
+  // The single-file UMD build avoids that whole class of problem at
+  // the cost of an extra DOM script-tag dance.
+  _mermaidPromise = new Promise((resolve, reject) => {
+    if (typeof window !== "undefined" && window.mermaid) {
+      return resolve(window.mermaid);
+    }
+    const script = document.createElement("script");
+    script.src = "/static/vendor/mermaid.min.js";
+    script.async = true;
+    script.onload = () => {
+      if (window.mermaid) resolve(window.mermaid);
+      else reject(new Error("mermaid script loaded but window.mermaid is undefined"));
+    };
+    script.onerror = (err) => reject(err || new Error("mermaid script failed to load"));
+    document.head.appendChild(script);
+  }).then((mermaid) => {
     mermaid.initialize({
       startOnLoad: false,
       theme: "dark",

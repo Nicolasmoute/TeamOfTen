@@ -7,13 +7,19 @@
 import { h } from "https://esm.sh/preact@10";
 import htm from "/static/vendor/htm.js";
 import { diffLines, diffWordsWithSpace } from "/static/vendor/diff.js";
-import hljs from "/static/vendor/hljs-core.js";
+// Re-use the configured hljs singleton from markdown.js — that module
+// owns language registration, so importing the raw vendor file would
+// give us an unregistered hljs (silently no-op highlight calls). The
+// import dependency also pins evaluation order: markdown.js evaluates
+// first, languages are registered before any code-render call here runs.
+import { hljs } from "/static/markdown.js";
 const html = htm.bind(h);
 
 // File extension → hljs language alias. Languages are registered in
-// app.js (single source of truth so we don't double-load packs); this
-// map just turns a path's extension into the alias hljs.getLanguage()
-// recognizes. Unknown extensions fall through to plaintext rendering.
+// markdown.js (single source of truth so we don't double-load packs);
+// this map just turns a path's extension into the alias
+// hljs.getLanguage() recognizes. Unknown extensions fall through to
+// plaintext rendering.
 const EXT_TO_LANG = {
   ".bash": "bash", ".sh": "bash", ".zsh": "bash",
   ".css": "css",
