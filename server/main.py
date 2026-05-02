@@ -1437,10 +1437,10 @@ from server.models_catalog import (
 
 
 class TeamModelsWrite(BaseModel):
-    coach: str = Field("", description="Default model for Coach. Empty = SDK default.")
-    players: str = Field("", description="Default model for p1..p10. Empty = SDK default.")
-    coach_codex: str = Field("", description="Default Codex model for Coach. Empty = SDK default.")
-    players_codex: str = Field("", description="Default Codex model for p1..p10. Empty = SDK default.")
+    coach: str = Field("", description="Default model for Coach. Empty = use hardcoded role default.")
+    players: str = Field("", description="Default model for p1..p10. Empty = use hardcoded role default.")
+    coach_codex: str = Field("", description="Default Codex model for Coach. Empty = use hardcoded role default.")
+    players_codex: str = Field("", description="Default Codex model for p1..p10. Empty = use hardcoded role default.")
 
 
 async def _read_team_config_str(key: str) -> str:

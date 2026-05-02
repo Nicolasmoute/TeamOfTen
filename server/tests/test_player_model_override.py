@@ -695,8 +695,10 @@ def test_role_defaults_resolved_for_api() -> None:
     assert suggested["players"].startswith("claude-sonnet-")
 
     suggested_codex = role_codex_defaults_concrete()
-    # Coach Codex default is empty by design (top-tier expensive).
-    assert suggested_codex["coach"] == ""
+    # Coach Codex defaults to latest_gpt (top-tier OpenAI), mirroring
+    # the Claude side's Coach=Opus default so a fresh Codex Coach has
+    # a concrete model from first spawn.
+    assert suggested_codex["coach"].startswith("gpt-")
     # Players default to mini-tier (currently gpt-5.4-mini).
     assert suggested_codex["players"].startswith("gpt-")
     assert "mini" in suggested_codex["players"]

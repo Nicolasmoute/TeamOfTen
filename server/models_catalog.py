@@ -83,9 +83,12 @@ _ROLE_MODEL_DEFAULTS = {
 }
 
 # Codex equivalents.
-#   - Coach is left empty (top-tier Codex is too expensive for a
-#     coordinator that runs every tick — the human picks one in the
-#     Settings drawer if they want Coach on Codex at all).
+#   - Coach defaults to `latest_gpt`: the Opus-equivalent top-tier
+#     model. Mirrors the Claude side (Coach=Opus, Players=Sonnet) so
+#     a fresh Codex Coach has a concrete model from first spawn —
+#     same cost ratio as Claude Coach on Opus, which is the existing
+#     accepted default. Override in the Settings drawer if you want
+#     Coach on a cheaper tier.
 #   - Players default to `latest_mini`: the Sonnet-equivalent
 #     mini-tier model. When Coach flips a Player to Codex (Claude
 #     rate limits, frequent compactions), this is the right default.
@@ -93,7 +96,7 @@ _ROLE_MODEL_DEFAULTS = {
 #     MODEL_GUIDANCE and Coach uses `coord_set_player_model` to
 #     escalate per Player.
 _ROLE_CODEX_MODEL_DEFAULTS = {
-    "coach": "",
+    "coach": "latest_gpt",
     "players": "latest_mini",
 }
 

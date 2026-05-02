@@ -1295,7 +1295,10 @@ thinking-budget hint unless the human or Coach explicitly set one.
   now falls through to `models_catalog.role_default_model` when
   team_config is empty / unreadable. So a clean deploy gets
   `latest_opus` for Coach and `latest_sonnet` for Players (Codex
-  Players: `latest_mini`; Codex Coach is still empty → SDK default).
+  Coach: `latest_gpt`, Codex Players: `latest_mini` — Codex Coach
+  was historically empty for cost reasons but mirroring the Claude
+  Coach=Opus/Players=Sonnet shape eliminates the cold-start gap
+  where the chip had to display the runtime tag).
   Human-set team_config rows still win when present.
 - `run_agent` resolution chain for `effort` and `plan_mode` gets a
   third tier: after per-pane override → Coach-set override →

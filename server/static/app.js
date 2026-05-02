@@ -440,6 +440,26 @@ const MODEL_ALIAS_TO_CONCRETE = {
   latest_mini: "gpt-5.4-mini",
 };
 
+// Mirror of server/models_catalog.py:_ROLE_MODEL_DEFAULTS +
+// _ROLE_CODEX_MODEL_DEFAULTS. The server resolves these at spawn time
+// so a fresh agent with no completed turn AND no team_config row still
+// runs on a known model. Used as the final fallback in effectiveModelId
+// so the model chip displays the concrete model the next spawn will
+// use during the cold-start window before /api/team/models has
+// resolved. Keep in sync with the Python dict; the server is the
+// source of truth.
+const ROLE_DEFAULT_ALIAS = {
+  claude: { coach: "latest_opus", players: "latest_sonnet" },
+  codex: { coach: "latest_gpt", players: "latest_mini" },
+};
+
+// Mirror of server/models_catalog.py:_ROLE_EFFORT_DEFAULTS. Runtime-
+// agnostic — the server applies the same medium tier to both Claude
+// and Codex agents through the shared dispatcher. Used as the chip's
+// final fallback so a fresh agent reads "med" (matching what the
+// server will actually run) rather than the implicit "low" floor.
+const ROLE_DEFAULT_EFFORT = { coach: 2, players: 2 };
+
 function resolveModelAlias(id) {
   if (!id) return "";
   return MODEL_ALIAS_TO_CONCRETE[id] || id;
@@ -628,13 +648,22 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
   // CODEX_MODEL_OPTIONS; on Claude, list MODEL_OPTIONS. Falls back to
   // Claude when the runtime isn't yet known (initial render). The
   // suffix that decorates the "default" entry uses the role-default
-  // model resolved server-side.
+  // model resolved server-side — preferring the human-set
+  // team_config row, falling back to the hardcoded `suggested`
+  // role default so the popover always shows a concrete model name
+  // (no "default" with no parens) even on a fresh deploy.
   const modelOptions = useMemo(() => {
     const effectiveRuntime = runtimeDraft || roleDefaultRuntime || "claude";
     const base = modelOptionsFor(effectiveRuntime);
     const role = slot === "coach" ? "coach" : "players";
     const key = effectiveRuntime === "codex" ? role + "_codex" : role;
-    const roleDefaultModel = roleDefaultModels ? (roleDefaultModels[key] || "") : "";
+    let roleDefaultModel = roleDefaultModels ? (roleDefaultModels[key] || "") : "";
+    if (!roleDefaultModel && roleDefaultModels) {
+      const suggested = effectiveRuntime === "codex"
+        ? roleDefaultModels.suggested_codex
+        : roleDefaultModels.suggested;
+      if (suggested && suggested[role]) roleDefaultModel = suggested[role];
+    }
     if (!roleDefaultModel) return base;
     const match = base.find((m) => m.value === roleDefaultModel);
     const suffix = match ? match.label : roleDefaultModel;
@@ -1497,9 +1526,18 @@ function App() {
         }
       }
     }
+    // Content-based key: live WS events arrive without __id (bus.publish
+    // fans out before the batched writer assigns the row id), while the
+    // persisted refetch + seedConversationsFromHistory both populate it.
+    // Keying on __id would split the same event into two cards (one from
+    // persistedAttention with __id, one from the live conversations copy
+    // without) and break dismissal across reloads — the user dismisses
+    // ha:ts:agent, then the page reloads and the persisted ha:<id> variant
+    // reappears. ts has microsecond precision so ts+agent is unique enough.
+    const haKey = (ev) => `ha:${ev.ts || ""}:${ev.agent_id || ""}`;
     for (const ev of persistedAttention) {
       if (ev.type !== "human_attention") continue;
-      const k = ev.__id != null ? `ha:${ev.__id}` : `ha:${ev.ts}:${ev.agent_id}`;
+      const k = haKey(ev);
       if (seen.has(k)) continue;
       seen.add(k);
       all.push({ ...ev, __key: k });
@@ -1507,7 +1545,7 @@ function App() {
     for (const list of conversations.values()) {
       for (const ev of list) {
         if (ev.type !== "human_attention") continue;
-        const k = ev.__id != null ? `ha:${ev.__id}` : `ha:${ev.ts}:${ev.agent_id}`;
+        const k = haKey(ev);
         if (seen.has(k)) continue;
         seen.add(k);
         all.push({ ...ev, __key: k });
@@ -3874,7 +3912,7 @@ function TeamModelsSection() {
               disabled=${saving}
               onChange=${(e) => onCoachChange(e.target.value)}
             >
-              <option value="">SDK default</option>
+              <option value="">use role default</option>
               ${available.map((m) => html`<option value=${m}>${modelLabelFor(m, "claude")}</option>`)}
             </select>
             ${suggested.coach
@@ -3888,7 +3926,7 @@ function TeamModelsSection() {
               disabled=${saving}
               onChange=${(e) => onPlayersChange(e.target.value)}
             >
-              <option value="">SDK default</option>
+              <option value="">use role default</option>
               ${available.map((m) => html`<option value=${m}>${modelLabelFor(m, "claude")}</option>`)}
             </select>
             ${suggested.players
@@ -3902,7 +3940,7 @@ function TeamModelsSection() {
               disabled=${saving}
               onChange=${(e) => onCoachCodexChange(e.target.value)}
             >
-              <option value="">SDK default</option>
+              <option value="">use role default</option>
               ${availableCodex.map((m) => html`<option value=${m}>${modelLabelFor(m, "codex")}</option>`)}
             </select>
             ${suggestedCodex.coach
@@ -3916,7 +3954,7 @@ function TeamModelsSection() {
               disabled=${saving}
               onChange=${(e) => onPlayersCodexChange(e.target.value)}
             >
-              <option value="">SDK default</option>
+              <option value="">use role default</option>
               ${availableCodex.map((m) => html`<option value=${m}>${modelLabelFor(m, "codex")}</option>`)}
             </select>
             ${suggestedCodex.players
@@ -9460,14 +9498,31 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
       if (suggested && suggested[role]) return suggested[role];
     }
     if (lastTurn?.model) return lastTurn.model;
+    // Hard-coded role-default fallback: covers the cold-start window
+    // before /api/team/models has resolved (chip otherwise reads as a
+    // generic "Claude" / "Codex" runtime tag). Mirrors the server's
+    // role defaults so we display the model the next spawn will
+    // actually use.
+    const role = slot === "coach" ? "coach" : "players";
+    const fallbackAlias = ROLE_DEFAULT_ALIAS[effectiveRuntime]?.[role];
+    if (fallbackAlias) return fallbackAlias;
     return "";
   }, [paneSettings.model, agentModelOverride, roleDefaultModels, effectiveRuntime, slot, lastTurn]);
-  // Resolve the effort tier shown on the chip. Precedence:
-  //   pane override (1..4) > latest turn's effort > 0 (no override
-  //   recorded yet — fall through to "low" as the implicit floor).
+  // Resolve the effort tier shown on the chip. Precedence mirrors
+  // server/agents.py:run_agent's spawn-time chain:
+  //   pane override (1..4) > latest turn's effort > role-level
+  //   default (`ROLE_DEFAULT_EFFORT`, mirror of `_ROLE_EFFORT_DEFAULTS`
+  //   in `server/models_catalog.py`).
+  // The role-level default is runtime-agnostic on the server (medium
+  // for everyone) — both Claude and Codex runtimes pick up the same
+  // value through the same dispatcher path. Without this fallback the
+  // chip would lie about cold-start effort (read "low" when the
+  // server is actually about to run medium).
   const effectiveEffort = paneSettings.effort
     ? paneSettings.effort
-    : (lastTurn && typeof lastTurn.effort === "number" ? lastTurn.effort : 0);
+    : (lastTurn && typeof lastTurn.effort === "number" && lastTurn.effort > 0
+        ? lastTurn.effort
+        : ROLE_DEFAULT_EFFORT[slot === "coach" ? "coach" : "players"]);
 
   const loadRoleDefaultRuntime = useCallback(async () => {
     try {
@@ -10893,15 +10948,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
                 ? `Model: Coach-set override (${agentModelOverride}) — click to change`
                 : "Model: resolved from role default / last turn (click to override)"}
           >
-            ${(() => {
-              if (effectiveModelId) {
-                return modelLabelFor(effectiveModelId, effectiveRuntime);
-              }
-              // Genuinely unknown — Codex agent with no role default
-              // and no completed turn yet. Show the runtime tag so the
-              // user at least knows which family will run.
-              return effectiveRuntime === "codex" ? "Codex" : "Claude";
-            })()}
+            ${modelLabelFor(effectiveModelId, effectiveRuntime)}
           </button>
           <button
             class=${"pane-mode-chip" + (paneSettings.planMode ? " active" : "")}
@@ -10917,9 +10964,9 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
             onClick=${() => setSettingsOpen(true)}
             title=${paneSettings.effort
               ? "Effort tier: per-pane override (click to change)"
-              : "Effort tier: from last turn / implicit minimum (click to override)"}
+              : "Effort tier: resolved from last turn / role default (click to override)"}
           >
-            ${EFFORT_LABELS[(effectiveEffort || 1) - 1]}
+            ${EFFORT_LABELS[(effectiveEffort || 2) - 1]}
           </button>
           <${ContextBar} slot=${slot} liveEvents=${liveEvents} model=${effectiveModelId || ""} />
           <span class="pane-modes-spacer"></span>

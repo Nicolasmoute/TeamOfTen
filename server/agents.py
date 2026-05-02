@@ -2367,8 +2367,10 @@ async def _get_role_default_model(agent_id: str, runtime_name: str = "claude") -
          map; spawn-time `resolve_model_alias` translates to a concrete id.
 
     Returns None only when the role has no hardcoded default for the
-    given runtime (currently only Codex Coach), so the caller can fall
-    back to the SDK default.
+    given runtime, so the caller can fall back to the SDK default.
+    Currently every (role, runtime) combination has a concrete
+    default, so None is unreachable in practice — kept for forward
+    compatibility if a future runtime opts out of role defaults.
     """
     role = "coach" if agent_id == "coach" else "players"
     suffix = "_codex" if runtime_name == "codex" else ""
@@ -2397,8 +2399,7 @@ async def _get_role_default_model(agent_id: str, runtime_name: str = "claude") -
                 pass
     if val:
         return val
-    # Fall through to the hardcoded role default (alias form). Returns
-    # "" when no default is set for this role+runtime (e.g. Codex Coach).
+    # Fall through to the hardcoded role default (alias form).
     from server.models_catalog import role_default_model
     fallback = role_default_model(agent_id, runtime_name)
     return fallback or None

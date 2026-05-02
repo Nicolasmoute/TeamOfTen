@@ -2302,10 +2302,16 @@ Resolution chain in `run_agent` (highest → lowest):
    `models_catalog._ROLE_MODEL_DEFAULTS` /
    `_ROLE_CODEX_MODEL_DEFAULTS` (resolved via `role_default_model`).
    Stored as tier aliases (`latest_opus` for Coach, `latest_sonnet`
-   for Players, `latest_mini` for Codex Players, empty for Codex
-   Coach) so model bumps only touch `_ALIAS_TO_CONCRETE`.
-5. SDK default (no `model` kwarg) — only reached for Codex Coach
-   when the role has no hardcoded default.
+   for Players, `latest_gpt` for Codex Coach, `latest_mini` for
+   Codex Players) so model bumps only touch `_ALIAS_TO_CONCRETE`.
+   Every (runtime, role) combination has a concrete default — Codex
+   Coach was historically empty (cost rationale) but is now
+   `latest_gpt` for symmetry with Claude Coach=Opus, eliminating the
+   chip's runtime-tag fallback.
+5. SDK default (no `model` kwarg) — unreachable in practice now that
+   every (runtime, role) combination has a hardcoded default; kept
+   as a defensive last resort for forward compatibility if a future
+   runtime opts out of role defaults.
 
 Project-switch behavior: the override is keyed by `(slot,
 project_id)`. Switching the active project automatically swaps which
@@ -2824,9 +2830,11 @@ agent gets on a fresh deploy when no `team_config` row is set):
 
 - Coach (Claude): `latest_opus` → resolves to `claude-opus-4-7`.
 - Players (Claude): `latest_sonnet` → resolves to `claude-sonnet-4-6`.
-- Codex Coach: empty (Codex SDK default — top-tier Codex is too
-  expensive for a coordinator that runs every tick; the human flips
-  via the Settings drawer).
+- Codex Coach: `latest_gpt` → resolves to `gpt-5.5`. Mirrors the
+  Claude side (Coach=Opus, Players=Sonnet) — same cost ratio as
+  Claude Coach on Opus, which is the existing accepted default. The
+  human can flip to a cheaper tier in the Settings drawer if running
+  Coach on top-tier Codex on every tick is too expensive.
 - Codex Players: `latest_mini` → resolves to `gpt-5.4-mini`.
 
 Reasoning effort and plan-mode role-level defaults
@@ -3195,14 +3203,26 @@ Input:
       the current runtime) → `/api/team/models[role|role_codex]` →
       server-side `suggested` fallback → latest `turns.model` row for
       this slot (`/api/turns?agent=<slot>&limit=1`, refreshed on every
-      `result` event). Tier aliases (`latest_opus`, `latest_gpt`, …)
-      are resolved to their concrete id (`MODEL_ALIAS_TO_CONCRETE` in
-      `app.js`, mirror of `_ALIAS_TO_CONCRETE` in
-      `server/models_catalog.py`) before label lookup so the chip
-      reads "GPT-5.5" rather than "latest_gpt". For a brand-new Codex
-      agent with no role default and no completed turn (the only
-      fully-unknown case), the chip shows the runtime tag (`Claude` /
-      `Codex`). The chip's `active` styling (and tooltip) lights up
+      `result` event) → hard-coded `ROLE_DEFAULT_ALIAS` fallback
+      (mirror of `_ROLE_MODEL_DEFAULTS` /
+      `_ROLE_CODEX_MODEL_DEFAULTS` in `server/models_catalog.py`) so
+      the chip displays a concrete model even during the cold-start
+      window before `/api/team/models` has resolved. Tier aliases
+      (`latest_opus`, `latest_gpt`, …) are resolved to their concrete
+      id (`MODEL_ALIAS_TO_CONCRETE` in `app.js`, mirror of
+      `_ALIAS_TO_CONCRETE` in `server/models_catalog.py`) before
+      label lookup so the chip reads "GPT-5.5" rather than
+      "latest_gpt". Every (runtime, role) combination has a concrete
+      role default — Claude is `Coach=latest_opus` /
+      `Players=latest_sonnet`; Codex mirrors the same Opus/Sonnet
+      shape with `Coach=latest_gpt` / `Players=latest_mini` — so the
+      chip always renders a concrete model name from first paint,
+      with no "Claude" / "Codex" runtime-tag fallback. The Codex
+      Coach default was historically empty (rationale: top-tier
+      Codex is expensive, leave it for the human to pick in
+      Settings); changed to `latest_gpt` for symmetry with Claude
+      Coach on Opus (same cost ratio, which the team has already
+      accepted). The chip's `active` styling (and tooltip) lights up
       whenever EITHER a per-pane override OR a Coach-set override is
       in force, so a Player whose model was changed by Coach reads as
       "non-default" at a glance even before the human opens the gear
@@ -3220,12 +3240,17 @@ Input:
       section instead. Resolution at spawn time: paneSettings.planMode
       (when non-null) → `agents[].plan_mode_override` → off.
     - **Effort chip** — `low` / `med` / `high` / `max`. Resolution
-      chain: paneSettings.effort → latest `turns.effort` → `low`
-      (the implicit minimum when nothing else resolves). Same
-      caveat as the Plan chip — Coach-set
-      `agent_project_roles.effort_override` is honored at spawn time
-      but not yet reflected in the chip; the EnvPane "Active
-      overrides" section is the human's surface for those.
+      chain mirrors `server/agents.py:run_agent`'s spawn-time chain:
+      paneSettings.effort → latest `turns.effort` → hard-coded
+      `ROLE_DEFAULT_EFFORT` (mirror of `_ROLE_EFFORT_DEFAULTS` in
+      `server/models_catalog.py` — medium for both Coach and
+      Players, runtime-agnostic so Claude and Codex agents read the
+      same default). Without the role-default fallback the chip
+      lied about cold-start effort (read "low" when the server was
+      actually about to run medium). Same caveat as the Plan chip —
+      Coach-set `agent_project_roles.effort_override` is honored at
+      spawn time but not yet reflected in the chip; the EnvPane
+      "Active overrides" section is the human's surface for those.
   The Settings drawer's role-default save dispatches a
   `team-models-updated` window event so all open panes refresh their
   resolved model labels live.
@@ -3409,6 +3434,18 @@ Shows (top-to-bottom):
        `open` / `onDismiss` / `onDismissAll` from App as props. The
        dismissed set persists in `localStorage` under
        `harness_attention_dismissed_v1` (capped at 200 ids).
+       Dedup / dismissal keys are **content-based**
+       (`ha:${ts}:${agent_id}` for `human_attention`,
+       `pq:${correlation_id}` for `pending_question`,
+       `pp:${correlation_id}` for `pending_plan`) — not the SQLite
+       row id. Live WS events arrive without the row id (the bus
+       fans them out before the batched writer assigns one), so a
+       row-id-based key would split the same event into two cards
+       (one from `persistedAttention` with `__id`, one from the live
+       `conversations` copy without) and break dismissal across
+       reloads. ISO ts has microsecond precision so `ts + agent_id`
+       is unique enough; correlation ids are server-assigned and
+       stable across both ingestion paths.
     4. **`EnvFileWriteProposalsSection` auto-expand.** When there's
        at least one pending row AND the user has never explicitly
        collapsed it (no localStorage entry), the section opens.

@@ -886,6 +886,15 @@ CSS-icon only (invariant #6). `.slot-runtime-claude::after` = filled disc; `.slo
 ### F.3 Options drawer defaults
 New section "Default runtime per role": Coach radio + Players radio. `team_config` keys `coach_default_runtime`, `players_default_runtime`. Resolution: per-agent > role default > `'claude'`. Default model controls are split by runtime (`coach_default_model` / `players_default_model` for Claude, `coach_default_model_codex` / `players_default_model_codex` for Codex), and pane model dropdowns resolve against the effective runtime (slot override or role default) before showing Claude vs Codex options.
 
+**Hardcoded role defaults** (`models_catalog._ROLE_CODEX_MODEL_DEFAULTS`) — what a fresh deploy uses when `team_config` is unset:
+
+- Codex Coach: `latest_gpt` → `gpt-5.5`. Mirrors the Claude side's Coach=Opus default (same cost ratio as Claude Coach on Opus, which is the existing accepted default). Was historically empty (rationale: top-tier Codex on every Coach tick is expensive); changed to a concrete default so the model chip can render a real name from first paint instead of falling back to the runtime tag.
+- Codex Players: `latest_mini` → `gpt-5.4-mini`. Sonnet-equivalent mini-tier — the right default when Coach flips a Player to Codex (Claude rate limits, frequent compactions).
+
+The "use top-tier only for heavy reasoning" rule lives in `MODEL_GUIDANCE` (Coach's system prompt); per-Player escalation goes through `coord_set_player_model`.
+
+**Effort tier role default** is shared with Claude (`_ROLE_EFFORT_DEFAULTS = {coach: 2, players: 2}`, both medium) — runtime-agnostic, applied by the dispatcher in `run_agent` before `tc.effort` reaches `_build_turn_overrides` in `server/runtimes/codex.py`. `_CODEX_EFFORT_LEVELS` maps `2 → "medium"` and passes it through `TurnOverrides(effort="medium")` to the Codex SDK. The UI's effort chip mirrors the same fallback (`ROLE_DEFAULT_EFFORT` in `app.js`) so the chip reads "med" from first paint on Codex agents too.
+
 ### F.4 Codex tool renderers (`server/static/tools.js`)
 - `shell` → reuse Bash card.
 - `apply_patch` → adapter that feeds unified-diff straight into `diff@7` and reuses Edit diff card layout.
