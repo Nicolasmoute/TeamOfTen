@@ -73,7 +73,7 @@ async def _seed_misc_project_with_team_and_tasks() -> None:
         await c.close()
 
 
-async def test_coordination_block_includes_project_name_and_goal(
+async def test_coordination_block_includes_project_name_and_objectives_pointer(
     fresh_db,
 ) -> None:
     from server.agents import _build_coach_coordination_block
@@ -83,7 +83,15 @@ async def test_coordination_block_includes_project_name_and_goal(
     # Spec example shows "## Coordinating: <Name>" header. Misc's
     # display name is seeded as "Misc" (capitalized) in init_db.
     assert block.startswith("## Coordinating: Misc")
-    assert "Goal: Rebrand misc landing page" in block
+    # `projects.description` is NOT rendered here anymore —
+    # goals/objectives flow through `project-objectives.md` to avoid
+    # two stale-prone copies of the same goal in every Coach turn.
+    assert "Rebrand misc landing page" not in block
+    assert "Goal:" not in block
+    # The pointer to project-objectives.md should still be present
+    # so Coach knows where to read / update goals.
+    assert "project-objectives.md" in block
+    assert "## Project objectives" in block
 
 
 async def test_coordination_block_lists_named_player_and_unassigned(
@@ -178,7 +186,7 @@ async def test_coordination_block_returns_empty_on_db_error(
 # ---------- Per-project CLAUDE.md stub ----------------------------
 
 
-def test_claude_md_stub_writes_with_goal_and_repo_pre_filled(
+def test_claude_md_stub_writes_with_repo_and_objectives_pointer(
     fresh_db,
 ) -> None:
     pathsmod.ensure_project_scaffold("alpha")
@@ -191,8 +199,16 @@ def test_claude_md_stub_writes_with_goal_and_repo_pre_filled(
     pp = project_paths("alpha")
     body = pp.claude_md.read_text(encoding="utf-8")
     assert "# Project: Alpha Project" in body
-    assert "Refresh the website" in body
     assert "https://github.com/foo/alpha.git" in body
+    # `description` from the creation modal is intentionally NOT
+    # injected — goals/objectives flow through `project-objectives.md`
+    # only.
+    assert "Refresh the website" not in body
+    assert "## Goal" not in body
+    # Pointer to the canonical objectives file must be present so
+    # Coach reads / edits there.
+    assert "## Project objectives" in body
+    assert "project-objectives.md" in body
     # Sections left blank for Coach to fill.
     assert "## Stakeholders" in body
     assert "## Team" in body
@@ -211,15 +227,18 @@ def test_claude_md_stub_skips_when_file_already_exists(fresh_db) -> None:
 
 
 def test_claude_md_stub_uses_placeholders_when_blank(fresh_db) -> None:
-    """A project created without description / repo gets sentinel
-    placeholders so a future reader sees they're intentionally
-    empty rather than data-missing."""
+    """A project created without repo gets a sentinel placeholder so
+    a future reader sees it's intentionally empty rather than
+    data-missing. `description` is no longer injected — the
+    objectives pointer covers the goal-content surface."""
     pathsmod.ensure_project_scaffold("gamma")
     _write_project_claude_md_stub("gamma", "Gamma", None, None)
     pp = project_paths("gamma")
     body = pp.claude_md.read_text(encoding="utf-8")
-    assert "<short description, from creation modal>" in body
     assert "<no repo configured>" in body
+    # `description` placeholder is gone with the `## Goal` section.
+    assert "<short description, from creation modal>" not in body
+    assert "## Project objectives" in body
 
 
 # ---------- Wiki INDEX.md auto-update ------------------------------

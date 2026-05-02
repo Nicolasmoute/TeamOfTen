@@ -619,10 +619,26 @@
 @media (max-width: 1100px) {
   .cmp-section-row { grid-template-columns: 1fr; }
 }
-.cmp-audits-textarea { min-height: 80px; }
-.cmp-audits-submit-row {
-  display: flex; align-items: center; justify-content: space-between;
-  margin-top: 6px;
+/* The manual-paste audit form was removed when the auto-audit
+   watcher landed (compass-specs §5.5). The "about" block replaces
+   the textarea + submit row — same grid slot, just explanatory copy. */
+.cmp-audits-about {
+  display: flex; flex-direction: column; gap: 6px;
+  min-height: 80px;
+  padding: 8px 10px;
+  border: 1px dashed var(--cmp-border-strong);
+  border-radius: 6px;
+  background: var(--cmp-soft-accent);
+}
+.cmp-audits-source {
+  line-height: 1.5;
+  color: var(--muted);
+}
+.cmp-audits-source code {
+  background: rgba(255,255,255,0.06);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 11px;
 }
 .cmp-audit-pills { display: flex; flex-wrap: wrap; gap: 4px; }
 .cmp-audit-pill {

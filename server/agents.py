@@ -426,14 +426,21 @@ def _context_window_for(model: str | None) -> int:
     than we assumed self-corrects after one real turn. For unknown
     smaller-than-1M models, the fallback over-reports — acceptable
     because the compact threshold then fires later than ideal rather
-    than prematurely (premature compact is the worse failure)."""
+    than prematurely (premature compact is the worse failure).
+
+    Tier aliases (`latest_opus`, `latest_gpt`, …) are resolved to
+    their concrete id before lookup so external callers (the
+    `/api/agents/{id}/context` endpoint, defensive uses elsewhere)
+    don't need to know about the aliasing layer."""
     if not model:
         return max(
             1_000_000,
             max(_OBSERVED_CONTEXT_WINDOWS.values(), default=0),
         )
-    observed = _OBSERVED_CONTEXT_WINDOWS.get(model, 0)
-    table = _CONTEXT_WINDOWS.get(model, 0)
+    from server.models_catalog import resolve_model_alias
+    resolved_id = resolve_model_alias(model)
+    observed = _OBSERVED_CONTEXT_WINDOWS.get(resolved_id, 0)
+    table = _CONTEXT_WINDOWS.get(resolved_id, 0)
     resolved = max(observed, table)
     return resolved if resolved > 0 else 1_000_000
 
@@ -1900,10 +1907,14 @@ async def _build_coach_coordination_block() -> str:
 
     Layout matches the spec excerpt:
       ## Coordinating: <Project Name>
-      Goal: ...
+      (Project context pointer — full CLAUDE.md path + objectives file)
       ## Team composition (this project)
       ## Current state
         Open tasks, Inbox count, Last decision, Wiki paths
+
+    Goals / objectives are injected as a separate `## Project
+    objectives` section later in the system prompt — see
+    recurrence-specs.md §3.3 + §6. Don't render them here too.
     """
     from server.paths import project_paths
 
@@ -1912,21 +1923,24 @@ async def _build_coach_coordination_block() -> str:
     except Exception:
         return ""
 
-    # ---- Project name + goal ---------------------------------------
+    # ---- Project name ----------------------------------------------
+    # `projects.description` is intentionally NOT read here anymore —
+    # goals/objectives flow through `project-objectives.md` (injected
+    # later as a separate section). Rendering the DB description in
+    # the coordination block AND injecting the objectives file
+    # produced two stale-prone copies of the same goal in every turn.
     project_name = active
-    project_goal = ""
     try:
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT name, description FROM projects WHERE id = ?",
+                "SELECT name FROM projects WHERE id = ?",
                 (active,),
             )
             row = await cur.fetchone()
             if row:
                 d = dict(row)
                 project_name = d.get("name") or active
-                project_goal = (d.get("description") or "").strip()
 
             # ---- Team composition (active project) -----------------
             cur = await c.execute(
@@ -2028,14 +2042,18 @@ async def _build_coach_coordination_block() -> str:
     lines: list[str] = []
     lines.append(f"## Coordinating: {project_name}")
     lines.append("")
-    if project_goal:
-        lines.append(f"Goal: {project_goal}")
-    else:
-        lines.append("Goal: (not set — edit projects.description to fill)")
+    # Goals / objectives are NOT rendered here. They flow through
+    # `project-objectives.md`, injected as a separate `## Project
+    # objectives` section later in the system prompt (recurrence-specs
+    # §3.3 + §6). Coach reads / edits that file directly via Write;
+    # the EnvPane Objectives section is the human's surface. Rendering
+    # the DB description here as well produced two stale-prone copies
+    # of the same goal text in every Coach turn.
     pp = project_paths(active)
     lines.append(
         f"(For full project context, read {pp.claude_md} and update "
-        "it as the project evolves.)"
+        "it as the project evolves. Goals / scope live in "
+        f"{pp.project_objectives} — see ## Project objectives below.)"
     )
     lines.append("")
 

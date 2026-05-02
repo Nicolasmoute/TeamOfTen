@@ -17,7 +17,7 @@ import {
   buildSideBySideRows,
   renderDiffBody,
 } from "/static/tools.js";
-import { CompassPane, createCompassEventRouter } from "/static/compass.js?v=1777706466";
+import { CompassPane, createCompassEventRouter } from "/static/compass.js?v=1777718517";
 
 const html = htm.bind(h);
 // Module-level event router for compass events. CompassPane(s) subscribe;
@@ -427,13 +427,32 @@ function modelOptionsFor(runtime) {
   return runtime === "codex" ? CODEX_MODEL_OPTIONS : MODEL_OPTIONS;
 }
 
+// Mirror of server/models_catalog.py:_ALIAS_TO_CONCRETE. Coach writes
+// tier aliases via coord_set_player_model so its overrides survive
+// model bumps; the chip resolves alias → concrete here so the label
+// shows the actual model the next spawn will use. Keep in sync with
+// the Python map.
+const MODEL_ALIAS_TO_CONCRETE = {
+  latest_opus: "claude-opus-4-7",
+  latest_sonnet: "claude-sonnet-4-6",
+  latest_haiku: "claude-haiku-4-5-20251001",
+  latest_gpt: "gpt-5.5",
+  latest_mini: "gpt-5.4-mini",
+};
+
+function resolveModelAlias(id) {
+  if (!id) return "";
+  return MODEL_ALIAS_TO_CONCRETE[id] || id;
+}
+
 function modelLabelFor(id, runtime) {
+  const resolved = resolveModelAlias(id);
   const opts = modelOptionsFor(runtime || "");
   const match =
-    opts.find((m) => m.value === id) ||
-    CODEX_MODEL_OPTIONS.find((m) => m.value === id) ||
-    MODEL_OPTIONS.find((m) => m.value === id);
-  return match ? match.label : (id || "default");
+    opts.find((m) => m.value === resolved) ||
+    CODEX_MODEL_OPTIONS.find((m) => m.value === resolved) ||
+    MODEL_OPTIONS.find((m) => m.value === resolved);
+  return match ? match.label : (resolved || "default");
 }
 
 // Effort: 1=low, 2=med, 3=high, 4=max. Mapped server-side to a
@@ -964,6 +983,18 @@ function App() {
   // when EnvPane is closed — the whole point is to surface pending
   // human review when the user can't see the EnvPane sections.
   const [pendingFileWriteCount, setPendingFileWriteCount] = useState(0);
+  // Attention state lifted from EnvAttentionSection so the env-toggle
+  // dot AND the auto-pop-open behavior work even when the EnvPane is
+  // closed. Covers human_attention warnings, AskUserQuestion route=
+  // human, and ExitPlanMode plan approvals — anything the harness
+  // needs the human to read/answer/decide. Dismissed set lives in
+  // localStorage (per-key) so per-tab dismissals survive reloads.
+  const [pendingHumanQuestions, setPendingHumanQuestions] = useState([]);
+  const [pendingHumanPlans, setPendingHumanPlans] = useState([]);
+  const [persistedAttention, setPersistedAttention] = useState([]);
+  const [dismissedAttention, setDismissedAttention] = useState(
+    () => loadDismissedAttention()
+  );
   // conversations: Map<slotId, Event[]>  (events ordered oldest → newest)
   const [conversations, setConversations] = useState(new Map());
   // streamingText: Map<slotId, {text, thinking}> — partial-token deltas
@@ -1309,6 +1340,215 @@ function App() {
   useEffect(() => {
     if (fileWriteEventCount > 0) refreshPendingFileWrite();
   }, [fileWriteEventCount, refreshPendingFileWrite]);
+
+  // Same pattern for attention items: refetch persisted human_attention
+  // + pending questions + pending plans whenever a relevant event lands.
+  // The count of in-conversation events drives the effect — any new
+  // event of these types triggers a fresh fetch.
+  const attentionLiveCount = useMemo(() => {
+    let n = 0;
+    for (const list of conversations.values()) {
+      for (const ev of list) {
+        if (ev.type === "human_attention"
+            || ev.type === "pending_question"
+            || ev.type === "question_answered"
+            || ev.type === "question_cancelled"
+            || ev.type === "pending_plan"
+            || ev.type === "plan_decided"
+            || ev.type === "plan_cancelled"
+            || ev.type === "interaction_extended") {
+          n++;
+        }
+      }
+    }
+    return n;
+  }, [conversations]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await authedFetch(
+          "/api/events?type=human_attention&limit=100"
+        );
+        if (res.ok) {
+          const data = await res.json();
+          if (!cancelled) {
+            setPersistedAttention((data.events || []).map(unwrapPersisted));
+          }
+        }
+      } catch (e) {
+        console.error("attention history load failed", e);
+      }
+      try {
+        const res2 = await authedFetch("/api/questions/pending");
+        if (res2.ok) {
+          const data2 = await res2.json();
+          if (!cancelled) {
+            setPendingHumanQuestions(
+              Array.isArray(data2.pending) ? data2.pending : []
+            );
+          }
+        }
+      } catch (e) {
+        console.error("pending questions load failed", e);
+      }
+      try {
+        const res3 = await authedFetch("/api/plans/pending");
+        if (res3.ok) {
+          const data3 = await res3.json();
+          if (!cancelled) {
+            setPendingHumanPlans(
+              Array.isArray(data3.pending) ? data3.pending : []
+            );
+          }
+        }
+      } catch (e) {
+        console.error("pending plans load failed", e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [attentionLiveCount, authedFetch]);
+
+  // Open attention items the human still needs to read/answer. Mirror
+  // of the derivation that used to live inside EnvAttentionSection,
+  // lifted so the env-toggle dot + auto-open both fire whether or not
+  // the pane is mounted. Dismissed items are excluded.
+  const attentionOpen = useMemo(() => {
+    const seen = new Set();
+    const all = [];
+    for (const pq of pendingHumanQuestions) {
+      if (pq.route !== "human") continue;
+      const k = `pq:${pq.correlation_id}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      all.push({
+        __key: k,
+        type: "pending_question",
+        agent_id: pq.agent_id,
+        correlation_id: pq.correlation_id,
+        questions: pq.questions || [],
+        ts: pq.created_at,
+        deadline_at: pq.deadline_at || null,
+        subject: pq.questions && pq.questions[0]
+          ? pq.questions[0].question
+          : "Question",
+      });
+    }
+    for (const pp of pendingHumanPlans) {
+      if (pp.route !== "human") continue;
+      const k = `pp:${pp.correlation_id}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      all.push({
+        __key: k,
+        type: "pending_plan",
+        agent_id: pp.agent_id,
+        correlation_id: pp.correlation_id,
+        plan: pp.plan || "",
+        ts: pp.created_at,
+        deadline_at: pp.deadline_at || null,
+        subject: "Plan approval — " + (pp.agent_id || ""),
+      });
+    }
+    for (const list of conversations.values()) {
+      for (const ev of list) {
+        if (ev.type === "pending_question" && ev.route === "human") {
+          const k = `pq:${ev.correlation_id}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          all.push({ ...ev, __key: k });
+          continue;
+        }
+        if (ev.type === "pending_plan" && ev.route === "human") {
+          const k = `pp:${ev.correlation_id}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          all.push({
+            ...ev,
+            __key: k,
+            subject: "Plan approval — " + (ev.agent_id || ""),
+          });
+          continue;
+        }
+        if (ev.type === "question_answered" || ev.type === "question_cancelled") {
+          const k = `pq:${ev.correlation_id}`;
+          seen.add(k);
+          for (let i = all.length - 1; i >= 0; i--) {
+            if (all[i].__key === k) all.splice(i, 1);
+          }
+        }
+        if (ev.type === "plan_decided" || ev.type === "plan_cancelled") {
+          const k = `pp:${ev.correlation_id}`;
+          seen.add(k);
+          for (let i = all.length - 1; i >= 0; i--) {
+            if (all[i].__key === k) all.splice(i, 1);
+          }
+        }
+      }
+    }
+    for (const ev of persistedAttention) {
+      if (ev.type !== "human_attention") continue;
+      const k = ev.__id != null ? `ha:${ev.__id}` : `ha:${ev.ts}:${ev.agent_id}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      all.push({ ...ev, __key: k });
+    }
+    for (const list of conversations.values()) {
+      for (const ev of list) {
+        if (ev.type !== "human_attention") continue;
+        const k = ev.__id != null ? `ha:${ev.__id}` : `ha:${ev.ts}:${ev.agent_id}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        all.push({ ...ev, __key: k });
+      }
+    }
+    const out = all.filter((ev) => !dismissedAttention.has(ev.__key));
+    out.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
+    return out;
+  }, [
+    conversations,
+    persistedAttention,
+    pendingHumanQuestions,
+    pendingHumanPlans,
+    dismissedAttention,
+  ]);
+
+  const dismissAttention = useCallback((key) => {
+    setDismissedAttention((prev) => {
+      const next = new Set(prev);
+      next.add(key);
+      saveDismissedAttention(next);
+      return next;
+    });
+  }, []);
+  const dismissAllAttention = useCallback(() => {
+    setDismissedAttention((prev) => {
+      const next = new Set(prev);
+      for (const ev of attentionOpen) next.add(ev.__key);
+      saveDismissedAttention(next);
+      return next;
+    });
+  }, [attentionOpen]);
+
+  // Combined notification count drives the env-toggle dot AND the
+  // auto-pop-open behavior. Anything the human needs to read/answer/
+  // approve in the EnvPane should land here.
+  const envPendingCount = attentionOpen.length + pendingFileWriteCount;
+
+  // Auto-open the EnvPane on every positive transition of the pending
+  // count: 0 → N covers both fresh-WS-arrival and page-load-with-
+  // leftover-items (the initial fetch lands as 0 → N), so the pane
+  // pops open exactly once per "new thing to read." Dismissals
+  // (N → 0) never re-trigger because the comparison is strictly
+  // greater. Dot still indicates pending state independently.
+  const prevEnvPendingRef = useRef(0);
+  useEffect(() => {
+    const prev = prevEnvPendingRef.current;
+    prevEnvPendingRef.current = envPendingCount;
+    if (envPendingCount > prev && envPendingCount > 0) {
+      setEnvOpen((cur) => (cur ? cur : true));
+    }
+  }, [envPendingCount]);
 
   // Click-handler for in-app file links. Marked + DOMPurify tag any
   // markdown link whose href is an absolute path (`/data/...`,
@@ -2451,7 +2691,7 @@ function App() {
         wsConnected=${wsConnected}
         envOpen=${envOpen}
         onToggleEnv=${() => setEnvOpen((v) => !v)}
-        pendingFileWriteCount=${pendingFileWriteCount}
+        envPendingCount=${envPendingCount}
         recurrenceOpen=${recurrenceOpen}
         onToggleRecurrence=${() => setRecurrenceOpen((v) => !v)}
         onOpenSettings=${() => setSettingsOpen(true)}
@@ -2564,6 +2804,9 @@ function App() {
             openSlots=${openSlots}
             serverStatus=${serverStatus}
             activeProjectId=${activeProjectId}
+            attentionOpen=${attentionOpen}
+            onDismissAttention=${dismissAttention}
+            onDismissAllAttention=${dismissAllAttention}
             onCreateTask=${createHumanTask}
             onClose=${() => setEnvOpen(false)}
             onResizerDown=${onEnvResizerDown}
@@ -3013,7 +3256,7 @@ function ProjectSwitchBusyModal({ busy, onDismiss, onRetry }) {
   `;
 }
 
-function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, activeProjectId, switchingProject, onActivateProject, onCreateProject, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, pendingFileWriteCount = 0, recurrenceOpen, onToggleRecurrence, onOpenSettings, paused, onTogglePause, onLayoutPreset, onCancelAll }) {
+function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, activeProjectId, switchingProject, onActivateProject, onCreateProject, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, envPendingCount = 0, recurrenceOpen, onToggleRecurrence, onOpenSettings, paused, onTogglePause, onLayoutPreset, onCancelAll }) {
   const workingCount = agents.filter((a) => a.status === "working").length;
   const grouped = useMemo(() => {
     const coach = agents.find((a) => a.kind === "coach");
@@ -3200,21 +3443,17 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
           </button>
           <button
             class=${"gear env-toggle" + (envOpen ? " active" : "")
-              + (pendingFileWriteCount > 0 ? " has-pending" : "")}
+              + (envPendingCount > 0 ? " has-pending" : "")}
             title=${(envOpen ? "Collapse environment panel" : "Open environment panel") + " (⌘/Ctrl+B)"
-              + (pendingFileWriteCount > 0
-                ? ` — ${pendingFileWriteCount} file-write proposal${pendingFileWriteCount === 1 ? "" : "s"} awaiting your review`
+              + (envPendingCount > 0
+                ? ` — ${envPendingCount} item${envPendingCount === 1 ? "" : "s"} awaiting your review`
                 : "")}
             onClick=${onToggleEnv}
+            aria-label=${envPendingCount > 0
+              ? `Environment panel — ${envPendingCount} pending`
+              : "Environment panel"}
           >
-            <span class="env-icon-desktop">▦</span>
-            <span class="env-icon-mobile">E</span>
-            ${pendingFileWriteCount > 0
-              ? html`<span
-                  class="env-toggle-pending-dot"
-                  aria-label=${`${pendingFileWriteCount} pending`}
-                ></span>`
-              : null}
+            <span class="env-icon">▦</span>
           </button>
           <button class="gear settings-toggle" title="Settings" onClick=${onOpenSettings}>⚙</button>
         </div>
@@ -6031,7 +6270,7 @@ function RecurrencePane({ rows, onClose, onRefresh, onError }) {
 // environment pane (right side): tasks + cost + timeline
 // ------------------------------------------------------------------
 
-function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, activeProjectId, onCreateTask, onClose, onResizerDown }) {
+function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, activeProjectId, attentionOpen, onDismissAttention, onDismissAllAttention, onCreateTask, onClose, onResizerDown }) {
   const [exporting, setExporting] = useState(false);
 
   const exportTeam = useCallback(async () => {
@@ -6222,7 +6461,11 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, active
         <button class="env-close" onClick=${onClose} title="Collapse">×</button>
       </header>
       <div class="env-body">
-        <${EnvAttentionSection} conversations=${conversations} />
+        <${EnvAttentionSection}
+          open=${attentionOpen}
+          onDismiss=${onDismissAttention}
+          onDismissAll=${onDismissAllAttention}
+        />
         <${EnvModelOverridesSection} agents=${agents} />
         <${EnvKDriveStatusSection} conversations=${conversations} />
         <${EnvTasksSection} tasks=${tasks} onCreate=${onCreateTask} />
@@ -6316,183 +6559,13 @@ function saveDismissedAttention(ids) {
   }
 }
 
-function EnvAttentionSection({ conversations }) {
-  const [dismissed, setDismissed] = useState(() => loadDismissedAttention());
-  const [persisted, setPersisted] = useState([]);
-
-  // Pending AskUserQuestion + ExitPlanMode interactions. Both go
-  // through can_use_tool and survive reloads via /api/questions/pending
-  // and /api/plans/pending. Separate from human_attention (fire-and-
-  // forget escalations).
-  const [pendingQuestions, setPendingQuestions] = useState([]);
-  const [pendingPlans, setPendingPlans] = useState([]);
-
-  const liveCount = useMemo(() => {
-    let n = 0;
-    for (const list of conversations.values()) {
-      for (const ev of list) {
-        if (ev.type === "human_attention"
-            || ev.type === "pending_question"
-            || ev.type === "question_answered"
-            || ev.type === "question_cancelled"
-            || ev.type === "pending_plan"
-            || ev.type === "plan_decided"
-            || ev.type === "plan_cancelled"
-            || ev.type === "interaction_extended") {
-          n++;
-        }
-      }
-    }
-    return n;
-  }, [conversations]);
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await authFetch(
-          "/api/events?type=human_attention&limit=100"
-        );
-        if (!res.ok) return;
-        const data = await res.json();
-        if (cancelled) return;
-        setPersisted((data.events || []).map(unwrapPersisted));
-      } catch (e) {
-        console.error("attention history load failed", e);
-      }
-      try {
-        const res2 = await authFetch("/api/questions/pending");
-        if (!res2.ok) return;
-        const data2 = await res2.json();
-        if (cancelled) return;
-        setPendingQuestions(Array.isArray(data2.pending) ? data2.pending : []);
-      } catch (e) {
-        console.error("pending questions load failed", e);
-      }
-      try {
-        const res3 = await authFetch("/api/plans/pending");
-        if (!res3.ok) return;
-        const data3 = await res3.json();
-        if (cancelled) return;
-        setPendingPlans(Array.isArray(data3.pending) ? data3.pending : []);
-      } catch (e) {
-        console.error("pending plans load failed", e);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [liveCount]);
-
-  const open = useMemo(() => {
-    const seen = new Set();
-    const all = [];
-    // Live pending questions.
-    for (const pq of pendingQuestions) {
-      if (pq.route !== "human") continue;
-      const k = `pq:${pq.correlation_id}`;
-      if (seen.has(k)) continue;
-      seen.add(k);
-      all.push({
-        __key: k,
-        type: "pending_question",
-        agent_id: pq.agent_id,
-        correlation_id: pq.correlation_id,
-        questions: pq.questions || [],
-        ts: pq.created_at,
-        deadline_at: pq.deadline_at || null,
-        subject: pq.questions && pq.questions[0]
-          ? pq.questions[0].question
-          : "Question",
-      });
-    }
-    // Live pending plans.
-    for (const pp of pendingPlans) {
-      if (pp.route !== "human") continue;
-      const k = `pp:${pp.correlation_id}`;
-      if (seen.has(k)) continue;
-      seen.add(k);
-      all.push({
-        __key: k,
-        type: "pending_plan",
-        agent_id: pp.agent_id,
-        correlation_id: pp.correlation_id,
-        plan: pp.plan || "",
-        ts: pp.created_at,
-        deadline_at: pp.deadline_at || null,
-        subject: "Plan approval — " + (pp.agent_id || ""),
-      });
-    }
-    for (const list of conversations.values()) {
-      for (const ev of list) {
-        if (ev.type === "pending_question" && ev.route === "human") {
-          const k = `pq:${ev.correlation_id}`;
-          if (seen.has(k)) continue;
-          seen.add(k);
-          all.push({ ...ev, __key: k });
-          continue;
-        }
-        if (ev.type === "pending_plan" && ev.route === "human") {
-          const k = `pp:${ev.correlation_id}`;
-          if (seen.has(k)) continue;
-          seen.add(k);
-          all.push({ ...ev, __key: k, subject: "Plan approval — " + (ev.agent_id || "") });
-          continue;
-        }
-        if (ev.type === "question_answered" || ev.type === "question_cancelled") {
-          const k = `pq:${ev.correlation_id}`;
-          seen.add(k);
-          for (let i = all.length - 1; i >= 0; i--) {
-            if (all[i].__key === k) all.splice(i, 1);
-          }
-        }
-        if (ev.type === "plan_decided" || ev.type === "plan_cancelled") {
-          const k = `pp:${ev.correlation_id}`;
-          seen.add(k);
-          for (let i = all.length - 1; i >= 0; i--) {
-            if (all[i].__key === k) all.splice(i, 1);
-          }
-        }
-      }
-    }
-    // Persisted human_attention next (canonical ids).
-    for (const ev of persisted) {
-      if (ev.type !== "human_attention") continue;
-      const k = ev.__id != null ? `ha:${ev.__id}` : `ha:${ev.ts}:${ev.agent_id}`;
-      if (seen.has(k)) continue;
-      seen.add(k);
-      all.push({ ...ev, __key: k });
-    }
-    for (const list of conversations.values()) {
-      for (const ev of list) {
-        if (ev.type !== "human_attention") continue;
-        const k = ev.__id != null ? `ha:${ev.__id}` : `ha:${ev.ts}:${ev.agent_id}`;
-        if (seen.has(k)) continue;
-        seen.add(k);
-        all.push({ ...ev, __key: k });
-      }
-    }
-    const out = all.filter((ev) => !dismissed.has(ev.__key));
-    out.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
-    return out;
-  }, [conversations, persisted, pendingQuestions, pendingPlans, dismissed]);
-
-  const dismiss = useCallback((key) => {
-    setDismissed((prev) => {
-      const next = new Set(prev);
-      next.add(key);
-      saveDismissedAttention(next);
-      return next;
-    });
-  }, []);
-  const dismissAll = useCallback(() => {
-    setDismissed((prev) => {
-      const next = new Set(prev);
-      for (const ev of open) next.add(ev.__key);
-      saveDismissedAttention(next);
-      return next;
-    });
-  }, [open]);
-
-  if (open.length === 0) return null;
+// Source of truth for `open`, `onDismiss`, `onDismissAll` lives in
+// App scope so the env-toggle dot + auto-pop-open work without the
+// pane being mounted. This component is purely presentational.
+function EnvAttentionSection({ open, onDismiss, onDismissAll }) {
+  const dismiss = onDismiss || (() => {});
+  const dismissAll = onDismissAll || (() => {});
+  if (!Array.isArray(open) || open.length === 0) return null;
 
   return html`
     <section class="env-section env-attention">
@@ -9251,12 +9324,24 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
   // Populated from /api/turns?agent=<slot>&limit=1 on mount and after
   // every `result` event arriving over the WS.
   const [lastTurn, setLastTurn] = useState(null);
-  // Resolve the effective model id for the chip label. Precedence:
-  //   pane override > role default (per runtime) > server suggested
-  //   fallback > latest turn's model > "" (only on a brand-new agent
-  //   with no role default and no completed turn — Codex edge case).
+  // Resolve the effective model id for the chip label. Precedence
+  // mirrors server/agents.py:run_agent's resolution chain:
+  //   pane override > Coach-set agent_project_roles.model_override
+  //   > role default (per runtime) > server suggested fallback
+  //   > latest turn's model > "" (brand-new agent, no role default,
+  //   no completed turn — Codex edge case).
+  // The Coach override is silently ignored when it doesn't fit the
+  // current runtime, mirroring _model_fits_runtime on the server.
+  const agentModelOverride = agent?.model_override || "";
   const effectiveModelId = useMemo(() => {
     if (paneSettings.model) return paneSettings.model;
+    if (agentModelOverride) {
+      const concrete = resolveModelAlias(agentModelOverride);
+      const opts = modelOptionsFor(effectiveRuntime);
+      if (opts.some((m) => m.value === concrete)) return agentModelOverride;
+      // Fits the other runtime — fall through; the server will drop
+      // it at spawn time too.
+    }
     if (roleDefaultModels) {
       const role = slot === "coach" ? "coach" : "players";
       const key = effectiveRuntime === "codex" ? role + "_codex" : role;
@@ -9268,7 +9353,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
     }
     if (lastTurn?.model) return lastTurn.model;
     return "";
-  }, [paneSettings.model, roleDefaultModels, effectiveRuntime, slot, lastTurn]);
+  }, [paneSettings.model, agentModelOverride, roleDefaultModels, effectiveRuntime, slot, lastTurn]);
   // Resolve the effort tier shown on the chip. Precedence:
   //   pane override (1..4) > latest turn's effort > 0 (no override
   //   recorded yet — fall through to "low" as the implicit floor).
@@ -10659,11 +10744,13 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
              bar so users don't have to go hunting for the gear. -->
         <div class="pane-modes">
           <button
-            class=${"pane-mode-chip" + (paneSettings.model ? " active" : "")}
+            class=${"pane-mode-chip" + ((paneSettings.model || agentModelOverride) ? " active" : "")}
             onClick=${() => setSettingsOpen(true)}
             title=${paneSettings.model
               ? "Model: per-pane override (click to change)"
-              : "Model: resolved from role default / last turn (click to override)"}
+              : agentModelOverride
+                ? `Model: Coach-set override (${agentModelOverride}) — click to change`
+                : "Model: resolved from role default / last turn (click to override)"}
           >
             ${(() => {
               if (effectiveModelId) {
@@ -10693,7 +10780,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
           >
             ${EFFORT_LABELS[(effectiveEffort || 1) - 1]}
           </button>
-          <${ContextBar} slot=${slot} liveEvents=${liveEvents} model=${paneSettings.model || ""} />
+          <${ContextBar} slot=${slot} liveEvents=${liveEvents} model=${effectiveModelId || ""} />
           <span class="pane-modes-spacer"></span>
           <button
             class="pane-mode-chip pane-mode-slash"

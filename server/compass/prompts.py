@@ -697,9 +697,19 @@ def region_merge_user(state: LatticeState) -> str:
 
 
 AUDIT_SYSTEM = _system("""\
-You are Compass auditing a piece of work against the lattice. Coach has submitted a
-work artifact (commit, decision, worker output) and wants to know if it aligns with
-current beliefs about the project.
+You are Compass auditing a piece of work against the lattice. Coach (or the
+auto-audit watcher) has submitted a work artifact and wants to know if it
+aligns with current beliefs about the project.
+
+Artifact shapes you may receive:
+- A short metadata line — `[commit]`, `[decision]`, `[knowledge]`, or
+  `[output]` followed by author + path + brief description.
+- A full document body inlined under a `--- document body (.ext extracted) ---`
+  separator (Tier B output audit). Treat this as the FULL content of a
+  finished deliverable the human will consume — read its framing, claims,
+  conclusions, and recommendations against the lattice. The verdict is
+  about whether the document's substance contradicts settled or
+  high-confidence statements, not about prose style.
 
 Verdict rules:
 - "aligned": work is consistent with the lattice, or touches no high-stakes statements.

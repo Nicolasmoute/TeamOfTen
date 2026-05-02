@@ -164,12 +164,6 @@ body {
     width: 16px;
     height: 12px;
   }
-  .rail-bottom .env-icon-desktop { display: none; }
-  .rail-bottom .env-icon-mobile {
-    display: inline;
-    font-size: 11px;
-    font-weight: 600;
-  }
   /* Tighter slot buttons on mobile so 11 slots fit without scroll on
      360px-wide phones. */
   .rail-group.rail-agents .slot {
@@ -475,28 +469,22 @@ body {
 .gear:hover { color: var(--fg); }
 .gear.env-toggle { font-size: 16px; position: relative; }
 .gear.env-toggle.active { color: var(--accent); }
-/* Pending-review notification dot on the env-toggle button. Lights
-   up whenever there's at least one pending file-write proposal so
-   the user knows to open the EnvPane (Ctrl+B) and review. Pulses
-   gently to read as "actionable", not "passive status". Sized and
-   positioned to sit at the top-right corner of the gear icon. */
-.gear.env-toggle .env-toggle-pending-dot {
-  position: absolute;
-  top: 4px;
-  right: 4px;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--err, #f85149);
-  box-shadow: 0 0 0 2px var(--bg);
-  pointer-events: none;
-  animation: env-toggle-pending-pulse 1.6s ease-in-out infinite;
+/* Pending-review state on the env-toggle button. Triggered whenever
+   the EnvPane has at least one item the human needs to read or act
+   on — pending file-write proposals, AskUserQuestion prompts routed
+   to the human, plan approvals, or human_attention escalations.
+   Recolours the whole ▦ icon amber and pulses a soft amber glow
+   around the button — same visual treatment as .slot.state-working
+   so "needs attention" reads consistently across the rail. */
+.gear.env-toggle.has-pending { color: var(--warn); }
+.gear.env-toggle.has-pending .env-icon { color: var(--warn); }
+.gear.env-toggle.has-pending {
+  animation: env-toggle-pending-pulse 1.8s ease-in-out infinite;
 }
 @keyframes env-toggle-pending-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
+  0%, 100% { box-shadow: 0 0 4px rgba(210, 153, 34, 0.35); }
+  50%      { box-shadow: 0 0 12px rgba(210, 153, 34, 0.85); }
 }
-.env-icon-mobile { display: none; }
 /* Project switcher (Phase 3) — replaces the dashed `P` placeholder
    with a working dropdown. Pill shows the first 2 letters of the
    active project's name; menu lists all non-archived projects with
@@ -2420,6 +2408,68 @@ body {
   overflow-y: hidden;
   padding: 2px 0;
 }
+
+/* Callouts (Obsidian / GFM-Alerts compatible). The renderer in
+   markdown.js emits .md-callout.md-callout-{theme} with a title row
+   and body. Twelve themes share a single color-variable contract:
+   each theme sets `--callout-color` and the rest cascades. The
+   collapsible variant uses <details>/<summary>; the chevron is
+   drawn via CSS so we don't depend on the browser's default marker
+   shape. */
+.md-callout {
+  --callout-color: var(--accent);
+  margin: 10px 0;
+  border-left: 3px solid var(--callout-color);
+  background: color-mix(in srgb, var(--callout-color) 8%, transparent);
+  border-radius: 0 4px 4px 0;
+  padding: 6px 12px 6px 12px;
+}
+.md-callout-title {
+  color: var(--callout-color);
+  font-weight: 600;
+  font-size: 0.85em;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin: 0 0 4px 0;
+  user-select: none;
+}
+.md-callout-body { font-size: 0.95em; }
+.md-callout-body > :first-child { margin-top: 0; }
+.md-callout-body > :last-child { margin-bottom: 0; }
+/* Collapsible variant: <details>/<summary>. Hide the default
+   browser disclosure triangle so we can draw our own. */
+details.md-callout-collapsible > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+details.md-callout-collapsible > summary::-webkit-details-marker { display: none; }
+details.md-callout-collapsible > summary::before {
+  content: "";
+  display: inline-block;
+  width: 0;
+  height: 0;
+  border-left: 4px solid currentColor;
+  border-top: 3px solid transparent;
+  border-bottom: 3px solid transparent;
+  transition: transform 0.12s ease;
+}
+details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg); }
+/* Theme palette — each theme just sets --callout-color. */
+.md-callout-note     { --callout-color: #58a6ff; } /* blue (--accent) */
+.md-callout-abstract { --callout-color: #2bbac5; } /* teal */
+.md-callout-info     { --callout-color: #6ab4ff; } /* lighter blue */
+.md-callout-todo     { --callout-color: #4493f8; } /* blue */
+.md-callout-tip      { --callout-color: #2dd4bf; } /* cyan */
+.md-callout-success  { --callout-color: #3fb950; } /* green */
+.md-callout-question { --callout-color: #d29922; } /* yellow (--warn) */
+.md-callout-warning  { --callout-color: #db7c2a; } /* orange */
+.md-callout-failure  { --callout-color: #f85149; } /* red (--err) */
+.md-callout-danger   { --callout-color: #ff6a69; } /* bright red */
+.md-callout-example  { --callout-color: #a371f7; } /* purple */
+.md-callout-quote    { --callout-color: #8b949e; } /* gray (--muted) */
 
 .files-editor-foot {
   display: flex;

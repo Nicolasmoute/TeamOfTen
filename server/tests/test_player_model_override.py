@@ -562,6 +562,75 @@ def test_resolve_model_alias_round_trip() -> None:
     assert resolve_model_alias("future-model-7") == "future-model-7"
 
 
+def test_js_alias_map_mirrors_python() -> None:
+    """The pane chip in [server/static/app.js] carries a JS-side
+    `MODEL_ALIAS_TO_CONCRETE` map that mirrors `_ALIAS_TO_CONCRETE`
+    in `server/models_catalog.py`. The two are kept in sync by
+    convention (a comment in app.js says so), but nothing enforces
+    it — a maintainer who bumps `latest_sonnet` to a new concrete
+    id in Python and forgets the JS side leaves the chip rendering
+    the wrong label until someone notices.
+
+    Parse the JS file's map literal and compare. Failure here means:
+    update the JS map in app.js to match `_ALIAS_TO_CONCRETE`."""
+    import re
+    from pathlib import Path
+    from server.models_catalog import _ALIAS_TO_CONCRETE
+
+    app_js = Path(__file__).resolve().parents[1] / "static" / "app.js"
+    text = app_js.read_text(encoding="utf-8")
+    m = re.search(
+        r"const MODEL_ALIAS_TO_CONCRETE\s*=\s*\{([^}]+)\};",
+        text,
+    )
+    assert m is not None, "MODEL_ALIAS_TO_CONCRETE map not found in app.js"
+
+    # Parse `key: "value",` lines tolerantly — strip blank lines and
+    # comment lines so future readers can annotate without breaking
+    # the test.
+    js_map: dict[str, str] = {}
+    for raw in m.group(1).splitlines():
+        line = raw.strip()
+        if not line or line.startswith("//"):
+            continue
+        entry = re.match(r'(\w+)\s*:\s*"([^"]+)"', line)
+        if entry:
+            js_map[entry.group(1)] = entry.group(2)
+
+    assert js_map == _ALIAS_TO_CONCRETE, (
+        f"alias-map drift between Python and JS:\n"
+        f"  python = {_ALIAS_TO_CONCRETE}\n"
+        f"  js     = {js_map}\n"
+        f"Update server/static/app.js MODEL_ALIAS_TO_CONCRETE to match."
+    )
+
+
+def test_context_window_for_resolves_aliases() -> None:
+    """The /api/agents/{id}/context endpoint hands the user-facing
+    `?model=` query param straight through to `_context_window_for`.
+    When a caller passes a tier alias (`latest_gpt`, `latest_mini`,
+    …) the lookup must resolve to the concrete id before consulting
+    `_CONTEXT_WINDOWS`, otherwise unknown aliases silently fall
+    through to the 1M default and the CTX bar reads against the
+    wrong window."""
+    from server.agents import _CONTEXT_WINDOWS, _context_window_for
+    from server.models_catalog import _ALIAS_TO_CONCRETE
+
+    for alias, concrete in _ALIAS_TO_CONCRETE.items():
+        # Both forms must yield the same window. If the concrete id
+        # isn't in the table either, both should fall through to the
+        # 1M default — still equal, just less informative.
+        assert _context_window_for(alias) == _context_window_for(concrete), (
+            f"alias {alias!r} did not resolve to {concrete!r}'s window"
+        )
+
+    # Spot-check the documented mini-tier window doesn't accidentally
+    # report 1M (which would defeat the auto-compact trip-wire).
+    mini = _ALIAS_TO_CONCRETE["latest_mini"]
+    assert _context_window_for("latest_mini") == _CONTEXT_WINDOWS[mini]
+    assert _context_window_for("latest_mini") < 1_000_000
+
+
 async def test_tool_accepts_alias_for_claude_player(fresh_db) -> None:
     """Coach passing 'latest_opus' on a Claude-runtime player should
     succeed and the override should be stored as the alias verbatim

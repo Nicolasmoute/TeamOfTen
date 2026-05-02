@@ -665,6 +665,112 @@ without touching prompts or migrating DB rows.
   `test_role_defaults_resolved_for_api`, plus the
   forbidden-concrete-ids enforcer above. Suite at 562/562.
 
+**Recent (2026-05-02, second follow-up) — Tier B output body audits:**
+
+The Compass auto-audit watcher (shipped earlier today) was extended to
+audit `output_saved` events too — and not with a path-only stub but
+with **actual body extraction** for text and office formats. Outputs
+(binary deliverables saved via `coord_save_output`) are infrequent
+but high-stakes: they're the polished PDFs / DOCX / spreadsheets the
+human consumes directly. Cheaper to spend the LLM tokens reading the
+document than to read it yourself and discover it's off-strategy.
+
+- New module
+  [server/compass/output_extractor.py](server/compass/output_extractor.py)
+  with format-specific extractors. Lazy imports for pypdf /
+  python-docx / openpyxl / python-pptx — missing parsers degrade to
+  path-only audit, never crash. Per-format exception isolation: a
+  malformed PDF doesn't tank the watcher.
+- Format coverage:
+  - Text-native (md/markdown/txt/csv/tsv/html/htm/json) → UTF-8 read
+  - PDF → pypdf page-text concat
+  - DOCX → python-docx paragraphs + table cells
+  - XLSX → openpyxl read-only TSV dump per sheet
+  - PPTX → python-pptx per-slide text frames
+  - Archives (zip/tar/gz) → filename listing, first 200 entries
+  - Images (png/jpg/etc.) → skipped (Tier C/vision deferred), path-only
+  - Unknown → path-only
+- Bodies capped at `MAX_BODY_CHARS=16_000` (~4k tokens) per file.
+  Composed artifact capped again at 18 KB final.
+- `AUDIT_SYSTEM` prompt
+  ([server/compass/prompts.py](server/compass/prompts.py)) lightly
+  extended to acknowledge the body-included artifact shape — same
+  prompt handles both "metadata only" and "full document body" cases.
+- 4 new pure-Python deps in pyproject:
+  [pyproject.toml](pyproject.toml) — pypdf, python-docx, openpyxl,
+  python-pptx. All wheel-only, no compile.
+- 21 new tests in
+  [server/tests/test_compass_output_extractor.py](server/tests/test_compass_output_extractor.py)
+  cover every format extractor (success + missing-dep + corrupt-input
+  paths), truncation, archive listing limits, fallback for images /
+  unknown / missing-file / directory inputs.
+- 4 new watcher tests in
+  [server/tests/test_compass_audit_watcher.py](server/tests/test_compass_audit_watcher.py)
+  cover the integration: text format inlines body, image falls back
+  to path-only, missing file falls back gracefully, extractor crash
+  falls back to path-only.
+- Spec mirror in `Docs/compass-specs.md` §5.5.2 + §5.5.3.
+
+The "every artifact gets audited against the Compass lattice" claim
+in the marketing surface is now literally true: commits, decisions,
+knowledge artifacts, AND binary deliverables all flow through the
+audit pipeline.
+
+**Recent (2026-05-02, follow-up) — Compass auto-audit watcher:**
+
+The §5 spec put the burden on Coach to call `compass_audit` whenever
+a worker produced "a meaningful unit of work." In practice Coach
+forgets, and the dashboard's manual paste UI was the wrong fallback
+(humans don't produce the artifacts being audited — agents do). New
+[server/compass/audit_watcher.py](server/compass/audit_watcher.py)
+closes the loop:
+
+- **Subscribes to the bus** on boot (`start_audit_watcher` wired in
+  `main.py:lifespan` next to the telegram bridge — same own-task-
+  handle pattern). Subscribes synchronously *before* scheduling the
+  consumer task to avoid losing events fired during the
+  `create_task` race window.
+- **Watched event types**: `commit_pushed` (Player commits via
+  `coord_commit_push`), `decision_written` (Coach decisions via
+  `coord_write_decision`), `knowledge_written` (any agent writing
+  via `coord_write_knowledge`). Each composes a small artifact blob
+  and dispatches `audit.audit_work` as a fire-and-forget task.
+- **Gates** (each independent, all must pass):
+  1. Per-project enable flag (`compass_enabled_<id>` truthy). Each
+     event carries its own `project_id` (auto-stamped by `EventBus.publish`)
+     so inactive-project commits still get audited.
+  2. Team daily cost cap (`HARNESS_TEAM_DAILY_CAP`). Read live via
+     `agents._today_spend()` so a deploy bumping the cap takes
+     effect without restart.
+  3. Per-(project, agent, type) debounce window (default 30s,
+     `HARNESS_COMPASS_AUTO_AUDIT_DEBOUNCE`). A burst of commits on
+     one Player collapses to one audit; different agents or different
+     event types bypass the window.
+  4. Global feature flag `HARNESS_COMPASS_AUTO_AUDIT` (default true).
+     Set false to disable the watcher entirely on cost-constrained
+     deploys.
+- **Failure isolation**: `audit_work` exceptions are caught by an
+  outer wrapper so a single bad LLM call doesn't kill the
+  subscriber. `audit_work` itself already degrades to an `aligned`
+  verdict on LLM failure.
+- **Dashboard surface change** ([server/static/compass.js](server/static/compass.js)):
+  the manual-paste textarea + "Audit" button is replaced by a
+  read-only "about" block describing the auto-fire sources. Audit
+  log + filter pills stay (§5.3 — humans pull when curious).
+  `POST /api/compass/audit` HTTP endpoint kept as a debug backstop
+  but not surfaced in the UI.
+- **15 new tests** in
+  [server/tests/test_compass_audit_watcher.py](server/tests/test_compass_audit_watcher.py):
+  per-event-type dispatch, filter-by-type, enable-flag gating
+  (unset and explicit-false), debounce collapse + key isolation,
+  zero-debounce passthrough, cost-cap blocking + threshold passthrough,
+  exception isolation, feature-flag short-circuit, idempotent start,
+  missing-project_id graceful drop.
+- **Spec mirror**: `Docs/compass-specs.md` §5.5 (full design),
+  `Docs/recurrence-specs.md` §15.5 (cross-reference table noting the
+  watcher is NOT a recurrence — different trigger / cardinality /
+  cost-cap location / lifecycle owner).
+
 **Recent (2026-05-01) — Compass module shipped:**
 
 Compass is an autonomous strategy engine that runs **alongside** the
@@ -1052,6 +1158,35 @@ OpenAI's Codex safety monitor, which cancelled the subsequent
   app-server exception) emit `auto_compact_failed` symmetrically with
   Claude. Spec mirror in `Docs/CODEX_RUNTIME_SPEC.md` §A.5 / §E.6.
 
+**Recent (2026-05-02, follow-up) — Env-toggle attention signal + auto-pop-open:**
+
+The pending-review signal on the left-rail env-toggle button used to
+fire only on pending file-write proposals (a small red pip in the
+corner). Now it covers everything the EnvPane surfaces for human
+action: AskUserQuestion prompts routed to the human
+(`pending_question`), ExitPlanMode plan approvals (`pending_plan`),
+`human_attention` escalations from `coord_request_human`, plus the
+existing file-write proposals. The attention state
+(`pendingHumanQuestions`, `pendingHumanPlans`, `persistedAttention`,
+`dismissedAttention`) lifted from `EnvAttentionSection` to App scope
+in [server/static/app.js](server/static/app.js) so both the visual
+signal and the auto-open work whether or not the EnvPane is mounted.
+
+Visual: the corner pip is gone. The whole ▦ icon recolours amber
+(`var(--warn)`) and a soft amber glow pulses around the button —
+same `box-shadow` keyframe shape as `.slot.state-working` on the
+agent buttons, so "needs attention" reads consistently across the
+rail. CSS lives at `.gear.env-toggle.has-pending` in
+[server/static/style.css](server/static/style.css).
+
+Auto-open: an App-scope `useRef` tracks the previous
+`envPendingCount` and `setEnvOpen(true)` fires on every positive
+transition. Page-load with leftover items lands as 0 → N (auto-
+open once); dismissals (N → 0) never re-trigger; a fresh item
+arriving while the pane is closed pops it open. The
+EnvAttentionSection component is now purely presentational —
+receives `open` / `onDismiss` / `onDismissAll` as props.
+
 **Next likely:**
 - **Mobile UI polish** — touch-drag doesn't work with HTML5 DnD;
    layout breakpoints for < 900 px need a rethink.
@@ -1234,19 +1369,29 @@ panes, files `.md` preview, compass briefings, decisions, wiki
 entries. Pipeline: `marked` (GFM) → custom code-renderer (hljs for
 known langs; placeholder for `mermaid`) → KaTeX inline+block extension
 (parse-time, `htmlAndMathml` output so equations also paste into Word
-as MathML) → DOMPurify (`html` + `mathMl` profiles, link-rewrite hook
-for in-app file links + external `target=_blank`) → consumer mounts
-via `dangerouslySetInnerHTML`. Post-mount: a single MutationObserver
+as MathML) → callouts extension (parse-time, GFM-Alerts compatible)
+→ DOMPurify (`html` + `mathMl` profiles, link-rewrite hook for in-app
+file links + external `target=_blank`) → consumer mounts via
+`dangerouslySetInnerHTML`. Post-mount: a single MutationObserver
 rooted at `document.body` (installed once at app boot in `app.js`)
 watches for `<pre class="md-mermaid">` placeholders and lazy-loads
 mermaid (3MB UMD via `<script>` tag; cached after first use). Render
 results cached by source string; WeakSet de-dupes already-processed
 nodes across Preact rerenders.
 
+Callouts use Obsidian's `> [!type]` syntax (`note`, `tip`, `warning`,
+`success`, `danger`, `example`, `quote`, `question`, `info`, `todo`,
+`abstract`, `failure` — plus aliases like `summary`/`tldr` for
+`abstract`, `hint`/`important` for `tip`, etc.). Optional `+` (open)
+or `-` (collapsed) sign after `]` makes the block a `<details>` rather
+than a `<div>`. 12 colour themes share a single `--callout-color` CSS
+contract; unknown types fall back to `note` so a typo never blanks
+the block.
+
 Adding a new renderer (PlantUML, GraphViz, alternative math engine,
 etc.): drop the parse-time hook into `markdown.js` and either render
-inline at parse time (KaTeX-style) or emit a placeholder + extend the
-observer (mermaid-style). Zero changes to consumers.
+inline at parse time (KaTeX/callouts-style) or emit a placeholder +
+extend the observer (mermaid-style). Zero changes to consumers.
 
 ### Post-ResultMessage teardown noise is SDK-version-sensitive
 

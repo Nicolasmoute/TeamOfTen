@@ -329,6 +329,19 @@ async def lifespan(app: FastAPI):
     # Docs/compass-specs.md and server/compass/scheduler.py.
     from server.compass.scheduler import compass_scheduler_loop
     compass_task = asyncio.create_task(compass_scheduler_loop())
+    # Compass auto-audit watcher — subscribes to the bus and fires
+    # `compass_audit` on artifact events (commit_pushed /
+    # decision_written / knowledge_written). See
+    # server/compass/audit_watcher.py and Docs/compass-specs.md §5.5.
+    # Owns its own task handle (mirrors the telegram pattern); lifespan
+    # only kicks it off + tears it down.
+    from server.compass.audit_watcher import (
+        start_audit_watcher, stop_audit_watcher,
+    )
+    try:
+        await start_audit_watcher()
+    except Exception:
+        logger.exception("compass audit watcher failed to start (non-fatal)")
     from server.telegram import start_telegram_bridge, stop_telegram_bridge
     # Telegram bridge owns its own task handle (so the UI can reload it
     # live via /api/team/telegram). Lifespan only kicks it off + tears
@@ -345,6 +358,10 @@ async def lifespan(app: FastAPI):
             await stop_telegram_bridge()
         except Exception:
             logger.exception("telegram bridge shutdown failed")
+        try:
+            await stop_audit_watcher()
+        except Exception:
+            logger.exception("compass audit watcher shutdown failed")
         for t in bg_tasks:
             t.cancel()
         for t in bg_tasks:

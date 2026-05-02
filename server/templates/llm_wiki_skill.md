@@ -88,9 +88,16 @@ Don't create an entry for:
   links: [/data/wiki/sync-state.md, /data/wiki/misc/upload-flow.md]
   ---
   ```
+  Full type table + standard properties: see
+  [references/PROPERTIES.md](references/PROPERTIES.md).
 - **Body:** standard markdown. Open with a 1-2 sentence summary so a
   future agent skimming `INDEX.md` link previews can decide whether
   to read further.
+- **Tags:** primary listing in the frontmatter `tags:` block (above).
+  Inline `#topic` syntax also works in the body and gets indexed by
+  Obsidian's tag pane — useful when you want to tag a single
+  paragraph rather than the whole entry. The harness wiki INDEX
+  reads frontmatter tags only; inline tags are Obsidian-side.
 
 ## Where entries go
 
@@ -187,6 +194,43 @@ or store the rendered image alongside the wiki entry.
 If KaTeX can't parse the source, the equation renders red inline (the
 rest of the page is unaffected). Common gotchas: a stray single `$`
 in plain text can trigger inline-math mode — escape with `\$`.
+
+## Callouts (Obsidian-flavored)
+
+Use callouts to flag a paragraph that's structurally different from
+its surroundings — a gotcha, a deprecated section, a worked example,
+a warning the next reader needs to see before they touch the code.
+Don't use them as decoration; the type carries semantic weight.
+
+```markdown
+> [!note]
+> A standard note callout.
+
+> [!warning] Custom title
+> The sync loop is single-writer. Don't add a second writer.
+
+> [!faq]- Collapsed by default
+> Body text hidden until the reader expands.
+
+> [!tip]+ Open by default
+> Body text shown but collapsible.
+```
+
+Renders as a coloured-bar block in both the harness UI and Obsidian
+(both wire callouts the same way; the `> [!type]` syntax is the
+GitHub Alerts spec that Obsidian adopted).
+
+Common types (each has a colour theme + label):
+`note`, `abstract` (alias `summary`, `tldr`), `info`, `todo`,
+`tip` (alias `hint`, `important`), `success` (alias `check`, `done`),
+`question` (alias `help`, `faq`), `warning` (alias `caution`,
+`attention`), `failure` (alias `fail`, `missing`), `danger` (alias
+`error`, `bug`), `example`, `quote` (alias `cite`).
+
+The optional sign after `]` controls foldability: `-` collapsed by
+default, `+` open by default, no sign = always-visible (not
+collapsible). Unknown types render as a generic `note`-themed callout
+so a typo doesn't blank the block.
 
 ## Don't
 

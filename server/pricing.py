@@ -45,9 +45,20 @@ _UNKNOWN_MODEL_PRICE = {"input": 5.0, "cached": 0.50, "output": 30.0}
 
 
 def _normalize_model(model: str | None) -> str:
+    """Canonicalize a model id for `CODEX_PRICING` lookup.
+
+    Strips whitespace, lowercases, then resolves tier aliases
+    (`latest_gpt`, `latest_mini`) to their concrete id via
+    `models_catalog.resolve_model_alias`. The pricing table is keyed
+    by concrete ids only; without alias resolution every aliased
+    lookup would fall through to `_UNKNOWN_MODEL_PRICE`. In the
+    normal path `run_agent` resolves before storing, so aliases
+    rarely reach here — this is defense in depth for callers that
+    bypass the dispatcher (tests, debugging, future code)."""
     if not model:
         return ""
-    return model.strip().lower()
+    from server.models_catalog import resolve_model_alias
+    return resolve_model_alias(model.strip().lower())
 
 
 def codex_cost_usd(model: str | None, usage: Mapping[str, int]) -> float:

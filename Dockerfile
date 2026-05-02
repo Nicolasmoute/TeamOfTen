@@ -24,7 +24,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # git is needed so Player agents can commit/push their work via Bash, and
 # so M4 worktree provisioning works.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates git \
+    && apt-get install -y --no-install-recommends curl ca-certificates git ripgrep \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g @anthropic-ai/claude-code @openai/codex \
@@ -70,7 +70,14 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY server/ ./server/
 
-RUN pip install .
+# `[dev]` brings in pytest + pytest-asyncio. They're not strictly
+# needed by the running server, but Codex-runtime players reach for
+# pytest directly via their `shell` tool — when it isn't on PATH the
+# agent burns a turn investigating the env before finding a
+# project-local runner. Installing here puts a working pytest at
+# /usr/local/bin so any agent (Claude or Codex) can fall through to
+# it when the project repo doesn't bring its own.
+RUN pip install ".[dev]"
 
 EXPOSE 8000
 

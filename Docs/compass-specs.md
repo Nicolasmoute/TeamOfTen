@@ -379,6 +379,59 @@ Compass should periodically (suggested: every 5 audits, or weekly) review the au
 
 This catches the case where compass's high-confidence statements are themselves stale or mistaken.
 
+### 5.5 Auto-audit on artifact events
+
+The original spec put the burden on Coach to "decide when to call audit". In practice Coach forgets, and humans don't manually paste artifacts (humans don't produce them — agents do). The TeamOfTen harness closes this loop with an **auto-audit watcher** ([server/compass/audit_watcher.py](../server/compass/audit_watcher.py)) that subscribes to the event bus and dispatches `compass_audit` automatically when meaningful units of work land:
+
+- **`commit_pushed`** — Player commits via `coord_commit_push`. Artifact = `[commit] <slot> <pushed|local-only> <sha>\n\n<message>`.
+- **`decision_written`** — Coach writes a decision via `coord_write_decision`. Artifact = `[decision] <actor> wrote: <title> (<size> chars)`. The decision body itself isn't on the event payload (only title + size are); Coach can call `compass_audit` directly with the body if deeper reasoning is wanted.
+- **`knowledge_written`** — agent saves a knowledge artifact via `coord_write_knowledge`. Artifact = `[knowledge] <actor> saved knowledge[<path>] (<size> chars)`.
+- **`output_saved`** — agent saves a binary deliverable via `coord_save_output` (Tier B body audit). Artifact = `[output] <actor> saved outputs[<path>] (<bytes>)` for path-only formats; for text-native and office formats the audit also folds in the **extracted document body** (see §5.5.2). Outputs are infrequent (a few per week typically) but high-stakes — they're what the human consumes — so the LLM-token cost of opening the document is the right tradeoff.
+
+The watcher is gated on multiple axes:
+
+  - **Per-project enable flag.** `compass_enabled_<project_id>` must be truthy. Events on disabled projects are dropped silently. Project scoping uses the event's auto-stamped `project_id` (set by `EventBus.publish` from `resolve_active_project()` if the publisher didn't set it explicitly), so an inactive project still gets audited when its commits land — same "iterate all projects" rule as the daily scheduler.
+  - **Team daily cost cap.** `_within_cost_cap()` reads `_today_spend()` against `TEAM_DAILY_CAP_USD` before each audit; if over, the audit is dropped silently. This is the same gate Player turns hit pre-spawn (`agents._spawn_allowed`). The check is done in the watcher rather than in `audit_work` because the only prior callers were Coach (via MCP) and the dashboard (rare manual use), neither of which needed pre-call gating.
+  - **Per-(project, agent, type) debounce.** A burst of commits on the same Player within `HARNESS_COMPASS_AUTO_AUDIT_DEBOUNCE` (default 30s) collapses into one audit per window. Different agents and different event types bypass the debounce — the tuple `(project_id, agent_id, event_type)` is the key. A 0 value disables debouncing entirely.
+  - **Global feature flag.** `HARNESS_COMPASS_AUTO_AUDIT=false` disables the watcher entirely (it doesn't even start). For cost-constrained deploys that prefer manual-only audits via the MCP tool.
+
+The watcher dispatches `audit_work` as a fire-and-forget task — a slow LLM call does not backpressure the bus, and an audit failure does not propagate back to the originating tool call (Compass §10.6: audits never block work). `audit_work` itself catches LLM errors and degrades to an `aligned` verdict; the watcher's outer wrapper logs any remaining unhandled exceptions and keeps consuming.
+
+#### 5.5.1 Subscription timing
+
+`start_audit_watcher` calls `bus.subscribe()` **synchronously** before scheduling the consumer task. Deferring the subscribe to inside the task would create a race window where events published between `create_task` returning and the task body actually running would be lost. Lifespan calls `start` once during boot; the watcher owns its own task handle (mirrors the telegram bridge pattern) and is stopped during teardown by `stop_audit_watcher` so a redeploy doesn't drop in-flight audits.
+
+#### 5.5.2 Output body extraction (Tier B)
+
+`output_saved` events have richer treatment than the other three watched types. Compass actually **opens the saved file** for text-native and office formats, extracts the body text, and folds it into the audit artifact under a `--- document body (.ext extracted) ---` separator. The LLM then reasons over the document's framing, claims, and conclusions — not just the path.
+
+Format coverage ([server/compass/output_extractor.py](../server/compass/output_extractor.py)):
+
+| Family | Extensions | Extraction |
+|---|---|---|
+| **Text-native** | `md`, `markdown`, `txt`, `csv`, `tsv`, `html`, `htm`, `json` | UTF-8 read with `errors='replace'` |
+| **PDF** | `pdf` | `pypdf` page-text concat |
+| **Word** | `docx` | `python-docx` paragraphs + table cells |
+| **Spreadsheet** | `xlsx` | `openpyxl` read-only mode, TSV-style rows per sheet |
+| **Slides** | `pptx` | `python-pptx` per-slide text frames |
+| **Archive** | `zip`, `tar`, `gz` | Filename listing only (no recursion); first 200 entries |
+| **Image** | `png`, `jpg`, `jpeg`, `gif`, `webp`, `svg` | **Skipped** (Tier C / vision is deferred); falls back to path-only audit |
+| **Unknown** | anything else | Path-only |
+
+Discipline:
+
+  - **Lazy imports**: each office-format parser is imported inside its extractor. A missing parser (e.g. an operator chose to skip the office deps in their venv) downgrades that one format to path-only, doesn't crash anything else.
+  - **Per-format exception isolation**: a malformed PDF that crashes pypdf doesn't tank the watcher — the outer handler in `extract_body` returns `None`, the watcher composer treats that as "no body", and the audit fires on path + size as if the format were unsupported.
+  - **Truncation**: extracted bodies are capped at `MAX_BODY_CHARS=16_000` (≈ 4k tokens) before insertion. The composed artifact is then capped again at `_OUTPUT_ARTIFACT_TRUNCATE=18_000` as a final outer bound. A 200-page PDF can't blow up the prompt.
+  - **Audit prompt awareness**: `AUDIT_SYSTEM` ([server/compass/prompts.py](../server/compass/prompts.py)) explicitly mentions the body-included artifact shape so the LLM knows when it's reading a header vs a full deliverable. No separate prompt variant — the same prompt handles both shapes.
+  - **Per-deploy cost**: a typical project produces 5–10 outputs per week; with body audits at ~$0.01–0.05 each, that's pennies per week. The cost cap and 30s debounce gates from §5.5 still apply, so a runaway can't escalate.
+
+Tier C (image content via Claude vision) is a deliberate non-goal for v1. Charts and diagrams that matter usually get cited from a markdown knowledge note that already gets audited; standalone images rarely contradict strategy on their own.
+
+#### 5.5.3 Dashboard implications
+
+The dashboard's manual paste UI (the textarea + "Audit" button in the Audits section) is **removed** as of this spec. Audits are auto-fired by the watcher; humans read the log when curious (§5.3). The audit log + filter pills remain, with explanatory copy noting the auto-fire sources. The `POST /api/compass/audit` HTTP endpoint is kept as a debug backstop (curl-able for testing) but not surfaced in the UI.
+
 ---
 
 ## 6 · File layout

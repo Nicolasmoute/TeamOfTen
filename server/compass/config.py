@@ -91,6 +91,26 @@ ANSWER_DELTA_MAX = _env_float("HARNESS_COMPASS_ANSWER_DELTA_MAX", 0.50)
 # question if a region drifted (spec §5.4). 0 disables.
 AUDIT_ROLLUP_INTERVAL = _env_int("HARNESS_COMPASS_AUDIT_ROLLUP", 5)
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+# Auto-audit watcher (spec §5.5) — subscribes to artifact events
+# (`commit_pushed` / `decision_written` / `knowledge_written`) and
+# auto-fires `compass_audit` so Coach doesn't have to remember.
+# Disable with HARNESS_COMPASS_AUTO_AUDIT=false on cost-constrained
+# deploys that prefer manual audits via the MCP tool only.
+AUTO_AUDIT_ENABLED = _env_bool("HARNESS_COMPASS_AUTO_AUDIT", True)
+
+# Per-(project, agent, event_type) debounce window in seconds. A burst
+# of commits on the same slot collapses into one audit per window.
+# 0 disables debouncing (every event fires an audit).
+AUTO_AUDIT_DEBOUNCE_SECONDS = _env_int("HARNESS_COMPASS_AUTO_AUDIT_DEBOUNCE", 30)
+
 # ------------------------------------------------------------ presence
 # Human-reachable window. If no human signal in this many hours, daily
 # runs skip and post a reminder (spec §2.2).
@@ -175,6 +195,8 @@ __all__ = [
     "PASSIVE_DELTA_MAX",
     "ANSWER_DELTA_MAX",
     "AUDIT_ROLLUP_INTERVAL",
+    "AUTO_AUDIT_ENABLED",
+    "AUTO_AUDIT_DEBOUNCE_SECONDS",
     "HUMAN_PRESENCE_WINDOW_HOURS",
     "SCHEDULER_TICK_SECONDS",
     "DAILY_RUN_HOUR_UTC",

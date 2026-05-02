@@ -54,6 +54,25 @@ def test_none_model_treated_as_unknown() -> None:
     assert cost > 0  # not crashed
 
 
+def test_aliases_resolve_to_concrete_pricing() -> None:
+    """`run_agent` resolves tier aliases before recording the turn,
+    so in the normal path `codex_cost_usd` only ever sees concrete
+    ids. But _normalize_model resolves aliases too as defense in
+    depth — without it, a future caller bypassing the dispatcher
+    would silently fall through to _UNKNOWN_MODEL_PRICE.
+
+    Verify the two Codex aliases bill identically to their concrete
+    counterparts so the pricing lookup is alias-safe."""
+    from server.models_catalog import _ALIAS_TO_CONCRETE
+
+    usage = {"input_tokens": 1_000_000, "output_tokens": 100_000}
+    for alias in ("latest_gpt", "latest_mini"):
+        concrete = _ALIAS_TO_CONCRETE[alias]
+        assert codex_cost_usd(alias, usage) == codex_cost_usd(concrete, usage), (
+            f"alias {alias!r} priced differently from {concrete!r}"
+        )
+
+
 def test_garbage_token_values_dont_crash() -> None:
     cost = codex_cost_usd("gpt-5.4", {
         "input_tokens": "not-a-number",

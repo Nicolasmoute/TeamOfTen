@@ -220,14 +220,27 @@ def bootstrap_status() -> str:
     return _BOOTSTRAP_STATUS
 
 
-# Phase 7 (PROJECTS_SPEC.md §8): per-project CLAUDE.md stub. Goal +
-# Repo pre-filled from creation modal (or blank placeholders for
-# misc / template invocations); Stakeholders / Team / Glossary /
-# Conventions left for Coach to fill as the project unfolds.
+# Phase 7 (PROJECTS_SPEC.md §8): per-project CLAUDE.md stub. Repo
+# pre-filled from creation modal (or blank placeholder for misc /
+# template invocations); Stakeholders / Team / Glossary / Conventions
+# left for Coach to fill as the project unfolds.
+#
+# **No `## Goal` section** — the project's goals/objectives live in
+# `project-objectives.md` (free-form, kDrive-mirrored, injected into
+# Coach's system prompt every turn — see `recurrence-specs.md` §3.3
+# and §6). The pointer below tells Coach where to look / update so
+# the prompt has a single canonical surface for goal content.
 _PROJECT_CLAUDE_MD_STUB = """# Project: {name}
 
-## Goal
-{goal}
+## Project objectives
+
+The project's goals, success criteria, and scope live in a separate
+file at `/data/projects/{slug}/project-objectives.md` (kDrive-mirrored,
+edited via the EnvPane Objectives section or via Coach's Write tool).
+The harness injects that file into Coach's system prompt every turn,
+so updates land on the next Coach turn — no need to duplicate them
+here. If the file is missing or empty, the next Coach tick will
+prompt the human to define them.
 
 ## Repo
 {repo}
@@ -285,7 +298,7 @@ be proposed at all — only the user edits that one directly.
 def write_project_claude_md_stub(
     project_id: str,
     name: str,
-    description: str | None = None,
+    description: str | None = None,  # noqa: ARG001 — see body comment
     repo_url: str | None = None,
 ) -> bool:
     """Phase 7 (PROJECTS_SPEC.md §8) — write a per-project CLAUDE.md
@@ -297,15 +310,20 @@ def write_project_claude_md_stub(
     Lives in paths.py (not projects_api.py) so both `init_db` (which
     seeds misc) and `create_project` (which scaffolds new projects)
     can call it without a circular import.
+
+    `description` is accepted for back-compat with positional callers
+    but intentionally NOT injected into the stub: project goals /
+    objectives flow through `project-objectives.md` instead
+    (recurrence-specs.md §3.3). `description` lives on
+    `projects.description` for UI surfaces (pane title, project
+    list).
     """
     pp = project_paths(project_id)
     if pp.claude_md.exists():
         return False
-    goal = (description or "").strip() or "<short description, from creation modal>"
     repo = (repo_url or "").strip() or "<no repo configured>"
     body = _PROJECT_CLAUDE_MD_STUB.format(
         name=name,
-        goal=goal,
         repo=repo,
         slug=project_id,
     )
@@ -483,14 +501,24 @@ def _read_template(name: str) -> str:
         return ""
 
 
+# Skill template files we copy on first boot. Each entry maps a
+# template filename under `server/templates/` to a destination path
+# (relative to `/data/skills/llm-wiki/`). First-write-only — once a
+# file exists we never overwrite, so user/Coach edits survive boot.
+_LLM_WIKI_SKILL_FILES: tuple[tuple[str, str], ...] = (
+    ("llm_wiki_skill.md", "SKILL.md"),
+    ("llm_wiki_properties.md", "references/PROPERTIES.md"),
+)
+
+
 def bootstrap_global_resources() -> str:
     """Phase 6 boot sequence (PROJECTS_SPEC.md §9 + §8):
 
       1. Ensure /data/wiki/ exists.
       2. Ensure /data/wiki/INDEX.md exists; write stub if missing.
       3. Ensure /data/skills/llm-wiki/ exists.
-      4. Ensure /data/skills/llm-wiki/SKILL.md; copy from
-         server/templates/llm_wiki_skill.md if missing.
+      4. Ensure each skill file in `_LLM_WIKI_SKILL_FILES` exists;
+         copy from its `server/templates/` source if missing.
       5. Ensure /data/CLAUDE.md; copy from
          server/templates/global_claude_md.md if missing.
 
@@ -527,15 +555,22 @@ def bootstrap_global_resources() -> str:
     except OSError:
         failed = True
 
-    # Step 4 — SKILL.md
-    skill_md = skill_dir / "SKILL.md"
-    if not failed and not skill_md.exists():
-        body = _read_template("llm_wiki_skill.md")
-        if not body:
-            failed = True
-        else:
+    # Step 4 — every entry in `_LLM_WIKI_SKILL_FILES` (SKILL.md plus
+    # any nested references/*.md). Each iteration is independent —
+    # one missing template marks `failed` but the others still try,
+    # which makes adding a new reference file a low-risk change.
+    if not failed:
+        for template_name, dest_relpath in _LLM_WIKI_SKILL_FILES:
+            dest = skill_dir / dest_relpath
+            if dest.exists():
+                continue
+            body = _read_template(template_name)
+            if not body:
+                failed = True
+                continue
             try:
-                skill_md.write_text(body, encoding="utf-8")
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(body, encoding="utf-8")
                 wrote_anything = True
             except OSError:
                 failed = True

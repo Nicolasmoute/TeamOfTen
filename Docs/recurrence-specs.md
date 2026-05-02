@@ -1,4 +1,5 @@
 # Coach Recurrence v2 — Specification
+# Coach Recurrence v2 — Specification
 
 > **Subordinate to `Docs/TOT-specs.md`.** When this doc and TOT-specs
 > disagree, TOT-specs wins. This file goes deeper on Coach recurrences
@@ -267,6 +268,29 @@ CLAUDE.md is today.
 
 Players' system prompts are **not** modified — todos and objectives are
 Coach's tools, not Players'.
+
+### 6.1 Goal content has a single canonical surface
+
+`project-objectives.md` is the **only** place project goals / scope live
+in Coach's system prompt. Specifically:
+
+- The per-project CLAUDE.md template (`server/paths.py`'s
+  `_PROJECT_CLAUDE_MD_STUB`) does NOT include a `## Goal` section. It
+  carries a `## Project objectives` pointer paragraph that names the
+  objectives file and tells Coach where to read / update.
+- The Coach coordination block (`_build_coach_coordination_block` in
+  `server/agents.py`) does NOT render a `Goal:` line from
+  `projects.description`. It surfaces only the project name and a
+  one-line pointer to both CLAUDE.md and `project-objectives.md`.
+- `projects.description` (the one-line creation-modal description)
+  remains in the DB strictly as a UI surface (pane title, project
+  list tagline). It is no longer injected into Coach's prompt.
+
+This collapse fixes a prior leak: the same goal text was rendered
+into Coach's prompt twice (CLAUDE.md `## Goal`, coordination block
+`Goal:`) AND a third time as `## Project objectives` from the
+free-form file — three stale-prone copies that drifted apart as
+soon as the operator updated the file but not the modal description.
 
 ---
 
@@ -744,6 +768,34 @@ When `coord_create_project` (or whatever creates a project today) runs:
     "TZ captured at save time, re-saving picks up the operator's
     current TZ" rule is enforced client-side, not requiring an
     explicit re-save click.
+
+---
+
+## 15.5 Related: Compass auto-audit watcher (NOT a recurrence)
+
+The Compass auto-audit watcher
+([server/compass/audit_watcher.py](../server/compass/audit_watcher.py),
+spec'd in `Docs/compass-specs.md` §5.5) is sometimes mistaken for a
+recurrence flavor because it auto-fires work. It is not — and the
+distinction matters for anyone editing either system.
+
+| Axis | Coach recurrences (this doc) | Compass auto-audit |
+|---|---|---|
+| **Trigger** | Wall clock (interval / cron) | Event bus (commit/decision/knowledge events) |
+| **Cardinality** | Per-project, persisted in `coach_recurrence` | Singleton background subscriber, not persisted |
+| **Subject** | Spawns a Coach turn (`run_agent`) | Calls `compass.audit.audit_work` (one-shot LLM call, no Coach session) |
+| **Cost cap** | Per-agent + team daily caps inside `agents._spawn_allowed` | Team daily cap inside the watcher itself, before the LLM call |
+| **Skip semantics** | `recurrence_skipped` event with reason | Silent drop; gated by debounce + enable flag + cost cap |
+| **UI surface** | Recurrence pane (`__recurrences`) | Compass pane (`__compass`) audit log section |
+| **Lifecycle owner** | `recurrence_scheduler_loop` background task | `start_audit_watcher` / `stop_audit_watcher` (own task handle, mirrors telegram pattern) |
+
+Both live alongside each other in `main.py:lifespan`. They share the
+"only fire when the project is enabled" pattern but otherwise have
+nothing in common at the table or scheduler level.
+
+If the future brings a unified "background triggers" surface, this
+table is the inventory. Until then: a recurrence is a Coach turn
+schedule; an audit watcher is an event subscription.
 
 ---
 

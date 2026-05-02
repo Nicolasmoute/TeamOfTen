@@ -789,42 +789,30 @@ function BriefingColumn({ state, onAsk }) {
 
 // ---------------------------------------------------------------- audits
 
-function AuditsSection({ audits, onSubmit }) {
-  const [draft, setDraft] = useState("");
+function AuditsSection({ audits }) {
+  // Audits are auto-fired by the watcher (server/compass/audit_watcher.py)
+  // when artifact events land on the bus — `commit_pushed`,
+  // `decision_written`, `knowledge_written`. Coach can also call
+  // `compass_audit` directly via MCP. The dashboard is read-only:
+  // §5.3 "the human reads the log when curious" and §10.5 "human is
+  // never pushed audit results". No submit form here on purpose —
+  // humans don't produce the artifacts being audited.
   const [filter, setFilter] = useState(null);
-  const [busy, setBusy] = useState(false);
   const counts = useMemo(() => {
     const c = { all: audits.length, aligned: 0, confident_drift: 0, uncertain_drift: 0 };
     for (const a of audits) c[a.verdict] = (c[a.verdict] || 0) + 1;
     return c;
   }, [audits]);
   const visible = filter ? audits.filter((a) => a.verdict === filter) : audits;
-  const submit = async () => {
-    const t = draft.trim();
-    if (!t) return;
-    setBusy(true);
-    try {
-      await onSubmit(t);
-      setDraft("");
-    } finally {
-      setBusy(false);
-    }
-  };
   return html`
     <section class="cmp-audits">
       <div class="cmp-section-row">
-        <div class="cmp-audits-submit">
+        <div class="cmp-audits-about">
           <h3>Work audits</h3>
-          <textarea
-            class="cmp-textarea cmp-audits-textarea"
-            placeholder="paste a commit message, decision, or worker output for audit…"
-            value=${draft}
-            onInput=${(e) => setDraft(e.target.value)}
-            rows=${5}
-          ></textarea>
-          <div class="cmp-audits-submit-row">
-            <span class="cmp-italic">advisory only · audits never block work</span>
-            <button class="cmp-btn-mini cmp-btn-ok" disabled=${busy} onClick=${submit}>Audit</button>
+          <div class="cmp-italic cmp-audits-source">
+            Auto-fired on commit / decision / knowledge events.
+            Coach can also audit on demand via <code>compass_audit</code>.
+            Audits never block work — advisory only.
           </div>
         </div>
         <div class="cmp-audits-filter">
@@ -1300,14 +1288,11 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
     return out.answer || "";
   }, [authedFetch]);
 
-  const submitAudit = useCallback(async (artifact) => {
-    try {
-      await apiFetch(authedFetch, "/audit", {
-        method: "POST", body: JSON.stringify({ artifact }),
-      });
-      await refresh();
-    } catch (err) { setError(err.message); }
-  }, [authedFetch, refresh]);
+  // The dashboard no longer offers a manual audit submit form —
+  // audits are auto-fired by the watcher (commit / decision /
+  // knowledge events) and via the Coach-only `compass_audit` MCP
+  // tool. The `POST /api/compass/audit` endpoint is kept as a debug
+  // backstop (curl-able) but isn't surfaced in the UI.
 
   // QA flow.
   const qaStart = useCallback(async () => {
@@ -1525,7 +1510,7 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
             onAsk=${ask}
           />
         </div>
-        <${AuditsSection} audits=${state.audits} onSubmit=${submitAudit} />
+        <${AuditsSection} audits=${state.audits} />
         <${RunHistory} runs=${state.runs} />
       </div>
       <${OverrideModal}

@@ -197,6 +197,136 @@ marked.use({
   ],
 });
 
+// Callouts (Obsidian-flavored, GFM-Alerts compatible).
+//
+// Syntax:  > [!type]      simple, always visible
+//          > [!type] Title with custom heading
+//          > [!type]-     collapsed by default (renders as <details>)
+//          > [!type]+     open by default (renders as <details open>)
+//          > Body lines that follow standard blockquote rules.
+//
+// Renders the same way in the harness AND in Obsidian. The original
+// kepano list of types maps to a smaller set of CSS theme classes
+// here — multiple aliases (e.g. tldr / summary → abstract) share a
+// theme so we don't have to maintain 25+ colour palettes. Unknown
+// types fall back to `note` so a typo doesn't blank the block.
+const _CALLOUT_TYPE_MAP = {
+  note:      { label: "Note",      cls: "note"      },
+  abstract:  { label: "Abstract",  cls: "abstract"  },
+  summary:   { label: "Summary",   cls: "abstract"  },
+  tldr:      { label: "TL;DR",     cls: "abstract"  },
+  info:      { label: "Info",      cls: "info"      },
+  todo:      { label: "Todo",      cls: "todo"      },
+  tip:       { label: "Tip",       cls: "tip"       },
+  hint:      { label: "Hint",      cls: "tip"       },
+  important: { label: "Important", cls: "tip"       },
+  success:   { label: "Success",   cls: "success"   },
+  check:     { label: "Check",     cls: "success"   },
+  done:      { label: "Done",      cls: "success"   },
+  question:  { label: "Question",  cls: "question"  },
+  help:      { label: "Help",      cls: "question"  },
+  faq:       { label: "FAQ",       cls: "question"  },
+  warning:   { label: "Warning",   cls: "warning"   },
+  caution:   { label: "Caution",   cls: "warning"   },
+  attention: { label: "Attention", cls: "warning"   },
+  failure:   { label: "Failure",   cls: "failure"   },
+  fail:      { label: "Fail",      cls: "failure"   },
+  missing:   { label: "Missing",   cls: "failure"   },
+  danger:    { label: "Danger",    cls: "danger"    },
+  error:     { label: "Error",     cls: "danger"    },
+  bug:       { label: "Bug",       cls: "danger"    },
+  example:   { label: "Example",   cls: "example"   },
+  quote:     { label: "Quote",     cls: "quote"     },
+  cite:      { label: "Cite",      cls: "quote"     },
+};
+
+// Header line: `> [!type]`, optional `+`/`-`, optional title text.
+const _CALLOUT_HEADER_RE = /^>\s*\[!(\w+)\]([+-]?)\s*([^\n]*)/;
+
+marked.use({
+  extensions: [{
+    name: "callout",
+    level: "block",
+    start(src) {
+      const m = src.match(/^>\s*\[!/m);
+      return m ? m.index : undefined;
+    },
+    tokenizer(src) {
+      // Only consume if the very first line of `src` is a callout
+      // header. (start() may have located one further in; marked
+      // only calls tokenizer once it's positioned us at that line.)
+      const headerMatch = src.match(_CALLOUT_HEADER_RE);
+      if (!headerMatch) return;
+      // Walk forward line by line, eating contiguous `>`-prefixed
+      // lines (the standard blockquote shape). Stop on a blank line
+      // or a line that doesn't start with `>` — that's where the
+      // callout ends.
+      const lines = src.split("\n");
+      let i = 1;
+      while (i < lines.length && /^>/.test(lines[i])) i++;
+      const raw = lines.slice(0, i).join("\n");
+      const headerLine = lines[0];
+      const headerInner = headerLine.replace(_CALLOUT_HEADER_RE, "").trim();
+      // Strip leading `> ` from each remaining line. The first line
+      // becomes the rest of the title-line content (unusual but
+      // legal in some Obsidian dialects); subsequent lines form the
+      // body. We treat the title as whatever followed `[!type]` on
+      // the header line — anything else on subsequent lines is body.
+      const bodyLines = lines.slice(1, i).map(
+        (line) => line.replace(/^>\s?/, "")
+      );
+      const body = bodyLines.join("\n");
+      // Append a trailing newline so block-level constructs at the
+      // end of the body (lists, code fences) tokenise cleanly.
+      const bodyWithNewline = body.endsWith("\n") ? body : body + "\n";
+
+      const rawType = headerMatch[1].toLowerCase();
+      const collapseSign = headerMatch[2];
+      const titleOverride = headerMatch[3].trim();
+      const theme = _CALLOUT_TYPE_MAP[rawType] || _CALLOUT_TYPE_MAP.note;
+
+      // Carry the inline-trail (anything after [!type] on the header
+      // line) AND the body separately so the renderer can decide
+      // whether the override IS the title or is the start of the
+      // first body paragraph.
+      const titleText = titleOverride || theme.label;
+
+      return {
+        type: "callout",
+        raw,
+        calloutType: rawType,
+        calloutCls: theme.cls,
+        calloutLabel: theme.label,
+        calloutTitle: titleText,
+        calloutCollapse: collapseSign,
+        // Pre-tokenise the body so the renderer can hand them off
+        // to the parser without re-lexing.
+        bodyTokens: this.lexer.blockTokens(bodyWithNewline, []),
+        // Also stash the inline-only trail for the title (in case
+        // the agent put markdown in the title — bold, links, etc).
+        titleTokens: this.lexer.inlineTokens(titleText),
+      };
+    },
+    renderer(token) {
+      const cls = token.calloutCls;
+      const titleHtml = this.parser.parseInline(token.titleTokens);
+      const bodyHtml = this.parser.parse(token.bodyTokens);
+      const collapse = token.calloutCollapse;
+      if (collapse === "+" || collapse === "-") {
+        const openAttr = collapse === "+" ? " open" : "";
+        return `<details class="md-callout md-callout-${cls} md-callout-collapsible"${openAttr}>` +
+          `<summary class="md-callout-title">${titleHtml}</summary>` +
+          `<div class="md-callout-body">${bodyHtml}</div>` +
+          `</details>`;
+      }
+      return `<div class="md-callout md-callout-${cls}">` +
+        `<div class="md-callout-title">${titleHtml}</div>` +
+        `<div class="md-callout-body">${bodyHtml}</div>` +
+        `</div>`;
+    },
+  }],
+});
+
 // Link handling for sanitised markdown:
 //   - external URL (http/https/mailto) → open in new tab
 //   - file path (anything starting with `/`) → marked as a harness

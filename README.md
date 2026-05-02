@@ -187,22 +187,18 @@ Hit `/api/health` to confirm every subsystem is green.
 
 ## Configuration
 
-Every knob is an env var. Copy [`.env.example`](.env.example) to `.env` and edit. Highlights:
+Copy [`.env.example`](.env.example) to `.env` and edit. The full set of env vars you actually configure per deploy:
 
 | Variable | Purpose |
 | --- | --- |
-| `HARNESS_TOKEN` | Bearer token for the API. Set this before exposing to the internet. |
-| `CLAUDE_CONFIG_DIR` | Where Claude CLI persists OAuth + sessions. Defaults to `/data/claude` in the Dockerfile. |
-| `CODEX_HOME` | Where the Codex CLI persists its ChatGPT session. Defaults to `/data/codex`. |
-| `HARNESS_CODEX_ENABLED` | Flip on the Codex runtime once auth is configured. |
-| `HARNESS_PROJECT_REPO` | GitHub repo (with PAT in URL) that Players will work on. |
-| `HARNESS_WEBDAV_URL` + `_USER` + `_PASSWORD` | WebDAV mirror. |
+| `HARNESS_TOKEN` | Bearer token for the API. **Set this before exposing to the internet.** |
+| `HARNESS_WEBDAV_URL` + `_USER` + `_PASSWORD` | WebDAV mirror (kDrive / Nextcloud / etc.). |
 | `HARNESS_AGENT_DAILY_CAP` / `_TEAM_DAILY_CAP` | USD/day per-Player and team-wide cost limits. |
-| `HARNESS_MCP_CONFIG` | Path to external MCP server config (see `mcp-servers.example.json`). |
-| `HARNESS_SECRETS_KEY` | Optional Fernet key to enable the encrypted secrets store for MCP credentials + Telegram. |
-| `TELEGRAM_BOT_TOKEN` + `TELEGRAM_ALLOWED_CHAT_IDS` | Bootstrap config for the Telegram bridge (overridable from the UI). |
+| `HARNESS_CODEX_ENABLED` | Flip on the Codex runtime once auth is configured. |
+| `HARNESS_SECRETS_KEY` | Fernet key for the encrypted secrets store (MCP credentials, Telegram token). |
+| `TELEGRAM_BOT_TOKEN` + `TELEGRAM_ALLOWED_CHAT_IDS` | First-boot bootstrap for the Telegram bridge — overridable from the UI. |
 
-See [`.env.example`](.env.example) for the full list (~40 vars: retention, intervals, compact thresholds, reliability tuning).
+Project repos, MCP servers, the Telegram bridge (post-bootstrap), and the Coach recurring tick are configured via the UI rather than env vars. Auth persistence paths (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) and data paths (`/data`, `/workspaces`) are baked into the Dockerfile. Tuning knobs (retention, sync intervals, auto-compact threshold, etc.) have code defaults — search `server/` for `os.environ.get("HARNESS_` if you need to override one.
 
 ---
 
@@ -245,9 +241,9 @@ What the container talks to:
 
 - **Anthropic API** — via the Claude CLI, on every Claude-runtime turn.
 - **OpenAI API** — via the Codex CLI, only if `HARNESS_CODEX_ENABLED` is set and a slot uses the Codex runtime.
-- **GitHub** (or your git host) — over HTTPS, only if `HARNESS_PROJECT_REPO` is set. Used for `git clone` + `git push` from within the per-Player worktrees.
+- **GitHub** (or your git host) — over HTTPS, for projects that have a repo URL configured. Used for `git clone` + `git push` from within the per-Player worktrees.
 - **Your WebDAV server** — only if `HARNESS_WEBDAV_*` are set.
-- **External MCP servers** — only the ones you explicitly wire in via `HARNESS_MCP_CONFIG`. See [mcp-servers.example.json](mcp-servers.example.json).
+- **External MCP servers** — only the ones you explicitly wire in via the Options drawer (encrypted credentials in the secrets store).
 - **Telegram API** — only if a bot token is configured.
 
 No telemetry, no phone-home, no auto-update of the harness itself. The Claude / Codex CLIs inside the container self-update per their respective release channels.

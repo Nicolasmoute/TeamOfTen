@@ -182,3 +182,49 @@ def test_bootstrap_health_style_restat_recovers_when_files_reappear(
     # Cache is still 'missing' (boot-time history) but the health
     # endpoint's re-stat-and-downgrade is what users see.
     assert bootstrap_status() == "missing"
+
+
+def test_bootstrap_writes_properties_reference(fresh_db) -> None:
+    """First boot writes the kepano-style properties reference at
+    /data/skills/llm-wiki/references/PROPERTIES.md alongside SKILL.md.
+    The skill's frontmatter section links to this file via the
+    relative path, so it has to land in the references/ subdir."""
+    bootstrap_global_resources()
+    properties = (
+        global_paths().skills / "llm-wiki" / "references" / "PROPERTIES.md"
+    )
+    assert properties.is_file()
+    body = properties.read_text(encoding="utf-8")
+    # Check structural anchors that the type-table relies on.
+    assert "# Wiki entry properties" in body
+    assert "## Property types" in body
+    assert "## Standard properties" in body
+    # Sanity: the type table is the value-add over a one-line `tags:`
+    # mention. If somebody trims it down, this fails loudly.
+    assert "Date" in body and "ISO 8601" in body
+    assert "Tag syntax" in body  # inline `#tag` doc lives here
+
+
+def test_bootstrap_preserves_user_edited_properties(fresh_db) -> None:
+    """Same first-write-only invariant as SKILL.md and CLAUDE.md —
+    once the user edits PROPERTIES.md, subsequent boots leave it
+    alone. The reference file is documentation; we never want to
+    revert a human's customisations on a redeploy."""
+    bootstrap_global_resources()
+    properties = (
+        global_paths().skills / "llm-wiki" / "references" / "PROPERTIES.md"
+    )
+    properties.write_text("CUSTOM PROPERTIES", encoding="utf-8")
+
+    status = bootstrap_global_resources()
+    assert status == "present"
+    assert properties.read_text(encoding="utf-8") == "CUSTOM PROPERTIES"
+
+
+def test_bootstrap_creates_references_dir_if_missing(fresh_db) -> None:
+    """Boot must mkdir the references/ subdir before writing
+    PROPERTIES.md — the destination is two levels deeper than the
+    skill dir, so a naive write would fail with FileNotFoundError."""
+    bootstrap_global_resources()
+    refs_dir = global_paths().skills / "llm-wiki" / "references"
+    assert refs_dir.is_dir()

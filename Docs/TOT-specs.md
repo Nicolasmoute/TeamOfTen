@@ -180,6 +180,20 @@ Important deployment decisions:
   target volume backend.
 - Static assets are served directly from `server/static`; no frontend build
   step exists.
+- The image installs `ripgrep` alongside `git` so Codex Players (which
+  use the native `shell` tool to grep) don't fall back to the much
+  slower `find` on every search. Claude Players bundle ripgrep behind
+  the SDK's `Grep` tool so they were unaffected; this gap only
+  surfaced when Codex agents hit it directly via `shell`.
+- The image installs the harness with `pip install ".[dev]"` rather
+  than just `.`, which adds `pytest` + `pytest-asyncio` to
+  `/usr/local/bin`. Same rationale as ripgrep: Codex Players reach
+  for `pytest` directly via `shell`, and a missing binary turns
+  into a multi-turn detour while the agent investigates the env.
+  The dev extras are tiny and version-pinned in `pyproject.toml`, so
+  shipping them costs almost nothing and removes one common
+  failure mode. Project repos that bring their own pytest still win
+  via venv activation; the system pytest is a fallback.
 
 ---
 
@@ -1212,8 +1226,11 @@ changes (see also "Migration: existing projects" further down):
 ```markdown
 # Project: <name>
 
-## Goal
-<description or placeholder>
+## Project objectives
+<pointer paragraph: the project's goals / scope live in the separate
+file `/data/projects/<slug>/project-objectives.md`, kDrive-mirrored,
+edited via the EnvPane Objectives section or Coach's Write tool;
+the harness injects that file into Coach's system prompt every turn>
 
 ## Repo
 <repo_url or placeholder>
@@ -1249,6 +1266,23 @@ fixed paragraphs (template literal in `_PROJECT_CLAUDE_MD_STUB`) that
 interpolate the project's slug and explain both proposal scopes.
 Coach in fresh projects reads this on every turn via
 `build_system_prompt_suffix`.
+
+**No `## Goal` section.** Earlier revisions of this template included
+a `## Goal\n<description>` section pre-filled from the creation-modal
+description. That was dropped (2026-05-02) because the same goal text
+was already injected into Coach's system prompt as the
+`## Project objectives` section read from
+`/data/projects/<slug>/project-objectives.md` (per
+[recurrence-specs.md](recurrence-specs.md) §3.3 and §6.1) — and the
+coordination block also rendered a `Goal:` line from
+`projects.description`. Three stale-prone copies of the same content
+drifted apart whenever the operator updated the objectives file but
+not the modal description (or vice-versa). The template now carries a
+**pointer paragraph** to `project-objectives.md` so Coach knows where
+to read / update goals; the file itself is the single canonical
+surface for goal content. `projects.description` (the modal one-liner)
+remains in the DB as a UI-only field for the project pane title and
+project list tagline.
 
 **Migration: existing projects.** Because the stub is first-write-only,
 projects created before this template change still have CLAUDE.md
@@ -1435,7 +1469,7 @@ Global loop:
 
 ## 10. Claude Context and Prompt Assembly
 
-Prompt layers:
+Prompt layers (order matches `agents.py:run_agent`):
 
 1. Per-agent identity block from `agent_project_roles`.
 2. Coach-only coordination block from current project/team/tasks/inbox/wiki.
@@ -1443,7 +1477,18 @@ Prompt layers:
 4. Global rules from `/data/CLAUDE.md`.
 5. Active project rules from `/data/projects/<slug>/CLAUDE.md`.
 6. Per-agent `brief` from `agent_project_roles`.
-7. Continuity handoff after `/compact`, when present.
+7. **Coach-only**: `## Project objectives` (verbatim from
+   `/data/projects/<slug>/project-objectives.md`) followed by
+   `## Open coach todos` (verbatim from `coach-todos.md`). Both are
+   re-read every turn; either section is omitted entirely when its
+   file is missing or empty. Defined by
+   [recurrence-specs.md](recurrence-specs.md) §6. This is the
+   **single canonical surface for goal content** — neither the
+   coordination block (#2) nor the per-project CLAUDE.md (#5)
+   carries a `Goal:` line or `## Goal` section. See
+   recurrence-specs §6.1 for the rationale and §8.3 above for the
+   stub template that points to this file.
+8. Continuity handoff after `/compact`, when present.
 
 `server/context.py` re-reads the global and project `CLAUDE.md` files every turn.
 Each file is truncated at 200,000 chars to prevent runaway prompt bloat.
@@ -1466,7 +1511,12 @@ no `agent_project_roles.name` for the active project. The auto assignment emits
 
 Built in `agents.py` for Coach turns. It includes:
 
-- Active project name/goal.
+- Active project name and a one-line pointer to the per-project
+  CLAUDE.md and `project-objectives.md` (the canonical surface for
+  goals / scope — see [recurrence-specs.md](recurrence-specs.md) §6
+  and §6.1). The block does NOT render `projects.description` as a
+  `Goal:` line; goal content has a single canonical surface
+  (§8.3 + recurrence-specs §6.1).
 - Team roster and locked players.
 - Open/current tasks.
 - Coach inbox summary.
@@ -2884,13 +2934,30 @@ Input:
   **currently running parameter**, no labels or `key:` prefix, and
   never the word "default" or "auto":
     - **Model chip** — actual model name ("Sonnet 4.6", "Opus 4.7",
-      "GPT-5.1 Codex"). Resolution chain: paneSettings.model →
-      `/api/team/models[role|role_codex]` → server-side `suggested`
-      fallback → latest `turns.model` row for this slot
-      (`/api/turns?agent=<slot>&limit=1`, refreshed on every `result`
-      event). For a brand-new Codex agent with no role default and
-      no completed turn (the only fully-unknown case), the chip
-      shows the runtime tag (`Claude` / `Codex`).
+      "GPT-5.1 Codex"). Resolution chain mirrors
+      `server/agents.py:run_agent`'s spawn-time chain so the chip
+      always reflects what the next turn will use: paneSettings.model
+      → `agents[].model_override` (Coach-set per-(slot, project) via
+      `coord_set_player_model`; silently skipped when it doesn't fit
+      the current runtime) → `/api/team/models[role|role_codex]` →
+      server-side `suggested` fallback → latest `turns.model` row for
+      this slot (`/api/turns?agent=<slot>&limit=1`, refreshed on every
+      `result` event). Tier aliases (`latest_opus`, `latest_gpt`, …)
+      are resolved to their concrete id (`MODEL_ALIAS_TO_CONCRETE` in
+      `app.js`, mirror of `_ALIAS_TO_CONCRETE` in
+      `server/models_catalog.py`) before label lookup so the chip
+      reads "GPT-5.5" rather than "latest_gpt". For a brand-new Codex
+      agent with no role default and no completed turn (the only
+      fully-unknown case), the chip shows the runtime tag (`Claude` /
+      `Codex`). The chip's `active` styling (and tooltip) lights up
+      whenever EITHER a per-pane override OR a Coach-set override is
+      in force, so a Player whose model was changed by Coach reads as
+      "non-default" at a glance even before the human opens the gear
+      popover. The pane's CTX bar uses the same `effectiveModelId` so
+      the context-window % computes against the model the chip
+      displays — `_context_window_for` in `server/agents.py` resolves
+      tier aliases internally so the `/api/agents/{id}/context`
+      endpoint accepts either form.
     - **Plan chip** — `plan` or `no plan`. Toggle on click.
     - **Effort chip** — `low` / `med` / `high` / `max`. Resolution
       chain: paneSettings.effort → latest `turns.effort` → `low`
@@ -3050,20 +3117,42 @@ Shows (top-to-bottom):
   new files fall back to a plain proposed-content render), and
   approve / deny buttons.
   **Discoverability surfaces** for pending proposals (so the user
-  doesn't have to remember to check):
-    1. A pulsing red dot on the env-toggle button (left rail) lights
-       up whenever there's at least one pending proposal — visible
-       even when the EnvPane is closed. Title attribute spells out
-       the count.
-    2. The "File-write proposals" section auto-expands when there's
+  doesn't have to remember to check) — **shared by every EnvPane
+  notification source**: file-write proposals, AskUserQuestion prompts
+  routed to the human (`pending_question`), ExitPlanMode plan
+  approvals (`pending_plan`), and `human_attention` escalations from
+  `coord_request_human`. App scope tracks the union as
+  `envPendingCount = attentionOpen.length + pendingFileWriteCount`;
+  attention state (`pendingHumanQuestions`, `pendingHumanPlans`,
+  `persistedAttention`, `dismissedAttention`) lives at App scope —
+  not inside `EnvAttentionSection` — so all of the surfaces below
+  fire whether or not the EnvPane is mounted.
+    1. **Amber-pulsing env-toggle.** The ▦ icon on the left-rail
+       env-toggle button recolours to `var(--warn)` and a soft amber
+       `box-shadow` glow breathes around the button (1.8s keyframe,
+       same shape as `.slot.state-working`) whenever
+       `envPendingCount > 0`. Visible even when the EnvPane is
+       closed. Title + `aria-label` spell out the count.
+    2. **Auto-pop-open.** An App-scope `useRef` tracks the previous
+       `envPendingCount`; on every positive transition, `setEnvOpen
+       (true)` fires. Page-load with leftover items lands as 0 → N
+       (auto-opens once); a fresh WS event arriving while the pane
+       is closed pops it open; dismissals (N → 0) never re-trigger
+       (strict `>` comparison). The user can still close the pane
+       manually after dismissing — it stays closed until the next
+       new item arrives.
+    3. **`EnvAttentionSection` is presentational.** It receives
+       `open` / `onDismiss` / `onDismissAll` from App as props. The
+       dismissed set persists in `localStorage` under
+       `harness_attention_dismissed_v1` (capped at 200 ids).
+    4. **`EnvFileWriteProposalsSection` auto-expand.** When there's
        at least one pending row AND the user has never explicitly
-       collapsed it (i.e. no localStorage entry for the section). Once
-       the user toggles the section, that explicit choice wins on
-       future opens. The auto-expand is driven by a
-       `data-pending-count` attribute on the section root; the
-       collapse-init `MutationObserver` watches that attribute via
-       `attributeFilter` so a fresh proposal arriving after mount
-       still re-opens the section.
+       collapsed it (no localStorage entry), the section opens.
+       Once the user toggles, that explicit choice wins on future
+       opens. Driven by a `data-pending-count` attribute on the
+       section root; the collapse-init `MutationObserver` watches
+       that attribute via `attributeFilter` so a fresh proposal
+       arriving after mount still re-opens the section.
 - Timeline of important events.
 
 It scopes project-sensitive sections to the active project through the
@@ -3159,7 +3248,7 @@ layout keeps the user's 2D `openColumns` structure intact.
 
 `server/static/markdown.js` is the single chokepoint for everything
 markdown-shaped in the UI: agent panes, files `.md` preview,
-compass briefings, decisions, wiki entries. Five-stage pipeline:
+compass briefings, decisions, wiki entries. Six-stage pipeline:
 
 1. **Parse** — `marked@12` (GFM) with a custom code-renderer:
    - fence lang ∈ hljs registry → highlighted `<pre><code>`
@@ -3173,15 +3262,27 @@ compass briefings, decisions, wiki entries. Five-stage pipeline:
    hidden MathML (so equations copy-paste into Word as real equation
    objects, not as flat text). `throwOnError: false` → invalid LaTeX
    renders red inline instead of blowing up the whole message.
-3. **Sanitise** — `DOMPurify@3` with `USE_PROFILES: { html: true,
+3. **Callouts (parse-time)** — Obsidian / GFM-Alerts compatible:
+   `> [!type]`, optionally `> [!type]+` (open `<details>`) or
+   `> [!type]-` (collapsed `<details>`), optional title text on the
+   header line, body lines following the standard blockquote shape.
+   12 colour themes (note, abstract, info, todo, tip, success,
+   question, warning, failure, danger, example, quote) plus aliases
+   (`summary`/`tldr` → abstract, `hint`/`important` → tip,
+   `check`/`done` → success, `help`/`faq` → question, `caution`/
+   `attention` → warning, `fail`/`missing` → failure, `error`/`bug`
+   → danger, `cite` → quote). Unknown types fall back to `note`. The
+   tokeniser pre-lexes title and body so nested markdown — bold,
+   links, code, even nested lists — works inside callouts.
+4. **Sanitise** — `DOMPurify@3` with `USE_PROFILES: { html: true,
    mathMl: true }`. The `afterSanitizeAttributes` hook rewrites
    `<a>` hrefs: external URLs get `target=_blank` + `rel=noreferrer
    noopener`; paths starting with `/` are tagged
    `data-harness-path` and the href is neutralised to `#` so the
    global click handler in `App` can route them to the Files pane.
-4. **Mount** — consumer drops the sanitised string into Preact via
+5. **Mount** — consumer drops the sanitised string into Preact via
    `dangerouslySetInnerHTML`.
-5. **Mermaid post-render** — a single `MutationObserver` rooted at
+6. **Mermaid post-render** — a single `MutationObserver` rooted at
    `document.body` (installed once at app boot via
    `enhanceMarkdownIn`) watches for `<pre class="md-mermaid">`
    inserts. First hit lazy-loads `mermaid.min.js` (~3MB UMD
@@ -3224,17 +3325,18 @@ Obsidian (kDrive-synced view).
 
 ## 17. Git Workspaces
 
-Configured by:
+Configured by (DB is the source of truth; env vars are a legacy
+fallback used only when no DB row is set):
+
+- `team_config.project_repo` (set via Options → Project repo)
+- `team_config.project_branch`
+
+Legacy env fallback:
 
 ```text
 HARNESS_PROJECT_REPO
 HARNESS_PROJECT_BRANCH
 ```
-
-or DB:
-
-- `team_config.project_repo`
-- `team_config.project_branch`
 
 Current implementation:
 
@@ -3276,13 +3378,13 @@ Known hybrid:
 
 ### 18.1 External MCP
 
-File config path:
+UI-managed via the `mcp_servers` DB table (Options drawer → MCP
+servers); credentials live in the encrypted secrets store keyed
+by `HARNESS_SECRETS_KEY`. The legacy file-config path
+(`HARNESS_MCP_CONFIG=/data/mcp-servers.json`) is still loaded if
+set, but DB entries override file entries on conflict.
 
-```text
-HARNESS_MCP_CONFIG=/data/mcp-servers.json
-```
-
-Example shape:
+Example file shape (also valid as DB row JSON):
 
 ```json
 {
@@ -3472,7 +3574,16 @@ contract are CodexRuntime concerns — see
 
 ## 20. Environment Variables
 
-Representative env vars from `.env.example` and implementation:
+Operator-facing env vars (the minimum you actually configure per
+deploy) live in [`.env.example`](../.env.example): `HARNESS_TOKEN`,
+`HARNESS_WEBDAV_URL` + `_USER` + `_PASSWORD`, `HARNESS_AGENT_DAILY_CAP`
++ `HARNESS_TEAM_DAILY_CAP`, `HARNESS_CODEX_ENABLED`,
+`HARNESS_SECRETS_KEY`, and the `TELEGRAM_*` first-boot bootstrap
+pair. Everything else has a Dockerfile-baked value, a code default,
+or has moved to UI/DB management.
+
+Full reference (every `os.environ.get("HARNESS_…"` site in the
+implementation):
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
@@ -3482,8 +3593,8 @@ Representative env vars from `.env.example` and implementation:
 | `HARNESS_CODEX_ENABLED` | unset | Codex runtime feature gate. Must be truthy (`true`, `1`, `yes`, `on`) before `PUT /api/agents/{id}/runtime` or the UI runtime controls can select `runtime=codex`. |
 | `HARNESS_DB_PATH` | `/data/harness.db` | SQLite path |
 | `HARNESS_DATA_ROOT` | `/data` | Global/project data root |
-| `HARNESS_PROJECT_REPO` | unset | Legacy/global git repo URL |
-| `HARNESS_PROJECT_BRANCH` | `main` | Legacy/global base branch |
+| `HARNESS_PROJECT_REPO` | unset | **Legacy.** Single-project fallback when no project row in the DB has `repo_url`. Removed from `.env.example`; the `projects` table is the source of truth now. |
+| `HARNESS_PROJECT_BRANCH` | `main` | **Legacy.** Paired with `HARNESS_PROJECT_REPO`. |
 | `HARNESS_WORKSPACES_ROOT` | `/workspaces` | Actual workspace root |
 | `HARNESS_WEBDAV_URL` | unset | WebDAV base folder URL |
 | `HARNESS_WEBDAV_USER` | unset | WebDAV username |
@@ -3499,7 +3610,7 @@ Representative env vars from `.env.example` and implementation:
 | `HARNESS_LIVE_CONVERSATION_S` | `30` | Recent conversation live tag window |
 | `HARNESS_AGENT_DAILY_CAP` | `5.0` | Per-agent daily spend cap |
 | `HARNESS_TEAM_DAILY_CAP` | `20.0` | Team daily spend cap |
-| `HARNESS_COACH_TICK_INTERVAL` | `0` | **Deprecated.** Honored only on first migration to seed a tick row in `coach_recurrence`. After that the env var is ignored — runtime control is via `PUT /api/coach/tick` or `/tick N`. |
+| `HARNESS_COACH_TICK_INTERVAL` | `0` | **Deprecated.** Honored only on first migration to seed a tick row in `coach_recurrence`. After that the env var is ignored — runtime control is via `PUT /api/coach/tick` or `/tick N`. Removed from `.env.example`. |
 | `HARNESS_RECURRENCE_TICK_SECONDS` | `30` | Scheduler resolution for `recurrence_scheduler_loop` |
 | `HARNESS_MAX_RECURRENCES_PER_PROJECT` | `50` | Soft cap per project; POST 409s when exceeded |
 | `HARNESS_AUTOWAKE_DEBOUNCE` | `10` | Auto-wake debounce seconds |
@@ -3513,7 +3624,7 @@ Representative env vars from `.env.example` and implementation:
 | `HARNESS_HANDOFF_TOKEN_BUDGET` | `20000` | Recent exchange budget |
 | `HARNESS_STREAM_TOKENS` | unset | Enable token delta streaming |
 | `HARNESS_INTERACTION_TIMEOUT_SECONDS` | `1800` | Question/plan timeout |
-| `HARNESS_MCP_CONFIG` | unset/example `/data/mcp-servers.json` | MCP file config |
+| `HARNESS_MCP_CONFIG` | unset | **Legacy.** Path to a static MCP server JSON file. Removed from `.env.example`; the `mcp_servers` table (Options drawer → MCP servers) is the source of truth. DB entries override file entries when both exist. |
 | `HARNESS_SECRETS_KEY` | unset | Fernet master key |
 | `HARNESS_EVENTS_RETENTION_DAYS` | `30` | Event trim window |
 | `HARNESS_EVENTS_TRIM_INTERVAL` | `86400` | Event trim cadence |
@@ -3528,13 +3639,34 @@ Representative env vars from `.env.example` and implementation:
 | `TELEGRAM_ALLOWED_CHAT_IDS` | unset | Telegram env fallback |
 | `PORT` | `8000` | Uvicorn port |
 
-Legacy vars still present in `.env.example` but no longer wired:
+Removed from `.env.example` (kept here for change-log audit; do not
+add back unless re-wiring the corresponding code path):
 
-- `HARNESS_CONTEXT_DIR`
-- `HARNESS_KNOWLEDGE_DIR`
-- `HARNESS_DECISIONS_DIR`
-- `HARNESS_UPLOADS_DIR`
-- `HARNESS_WORKSPACES_DIR` (implementation uses `HARNESS_WORKSPACES_ROOT`)
+- `HARNESS_CONTEXT_DIR` — never referenced in code.
+- `HARNESS_KNOWLEDGE_DIR` — never referenced in code.
+- `HARNESS_DECISIONS_DIR` — never referenced in code.
+- `HARNESS_HANDOFFS_DIR` — never referenced in code.
+- `HARNESS_WORKSPACES_DIR` — wrong name; the code reads
+  `HARNESS_WORKSPACES_ROOT` instead.
+
+Also dropped from `.env.example` (still wired, but defaulted in code
+or in the Dockerfile and not configured per-deploy in practice):
+
+- `CLAUDE_CONFIG_DIR` / `CODEX_HOME` — set in the Dockerfile to
+  `/data/claude` and `/data/codex`. Override only if the persistent
+  volume mount differs.
+- `HARNESS_DATA_ROOT` (`/data`) and `HARNESS_WORKSPACES_ROOT`
+  (`/workspaces`) — code defaults match the Dockerfile mount points.
+- `HARNESS_DB_PATH`, `HARNESS_OUTPUTS_DIR`, `HARNESS_UPLOADS_DIR`,
+  `HARNESS_ATTACHMENTS_DIR` — derived from `HARNESS_DATA_ROOT`.
+- All retention / interval / debounce / batch-size / threshold
+  tuning vars (auto-compact, handoff token budget, error retry,
+  stale-task watchdog, event batcher, WebDAV intervals + retries,
+  project-sync intervals, recurrence tick resolution, etc.) — code
+  defaults are documented at each `os.environ.get` call site.
+
+`.env.example` is the operator-facing minimum; this section is the
+implementation-facing complete reference.
 
 ---
 
@@ -3650,7 +3782,15 @@ and the desired architecture are still not perfectly aligned.
 
 5. UI `/tools` help still mentions `coord_write_context`, which was removed.
 
-6. `.env.example` still lists several pre-projects flat-dir vars.
+6. (Resolved 2026-05-02.) `.env.example` is now the operator-facing
+   minimum (auth, WebDAV, caps, secrets-key, Codex gate, Telegram
+   bootstrap). Pre-projects flat-dir vars
+   (`HARNESS_CONTEXT_DIR` / `_KNOWLEDGE_DIR` / `_DECISIONS_DIR` /
+   `_HANDOFFS_DIR` / `_WORKSPACES_DIR`) and legacy single-project
+   knobs (`HARNESS_PROJECT_REPO`, `HARNESS_PROJECT_BRANCH`,
+   `HARNESS_MCP_CONFIG`, `HARNESS_COACH_TICK_INTERVAL`) were
+   removed. See §20 for the full implementation reference + change
+   log.
 
 7. (Resolved 2026-05-01.) Coach edits the per-project CLAUDE.md via
    `coord_propose_file_write(scope='project_claude_md', path='CLAUDE.md',
