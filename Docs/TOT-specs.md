@@ -407,6 +407,17 @@ Coach:
 - Creates top-level tasks.
 - Assigns Players using `coord_assign_task`.
 - Assigns player names/roles with `coord_set_player_role`.
+- Tunes per-Player execution knobs via
+  `coord_set_player_runtime` / `coord_set_player_model` /
+  `coord_set_player_effort` / `coord_set_player_plan_mode`. Reads the
+  current state with `coord_get_player_settings` (one slot or whole
+  roster) before changing anything so the team doesn't churn already-
+  correct settings. The four tools mutate per-(slot, project)
+  override columns; resolution at spawn time is per-pane request →
+  Coach override → role default → SDK default, so Coach overrides
+  apply uniformly to auto-wake spawns (task assignments, direct
+  messages) and to direct human prompts that don't set a per-pane
+  value.
 - Writes decisions.
 - Monitors stalled work.
 - Answers Player plan/question interactions routed to Coach.
@@ -444,6 +455,12 @@ Hard enforcement in `server/tools.py`:
 - Only Coach can directly assign tasks to Players.
 - Only Coach can assign player names/roles.
 - Only Coach can write decisions.
+- Only Coach can set per-Player runtime/model/effort/plan-mode
+  overrides; the corresponding `coord_set_player_*` tools reject
+  Player callers and `coord_get_player_settings` is Coach-only as
+  well. The MCP tools accept `p1..p10` for `player_id`; Coach's own
+  effort/plan-mode have no MCP path (the human controls them via
+  Coach's pane gear).
 - Only Players can claim tasks.
 - Coach cannot use standard mutating tools through the baseline allowlist.
 - Players can only create subtasks under a task they own; only Coach or human
@@ -776,6 +793,11 @@ Generated columns support fast pane-history fan-out for:
 - messages addressed to the pane's agent
 - task assignments to that agent
 - task updates whose owner is that agent
+- Coach-set per-Player overrides keyed off `payload_to`:
+  `agent_model_set`, `agent_effort_set`, `agent_plan_mode_set`. The
+  override-setting tools emit with `to: <player_id>` so a history
+  reload of the target's pane includes them alongside Coach's own
+  timeline copy.
 
 Transient events not persisted:
 
@@ -3122,10 +3144,21 @@ Input:
       displays — `_context_window_for` in `server/agents.py` resolves
       tier aliases internally so the `/api/agents/{id}/context`
       endpoint accepts either form.
-    - **Plan chip** — `plan` or `no plan`. Toggle on click.
+    - **Plan chip** — `plan` or `no plan`. Toggle on click. The chip
+      reflects the per-pane toggle only; Coach-set
+      `agent_project_roles.plan_mode_override` (set via
+      `coord_set_player_plan_mode`) is consulted at spawn time in
+      `run_agent` but does not currently propagate into the chip.
+      Coach overrides surface in the EnvPane "Active overrides"
+      section instead. Resolution at spawn time: paneSettings.planMode
+      (when non-null) → `agents[].plan_mode_override` → off.
     - **Effort chip** — `low` / `med` / `high` / `max`. Resolution
       chain: paneSettings.effort → latest `turns.effort` → `low`
-      (the implicit minimum when nothing else resolves).
+      (the implicit minimum when nothing else resolves). Same
+      caveat as the Plan chip — Coach-set
+      `agent_project_roles.effort_override` is honored at spawn time
+      but not yet reflected in the chip; the EnvPane "Active
+      overrides" section is the human's surface for those.
   The Settings drawer's role-default save dispatches a
   `team-models-updated` window event so all open panes refresh their
   resolved model labels live.
@@ -3636,6 +3669,55 @@ Behavior:
 
 UI endpoints support live reload without redeploy.
 
+#### 18.3.1 Escalation Watcher
+
+A separate background task (`server/telegram_escalation.py`,
+`start_escalation_watcher()` in `lifespan`) pings the same
+whitelisted chats when a pending-attention item goes unanswered
+for too long. Independent of the bridge's outbound buffer; uses
+`server.telegram.send_outbound(text)` which resolves the disabled
+flag + token + chat_ids fresh on every call (so a UI Clear stops
+escalations immediately).
+
+Watched events:
+
+- `pending_question` with `route='human'` (AskUserQuestion).
+- `pending_plan` with `route='human'` (ExitPlanMode plan approval).
+- `file_write_proposal_created` (truth or `project_claude_md` scope).
+
+Resolution events that cancel the timer:
+
+- `question_answered` / `question_cancelled` (matched on
+  `correlation_id`).
+- `plan_decided` / `plan_cancelled` (matched on `correlation_id`).
+- `file_write_proposal_approved` / `_denied` / `_cancelled` /
+  `_superseded` (matched on `proposal_id`).
+
+Delay model:
+
+- `HARNESS_TELEGRAM_ESCALATION_SECONDS` (default 300; 0 disables
+  the watcher).
+- `HARNESS_TELEGRAM_ESCALATION_GRACE` (default 5).
+- Branch chosen at schedule time: full delay when
+  `bus.subscriber_count > 0` (web active), grace delay otherwise.
+
+`pending_question(route='coach')` and `pending_plan(route='coach')`
+are explicitly ignored — Coach is responsible for those, not the
+human. `human_attention` keeps the bridge's existing immediate
+forwarding (the agent has already declared "I can't proceed";
+adding a delay would slow the most-urgent signal).
+
+Telegram message includes context: agent slot + name + role label
+(via `_get_agent_identity`), `ts` and `deadline_at` rendered as
+`HH:MM UTC`, the structured questions array (or plan body
+truncated to 1500 chars, or proposal scope+path+summary+size),
+and a "Open the web UI to answer" footer.
+
+Restart behaviour: timers are in-memory only. A
+`file_write_proposal_created` open before a server restart keeps
+its `status='pending'` row in the DB but does not re-arm a timer
+on next boot. The EnvPane still surfaces it on reconnect.
+
 ---
 
 ## 19. Security and Auth
@@ -3808,6 +3890,8 @@ implementation):
 | `HARNESS_OUTPUTS_DIR` | `/data/outputs` | Legacy outputs dir |
 | `TELEGRAM_BOT_TOKEN` | unset | Telegram env fallback |
 | `TELEGRAM_ALLOWED_CHAT_IDS` | unset | Telegram env fallback |
+| `HARNESS_TELEGRAM_ESCALATION_SECONDS` | `300` | Delay before pinging Telegram for an unanswered pending-attention item when the web UI is connected. `0` disables the escalation watcher. |
+| `HARNESS_TELEGRAM_ESCALATION_GRACE` | `5` | Delay used instead of the long delay when no WebSocket subscriber is connected at the time the pending event arrives. |
 | `PORT` | `8000` | Uvicorn port |
 
 Removed from `.env.example` (kept here for change-log audit; do not

@@ -350,10 +350,28 @@ async def lifespan(app: FastAPI):
         await start_telegram_bridge()
     except Exception:
         logger.exception("telegram bridge failed to start (non-fatal)")
+    # Telegram escalation watcher — pings the phone when a pending
+    # AskUserQuestion / ExitPlanMode / file-write proposal goes
+    # unanswered for too long (or right away if the web UI isn't
+    # connected). Independent of the bridge: silently no-ops when
+    # Telegram isn't configured, but registers timers regardless so
+    # turning the bridge on later picks up future items. Owns its own
+    # task handle (mirrors the bridge + audit watcher patterns).
+    from server.telegram_escalation import (
+        start_escalation_watcher, stop_escalation_watcher,
+    )
+    try:
+        await start_escalation_watcher()
+    except Exception:
+        logger.exception("telegram escalation watcher failed to start (non-fatal)")
     bg_tasks = (snapshot_task, project_sync_task, global_sync_task, recurrence_task, stale_task_task, trim_task, att_trim_task, sessions_trim_task, compass_task)
     try:
         yield
     finally:
+        try:
+            await stop_escalation_watcher()
+        except Exception:
+            logger.exception("telegram escalation watcher shutdown failed")
         try:
             await stop_telegram_bridge()
         except Exception:

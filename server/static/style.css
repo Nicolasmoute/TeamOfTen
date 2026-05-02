@@ -3561,6 +3561,15 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   overflow: visible;
   text-overflow: clip;
 }
+/* Inter-agent / human auto-wake: tint the prompt accent-blue so the
+   receiver spots incoming traffic at a glance, distinct from ticks
+   and self-originated turns. Covers Coach←Player, Player←Coach,
+   Player←Player, and human→agent wakes (all share the same
+   "New message from <sender>" preamble). */
+.turn-header.wake-from-message .turn-header-prompt,
+.turn-header.wake-from-message .turn-header-full {
+  color: var(--accent);
+}
 /* Compact turn: muted badge instead of the full prompt dump. */
 .turn-header.compact {
   border-left-color: var(--muted);

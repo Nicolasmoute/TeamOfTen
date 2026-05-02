@@ -554,11 +554,26 @@ Three sections:
 
 A single block:
 
-- **Interval input** — number of minutes. Empty/0 = disabled.
+- **Interval input** — number of minutes. Used by the **Create / Update**
+  button below the card. Updating cadence on a disabled row also
+  re-enables it (matches the `/tick N` slash-command contract in §8 —
+  `PUT /api/coach/tick {minutes}` auto-enables a disabled row).
 - **Status dot** — green when enabled, gray when disabled.
 - **Next fire** — relative ("in 23 min") + absolute timestamp.
 - **Last fire** — relative ("12 min ago") + absolute timestamp.
 - **"Fire now" button** — calls `POST /api/coach/tick`.
+- **Enable / Disable button** — toggles the existing row without
+  changing cadence. Disable preserves the row (sets `next_fire_at=NULL`);
+  Enable schedules `next_fire_at` one cadence-unit out from now.
+- **Delete button** — removes the tick row entirely (calls
+  `DELETE /api/recurrences/{id}`). Symmetric with Repeats / Crons.
+
+If no tick row exists, the card collapses to "No tick yet — set one
+below" and the Create button below adopts the typed cadence.
+
+Errors from any tick action surface as a banner under the pane head
+with a dismiss × — keeps failed PUT/DELETE/POST visible instead of
+silently swallowing them.
 
 #### Repeats
 

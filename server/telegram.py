@@ -256,6 +256,35 @@ async def _send_telegram(
             logger.exception("telegram sendMessage chat=%d failed", chat_id)
 
 
+async def send_outbound(text: str) -> bool:
+    """Send `text` to every whitelisted chat using the current config.
+
+    Independent of the bridge's outbound buffer — used by callers that
+    need to push a message right now (e.g. the escalation watcher),
+    even when the bridge isn't running. Resolves the disabled flag
+    + token + chat_ids fresh on every call so a Clear in the UI is
+    immediately respected.
+
+    Returns True iff config was valid and at least one chat was
+    targeted. False when the bridge is disabled / unconfigured —
+    callers should treat that as "no Telegram available, skip
+    silently". Per-chat send failures are logged, not raised.
+    """
+    text = (text or "").strip()
+    if not text:
+        return False
+    cfg = await _resolve_config()
+    if cfg is None:
+        return False
+    token, allowed = cfg
+    if not allowed:
+        return False
+    async with httpx.AsyncClient() as client:
+        for chat_id in allowed:
+            await _send_telegram(client, token, chat_id, text)
+    return True
+
+
 async def _outbound_loop(
     client: httpx.AsyncClient, token: str, allowed: set[int]
 ) -> None:

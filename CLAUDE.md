@@ -1240,6 +1240,75 @@ tool routing including the empty-clear blunt path and the
 prior-session queued path, and the `TurnContext.transfer_to_runtime`
 schema.
 
+**Recent (2026-05-02, fifth follow-up) — Telegram escalation watcher:**
+
+The bridge already forwards `human_attention` events (from
+`coord_request_human`) to Telegram immediately, but the three other
+"needs the human" event types — `pending_question(route='human')`,
+`pending_plan(route='human')`, `file_write_proposal_created` — only
+surfaced in the EnvPane attention strip. If the human walked away
+from the laptop, those items sat unanswered indefinitely. Closed
+the gap with
+[server/telegram_escalation.py](server/telegram_escalation.py):
+
+- **Per-item asyncio timer.** On every watched pending event, a
+  task keyed by `(kind, correlation_id|proposal_id)` is registered
+  in `_pending`. The matching resolution event (`question_answered`
+  / `question_cancelled` / `plan_decided` / `plan_cancelled` /
+  `file_write_proposal_{approved,denied,cancelled,superseded}`)
+  cancels the task. Duplicate pendings replace the prior timer so
+  one item never has two competing fire paths.
+- **Web-active vs web-inactive delays.** Decision happens at
+  schedule time (`bus.subscriber_count` check). Active web →
+  `HARNESS_TELEGRAM_ESCALATION_SECONDS` (default 300s). Inactive →
+  `HARNESS_TELEGRAM_ESCALATION_GRACE` (default 5s) so a quick
+  reload still catches the item before the phone pings. Setting
+  `HARNESS_TELEGRAM_ESCALATION_SECONDS=0` disables the watcher
+  entirely; the consumer still drains the bus queue (otherwise it
+  would back up) but does nothing with events.
+- **Telegram config resolved at fire time.** Calls
+  `server.telegram.send_outbound(text)` — new public helper that
+  reuses the bridge's `_resolve_config` + chunked `_send_telegram`
+  via a fresh `httpx.AsyncClient`. When the bridge is disabled /
+  unconfigured the helper returns False and the watcher silently
+  no-ops, so the Clear button in Options drawer is respected
+  without any watcher-side state.
+- **Context-rich Telegram message.** Each kind has a dedicated
+  formatter that includes the agent's slot + name + role label
+  (looked up via `_get_agent_identity`), the `ts` / `deadline_at`
+  rendered as `HH:MM UTC`, the structured questions array (or
+  plan body, or file-path + summary), and a "Open the web UI to
+  answer" footer. Bodies are truncated at 1500 chars with an
+  ellipsis so a long plan doesn't blow Telegram's 4096-char cap
+  (the bridge's `_split_chunks` handles overflow regardless).
+- **`human_attention` keeps its existing immediate-fire path** in
+  the bridge's outbound loop. The agent has explicitly declared
+  "I can't proceed" — adding a delay there would only slow the
+  signal the user wants fastest.
+- **Lifecycle**: `start_escalation_watcher()` /
+  `stop_escalation_watcher()` mirror the audit watcher's pattern
+  (own task handle, subscribe synchronously before
+  `create_task`-ing the consumer). Wired in
+  [server/main.py:lifespan](server/main.py) right after the
+  bridge. Stop cancels in-flight timers so a redeploy doesn't
+  fire stale escalations on the next boot.
+- **Restart limitation (v1)**: timers are in-memory only. A
+  `file_write_proposal_created` that arrives before a deploy
+  keeps its `status='pending'` row in the DB but doesn't re-arm a
+  timer on next boot. The EnvPane still surfaces it on reconnect
+  so the signal isn't lost — it just won't trigger Telegram
+  unless a fresh proposal lands. Replay-on-boot is a possible v2
+  extension.
+- **Tests** in
+  [server/tests/test_telegram_escalation.py](server/tests/test_telegram_escalation.py)
+  (29, all passing) cover key extraction, env knobs (default /
+  zero / negative / invalid), formatters across all three kinds,
+  schedule-cancel via resolution event, fire-on-timeout,
+  web-active long-delay branch, disabled / no-op paths,
+  route='coach' filtering, duplicate replacement, idempotent
+  start, stop cancels in-flight timers, plus an end-to-end
+  through-the-bus path.
+
 **Recent (2026-05-02, fourth follow-up) — Coach effort + plan-mode overrides:**
 
 Coach already controlled per-Player runtime + model via
