@@ -541,10 +541,16 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
   const [identitySaving, setIdentitySaving] = useState(false);
   const identityDirty =
     nameDraft !== (initialName || "") || roleDraft !== (initialRole || "");
-  // PR 6: per-slot runtime override. UI saves immediately on change
-  // via PUT /api/agents/{slot}/runtime. Empty string = clear (fall
-  // through to role default → 'claude'). Mid-turn changes 409 on the
-  // server; we surface that via runtimeError below.
+  // PR 6: per-slot runtime override. UI saves immediately on change.
+  // - Empty string = clear (fall through to role default → 'claude').
+  //   Uses PUT /api/agents/{slot}/runtime — blunt column flip, no
+  //   transfer (the user explicitly asked to revert to defaults).
+  // - 'claude' / 'codex' = explicit target. Uses
+  //   POST /api/agents/{slot}/transfer-runtime, which compacts the
+  //   current session on the source runtime first and flips on
+  //   success. The next turn on the new runtime reads the handoff
+  //   from continuity_note. Server returns 409 on mid-turn flips
+  //   either way.
   const [runtimeDraft, setRuntimeDraft] = useState(initialRuntime || "");
   const [runtimeSaving, setRuntimeSaving] = useState(false);
   const [runtimeError, setRuntimeError] = useState("");
@@ -554,8 +560,13 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
     setRuntimeSaving(true);
     setRuntimeError("");
     try {
-      const res = await authFetch("/api/agents/" + slot + "/runtime", {
-        method: "PUT",
+      const useTransfer = next === "claude" || next === "codex";
+      const url = useTransfer
+        ? "/api/agents/" + slot + "/transfer-runtime"
+        : "/api/agents/" + slot + "/runtime";
+      const method = useTransfer ? "POST" : "PUT";
+      const res = await authFetch(url, {
+        method,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ runtime: next }),
       });
@@ -774,7 +785,7 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
         </div>
         ${runtimeError
           ? html`<span class="pane-settings-runtime-err">${runtimeError}</span>`
-          : html`<span class="pane-settings-hint">Saves immediately. Mid-turn change is rejected — cancel the turn first.</span>`}
+          : html`<span class="pane-settings-hint">Picking Claude/Codex runs a session transfer (compact + flip) so the new runtime inherits the conversation. "default" reverts blunt-clear. Mid-turn change rejected — cancel first.</span>`}
       </div>
       <div class="pane-settings-row">
         <label class="pane-settings-label">
@@ -4454,7 +4465,10 @@ function TeamRepoSection() {
       if (res.ok) {
         const d = await res.json();
         setData(d);
-        setRepoDraft(d.repo || "");
+        // Repo URL is write-only — the GET endpoint never returns the
+        // raw value (could carry a PAT). Leave the textbox empty so
+        // the user knows to re-paste if they want to change it.
+        setRepoDraft("");
         setBranchDraft(d.branch && d.branch !== "main" ? d.branch : "");
       }
     } catch (e) {
@@ -4598,7 +4612,7 @@ function TeamRepoSection() {
       >${saving ? "saving…" : "save"}</button>
       <button
         type="button"
-        disabled=${saving || provisioning || !(data && data.repo)}
+        disabled=${saving || provisioning || !(data && data.configured)}
         onClick=${provision}
         title="Clone + create worktrees now, without a restart. Idempotent."
       >${provisioning ? "provisioning…" : "provision now"}</button>
@@ -5589,9 +5603,10 @@ function SettingsDrawer({ onClose, serverStatus }) {
     setHealthLoading(true);
     setHealthErr("");
     try {
-      const res = await authFetch("/api/health");
-      // /api/health returns 503 when a required subsystem fails, but
-      // the body still carries per-subsystem detail; read both.
+      // /api/health/detail (auth) — verbose subsystem report. The
+      // public /api/health endpoint is minimal liveness only and
+      // doesn't carry the `checks` map this UI renders.
+      const res = await authFetch("/api/health/detail");
       const data = await res.json();
       setHealth(data);
       if (!res.ok) setHealthErr("HTTP " + res.status);
@@ -9212,9 +9227,12 @@ function ContextBar({ slot, liveEvents, model }) {
     } else if (
       last.type === "session_cleared" ||
       last.type === "session_compacted" ||
+      last.type === "session_transferred" ||
       last.type === "compact_empty_forced"
     ) {
       // Session just got cleared; the bar should drop to 0 immediately.
+      // session_transferred resets the same way — both runtime session
+      // ids are nulled in _perform_runtime_transfer_flip.
       setData((d) => d ? { ...d, used_tokens: 0, ratio: 0 } : d);
     }
   }, [liveEvents, refetch]);
@@ -9968,13 +9986,13 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
           "coord_list_team · coord_commit_push · coord_request_human",
         ];
         const list = slot === "coach" ? coach : player;
-        // Also fetch /api/health to pick up external MCP servers from
-        // HARNESS_MCP_CONFIG and /api/team/tools for the team-wide
+        // Also fetch /api/health/detail to pick up external MCP servers
+        // from HARNESS_MCP_CONFIG and /api/team/tools for the team-wide
         // extras (WebSearch / WebFetch) the human toggled on in the
         // Settings drawer. Both vary at runtime so they can't live in
         // the hardcoded list.
         Promise.all([
-          authFetch("/api/health").then((r) => r.json()).catch(() => null),
+          authFetch("/api/health/detail").then((r) => r.json()).catch(() => null),
           authFetch("/api/team/tools").then((r) => r.json()).catch(() => null),
         ])
           .then(([health, tools]) => {
@@ -11174,6 +11192,33 @@ function EventItem({ event }) {
     const f = event.handoff_file ? ` → handoffs/${event.handoff_file}` : "";
     return html`<div class="event sys">
       <div class="event-meta">${ts} · session compacted (${event.chars || 0} chars)${f}</div>
+    </div>`;
+  }
+
+  if (type === "session_transfer_requested") {
+    const fr = event.from_runtime || "?";
+    const to = event.to_runtime || "?";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · session transfer queued: ${fr} to ${to} (compact running on ${fr})</div>
+    </div>`;
+  }
+
+  if (type === "session_transferred") {
+    const fr = event.from_runtime || "?";
+    const to = event.to_runtime || "?";
+    const note = event.note === "no_prior_session"
+      ? " (no prior session, flipped directly)"
+      : event.handoff_file ? ` (handoff: ${event.handoff_file})` : "";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · session transferred ${fr} to ${to}${note}</div>
+    </div>`;
+  }
+
+  if (type === "session_transfer_failed") {
+    const to = event.to_runtime || "?";
+    const why = event.reason || "compact failed";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · session transfer to ${to} failed: ${why}</div>
     </div>`;
   }
 

@@ -199,10 +199,12 @@ async def main() -> int:
     print(f"  slot          = {SLOT}")
     print(f"  token set     = {bool(HARNESS_TOKEN)}")
 
-    # 1. Health probe.
-    status, body = _request("GET", "/api/health")
+    # 1. Health probe — use /api/health/detail (auth-protected) for the
+    # full subsystem report. The public /api/health is liveness-only
+    # since the security hardening PR.
+    status, body = _request("GET", "/api/health/detail")
     if status != 200:
-        print(f"FAIL: /api/health returned {status}: {body!r}")
+        print(f"FAIL: /api/health/detail returned {status}: {body!r}")
         return 1
     health = body if isinstance(body, dict) else {}
     codex_auth = (health.get("checks") or {}).get("codex_auth") or {}

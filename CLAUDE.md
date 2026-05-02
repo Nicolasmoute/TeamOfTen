@@ -1187,6 +1187,59 @@ arriving while the pane is closed pops it open. The
 EnvAttentionSection component is now purely presentational —
 receives `open` / `onDismiss` / `onDismissAll` as props.
 
+**Recent (2026-05-02, third follow-up) — Runtime session transfer (compact + flip):**
+
+Switching an agent's runtime used to be an all-or-nothing flip.
+`PUT /api/agents/{id}/runtime` writes `runtime_override` and the next
+turn on the new runtime starts with no memory of the prior
+conversation — `session_id` and `codex_thread_id` are runtime-
+specific and cannot cross over. Users had to manually `/compact`
+first, then flip, and remember the order.
+
+`POST /api/agents/{id}/transfer-runtime {runtime}` does both atomically:
+
+- **No prior session on source runtime** → flip immediately, emit
+  `runtime_updated` + `session_transferred(note=no_prior_session)`.
+- **Prior session exists** → schedule a transfer-mode compact on the
+  current runtime; on success the runtime flips and
+  `session_transferred(from_runtime, to_runtime, ...)` fires; on
+  empty-summary failure (Claude only — Codex's `compact_thread` has
+  already cleared the thread) `session_transfer_failed` fires and
+  the runtime stays put.
+- **Same target runtime** → 200 noop.
+- **Mid-turn (status='working')** → 409 (cancel first).
+
+Plumbed via a new `transfer_to_runtime` field on `TurnContext` /
+`run_agent` kwargs / `turn_ctx`. Each runtime's compact handler
+reads it after the post-compact bookkeeping (`continuity_note`
+written, source session id nulled) and calls
+`_perform_runtime_transfer_flip(slot, target)` — flips the column,
+nulls the **other** runtime's session column too (defensive against
+orphaned thread ids from a prior life on the target), evicts any
+cached Codex client, and emits `runtime_updated` with
+`source=session_transfer`.
+
+Surfaces:
+- **Pane gear popover** picks claude/codex via the new endpoint;
+  picking `default` (empty) keeps the legacy blunt-clear PUT.
+- **`coord_set_player_runtime`** (Coach MCP tool) reroutes through
+  the same path: queues a transfer-mode compact via
+  `asyncio.create_task` when there's a session to carry, flips
+  immediately when there isn't, blunt-clears on `runtime=''`.
+- **Three new event types** (`session_transfer_requested`,
+  `session_transferred`, `session_transfer_failed`) render as
+  `.sys` rows in [server/static/app.js](server/static/app.js) so
+  the timeline labels the boundary as a transfer, not a compact.
+  Context-bar handler also drops to 0 on `session_transferred`
+  (the sessions-cleared trio became a quartet).
+
+Spec mirror: `Docs/CODEX_RUNTIME_SPEC.md` §E.8. Tests in
+[server/tests/test_runtime_transfer.py](server/tests/test_runtime_transfer.py)
+cover the helper, HTTP endpoint validation + dispatch matrix, MCP
+tool routing including the empty-clear blunt path and the
+prior-session queued path, and the `TurnContext.transfer_to_runtime`
+schema.
+
 **Next likely:**
 - **Mobile UI polish** — touch-drag doesn't work with HTML5 DnD;
    layout breakpoints for < 900 px need a rethink.

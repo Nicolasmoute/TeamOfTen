@@ -774,6 +774,91 @@ wired through once that signal was available.
 - Exception post-result → suppressed by dispatcher's existing `got_result` discipline.
 - 401/auth errors → emit `human_attention`, stop retrying (Telegram bridge precedent).
 
+### E.8 Session transfer (compact + flip)
+
+Switching an agent's runtime mid-life would normally lose the entire
+conversation: each runtime owns its own session column
+(`session_id` for Claude, `codex_thread_id` for Codex), and neither
+can read the other. A blunt flip via `PUT /api/agents/{id}/runtime`
+preserves that semantic — it's a "fresh start on the new runtime"
+operation with no continuity carry-over.
+
+The session-transfer flow (added 2026-05-02) closes the gap by
+running the standard `/compact` summary on the **source** runtime
+before the column flip. The summary is written to
+`agent_sessions.continuity_note`, which the next system prompt on
+the target runtime injects as a `## Handoff from your prior session`
+block — the same vehicle a normal `/compact` uses to brief
+fresh-you on the new session.
+
+**Surfaces:**
+- `POST /api/agents/{id}/transfer-runtime {runtime: 'claude'|'codex'}`
+  — HTTP entry point used by the pane's runtime selector.
+- `coord_set_player_runtime(player_id, runtime)` MCP tool — Coach
+  entry point. Empty `runtime=''` keeps the legacy blunt-clear
+  semantics (revert to role default, no transfer).
+
+**Dispatch matrix** (computed before queueing anything):
+
+| Source runtime  | Target runtime  | Prior session?  | Action                                                                                      |
+|-----------------|-----------------|-----------------|---------------------------------------------------------------------------------------------|
+| X               | X (same)        | —               | 200 noop                                                                                    |
+| X               | Y               | NO              | flip column directly + emit `runtime_updated` + `session_transferred(note=no_prior_session)`|
+| X               | Y               | YES             | queue `run_agent(COMPACT_PROMPT, compact_mode=True, transfer_to_runtime=Y)` on X            |
+
+Mid-turn flips (`agents.status='working'`) are 409'd at the entry
+point — same rule as the blunt PUT, for the same reason
+(in-flight turn would be on the old runtime while subsequent turns
+use the new one).
+
+**Compact-handler branch.** `transfer_to_runtime` rides through
+`run_agent` → `TurnContext` → `turn_ctx`. The post-compact path in
+each runtime's message handler reads the flag:
+
+- ClaudeRuntime (`server/agents.py:_handle_message`) writes
+  `continuity_note`, nulls `session_id`, calls
+  `_perform_runtime_transfer_flip(slot, target)` (which flips the
+  column, nulls the **other** runtime's session column too — defensive
+  against orphaned thread ids from a prior life on the target — and
+  emits `runtime_updated` with `source=session_transfer`), then emits
+  `session_transferred(from_runtime, to_runtime, chars, handoff_file)`
+  in place of the ordinary `session_compacted`. If the compact yielded
+  no summary, the runtime is **not** flipped — `session_transfer_failed`
+  fires and the agent stays put.
+- CodexRuntime (`server/runtimes/codex.py:run_manual_compact`) calls
+  `client.compact_thread(thread_id)`, writes the returned summary to
+  `continuity_note`, clears `codex_thread_id`, then performs the same
+  flip + emits `session_transferred`. Codex flips even on empty
+  summary because `compact_thread` already cleared the thread id;
+  not flipping would leave the agent on Codex with no thread to
+  resume — strictly worse than flipping with thin context. Asymmetry
+  is intentional and noted inline.
+
+**Event vocabulary additions.** The bus carries three new event
+types so the UI can label the timeline as a transfer rather than a
+compact:
+
+| Event                          | When                                                                                                |
+|--------------------------------|-----------------------------------------------------------------------------------------------------|
+| `session_transfer_requested`   | Fired by the entry point when a compact is queued (replaces `session_compact_requested`).           |
+| `session_transferred`          | Fired by the compact handler on success after the flip (replaces `session_compacted`).              |
+| `session_transfer_failed`      | Claude path only — fired when compact yields no summary so the runtime stays put. UI shows reason.  |
+
+The pane's runtime selector in
+[server/static/app.js](server/static/app.js) routes through this
+endpoint when the user picks `claude` / `codex`. Picking `default`
+(empty) still uses the blunt `PUT /api/agents/{id}/runtime` path —
+the user explicitly asked to revert to role defaults, no compact.
+
+**Why this is not just `/compact` followed by a flip.** Atomicity:
+the flip only happens **iff** the compact succeeded with a non-empty
+summary. A user who runs `/compact` then `PUT runtime` separately
+gets the flip even when the compact failed, leaving the agent on
+the new runtime with no continuity carry-over. The transfer flow
+also emits the right event vocabulary so timelines read as
+"transfer", not "compact + unrelated flip", and the LeftRail's
+runtime badge updates exactly once via `runtime_updated`.
+
 ### E.8 AskUserQuestion under Codex
 
 ClaudeRuntime intercepts `AskUserQuestion` via `can_use_tool`

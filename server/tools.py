@@ -1762,9 +1762,16 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         "coord_set_player_runtime",
         (
             "Coach-only. Flip a Player between the Claude and Codex "
-            "runtimes. Stored on `agents.runtime_override`; resolution "
-            "at spawn time is per-slot override → role default in "
-            "team_config → 'claude'.\n"
+            "runtimes WITH session transfer. The Player's current "
+            "session (if any) is summarized via /compact on the source "
+            "runtime, the runtime then flips, and the next turn on the "
+            "new runtime reads that summary as a handoff in its system "
+            "prompt. Continuity preserved across the flip without "
+            "mid-conversation memory loss.\n"
+            "\n"
+            "Stored on `agents.runtime_override`; resolution at spawn "
+            "time is per-slot override → role default in team_config → "
+            "'claude'.\n"
             "\n"
             "Use this BEFORE coord_set_player_model when you want to set "
             "a model from the other runtime family — the model tool "
@@ -1784,12 +1791,26 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "while subsequent turns use the new one); cancel the Player "
             "first if they're working.\n"
             "\n"
-            "Emits a 'runtime_updated' event so the UI refreshes.\n"
+            "Behavior:\n"
+            "- runtime equals current → no-op (returns ok with note='noop').\n"
+            "- no prior session on the source runtime → flip is "
+            "immediate; one 'runtime_updated' + one 'session_transferred' "
+            "event with note='no_prior_session'.\n"
+            "- has a prior session → a compact turn is queued on the "
+            "current runtime. The runtime flips on compact success and "
+            "'session_transferred' fires; if the compact returns no "
+            "summary 'session_transfer_failed' fires and the runtime "
+            "stays put. The MCP call returns IMMEDIATELY (queued=True) — "
+            "watch the Player's pane for completion.\n"
+            "- runtime='' (empty string) keeps the legacy blunt clear: "
+            "writes runtime_override=NULL and emits 'runtime_updated'. "
+            "No transfer/compact is run; use this only when you "
+            "explicitly want a fresh start on the role default.\n"
             "\n"
             "Params:\n"
             "- player_id: one of p1..p10 (required; cannot flip Coach's runtime)\n"
-            "- runtime: 'claude', 'codex', or empty string to clear (revert "
-            "to the role default)."
+            "- runtime: 'claude', 'codex', or empty string to clear "
+            "(revert to the role default; blunt — no transfer)."
         ),
         {"player_id": str, "runtime": str},
     )
@@ -1823,6 +1844,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     "coord_request_human to ask."
                 )
 
+        # Mid-turn flip rejection mirrors PUT /api/agents/{id}/runtime —
+        # an in-flight turn would be on the old runtime while subsequent
+        # turns use the new one, leaving the timeline incoherent.
         c = await configured_conn()
         try:
             cur = await c.execute(
@@ -1832,56 +1856,108 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             if not row:
                 return _err(f"player '{pid}' not found")
             current_status = dict(row).get("status")
-            # Mirror PUT /api/agents/{id}/runtime: a mid-turn flip would
-            # leave the in-flight turn on the old runtime. Cancel first.
             if current_status == "working":
                 return _err(
                     f"{pid} is mid-turn — cancel their turn first (or "
                     "wait for it to finish), then flip the runtime."
                 )
-            await c.execute(
-                "UPDATE agents SET runtime_override = ? WHERE id = ?",
-                (runtime_value, pid),
-            )
-            await c.commit()
         finally:
             await c.close()
 
-        # Drop any cached Codex subprocess for this slot. Going codex →
-        # claude leaves the old client unused but still holding a proxy
-        # token + subprocess handle until the next MCP-config change or
-        # session clear. Going claude → codex is unaffected (no cached
-        # codex client existed). The mid-turn check above guarantees
-        # the slot is idle, so evict_client takes the full close path
-        # rather than the cache-pop fallback. Best-effort: a failure
-        # here is a tidy-up regression, not a correctness one (next
-        # turn rebuilds anyway), and tools.py's convention is to
-        # swallow on this kind of cleanup path.
-        try:
-            from server.runtimes.codex import evict_client as _codex_evict
-            await _codex_evict(pid)
-        except Exception:
-            pass
+        # Empty/clear path — keep the legacy blunt behavior. Coach asks
+        # for "clear" when they explicitly want a fresh start with no
+        # transfer (revert to role default + drop any continuity).
+        if runtime_value is None:
+            from server.agents import _set_runtime_override
+            await _set_runtime_override(pid, None)
+            await bus.publish(
+                {
+                    "ts": _now_iso(),
+                    "agent_id": pid,
+                    "type": "runtime_updated",
+                    "player_id": pid,
+                    "runtime_override": None,
+                }
+            )
+            return _ok(f"{pid} runtime cleared (will use role default)")
 
-        # Match the HTTP path: log against the target so the event lands
-        # in the Player's pane regardless of whether the human or Coach
-        # initiated the flip. Coach's own tool_use/tool_result pair
-        # already records "Coach called this" in Coach's timeline, so
-        # this avoids a duplicate. No `to` field — runtime_updated isn't
-        # in either fan-out registry (WS-side in app.js, SQL-side in
-        # main.py /api/events) so a `to` field would be dead weight.
+        # Transfer path. Re-resolve the current runtime now that we
+        # know we're moving to a concrete target.
+        from server.agents import (
+            _resolve_runtime_for,
+            _get_session_id,
+            _set_runtime_override,
+            run_agent as _run_agent,
+            COMPACT_PROMPT as _COMPACT_PROMPT,
+        )
+        from_runtime = await _resolve_runtime_for(pid)
+        if from_runtime == runtime_value:
+            return _ok(
+                f"{pid} runtime is already {runtime_value} — no flip needed"
+            )
+
+        if from_runtime == "claude":
+            prior = await _get_session_id(pid)
+        else:
+            from server.runtimes.codex import _get_codex_thread_id
+            prior = await _get_codex_thread_id(pid)
+
+        if not prior:
+            # No prior session — flip immediately, emit the same event
+            # pair the HTTP endpoint produces.
+            await _set_runtime_override(pid, runtime_value)
+            ts_iso = _now_iso()
+            await bus.publish(
+                {
+                    "ts": ts_iso,
+                    "agent_id": pid,
+                    "type": "runtime_updated",
+                    "player_id": pid,
+                    "runtime_override": runtime_value,
+                }
+            )
+            await bus.publish(
+                {
+                    "ts": ts_iso,
+                    "agent_id": pid,
+                    "type": "session_transferred",
+                    "from_runtime": from_runtime,
+                    "to_runtime": runtime_value,
+                    "note": "no_prior_session",
+                }
+            )
+            return _ok(
+                f"{pid} runtime → {runtime_value} (no prior session — "
+                "flipped directly)"
+            )
+
+        # Schedule the transfer-mode compact. The message handler in
+        # the source runtime applies the flip on success. We use
+        # asyncio.create_task here (not BackgroundTasks) because tool
+        # callbacks have no FastAPI request context — the run_agent
+        # coroutine self-cleans even when its parent task isn't awaited.
         await bus.publish(
             {
                 "ts": _now_iso(),
                 "agent_id": pid,
-                "type": "runtime_updated",
-                "player_id": pid,
-                "runtime_override": runtime_value,
+                "type": "session_transfer_requested",
+                "from_runtime": from_runtime,
+                "to_runtime": runtime_value,
             }
         )
-        if runtime_value:
-            return _ok(f"{pid} runtime → {runtime_value}")
-        return _ok(f"{pid} runtime cleared (will use role default)")
+        asyncio.create_task(
+            _run_agent(
+                pid,
+                _COMPACT_PROMPT,
+                compact_mode=True,
+                transfer_to_runtime=runtime_value,
+            )
+        )
+        return _ok(
+            f"{pid} runtime transfer queued: {from_runtime} → "
+            f"{runtime_value} via /compact (watch pane for "
+            "session_transferred event)"
+        )
 
     @tool(
         "coord_set_player_model",

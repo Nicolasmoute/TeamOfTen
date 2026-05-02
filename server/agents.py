@@ -880,17 +880,42 @@ async def _handle_message(
                 else:
                     pointer = summary_with_footer
                 await _set_continuity_note(agent_id, pointer)
-                await _set_session_id(agent_id, None)
+                # Use _clear_session_id (issues UPDATE … = NULL) rather
+                # than _set_session_id(None) — the latter early-returns
+                # on falsy values so the column would NOT actually be
+                # cleared, and the next turn would resume the prior
+                # session AND inject the handoff (defeats /compact's
+                # whole point of freeing context).
+                await _clear_session_id(agent_id)
                 # Freeze the exchange log we just quoted into the
                 # handoff; the next session starts with an empty buffer
                 # so a later compact doesn't re-quote pre-compact turns.
                 await _clear_exchange_log(agent_id)
-                await _emit(
-                    agent_id,
-                    "session_compacted",
-                    chars=len(summary),
-                    handoff_file=handoff_file,
-                )
+                # Transfer-mode (compact + flip): apply the runtime
+                # change now that the handoff is durable, and emit
+                # `session_transferred` instead of `session_compacted`
+                # so the UI labels the boundary correctly. The
+                # continuity_note we just wrote will be injected into
+                # the new runtime's first system prompt.
+                _xfer_to = (turn_ctx.get("transfer_to_runtime") or "").strip().lower()
+                if _xfer_to in ("claude", "codex"):
+                    _xfer_from = await _resolve_runtime_for(agent_id)
+                    await _perform_runtime_transfer_flip(agent_id, _xfer_to)
+                    await _emit(
+                        agent_id,
+                        "session_transferred",
+                        from_runtime=_xfer_from,
+                        to_runtime=_xfer_to,
+                        chars=len(summary),
+                        handoff_file=handoff_file,
+                    )
+                else:
+                    await _emit(
+                        agent_id,
+                        "session_compacted",
+                        chars=len(summary),
+                        handoff_file=handoff_file,
+                    )
             else:
                 # Model produced no text despite being asked to summarize.
                 # If this was an AUTO-compact (triggered because context
@@ -901,7 +926,12 @@ async def _handle_message(
                 # Manual /compact leaves the session intact so the user
                 # can retry without losing state.
                 if turn_ctx.get("auto_compact"):
-                    await _set_session_id(agent_id, None)
+                    # _clear_session_id issues an explicit NULL update;
+                    # _set_session_id(None) early-returns and leaves the
+                    # column intact, which would re-trip the threshold
+                    # loop on the very next turn — the exact deadlock
+                    # this branch is meant to escape.
+                    await _clear_session_id(agent_id)
                     await _clear_exchange_log(agent_id)
                     await _emit(
                         agent_id,
@@ -913,6 +943,24 @@ async def _handle_message(
                     )
                 else:
                     await _set_session_id(agent_id, session_id)
+                # Transfer requested but the compact yielded no summary
+                # — refuse to flip the runtime. The semantic of transfer
+                # is "carry forward via summary"; flipping with empty
+                # context is just a destructive blind switch. Emit
+                # session_transfer_failed so the UI tells the user
+                # what happened and the runtime stays put.
+                _xfer_to = (turn_ctx.get("transfer_to_runtime") or "").strip().lower()
+                if _xfer_to in ("claude", "codex"):
+                    await _emit(
+                        agent_id,
+                        "session_transfer_failed",
+                        to_runtime=_xfer_to,
+                        reason=(
+                            "compact turn produced no summary; runtime "
+                            "not flipped. Retry the transfer or use "
+                            "PUT /api/agents/{id}/runtime for a blunt flip."
+                        ),
+                    )
         else:
             await _set_session_id(agent_id, session_id)
             # First fresh turn AFTER a compact: the handoff has been
@@ -2277,6 +2325,90 @@ async def _clear_session_id(agent_id: str) -> None:
         logger.exception("clear_session_id failed: agent=%s", agent_id)
 
 
+async def _set_runtime_override(agent_id: str, runtime: str | None) -> None:
+    """Update agents.runtime_override and best-effort evict any cached
+    Codex client for the slot.
+
+    Used by the runtime-transfer flow (post-compact flip) and by
+    `coord_set_player_runtime` / `PUT /api/agents/{id}/runtime` when
+    they need to write the column without re-implementing the eviction
+    dance. `runtime` of 'claude' / 'codex' / None — None reverts to the
+    role default at the next spawn.
+
+    Caller is responsible for emitting the `runtime_updated` bus event
+    (the audit / actor shape varies by entry path).
+    """
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE agents SET runtime_override = ? WHERE id = ?",
+                (runtime, agent_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("set_runtime_override failed: agent=%s", agent_id)
+        return
+    # Drop any cached Codex subprocess for this slot. Same rationale as
+    # in coord_set_player_runtime — the cached client captured its
+    # mcp_servers / proxy token at first spawn; a runtime change makes
+    # those stale. Best-effort; a failure here is a tidy-up regression
+    # only (next turn rebuilds the client anyway).
+    try:
+        from server.runtimes.codex import evict_client as _codex_evict
+        await _codex_evict(agent_id)
+    except Exception:
+        pass
+
+
+async def _perform_runtime_transfer_flip(
+    agent_id: str,
+    target_runtime: str,
+) -> None:
+    """Apply a successful session-transfer: flip runtime_override AND
+    null both runtime session columns (session_id + codex_thread_id).
+
+    Why null both: the user asked for a transfer-via-summary, so
+    continuity carries forward via `continuity_note` (already written
+    by the compact handler). Leaving the target runtime's stored
+    session id around would make the next turn try to resume an
+    orphaned session/thread from a prior life — the opposite of "fresh
+    start with handoff." The source runtime's id is also cleared
+    (Claude's compact handler already nulled session_id, so this is
+    idempotent for that direction; Codex compact already cleared its
+    thread id).
+
+    Also emits a `runtime_updated` event so UI refresh hooks that key
+    on `agents.runtime_override` changes (LeftRail badges,
+    `refreshAgents()` on the WS feed) update consistently regardless
+    of whether the flip came from a blunt PUT or a queued transfer.
+
+    Note on helper choice: we use `_clear_session_id` here, NOT
+    `_set_session_id(None)`. The latter early-returns on falsy values
+    so the column is never actually written; the former issues an
+    explicit `UPDATE … SET session_id = NULL`. Mixing them up was a
+    long-standing bug in `/compact` itself (sessions weren't being
+    freed) — the audit caught it during this transfer rollout.
+    """
+    await _set_runtime_override(agent_id, target_runtime)
+    await _clear_session_id(agent_id)
+    try:
+        from server.runtimes.codex import _clear_codex_thread_id
+        await _clear_codex_thread_id(agent_id)
+    except Exception:
+        logger.exception(
+            "runtime_transfer: clear codex_thread_id failed agent=%s", agent_id,
+        )
+    await _emit(
+        agent_id,
+        "runtime_updated",
+        runtime_override=target_runtime,
+        source="session_transfer",
+    )
+
+
 # Men's Field Lacrosse last names — fits the "team of ten" metaphor
 # (lacrosse puts 10 players on the field, vs 11 for soccer). Pool is
 # larger than 10 so the picker can avoid collisions; all ASCII so the
@@ -2706,6 +2838,172 @@ async def _pretool_file_guard_hook(
         }
     except Exception:
         logger.exception("file-guard hook error (failing open)")
+        return {}
+
+
+# ----------------------------------------------------------------------
+# Secret-path guard
+# ----------------------------------------------------------------------
+#
+# Defense-in-depth on top of Item 1 (env scrub) and Item 2 (Files API
+# denylist): block agent SDK tool calls (Read/Edit/Write/MultiEdit/
+# NotebookEdit/Bash) that target the same set of sensitive paths
+# (Claude/Codex OAuth dirs, harness.db, /proc/<pid>/environ).
+#
+# This is best-effort. A determined attacker can read these via a
+# Python one-liner that doesn't textually mention the path
+# (constructing the string at runtime), and the hook only sees the
+# `command` field for Bash. Acceptable trade-off vs the architectural
+# fix (per-slot uid sandboxing, out of scope per threat model).
+#
+# Conservative patterns: a literal mention of `/data/claude/` in an
+# echo or comment trips the deny — agents have no legitimate reason
+# to type these strings, and over-deny just makes the agent escalate.
+
+def _denied_secret_paths() -> tuple[Path, ...]:
+    """Resolved absolute paths the secret-guard hook refuses to expose.
+
+    Mirrors `server.files._denied_paths()` plus:
+      - `/proc/<pid>/environ` is matched separately by `_path_is_secret`
+        because it doesn't necessarily exist on disk to resolve.
+      - Home-directory variants of the Claude and Codex CLI config
+        directories (`~/.claude`, `~/.codex`). The Dockerfile sets
+        `CLAUDE_CONFIG_DIR=/data/claude` and `CODEX_HOME=/data/codex`
+        so production deploys put OAuth in those, but a dev machine
+        run without env overrides falls back to home-dir defaults —
+        defense-in-depth.
+    """
+    from server.paths import DATA_ROOT
+    paths: list[Path] = []
+    claude_env = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if claude_env:
+        paths.append(Path(claude_env).resolve())
+    paths.append((DATA_ROOT / "claude").resolve())
+    codex_env = os.environ.get("CODEX_HOME", "").strip()
+    if codex_env:
+        paths.append(Path(codex_env).resolve())
+    paths.append((DATA_ROOT / "codex").resolve())
+    # Home-dir defaults — only matter when the env overrides are unset
+    # (dev machine without Dockerfile env), but cheap to include.
+    try:
+        home = Path.home()
+        paths.append((home / ".claude").resolve())
+        paths.append((home / ".codex").resolve())
+    except (RuntimeError, OSError):
+        # Path.home() raises if HOME is unset and pwd lookup fails.
+        # Skip — production always has HOME set.
+        pass
+    db_default = (DATA_ROOT / "harness.db").resolve()
+    paths.append(db_default)
+    db_override = os.environ.get("HARNESS_DB_PATH", "").strip()
+    if db_override:
+        paths.append(Path(db_override).resolve())
+    # Dedupe.
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return tuple(out)
+
+
+def _path_is_secret(path_str: str) -> bool:
+    """True if `path_str` refers to a denied secret path. Resolves to
+    follow symlinks before comparing, so a symlink at
+    /workspaces/p1/foo → /data/claude won't slip past."""
+    if not path_str:
+        return False
+    # /proc/<pid>/environ — match before the resolve() call because the
+    # path may not exist on the filesystem if pid is wrong. Also covers
+    # /proc/self/environ.
+    if re.search(r"/proc/(?:\d+|self|thread-self)/environ\b", path_str):
+        return True
+    try:
+        target = Path(path_str).resolve()
+    except OSError:
+        return False
+    for denied in _denied_secret_paths():
+        if target == denied:
+            return True
+        try:
+            target.relative_to(denied)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+# Bash heuristics — same conservative philosophy as the file-guard
+# hook above. Match path components anywhere in the command string.
+_BASH_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Default-deploy paths.
+    re.compile(r"/data/claude(?:/|$|\b)"),
+    re.compile(r"/data/codex(?:/|$|\b)"),
+    re.compile(r"/data/harness\.db\b"),
+    # Anywhere agents try to grab a process's env.
+    re.compile(r"/proc/(?:\d+|self|thread-self)/environ\b"),
+)
+
+
+async def _pretool_secret_guard_hook(
+    input_data: dict[str, Any],
+    tool_use_id: str | None,
+    context: Any,
+) -> dict[str, Any]:
+    """Block agent tool calls that read or write sensitive harness state.
+
+    Targets:
+      - Claude/Codex OAuth directories (`/data/claude/`, `/data/codex/`).
+      - SQLite database (`/data/harness.db` + WAL/SHM/journal sidecars).
+      - `/proc/<pid>/environ` — env exfil (the harness's own env still
+        contains live values on the harness process even after Item 1
+        scrubbed agent subprocesses).
+
+    Best-effort. Item 11's threat-model section documents the residual
+    risk (Bash one-liners that construct paths at runtime can bypass).
+    """
+    try:
+        tool_name = input_data.get("tool_name") or ""
+        tool_input = input_data.get("tool_input") or {}
+        denied = False
+        if tool_name in (
+            "Read", "Write", "Edit", "MultiEdit", "NotebookEdit",
+            "Grep", "Glob",
+        ):
+            # Grep / Glob expose content via match output / file lists,
+            # so a search rooted at /data/claude/ leaks just as much as
+            # a Read does. Check the same path-bearing fields uniformly.
+            for key in ("file_path", "notebook_path", "path"):
+                v = tool_input.get(key)
+                if v and _path_is_secret(str(v)):
+                    denied = True
+                    break
+        elif tool_name == "Bash":
+            cmd = str(tool_input.get("command") or "")
+            for pat in _BASH_SECRET_PATTERNS:
+                if pat.search(cmd):
+                    denied = True
+                    break
+        if not denied:
+            return {}
+        reason = (
+            "harness-managed secret path. The Claude/Codex OAuth "
+            "directories, the SQLite DB, and /proc/<pid>/environ are "
+            "off-limits to agent tool calls — they hold credentials or "
+            "leak the harness process env. If you genuinely need data "
+            "from one of these (e.g. to investigate a deploy issue), "
+            "ask the human directly via coord_request_human."
+        )
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }
+    except Exception:
+        logger.exception("secret-guard hook error (failing open)")
         return {}
 
 
@@ -3151,6 +3449,7 @@ async def run_agent(
     effort: int | None = None,
     compact_mode: bool = False,
     auto_compact: bool = False,
+    transfer_to_runtime: str | None = None,
 ) -> None:
     """Spawn one SDK query for the given slot and stream its events.
 
@@ -3159,6 +3458,12 @@ async def run_agent(
     - plan_mode: sets permission_mode="plan" so the agent outlines an
       approach before touching tools.
     - effort: 1..4 → "low" | "medium" | "high" | "max" thinking budget.
+    - transfer_to_runtime: only meaningful with compact_mode=True. When
+      set to 'claude' / 'codex', a successful compact triggers a
+      runtime flip + `session_transferred` event in place of the
+      ordinary `session_compacted` event. The next turn runs on the
+      target runtime with the freshly-written continuity_note injected
+      into its system prompt (i.e. compact + flip = "session transfer").
     """
     # Global pause short-circuits before the cost check; users pausing
     # the harness shouldn't also burn a DB write counting cost.
@@ -3193,6 +3498,7 @@ async def run_agent(
         effort=effort,
         compact_mode=compact_mode,
         auto_compact=auto_compact,
+        transfer_to_runtime=transfer_to_runtime,
     )
     await _runtime.maybe_auto_compact(_tc_compact)
 
@@ -3524,6 +3830,7 @@ async def run_agent(
         "effort": effort,
         "compact_mode": compact_mode,
         "auto_compact": auto_compact,
+        "transfer_to_runtime": transfer_to_runtime,
         "had_handoff_on_entry": bool(handoff_suffix) and not compact_mode,
         "entry_prompt": prompt,
         # Runtime tag flows through to the turns ledger row so
@@ -3557,6 +3864,7 @@ async def run_agent(
         effort=effort,
         compact_mode=compact_mode,
         auto_compact=auto_compact,
+        transfer_to_runtime=transfer_to_runtime,
         prior_session=prior_session,
         turn_ctx=turn_ctx,
     )

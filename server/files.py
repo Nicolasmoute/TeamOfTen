@@ -80,13 +80,20 @@ def _denied_paths() -> tuple[Path, ...]:
     if codex_dir:
         paths.append(Path(codex_dir).resolve())
     paths.append((DATA_ROOT / "codex").resolve())
-    db_path = os.environ.get("HARNESS_DB_PATH", "").strip() or str(
-        DATA_ROOT / "harness.db"
-    )
-    db = Path(db_path).resolve()
-    paths.append(db)
-    for suffix in ("-wal", "-shm", "-journal"):
-        paths.append(db.with_name(db.name + suffix))
+    # Deny BOTH the default location AND the env-override (if set).
+    # Mirrors the claude/codex handling above — if a deploy moves the
+    # DB but a stale file is left at the default path, we still refuse
+    # to serve it. The override is a moved-DB scenario, not a relocated-
+    # nothing-at-default scenario.
+    db_candidates: list[Path] = [DATA_ROOT / "harness.db"]
+    db_override = os.environ.get("HARNESS_DB_PATH", "").strip()
+    if db_override:
+        db_candidates.append(Path(db_override))
+    for db in db_candidates:
+        db_resolved = db.resolve()
+        paths.append(db_resolved)
+        for suffix in ("-wal", "-shm", "-journal"):
+            paths.append(db_resolved.with_name(db_resolved.name + suffix))
     # Dedupe while preserving order — env-derived and default paths
     # often collide on the standard `/data/...` deploy.
     seen: set[Path] = set()

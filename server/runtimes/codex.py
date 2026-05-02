@@ -1986,11 +1986,34 @@ class CodexRuntime:
         if not thread_id:
             # No prior thread → nothing to compact. Treat as no-op success
             # so the dispatcher's /compact slash command doesn't loop.
-            await _emit(
-                tc.agent_id,
-                "session_compacted",
-                note="no codex thread to compact (fresh session)",
+            # If a transfer was requested, the endpoint should have
+            # short-circuited to a bare flip; reaching this branch with
+            # transfer_to_runtime set means we lost that race (e.g. the
+            # thread id was cleared between endpoint check and turn
+            # start). Fall back to flipping here so the user's intent
+            # still completes.
+            _xfer_to = (
+                (tc.turn_ctx.get("transfer_to_runtime") or "").strip().lower()
             )
+            if _xfer_to in ("claude", "codex"):
+                from server.agents import (
+                    _perform_runtime_transfer_flip, _resolve_runtime_for,
+                )
+                _xfer_from = await _resolve_runtime_for(tc.agent_id)
+                await _perform_runtime_transfer_flip(tc.agent_id, _xfer_to)
+                await _emit(
+                    tc.agent_id,
+                    "session_transferred",
+                    from_runtime=_xfer_from,
+                    to_runtime=_xfer_to,
+                    note="no codex thread to compact (fresh session)",
+                )
+            else:
+                await _emit(
+                    tc.agent_id,
+                    "session_compacted",
+                    note="no codex thread to compact (fresh session)",
+                )
             tc.turn_ctx["got_result"] = True
             return
 
@@ -2033,11 +2056,39 @@ class CodexRuntime:
             await _set_continuity_note(tc.agent_id, summary)
         await _clear_codex_thread_id(tc.agent_id)
 
-        await _emit(
-            tc.agent_id,
-            "session_compacted",
-            summary_preview=(summary[:200] if summary else None),
+        # Transfer-mode (compact + flip): apply the runtime change now
+        # that compaction succeeded. The continuity_note we just wrote
+        # is the handoff the new runtime's first turn will read. We
+        # still flip when summary is empty here because (a) the
+        # compact_thread call itself succeeded — Codex returned without
+        # raising, the only reason summary is empty is the SDK's opaque
+        # return shape — and (b) we already cleared codex_thread_id, so
+        # not flipping would leave the agent on Codex with no thread to
+        # resume, which is strictly worse than flipping with thin
+        # context. Symmetry-with-Claude is broken intentionally here:
+        # Claude detects empty summary BEFORE clearing, Codex can't.
+        _xfer_to = (
+            (tc.turn_ctx.get("transfer_to_runtime") or "").strip().lower()
         )
+        if _xfer_to in ("claude", "codex"):
+            from server.agents import (
+                _perform_runtime_transfer_flip, _resolve_runtime_for,
+            )
+            _xfer_from = await _resolve_runtime_for(tc.agent_id)
+            await _perform_runtime_transfer_flip(tc.agent_id, _xfer_to)
+            await _emit(
+                tc.agent_id,
+                "session_transferred",
+                from_runtime=_xfer_from,
+                to_runtime=_xfer_to,
+                summary_preview=(summary[:200] if summary else None),
+            )
+        else:
+            await _emit(
+                tc.agent_id,
+                "session_compacted",
+                summary_preview=(summary[:200] if summary else None),
+            )
         tc.turn_ctx["got_result"] = True
 
     async def _emit_disabled_attention(self, tc: TurnContext) -> None:

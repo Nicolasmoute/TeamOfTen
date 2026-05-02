@@ -389,6 +389,60 @@ app = FastAPI(
 # both compress to ~20% original size. Skip tiny responses so we don't
 # pay the compression overhead for a {"ok": true} reply.
 app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+
+# Content Security Policy — layered defense alongside the markdown
+# DOMPurify pass and the Mermaid SVG sanitize. CSP closes the
+# script-injection escape hatch even if a sanitizer hook is bypassed:
+# the browser refuses to execute inline / external scripts that don't
+# match `script-src`. Header is set on every response (including
+# /static and JSON API replies — extra coverage is free; CSP only
+# applies meaningfully to HTML the browser parses, but having it
+# everywhere costs nothing).
+#
+# Sources match what the UI actually loads:
+#   - script-src 'self' https://esm.sh — preact + preact/hooks load
+#     from esm.sh; everything else is vendored under /static/vendor/.
+#   - style-src 'self' 'unsafe-inline' — JSX `style={{...}}` props
+#     produce inline style attributes that CSP otherwise blocks.
+#   - font-src 'self' https://cdn.jsdelivr.net data: — KaTeX CSS
+#     references font URLs on jsdelivr; vendor pipeline rewrites
+#     relative font URLs to absolute jsdelivr URLs.
+#   - connect-src 'self' — covers same-origin fetch + WebSocket.
+#   - img-src 'self' data: blob: — local + clipboard-paste images.
+#   - object-src 'none' — block <object>/<embed>/<applet>.
+#   - frame-ancestors 'none' — refuse to be iframed (clickjacking).
+#   - form-action 'self' — block hijacked form posts to external URLs.
+#
+# Audit follow-up: if a future feature genuinely needs an external
+# script source (Stripe, Sentry, etc.), add it here AND document why
+# in the threat-model section of Docs/TOT-specs.md.
+_CSP_HEADER_VALUE = (
+    "default-src 'self'; "
+    "script-src 'self' https://esm.sh; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data: blob:; "
+    "font-src 'self' https://cdn.jsdelivr.net data:; "
+    "connect-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "frame-ancestors 'none'; "
+    "form-action 'self'"
+)
+
+
+@app.middleware("http")
+async def _csp_middleware(request, call_next):
+    response = await call_next(request)
+    # Don't overwrite a more specific policy if some other code path
+    # has already set one; otherwise apply the default.
+    response.headers.setdefault("Content-Security-Policy", _CSP_HEADER_VALUE)
+    # Belt-and-braces — a misconfigured browser ignoring CSP still gets
+    # the equivalent of frame-ancestors via X-Frame-Options.
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
 if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 else:
@@ -452,10 +506,42 @@ _WEBDAV_PROBE_TTL_SECONDS = 60.0
 
 @app.get("/api/health")
 async def health() -> JSONResponse:
+    """Public liveness probe. Minimal — returns `{ok: bool,
+    auth_required: bool}` and an HTTP status of 200 (DB reachable) or
+    503 (DB read failed). Used by the Docker HEALTHCHECK and the
+    Zeabur platform probe; deliberately leaks no deployment detail.
+
+    The verbose subsystem report (CLI versions, paths, credential
+    presence, WebDAV probe, MCP server names, …) lives on the
+    auth-protected `/api/health/detail` endpoint — see audit finding
+    "Public health endpoint leaks deployment details" + the threat
+    model section in Docs/TOT-specs.md.
+    """
+    db_ok = True
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute("SELECT 1")
+        finally:
+            await c.close()
+    except Exception:
+        db_ok = False
+    body: dict[str, object] = {
+        "ok": db_ok,
+        "auth_required": bool(HARNESS_TOKEN),
+    }
+    return JSONResponse(body, status_code=200 if db_ok else 503)
+
+
+@app.get("/api/health/detail", dependencies=[Depends(require_token)])
+async def health_detail() -> JSONResponse:
     """Per-subsystem readiness probe. Returns 200 if everything required
     is green, 503 if any subsystem is failing, with a `checks` object
     detailing each. Skipped subsystems (webdav/workspaces when unconfigured)
     don't fail the overall ok flag.
+
+    Auth-protected since it leaks deployment detail (CLI versions,
+    on-disk paths, credential presence flags, MCP server names).
     """
     checks: dict[str, dict[str, object]] = {}
     overall_ok = True
@@ -2134,10 +2220,16 @@ async def get_team_repo() -> dict[str, object]:
         active_branch, branch_source = env_branch, "env"
     else:
         active_branch, branch_source = "main", "default"
+    # Never return the raw repo URL — if a deploy bypasses the
+    # `${VAR}` placeholder convention and saves a literal PAT-bearing
+    # URL, the raw value would leak to anyone holding the bearer
+    # token (or any XSS that grabs it). Editing requires the user to
+    # re-paste the URL via PUT (write-only credential pattern,
+    # standard for password fields).
     return {
-        "repo": active_repo,
         "repo_masked": _mask_repo_url(active_repo),
         "repo_source": repo_source,
+        "configured": bool(active_repo),
         "branch": active_branch,
         "branch_source": branch_source,
         "env_repo_set": bool(env_repo),
@@ -2668,6 +2760,158 @@ async def set_agent_runtime(
         }
     )
     return {"ok": True, "agent_id": agent_id, "runtime_override": runtime_value}
+
+
+@app.post("/api/agents/{agent_id}/transfer-runtime", dependencies=[Depends(require_token)])
+async def transfer_agent_runtime(
+    agent_id: str,
+    req: AgentRuntimeWrite,
+    background: BackgroundTasks,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    """Switch an agent's runtime with continuity carried via /compact.
+
+    Smarter sibling of `PUT /api/agents/{id}/runtime`. The plain PUT
+    is a blunt column flip — the next turn on the new runtime starts
+    with no memory of the prior conversation. This endpoint runs the
+    standard compact summary on the CURRENT runtime first, then flips
+    the column on success, so the new runtime's first turn picks up
+    `continuity_note` in its system prompt.
+
+    Flow:
+    - 400 on invalid slot / runtime / unset HARNESS_CODEX_ENABLED
+    - 409 if the agent is mid-turn (cancel first)
+    - 200 + `noop=True` when target == currently-resolved runtime
+    - 200 + `queued=False` when there's no prior session to carry
+      forward — flips immediately, emits `runtime_updated` and a
+      `session_transferred` with `note=no_prior_session`
+    - 202 + `queued=True` otherwise — schedules a transfer-mode
+      compact turn on the current runtime; on success the runtime
+      flips and `session_transferred` fires. Watch the pane for
+      `session_transfer_requested` then `session_transferred` (or
+      `session_transfer_failed` if the compact returned no summary).
+
+    See CLAUDE.md "Session transfer" + Docs/CODEX_RUNTIME_SPEC.md §E.7.
+    """
+    from server.agents import (
+        _resolve_runtime_for,
+        _get_session_id,
+        _set_runtime_override,
+        is_agent_running,
+        run_agent,
+        COMPACT_PROMPT,
+    )
+
+    if not _valid_slot(agent_id):
+        raise HTTPException(400, detail=f"invalid agent_id '{agent_id}'")
+    raw = (req.runtime or "").strip().lower()
+    if raw not in ("claude", "codex"):
+        raise HTTPException(
+            400,
+            detail=(
+                "runtime must be 'claude' or 'codex' (transfer requires an "
+                "explicit target — empty/clear is not meaningful here; use "
+                "PUT /api/agents/{id}/runtime to clear the override)"
+            ),
+        )
+    if raw == "codex":
+        from server.runtimes import is_codex_enabled
+        if not is_codex_enabled():
+            raise HTTPException(
+                400,
+                detail=(
+                    "Codex runtime is gated behind HARNESS_CODEX_ENABLED. "
+                    "Set the env var on the deployment to enable."
+                ),
+            )
+
+    if is_agent_running(agent_id):
+        raise HTTPException(
+            409,
+            detail=(
+                "agent is currently running — cancel the in-flight turn "
+                "first, then transfer"
+            ),
+        )
+
+    from_runtime = await _resolve_runtime_for(agent_id)
+    if from_runtime == raw:
+        return {
+            "ok": True,
+            "noop": True,
+            "agent_id": agent_id,
+            "runtime": raw,
+        }
+
+    # No prior session on the source runtime → nothing to compact, just
+    # flip. Read the runtime-specific session column so we don't fire a
+    # pointless compact turn.
+    if from_runtime == "claude":
+        prior = await _get_session_id(agent_id)
+    else:
+        from server.runtimes.codex import _get_codex_thread_id
+        prior = await _get_codex_thread_id(agent_id)
+
+    if not prior:
+        await _set_runtime_override(agent_id, raw)
+        ts_iso = datetime.now(timezone.utc).isoformat()
+        await bus.publish(
+            {
+                "ts": ts_iso,
+                "agent_id": agent_id,
+                "type": "runtime_updated",
+                "runtime_override": raw,
+                "actor": actor,
+            }
+        )
+        await bus.publish(
+            {
+                "ts": ts_iso,
+                "agent_id": agent_id,
+                "type": "session_transferred",
+                "from_runtime": from_runtime,
+                "to_runtime": raw,
+                "note": "no_prior_session",
+                "actor": actor,
+            }
+        )
+        return {
+            "ok": True,
+            "queued": False,
+            "agent_id": agent_id,
+            "from_runtime": from_runtime,
+            "to_runtime": raw,
+        }
+
+    # Prior session exists — schedule the transfer-mode compact. The
+    # message handler in agents.py / runtimes/codex.py applies the
+    # runtime flip after a successful compact and emits
+    # `session_transferred` (or `session_transfer_failed` if the
+    # compact yielded no summary).
+    background.add_task(
+        run_agent,
+        agent_id,
+        COMPACT_PROMPT,
+        compact_mode=True,
+        transfer_to_runtime=raw,
+    )
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": agent_id,
+            "type": "session_transfer_requested",
+            "from_runtime": from_runtime,
+            "to_runtime": raw,
+            "actor": actor,
+        }
+    )
+    return {
+        "ok": True,
+        "queued": True,
+        "agent_id": agent_id,
+        "from_runtime": from_runtime,
+        "to_runtime": raw,
+    }
 
 
 # ----------------------------------------------------------------
@@ -4319,10 +4563,51 @@ async def list_events(
 # ------------------------------------------------------------------
 
 
+MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024  # 30 MB; adjust via spec, not env.
+
+
+def _matches_magic_bytes(head: bytes, ext: str) -> bool:
+    """Verify file content matches the declared image extension.
+
+    Closes the "polyglot upload" hole — without this check, an attacker
+    can rename a JS / HTML / SVG file to `.png` and the server stores
+    it with `Content-Type: image/png`. Most browsers honor the magic
+    bytes over Content-Type for image rendering, but a quirky one
+    (or a future fetch-as-text retrieval) would execute the script.
+
+    Magic byte references:
+      - PNG:  89 50 4E 47 0D 0A 1A 0A
+      - JPEG: FF D8 FF
+      - GIF:  GIF87a / GIF89a
+      - WebP: RIFF....WEBP (4 + 4 + 4 layout)
+    """
+    if ext == "png":
+        return head.startswith(b"\x89PNG\r\n\x1a\n")
+    if ext in ("jpg", "jpeg"):
+        return head.startswith(b"\xff\xd8\xff")
+    if ext == "gif":
+        return head.startswith(b"GIF87a") or head.startswith(b"GIF89a")
+    if ext == "webp":
+        # 'RIFF' + 4-byte size + 'WEBP'
+        return (
+            len(head) >= 12
+            and head[0:4] == b"RIFF"
+            and head[8:12] == b"WEBP"
+        )
+    return False
+
+
 @app.post("/api/attachments", dependencies=[Depends(require_token)])
 async def upload_attachment(file: UploadFile = File(...)) -> dict[str, Any]:
     """Accept an image upload, store under the active project's
     `/data/projects/<slug>/attachments/<id>.<ext>` (PROJECTS_SPEC.md §4).
+
+    Enforces:
+      - extension allowlist (PNG / JPEG / GIF / WebP),
+      - magic-byte match against the declared extension (defends
+        against polyglot files),
+      - 30 MB size cap (streamed, aborts mid-upload if exceeded so a
+        large attacker payload doesn't tie up the disk).
 
     Returns a stable id + filesystem path. The caller (frontend) includes
     the path in the prompt text so the agent can Read the image. Pastes
@@ -4343,15 +4628,75 @@ async def upload_attachment(file: UploadFile = File(...)) -> dict[str, Any]:
     target = attachments_dir / f"{att_id}.{ext}"
     attachments_dir.mkdir(parents=True, exist_ok=True)
 
-    with target.open("wb") as fp:
-        shutil.copyfileobj(file.file, fp)
+    # Stream into the file with a per-chunk size guard. Read the first
+    # chunk before opening the destination so a magic-byte mismatch
+    # doesn't leave a zero-byte file on disk. 64 KB chunks are large
+    # enough to amortize syscall overhead and small enough that a 30 MB
+    # cap aborts within ~480 chunks. UploadFile.read() is async and
+    # delegates to its SpooledTemporaryFile under the hood — no
+    # asyncio.to_thread wrapper needed.
+    CHUNK = 64 * 1024
+    total = 0
+    try:
+        first = await file.read(CHUNK)
+        if not first:
+            raise HTTPException(400, detail="empty upload")
+        if not _matches_magic_bytes(first[:16], ext):
+            raise HTTPException(
+                400,
+                detail=(
+                    f"file content does not match declared extension "
+                    f"'.{ext}' (magic-byte check). Refused to store."
+                ),
+            )
+        if len(first) > MAX_ATTACHMENT_BYTES:
+            raise HTTPException(
+                413,
+                detail=(
+                    f"upload exceeds {MAX_ATTACHMENT_BYTES} byte cap"
+                ),
+            )
+        total = len(first)
+        with target.open("wb") as fp:
+            fp.write(first)
+            while True:
+                chunk = await file.read(CHUNK)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_ATTACHMENT_BYTES:
+                    fp.close()
+                    try:
+                        target.unlink()
+                    except OSError:
+                        pass
+                    raise HTTPException(
+                        413,
+                        detail=(
+                            f"upload exceeds {MAX_ATTACHMENT_BYTES} "
+                            "byte cap"
+                        ),
+                    )
+                fp.write(chunk)
+    except HTTPException:
+        raise
+    except Exception:
+        # Mid-stream failure: tidy up the partial file and surface a
+        # generic 500 — don't leak the stack to the caller.
+        try:
+            if target.exists():
+                target.unlink()
+        except OSError:
+            pass
+        logger.exception("attachment upload failed mid-stream")
+        raise HTTPException(500, detail="upload failed")
 
     return {
         "id": att_id,
         "filename": f"{att_id}.{ext}",
         "path": str(target),
         "url": f"/api/attachments/{att_id}.{ext}",
-        "size": target.stat().st_size,
+        "size": total,
         "media_type": f"image/{ext if ext != 'jpg' else 'jpeg'}",
     }
 

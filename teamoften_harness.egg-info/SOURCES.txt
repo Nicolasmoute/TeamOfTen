@@ -2,6 +2,7 @@ LICENSE
 README.md
 pyproject.toml
 server/__init__.py
+server/agent_env.py
 server/agents.py
 server/coach_objectives.py
 server/coach_todos.py
@@ -36,6 +37,7 @@ server/compass/audit_watcher.py
 server/compass/config.py
 server/compass/llm.py
 server/compass/mutate.py
+server/compass/output_extractor.py
 server/compass/paths.py
 server/compass/presence.py
 server/compass/prompts.py

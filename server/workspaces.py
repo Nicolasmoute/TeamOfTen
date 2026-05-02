@@ -191,7 +191,12 @@ def workspace_dir(slot: str) -> Path:
 
 
 def get_status() -> dict[str, object]:
-    """Snapshot of workspace state for /api/status. Cheap — just stats."""
+    """Snapshot of workspace state for /api/status. Cheap — just stats.
+
+    The repo URL is masked before returning — the raw value can carry
+    a PAT (from `${GITHUB_TOKEN}` placeholder expansion) and must
+    never leave the harness server. Boot logs use the unexpanded
+    placeholder form so production logs don't leak either."""
     if not project_configured():
         return {"configured": False, "reason": "no project repo set (Options → Project repo or HARNESS_PROJECT_REPO)"}
     slot_state = {}
@@ -207,9 +212,11 @@ def get_status() -> dict[str, object]:
             "is_git": (worktree / ".git").exists(),
             "fallback_active": actual != worktree,
         }
+    # Local import to avoid a circular: main.py imports this module.
+    from server.main import _mask_repo_url
     return {
         "configured": True,
-        "repo": _project_repo(),
+        "repo_masked": _mask_repo_url(_project_repo()),
         "branch": _project_branch(),
         "base_cloned": BASE_REPO_PATH.exists(),
         "slots": slot_state,
@@ -236,9 +243,14 @@ async def ensure_workspaces() -> dict[str, object]:
         )
         return {"configured": False}
 
+    # Mask before storing in the status dict — `_project_repo()` is the
+    # unexpanded `${VAR}` form by convention, so masking is a no-op for
+    # well-formed deploys. Belt-and-braces against a developer who
+    # pastes a literal PAT rather than using the placeholder pattern.
+    from server.main import _mask_repo_url
     status: dict[str, object] = {
         "configured": True,
-        "repo": _project_repo(),
+        "repo_masked": _mask_repo_url(_project_repo()),
         "branch": _project_branch(),
         "slots": {},
     }

@@ -381,3 +381,23 @@ def test_denied_paths_picks_up_env_overrides(
     paths = filesmod._denied_paths()
     from pathlib import Path as _P
     assert _P(custom_claude).resolve() in paths
+
+
+def test_denied_paths_keeps_default_db_when_override_set(
+    fresh_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """HARNESS_DB_PATH override must not unprotect the default
+    `<DATA_ROOT>/harness.db` location — defense in depth against a
+    stale file at the original path. Both should be in the deny set."""
+    import tempfile
+    moved = tempfile.NamedTemporaryFile(delete=False, suffix=".db").name
+    monkeypatch.setenv("HARNESS_DB_PATH", moved)
+    paths = filesmod._denied_paths()
+    from pathlib import Path as _P
+    from server.paths import DATA_ROOT
+    # Both the default AND the override must be in the deny set.
+    assert (DATA_ROOT / "harness.db").resolve() in paths
+    assert _P(moved).resolve() in paths
+    # WAL sidecars for both are also denied.
+    assert (DATA_ROOT / "harness.db-wal").resolve() in paths
+    assert _P(moved + "-wal").resolve() in paths

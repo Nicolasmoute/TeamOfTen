@@ -58,6 +58,7 @@ class ClaudeRuntime:
             _posttool_wiki_index_hook,
             _pretool_continue_hook,
             _pretool_file_guard_hook,
+            _pretool_secret_guard_hook,
             _EFFORT_LEVELS,
             workspace_dir,
         )
@@ -90,6 +91,10 @@ class ClaudeRuntime:
                     HookMatcher(
                         matcher=r"^(Write|Edit|MultiEdit|NotebookEdit|Bash)$",
                         hooks=[_pretool_file_guard_hook],
+                    ),
+                    HookMatcher(
+                        matcher=r"^(Read|Write|Edit|MultiEdit|NotebookEdit|Bash|Grep|Glob)$",
+                        hooks=[_pretool_secret_guard_hook],
                     ),
                 ],
                 "PostToolUse": [

@@ -45,6 +45,11 @@ class TurnContext:
     effort: int | None = None
     compact_mode: bool = False
     auto_compact: bool = False
+    # When set on a compact_mode turn, the dispatcher wraps the compact
+    # in a runtime-transfer: on success the runtime_override flips to
+    # this value and the message handler emits `session_transferred`
+    # instead of `session_compacted`. Empty / None = ordinary compact.
+    transfer_to_runtime: str | None = None
     # Prior-session continuation id, runtime-shaped. ClaudeRuntime
     # reads this as the SDK `resume` kwarg and as the stale-session
     # retry detector. CodexRuntime receives the stored codex_thread_id
