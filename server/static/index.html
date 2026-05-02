@@ -4,13 +4,22 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>TeamOfTen</title>
-    <!-- Inline SVG favicon: a dark-outlined rounded square with 11 dots
-         laid out in a 4-3-4 grid (1 Coach + 10 Players). Kept inline
-         so no extra request / server route is needed. -->
+    <meta name="theme-color" content="#F5832E" />
+    <!-- TeamOfTen brand mark — orange "10" disk. Source SVGs in brand/.
+         Modern browsers use the master SVG at any DPI; the 16-tuned
+         SVG is a fallback for old address-bar renderers; the 180×180
+         PNG covers iOS home-screen (no SVG support there). -->
+    <link rel="icon" type="image/svg+xml" href="/static/teamoften-mark.svg" />
     <link
       rel="icon"
       type="image/svg+xml"
-      href="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='10' fill='%23141414'/%3E%3Cg fill='%23c9a227'%3E%3Ccircle cx='16' cy='18' r='4'/%3E%3Ccircle cx='32' cy='18' r='4'/%3E%3Ccircle cx='48' cy='18' r='4'/%3E%3Ccircle cx='16' cy='34' r='4'/%3E%3Ccircle cx='32' cy='34' r='4'/%3E%3Ccircle cx='48' cy='34' r='4'/%3E%3Ccircle cx='16' cy='50' r='4'/%3E%3Ccircle cx='32' cy='50' r='4'/%3E%3Ccircle cx='48' cy='50' r='4'/%3E%3C/g%3E%3Cg fill='%2363b3ed'%3E%3Ccircle cx='24' cy='18' r='4'/%3E%3Ccircle cx='40' cy='18' r='4'/%3E%3C/g%3E%3C/svg%3E"
+      sizes="16x16 32x32"
+      href="/static/teamoften-favicon-16.svg"
+    />
+    <link
+      rel="apple-touch-icon"
+      sizes="180x180"
+      href="/static/teamoften-mark-180.png"
     />
     <!-- highlight.js theme — dark variant to match the harness UI.
          Vendored under /static/vendor/ (see scripts/vendor_deps.py)

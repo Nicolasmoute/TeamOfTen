@@ -1122,6 +1122,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "/api/status workspaces section."
             )
 
+        # Env scrub for git subprocesses — git can run worktree-supplied
+        # hooks (.git/hooks/pre-commit, etc.) which an agent could plant
+        # to dump inherited env. Build a clean env so HARNESS_TOKEN /
+        # secret material isn't readable from a hook. Push auth uses
+        # the PAT embedded in the remote URL (see _expand_placeholders
+        # in workspaces.py), so we don't need GITHUB_TOKEN in env.
+        from server.agent_env import build_clean_agent_env
+        clean_env = build_clean_agent_env()
+
         async def run(cmd: list[str], timeout: int = 60) -> tuple[int, str, str]:
             def _do() -> tuple[int, str, str]:
                 p = subprocess.run(
@@ -1130,6 +1139,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     capture_output=True,
                     text=True,
                     timeout=timeout,
+                    env=clean_env,
                 )
                 return p.returncode, p.stdout, p.stderr
             return await asyncio.to_thread(_do)

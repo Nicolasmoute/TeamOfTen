@@ -135,6 +135,11 @@ async def call(
     )
     if chosen_model:
         options_kwargs["model"] = chosen_model
+    # Env scrub — same rationale as server/runtimes/claude.py: the
+    # Compass `query()` call spawns a `claude` CLI subprocess that
+    # would otherwise inherit HARNESS_TOKEN / KDRIVE_* / etc.
+    from server.agent_env import build_agent_env_overrides
+    options_kwargs["env"] = build_agent_env_overrides()
     options = ClaudeAgentOptions(**options_kwargs)
 
     started = _now_iso()

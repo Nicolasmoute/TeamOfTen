@@ -262,3 +262,122 @@ async def test_write_rejects_unknown_root(fresh_db) -> None:
     await init_db()
     with pytest.raises(PermissionError):
         await filesmod.write_text("nope", "x.md", "body")
+
+
+# ---------- denylist (Claude/Codex OAuth, SQLite DB) ----------
+
+
+def test_resolve_denies_claude_credentials(fresh_db) -> None:
+    """Direct `read` / `write` of the OAuth token file is refused even
+    though `tree('global')` already hides it. _resolve() is the choke
+    point so all three operations honour the same denylist."""
+    asyncio.get_event_loop().run_until_complete(init_db())
+    from server.paths import DATA_ROOT
+    claude_dir = DATA_ROOT / "claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    creds = claude_dir / ".credentials.json"
+    creds.write_text("{\"oauth\":\"secret\"}")
+
+    with pytest.raises(filesmod.FileDenied):
+        filesmod._resolve("global", "claude/.credentials.json")
+
+
+def test_resolve_denies_codex_auth(fresh_db) -> None:
+    asyncio.get_event_loop().run_until_complete(init_db())
+    from server.paths import DATA_ROOT
+    codex_dir = DATA_ROOT / "codex"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    auth = codex_dir / "auth.json"
+    auth.write_text("{}")
+
+    with pytest.raises(filesmod.FileDenied):
+        filesmod._resolve("global", "codex/auth.json")
+
+
+def test_resolve_denies_sqlite_db(fresh_db) -> None:
+    """Direct read of harness.db bypasses every API guard — refuse it
+    even though the file lives under a writable root."""
+    asyncio.get_event_loop().run_until_complete(init_db())
+    # The fresh_db fixture points DB_PATH at a tempfile, but the
+    # `DATA_ROOT/harness.db` default is also denied (covers production
+    # deploys regardless of HARNESS_DB_PATH override).
+    from server.paths import DATA_ROOT
+    db = DATA_ROOT / "harness.db"
+    db.write_bytes(b"SQLite-format-3\x00")
+
+    with pytest.raises(filesmod.FileDenied):
+        filesmod._resolve("global", "harness.db")
+
+
+def test_resolve_denies_sqlite_wal_sidecar(fresh_db) -> None:
+    asyncio.get_event_loop().run_until_complete(init_db())
+    from server.paths import DATA_ROOT
+    sidecar = DATA_ROOT / "harness.db-wal"
+    sidecar.write_bytes(b"")
+
+    with pytest.raises(filesmod.FileDenied):
+        filesmod._resolve("global", "harness.db-wal")
+
+
+def test_resolve_denies_anything_inside_claude_dir(fresh_db) -> None:
+    """A nested file inside the OAuth dir is denied even if its name
+    looks innocuous — the whole subtree is off-limits."""
+    asyncio.get_event_loop().run_until_complete(init_db())
+    from server.paths import DATA_ROOT
+    nested = DATA_ROOT / "claude" / "subdir"
+    nested.mkdir(parents=True, exist_ok=True)
+    (nested / "anything.txt").write_text("nope")
+
+    with pytest.raises(filesmod.FileDenied):
+        filesmod._resolve("global", "claude/subdir/anything.txt")
+
+
+def test_resolve_allows_lookalike_paths_outside_denied(fresh_db) -> None:
+    """Don't false-positive on paths whose names start with `claude` /
+    `codex` / `harness.db` but live elsewhere on the tree (e.g. a
+    project named `claude-helper`, a doc called `harness.db.md`)."""
+    asyncio.get_event_loop().run_until_complete(init_db())
+    from server.paths import DATA_ROOT
+    # A lookalike directory next to the denied one — different name,
+    # not a prefix issue.
+    sib = DATA_ROOT / "claude-helper"
+    sib.mkdir(parents=True, exist_ok=True)
+    (sib / "notes.md").write_text("# fine")
+
+    target = filesmod._resolve("global", "claude-helper/notes.md")
+    assert target == (sib / "notes.md").resolve()
+
+
+async def test_read_text_raises_file_denied(fresh_db) -> None:
+    """End-to-end: read_text() surfaces FileDenied (not FileNotFoundError
+    or PermissionError) so the API layer can map it to 403 distinctly."""
+    await init_db()
+    from server.paths import DATA_ROOT
+    claude_dir = DATA_ROOT / "claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / ".credentials.json").write_text("{}")
+    with pytest.raises(filesmod.FileDenied):
+        filesmod.read_text("global", "claude/.credentials.json")
+
+
+async def test_write_text_raises_file_denied(fresh_db) -> None:
+    """write_text() also blocks denied paths — the original audit gap
+    was that .json is in EDITABLE_EXTS so OAuth files were writable."""
+    await init_db()
+    with pytest.raises(filesmod.FileDenied):
+        await filesmod.write_text(
+            "global", "claude/.credentials.json", "{}"
+        )
+
+
+def test_denied_paths_picks_up_env_overrides(
+    fresh_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLAUDE_CONFIG_DIR / CODEX_HOME / HARNESS_DB_PATH overrides are
+    honoured at call time so a non-default deploy still gets coverage."""
+    import tempfile
+    custom_claude = tempfile.mkdtemp(prefix="harness-claude-")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", custom_claude)
+    paths = filesmod._denied_paths()
+    from pathlib import Path as _P
+    assert _P(custom_claude).resolve() in paths

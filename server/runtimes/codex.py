@@ -264,9 +264,14 @@ async def get_client(
             return cached
 
         sdk = _import_codex_sdk()
-        env = dict(os.environ)
-        if env_overrides:
-            env.update(env_overrides)
+        # Env scrub — the codex app-server subprocess (and every shell
+        # child it spawns under `danger-full-access`) inherits this
+        # env. Build from a tight allowlist instead of `dict(os.environ)`
+        # so HARNESS_TOKEN / HARNESS_SECRETS_KEY / KDRIVE_* / etc. don't
+        # leak. The coord_mcp child of the app-server inherits this
+        # scrubbed env transitively. See server/agent_env.py.
+        from server.agent_env import build_clean_agent_env
+        env = build_clean_agent_env(extra=env_overrides or {})
 
         # Mint the coord-proxy token here, not in the dispatcher: the
         # subprocess we're about to spawn captures its env once and

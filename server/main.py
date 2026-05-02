@@ -3663,6 +3663,8 @@ async def files_read(root: str, path: str = Query(..., description="relative to 
         return filesmod.read_text(root, path)
     except FileNotFoundError:
         raise HTTPException(404, detail="not found")
+    except filesmod.FileDenied as e:
+        raise HTTPException(403, detail=str(e))
     except PermissionError as e:
         raise HTTPException(403, detail=str(e))
     except ValueError as e:
@@ -3689,6 +3691,8 @@ async def files_write(
         )
     except filesmod.FileAlreadyExists as e:
         raise HTTPException(409, detail=str(e))
+    except filesmod.FileDenied as e:
+        raise HTTPException(403, detail=str(e))
     except PermissionError as e:
         raise HTTPException(403, detail=str(e))
     except ValueError as e:

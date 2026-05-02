@@ -105,6 +105,15 @@ class ClaudeRuntime:
         # only after verifying your CLI handles it.
         if os.environ.get("HARNESS_STREAM_TOKENS", "").lower() in ("1", "true", "yes"):
             options_kwargs["include_partial_messages"] = True
+
+        # Env scrub — overwrite sensitive harness env vars to empty
+        # strings so the spawned `claude` CLI subprocess (and any shell
+        # children it spawns for tool calls) can't read them via
+        # `printenv`, `cat /proc/self/environ`, etc. The SDK merges
+        # options.env INTO the inherited env, so our entries override
+        # the real values. See server/agent_env.py for the policy.
+        from server.agent_env import build_agent_env_overrides
+        options_kwargs["env"] = build_agent_env_overrides()
         if tc.model:
             options_kwargs["model"] = tc.model
         options_kwargs["permission_mode"] = "plan" if tc.plan_mode else "default"

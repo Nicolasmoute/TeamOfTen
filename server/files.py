@@ -17,6 +17,7 @@ drive prefixes.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,86 @@ READ_MAX_BYTES = 256_000
 # Skip directories that have no business being exposed — they'd be noise
 # and in some cases security-relevant (.git config, SQLite's WAL sidecars).
 SKIP_DIRNAMES = {".git", "__pycache__", ".venv", "node_modules"}
+
+
+def _denied_paths() -> tuple[Path, ...]:
+    """Absolute paths the Files API refuses to read or write, regardless
+    of which root the caller used or whether they reach via symlink.
+
+    Computed each call so HARNESS_DATA_ROOT / CLAUDE_CONFIG_DIR / etc.
+    overrides are honoured at runtime without restart.
+
+    Covers:
+      - the Claude OAuth directory (`/data/claude` by default; override
+        via CLAUDE_CONFIG_DIR) — holds `.credentials.json`.
+      - the Codex OAuth directory (`/data/codex` by default; override
+        via CODEX_HOME) — holds `auth.json`.
+      - the SQLite database file (`/data/harness.db` by default;
+        override via HARNESS_DB_PATH) and its WAL / SHM / journal
+        sidecars — direct DB read bypasses every API guard, including
+        the encrypted `secrets` and `agent_sessions` tables.
+
+    The Fernet master key (`HARNESS_SECRETS_KEY`) lives only in env, so
+    no on-disk file needs to be denied for it — `Item 1` env scrub is
+    what protects that.
+
+    Note: this denies READ/WRITE through the Files API. The `tree`
+    walker has its own top-level `extra_skip` set to also hide these
+    from enumeration under the `global` root. Both are needed because
+    `tree` walks via `Path.iterdir()` and never calls `_resolve()`
+    recursively, so the resolve-time check below would not catch
+    enumeration-only access.
+    """
+    paths: list[Path] = []
+    claude_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if claude_dir:
+        paths.append(Path(claude_dir).resolve())
+    paths.append((DATA_ROOT / "claude").resolve())
+    codex_dir = os.environ.get("CODEX_HOME", "").strip()
+    if codex_dir:
+        paths.append(Path(codex_dir).resolve())
+    paths.append((DATA_ROOT / "codex").resolve())
+    db_path = os.environ.get("HARNESS_DB_PATH", "").strip() or str(
+        DATA_ROOT / "harness.db"
+    )
+    db = Path(db_path).resolve()
+    paths.append(db)
+    for suffix in ("-wal", "-shm", "-journal"):
+        paths.append(db.with_name(db.name + suffix))
+    # Dedupe while preserving order — env-derived and default paths
+    # often collide on the standard `/data/...` deploy.
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return tuple(unique)
+
+
+def _is_denied(target: Path) -> bool:
+    """True if `target` is itself one of the denied paths or sits inside
+    a denied directory. Caller must pass a resolved (symlink-followed)
+    path; otherwise a symlink at /data/projects/foo → /data/claude
+    would slip past."""
+    target_resolved = target if target == target.resolve() else target.resolve()
+    for denied in _denied_paths():
+        if target_resolved == denied:
+            return True
+        try:
+            target_resolved.relative_to(denied)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+class FileDenied(Exception):
+    """Raised when `_resolve()` lands on a path the Files API refuses to
+    read or write (Claude/Codex OAuth dirs, the SQLite DB). The HTTP
+    layer maps to 403 — distinct from 404 (missing) so a probing client
+    can tell "denied" from "absent" but doesn't learn the exact policy
+    via timing or response body."""
 
 # Editable extension allowlist for write_text. Mirrors the FilesPane's
 # FILES_TEXT_EXTENSIONS + FILES_TEXT_BASENAMES so anything previewable
@@ -231,6 +312,11 @@ def _resolve(root_key: str, relative: str) -> Path:
         target.relative_to(base)
     except ValueError:
         raise ValueError("path escapes root")
+    # Deny known-sensitive paths (Claude/Codex OAuth dirs, SQLite DB +
+    # sidecars). Enforced here so read_text / write_text honour the
+    # same denylist as tree's enumeration filter — see _denied_paths().
+    if _is_denied(target):
+        raise FileDenied(f"path is denied: {root_key}/{relative}")
     return target
 
 
