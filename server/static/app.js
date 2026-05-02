@@ -10987,12 +10987,12 @@ function TurnHeader({ event, ts }) {
   const prompt = event.prompt || "";
   const oneLiner = prompt.replace(/\s+/g, " ").trim();
   const arrow = event.resumed_session ? "↻" : "→";
-  // Auto-wake prompts from server/agents.py / tools.py / main.py start
-  // with a conventional "New message from <sender>" preamble. Color
-  // the row accent-blue for any inter-agent or human-originated wake
-  // so the receiver can spot incoming traffic at a glance, distinct
-  // from ticks and self-originated turns.
-  const wakeFromMessage = /^New message from\b/i.test(oneLiner);
+  // Inter-agent / human-originated auto-wake prompts (server/agents.py,
+  // tools.py, main.py, telegram.py) all share a conventional preamble.
+  // Color the row accent-blue so the receiver can tell at a glance the
+  // turn was triggered by someone else, distinct from ticks and
+  // internal SDK-retry wakes ("Your previous turn ...").
+  const wakeExternal = /^(New message from|Coach assigned you|The operator|Player \w+ is paused)\b/i.test(oneLiner);
   // Compact turns get a condensed one-line renderer — the prompt is a
   // giant boilerplate instruction that clutters the timeline. A badge
   // + short label is enough; expand-click still reveals full text.
@@ -11017,7 +11017,7 @@ function TurnHeader({ event, ts }) {
         : null}
     </div>`;
   }
-  return html`<div class=${"event agent_started turn-header" + (open ? " open" : "") + (wakeFromMessage ? " wake-from-message" : "")}>
+  return html`<div class=${"event agent_started turn-header" + (open ? " open" : "") + (wakeExternal ? " wake-external" : "")}>
     <div
       class="turn-header-row"
       onClick=${() => setOpen((v) => !v)}
@@ -11029,7 +11029,7 @@ function TurnHeader({ event, ts }) {
       >${arrow}</span>
       <span class="turn-header-ts">${ts}</span>
       <${RuntimeChip} runtime=${event.runtime} />
-      <span class="turn-header-prompt">${oneLiner || "(empty prompt)"}</span>
+      <span class="turn-header-prompt">${open ? "" : (oneLiner || "(empty prompt)")}</span>
       <span class="turn-header-chev">${open ? "▾" : "▸"}</span>
     </div>
     ${open && prompt

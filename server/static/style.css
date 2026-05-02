@@ -3556,18 +3556,13 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   color: var(--muted);
   flex: 0 0 auto;
 }
-.turn-header.open .turn-header-prompt {
-  white-space: normal;
-  overflow: visible;
-  text-overflow: clip;
-}
-/* Inter-agent / human auto-wake: tint the prompt accent-blue so the
-   receiver spots incoming traffic at a glance, distinct from ticks
-   and self-originated turns. Covers Coach←Player, Player←Coach,
-   Player←Player, and human→agent wakes (all share the same
-   "New message from <sender>" preamble). */
-.turn-header.wake-from-message .turn-header-prompt,
-.turn-header.wake-from-message .turn-header-full {
+/* Externally-triggered auto-wakes: tint the prompt accent-blue so
+   the receiver spots at a glance that this turn was caused by
+   someone else (peer message, Coach task assignment, human plan
+   note, paused-Player escalation), distinct from ticks and internal
+   SDK-retry wakes. */
+.turn-header.wake-external .turn-header-prompt,
+.turn-header.wake-external .turn-header-full {
   color: var(--accent);
 }
 /* Compact turn: muted badge instead of the full prompt dump. */

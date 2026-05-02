@@ -82,6 +82,58 @@ For non-trivial changes, run two auditors:
 
 They catch different bug classes. Don't collapse them.
 
+### Strategic alignment via Compass
+
+Compass is the project's strategic safety net — a per-project
+weighted lattice of goals, constraints, stakeholder preferences, and
+architectural commitments, distilled from `truth/`,
+`project-objectives.md`, and the per-project wiki. It runs alongside
+the team and exposes four Coach-only MCP tools: `compass_ask`,
+`compass_audit`, `compass_brief`, `compass_status`. Players don't
+query it directly, but their work gets auto-audited.
+
+**What runs automatically (don't trigger these):**
+- Every Player commit, Coach decision, knowledge artifact, and
+  binary output is auto-audited against the lattice as it lands.
+  Verdicts: `aligned` (silent), `confident_drift` (logged),
+  `uncertain_drift` (queues a question for the human).
+- A daily briefing summarizes lattice state + open questions.
+
+**When Coach should actively query Compass:**
+- **Before scoping ambiguous work.** `compass_ask("which approach
+  fits the stated priorities?")` returns a terse answer citing
+  statement IDs + weights. Cheaper than guessing or pinging the
+  human.
+- **On strategic forks.** Before sending the human a
+  structured-choice ping (see "Communicating with the human"),
+  check Compass — the lattice may already encode a preference that
+  resolves the fork without bothering them.
+- **At session start after a gap.** `compass_brief()` for the
+  latest briefing; `compass_status()` for pending questions and
+  lattice freshness.
+- **For plans / contracts BEFORE they ship.** The auto-audit
+  watcher catches shipped artifacts; it does NOT catch in-flight
+  plans. Run `compass_audit(<draft contract>)` before locking a
+  phase on non-trivial work — strategic drift caught at the plan
+  stage is much cheaper than at the merge stage.
+
+**What to do with drift verdicts:**
+- `confident_drift` on a recently-merged artifact: investigate.
+  Either the merge was wrong (revert + redo), or the lattice is
+  stale (propose an update). Don't ignore.
+- `uncertain_drift` queues a question — surface it in the next
+  human ping ("Compass asked about X, your call"). Unanswered
+  Compass questions mean the lattice goes stale and future audits
+  drift further.
+
+**Don't:** manually call `compass_audit` on artifacts the watcher
+already covered (commits, decisions, knowledge artifacts, binary
+outputs). Double-charges the budget.
+
+Compass is the third axis: code-audit checks "did we do the thing
+right?", semantics-audit checks "does it still mean what it should?",
+Compass checks "is this the thing we should be doing at all?"
+
 ### Contract before implementation
 
 For any multi-phase work, write a contract before implementation
@@ -146,7 +198,7 @@ is heavier and loses context.
 
 Resist bumping Players to more capable models. The default mid-tier
 (Sonnet for Claude / `latest_mini` for Codex) is sized to be the
-right answer most of the time. A capable model on a Player making
+right answer most of the time. One option is to bump effort or turn on plan mode first. A capable model on a Player making
 process mistakes will not fix the process — it will burn budget
 faster. When a bump is genuinely warranted (e.g. contract-following
 discipline on a struggling Player), record the reason in
