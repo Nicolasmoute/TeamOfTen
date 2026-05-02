@@ -665,6 +665,44 @@ without touching prompts or migrating DB rows.
   `test_role_defaults_resolved_for_api`, plus the
   forbidden-concrete-ids enforcer above. Suite at 562/562.
 
+**Recent (2026-05-03) — Compass pinned to Sonnet + medium effort:**
+
+Compass was previously letting the Claude Agent SDK fall through to
+its built-in default for the model — accidentally inheriting whatever
+the local CLI happened to ship with, with no effort specified. Now
+the model + effort are explicit:
+
+- **Default model**: `latest_sonnet` (alias resolved at call time via
+  [server/models_catalog.py](server/models_catalog.py)). Cheap enough
+  for routine audits + daily runs, capable enough for lattice +
+  truth-corpus reasoning. Coach gets Opus for the hard work; Players
+  get Sonnet for execution; Compass sits between them — same Sonnet
+  tier as Players.
+- **Default effort**: `medium`. Balances signal quality with token
+  cost for the mid-stakes Compass pipeline (digest / audit / question
+  generation / Tier B output body review).
+- **Overrides**: `HARNESS_COMPASS_MODEL=<alias-or-concrete-id>` and
+  `HARNESS_COMPASS_EFFORT=low|medium|high|max`. Both are env-only;
+  no UI knob (Compass tuning isn't operator-facing per the
+  established convention).
+- **Resolution chain** in [server/compass/llm.py](server/compass/llm.py):
+  explicit `model=` param → `HARNESS_COMPASS_MODEL` env →
+  `LLM_MODEL_DEFAULT_ALIAS = "latest_sonnet"`. The chosen value
+  passes through `resolve_model_alias` so the SDK + turns ledger see
+  the concrete id, not the alias string. Aliases in the env var work
+  too (e.g. `HARNESS_COMPASS_MODEL=latest_opus`).
+- **9 new tests** in
+  [server/tests/test_compass_llm.py](server/tests/test_compass_llm.py)
+  cover: default → concrete Sonnet, explicit param wins, env override
+  beats default, effort default = medium, valid effort values pass
+  through, garbage effort drops to None, model + effort actually land
+  in `ClaudeAgentOptions(...)`.
+- Spec mirror in `Docs/compass-specs.md` §5.5.2 (last bullet).
+
+When Anthropic ships Sonnet 4.7, only `_ALIAS_TO_CONCRETE` in
+`models_catalog.py` needs updating — Compass picks it up
+automatically on next process start.
+
 **Recent (2026-05-02, second follow-up) — Tier B output body audits:**
 
 The Compass auto-audit watcher (shipped earlier today) was extended to
@@ -1239,6 +1277,44 @@ cover the helper, HTTP endpoint validation + dispatch matrix, MCP
 tool routing including the empty-clear blunt path and the
 prior-session queued path, and the `TurnContext.transfer_to_runtime`
 schema.
+
+**Recent (2026-05-02, sixth follow-up) — Role-level defaults wired through:**
+
+`_ROLE_MODEL_DEFAULTS` in
+[server/models_catalog.py](server/models_catalog.py) was previously
+"suggested only" — surfaced as the `suggested` field of
+`/api/team/models` for the Settings drawer hint, but never actually
+consulted by the spawn-time resolution chain. So a fresh deploy with
+no human-set `team_config` rows (`coach_default_model` /
+`players_default_model`) fell straight through to the SDK default
+(sonnet 4.6 for everyone, including Coach — wrong, since Coach should
+be on Opus). Likewise effort had no role default; turns ran without a
+thinking-budget hint unless the human or Coach explicitly set one.
+
+- `_get_role_default_model` in [server/agents.py](server/agents.py)
+  now falls through to `models_catalog.role_default_model` when
+  team_config is empty / unreadable. So a clean deploy gets
+  `latest_opus` for Coach and `latest_sonnet` for Players (Codex
+  Players: `latest_mini`; Codex Coach is still empty → SDK default).
+  Human-set team_config rows still win when present.
+- `run_agent` resolution chain for `effort` and `plan_mode` gets a
+  third tier: after per-pane override → Coach-set override →
+  **role-level default** (`role_default_effort` /
+  `role_default_plan_mode` in
+  [server/models_catalog.py](server/models_catalog.py)). Effort
+  defaults to medium (=2) for both Coach and Players. Plan mode
+  default is False for both — the same value the prior code path
+  produced, but now declared in one table for symmetry.
+- `coord_get_player_settings` ([server/tools.py](server/tools.py))
+  surfaces the resolved effort / plan defaults so Coach sees
+  `medium (default)` / `off (default)` instead of bare `default` —
+  more useful when planning a `coord_set_player_*` call.
+- Tests adjusted:
+  `test_run_agent_no_override_no_pane_falls_through_to_default`
+  now asserts `effort == 2`;
+  `test_get_role_default_model_does_not_fall_back_to_claude_for_codex`
+  now asserts the Codex players fallback returns `latest_mini`
+  (the hardcoded Codex default) rather than None.
 
 **Recent (2026-05-02, fifth follow-up) — Telegram escalation watcher:**
 

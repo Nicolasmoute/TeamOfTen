@@ -228,3 +228,188 @@ def test_parse_json_safe_returns_none_on_garbage() -> None:
     assert llm.parse_json_safe("") is None
     assert llm.parse_json_safe("not json at all") is None
     assert llm.parse_json_safe("{ invalid") is None
+
+
+# ---------------------------------------------- model + effort resolution
+
+
+def test_resolve_model_defaults_to_latest_sonnet_concrete() -> None:
+    """No param, no env override → falls through to the catalog's
+    `latest_sonnet` alias and resolves to a concrete Sonnet id. Must
+    not return the alias string itself, and must not return None."""
+    from server.compass import config as cmp_config
+    from server.compass.llm import _resolve_model
+
+    # Confirm the test environment has no override leaking through.
+    if cmp_config.LLM_MODEL_OVERRIDE:
+        pytest.skip("HARNESS_COMPASS_MODEL set in env; skipping default test")
+
+    resolved = _resolve_model(None)
+    assert resolved is not None
+    assert resolved != "latest_sonnet"  # alias was resolved, not passed through
+    assert "sonnet" in resolved.lower()
+
+
+def test_resolve_model_explicit_param_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit `model=` param beats both the env override and the
+    default alias. Concrete ids pass through `resolve_model_alias`
+    unchanged."""
+    from server.compass import config as cmp_config
+    from server.compass.llm import _resolve_model
+
+    monkeypatch.setattr(cmp_config, "LLM_MODEL_OVERRIDE", "claude-haiku-4-5-20251001")
+    resolved = _resolve_model("claude-opus-4-7")
+    assert resolved == "claude-opus-4-7"
+
+
+def test_resolve_model_env_override_used_when_no_param(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When `HARNESS_COMPASS_MODEL` is set and no param is given, the
+    env value wins over the default alias. Aliases in the env are
+    resolved through the catalog same as the default."""
+    from server.compass import config as cmp_config
+    from server.compass.llm import _resolve_model
+
+    monkeypatch.setattr(cmp_config, "LLM_MODEL_OVERRIDE", "latest_opus")
+    resolved = _resolve_model(None)
+    assert resolved is not None
+    # `latest_opus` resolves to a concrete Opus id, not the alias string.
+    assert resolved != "latest_opus"
+    assert "opus" in resolved.lower()
+
+
+def test_resolve_effort_returns_medium_by_default() -> None:
+    """No env override → `LLM_EFFORT` defaults to `"medium"`, which is
+    the agreed-on Compass setting."""
+    from server.compass import config as cmp_config
+    from server.compass.llm import _resolve_effort
+
+    if cmp_config.LLM_EFFORT != "medium":
+        pytest.skip("HARNESS_COMPASS_EFFORT set in env; skipping default test")
+    assert _resolve_effort() == "medium"
+
+
+def test_resolve_effort_accepts_valid_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.compass import config as cmp_config
+    from server.compass.llm import _resolve_effort
+
+    for level in ("low", "medium", "high", "max"):
+        monkeypatch.setattr(cmp_config, "LLM_EFFORT", level)
+        assert _resolve_effort() == level
+
+
+def test_resolve_effort_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Garbage values fall through to None — Compass calls are
+    best-effort and shouldn't crash on a typo'd env var."""
+    from server.compass import config as cmp_config
+    from server.compass.llm import _resolve_effort
+
+    for bad in ("ultra", "MED", "", "  ", "extreme"):
+        monkeypatch.setattr(cmp_config, "LLM_EFFORT", bad)
+        assert _resolve_effort() is None
+
+
+@pytest.mark.asyncio
+async def test_call_passes_resolved_model_to_options(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`call()` without a `model=` param feeds the resolved default
+    (concrete Sonnet id) into `ClaudeAgentOptions(model=...)`."""
+    captured: dict[str, Any] = {}
+
+    class _Options:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    async def _query(prompt: Any = None, options: Any = None) -> Any:
+        if prompt is not None:
+            async for _ in prompt:
+                pass
+        msg = _StubAssistantMessage(content=[_StubTextBlock(text="hi")])
+        yield msg
+        yield _StubResultMessage()
+
+    import claude_agent_sdk as sdk
+
+    monkeypatch.setattr(sdk, "query", _query)
+    monkeypatch.setattr(sdk, "ClaudeAgentOptions", _Options)
+    monkeypatch.setattr(sdk, "AssistantMessage", _StubAssistantMessage)
+    monkeypatch.setattr(sdk, "ResultMessage", _StubResultMessage)
+    monkeypatch.setattr(sdk, "TextBlock", _StubTextBlock)
+
+    await llm.call("s", "u")
+    assert "model" in captured
+    assert "sonnet" in str(captured["model"]).lower()
+
+
+@pytest.mark.asyncio
+async def test_call_passes_effort_to_options(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`call()` feeds the resolved effort into
+    `ClaudeAgentOptions(effort=...)`. Default is `"medium"`."""
+    captured: dict[str, Any] = {}
+
+    class _Options:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    async def _query(prompt: Any = None, options: Any = None) -> Any:
+        if prompt is not None:
+            async for _ in prompt:
+                pass
+        yield _StubAssistantMessage(content=[_StubTextBlock(text="ok")])
+        yield _StubResultMessage()
+
+    import claude_agent_sdk as sdk
+    from server.compass import config as cmp_config
+
+    monkeypatch.setattr(sdk, "query", _query)
+    monkeypatch.setattr(sdk, "ClaudeAgentOptions", _Options)
+    monkeypatch.setattr(sdk, "AssistantMessage", _StubAssistantMessage)
+    monkeypatch.setattr(sdk, "ResultMessage", _StubResultMessage)
+    monkeypatch.setattr(sdk, "TextBlock", _StubTextBlock)
+    monkeypatch.setattr(cmp_config, "LLM_EFFORT", "high")
+
+    await llm.call("s", "u")
+    assert captured.get("effort") == "high"
+
+
+@pytest.mark.asyncio
+async def test_call_omits_effort_when_invalid(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Invalid effort string → no `effort` kwarg in options (SDK uses
+    its built-in default rather than failing the call)."""
+    captured: dict[str, Any] = {}
+
+    class _Options:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+    async def _query(prompt: Any = None, options: Any = None) -> Any:
+        if prompt is not None:
+            async for _ in prompt:
+                pass
+        yield _StubAssistantMessage(content=[_StubTextBlock(text="ok")])
+        yield _StubResultMessage()
+
+    import claude_agent_sdk as sdk
+    from server.compass import config as cmp_config
+
+    monkeypatch.setattr(sdk, "query", _query)
+    monkeypatch.setattr(sdk, "ClaudeAgentOptions", _Options)
+    monkeypatch.setattr(sdk, "AssistantMessage", _StubAssistantMessage)
+    monkeypatch.setattr(sdk, "ResultMessage", _StubResultMessage)
+    monkeypatch.setattr(sdk, "TextBlock", _StubTextBlock)
+    monkeypatch.setattr(cmp_config, "LLM_EFFORT", "garbage-value")
+
+    await llm.call("s", "u")
+    assert "effort" not in captured

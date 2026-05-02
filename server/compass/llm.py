@@ -79,15 +79,35 @@ def _now_iso() -> str:
 # ---------------------------------------------------------------- query
 
 
+_VALID_EFFORTS: frozenset[str] = frozenset({"low", "medium", "high", "max"})
+
+
 def _resolve_model(model: str | None) -> str | None:
     """Pick the model for this Compass call.
 
-    Precedence: explicit param > HARNESS_COMPASS_MODEL env > None
-    (which lets the SDK fall back to its own default — typically the
-    Coach default model in the user's environment)."""
-    if model:
-        return model
-    return config.LLM_MODEL_OVERRIDE
+    Precedence: explicit param > `HARNESS_COMPASS_MODEL` env >
+    `LLM_MODEL_DEFAULT_ALIAS` (default `latest_sonnet`). The resolved
+    value runs through `models_catalog.resolve_model_alias` so
+    aliases (`latest_sonnet`, `latest_opus`, etc.) are turned into
+    concrete model ids before being handed to the SDK + recorded in
+    the turns ledger. The catalog alias map is the single point of
+    update when newer models ship.
+    """
+    from server.models_catalog import resolve_model_alias  # noqa: PLC0415
+
+    raw = model or config.LLM_MODEL_OVERRIDE or config.LLM_MODEL_DEFAULT_ALIAS
+    return resolve_model_alias(raw)
+
+
+def _resolve_effort() -> str | None:
+    """Return the validated effort string for `ClaudeAgentOptions`, or
+    `None` to let the SDK use its built-in default. Invalid values
+    fall through to `None` rather than crashing — Compass calls are
+    best-effort."""
+    val = (config.LLM_EFFORT or "").strip().lower()
+    if val in _VALID_EFFORTS:
+        return val
+    return None
 
 
 async def call(
@@ -127,6 +147,7 @@ async def call(
     )
 
     chosen_model = _resolve_model(model)
+    chosen_effort = _resolve_effort()
     options_kwargs: dict[str, Any] = dict(
         system_prompt=system,
         max_turns=1,
@@ -135,6 +156,8 @@ async def call(
     )
     if chosen_model:
         options_kwargs["model"] = chosen_model
+    if chosen_effort:
+        options_kwargs["effort"] = chosen_effort
     # Env scrub — same rationale as server/runtimes/claude.py: the
     # Compass `query()` call spawns a `claude` CLI subprocess that
     # would otherwise inherit HARNESS_TOKEN / KDRIVE_* / etc.

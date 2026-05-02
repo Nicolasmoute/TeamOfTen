@@ -234,7 +234,9 @@ async def test_get_role_default_model_is_runtime_aware(fresh_db: str) -> None:
 async def test_get_role_default_model_does_not_fall_back_to_claude_for_codex(
     fresh_db: str,
 ) -> None:
-    """A Codex turn with no Codex default should let the SDK choose."""
+    """A Codex turn with no Codex `team_config` row uses the hardcoded
+    Codex Players default (`latest_mini`) — never the Claude default,
+    even if the Claude side is set."""
     import server.db as dbmod
     await dbmod.init_db()
     from server.agents import _get_role_default_model
@@ -247,7 +249,7 @@ async def test_get_role_default_model_does_not_fall_back_to_claude_for_codex(
         )
         await db.commit()
 
-    assert await _get_role_default_model("p1", "codex") is None
+    assert await _get_role_default_model("p1", "codex") == "latest_mini"
 
 
 async def test_claude_maybe_auto_compact_off_when_threshold_unparseable(

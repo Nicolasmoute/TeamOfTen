@@ -97,6 +97,54 @@ _ROLE_CODEX_MODEL_DEFAULTS = {
     "players": "latest_mini",
 }
 
+# Per-role default reasoning effort tier (1..4 → low / medium / high / max).
+# Medium for both Coach and Players — the Sonnet/Opus pairing benefits from
+# a small thinking budget on most turns; the human flips to low/high in the
+# pane gear popover or via `coord_set_player_effort` when a specific Player
+# needs a different tier. Used by `agents.run_agent` after per-pane and
+# Coach-set overrides resolve to None.
+_ROLE_EFFORT_DEFAULTS = {
+    "coach": 2,
+    "players": 2,
+}
+
+# Per-role default plan-mode flag. False for both — plan mode is opt-in
+# per turn (pane toggle) or per Player (`coord_set_player_plan_mode`).
+# Kept as a declarative table for symmetry with the model and effort
+# defaults; `agents.run_agent` consults it via `role_default_plan_mode`.
+_ROLE_PLAN_MODE_DEFAULTS = {
+    "coach": False,
+    "players": False,
+}
+
+
+def _role_for(agent_id: str) -> str:
+    """Map an agent slot id to its role bucket. `coach` → 'coach',
+    `p1..p10` (and any future extension) → 'players'."""
+    return "coach" if agent_id == "coach" else "players"
+
+
+def role_default_model(agent_id: str, runtime_name: str = "claude") -> str:
+    """Return the role-level default model alias for `agent_id` under
+    the given runtime. Empty string when no default is set (currently
+    only Codex Coach). Resolved to a concrete id by
+    `resolve_model_alias` at spawn time."""
+    table = (
+        _ROLE_CODEX_MODEL_DEFAULTS if runtime_name == "codex"
+        else _ROLE_MODEL_DEFAULTS
+    )
+    return table.get(_role_for(agent_id), "")
+
+
+def role_default_effort(agent_id: str) -> int:
+    """Return the role-level default reasoning-effort tier (1..4)."""
+    return _ROLE_EFFORT_DEFAULTS[_role_for(agent_id)]
+
+
+def role_default_plan_mode(agent_id: str) -> bool:
+    """Return the role-level default plan-mode flag."""
+    return _ROLE_PLAN_MODE_DEFAULTS[_role_for(agent_id)]
+
 # Allowlist for Claude. Empty string means "fall through to SDK
 # default" — the gear popover models that as the "(default)" option.
 # Aliases included so `coord_set_player_model` can validate either

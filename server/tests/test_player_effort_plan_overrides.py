@@ -370,8 +370,8 @@ async def test_run_agent_pane_value_beats_coach_override(
 async def test_run_agent_no_override_no_pane_falls_through_to_default(
     fresh_db, monkeypatch
 ) -> None:
-    """Both kwarg=None and no Coach override → plan_mode=False /
-    effort=None (SDK default thinking budget)."""
+    """Both kwarg=None and no Coach override → role-level defaults
+    (plan_mode=False, effort=2/medium for both Coach and Players)."""
     await init_db()
 
     captured: dict = {}
@@ -381,4 +381,4 @@ async def test_run_agent_no_override_no_pane_falls_through_to_default(
     await agentsmod.run_agent("p1", "hello")
 
     assert captured["plan_mode"] is False
-    assert captured["effort"] is None
+    assert captured["effort"] == 2

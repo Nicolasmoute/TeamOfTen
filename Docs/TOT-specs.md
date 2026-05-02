@@ -414,10 +414,12 @@ Coach:
   roster) before changing anything so the team doesn't churn already-
   correct settings. The four tools mutate per-(slot, project)
   override columns; resolution at spawn time is per-pane request →
-  Coach override → role default → SDK default, so Coach overrides
-  apply uniformly to auto-wake spawns (task assignments, direct
-  messages) and to direct human prompts that don't set a per-pane
-  value.
+  Coach override → team-level role default (Settings drawer) →
+  hardcoded role default (`models_catalog`: `latest_opus` for Coach,
+  `latest_sonnet` for Players, medium effort, plan-mode off) → SDK
+  default. Coach overrides apply uniformly to auto-wake spawns (task
+  assignments, direct messages) and to direct human prompts that
+  don't set a per-pane value.
 - Writes decisions.
 - Monitors stalled work.
 - Answers Player plan/question interactions routed to Coach.
@@ -592,10 +594,12 @@ Notes:
 - `effort_override` (1..4) and `plan_mode_override` (0/1) are
   Coach-set via `coord_set_player_effort` / `coord_set_player_plan_mode`.
   NULL when unset. Both follow the same precedence as `model_override`:
-  per-pane request value (highest) → this column → default. The Coach
-  layer is what makes auto-wake spawns (task assignments, direct
-  messages — which call `run_agent` with the kwargs unset) honor the
-  preference; per-pane settings only apply to direct human prompts.
+  per-pane request value (highest) → this column → role-level default
+  (`models_catalog._ROLE_EFFORT_DEFAULTS`: medium for both Coach and
+  Players; `_ROLE_PLAN_MODE_DEFAULTS`: off for both). The Coach layer
+  is what makes auto-wake spawns (task assignments, direct messages —
+  which call `run_agent` with the kwargs unset) honor the preference;
+  per-pane settings only apply to direct human prompts.
 
 ### 6.4 `agent_sessions`
 
@@ -2294,7 +2298,14 @@ Resolution chain in `run_agent` (highest → lowest):
 3. Runtime-aware per-role default in `team_config`
    (`coach_default_model` / `players_default_model` and their
    `_codex` counterparts).
-4. SDK default (no `model` kwarg).
+4. Hardcoded role default in
+   `models_catalog._ROLE_MODEL_DEFAULTS` /
+   `_ROLE_CODEX_MODEL_DEFAULTS` (resolved via `role_default_model`).
+   Stored as tier aliases (`latest_opus` for Coach, `latest_sonnet`
+   for Players, `latest_mini` for Codex Players, empty for Codex
+   Coach) so model bumps only touch `_ALIAS_TO_CONCRETE`.
+5. SDK default (no `model` kwarg) — only reached for Codex Coach
+   when the role has no hardcoded default.
 
 Project-switch behavior: the override is keyed by `(slot,
 project_id)`. Switching the active project automatically swaps which
@@ -2314,7 +2325,8 @@ different projects without cross-talk.
   the active project. Empty-clear on a row that doesn't exist is a
   no-op (no orphan row).
 - Resolution at spawn time: per-pane request value (highest) → this
-  Coach override → no override (SDK default thinking budget).
+  Coach override → role-level default (medium for both Coach and
+  Players, see `models_catalog._ROLE_EFFORT_DEFAULTS`).
 - Emits `agent_effort_set` with `to: <player_id>` so the event
   renders in both Coach's pane and the target Player's pane (history
   reload uses the same indexed `payload_to` filter).
@@ -2329,11 +2341,12 @@ different projects without cross-talk.
   for the active project. Empty-clear no-orphan invariant matches
   the other override tools.
 - Resolution at spawn time: per-pane request value (highest) → this
-  Coach override → off. Plan mode is heavy (every turn pauses for
-  ExitPlanMode review before any tool use), so leave it off in the
-  common case and use it only on Players doing destructive /
-  hard-to-undo work where the human should review the approach
-  first.
+  Coach override → role-level default (off for both Coach and
+  Players, see `models_catalog._ROLE_PLAN_MODE_DEFAULTS`). Plan mode
+  is heavy (every turn pauses for ExitPlanMode review before any
+  tool use), so leave it off in the common case and use it only on
+  Players doing destructive / hard-to-undo work where the human
+  should review the approach first.
 - Emits `agent_plan_mode_set` with `to: <player_id>`.
 
 `coord_get_player_settings(player_id?)`
@@ -2805,11 +2818,29 @@ Model whitelist:
 - `gpt-5.1-codex-mini`
 - `gpt-5-codex`
 
-Suggested defaults:
+Suggested defaults (also the hardcoded role-level defaults
+[server/models_catalog.py](../server/models_catalog.py) — what every
+agent gets on a fresh deploy when no `team_config` row is set):
 
-- Coach: `claude-opus-4-7`
-- Players: `claude-sonnet-4-6`
-- Codex Coach/Players: empty, meaning Codex SDK default.
+- Coach (Claude): `latest_opus` → resolves to `claude-opus-4-7`.
+- Players (Claude): `latest_sonnet` → resolves to `claude-sonnet-4-6`.
+- Codex Coach: empty (Codex SDK default — top-tier Codex is too
+  expensive for a coordinator that runs every tick; the human flips
+  via the Settings drawer).
+- Codex Players: `latest_mini` → resolves to `gpt-5.4-mini`.
+
+Reasoning effort and plan-mode role-level defaults
+([server/models_catalog.py](../server/models_catalog.py)):
+
+- Effort: medium (=2) for both Coach and Players.
+- Plan mode: off for both Coach and Players.
+
+These are consulted by `run_agent` after the per-pane and Coach-set
+overrides resolve to None, so a fresh deploy gets the policy-correct
+combination (Coach on Opus, Players on Sonnet, medium thinking, no
+plan-mode pause) without any `team_config` rows being set. The
+human-set rows in the Settings drawer override these whenever
+present.
 
 ### 14.13 MCP and Secrets
 

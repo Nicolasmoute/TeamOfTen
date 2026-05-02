@@ -135,9 +135,24 @@ LLM_MAX_TOKENS_DEFAULT = _env_int("HARNESS_COMPASS_LLM_MAX_TOKENS", 1500)
 LLM_MAX_TOKENS_BRIEFING = _env_int("HARNESS_COMPASS_LLM_MAX_TOKENS_BRIEFING", 2000)
 LLM_MAX_TOKENS_AUDIT = _env_int("HARNESS_COMPASS_LLM_MAX_TOKENS_AUDIT", 1200)
 
-# Override the model used for compass calls. Falls through to the
-# Coach default model in team_config when unset.
+# Compass uses a Sonnet-tier model by default — capable enough for
+# strategy reasoning over the lattice + truth corpus, cheap enough
+# that a few daily runs + a handful of audits per project costs
+# pennies. The default is the **alias** `latest_sonnet` (resolved at
+# call time via `models_catalog.resolve_model_alias`) so when
+# Anthropic ships a newer Sonnet, only the catalog alias map needs
+# bumping — no compass-side change. Override with
+# `HARNESS_COMPASS_MODEL=<alias-or-concrete-id>` to pin a specific
+# model (e.g. `latest_opus` for hard reasoning, `latest_haiku` for
+# cost-constrained deploys).
+LLM_MODEL_DEFAULT_ALIAS = "latest_sonnet"
 LLM_MODEL_OVERRIDE = os.environ.get("HARNESS_COMPASS_MODEL", "").strip() or None
+
+# Reasoning-effort knob passed through to `ClaudeAgentOptions(effort=...)`.
+# "medium" balances signal quality with token cost for Compass's
+# mid-stakes pipeline (digest / audit / question generation / Tier B
+# output body review). Override with `HARNESS_COMPASS_EFFORT=low|medium|high|max`.
+LLM_EFFORT = os.environ.get("HARNESS_COMPASS_EFFORT", "").strip().lower() or "medium"
 
 # ---------------------------------------------------- CLAUDE.md markers
 # Marker pair delimiting Compass's managed block in the project
@@ -203,7 +218,9 @@ __all__ = [
     "LLM_MAX_TOKENS_DEFAULT",
     "LLM_MAX_TOKENS_BRIEFING",
     "LLM_MAX_TOKENS_AUDIT",
+    "LLM_MODEL_DEFAULT_ALIAS",
     "LLM_MODEL_OVERRIDE",
+    "LLM_EFFORT",
     "CLAUDE_MD_START_MARKER",
     "CLAUDE_MD_END_MARKER",
     "enabled_key",

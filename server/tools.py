@@ -2323,7 +2323,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             _get_role_default_model,
             _resolve_runtime_for,
         )
-        from server.models_catalog import resolve_model_alias
+        from server.models_catalog import (
+            resolve_model_alias,
+            role_default_effort,
+            role_default_plan_mode,
+        )
 
         scope_id = (args.get("player_id") or "").strip()
         if scope_id and not re.fullmatch(r"(coach|p([1-9]|10))", scope_id):
@@ -2383,11 +2387,21 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                         _EFFORT_VALUE_LABELS.get(int(effort_override))
                         if effort_override is not None else None
                     ),
+                    "resolved": _EFFORT_VALUE_LABELS.get(
+                        role_default_effort(sid)
+                        if effort_override is None
+                        else int(effort_override)
+                    ),
                 },
                 "plan_mode": {
                     "override": (
                         None if plan_override is None
                         else bool(int(plan_override))
+                    ),
+                    "resolved": (
+                        bool(int(plan_override))
+                        if plan_override is not None
+                        else role_default_plan_mode(sid)
                     ),
                 },
             })
@@ -2417,12 +2431,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             ef_cell = (
                 f"{r['effort']['override']} (override)"
                 if r["effort"]["override"]
-                else "default"
+                else f"{r['effort']['resolved']} (default)"
             ).ljust(10)[:10]
             pm_cell = (
                 "on" if r["plan_mode"]["override"] is True
                 else "off" if r["plan_mode"]["override"] is False
-                else "default"
+                else ("on (default)" if r["plan_mode"]["resolved"] else "off (default)")
             )
             lines.append(f"{slot}  {name}  {rt_cell}  {md_cell}  {ef_cell}  {pm_cell}")
         text = "\n".join(lines)

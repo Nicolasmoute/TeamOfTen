@@ -2353,17 +2353,22 @@ async def _build_coach_coordination_block() -> str:
 
 
 async def _get_role_default_model(agent_id: str, runtime_name: str = "claude") -> str | None:
-    """Read the per-role default model from team_config.
+    """Read the per-role default model.
 
-    Keys:
-      coach_default_model          Claude Coach default
-      players_default_model        Claude p1..p10 default
-      coach_default_model_codex    Codex Coach default
-      players_default_model_codex  Codex p1..p10 default
+    Lookup order:
+      1. team_config (human-set in the Settings drawer):
+         coach_default_model          Claude Coach default
+         players_default_model        Claude p1..p10 default
+         coach_default_model_codex    Codex Coach default
+         players_default_model_codex  Codex p1..p10 default
+      2. Hardcoded role default in `models_catalog._ROLE_MODEL_DEFAULTS`
+         (or `_ROLE_CODEX_MODEL_DEFAULTS` under runtime='codex').
+         Stored as tier aliases so a model bump only touches the alias
+         map; spawn-time `resolve_model_alias` translates to a concrete id.
 
-    Returns None when the row is missing / empty / unreadable so the
-    caller can fall back to the SDK default (or the per-pane override
-    that takes precedence upstream).
+    Returns None only when the role has no hardcoded default for the
+    given runtime (currently only Codex Coach), so the caller can fall
+    back to the SDK default.
     """
     role = "coach" if agent_id == "coach" else "players"
     suffix = "_codex" if runtime_name == "codex" else ""
@@ -2379,18 +2384,24 @@ async def _get_role_default_model(agent_id: str, runtime_name: str = "claude") -
             await c.close()
     except Exception:
         logger.exception("get_role_default_model failed: agent=%s", agent_id)
-        return None
-    if not row:
-        return None
-    val = (dict(row).get("value") or "").strip()
-    # team_config values are stored as JSON; unwrap if so, but tolerate
-    # a raw string too (future-proof for a manual DB edit).
-    if val.startswith('"') and val.endswith('"'):
-        try:
-            val = json.loads(val)
-        except Exception:
-            pass
-    return val or None
+        row = None
+    val = ""
+    if row:
+        val = (dict(row).get("value") or "").strip()
+        # team_config values are stored as JSON; unwrap if so, but tolerate
+        # a raw string too (future-proof for a manual DB edit).
+        if val.startswith('"') and val.endswith('"'):
+            try:
+                val = json.loads(val)
+            except Exception:
+                pass
+    if val:
+        return val
+    # Fall through to the hardcoded role default (alias form). Returns
+    # "" when no default is set for this role+runtime (e.g. Codex Coach).
+    from server.models_catalog import role_default_model
+    fallback = role_default_model(agent_id, runtime_name)
+    return fallback or None
 
 
 async def _get_team_extra_tools() -> list[str]:
@@ -4009,16 +4020,26 @@ async def run_agent(
     #   2. Coach-set per-(slot, project) override
     #      (`agent_project_roles.{plan_mode,effort}_override`, written
     #      via `coord_set_player_plan_mode` / `coord_set_player_effort`)
-    #   3. default (False / no thinking-budget override)
+    #   3. role-level default from `models_catalog`
+    #      (medium effort, plan_mode off — see `_ROLE_EFFORT_DEFAULTS` /
+    #      `_ROLE_PLAN_MODE_DEFAULTS`).
     # Fallbacks happen here in the dispatcher so the turn ledger row
     # records the effective values, and the same precedence applies to
     # both human-driven /api/agents/start spawns and Coach-triggered
     # auto-wakes (which call run_agent with plan_mode=None / effort=None).
+    from server.models_catalog import (
+        role_default_effort,
+        role_default_plan_mode,
+    )
     if plan_mode is None:
         plan_mode = await _get_agent_plan_mode_override(agent_id)
-    plan_mode = bool(plan_mode) if plan_mode is not None else False
+    if plan_mode is None:
+        plan_mode = role_default_plan_mode(agent_id)
+    plan_mode = bool(plan_mode)
     if effort is None:
         effort = await _get_agent_effort_override(agent_id)
+    if effort is None:
+        effort = role_default_effort(agent_id)
 
     # Per-turn context the ResultMessage handler appends to the turns
     # ledger. The runtime stamps started_at on each iterate call so
