@@ -1749,6 +1749,131 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         return _ok(f"{pid} → {name or '(no name)'} — {role or '(no role)'}")
 
     @tool(
+        "coord_set_player_runtime",
+        (
+            "Coach-only. Flip a Player between the Claude and Codex "
+            "runtimes. Stored on `agents.runtime_override`; resolution "
+            "at spawn time is per-slot override → role default in "
+            "team_config → 'claude'.\n"
+            "\n"
+            "Use this BEFORE coord_set_player_model when you want to set "
+            "a model from the other runtime family — the model tool "
+            "validates against the Player's currently-resolved runtime, "
+            "so a Codex model on a Claude-runtime Player is rejected "
+            "until you flip the runtime here first.\n"
+            "\n"
+            "An existing `model_override` is preserved across the flip "
+            "(spawn-time silently drops it if it doesn't fit the new "
+            "runtime, then re-applies it if you flip back). Set the "
+            "new model explicitly via coord_set_player_model after "
+            "flipping if you don't want fall-through to the role default.\n"
+            "\n"
+            "Codex requires the HARNESS_CODEX_ENABLED env flag — without "
+            "it, runtime='codex' is rejected. Mid-turn flips are also "
+            "rejected (the in-flight turn would be on the old runtime "
+            "while subsequent turns use the new one); cancel the Player "
+            "first if they're working.\n"
+            "\n"
+            "Emits a 'runtime_updated' event so the UI refreshes.\n"
+            "\n"
+            "Params:\n"
+            "- player_id: one of p1..p10 (required; cannot flip Coach's runtime)\n"
+            "- runtime: 'claude', 'codex', or empty string to clear (revert "
+            "to the role default)."
+        ),
+        {"player_id": str, "runtime": str},
+    )
+    async def set_player_runtime(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("Only Coach flips Player runtimes.")
+        pid = (args.get("player_id") or "").strip()
+        raw = (args.get("runtime") or "").strip().lower()
+        if not re.fullmatch(r"p([1-9]|10)", pid):
+            return _err(
+                f"invalid player_id '{pid}' — expected p1..p10 "
+                "(cannot flip Coach's runtime via MCP; ask the human)"
+            )
+        if raw == "":
+            runtime_value: str | None = None
+        elif raw in ("claude", "codex"):
+            runtime_value = raw
+        else:
+            return _err(
+                f"invalid runtime '{args.get('runtime')}' — must be "
+                "'claude', 'codex', or empty (clear)"
+            )
+
+        if runtime_value == "codex":
+            from server.runtimes import is_codex_enabled
+            if not is_codex_enabled():
+                return _err(
+                    "Codex runtime is gated behind HARNESS_CODEX_ENABLED. "
+                    "The human must set that env var on the deployment "
+                    "before any Player can run on Codex. Use "
+                    "coord_request_human to ask."
+                )
+
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT status FROM agents WHERE id = ?", (pid,)
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"player '{pid}' not found")
+            current_status = dict(row).get("status")
+            # Mirror PUT /api/agents/{id}/runtime: a mid-turn flip would
+            # leave the in-flight turn on the old runtime. Cancel first.
+            if current_status == "working":
+                return _err(
+                    f"{pid} is mid-turn — cancel their turn first (or "
+                    "wait for it to finish), then flip the runtime."
+                )
+            await c.execute(
+                "UPDATE agents SET runtime_override = ? WHERE id = ?",
+                (runtime_value, pid),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+
+        # Drop any cached Codex subprocess for this slot. Going codex →
+        # claude leaves the old client unused but still holding a proxy
+        # token + subprocess handle until the next MCP-config change or
+        # session clear. Going claude → codex is unaffected (no cached
+        # codex client existed). The mid-turn check above guarantees
+        # the slot is idle, so evict_client takes the full close path
+        # rather than the cache-pop fallback. Best-effort: a failure
+        # here is a tidy-up regression, not a correctness one (next
+        # turn rebuilds anyway), and tools.py's convention is to
+        # swallow on this kind of cleanup path.
+        try:
+            from server.runtimes.codex import evict_client as _codex_evict
+            await _codex_evict(pid)
+        except Exception:
+            pass
+
+        # Match the HTTP path: log against the target so the event lands
+        # in the Player's pane regardless of whether the human or Coach
+        # initiated the flip. Coach's own tool_use/tool_result pair
+        # already records "Coach called this" in Coach's timeline, so
+        # this avoids a duplicate. No `to` field — runtime_updated isn't
+        # in either fan-out registry (WS-side in app.js, SQL-side in
+        # main.py /api/events) so a `to` field would be dead weight.
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": pid,
+                "type": "runtime_updated",
+                "player_id": pid,
+                "runtime_override": runtime_value,
+            }
+        )
+        if runtime_value:
+            return _ok(f"{pid} runtime → {runtime_value}")
+        return _ok(f"{pid} runtime cleared (will use role default)")
+
+    @tool(
         "coord_set_player_model",
         (
             "Coach-only. Set or clear the model a Player runs on. "
@@ -1800,6 +1925,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         from server.models_catalog import (
             _CLAUDE_MODEL_WHITELIST,
             _CODEX_MODEL_WHITELIST,
+            model_is_claude,
+            model_is_codex,
         )
 
         if model:
@@ -1809,6 +1936,33 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 else _CLAUDE_MODEL_WHITELIST
             )
             if model not in whitelist:
+                # Distinguish "wrong runtime" (model is real, just on
+                # the other family) from "typo" so Coach knows whether
+                # to flip the runtime first or pick a different id.
+                # Without this split Coach reads the rejection as
+                # "harness blocked me" and stops, missing that the
+                # fix is `runtime_override` not a different model id.
+                other_runtime = (
+                    "codex" if runtime == "claude" and model_is_codex(model)
+                    else "claude" if runtime == "codex" and model_is_claude(model)
+                    else None
+                )
+                if other_runtime is not None:
+                    same_runtime_aliases = (
+                        "latest_opus / latest_sonnet / latest_haiku"
+                        if runtime == "claude"
+                        else "latest_gpt / latest_mini"
+                    )
+                    return _err(
+                        f"'{model}' is a {other_runtime} model, but {pid} "
+                        f"is on the {runtime} runtime. Flip the runtime "
+                        f"first via "
+                        f"coord_set_player_runtime(player_id='{pid}', "
+                        f"runtime='{other_runtime}'), then call "
+                        f"coord_set_player_model again. Or pick a "
+                        f"{runtime} model ({same_runtime_aliases}) to "
+                        f"keep the current runtime."
+                    )
                 family = "Codex" if runtime == "codex" else "Claude"
                 allowed = sorted(m for m in whitelist if m)
                 return _err(
@@ -2439,6 +2593,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         list_knowledge,
         list_team,
         set_player_role,
+        set_player_runtime,
         set_player_model,
         answer_question,
         answer_plan,
@@ -2493,6 +2648,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_save_output",
     "mcp__coord__coord_list_team",
     "mcp__coord__coord_set_player_role",
+    "mcp__coord__coord_set_player_runtime",
     "mcp__coord__coord_set_player_model",
     "mcp__coord__coord_answer_question",
     "mcp__coord__coord_answer_plan",

@@ -712,23 +712,27 @@ async def test_compose_tick_prompt_resets_after_objectives_saved(
 
 def test_tick_base_prompt_constant_matches_spec() -> None:
     # Spec §4 — the tick prompt orients Coach to a priority order:
-    # inbox → coach-todos → objectives → end-quietly. The empty-state
-    # branch (objectives) explicitly directs Coach to take a concrete
-    # action rather than just "advance" something vague. Tests pin
-    # the structural pieces, not the verbatim string, so wording can
-    # be tuned without breaking unrelated tests.
+    # inbox → coach-todos → objectives. Step (3) is intentionally
+    # directive: Coach must take action when objectives exist. Only
+    # when objectives are absent or empty does Coach end the turn
+    # quietly. Tests pin the structural pieces, not the verbatim
+    # string, so wording can be tuned without breaking other tests.
     p = recmod.TICK_BASE_PROMPT
     assert p.startswith("Routine tick.")
     assert "Inbox" in p
     assert "coord_read_inbox" in p
     assert "coach-todos" in p
-    assert "Project objectives" in p
-    # Concrete action language for the empty-state branch — not just
-    # "advance objectives" which is what the original wording said.
+    assert "objective" in p.lower()
+    # Concrete action language for the empty-inbox/todos branch.
     assert "concrete action" in p
-    # Empty-state guard preserved: do not invent work.
-    assert "Don't invent work" in p
-    assert "without calling tools" in p
+    # Step (3) must be emphatic — Coach must NOT idle when objectives
+    # exist. Pin the directive language so a future rewrite can't
+    # silently soften it back to "if there's nothing useful to do".
+    assert "must" in p.lower()
+    # End-quietly path is gated on objectives being absent — not on
+    # inbox/todos being empty.
+    assert "absent" in p or "empty" in p
+    assert "Project objectives" in p
 
 
 async def test_scheduler_uses_compose_tick_prompt(

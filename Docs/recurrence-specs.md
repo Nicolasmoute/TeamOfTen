@@ -1,7 +1,13 @@
 # Coach Recurrence v2 — Specification
 
-Status: design draft for implementation. Will fold into `Docs/TOT-specs.md`
-once shipped.
+> **Subordinate to `Docs/TOT-specs.md`.** When this doc and TOT-specs
+> disagree, TOT-specs wins. This file goes deeper on Coach recurrences
+> (tick / repeat / cron, coach-todos, project-objectives) but cannot
+> redefine fields, endpoints, events, or invariants that TOT-specs
+> declares.
+
+Status: shipped. TOT-specs §11.3 carries the operational summary; this
+file is the design reference.
 
 This spec replaces today's `/loop`, `/repeat`, and `/tick` with a unified,
 project-scoped, persisted recurrence model, plus two new project artifacts —
@@ -93,7 +99,9 @@ with no tick; the operator enables it via `/tick 60` or the pane.
 ### 3.3 `project-objectives.md`
 
 - **Path:** `/data/projects/<slug>/project-objectives.md`.
-- **kDrive mirror:** yes.
+- **kDrive mirror:** yes (synchronous on `PUT /api/projects/{id}/
+  objectives`; the periodic project sync loop covers other writers
+  like Coach via the Write tool).
 - **Format:** free-form markdown. No mandated sections — operator describes
   goals however they like.
 - **Injected** into Coach's system prompt every turn alongside CLAUDE.md
@@ -118,38 +126,52 @@ prompt from project state, with priority:
 2. **Todos** — if `coach-todos.md` has open entries, pick the most relevant
    (consider deadlines, dependencies) and act on it.
 3. **Objectives** — if no inbox items and no open todos, consult
-   `project-objectives.md` and either:
-   - propose a single useful action toward an objective and take it, or
-   - add a new entry to `coach-todos.md` for human review.
-4. **Empty state** — if all three are empty (no inbox, no todos, objectives
-   absent or empty), end the turn without calling tools. Do not invent
-   work. The next tick will check again.
+   `project-objectives.md` and pick **one concrete action** that
+   materially advances an objective. Coach must take action on every
+   fire when objectives exist; this branch is the whole point of a
+   recurring tick. Action shapes include: assign a Player, send a
+   status update or coordination message, add a new coach-todo for
+   the operator to refine, audit Player work in progress, or just
+   propose a useful next step and execute it.
+4. **Empty state — objectives absent or empty** — only when no
+   `## Project objectives` section appears in the system prompt
+   (file missing, empty, or fully whitespace) does Coach end the
+   turn without acting. The next tick will check again.
 
 The composed prompt is sent as a normal user-role message. The system prompt
 already contains the project objectives + open todos (see §6), so the user
 prompt is short — it just orients Coach to the priority order:
 
-> Routine tick. Priority order:
+> Routine tick. Work the project — do something useful every fire.
 >
-> (1) Inbox — call coord_read_inbox and respond to anything pending from the
-> human or your teammates.
-> (2) Outstanding coach-todos — pick the one most aligned with current
-> priorities and act on it (assign it, break it down, or do the work).
-> (3) Project objectives — if inbox and todos are both empty, take one
-> concrete action that pushes the project closer to its objectives:
-> propose a useful next step and execute it, break a goal into a new
-> coach-todo for the operator to refine, or send a status update to the
-> team.
+> Priority order:
 >
-> Don't invent work. If there's genuinely nothing useful to do, end the
-> turn without calling tools.
+> (1) Inbox first — call coord_read_inbox. Respond to anything pending
+> from the human or your teammates.
+> (2) Open coach-todos — if inbox is clear, pick the todo most aligned
+> with current priorities and act on it (assign to a Player, break it
+> into smaller steps, or do the work yourself).
+> (3) Drive the objectives — if inbox AND todos are both empty, you
+> must still pick one concrete action that materially advances a
+> project objective. Examples: assign a Player to scout an open
+> question, send a status update or coordination message, capture a
+> new coach-todo for the operator to refine, audit recent Player work
+> for blockers, propose a useful next step and execute it. Don't end
+> the turn idle when objectives exist — invent forward motion
+> grounded in them.
+>
+> Only end the turn without acting when project objectives are absent
+> or empty (no "## Project objectives" section in your system
+> prompt). In that case, end quietly — there's nothing to anchor
+> invented work to.
 
-The objectives branch is intentionally directive — earlier wording ("advance
-project objectives") was too vague to push Coach off the fence on a quiet
-day. The current wording asks for **one concrete action** with three
-example shapes (execute a step, capture a coach-todo, share a status
-update), so an empty-inbox tick produces visible forward motion when there
-*is* useful work, and end-quietly when there isn't.
+The objectives branch is intentionally directive. Earlier wording asked
+for "one concrete action" but closed with a blanket "Don't invent work"
+line; in practice Coach read the closer as the dominant rule and ended
+quiet ticks idle even when the project had clear objectives. The fix
+makes step (3) emphatic ("you must still pick one concrete action") and
+gates the end-quietly path strictly on objectives being absent — nothing
+else.
 
 This replaces today's `COACH_TICK_PROMPT`.
 
@@ -172,9 +194,9 @@ recurring:= "daily" TIME
           | "weekly" DAY TIME          # e.g. "weekly mon 09:00"
           | "monthly" DAY_OF_MONTH TIME  # e.g. "monthly 1 09:00"
 
-TIME      := HH:MM (24h)
+TIME      := HH:MM (24h, leading-zero hour required, e.g. "09:00" not "9:00")
 DAY       := mon | tue | wed | thu | fri | sat | sun
-DAY_LIST  := DAY ("," DAY)+
+DAY_LIST  := DAY ("," DAY)+         # ≥2 days; single days use `weekly DAY TIME`
 DAY_OF_MONTH := 1..31
 ISO_DATE  := YYYY-MM-DD
 ```
@@ -186,6 +208,12 @@ Examples:
 - `mon,thu 14:00`
 - `monthly 1 09:00`
 - `2026-05-01 10:00` (one-shot)
+
+The parser is strict on both fronts: `9:00` is rejected (single-digit
+hour) and a bare `mon 09:00` is rejected (single-day shorthand requires
+the `weekly` keyword). UI cron edits validate against the same grammar
+client-side so the Save button is disabled on bad input — no
+round-trip-to-400 needed.
 
 ### 5.2 Timezone
 
@@ -326,13 +354,19 @@ itself starts with a digit.
 ```
 GET    /api/recurrences
 POST   /api/recurrences         # create repeat or cron
-PATCH  /api/recurrences/{id}    # edit prompt / cadence / enabled
+PATCH  /api/recurrences/{id}    # edit prompt / cadence / tz / enabled
 DELETE /api/recurrences/{id}
 
 POST   /api/coach/tick          # fire one tick now (kept; semantics unchanged)
 PUT    /api/coach/tick          # set recurring tick interval
                                 # body: {"minutes": 60}  or {"enabled": false}
 ```
+
+**Active-project scoping.** PATCH and DELETE return `404` when the
+target row's `project_id` differs from the active project — the
+operator should switch to that project first. POST always creates
+under the active project. This stops a stale UI tab from mutating a
+project that's no longer active.
 
 `GET /api/recurrences` returns rows scoped to the active project, ordered
 by kind then created_at. Response shape:
@@ -354,11 +388,20 @@ by kind then created_at. Response shape:
 ```
 GET    /api/projects/{slug}/coach-todos        # parsed array of todos
 PUT    /api/projects/{slug}/coach-todos        # full-file replace, validated
+POST   /api/projects/{slug}/coach-todos        # add one (HTTP shim for EnvPane)
+PATCH  /api/projects/{slug}/coach-todos/{id}   # edit fields (HTTP shim)
+POST   /api/projects/{slug}/coach-todos/{id}/complete  # mark done (HTTP shim)
 GET    /api/projects/{slug}/coach-todos/archive
 ```
 
-Individual add/complete/update go through the MCP tools; the GET/PUT endpoints
-are for the EnvPane editor.
+Individual add/complete/update have **two paths**: Coach uses the MCP
+tools (`coord_add_todo` / `coord_complete_todo` / `coord_update_todo`);
+the EnvPane uses the HTTP shim (POST / PATCH / complete) that wraps
+the same helpers. Both emit the spec §13 events with `agent_id="coach"`
+so they fan into Coach's pane regardless of trigger. The PUT endpoint
+is the operator's escape hatch for hand-editing the whole file at
+once; it parses + validates the body before writing through the same
+synchronous kDrive mirror as the per-entry helpers.
 
 ### Project objectives
 
@@ -397,12 +440,20 @@ CREATE UNIQUE INDEX idx_recurrence_one_tick
   ON coach_recurrence(project_id) WHERE kind = 'tick';
 ```
 
-Migration: `recurrence_v1`. Stamps `team_config.schema_version`.
+Migration: `recurrence_v1`. Stamps two `team_config` rows:
+
+- `recurrence_v1_seeded` = `'1'` — gates the one-shot env-var seed so
+  later boots skip seeding regardless of the env var.
+- `schema_version` = `'recurrence_v1'` — forward-compatible signal for
+  a future versioned-migration runner; today's codebase otherwise
+  relies on `CREATE TABLE IF NOT EXISTS`.
 
 On migration, copy over today's in-memory tick interval (if non-zero, from
-`HARNESS_COACH_TICK_INTERVAL` env) into a new tick row for the active
-project. Today's `/repeat` state is in-memory and not migrated — operator
-re-issues the slash command if they want it back.
+`HARNESS_COACH_TICK_INTERVAL` env) into a tick row for **every existing
+project** (not just active) so a multi-project install carries the
+operator's intent across all of them. Today's `/repeat` state is
+in-memory and not migrated — operator re-issues the slash command if
+they want it back.
 
 ---
 
@@ -414,9 +465,16 @@ loops. On every tick (every 30 seconds, configurable via
 
 1. Read all enabled rows for the **active project** where
    `next_fire_at <= now_utc`.
-2. For each due row:
-   - If Coach is mid-turn → emit `recurrence_skipped`, advance
-     `next_fire_at` past now, continue.
+2. For each due row (sequentially; see §15.1 for ordering):
+   - If Coach is mid-turn OR a prior row in this same pass already
+     fired → emit `recurrence_skipped` (reason `coach_busy`), advance
+     `next_fire_at` past now, continue. Tracking the "already fired
+     this pass" flag locally is essential because `await run_agent`
+     blocks until the Coach turn completes — without the flag, the
+     next due row would see `_coach_is_working() == False` again and
+     stack onto the just-finished turn.
+   - Else if the daily cost cap is hit → emit `recurrence_skipped`
+     (reason `cost_capped`), advance `next_fire_at`, continue.
    - Else → spawn the appropriate Coach turn:
      - `tick` → §4 composed prompt.
      - `repeat` → row's `prompt`.
@@ -424,6 +482,12 @@ loops. On every tick (every 30 seconds, configurable via
    - Emit `recurrence_fired` with row id and kind.
    - For one-shot crons, set `enabled=false` and emit `recurrence_disabled`
      with `reason: one_shot_complete`.
+   - **One-shot terminal skip ordering**: when a one-shot cron is both
+     past AND skipped (busy / cost-capped), the harness emits
+     `recurrence_skipped` first, then `recurrence_disabled` with
+     `reason: one_shot_complete`. The skip carries the cause; the
+     disable closes the row. Both events are needed so the operator
+     can audit why a one-shot never fired.
 3. Recompute `next_fire_at`:
    - tick / repeat: `last_fired_at + cadence_minutes` (in UTC).
    - cron: parse DSL, compute next match in row's TZ, convert to UTC.
@@ -530,19 +594,31 @@ Both panes refresh on these WebSocket events:
 
 | Event type | Payload | Where surfaced |
 |---|---|---|
-| `recurrence_added` | id, kind, cadence, tz, prompt | Coach pane (system row) + Recurrence pane |
-| `recurrence_changed` | id, before, after | Recurrence pane only |
-| `recurrence_deleted` | id, kind | Recurrence pane only |
-| `recurrence_fired` | id, kind, prompt_excerpt | Coach pane (subtle, sticky off) |
-| `recurrence_skipped` | id, kind, reason ("coach_busy") | Coach pane (system row) |
-| `recurrence_disabled` | id, kind, reason | Coach pane + Recurrence pane |
-| `coach_todo_added` | id, title | Coach pane + EnvPane |
+| `recurrence_added` | id, kind, cadence, tz, prompt, enabled, project_id | Coach pane (system row) + Recurrence pane |
+| `recurrence_changed` | id, kind, before, after, project_id | Recurrence pane only |
+| `recurrence_deleted` | id, kind, project_id | Recurrence pane only |
+| `recurrence_fired` | id, kind, prompt_excerpt, project_id | Coach pane (subtle, sticky off) |
+| `recurrence_skipped` | id, kind, reason (`"coach_busy"` / `"cost_capped"`), project_id | Coach pane (system row) |
+| `recurrence_disabled` | id, kind, reason (`"one_shot_complete"`), project_id | Coach pane + Recurrence pane |
+| `coach_todo_added` | id, title, due | Coach pane + EnvPane |
 | `coach_todo_completed` | id, title | Coach pane + EnvPane |
-| `coach_todo_updated` | id, fields | EnvPane |
-| `objectives_updated` | (no payload) | EnvPane (full re-read) |
+| `coach_todo_updated` | id, fields | Coach pane + EnvPane |
+| `objectives_updated` | project_id | EnvPane (full re-read) |
 
-All events have the standard envelope (`__id`, `agent_id`, `ts`, etc.).
-`recurrence_*` events use `agent_id="coach"` so they fan into Coach's pane.
+All events have the standard envelope (`__id`, `agent_id`, `ts`,
+`project_id`). `recurrence_*` and `coach_todo_*` events all use
+`agent_id="coach"` so they fan into Coach's pane regardless of who
+triggered them (scheduler / Coach via MCP / human via HTTP shim);
+the `actor` envelope key records the real audit trigger
+(`{source, ip, ua}`) so cross-device introspection still works.
+
+`before`/`after` snapshots in `recurrence_changed` are
+`{cadence, enabled, tz, prompt}` dicts. For tick rows, `tz` and
+`prompt` are always `null` but the keys are present so a UI consumer
+can index uniformly across kinds. `enabled` is included on
+`recurrence_added` (not in original spec table) because the row's
+enabled state is part of "what just got created" — useful for the UI
+in case future endpoints allow creating disabled rows.
 
 ---
 
@@ -586,9 +662,15 @@ When `coord_create_project` (or whatever creates a project today) runs:
 ## 15. Edge cases & invariants
 
 1. **Multiple due rows in one scheduler tick**: fire them sequentially
-   (don't parallelize Coach turns). After the first fires, the rest see
-   "coach_busy" and skip; their `next_fire_at` advances past the first
-   fire's end.
+   (don't parallelize Coach turns). After the first fires, the rest
+   skip with `reason="coach_busy"`; their `next_fire_at` advances past
+   the first fire's end. Implementation note: because the scheduler
+   `await`s the full Coach turn in `_fire_row`, by the time the next
+   row's iteration runs `_coach_is_working()` would return `False`
+   again — so the loop also keeps a local `fired_in_pass` flag and
+   forces `busy=True` for any subsequent rows in the same pass.
+   Without that flag, a busy day with several due rows would stack
+   turns back-to-back instead of skipping.
 
 2. **Project switch mid-fire**: the in-flight Coach turn completes against
    the original project. The scheduler's next pass picks up the new
@@ -602,16 +684,32 @@ When `coord_create_project` (or whatever creates a project today) runs:
    error. ("That schedule is in the past.")
 
 5. **Tick fires while objectives empty**:
-   - First time → Coach asks operator to define objectives.
-   - Subsequent times (operator hasn't responded yet) → Coach ends turn
-     quietly (no inbox, no todos, no objectives = no work, per §4 step 4).
-   - Once objectives are saved, normal operation resumes on the next tick.
+   - First time → tick prompt appends an elicitation hint asking the
+     operator to define objectives; Coach decides whether to actually
+     send it based on the inbox/todos priority order.
+   - Subsequent ticks → harness scans Coach's last 50 outgoing
+     `message_sent` events for objectives-related wording
+     (`project-objectives.md`, `define...objectives`, `trying to
+     accomplish`); if Coach has already asked, the elicitation hint
+     is suppressed. This replaced an earlier `team_config` flag that
+     marked the elicitation as "asked" the first time the harness
+     even *considered* showing it — which suppressed the hint even
+     when Coach never actually saw it (busy inbox, etc.). The
+     event-log scan is the source of truth: Coach's actual behavior
+     drives what the next tick sees.
+   - Once objectives are saved, the system-prompt injector picks up
+     the file on the next turn and the elicitation hint stops
+     appearing entirely (presence check short-circuits the scan).
 
-6. **Coach todos file becomes corrupted by hand-editing**: PUT endpoint
-   validates shape and rejects invalid markdown; MCP tools also validate.
-   If the file is corrupted out-of-band, the system-prompt injector
-   surfaces the raw content and Coach reports the parse failure on the
-   next turn.
+6. **Coach todos file becomes corrupted by hand-editing**: the PUT
+   `/api/projects/{slug}/coach-todos` endpoint parses the body
+   through `coach_todos.parse` and rejects payloads that look like
+   bullets but yield zero parseable entries (heuristic: contains
+   `- [` but no `<!-- id:t-N -->`). MCP tools also validate every
+   write. If the file is corrupted out-of-band (someone edits via
+   the kDrive web UI), the system-prompt injector surfaces only the
+   parseable subset and Coach reports the parse failure on the next
+   turn — non-fatal, the rest of the team is unaffected.
 
 7. **Project deleted while recurrences exist**: `ON DELETE CASCADE` on the
    FK drops the rows. Scheduler's next pass sees no rows for that project.
@@ -627,6 +725,25 @@ When `coord_create_project` (or whatever creates a project today) runs:
 10. **Telegram trigger interaction**: incoming Telegram messages still
     auto-wake Coach. They are a separate trigger path and do not interact
     with the recurrence scheduler.
+
+11. **Cross-project mutation via stale UI**: PATCH and DELETE on
+    `/api/recurrences/{id}` are scoped to the active project and
+    return `404` for rows belonging to other projects. Without this
+    guard, a stale browser tab pinned to project A could silently
+    mutate project B's recurrences after the operator switched —
+    and the operator would have no way to see the change in their
+    Recurrence pane (which only lists active-project rows). POST is
+    inherently scoped because it always creates under the active
+    project.
+
+12. **Cron edits and timezone re-anchoring**: the Recurrence pane
+    sends the browser's current TZ on every cron-row save, so a move
+    (DST shift, laptop relocation, switching from local to UTC for
+    a remote install) is reflected in the next computed fire. The
+    DB row's `tz` column is the source of truth — the spec §5.2
+    "TZ captured at save time, re-saving picks up the operator's
+    current TZ" rule is enforced client-side, not requiring an
+    explicit re-save click.
 
 ---
 

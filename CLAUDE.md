@@ -959,6 +959,99 @@ Players. Spec: [Docs/compass-specs.md](Docs/compass-specs.md).
   merged count. The `skipped` flag is only set when both sources
   yield zero servers.
 
+**Recent (2026-05-02) — Coach Codex orchestration unblock:**
+
+User reported a cascade where Coach (under Codex runtime) repeatedly
+hit "blocked by safety policy" errors when trying to activate a fresh
+Player. Root cause was a missing tool, not a real harness block —
+Coach hallucinated a `runtime_override` kwarg on `coord_set_player_model`
+because there was no MCP path to actually flip a Player's runtime,
+and the cascade of failed attempts within the turn eventually tripped
+OpenAI's Codex safety monitor, which cancelled the subsequent
+`coord_assign_task` call.
+
+- **`coord_set_player_runtime(player_id, runtime)` MCP tool**
+  ([server/tools.py](server/tools.py)). Coach-only, p1..p10 (cannot
+  flip Coach itself — HTTP-only path). `'codex'` rejected when
+  `HARNESS_CODEX_ENABLED` is unset. Mid-turn flips rejected (mirrors
+  the HTTP endpoint's 409). Existing `model_override` preserved
+  across the flip; spawn-time silently drops it if it doesn't fit
+  the new runtime. Emits `runtime_updated` with `agent_id=pid`
+  matching the HTTP `PUT /api/agents/{id}/runtime` shape — the event
+  lands in the target Player's pane regardless of who initiated the
+  flip. Coach's natural `tool_use`/`tool_result` pair already records
+  the action in Coach's timeline, so a duplicate `runtime_updated`
+  there would be noise; and `runtime_updated` isn't a fan-out type in
+  either the WS-side handler or the `/api/events` SQL filter, so a
+  `to` field would be dead weight. Side-effect:
+  invalidates the Codex client cache for the slot
+  (`evict_client`) so a codex→claude flip doesn't leak the cached
+  subprocess + proxy token until the next MCP-config change.
+  Bumped `_CODEX_TOOL_CONTRACT_VERSION` to
+  `2026-05-02.coord-set-player-runtime` so existing Codex threads
+  get cleared on next boot and pick up the new tool.
+
+- **Cross-runtime model error message** in
+  `coord_set_player_model`. Previously the validator emitted
+  "unknown Claude model 'gpt-5.5' for p8 (runtime=claude)" when
+  Coach tried a Codex model on a Claude-runtime Player. Coach
+  paraphrased that as "harness safety layer blocked me" and gave up.
+  Now the validator detects the cross-runtime case via
+  `model_is_claude` / `model_is_codex` and returns an actionable
+  pointer at `coord_set_player_runtime` — no more dead-end errors.
+  `MODEL_GUIDANCE` in
+  [server/models_catalog.py](server/models_catalog.py) updated
+  to mention the new tool; Coach's tool catalogue in
+  [server/agents.py](server/agents.py) lists it ahead of
+  `coord_set_player_model` with a "required first" note.
+
+- **Codex `thread/resume` retry on `CodexTimeoutError`**
+  ([server/runtimes/codex.py:open_thread](server/runtimes/codex.py)).
+  The SDK's default `request_timeout` is 30s; under load (cold
+  app-server subprocess, slow Codex backend, large stored thread
+  state — Coach especially) `thread/resume` can transiently exceed
+  it. Previously every exception cleared the stored
+  `codex_thread_id` and fell back to `start_thread`, costing the
+  agent its thread continuity for what was usually a transient
+  blip. Now `CodexTimeoutError` retries 2× (3 attempts, 1s gap)
+  before falling back; `session_resume_failed` only fires once
+  retries are exhausted. Other exception classes (CodexProtocolError
+  "thread not found", transport errors) skip the retry — they're
+  not transient. Spec mirror in `Docs/CODEX_RUNTIME_SPEC.md` §E.2.
+
+- **Codex monitor cancellation rendered as error.**
+  `_step_payload_is_error` in
+  [server/runtimes/codex.py](server/runtimes/codex.py) previously
+  treated only `status` containing `"error"` / `"fail"` as an error.
+  OpenAI's Codex safety monitor surfaces a cancelled tool call as
+  a "completed" item with `status='cancelled'` (or similar) and a
+  prose explanation in the body — these used to render green like
+  a successful tool result, leaving the user no way to tell a
+  monitor refusal from a real success without reading every body.
+  Now `"cancel"` and `"reject"` patterns also fire the error path.
+  The same change covers `state` key as a fallback for `status`.
+
+- **Codex auto-compact wired up.**
+  `CodexRuntime.maybe_auto_compact` previously returned False
+  unconditionally — the original "context-pressure signal isn't
+  exposed yet" rationale was stale once
+  `_codex_session_context_estimate` shipped (it reads the latest
+  `turns` row for the resumed thread and reconstructs prompt+output
+  tokens in the same shape Claude's JSONL probe produces; the UI
+  context bar already used it). Trip-wire now mirrors Claude's:
+  honors the shared `HARNESS_AUTO_COMPACT_THRESHOLD` env (default
+  0.7), short-circuits on `compact_mode` / unparseable threshold /
+  no `codex_thread_id`, computes `used / window` against
+  `_context_window_for(tc.model)`, emits `auto_compact_triggered`
+  with the same payload shape, then delegates to `run_manual_compact`
+  so the actual compaction goes through the **native**
+  `client.compact_thread(thread_id)` endpoint (not a `COMPACT_PROMPT`
+  LLM round-trip). The dispatcher then runs the user's original
+  prompt on a fresh thread that picks up the continuity note from
+  the system prompt. Failure paths (auth gone, ImportError,
+  app-server exception) emit `auto_compact_failed` symmetrically with
+  Claude. Spec mirror in `Docs/CODEX_RUNTIME_SPEC.md` §A.5 / §E.6.
+
 **Next likely:**
 - **Mobile UI polish** — touch-drag doesn't work with HTML5 DnD;
    layout breakpoints for < 900 px need a rethink.

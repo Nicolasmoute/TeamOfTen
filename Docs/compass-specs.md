@@ -1,6 +1,11 @@
 # Compass — Specification
 
-**Status:** Design specification, ready for implementation
+> **Subordinate to `Docs/TOT-specs.md`.** When this doc and TOT-specs
+> disagree, TOT-specs wins. This file goes deeper on Compass (lattice,
+> regions, truth corpus, audits, briefings) but cannot redefine
+> fields, endpoints, events, or invariants that TOT-specs declares.
+
+**Status:** Shipped (2026-05-01).
 **Target:** TeamOfTen multi-agent harness (Python, Claude Agent SDK, kDrive-backed shared state, single-VPS)
 **Version:** 0.2
 

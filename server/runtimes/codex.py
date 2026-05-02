@@ -57,7 +57,7 @@ _client_locks: dict[str, asyncio.Lock] = {}
 
 # Bump when the Codex-visible coord tool contract changes in a way that
 # old persisted Codex threads might not pick up on resume.
-_CODEX_TOOL_CONTRACT_VERSION = "2026-04-29.coord-mcp-names-v2"
+_CODEX_TOOL_CONTRACT_VERSION = "2026-05-02.coord-set-player-runtime"
 
 
 class _CapturedStdioTransport:
@@ -518,6 +518,18 @@ async def ensure_codex_tool_contract_current() -> int:
         await c.close()
 
 
+# Number of extra resume attempts on `CodexTimeoutError` before we give
+# up and fall back to `start_thread`. The SDK's default `request_timeout`
+# is 30s; under load (cold app-server subprocess, slow Codex backend, or
+# a thread with substantial state — Coach is the usual victim) `thread/
+# resume` can transiently exceed it. Treating every timeout as a stale
+# thread loses continuity unnecessarily; retrying first preserves it.
+# Genuine stale-thread errors raise `CodexProtocolError` immediately and
+# don't go through this path.
+_CODEX_RESUME_TIMEOUT_RETRIES = 2
+_CODEX_RESUME_TIMEOUT_RETRY_DELAY = 1.0
+
+
 async def open_thread(
     agent_id: str,
     client: Any,
@@ -528,6 +540,10 @@ async def open_thread(
     appropriate. Implements §E.2's stale-thread auto-heal: if a stored
     `codex_thread_id` fails to resume (any non-cancellation exception),
     null it and fall back to `start_thread` once.
+
+    `CodexTimeoutError` on `thread/resume` is retried a small number of
+    times before falling back, since it's typically a transient backend
+    blip rather than a real stale-thread signal — see §E.2.
 
     Returns `(thread_handle, resumed: bool)` so the dispatcher can stamp
     the `agent_started` event with the right `resumed_session` flag.
@@ -543,32 +559,53 @@ async def open_thread(
     """
     existing = await _get_codex_thread_id(agent_id)
     if existing:
-        try:
-            r = client.resume_thread(existing, overrides=config)
-            if hasattr(r, "__await__"):
-                r = await r
-            return (r, True)
-        except Exception as exc:
-            logger.exception(
-                "CodexRuntime: resume_thread failed for slot=%s "
-                "thread_id=%s — clearing and retrying with start_thread",
-                agent_id, existing,
-            )
+        sdk = _import_codex_sdk()
+        timeout_cls = getattr(sdk, "CodexTimeoutError", None)
+        last_exc: Exception | None = None
+        for attempt in range(_CODEX_RESUME_TIMEOUT_RETRIES + 1):
             try:
-                from server.agents import _emit
-                await _emit(
-                    agent_id,
-                    "session_resume_failed",
-                    session_id=existing,
-                    error=f"{type(exc).__name__}: {exc}",
-                    runtime="codex",
+                r = client.resume_thread(existing, overrides=config)
+                if hasattr(r, "__await__"):
+                    r = await r
+                return (r, True)
+            except Exception as exc:
+                last_exc = exc
+                is_timeout = (
+                    timeout_cls is not None and isinstance(exc, timeout_cls)
                 )
-            except Exception:
-                logger.exception(
-                    "CodexRuntime: session_resume_failed emit failed for slot=%s",
-                    agent_id,
-                )
-            await _clear_codex_thread_id(agent_id)
+                if is_timeout and attempt < _CODEX_RESUME_TIMEOUT_RETRIES:
+                    logger.warning(
+                        "CodexRuntime: resume_thread timed out for slot=%s "
+                        "thread_id=%s (attempt %d/%d) — retrying",
+                        agent_id, existing,
+                        attempt + 1, _CODEX_RESUME_TIMEOUT_RETRIES + 1,
+                    )
+                    await asyncio.sleep(_CODEX_RESUME_TIMEOUT_RETRY_DELAY)
+                    continue
+                break
+
+        assert last_exc is not None
+        logger.exception(
+            "CodexRuntime: resume_thread failed for slot=%s "
+            "thread_id=%s — clearing and retrying with start_thread",
+            agent_id, existing,
+            exc_info=last_exc,
+        )
+        try:
+            from server.agents import _emit
+            await _emit(
+                agent_id,
+                "session_resume_failed",
+                session_id=existing,
+                error=f"{type(last_exc).__name__}: {last_exc}",
+                runtime="codex",
+            )
+        except Exception:
+            logger.exception(
+                "CodexRuntime: session_resume_failed emit failed for slot=%s",
+                agent_id,
+            )
+        await _clear_codex_thread_id(agent_id)
 
     r = client.start_thread(config)
     if hasattr(r, "__await__"):
@@ -1149,7 +1186,19 @@ def _extract_step_tool_result(item_payload: Mapping[str, Any]) -> str | None:
 
 def _step_payload_is_error(item_payload: Mapping[str, Any]) -> bool:
     status = str(item_payload.get("status") or item_payload.get("state") or "").lower()
-    if "error" in status or "fail" in status:
+    # `cancel` / `reject` cover the OpenAI Codex safety-monitor path: a
+    # tool call the monitor refuses lands as a "completed" item with
+    # status='cancelled' (or similar) and a prose explanation in the
+    # body. Without these patterns the result renders green, which made
+    # past monitor cancellations indistinguishable from a real success
+    # in the UI — and Coach paraphrased them as generic "rejected by
+    # the coordination layer" because there was no clean error signal.
+    if (
+        "error" in status
+        or "fail" in status
+        or "cancel" in status
+        or "reject" in status
+    ):
         return True
     exit_code = (
         item_payload.get("exit_code")
@@ -1798,10 +1847,89 @@ class CodexRuntime:
                     )
 
     async def maybe_auto_compact(self, tc: TurnContext) -> bool:
-        """Disabled in v1 — Codex app-server doesn't expose a usable
-        context-pressure signal yet. Return False so the dispatcher
-        proceeds straight to run_turn. See spec §A.5 / §E.6."""
-        return False
+        """Auto-compact trip-wire — Codex shape.
+
+        Mirrors `ClaudeRuntime.maybe_auto_compact` but uses the native
+        `client.compact_thread(thread_id)` path (via
+        `run_manual_compact`) instead of running a `COMPACT_PROMPT`
+        turn. Reads the same `HARNESS_AUTO_COMPACT_THRESHOLD` env
+        (default 0.7) so behavior is symmetric across runtimes.
+
+        Context-pressure signal comes from
+        `_codex_session_context_estimate(thread_id)` — reads the latest
+        `turns` row for the thread and reconstructs prompt+output
+        tokens. That signal didn't exist when this runtime first
+        shipped (hence the original "disabled" caveat in §A.5/§E.6);
+        it does now, so the trip-wire matches Claude's.
+
+        Returns False when:
+          - this call is itself the compact turn (avoid recursion),
+          - the env threshold is unset / 0 / unparseable,
+          - there is no prior Codex thread,
+          - the used/window ratio is below threshold,
+          - or the compact attempt fails (logged + emitted; the user's
+            original turn proceeds on the original thread).
+        """
+        if tc.compact_mode:
+            return False
+        threshold_env = os.environ.get("HARNESS_AUTO_COMPACT_THRESHOLD", "0.7")
+        try:
+            threshold = float(threshold_env)
+        except ValueError:
+            threshold = 0.7
+        if not (0.0 < threshold < 1.0):
+            return False
+
+        from server.agents import (
+            _codex_session_context_estimate,
+            _context_window_for,
+            _emit,
+        )
+
+        prior_thread = await _get_codex_thread_id(tc.agent_id)
+        if not prior_thread:
+            return False
+        used = await _codex_session_context_estimate(prior_thread)
+        ctx_max = _context_window_for(tc.model)
+        if ctx_max <= 0 or used / ctx_max < threshold:
+            return False
+
+        await _emit(
+            tc.agent_id,
+            "auto_compact_triggered",
+            used_tokens=used,
+            context_window=ctx_max,
+            ratio=round(used / ctx_max, 3),
+            threshold=threshold,
+            deferred_prompt=tc.prompt,
+        )
+        # Mark the throwaway TurnContext compact-mode for symmetry with
+        # Claude's run_manual_compact (defensive against any future code
+        # path that consults `tc.compact_mode` to avoid recursion). The
+        # dispatcher creates a fresh TurnContext for the actual user
+        # turn after maybe_auto_compact returns, so these mutations
+        # don't bleed into the deferred prompt.
+        tc.compact_mode = True
+        tc.auto_compact = True
+        tc.turn_ctx["compact_mode"] = True
+        tc.turn_ctx["auto_compact"] = True
+        try:
+            await self.run_manual_compact(tc)
+        except Exception:
+            logger.exception(
+                "codex auto-compact failed for %s; proceeding on original thread",
+                tc.agent_id,
+            )
+            await _emit(tc.agent_id, "auto_compact_failed")
+            return False
+        # run_manual_compact swallows its own auth / import / SDK
+        # errors with an `error` emit + status=error and a silent
+        # return. Use got_result as the success signal to surface the
+        # symmetric `auto_compact_failed` event in those cases too.
+        if not tc.turn_ctx.get("got_result"):
+            await _emit(tc.agent_id, "auto_compact_failed")
+            return False
+        return True
 
     async def run_manual_compact(self, tc: TurnContext) -> None:
         """Compact the agent's Codex thread via the native SDK call.

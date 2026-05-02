@@ -218,11 +218,15 @@ correct when a new model ships.
   formatting, single-file mechanical edits. Fast and cheap, but
   loses on multi-step reasoning.
 
-**Codex tier (OpenAI runtime — flip via `runtime_override` first)**
+**Codex tier (OpenAI runtime)**
 
 Use Codex when a Player is blocked on Claude rate limits or has been
 hitting `/compact` repeatedly (their Claude allowance is gone for
-the day). Mirror the Claude tier ordering:
+the day). Flip them with
+`coord_set_player_runtime(player_id, runtime='codex')` FIRST — the
+model tool validates against the Player's current runtime, so a
+Codex model on a Claude-runtime Player is rejected until the
+runtime flip lands. Mirror the Claude tier ordering:
 
 - `latest_mini` — **default for Players** on Codex. Sonnet equivalent.
 - `latest_gpt` — top-tier OpenAI. Opus equivalent. Use only for

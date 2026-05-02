@@ -87,6 +87,55 @@ async def test_codex_model_rejected_for_claude_player(fresh_db) -> None:
     assert "claude" in text.lower() or "runtime" in text.lower()
 
 
+async def test_wrong_runtime_error_suggests_runtime_flip(fresh_db) -> None:
+    """When Coach picks a model from the OTHER runtime family, the
+    error should explicitly say so and point Coach at
+    coord_set_player_runtime to flip the runtime first.
+
+    Without this Coach paraphrases the rejection as "harness blocked
+    me" and stops, which is what the user observed live."""
+    await init_db()
+    # p4 is on Claude (default). gpt-5.5 is a real Codex concrete id.
+    out = await _call("coach", player_id="p4", model="gpt-5.5")
+    assert out.get("isError") is True
+    text = out["content"][0]["text"]
+    assert "codex model" in text.lower()
+    assert "claude runtime" in text.lower()
+    # Tells Coach exactly how to flip — names the new tool.
+    assert "coord_set_player_runtime" in text
+    # Mentions the same-runtime aliases as an alternative path.
+    assert "latest_sonnet" in text or "latest_opus" in text
+    # Same shape on the alias case.
+    out2 = await _call("coach", player_id="p4", model="latest_gpt")
+    assert out2.get("isError") is True
+    text2 = out2["content"][0]["text"]
+    assert "codex model" in text2.lower()
+    assert "claude runtime" in text2.lower()
+    assert "coord_set_player_runtime" in text2
+
+
+async def test_wrong_runtime_error_works_in_reverse(fresh_db) -> None:
+    """Codex-runtime player + Claude model gets the symmetric error."""
+    await init_db()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE agents SET runtime_override = 'codex' WHERE id = ?",
+            ("p5",),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    out = await _call("coach", player_id="p5", model="latest_opus")
+    assert out.get("isError") is True
+    text = out["content"][0]["text"]
+    assert "claude model" in text.lower()
+    assert "codex runtime" in text.lower()
+    assert "latest_gpt" in text or "latest_mini" in text
+    assert "coord_set_player_runtime" in text
+
+
 async def test_set_and_clear_round_trip(fresh_db) -> None:
     await init_db()
     from server.agents import _get_agent_model_override
@@ -582,3 +631,229 @@ def test_role_defaults_resolved_for_api() -> None:
     # Players default to mini-tier (currently gpt-5.4-mini).
     assert suggested_codex["players"].startswith("gpt-")
     assert "mini" in suggested_codex["players"]
+
+
+# ---------- coord_set_player_runtime -------------------------------
+#
+# Coach-facing tool to flip a Player between the 'claude' and 'codex'
+# runtimes. Without this, Coach has no way to satisfy the runtime
+# precondition for cross-runtime coord_set_player_model calls — the
+# user observed Coach hallucinating a runtime_override kwarg on
+# coord_set_player_model and giving up when it had no effect.
+
+
+async def _call_runtime(caller_id: str, **args):
+    from server.tools import build_coord_server
+
+    srv = build_coord_server(caller_id, include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_set_player_runtime"]
+    return await handler(args)
+
+
+def test_set_player_runtime_in_coord_allowlist() -> None:
+    from server.tools import ALLOWED_COORD_TOOLS
+
+    assert "mcp__coord__coord_set_player_runtime" in ALLOWED_COORD_TOOLS
+
+
+async def test_set_player_runtime_player_cannot_call(fresh_db) -> None:
+    await init_db()
+    out = await _call_runtime("p1", player_id="p2", runtime="codex")
+    assert out.get("isError") is True
+    assert "Coach" in out["content"][0]["text"]
+
+
+async def test_set_player_runtime_invalid_player_id(fresh_db) -> None:
+    await init_db()
+    out = await _call_runtime("coach", player_id="p11", runtime="codex")
+    assert out.get("isError") is True
+    text = out["content"][0]["text"]
+    assert "p1..p10" in text
+    # Coach itself can't be flipped via MCP — that's an HTTP-only path.
+    out2 = await _call_runtime("coach", player_id="coach", runtime="codex")
+    assert out2.get("isError") is True
+
+
+async def test_set_player_runtime_invalid_runtime(fresh_db) -> None:
+    await init_db()
+    out = await _call_runtime("coach", player_id="p1", runtime="haiku")
+    assert out.get("isError") is True
+    assert "claude" in out["content"][0]["text"].lower()
+
+
+async def test_set_player_runtime_codex_gated(monkeypatch, fresh_db) -> None:
+    """When HARNESS_CODEX_ENABLED is unset, requesting codex must fail
+    with a helpful pointer to coord_request_human."""
+    monkeypatch.delenv("HARNESS_CODEX_ENABLED", raising=False)
+    await init_db()
+    out = await _call_runtime("coach", player_id="p1", runtime="codex")
+    assert out.get("isError") is True
+    text = out["content"][0]["text"]
+    assert "HARNESS_CODEX_ENABLED" in text
+    assert "coord_request_human" in text
+
+
+async def test_set_player_runtime_flips_to_codex(monkeypatch, fresh_db) -> None:
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    await init_db()
+    out = await _call_runtime("coach", player_id="p2", runtime="codex")
+    assert out.get("isError") is not True
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT runtime_override FROM agents WHERE id = ?", ("p2",)
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    assert dict(row)["runtime_override"] == "codex"
+
+
+async def test_set_player_runtime_emits_event_against_target(
+    monkeypatch, fresh_db,
+) -> None:
+    """Event-shape lock: `agent_id` must be the target Player's slot
+    (not the caller / Coach), and there must be no `to` field. This
+    matches the HTTP `PUT /api/agents/{id}/runtime` path so the event
+    lands in the Player's pane regardless of who initiated the flip.
+    Without this lock, an inadvertent revert to caller_id would silently
+    move runtime change events out of the Player's timeline."""
+    from server.events import bus
+
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    await init_db()
+
+    q = bus.subscribe()
+    try:
+        out = await _call_runtime("coach", player_id="p7", runtime="codex")
+        assert out.get("isError") is not True
+
+        runtime_events = []
+        while not q.empty():
+            ev = q.get_nowait()
+            if ev.get("type") == "runtime_updated":
+                runtime_events.append(ev)
+        assert len(runtime_events) == 1, runtime_events
+
+        ev = runtime_events[0]
+        assert ev["agent_id"] == "p7", (
+            "runtime_updated must log against the target so it renders "
+            "in the Player's pane, matching the HTTP path"
+        )
+        assert ev["player_id"] == "p7"
+        assert ev["runtime_override"] == "codex"
+        assert "to" not in ev, (
+            "runtime_updated has no fan-out registry entry, so a `to` "
+            "field would be dead weight + confuse readers — drop it"
+        )
+    finally:
+        bus.unsubscribe(q)
+
+
+async def test_set_player_runtime_clear_reverts_to_role_default(
+    monkeypatch, fresh_db,
+) -> None:
+    """Empty string clears the override (back to role default = NULL).
+
+    The user-visible name for the column is `runtime_override`, and
+    NULL means "use the role default" — same semantics as the HTTP
+    endpoint at PUT /api/agents/{id}/runtime."""
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    await init_db()
+    # Set then clear.
+    await _call_runtime("coach", player_id="p3", runtime="codex")
+    out = await _call_runtime("coach", player_id="p3", runtime="")
+    assert out.get("isError") is not True
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT runtime_override FROM agents WHERE id = ?", ("p3",)
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    assert dict(row)["runtime_override"] is None
+
+
+async def test_set_player_runtime_rejects_mid_turn(monkeypatch, fresh_db) -> None:
+    """A working player can't have its runtime flipped — the in-flight
+    turn would be on the old runtime while subsequent turns use the new
+    one. Mirrors the HTTP endpoint's 409 behavior."""
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    await init_db()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE agents SET status = 'working' WHERE id = ?", ("p4",)
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    out = await _call_runtime("coach", player_id="p4", runtime="codex")
+    assert out.get("isError") is True
+    text = out["content"][0]["text"]
+    assert "mid-turn" in text or "cancel" in text.lower()
+
+
+async def test_set_player_runtime_evicts_cached_codex_client(
+    monkeypatch, fresh_db,
+) -> None:
+    """A flip from codex → claude should drop the cached Codex
+    subprocess for that slot so we don't leak a process + proxy token
+    until the next MCP-config change. claude → codex has nothing to
+    evict (no cached Codex client existed). Best-effort: an evict
+    failure must NOT bubble up as a tool error."""
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    await init_db()
+
+    evicted: list[str] = []
+    async def fake_evict(slot: str) -> None:
+        evicted.append(slot)
+
+    import server.runtimes.codex as codex_mod
+    monkeypatch.setattr(codex_mod, "evict_client", fake_evict)
+
+    # claude → codex: still calls evict (no-op, but call is unconditional).
+    out1 = await _call_runtime("coach", player_id="p6", runtime="codex")
+    assert out1.get("isError") is not True
+    assert evicted == ["p6"]
+
+    # codex → claude: this is the case that actually leaks without eviction.
+    out2 = await _call_runtime("coach", player_id="p6", runtime="claude")
+    assert out2.get("isError") is not True
+    assert evicted == ["p6", "p6"]
+
+    # Eviction failure is swallowed; the tool still succeeds.
+    async def boom(_slot: str) -> None:
+        raise RuntimeError("evict explosion")
+    monkeypatch.setattr(codex_mod, "evict_client", boom)
+    out3 = await _call_runtime("coach", player_id="p6", runtime="")
+    assert out3.get("isError") is not True
+
+
+async def test_set_player_runtime_unblocks_cross_runtime_model_set(
+    monkeypatch, fresh_db,
+) -> None:
+    """The end-to-end shape that motivated this tool: Coach wants a
+    Codex model on a Claude-default player. Set runtime first, then
+    set model — both should succeed."""
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    await init_db()
+    # Step 1: set the model directly — should fail (still Claude runtime).
+    out1 = await _call("coach", player_id="p5", model="latest_gpt")
+    assert out1.get("isError") is True
+
+    # Step 2: flip the runtime.
+    out2 = await _call_runtime("coach", player_id="p5", runtime="codex")
+    assert out2.get("isError") is not True
+
+    # Step 3: now setting the codex model works.
+    out3 = await _call("coach", player_id="p5", model="latest_gpt")
+    assert out3.get("isError") is not True
+
+    from server.agents import _get_agent_model_override
+    stored = await _get_agent_model_override("p5")
+    assert stored == "latest_gpt"

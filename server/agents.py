@@ -2396,6 +2396,12 @@ def _system_prompt_for(agent_id: str) -> str:
             "Player their name + role (e.g. p3 → 'Alice' / 'Frontend developer'). "
             "Do this once per Player when forming the team — the UI labels "
             "their pane from these values.\n"
+            "  - coord_set_player_runtime(player_id, runtime): flip a "
+            "Player between the 'claude' and 'codex' runtimes. Empty "
+            "string clears (back to role default). Required BEFORE "
+            "coord_set_player_model when picking a model from the other "
+            "family — the model tool validates against the Player's "
+            "current runtime.\n"
             "  - coord_set_player_model(player_id, model): set or clear a "
             "Player's model override (e.g. 'claude-opus-4-7', 'gpt-5.4-mini'). "
             "Empty string clears. Read the 'Model selection policy' section "
@@ -3145,11 +3151,12 @@ async def run_agent(
 
     # Auto-compact trip-wire is delegated to the runtime: each runtime
     # knows its own session-state column and context-pressure signal
-    # (Claude probes the JSONL session file; Codex returns False in v1
-    # until app-server exposes a usable signal — see
-    # CODEX_RUNTIME_SPEC.md §A.5). When the runtime returns True it
-    # already ran a COMPACT_PROMPT turn, so we fall through to run the
-    # user's original prompt on the now-fresh session.
+    # (Claude probes the JSONL session file; Codex reads the latest
+    # `turns` row for the thread — see CODEX_RUNTIME_SPEC.md §A.5).
+    # When the runtime returns True it already ran a compact (Claude
+    # via COMPACT_PROMPT turn, Codex via native client.compact_thread),
+    # so we fall through to run the user's original prompt on the
+    # now-fresh session.
     from server.runtimes import get_runtime
     from server.runtimes.base import TurnContext
 

@@ -13,6 +13,23 @@ Companion references:
 - `CLAUDE.md`: working notes and constraints for agents editing this repo.
 - `README.md`: operator-facing overview and quick start.
 
+Dependent specs (subordinate to this document):
+
+- `Docs/CODEX_RUNTIME_SPEC.md` — Codex runtime specifics. This file
+  assumes the Claude runtime; Codex is the alternate runtime and its
+  behavior, schema additions, error handling, and lifecycle live in
+  the dependent doc.
+- `Docs/recurrence-specs.md` — Coach recurrence model (tick / repeat
+  / cron) and project artifacts (`coach-todos.md`,
+  `project-objectives.md`).
+- `Docs/compass-specs.md` — Compass autonomous strategy engine
+  (lattice, regions, truth corpus, audits, briefings).
+
+These docs are subordinate: when a dependent disagrees with this one,
+TOT-specs.md wins. Dependents may go deeper on their own subject but
+cannot redefine fields, endpoints, events, or invariants declared
+here.
+
 Last audited from the repository on 2026-04-26.
 
 ---
@@ -1524,41 +1541,15 @@ Estimation semantics — Claude path (when `session_id` is set):
 - Do not sum `ResultMessage.usage` across tool rounds; that overstates context
   pressure when prompt caching is active.
 
-Estimation semantics — Codex path (when `codex_thread_id` is set):
+Codex path: the Claude path returns 0 for codex sessions; the server
+reconstructs prompt size from the latest `turns` row matching the
+codex thread id (`runtime = 'codex'`). The CodexRuntime is responsible
+for populating that row from its own usage source. Parser shape and
+known limitations: see `Docs/CODEX_RUNTIME_SPEC.md` §E.5.
 
-- Codex doesn't write a per-session jsonl in `CLAUDE_CONFIG_DIR`, so the
-  Claude path returns 0 for codex sessions.
-- Read the latest `turns` row whose `session_id` equals the codex thread id
-  (with `runtime = 'codex'`) and reconstruct prompt size from
-  `input_tokens + cache_read_tokens + cache_creation_tokens + output_tokens`.
-- Same shape as the Claude path, so the UI percentage stays comparable
-  across runtimes.
-
-Codex usage source of truth: the on-disk rollout JSONL at
-`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*-<thread_id>.jsonl`.
-SDK 0.3.2's `Thread.read(include_turns=True).turns[*]` does **not**
-expose a `usage` field — codex emits `event_msg` lines whose payload
-type is `token_count` with `info.last_token_usage` and
-`info.model_context_window`. The CodexRuntime parses that file after
-every turn and writes the per-turn counts into `turns`. See
-`Docs/CODEX_RUNTIME_SPEC.md` §E.5 for the parser + shape translation.
-
-**Known limitation** — Codex's CLI internally compresses context, so
-`info.model_context_window` (e.g. 258400 for gpt-5.5) is smaller than
-the model's theoretical max recorded in `_CONTEXT_WINDOWS` (1.05M for
-gpt-5.5). The context endpoint currently divides by the theoretical
-max, so the bar under-reports actual context pressure on Codex. A
-future fix should surface `model_context_window` from the rollout
-into the response and divide by that instead.
-
-Window resolution: `_context_window_for(model)` returns the per-model max.
-Codex variants (`gpt-5.x-codex`, `gpt-5.4-mini`, `gpt-5.4-nano`) are pinned
-at 400K; frontier general models (`gpt-5.4`, `gpt-5.5`) and Claude Max
-models at 1M+. Unknown models fall through to a conservative default. When
-the UI doesn't pass `?model=`, the server reads the model recorded on the
-latest turn for the active session — without this fallback, Codex panes
-would always resolve against the global default and the bar would
-under-report by ~2.5×.
+Window resolution: `_context_window_for(model)` returns the per-model
+max. When the UI doesn't pass `?model=`, the server reads the model
+recorded on the latest turn for the active session.
 
 The pane renders this as a compact `ctx` bar: current footprint as a fraction
 of the model's max window.
@@ -2022,14 +2013,11 @@ The resolver in `server/truth.py` handles approve/deny:
   that aren't valid UTF-8 are rejected with a clear error rather
   than returning garbage; binary deliverables under `outputs/`
   cannot be read through this tool.
-- Why this exists alongside Claude's native `Read`: Codex's
-  `read-only` sandbox in nested containers (Zeabur Docker-in-
-  Docker) breaks bubblewrap, which kills `shell cat`. Codex Coach
-  has no native filesystem read tool besides `shell`, and
-  app-server's `view` action is also bwrap-routed. `coord_read_file`
-  goes through the in-process MCP (Claude) / loopback proxy (Codex),
-  bypassing bwrap entirely. On Claude this overlaps with `Read` —
-  agents can use either; the harness doesn't restrict.
+- Exists in addition to Claude's native `Read` because the Codex
+  runtime's restrictive sandbox blocks alternative read paths;
+  `coord_read_file` bypasses that constraint via the MCP proxy. See
+  `Docs/CODEX_RUNTIME_SPEC.md` for sandbox details. On Claude this
+  overlaps with `Read` — agents can use either.
 - Project CLAUDE.md note: it's also auto-injected into every
   agent's system prompt via `server/context.py`, so calling
   `coord_read_file('CLAUDE.md')` is redundant for read-only
@@ -2054,6 +2042,40 @@ The resolver in `server/truth.py` handles approve/deny:
 - Upserts active project's `agent_project_roles`.
 - Emits `player_assigned`.
 
+`coord_set_player_runtime(player_id, runtime)`
+
+- Coach only.
+- `player_id`: `p1` to `p10` (cannot flip Coach's own runtime via MCP
+  — that path is HTTP-only via `PUT /api/agents/coach/runtime`).
+- `runtime`: `'claude'`, `'codex'`, or empty string to clear (revert
+  to the role default in `team_config`).
+- `'codex'` is rejected when `HARNESS_CODEX_ENABLED` is unset; the
+  error message tells Coach to call `coord_request_human` so the user
+  can flip the env flag on the deployment.
+- Mid-turn flips are rejected (mirrors `PUT /api/agents/{id}/runtime`'s
+  409 behavior) — the in-flight turn would be on the old runtime
+  while subsequent turns use the new one.
+- Existing `model_override` is preserved across the flip. Spawn-time
+  resolution silently drops a model that doesn't fit the new runtime
+  and falls through to the role default; flipping back re-applies the
+  preserved override.
+- Updates global `agents.runtime_override` (NOT per-project — runtime
+  is a global slot setting).
+- Side-effect: invalidates the Codex client cache for the slot
+  (`evict_client`) so a codex→claude flip drops the old subprocess +
+  proxy token rather than leaving them dangling until the next
+  MCP-config change.
+- Emits `runtime_updated` with `agent_id=<player_id>` (NOT the caller),
+  matching the shape of the HTTP `PUT /api/agents/{id}/runtime`
+  endpoint — the event renders in the target Player's pane regardless
+  of whether the human or Coach initiated the flip. Coach's tool_use /
+  tool_result pair already records "Coach called this tool" in Coach's
+  timeline, so logging the state-change event there too would
+  duplicate. No `to` field — `runtime_updated` is not a fan-out type
+  in either the WS-side handler or the `/api/events` SQL filter.
+- Required precondition for `coord_set_player_model` when Coach wants
+  a model from the other runtime family.
+
 `coord_set_player_model(player_id, model)`
 
 - Coach only.
@@ -2067,10 +2089,11 @@ The resolver in `server/truth.py` handles approve/deny:
   release. Concrete ids stay accepted for cases where a specific
   version pin matters. Empty string clears the override.
 - Validated against the player's currently-resolved runtime — a Codex
-  model id on a Claude-runtime player is rejected at SET time. If the
-  runtime later flips, the stored override that no longer fits is
-  silently dropped at spawn time and resolution falls through to the
-  role default.
+  model id on a Claude-runtime player is rejected at SET time with
+  an actionable error pointing to `coord_set_player_runtime` for the
+  flip. If the runtime later flips, the stored override that no
+  longer fits is silently dropped at spawn time and resolution falls
+  through to the role default.
 - Upserts `agent_project_roles.model_override` for the active project.
   Empty-clear on a player that has no row is a no-op (no orphan row
   is created).
@@ -2195,13 +2218,8 @@ Runtime translation:
 
 - ClaudeRuntime: passes the literal strings as `allowed_tools` to the
   SDK — `WebSearch` and `WebFetch` are first-class Claude tools.
-- CodexRuntime: there are no tools by those names. The
-  `_codex_config_overrides` builder sets `config.web_search = "live"`
-  whenever either toggle is on, which gates Codex's native built-in
-  search. There's no per-URL fetch in Codex — the developer
-  instructions tell the agent to pass URLs through `web_search`
-  rather than reach for `curl` (Coach's `read-only` sandbox blocks
-  shell network access anyway).
+- CodexRuntime: maps the toggle onto Codex's native built-in search
+  (no per-URL fetch tool exists). See `Docs/CODEX_RUNTIME_SPEC.md`.
 
 External MCP servers:
 
@@ -2210,17 +2228,10 @@ External MCP servers:
 - DB wins on name collision.
 - Explicit `allowed_tools` list is required; no automatic tool exposure.
 - Tool names become `mcp__<server>__<tool>`.
-- Codex runtime injects `default_tools_approval_mode = "approve"` on every
-  external server unless the saved config already sets one. Without this
-  pre-approval, Coach (read-only sandbox) can't invoke any external tool —
-  Codex's elicitation/approval path auto-cancels the call because the
-  embedded app-server client has no `request_user_input` handler. The act
-  of saving a server through the Options drawer is the user's
-  authorization signal; users who want explicit approval-on-use can set
-  `default_tools_approval_mode` to a different value in the saved config
-  (it's preserved verbatim). Players (`danger-full-access`) skip approval
-  and are unaffected. Claude runtime is unaffected — its allow-list is
-  enforced through `ClaudeAgentOptions.allowed_tools`.
+- CodexRuntime applies a Codex-specific approval-mode injection on
+  external servers; see `Docs/CODEX_RUNTIME_SPEC.md` §C.5. Claude
+  runtime enforces its allow-list through
+  `ClaudeAgentOptions.allowed_tools`.
 
 ---
 
@@ -2483,9 +2494,9 @@ Path injected into agent prompts:
   `/workspaces/<slot>/attachments/...` path expecting a per-slot
   symlink that `ensure_workspaces` never created — broken for every
   slot and outright unreachable for Coach (no worktree).
-- Coach's read-only Codex sandbox grants `root` filesystem read access,
-  so the absolute `/data/...` path resolves under sandbox. Players run
-  with broader access and have always been able to read it.
+- Players run with broad filesystem access. Coach's sandbox under
+  CodexRuntime is configured to read the absolute `/data/...` path;
+  see `Docs/CODEX_RUNTIME_SPEC.md` for sandbox details.
 
 ### 14.11 Pending Interactions
 
@@ -3329,127 +3340,56 @@ They are not exposed through API beyond enabled/reason/url status.
 UI-managed secrets are encrypted in SQLite. API never returns plaintext. The
 runtime interpolator can read them for MCP/Telegram use.
 
-### 19.5 Per-agent runtime selection (Codex pilot)
+### 19.5 Per-agent runtime selection
 
-Two runtimes ship in v0.3+: ClaudeRuntime (default) and CodexRuntime
-(gated). Resolution at spawn time is `agents.runtime_override` →
-team_config role default → `'claude'`. CodexRuntime is backed by
-`codex-app-server-sdk` and runs through `codex app-server`: it resolves
-ChatGPT-session auth first, falls back to encrypted `openai_api_key`,
-starts or resumes `agent_sessions.codex_thread_id`, streams
-ConversationStep items into the same harness event vocabulary, records
-Codex turns with `runtime='codex'` plus `cost_basis`, and uses native
-`compact_thread` for manual `/compact`.
-Codex opens/resumes the thread before emitting `agent_started` so stale
-thread ids can emit `session_resume_failed` and the resume indicator is
-accurate. Successful Codex turns also clear consumed compact handoff
-notes and append the prompt/response pair used by the next compact
-handoff.
-Pre-start Codex preparation may hold SDK clients, thread handles, and
-callbacks internally until `run_turn` consumes them; those objects must
-remain runtime-private and never be copied into persisted events or
-other JSON-serialized payloads.
+Two runtimes ship: **ClaudeRuntime** (default; described inline
+throughout this doc) and **CodexRuntime** (gated by
+`HARNESS_CODEX_ENABLED`; full spec in `Docs/CODEX_RUNTIME_SPEC.md`).
 
-Codex auto-compact remains disabled until app-server exposes a stable
-context-pressure signal. Codex also does not receive Claude's
-`AskUserQuestion` interception; v1 deliberately degrades by declining
-Codex approval side-channel requests and asking agents to use normal
-coord/human escalation paths instead.
-`HARNESS_CODEX_ENABLED` must be truthy before the API will accept
-`runtime=codex` on a slot. See `Docs/CODEX_RUNTIME_SPEC.md`.
-Codex developer instructions include a compatibility note for this
-Claude-origin harness: Codex agents must treat `CLAUDE.md` as
-`AGENTS.md`/`agents.md`, and `.claude/` directories as `.agents/`
-directories, reading and obeying them for the applicable tree.
+Resolution at spawn time:
+`agents.runtime_override` → `team_config` role default
+(`coach_default_runtime` / `players_default_runtime`) → `'claude'`.
 
-Model selection is runtime-aware. The pane gear popover resolves the
-effective runtime from the per-slot override, then the role default, and
-only then chooses the Claude or Codex model list. Team defaults are also
-split by runtime so a role configured for Codex reads
-`coach_default_model_codex` / `players_default_model_codex` and never
-falls back to Claude's Opus/Sonnet defaults. The Codex menu includes the
-current flagship and coding ids (`gpt-5.5`, `gpt-5.4*`,
-`gpt-5.3-codex`, `gpt-5.2-codex`, and GPT-5.1 Codex variants).
-Panes refresh role-default runtime state when their settings popover
-opens and when `team_runtimes_updated` arrives over the WebSocket, so a
-settings-drawer runtime change takes effect without a browser reload.
-Submitting a prompt ignores a stale per-pane model override if that
-model is not valid for the pane's current effective runtime, and the UI
-times out a stuck `/api/agents/start` request instead of leaving the
-Run button disabled indefinitely.
+`PUT /api/agents/{id}/runtime` sets the per-slot override. `'codex'`
+is rejected when `HARNESS_CODEX_ENABLED` is unset. Mid-turn flips
+return 409.
 
-### 19.6 Coord MCP proxy (loopback, used by Codex)
+Model selection is runtime-aware: Claude defaults
+(`coach_default_model` / `players_default_model`) and Codex defaults
+(`coach_default_model_codex` / `players_default_model_codex`) are
+stored separately. The pane gear resolves the effective runtime
+first, then chooses the Claude or Codex model list. A stored
+`agent_project_roles.model_override` that no longer fits the slot's
+current runtime is silently dropped at spawn time.
 
-`POST /api/_coord/{tool_name}` and `GET /api/_coord/_tools` are
-internal-only endpoints used by the `python -m server.coord_mcp`
-stdio MCP subprocess to forward coord_* calls into the main FastAPI
-process. The subprocess uses the official `mcp` stdio server transport
-so Codex sees a normal MCP initialize/tools/list/tools/call handshake,
-not a harness-specific JSON-RPC dialect. Loopback bind check + bearer
-token (minted via `server.spawn_tokens.mint(caller_id)`, passed to the
-subprocess via `HARNESS_COORD_PROXY_TOKEN` env). caller_id is resolved
-from the token server-side; body's `caller_id` is a sanity check only.
+`agent_started` payload carries `runtime`. Successful turns insert a
+`turns` row with `runtime` and `cost_basis` populated. The
+`team_runtimes_updated` WebSocket event refreshes pane state when the
+Options drawer changes role defaults.
 
-**Token lifetime is bound to the cached `CodexClient` (subprocess),
-not to a single turn.** The codex app-server subprocess is cached per
-slot via `_codex_clients` and lives across many turns; the env it
-inherits — including `HARNESS_COORD_PROXY_TOKEN` — is captured once at
-spawn. Per-turn mint+revoke would invalidate the token after turn 1
-and every subsequent `coord_*` call would 401. `CodexRuntime.get_client`
-mints the token on first spawn and stores it in `_codex_client_tokens`;
-`close_client` revokes it (called on auth/transport error, manual
-session-clear, harness shutdown, or handshake failure). See
-`Docs/CODEX_RUNTIME_SPEC.md` §C.4 for the security argument.
+### 19.6 Coord MCP proxy (loopback)
 
-Codex runtime wires this into each turn's
-`ThreadConfig.config.mcp_servers` as an explicit `type="stdio"` server
-alongside any external MCP servers. The coord entry sets
-`default_tools_approval_mode: "approve"` so every `coord_*` tool is
-pre-approved at the Codex elicitation/approval layer; without this,
-calls fail with "user rejected MCP tool call" under restrictive
-sandboxes (Coach is `read-only`) because the embedded app-server
-client has no `request_user_input` handler. `coord_*` is harness-
-trusted by the single-write-handle invariant, so blanket approval is
-correct (see openai/codex issue #16685). External MCP servers added
-through the Options drawer inherit the same `default_tools_approval_mode
-= "approve"` injection (see §13 above) — without it, Coach can't call
-*any* external MCP tool. The harness must NOT pass `config.plugins` —
-Codex's TOML schema treats `plugins` as a map keyed by plugin name
-with `PluginConfig` values, so any boolean there fails serde at
-`thread/start`.
+CodexRuntime cannot host an in-process Python MCP server, so
+`coord_*` calls route through a stdio subprocess
+(`python -m server.coord_mcp`) that forwards to the main FastAPI
+process via two internal endpoints:
 
-**Cache invalidation on config change.** The Codex app-server subprocess
-captures `mcp_servers` at spawn time, so a UI-side MCP server add /
-patch / delete won't propagate into the running subprocess. Two helpers
-in `server/runtimes/codex.py` handle this:
+- `POST /api/_coord/{tool_name}` — dispatches to the in-process
+  coord handler.
+- `GET /api/_coord/_tools` — tool catalog for the subprocess to
+  publish over MCP `tools/list`.
 
-- `evict_client(slot)` — full `close_client` on idle slots; cache-pop
-  only when a turn is in flight (the live turn keeps its client
-  reference; next turn rebuilds with current MCP config).
-- `evict_all_clients()` — same, applied to every cached slot.
+Both are loopback-only and bearer-token gated
+(`HARNESS_COORD_PROXY_TOKEN` env). The token is minted by
+`server.spawn_tokens.mint(caller_id)` and bound to the caller — the
+endpoint resolves `caller_id` from the token, not the request body.
+ClaudeRuntime is unaffected; it uses an in-process MCP server and
+never touches these endpoints.
 
-`evict_client(slot)` is called from `DELETE /api/agents/{id}/session`
-(single + batch). `evict_all_clients()` is called from the MCP CRUD
-endpoints (`POST/PATCH/DELETE /api/mcp/servers/...`). Result: MCP
-server changes take effect on the next turn without a full server
-restart. ClaudeRuntime is unaffected because it constructs
-`ClaudeAgentOptions` fresh per turn and re-reads
-`load_external_servers()` each time.
-
-The coord MCP config pins both `cwd` and `PYTHONPATH` to the harness
-root so `python -m server.coord_mcp` remains importable even when
-Codex runs the agent workspace from `/workspaces/<slot>/project`. The
-in-process Claude coord server is built without proxy-only metadata by
-default. The loopback dispatcher explicitly opts into `_handlers` and
-`_tool_names`; those contain Python callables and must not be attached
-to the server object passed to Claude, because the Claude SDK
-serializes its MCP configuration while spawning the CLI.
-The stdio proxy preserves FastAPI HTTP error details (`detail`,
-`error`, or `message`) in MCP tool errors, and treats an in-process
-coord handler result with `isError: true` as an MCP error instead of a
-successful JSON blob. This keeps Codex-visible failures actionable
-(`HTTP 403: caller_id mismatch`, `ERROR: task is not open`, etc.) and
-prevents agents from interpreting proxy failures as missing tools.
+Token lifetime, MCP cache invalidation on config change,
+`default_tools_approval_mode` injection, and the stdio error-shape
+contract are CodexRuntime concerns — see
+`Docs/CODEX_RUNTIME_SPEC.md` §C.4 and §E.1.
 
 ---
 

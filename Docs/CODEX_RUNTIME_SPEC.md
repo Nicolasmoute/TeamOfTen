@@ -1,48 +1,62 @@
-# Implementation Plan: Codex Runtime Alongside Claude in TeamOfTen
+# Codex Runtime — Specification
 
-This plan adds OpenAI Codex as a second per-agent runtime sharing the existing task board, memory, messages, worktrees, event log, MCP surface, cost caps, auto-compact, fan-out, and wake logic. The Claude path stays the default; runtime selection is per slot.
+> **Subordinate to `Docs/TOT-specs.md`.** When this doc and TOT-specs
+> disagree, TOT-specs wins. This file is the source of truth for
+> Codex-specific behavior — runtime lifecycle, thread/resume semantics,
+> rollout JSONL parsing, cost basis, MCP proxy details, error handling
+> — but cannot redefine fields, endpoints, events, or invariants that
+> TOT-specs declares.
 
-> **Revision note (post-review).** Five blockers from the first draft were
-> corrected: (1) session state lives on `agent_sessions` (per-project),
-> not `agents`; (2) `coord_mcp` is a proxy-to-main-harness, not a direct
-> DB writer — `tools.py` publishes through the in-process event bus and
-> calls `maybe_wake_agent`, which cannot work cross-process; (3) the
-> Python Codex SDK is experimental and not reliably on PyPI — sourcing
-> strategy spelled out in §I; (4) cost is token-priced only in API-key
-> mode; ChatGPT-auth has no per-turn USD — tracking is split; (5)
-> `pyproject.toml` switches from explicit packages to discovery so
-> `server/runtimes/` is picked up. Phasing reflows accordingly.
+Status: shipped. TOT-specs assumes the Claude runtime everywhere it
+describes runtime behavior; Codex is the alternate runtime and its
+specifics live here. Per-agent runtime selection is a TOT-level
+concept (slot-level `runtime_override`, role default in `team_config`,
+`HARNESS_CODEX_ENABLED` gate). Everything below describes how
+CodexRuntime implements its half of the `AgentRuntime` contract.
 
-## A. Runtime abstraction extraction (Phase 0 — no behavior change)
+OpenAI Codex shares the existing task board, memory, messages,
+worktrees, event log, MCP surface, cost caps, fan-out, and wake logic
+with Claude. Auto-compact runs on both runtimes — Claude via a
+`COMPACT_PROMPT` turn, Codex via the native `client.compact_thread`
+endpoint (see §E.6). Runtime selection is per-slot.
 
-### A.1 Goal
-Carve the Claude-specific parts of `run_agent` ([server/agents.py:2624](../server/agents.py#L2624)) out into a `ClaudeRuntime` while leaving everything runtime-agnostic in a dispatcher.
+## A. Runtime abstraction
 
-### A.2 What stays in the dispatcher
+### A.1 Shape
+The runtime layer separates Claude-specific code into `ClaudeRuntime`
+and Codex-specific code into `CodexRuntime`, both behind the
+`AgentRuntime` protocol. The dispatcher (`run_agent`) is
+runtime-agnostic.
+
+### A.2 Dispatcher responsibilities
 - pause check
 - spawn-lock claim, `_autoname_player`, `_check_cost_caps`
 - status flip, `agent_started` emit
-- system-prompt assembly (`_get_agent_brief`, prior-error suffix, handoff suffix, identity prefix, coordination block)
-- outer `try/except` with post-result exception suppression and auto-retry counter
+- system-prompt assembly (`_get_agent_brief`, prior-error suffix,
+  handoff suffix, identity prefix, coordination block)
+- outer `try/except` with post-result exception suppression and
+  auto-retry counter
 
-**Auto-compact and prior-session reads move into the runtime.** The
-current trip-wire calls `_get_session_id`, `_session_context_estimate`,
-and reads Claude's session JSONL files — all Claude-shaped. The
-dispatcher cannot run that logic for a Codex agent. The protocol
-defining `maybe_auto_compact` (and `run_manual_compact`) is given
-once in §A.4 — see that section for the canonical signatures.
+Auto-compact and prior-session reads belong to the runtime, not the
+dispatcher: Claude's trip-wire reads `agent_sessions.session_id` plus
+session JSONL files, Codex's reads `agent_sessions.codex_thread_id`
+plus the latest `turns` row for that thread (via
+`_codex_session_context_estimate`). The dispatcher calls
+`runtime.maybe_auto_compact(tc)` before the main turn; if it returns
+True, the dispatcher proceeds to run the user's original prompt on
+the now-fresh session.
 
-The dispatcher calls `runtime.maybe_auto_compact(tc)` before the
-main turn; if it returns True, the dispatcher proceeds to run the
-user's original prompt on the now-fresh session. Recursion semantics
-preserved without the dispatcher caring how each runtime estimates
-context.
-
-### A.3 What moves into `ClaudeRuntime.run_turn`
-`coord_server` build, allowed-tools assembly, external MCP load, `_build_can_use_tool`, `options_kwargs` (hooks, model, permission_mode, effort, resume), `_prompt_stream`, `_iterate`, stale-session retry. The `turn_ctx` dict stays owned by the dispatcher, passed by reference so the runtime can mutate `got_result`, `accumulated_text`, etc.
+### A.3 ClaudeRuntime responsibilities
+`coord_server` build, allowed-tools assembly, external MCP load,
+`_build_can_use_tool`, `options_kwargs` (hooks, model,
+permission_mode, effort, resume), `_prompt_stream`, `_iterate`,
+stale-session retry. The `turn_ctx` dict is owned by the dispatcher
+and passed by reference so the runtime can mutate `got_result`,
+`accumulated_text`, etc. CodexRuntime owns the equivalent surface
+for the Codex SDK (see §E).
 
 ### A.4 Protocol
-New `server/runtimes/` package with `base.py`, `claude.py`, `codex.py`:
+The `server/runtimes/` package contains `base.py`, `claude.py`, `codex.py`:
 
 ```python
 @dataclass
@@ -75,14 +89,15 @@ class AgentRuntime(Protocol):
 
     async def maybe_auto_compact(self, tc: TurnContext) -> bool:
         """Runtime-specific auto-compact trip-wire. Return True if a
-        compact turn was run (so the dispatcher proceeds to run the
-        user's original prompt on the now-fresh session). The full
-        TurnContext is passed because Claude's current trip-wire runs
-        a recursive compact turn with COMPACT_PROMPT, compact_mode=True,
+        compact was actually executed (so the dispatcher proceeds to
+        run the user's original prompt on the now-fresh session). The
+        full TurnContext is passed because Claude's trip-wire runs a
+        recursive compact turn with COMPACT_PROMPT, compact_mode=True,
         auto_compact=True — and needs `model`, `system_prompt`,
-        `workspace_cwd`, etc. to do so. ClaudeRuntime preserves the
-        current Claude-shaped behavior; CodexRuntime returns False
-        in v1 (see §E.6)."""
+        `workspace_cwd`, etc. to do so. Codex's trip-wire instead
+        delegates to its own `run_manual_compact` (native
+        `client.compact_thread`) when used/window ≥ threshold (see
+        §E.6)."""
 
     async def run_manual_compact(self, tc: TurnContext) -> None:
         """Execute a manual /compact request. Receives the full
@@ -92,11 +107,15 @@ class AgentRuntime(Protocol):
         returned summary defensively (see §E.6)."""
 ```
 
-PR 2 ships exactly this contract; both runtimes implement all three
-methods. CodexRuntime's `run_turn` is SDK-bound as of the 2026-04-28
-follow-up pass; the remaining caveats are live validation, not stubs.
+Both runtimes implement all three methods.
 
-`HarnessEvent` is **not** a new struct — reuse the existing `_emit(agent_id, type, **payload)` bus vocabulary (`tool_use`, `tool_result`, `text`, `thinking`, `result`, `error`, `agent_started`, `agent_stopped`, `context_applied`, `auto_compact_triggered`, `session_compacted`, `session_resume_failed`, `cost_capped`, `agent_cancelled`, `paused`, `spawn_rejected`). CodexRuntime maps Codex notifications onto **this same vocabulary**.
+`HarnessEvent` is **not** a separate struct — runtimes use the existing
+`_emit(agent_id, type, **payload)` bus vocabulary (`tool_use`,
+`tool_result`, `text`, `thinking`, `result`, `error`, `agent_started`,
+`agent_stopped`, `context_applied`, `auto_compact_triggered`,
+`session_compacted`, `session_resume_failed`, `cost_capped`,
+`agent_cancelled`, `paused`, `spawn_rejected`). CodexRuntime maps
+Codex notifications onto **this same vocabulary**.
 
 ### A.5 Auto-compact and manual compact interaction
 
@@ -106,10 +125,17 @@ The dispatcher delegates **both** flows to the runtime:
   `runtime.maybe_auto_compact(...)` before the main turn. If True,
   dispatcher proceeds to run the user's original prompt on the fresh
   session; if False, dispatcher runs the original prompt directly.
-  ClaudeRuntime preserves the existing Claude-shaped trip-wire logic
-  (session JSONL probe + threshold check). **CodexRuntime returns
-  False in v1** — auto-compact disabled until app-server exposes a
-  usable context-pressure signal.
+  Both runtimes share the `HARNESS_AUTO_COMPACT_THRESHOLD` env (default
+  0.7). ClaudeRuntime uses the Claude-shaped trip-wire (session JSONL
+  probe + threshold check, then a `COMPACT_PROMPT` turn).
+  CodexRuntime reads `_codex_session_context_estimate(thread_id)` —
+  the latest `turns` row for the resumed Codex thread, summed as
+  `input + cache_read + cache_creation + output` — and when the ratio
+  trips, delegates to its own `run_manual_compact` so the compact uses
+  the native `client.compact_thread(thread_id)` endpoint (cheaper than
+  a full LLM round-trip). On failure both runtimes emit
+  `auto_compact_failed` and the dispatcher proceeds with the original
+  session.
 - **Manual `/compact` (or `POST /api/agents/{id}/compact`)**:
   dispatcher calls `runtime.run_manual_compact(...)`. ClaudeRuntime
   runs the existing COMPACT_PROMPT turn. CodexRuntime uses the native
@@ -117,26 +143,29 @@ The dispatcher delegates **both** flows to the runtime:
   returned summary.
 
 ### A.6 Tests
-All ~113 existing pytests pass. New `server/tests/test_runtime_dispatch.py` builds a `FakeRuntime` and asserts dispatcher contract (cost-cap rejects before `run_turn`, `agent_started` before, `agent_stopped` after).
+`server/tests/test_runtime_dispatch.py` builds a `FakeRuntime` and
+asserts dispatcher contract (cost-cap rejects before `run_turn`,
+`agent_started` before, `agent_stopped` after).
 
 ---
 
-## B. DB migration
+## B. Schema additions
 
-Per project pattern (commit `c4c4557` rolled migrations into `SCHEMA`), edit `SCHEMA` in [server/db.py](../server/db.py).
+The columns themselves are documented in TOT-specs §6.2 and §6.4 (the
+`agents` and `agent_sessions` tables). This section covers the
+rationale for the column shape, which is Codex-specific.
 
-**Important — runtime-vs-session split.** The repo now uses per-project
-`agent_sessions` for session state (see [server/db.py:244](../server/db.py#L244)
-and [server/main.py:707](../server/main.py#L707)). `session_id`,
-`continuity_note`, and `last_exchange_json` already live there, scoped by
-`(slot, project_id)`. Codex thread IDs MUST go on `agent_sessions`, not
-`agents` — otherwise switching projects on the same slot would either
+**Runtime-vs-session split.** Session state lives on per-project
+`agent_sessions` ([server/db.py](../server/db.py)). `session_id`,
+`continuity_note`, and `last_exchange_json` are scoped by
+`(slot, project_id)`. Codex thread IDs go on `agent_sessions`, not
+`agents` — switching projects on the same slot would otherwise
 clobber the Codex thread or resume the wrong project's thread.
 
 The `runtime` choice itself is a **slot-level user preference**, not
-session state, so it stays on `agents`.
+session state, so it stays on `agents` as `runtime_override`.
 
-### B.1 Schema additions
+### B.1 Column rationale
 
 On `agents` (slot-level preference — **nullable so role defaults can apply**):
 ```sql
@@ -185,28 +214,24 @@ report by tokens/messages instead — see §G).
 (No CHECK on `turns.runtime` — keep analytics queries safe across future runtimes.)
 
 ### B.2 Backfill for existing DBs
-`CREATE TABLE IF NOT EXISTS` doesn't add columns. Add an inline migration runner in `init_db()` after `executescript`:
-
-```python
-async def _ensure_columns(db, table, cols):
-    cur = await db.execute(f"PRAGMA table_info({table})")
-    existing = {row[1] for row in await cur.fetchall()}
-    for name, ddl in cols:
-        if name not in existing:
-            await db.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
-```
-
-`ALTER TABLE … ADD COLUMN … NOT NULL DEFAULT 'claude'` populates existing rows with the default — no explicit UPDATE. CHECK constraint can't be added retroactively without table rebuild — rely on `PUT /api/agents/{id}/runtime` validation instead.
+`CREATE TABLE IF NOT EXISTS` doesn't add columns, so `init_db()` runs
+an inline migration via `_ensure_columns(db, table, cols)` after
+`executescript`. `ALTER TABLE … ADD COLUMN … NOT NULL DEFAULT 'claude'`
+populates existing rows with the default. CHECK constraints can't be
+added retroactively without a table rebuild — `PUT
+/api/agents/{id}/runtime` validates instead.
 
 ---
 
-## C. Coord MCP — proxy to main harness (revised)
+## C. Coord MCP — proxy to main harness
 
 ### C.1 Why direct-DB-from-subprocess is wrong
 
-The first draft proposed letting `coord_mcp` open its own `aiosqlite`
-handle and write directly. That breaks more than the single-write-handle
-invariant. `tools.py` does three things every coord call:
+`coord_mcp` runs in a subprocess (Codex's `app-server` cannot host
+in-process Python MCP servers the way Claude's SDK can). It cannot
+open its own `aiosqlite` handle and write directly — that breaks more
+than the single-write-handle invariant. `tools.py` does three things
+on every coord call:
 
 1. **DB write** (the obvious part).
 2. **`bus.publish(...)` on the in-process event bus** ([server/events.py:235](../server/events.py#L235)) — feeds the WebSocket out to the UI and the Telegram bridge subscriber.
@@ -215,7 +240,8 @@ invariant. `tools.py` does three things every coord call:
 A subprocess can do (1) but emits (2) and (3) into a void. Symptoms
 would be: agent A sends a message, row appears in `messages` table,
 but the WebSocket never fires, the recipient never wakes, the UI
-shows nothing until the next page reload.
+shows nothing until the next page reload. So `coord_mcp` is a thin
+stdio proxy that forwards every tool call back to the main process.
 
 ### C.2 Design — thin stdio proxy
 
@@ -322,14 +348,12 @@ session-clear on the affected slot — closes + revokes + respawns.
 
 ### C.5 ClaudeRuntime continues working
 
-ClaudeRuntime can keep using the in-process `create_sdk_mcp_server`
-wrapper (zero overhead) OR switch to the same subprocess proxy as
-Codex for symmetry. **Recommend keeping in-process for Claude** to
-minimize blast radius of PR 3 — the subprocess proxy only ships
-because Codex needs it. Two paths, same handlers.
+ClaudeRuntime keeps the in-process `create_sdk_mcp_server` wrapper
+(zero overhead). The subprocess proxy ships only because Codex needs
+it. Two paths, same handlers.
 
 ```python
-# ClaudeRuntime mcp_servers (unchanged from today):
+# ClaudeRuntime mcp_servers:
 mcp_servers = {"coord": coord_server, **external_servers}
 ```
 
@@ -357,38 +381,38 @@ mcp_servers = {"coord": coord_server, **external_servers}
 ```
 
 **External MCP servers inherit the same approval policy.** Servers added
-through the Options drawer (Phase 1 MCP UI) are merged into `mcp_servers`
-with `default_tools_approval_mode = "approve"` injected when not already
+through the Options drawer are merged into `mcp_servers` with
+`default_tools_approval_mode = "approve"` injected when not already
 set. Without this, Coach (read-only sandbox) can't call any external
-tool — every call hits the same auto-cancellation path that previously
-broke `coord`. The act of adding a server via the UI is the user's
+tool — every call hits the same auto-cancellation path that broke
+`coord`. The act of adding a server via the UI is the user's
 authorization signal; an explicit `default_tools_approval_mode` value
 in the saved config is preserved (opt-out for users who want
 approval-on-use). Implementation in `_build_mcp_servers`
 ([server/runtimes/codex.py](../server/runtimes/codex.py)).
 
-> **Don't pass `config.plugins`.** Earlier drafts injected
-> `config = {"plugins": {"enabled": false}}` to suppress plugin
-> warmups. Codex's TOML schema treats `plugins` as a map keyed by
-> plugin *name* with `PluginConfig` values (a struct with an
-> `enabled: bool` field), so `plugins.enabled = false` is parsed
-> as plugin name `"enabled"` with a bool — `thread/start` fails
-> with `invalid type: boolean false, expected struct PluginConfig`.
-> Default (no `plugins` key) is correct. To disable a specific
-> plugin, use `plugins = { "<name>" = { enabled = false } }`.
+> **Don't pass `config.plugins`.** Codex's TOML schema treats
+> `plugins` as a map keyed by plugin *name* with `PluginConfig`
+> values (a struct with an `enabled: bool` field), so
+> `plugins.enabled = false` is parsed as plugin name `"enabled"`
+> with a bool — `thread/start` fails with `invalid type: boolean
+> false, expected struct PluginConfig`. Default (no `plugins` key)
+> is correct. To disable a specific plugin, use
+> `plugins = { "<name>" = { enabled = false } }`.
 
-AskUserQuestion stays in-process via Claude's `can_use_tool` interception. For Codex, AskUserQuestion needs a different path entirely — see §E.8.
+AskUserQuestion stays in-process via Claude's `can_use_tool`
+interception. For Codex, AskUserQuestion needs a different path
+entirely — see §E.8.
 
 ---
 
 ## D. Auth — headless Codex login
 
-### D.1 Spike (PR 1)
-Before any runtime code:
-1. SSH into Zeabur with `CODEX_HOME=/data/codex`. Run `codex login`.
-2. Confirm credentials persist at `/data/codex/auth.json` (or version-specific filename).
-3. Redeploy and verify auth survives.
-4. Document exact filenames in CLAUDE.md gotchas.
+### D.1 Persistence
+`CODEX_HOME=/data/codex` mirrors `CLAUDE_CONFIG_DIR=/data/claude`. The
+ChatGPT-session token persists at `/data/codex/auth.json` and survives
+redeploys. After deploy, run `CODEX_HOME=/data/codex codex login
+--device-auth` once in the container to create the session.
 
 ### D.2 Dockerfile
 ```dockerfile
@@ -397,19 +421,26 @@ ENV CLAUDE_CONFIG_DIR=/data/claude \
 ...
 RUN npm install -g @anthropic-ai/claude-code @openai/codex
 ```
-(Confirm exact npm package name during spike.)
 
 ### D.3 `/api/health` extension
-Mirror the existing `claude_auth.credentials_present` probe: read `${CODEX_HOME}/auth.json` for nonzero size, surface `codex_auth.credentials_present` and `codex_auth.method: "chatgpt" | "api_key" | "none"`.
+Mirrors the `claude_auth.credentials_present` probe: reads
+`${CODEX_HOME}/auth.json` for nonzero size, surfaces
+`codex_auth.credentials_present` and
+`codex_auth.method: "chatgpt" | "api_key" | "none"`.
 
 ### D.4 API-key fallback
-Stored in `secrets` table under `openai_api_key`, encrypted via existing Fernet. Resolution precedence in CodexRuntime:
-1. ChatGPT session present → let Codex CLI use it natively.
-2. Else `secrets.openai_api_key` set → inject `OPENAI_API_KEY` into subprocess env.
+Stored in `secrets` table under `openai_api_key`, encrypted via Fernet.
+Resolution precedence in CodexRuntime:
+1. ChatGPT session present → Codex CLI uses it natively.
+2. Else `secrets.openai_api_key` set → inject `OPENAI_API_KEY` into
+   subprocess env.
 3. Else: emit `human_attention` and abort spawn.
 
 ### D.5 Options drawer UI
-New "Codex auth" section mirroring Telegram pattern: read-only ChatGPT-session badge, write-only masked API-key field, "Test" button (`POST /api/team/codex/test`). Endpoints `GET/PUT/DELETE /api/team/codex` mirror Telegram's `codex_disabled` flag handling.
+"Codex auth" section mirrors the Telegram pattern: read-only
+ChatGPT-session badge, write-only masked API-key field, "Test" button
+(`POST /api/team/codex/test`). Endpoints `GET/PUT/DELETE
+/api/team/codex` mirror Telegram's `codex_disabled` flag handling.
 
 ---
 
@@ -442,9 +473,25 @@ running subprocess. Two helpers handle this:
 - `evict_all_clients()` — same, applied to every cached slot.
 
 `evict_client(slot)` is called from `DELETE /api/agents/{id}/session`
-(single + batch). `evict_all_clients()` is called from
+(single + batch), and from `coord_set_player_runtime` when Coach flips
+a Player's runtime (a codex→claude flip would otherwise leave the
+cached Codex subprocess + proxy token dangling until the next
+MCP-config change). `evict_all_clients()` is called from
 `POST/PATCH/DELETE /api/mcp/servers/...`. Result: MCP server changes
 take effect on the agent's next turn without a server restart.
+
+**Tool-contract version bump on coord-tool changes.**
+`_CODEX_TOOL_CONTRACT_VERSION` (see [server/runtimes/codex.py]) is a
+string the runtime stores in `team_config` after each successful boot.
+On the next boot, if it differs from the in-code value,
+`ensure_codex_tool_contract_current()` clears every persisted
+`codex_thread_id` so the next Codex turn starts fresh and picks up
+the current MCP tool surface. This is necessary because the
+codex-app-server can preserve thread-local tool state across resumes
+— old threads can keep telling the model that a coord_* tool is
+"unavailable in this session" even after the harness adds it. Bump
+the constant whenever a coord_* tool is added, removed, or renamed,
+or when a tool's exposed description changes meaningfully.
 
 ### E.2 Thread start vs resume
 
@@ -468,6 +515,16 @@ thread.compact()          # native compact (returns Any)
   (CodexProtocolError, "thread not found", etc.), mirror Claude's
   stale-session auto-heal: emit `session_resume_failed`, null
   `codex_thread_id`, retry once with `start_thread`.
+  - `CodexTimeoutError` is special-cased. The SDK's default
+    `request_timeout` is 30s; under load (cold app-server subprocess,
+    slow Codex backend, large stored thread state — Coach especially)
+    `thread/resume` can transiently exceed it. `open_thread` retries
+    `_CODEX_RESUME_TIMEOUT_RETRIES` (default 2, total 3 attempts) with
+    a brief inter-attempt delay before falling back, so a transient
+    blip does not cost the agent its thread continuity. Other
+    exception classes (CodexProtocolError, CodexTransportError,
+    plain Exception) skip the retry and fall back on the first
+    attempt — they are not transient.
 - Codex prepares this start/resume before `agent_started` is emitted so
   `agent_started.resumed_session` reflects the actual successful path,
   not just the presence of a stored `codex_thread_id`.
@@ -515,6 +572,33 @@ directly, **and** `thread.read(include_turns=True).turns[*]` ships
 without a `usage` field either (verified live 2026-04-29 against
 Codex CLI 0.125.0 / SDK 0.3.2). Token counts only land on disk in the
 rollout JSONL — see §E.5 for the parser the runtime now uses.
+
+#### E.3.1 Tool-result error classification
+
+`_step_payload_is_error(item_payload)` decides whether a completed
+tool item renders red (error) or green (success) in the UI. It
+matches against the lowercased `status` (or `state` as fallback):
+
+| Pattern  | Origin                                                          |
+|----------|-----------------------------------------------------------------|
+| `error`  | tool itself reported failure                                    |
+| `fail`   | tool itself reported failure                                    |
+| `cancel` | OpenAI Codex safety-monitor cancelled the call mid-flight      |
+| `reject` | OpenAI Codex safety-monitor refused the call                    |
+
+Plus any non-zero `exit_code` / `exitCode` / `returncode` is treated
+as an error. The `cancel` / `reject` patterns are the important
+addition for Codex: the safety monitor surfaces a refused tool call
+as a "completed" item with `status='cancelled'` (or similar) and a
+prose explanation in the body. Without those patterns, monitor
+cancellations rendered green and were indistinguishable from real
+successes — Coach historically paraphrased them as generic "rejected
+by the coordination layer" because there was no clean error signal
+to lean on.
+
+Substring matching is intentional (handles `cancelled`/`canceled`,
+`user_cancelled`, `cancellation_pending`, `rejected`, etc.); no real
+status string uses these words for a success outcome.
 
 ### E.4 Tool execution
 Codex executes native tools inside the codex-app-server subprocess — we
@@ -609,10 +693,81 @@ if tc.compact_mode:
     return
 ```
 
-**Auto-compact for Codex agents is disabled in v1** (see §A.2 —
-`CodexRuntime.maybe_auto_compact` returns False until app-server
-exposes a usable context-pressure signal). Manual `/compact` still
-works via the path above.
+**Auto-compact for Codex agents** (added 2026-05-02 — see §A.5)
+mirrors Claude's threshold semantics but takes a structurally
+different path through the dispatcher.
+`CodexRuntime.maybe_auto_compact` reads the shared
+`HARNESS_AUTO_COMPACT_THRESHOLD` env (default 0.7), short-circuits on
+`tc.compact_mode` / unparseable threshold / threshold ∉ (0.0, 1.0) /
+no `codex_thread_id` / `used / window < threshold`, and computes
+`used / window` from `_codex_session_context_estimate(thread_id)`
+(falls back to 0 if no `turns` row exists yet) and
+`_context_window_for(tc.model)` (1M floor for unknown models, so
+Codex auto-compact errs on the conservative side rather than
+firing prematurely). When the ratio trips, it:
+
+1. Emits `auto_compact_triggered` with the same payload shape Claude
+   emits (`used_tokens`, `context_window`, `ratio`, `threshold`,
+   `deferred_prompt`).
+2. Sets `tc.compact_mode = True` and `tc.auto_compact = True` on the
+   throwaway dispatcher TurnContext (so a re-entry via
+   `run_manual_compact` doesn't recurse) and mirrors them into
+   `tc.turn_ctx` for any downstream reader.
+3. Delegates to its own `run_manual_compact(tc)` — i.e. the
+   **native** `client.compact_thread(thread_id)` path above, not a
+   `COMPACT_PROMPT` LLM turn.
+4. After `run_manual_compact` returns, checks
+   `tc.turn_ctx.get("got_result")` as the success signal.
+   `run_manual_compact` swallows its own auth / ImportError /
+   `compact_thread` exceptions (it emits `error` + sets status=error
+   and returns silently), so an unraised-but-failed compact is
+   detected by the absence of `got_result`. Both the explicit raise
+   path and the silent-failure path emit `auto_compact_failed` and
+   return False — symmetric with Claude's failure posture.
+
+The dispatcher then proceeds with the user's original prompt; the
+subsequent prior-session read at `agents.py` returns None (the
+compact cleared `codex_thread_id`), and the fresh Codex thread picks
+up the just-written continuity note from the system prompt assembly.
+
+**Structural differences from Claude's auto-compact** (intentional;
+documented for future maintainers):
+
+- Claude's `maybe_auto_compact` recursively calls
+  `run_agent(COMPACT_PROMPT, compact_mode=True, auto_compact=True)`,
+  which goes through the full dispatcher (spawn lock, cost cap,
+  `agent_started` / `agent_stopped` events, `run_turn` with the
+  COMPACT_PROMPT through the SDK). The user therefore sees TWO turn
+  cycles in the timeline: compact-cycle then user-cycle. CodexRuntime
+  instead invokes `run_manual_compact` directly as a side-effect of
+  `maybe_auto_compact`. The user sees only `auto_compact_triggered`
+  → `session_compacted` → the user's `agent_started` (single cycle).
+- Claude's recursive path goes through `_check_cost_caps`, so an
+  over-budget compact is rejected with `cost_capped` (no compact AND
+  no user turn). Codex's path bypasses the cap because
+  `client.compact_thread` is a server-side operation that doesn't
+  show up in the harness's `turns`/cost ledger. Net effect on
+  over-budget Codex: compact still happens, then the user's turn is
+  rejected with `cost_capped`. When budget frees up, the next user
+  turn lands on the already-compacted fresh thread with the
+  continuity note in place.
+- Both runtimes share the spawn-lock-after-`maybe_auto_compact` race
+  window: two concurrent `run_agent` calls for the same slot can
+  both enter `maybe_auto_compact` before either claims the spawn
+  lock. Claude's recursive path serializes via the inner spawn
+  lock; Codex's direct path can fire two `compact_thread` calls
+  back-to-back. In practice, the second one sees a cleared
+  `codex_thread_id` (the first finished before the second's
+  `_get_codex_thread_id` re-read inside `run_manual_compact`) and
+  no-ops via the existing "no codex thread to compact" branch.
+  Acceptable.
+
+The original "context-pressure signal isn't exposed yet" caveat
+applied before `_codex_session_context_estimate` shipped (that
+helper reads the per-thread `turns` ledger and reconstructs
+prompt+output tokens in the same shape Claude's JSONL probe
+produces, so the UI context bar already used it). The trip-wire was
+wired through once that signal was available.
 
 ### E.7 Error handling
 - `turn.failed` pre-result → `_emit("error")`, increment `_consecutive_errors`, schedule retry.
@@ -621,21 +776,17 @@ works via the path above.
 
 ### E.8 AskUserQuestion under Codex
 
-ClaudeRuntime intercepts `AskUserQuestion` via `can_use_tool` ([server/agents.py:_build_can_use_tool](../server/agents.py)). Codex has no equivalent hook — it executes its own native tools internally. Two options:
+ClaudeRuntime intercepts `AskUserQuestion` via `can_use_tool`
+([server/agents.py:_build_can_use_tool](../server/agents.py)). Codex
+has no equivalent hook — it executes its own native tools internally,
+and shipped behavior degrades: the runtime sets
+`approval_policy='never'`; if the SDK still emits an approval
+side-channel request, the harness surfaces `human_attention` and
+declines so the turn does not hang behind an invisible prompt. Coach
+and Players are expected to escalate via `coord_request_human` instead.
 
-- (a) Re-expose AskUserQuestion as a coord_* MCP tool (`coord_ask_user`).
-  Codex calls it like any other tool; the main process renders the
-  question in the QuestionForm UI, blocks until answered, returns
-  the answer string. Symmetric: Claude could optionally also use this
-  path, removing the dual mechanism.
-- (b) Skip AskUserQuestion on Codex agents. Players currently use it
-  rarely; Coach uses it more. Acceptable degradation for v1.
-
-v1 ships option (b). The runtime sets `approval_policy='never'`; if the
-SDK still emits an approval side-channel request, TeamOfTen surfaces a
-`human_attention` event and declines it so the turn does not hang behind
-an invisible prompt. A future `coord_ask_user` MCP tool can replace this
-degradation if Codex agents prove to need synchronous user questions.
+A future `coord_ask_user` MCP tool could replace this degradation if
+Codex agents prove to need synchronous user questions; not shipped.
 
 ---
 
@@ -674,8 +825,6 @@ Add `runtime=runtime_name`. UI renders a small chip in the sticky turn header.
   cached input). Per-turn USD computable from `Turn.usage` × pricing
   table.
 
-Treating both as `cost_usd` was a mistake in the first draft.
-
 ### G.1 What `turns` records
 
 For each Codex turn, set `cost_basis`:
@@ -706,10 +855,12 @@ shows two side-by-side meters in EnvPane: "Spent today: $X.XX" and
 "Plan-included tokens today: N". Don't pretend a USD value exists for
 plan-included usage — show what is actually true.
 
-### G.4 No new env caps
+### G.4 No Codex-specific env caps
 
-Defer `HARNESS_CODEX_DAILY_USD` and `HARNESS_CHATGPT_TOKENS_DAILY`. The
-existing combined USD cap + visible token meter is enough for v1.
+The existing combined USD cap (`HARNESS_AGENT_DAILY_CAP` /
+`HARNESS_TEAM_DAILY_CAP`) plus the visible token meter is the cap
+surface. There is no separate `HARNESS_CODEX_DAILY_USD` or
+`HARNESS_CHATGPT_TOKENS_DAILY`.
 
 ---
 
@@ -730,197 +881,54 @@ Skip block when all 10 Players are on the same runtime — saves tokens on defau
 
 ## I. Dependencies & packaging
 
-### I.1 Codex Python SDK sourcing
+### I.1 Codex Python SDK
+`codex-app-server-sdk>=0.3.2` from PyPI. Provides the `CodexClient`
+stdio transport, `start_thread` / `resume_thread`, and the
+`ConversationStep` notification stream. The harness patches the SDK's
+stdio transport to capture `codex app-server` stderr (the stock
+transport discards it, leaving opaque "failed reading from stdio
+transport" diagnostics).
 
-The official OpenAI docs
-(<https://developers.openai.com/codex/sdk>, lines 620-647) describe the
-Python SDK as **experimental and installed from a local checkout** of
-the open-source `openai/codex` repo via editable install from
-`sdk/python`. It is **not safe to assume a stable
-`codex-app-server-sdk>=0.1` is on PyPI** the way the first draft did.
-The public example uses `thread_start(...); thread.run(...)`; some
-method names referenced earlier in this spec (`start_thread`,
-`resume_thread`, `client.start_thread(...)`) need to be reconciled
-against the actual installed signature during the PR 1 spike.
-
-Practical sourcing options, in order of preference:
-
-- **(a) Vendor a pinned commit** — git submodule or vendored copy of
-  `openai/codex/sdk/python` at a known SHA, installed via
-  `pip install ./vendor/codex-sdk` in the Dockerfile. Most reproducible.
-  Update procedure documented alongside `scripts/vendor_deps.py`.
-- **(b) Direct VCS dependency** — `pip install
-  "codex-app-server-sdk @ git+https://github.com/openai/codex@<SHA>#subdirectory=sdk/python"`.
-  Cleaner pyproject.toml; relies on GitHub at every container build.
-- **(c) Talk to `codex app-server` over JSON-RPC ourselves** — drop the
-  SDK entirely, write a small async JSON-RPC client. ~300 lines.
-  No dependency on an experimental package; full control. Worth it
-  if (a)/(b) prove fragile.
-
-**Recommendation: start with (b) for PR 1 spike, switch to (a) for
-PR 4 if the SDK proves stable enough, fall back to (c) only if the
-SDK churns badly between Codex CLI releases.**
-
-The PR 1 spike must (i) confirm the install path works in the Docker
-build, (ii) print the actual installed `AsyncCodex` method signatures,
-(iii) update §E.2 method names to match.
-
-### I.2 Other Python deps (`pyproject.toml`)
-
-**Implementation note:** the `coord_mcp` proxy in
-`server/coord_mcp.py` now uses the official `mcp` Python stdio server
-transport. The dependency is intentional: Codex app-server gets the
-standard initialize/tools/list/tools/call handshake, while TeamOfTen
-keeps the actual coord tool execution centralized behind the loopback
-HTTP proxy.
-
-The pyproject deps include the MCP transport and the SDK's direct
-WebSocket runtime dependency:
-
-```toml
-"mcp>=1.0",
-"websockets>=16.0",
-```
+### I.2 MCP transport
+`server/coord_mcp.py` uses the official `mcp` Python stdio server
+transport (`mcp>=1.0`). Codex app-server gets the standard
+initialize/tools/list/tools/call handshake; coord tool execution
+remains centralized behind the loopback HTTP proxy. `websockets>=16.0`
+is the SDK's direct runtime dependency.
 
 ### I.3 Package discovery
-
-The current [pyproject.toml:28](../pyproject.toml#L28) declares
-`packages = ["server"]` explicitly. Adding `server/runtimes/` as a
-subpackage works under most build backends because `find_packages`
-recurses, but the explicit list is brittle — if it's setuptools'
-`packages = [...]` literally (no `find_packages`), `server.runtimes`
-silently won't ship in the wheel and imports will break in any
-non-source-tree install.
-
-Switch to package discovery:
-
-```toml
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["server*"]
-```
-
-(Or hatchling/poetry equivalent, depending on the build backend in
-use.) Verify by `pip install .` into a clean venv and `python -c
-"import server.runtimes"`.
+`pyproject.toml` uses `[tool.setuptools.packages.find]` with
+`include = ["server*"]` so `server/runtimes/` ships in the wheel.
+Explicit `packages = [...]` would silently miss the subpackage.
 
 ### I.4 Dockerfile
-
-ENV `CODEX_HOME=/data/codex`. npm install Codex CLI (exact package
-name confirmed in spike — likely `@openai/codex`). Smoke test
-`codex app-server --help` in the build to fail fast on install
-breakage.
-
-### I.5 `requirements.txt`
-
-Not used in this repo (pyproject is the sole source). No change.
+`ENV CODEX_HOME=/data/codex`. `npm install -g @openai/codex` for the
+Codex CLI. Build smoke-tests `codex app-server --help` to fail fast
+on install breakage.
 
 ---
 
-## J. Testing
+## J. Tests
 
-Existing pattern: DB-level pytest, no FastAPI TestClient. New tests:
-- `test_runtime_dispatch.py` — fake runtime + dispatcher contract.
-- `test_db_schema_migration.py` — open old-schema DB, run `init_db()`, assert columns + defaults.
-- `test_codex_pricing.py` — table of `(model, usage, expected_usd)` cases + unknown-model fallback.
-- `test_codex_event_normalization.py` — fake stream of Codex notifications, assert `_emit` calls match Claude vocabulary.
-- `test_compact_path_routing.py` — Claude branch is fixed: a manual
-  `/compact` against a Claude agent runs a `COMPACT_PROMPT` turn
-  exactly once. **Codex branch is conditional on the PR 1 SDK
-  spike result**: if the spike confirms a native compact call exists
-  on the SDK, assert it is invoked once; if the spike concludes
-  CodexRuntime falls back to a `COMPACT_PROMPT` turn against Codex,
-  assert that path instead. The test file ships in PR 5 with the
-  spike-confirmed assertion — not before.
-- `test_cost_cap_aggregation.py` — mixed-runtime rows in `turns`, assert combined sum and rejection.
-- `test_coord_mcp_proxy.py` — spin up the FastAPI ASGI app in-process
-  with a temp DB; issue a per-spawn token bound to `caller_id='p1'`;
-  spawn `python -m server.coord_mcp --proxy-url <uvicorn loopback>
-  with `HARNESS_COORD_PROXY_TOKEN=<token>` in the env; send
-  `tools/list` over stdio (assert tool
-  catalog matches the in-process registry); call `coord_send_message`
-  through the proxy. Assert (i) the row appears in `messages`,
-  (ii) a `message_sent` event is published on the **main process'**
-  bus (subscribe before the call), (iii) `maybe_wake_agent` was
-  invoked for the recipient. Negative test: send a request with a
-  body `caller_id` that mismatches the token's bound identity →
-  expect 403.
+`server/tests/` (DB-level pytest, no FastAPI TestClient) covers:
 
----
-
-## K. Phased rollout — revised PR boundaries
-
-**PR 1 — Codex install/auth spike (no runtime code).** completed and audited
-- Dockerfile: install Codex CLI, `CODEX_HOME=/data/codex`.
-- Source the Python SDK per §I.1 option (b); vendor a Codex repo
-  commit; smoke test `codex app-server --help` and a minimal
-  `AsyncCodex().thread_start(...).run("hi")` against the running
-  app-server.
-- Verify headless `codex login` (ChatGPT auth) works and persists
-  across redeploy.
-- Print actual `AsyncCodex` method signatures; update §E method
-  names in this doc.
-- Extend `/api/health` with `codex_auth.*`.
-- Packaging: switch `pyproject.toml` to discovery (§I.3).
-
-**PR 2 — Runtime abstraction, Claude-only.** completed and audited
-- `server/runtimes/` package, `AgentRuntime`, `ClaudeRuntime` carved
-  out of `run_agent`. Zero behavior change.
-- New `test_runtime_dispatch.py`. All ~113 existing tests green.
-- Manual smoke: Coach + 2 Players, code-touching turn, /compact,
-  mid-turn cancel, project switch.
-
-**PR 3 — DB migration on `agent_sessions`.** completed and audited
-- Add `agents.runtime_override` (nullable), `agent_sessions.codex_thread_id`,
-  `turns.runtime`, `turns.cost_basis` (§B).
-- `_ensure_columns` migration runner.
-- New `PUT /api/agents/{id}/runtime` endpoint with audit logging.
-- No Codex code yet — this PR is just schema + the slot-level
-  preference plumbed through, defaulting to `'claude'` everywhere.
-
-**PR 4 — Coord MCP proxy.** completed and audited
-- `server/coord_mcp.py` as the stdio→HTTP proxy (§C.2–C.4).
-- `POST /api/_coord/{tool}` internal endpoints (loopback bind +
-  per-spawn token).
-- ClaudeRuntime keeps in-process MCP (no migration risk for the
-  default path); the proxy ships dormant until PR 5 wires Codex.
-- Contract test: enumerate the proxy tool list and assert it
-  matches `build_coord_server`'s registered tools.
-
-**PR 5 — CodexRuntime behind a feature flag, one-slot pilot.** completed and audited
-- `server/runtimes/codex.py`, `server/pricing.py`.
-- `HARNESS_CODEX_ENABLED=true` env gate; `PUT /api/agents/{id}/runtime`
-  rejects `codex` when the flag is unset.
-- Runtime path: resolve ChatGPT/API-key auth, open cached
-  `CodexClient`, start/resume the per-slot thread, attach coord MCP
-  proxy + external MCP servers, stream notifications into harness
-  events, persist `codex_thread_id`, and insert `turns` rows with
-  runtime/cost-basis metadata.
-- Manual compact uses native `compact_thread`; auto-compact stays off
-  until app-server exposes context-pressure telemetry.
-- AskUserQuestion path decided per §E.8: v1 degrades and declines
-  side-channel approval requests after surfacing `human_attention`.
-- Cost-basis split working (§G); EnvPane shows both meters.
-
-**PR 6 — UI polish, renderers, mixed-team prompting.** completed and audited
-- LeftRail runtime badge.
-- Pane settings popover Runtime radio.
-- Options drawer per-role default + per-runtime model dropdowns.
-- `apply_patch` / `shell` / `web_search` renderers.
-- Coach "Roster runtimes" block.
-- CLAUDE.md updates (invariants clarification, Codex section, gotchas).
-- Drop the `HARNESS_CODEX_ENABLED` flag once stable.
-
-Each PR independently revertable. PR 1 is the gate — if the SDK
-sourcing or headless login spike fails, the rest deserves a redesign
-before continuing.
-
----
-
-## L. Risks / unknowns to validate
-
-1. **Headless `codex login` viability.** Highest risk. PR 0 spike. If device-code can't complete in non-TTY container shell, fall back to API-key-only Codex.
-2. **SDK "one active turn consumer per client" limit.** Validate with 5-turn loop, confirm no notification cross-talk. Live-validation script: [scripts/codex_validate_concurrency.py](../scripts/codex_validate_concurrency.py) — runs sequential + concurrent probes and prints a verdict keyed to follow-up actions.
-3. **Coord MCP under both runtimes.** Codex's MCP config shape may differ — verify standalone smoke test from both runtimes before integrating. Live E2E script: [scripts/codex_validate_coord_e2e.py](../scripts/codex_validate_coord_e2e.py) — drives a real Codex turn through the running harness API and asserts a coord_* tool round-trip.
-4. **`Turn.usage` shape.** Confirm `cached_input_tokens` is a single field; some early SDK versions returned `usage=None` on streamed turns.
-5. **`thread_resume` config matching.** If Codex requires original model/sandbox to match on resume, mid-session model swap invalidates resume. Mitigation: null `codex_thread_id` on detected model change.
+- `test_runtime_dispatch.py` — fake runtime + dispatcher contract
+  (cost-cap rejects before `run_turn`, `agent_started` before,
+  `agent_stopped` after).
+- `test_db_schema_migration.py` — old-schema DB → `init_db()` →
+  asserts new columns + defaults.
+- `test_codex_pricing.py` — `(model, usage, expected_usd)` table +
+  unknown-model fallback.
+- `test_codex_event_normalization.py` — fake stream of Codex
+  notifications, asserts `_emit` calls match Claude vocabulary.
+- `test_codex_runtime_gate.py` — runtime resolution, MCP cache
+  eviction (idle close, in-flight pop, `evict_all_clients`).
+- `test_cost_cap_aggregation.py` — mixed-runtime rows, asserts
+  combined sum and rejection.
+- `test_coord_mcp_proxy.py` — spin up FastAPI in-process, mint a
+  token bound to `caller_id='p1'`, spawn `python -m server.coord_mcp`
+  with the token in env, exercise `tools/list` and
+  `coord_send_message`. Asserts the row appears in `messages`, the
+  `message_sent` event is published on the **main process'** bus,
+  and `maybe_wake_agent` is invoked. Negative test: body `caller_id`
+  mismatching the token's bound identity → 403.

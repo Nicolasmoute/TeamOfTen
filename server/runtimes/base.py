@@ -97,10 +97,13 @@ class AgentRuntime(Protocol):
         dispatcher proceeds to run the user's original prompt on the
         now-fresh session). Return False to skip compaction.
 
-        ClaudeRuntime preserves the existing JSONL-probe + threshold
-        check. CodexRuntime returns False in v1 — auto-compact is
-        disabled until app-server exposes a usable context-pressure
-        signal.
+        Both runtimes honor `HARNESS_AUTO_COMPACT_THRESHOLD` (default
+        0.7). ClaudeRuntime probes the session JSONL for prompt-token
+        usage and runs a `COMPACT_PROMPT` turn when the ratio trips.
+        CodexRuntime reads `_codex_session_context_estimate` from the
+        latest `turns` row for the thread and delegates to
+        `run_manual_compact` (native `client.compact_thread`) when the
+        ratio trips.
         """
         ...
 

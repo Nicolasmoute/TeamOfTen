@@ -321,23 +321,36 @@ async def _emit(event: dict[str, Any]) -> None:
 
 # Spec §4 priority orientation. Short by design — the system prompt
 # already contains project objectives + open coach todos, so the user
-# prompt just tells Coach the priority order.
+# prompt just tells Coach the priority order. Step (3) is intentionally
+# directive: when inbox/todos are empty BUT objectives exist, Coach
+# must still pick a concrete action grounded in the objectives — the
+# whole point of a recurring tick is forward motion. The end-quietly
+# branch is gated on objectives being absent or empty (nothing to
+# anchor invented work to), not on inbox/todos being empty.
 TICK_BASE_PROMPT = (
-    "Routine tick. Priority order:\n"
+    "Routine tick. Work the project — do something useful every "
+    "fire.\n"
     "\n"
-    "(1) Inbox — call coord_read_inbox and respond to anything pending "
-    "from the human or your teammates.\n"
-    "(2) Outstanding coach-todos — pick the one most aligned with "
-    "current priorities and act on it (assign it, break it down, or "
-    "do the work).\n"
-    "(3) Project objectives — if inbox and todos are both empty, take "
-    "one concrete action that pushes the project closer to its "
-    "objectives: propose a useful next step and execute it, break a "
-    "goal into a new coach-todo for the operator to refine, or send "
-    "a status update to the team.\n"
+    "Priority order:\n"
     "\n"
-    "Don't invent work. If there's genuinely nothing useful to do, "
-    "end the turn without calling tools."
+    "(1) Inbox first — call coord_read_inbox. Respond to anything "
+    "pending from the human or your teammates.\n"
+    "(2) Open coach-todos — if inbox is clear, pick the todo most "
+    "aligned with current priorities and act on it (assign to a "
+    "Player, break it into smaller steps, or do the work yourself).\n"
+    "(3) Drive the objectives — if inbox AND todos are both empty, "
+    "you must still pick one concrete action that materially "
+    "advances a project objective. Examples: assign a Player to "
+    "scout an open question, send a status update or coordination "
+    "message, capture a new coach-todo for the operator to refine, "
+    "audit recent Player work for blockers, propose a useful next "
+    "step and execute it. Don't end the turn idle when objectives "
+    "exist — invent forward motion grounded in them.\n"
+    "\n"
+    "Only end the turn without acting when project objectives are "
+    "absent or empty (no \"## Project objectives\" section in your "
+    "system prompt). In that case, end quietly — there's nothing "
+    "to anchor invented work to."
 )
 
 

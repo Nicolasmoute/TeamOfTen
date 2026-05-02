@@ -127,11 +127,33 @@ async def test_codex_resolve_auth_api_key_fallback(
     assert env == {"OPENAI_API_KEY": "sk-test-fake"}
 
 
-async def test_codex_maybe_auto_compact_returns_false() -> None:
-    """v1 has no Codex auto-compact — context-pressure signal isn't
-    exposed yet."""
+async def test_codex_maybe_auto_compact_short_circuits_in_compact_mode() -> None:
+    """If we're already inside a compact turn, the trip-wire must
+    early-out before any DB hit so a recursive compact is impossible."""
     from server.runtimes.base import TurnContext
 
+    rt = CodexRuntime()
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="hi",
+        system_prompt="",
+        workspace_cwd="",
+        allowed_tools=[],
+        external_mcp_servers={},
+    )
+    tc.compact_mode = True
+    assert await rt.maybe_auto_compact(tc) is False
+
+
+async def test_codex_maybe_auto_compact_off_when_threshold_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`HARNESS_AUTO_COMPACT_THRESHOLD=0` disables the feature entirely
+    — no thread/DB read, no compact path."""
+    from server.runtimes.base import TurnContext
+
+    monkeypatch.setenv("HARNESS_AUTO_COMPACT_THRESHOLD", "0.0")
     rt = CodexRuntime()
     tc = TurnContext(
         agent_id="p1",
@@ -602,7 +624,16 @@ class _ThreadFakeClient:
     def resume_thread(self, thread_id: str, *, overrides=None):
         self.resume_calls.append({"thread_id": thread_id, "overrides": overrides})
         if self.fail_resume_with is not None:
-            raise self.fail_resume_with
+            # Support a list to model "fail N times, then succeed" so we
+            # can exercise the CodexTimeoutError retry path. A bare
+            # exception keeps the original "fail every call" behavior.
+            if isinstance(self.fail_resume_with, list):
+                if self.fail_resume_with:
+                    exc = self.fail_resume_with.pop(0)
+                    if exc is not None:
+                        raise exc
+            else:
+                raise self.fail_resume_with
         return _FakeThread(thread_id=thread_id, config=overrides)
 
 
@@ -783,6 +814,106 @@ async def test_open_thread_passes_config_to_start_and_resume(
     await _set_codex_thread_id("p1", "tid")
     thread, _ = await open_thread("p1", client, config=sentinel)
     assert client.resume_calls[-1] == {"thread_id": "tid", "overrides": sentinel}
+
+
+async def test_open_thread_retries_resume_on_codex_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_db,
+) -> None:
+    """A transient CodexTimeoutError on `thread/resume` should be retried
+    instead of immediately falling back to `start_thread` and losing the
+    thread continuity. Coach with a heavy thread regularly hits the
+    SDK's 30s `request_timeout` under backend pressure."""
+    import server.db as dbmod
+    from codex_app_server_sdk import CodexTimeoutError
+    from server.runtimes.codex import (
+        open_thread, _set_codex_thread_id, _get_codex_thread_id,
+    )
+    await dbmod.init_db()
+    _FakeThread.instances.clear()
+    # Fail once with a timeout, then succeed on retry.
+    client = _ThreadFakeClient()
+    client.fail_resume_with = [CodexTimeoutError("request timed out")]
+    monkeypatch.setattr(
+        "server.runtimes.codex._CODEX_RESUME_TIMEOUT_RETRY_DELAY", 0.0
+    )
+    captured = _capture_emit(monkeypatch)
+
+    await _set_codex_thread_id("p1", "thread_slow")
+    thread, resumed = await open_thread("p1", client)
+
+    # Two resume attempts (one timed out, one succeeded), no fallback start.
+    assert len(client.resume_calls) == 2
+    assert client.start_calls == []
+    assert resumed is True
+    assert thread.thread_id == "thread_slow"
+    # Stored id preserved — continuity intact.
+    assert (await _get_codex_thread_id("p1")) == "thread_slow"
+    # No session_resume_failed event since the retry rescued the resume.
+    assert captured == []
+
+
+async def test_open_thread_falls_back_after_repeated_codex_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_db,
+) -> None:
+    """If every retry also times out, fall back to start_thread and emit
+    the failure event so the user has visibility."""
+    import server.db as dbmod
+    from codex_app_server_sdk import CodexTimeoutError
+    from server.runtimes.codex import (
+        _CODEX_RESUME_TIMEOUT_RETRIES,
+        open_thread, _set_codex_thread_id, _get_codex_thread_id,
+    )
+    await dbmod.init_db()
+    _FakeThread.instances.clear()
+    client = _ThreadFakeClient()
+    client.fail_resume_with = [
+        CodexTimeoutError("request timed out")
+        for _ in range(_CODEX_RESUME_TIMEOUT_RETRIES + 1)
+    ]
+    monkeypatch.setattr(
+        "server.runtimes.codex._CODEX_RESUME_TIMEOUT_RETRY_DELAY", 0.0
+    )
+    captured = _capture_emit(monkeypatch)
+
+    await _set_codex_thread_id("p1", "thread_dead")
+    thread, resumed = await open_thread("p1", client)
+
+    assert len(client.resume_calls) == _CODEX_RESUME_TIMEOUT_RETRIES + 1
+    assert client.start_calls == [{"config": None}]
+    assert resumed is False
+    assert (await _get_codex_thread_id("p1")) is None
+    assert len(captured) == 1
+    assert captured[0]["type"] == "session_resume_failed"
+    assert captured[0]["session_id"] == "thread_dead"
+    assert "CodexTimeoutError" in captured[0]["error"]
+
+
+async def test_open_thread_does_not_retry_non_timeout_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_db,
+) -> None:
+    """A CodexProtocolError ("thread not found") is a real stale-thread
+    signal — no point retrying. Fall back on the first attempt."""
+    import server.db as dbmod
+    from codex_app_server_sdk import CodexProtocolError
+    from server.runtimes.codex import open_thread, _set_codex_thread_id
+    await dbmod.init_db()
+    _FakeThread.instances.clear()
+    client = _ThreadFakeClient()
+    client.fail_resume_with = CodexProtocolError("thread not found")
+    captured = _capture_emit(monkeypatch)
+
+    await _set_codex_thread_id("p1", "thread_gone")
+    thread, resumed = await open_thread("p1", client)
+
+    # Exactly one resume attempt; non-timeout errors don't retry.
+    assert len(client.resume_calls) == 1
+    assert client.start_calls == [{"config": None}]
+    assert resumed is False
+    assert len(captured) == 1
+    assert captured[0]["type"] == "session_resume_failed"
 
 
 # Audit item #10 — ConversationStep → harness event mapping.
@@ -1138,6 +1269,35 @@ async def test_handle_step_mcp_tool_call_parses_sdk_arguments_and_result(
     assert captured[1]["type"] == "tool_result"
     assert captured[1]["tool_use_id"] == "mcp_call_real"
     assert captured[1]["content"] == '{"ok":true}'
+
+
+def test_step_payload_is_error_detects_cancellation_and_rejection() -> None:
+    """OpenAI's Codex safety monitor surfaces a refused tool call as a
+    "completed" item with status='cancelled' (or similar) and a prose
+    explanation in the body. Without picking up `cancel` / `reject` as
+    error indicators, the result rendered green in the UI — the user
+    couldn't tell a monitor refusal from a real success without reading
+    every tool_result body, and Coach paraphrased these as generic
+    "rejected by the coordination layer" because there was no clean
+    signal to lean on."""
+    from server.runtimes.codex import _step_payload_is_error
+
+    # Original error/fail patterns still detected.
+    assert _step_payload_is_error({"status": "error"}) is True
+    assert _step_payload_is_error({"status": "failed"}) is True
+    assert _step_payload_is_error({"status": "completed", "exit_code": 1}) is True
+
+    # New: monitor cancellations + rejections.
+    assert _step_payload_is_error({"status": "cancelled"}) is True
+    assert _step_payload_is_error({"status": "canceled"}) is True
+    assert _step_payload_is_error({"status": "user_cancelled"}) is True
+    assert _step_payload_is_error({"status": "rejected"}) is True
+    assert _step_payload_is_error({"state": "cancelled"}) is True
+
+    # Real successes stay green.
+    assert _step_payload_is_error({"status": "completed"}) is False
+    assert _step_payload_is_error({"status": "completed", "exit_code": 0}) is False
+    assert _step_payload_is_error({}) is False
 
 
 async def test_resolve_mcp_tool_name_accepts_alternate_key_spellings() -> None:
@@ -1602,3 +1762,227 @@ async def test_codex_run_manual_compact_uses_native_compact(
     assert cleared == ["p1"]
     assert tc.turn_ctx["got_result"] is True
     assert captured[-1]["type"] == "session_compacted"
+
+
+async def test_codex_maybe_auto_compact_no_thread_returns_false(
+    monkeypatch,
+) -> None:
+    """Threshold parses fine but there is no stored codex_thread_id —
+    nothing to compact, return False so the dispatcher proceeds with
+    the user's prompt as-is."""
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    monkeypatch.setenv("HARNESS_AUTO_COMPACT_THRESHOLD", "0.7")
+    monkeypatch.setattr(
+        codex_mod, "_get_codex_thread_id", lambda agent_id: _async_value(None)
+    )
+
+    captured = _capture_emit(monkeypatch)
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="hi",
+        system_prompt="",
+        workspace_cwd="",
+        allowed_tools=[],
+        external_mcp_servers={},
+        model="gpt-5.4-mini",
+        turn_ctx={},
+    )
+
+    assert await CodexRuntime().maybe_auto_compact(tc) is False
+    assert captured == [], "no thread → no events"
+
+
+async def test_codex_maybe_auto_compact_below_threshold_returns_false(
+    monkeypatch,
+) -> None:
+    """Used/window ratio under threshold → False, no compact path."""
+    import server.agents as agentsmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    monkeypatch.setenv("HARNESS_AUTO_COMPACT_THRESHOLD", "0.7")
+    monkeypatch.setattr(
+        codex_mod, "_get_codex_thread_id", lambda agent_id: _async_value("tid_low")
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_codex_session_context_estimate",
+        lambda thread_id: _async_value(10_000),
+    )
+    monkeypatch.setattr(agentsmod, "_context_window_for", lambda model: 1_000_000)
+
+    captured = _capture_emit(monkeypatch)
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="hi",
+        system_prompt="",
+        workspace_cwd="",
+        allowed_tools=[],
+        external_mcp_servers={},
+        model="gpt-5.4-mini",
+        turn_ctx={},
+    )
+
+    assert await CodexRuntime().maybe_auto_compact(tc) is False
+    assert not any(ev["type"] == "auto_compact_triggered" for ev in captured)
+
+
+async def test_codex_maybe_auto_compact_trips_native_compact(
+    monkeypatch,
+) -> None:
+    """Used/window ratio over threshold → emit auto_compact_triggered,
+    delegate to run_manual_compact (native client.compact_thread),
+    persist continuity_note, clear codex_thread_id, emit
+    session_compacted, return True."""
+    import server.agents as agentsmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    monkeypatch.setenv("HARNESS_AUTO_COMPACT_THRESHOLD", "0.7")
+
+    client = _CompactFakeClient()
+    notes: list[tuple[str, str | None]] = []
+    cleared: list[str] = []
+
+    async def fake_get_client(slot, *, cwd, env_overrides=None):
+        return client
+
+    async def fake_set_note(agent_id, note):
+        notes.append((agent_id, note))
+
+    async def fake_clear(agent_id):
+        cleared.append(agent_id)
+
+    monkeypatch.setattr(
+        codex_mod, "_get_codex_thread_id",
+        lambda agent_id: _async_value("tid_full"),
+    )
+    monkeypatch.setattr(
+        codex_mod, "resolve_auth",
+        lambda: _async_value(("chatgpt", {})),
+    )
+    monkeypatch.setattr(codex_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(codex_mod, "_clear_codex_thread_id", fake_clear)
+    monkeypatch.setattr(agentsmod, "_set_continuity_note", fake_set_note)
+    # 800k of 1M = 80% — well above the 70% threshold.
+    monkeypatch.setattr(
+        agentsmod,
+        "_codex_session_context_estimate",
+        lambda thread_id: _async_value(800_000),
+    )
+    monkeypatch.setattr(agentsmod, "_context_window_for", lambda model: 1_000_000)
+
+    captured = _capture_emit(monkeypatch)
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="user's deferred prompt",
+        system_prompt="",
+        workspace_cwd="C:/work/p1/project",
+        allowed_tools=[],
+        external_mcp_servers={},
+        model="gpt-5.4-mini",
+        turn_ctx={},
+    )
+
+    result = await CodexRuntime().maybe_auto_compact(tc)
+    assert result is True
+
+    triggered = [ev for ev in captured if ev["type"] == "auto_compact_triggered"]
+    assert len(triggered) == 1
+    assert triggered[0]["used_tokens"] == 800_000
+    assert triggered[0]["context_window"] == 1_000_000
+    assert triggered[0]["ratio"] == 0.8
+    assert triggered[0]["threshold"] == 0.7
+    assert triggered[0]["deferred_prompt"] == "user's deferred prompt"
+
+    # Native compact ran on the right thread id.
+    assert client.calls == ["tid_full"]
+    assert notes == [("p1", "compact summary")]
+    assert cleared == ["p1"]
+    # session_compacted is the run_manual_compact tail event.
+    assert any(ev["type"] == "session_compacted" for ev in captured)
+    # got_result is the success signal the trip-wire reads.
+    assert tc.turn_ctx["got_result"] is True
+
+
+class _RaisingCompactClient:
+    def compact_thread(self, thread_id):
+        raise RuntimeError("app-server died mid-compact")
+
+
+async def test_codex_maybe_auto_compact_emits_failed_on_compact_error(
+    monkeypatch,
+) -> None:
+    """When the native compact fails inside run_manual_compact, the
+    trip-wire must surface `auto_compact_failed` (symmetric with
+    Claude) and return False so the dispatcher continues on the
+    original thread."""
+    import server.agents as agentsmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    monkeypatch.setenv("HARNESS_AUTO_COMPACT_THRESHOLD", "0.7")
+
+    async def fake_get_client(slot, *, cwd, env_overrides=None):
+        return _RaisingCompactClient()
+
+    async def fake_close_client(slot):
+        return None
+
+    monkeypatch.setattr(
+        codex_mod, "_get_codex_thread_id",
+        lambda agent_id: _async_value("tid_boom"),
+    )
+    monkeypatch.setattr(
+        codex_mod, "resolve_auth",
+        lambda: _async_value(("chatgpt", {})),
+    )
+    monkeypatch.setattr(codex_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(codex_mod, "close_client", fake_close_client)
+    monkeypatch.setattr(
+        codex_mod, "_clear_codex_thread_id",
+        lambda agent_id: _async_value(None),
+    )
+    monkeypatch.setattr(
+        agentsmod, "_set_continuity_note",
+        lambda *_: _async_value(None),
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_codex_session_context_estimate",
+        lambda thread_id: _async_value(900_000),
+    )
+    monkeypatch.setattr(agentsmod, "_context_window_for", lambda model: 1_000_000)
+
+    # _set_status is reached by run_manual_compact's error path.
+    async def fake_set_status(agent_id, status):
+        return None
+    monkeypatch.setattr(agentsmod, "_set_status", fake_set_status)
+
+    captured = _capture_emit(monkeypatch)
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="deferred",
+        system_prompt="",
+        workspace_cwd="C:/work/p1/project",
+        allowed_tools=[],
+        external_mcp_servers={},
+        model="gpt-5.4-mini",
+        turn_ctx={},
+    )
+
+    result = await CodexRuntime().maybe_auto_compact(tc)
+    assert result is False
+    types = [ev["type"] for ev in captured]
+    assert "auto_compact_triggered" in types
+    assert "auto_compact_failed" in types
+    # got_result must NOT be set — it's the failure signal the trip-wire reads.
+    assert tc.turn_ctx.get("got_result") is not True
