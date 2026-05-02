@@ -9,21 +9,7 @@ import { h, render, Component } from "https://esm.sh/preact@10";
 import { useState, useEffect, useMemo, useRef, useCallback, useLayoutEffect } from "https://esm.sh/preact@10/hooks";
 import htm from "/static/vendor/htm.js";
 import Split from "/static/vendor/split.js";
-import { Marked } from "/static/vendor/marked.js";
-import DOMPurify from "/static/vendor/dompurify.js";
-import hljs from "/static/vendor/hljs-core.js";
-import hljsBash from "/static/vendor/hljs-bash.js";
-import hljsCss from "/static/vendor/hljs-css.js";
-import hljsGo from "/static/vendor/hljs-go.js";
-import hljsJson from "/static/vendor/hljs-json.js";
-import hljsJs from "/static/vendor/hljs-javascript.js";
-import hljsMd from "/static/vendor/hljs-markdown.js";
-import hljsPython from "/static/vendor/hljs-python.js";
-import hljsRust from "/static/vendor/hljs-rust.js";
-import hljsSql from "/static/vendor/hljs-sql.js";
-import hljsTs from "/static/vendor/hljs-typescript.js";
-import hljsXml from "/static/vendor/hljs-xml.js";
-import hljsYaml from "/static/vendor/hljs-yaml.js";
+import { renderMarkdown, enhanceMarkdownIn, hljs, DOMPurify } from "/static/markdown.js";
 import {
   renderToolCall,
   setAgentDirectory,
@@ -39,125 +25,10 @@ const html = htm.bind(h);
 // is per-window — multiple panes can mount and unmount cleanly.
 const compassEvents = createCompassEventRouter();
 
-// ------------------------------------------------------------------
-// markdown rendering: marked (GFM) + highlight.js + DOMPurify
-// ------------------------------------------------------------------
-//
-// English-only language argument doesn't apply here — these are
-// PROGRAMMING-language packs for syntax highlighting. Adding more
-// later is a one-liner: import the pack from
-// https://esm.sh/highlight.js@11/lib/languages/<name> and register it
-// against the aliases agents are likely to use.
-
-hljs.registerLanguage("bash", hljsBash);
-hljs.registerLanguage("sh", hljsBash);
-hljs.registerLanguage("shell", hljsBash);
-hljs.registerLanguage("css", hljsCss);
-hljs.registerLanguage("go", hljsGo);
-hljs.registerLanguage("html", hljsXml);
-hljs.registerLanguage("xml", hljsXml);
-hljs.registerLanguage("javascript", hljsJs);
-hljs.registerLanguage("js", hljsJs);
-hljs.registerLanguage("json", hljsJson);
-hljs.registerLanguage("markdown", hljsMd);
-hljs.registerLanguage("md", hljsMd);
-hljs.registerLanguage("python", hljsPython);
-hljs.registerLanguage("py", hljsPython);
-hljs.registerLanguage("rust", hljsRust);
-hljs.registerLanguage("rs", hljsRust);
-hljs.registerLanguage("sql", hljsSql);
-hljs.registerLanguage("typescript", hljsTs);
-hljs.registerLanguage("ts", hljsTs);
-hljs.registerLanguage("yaml", hljsYaml);
-hljs.registerLanguage("yml", hljsYaml);
-
-// Single Marked instance with GFM (tables, task lists, autolinks,
-// strikethrough). Custom code-block renderer runs hljs when the fence
-// info-string names a registered language; falls back to plain
-// escaped <pre><code> otherwise (keeps unknown langs readable).
-const marked = new Marked({
-  gfm: true,
-  breaks: false,
-  pedantic: false,
-});
-marked.use({
-  renderer: {
-    code(code, infostring) {
-      const text = typeof code === "object" && code ? (code.text || "") : String(code || "");
-      const lang = (typeof infostring === "string"
-        ? infostring
-        : typeof code === "object" && code
-          ? (code.lang || "")
-          : ""
-      ).trim().toLowerCase();
-      if (lang && hljs.getLanguage(lang)) {
-        try {
-          const highlighted = hljs.highlight(text, {
-            language: lang, ignoreIllegals: true,
-          }).value;
-          return `<pre class="md-code"><code class="hljs language-${lang}" data-lang="${lang}">${highlighted}</code></pre>`;
-        } catch (_) {
-          // Fall through to escaped plaintext.
-        }
-      }
-      const esc = text
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
-      return `<pre class="md-code"><code class="hljs"${lang ? ` data-lang="${lang}"` : ""}>${esc}</code></pre>`;
-    },
-  },
-});
-
-// Link handling for sanitized markdown:
-//   - external URL (http/https/mailto) → open in new tab
-//   - file path (anything starting with `/`) → marked as a harness
-//     file-link; the global click handler in App intercepts it,
-//     opens the Files pane, and selects the file. href is neutralized
-//     to "#" so a stray middle-click doesn't 404.
-DOMPurify.addHook("afterSanitizeAttributes", (node) => {
-  if (node.tagName !== "A" || !node.hasAttribute("href")) return;
-  const href = node.getAttribute("href") || "";
-  if (href.startsWith("/") && !href.startsWith("//")) {
-    node.setAttribute("data-harness-path", href);
-    node.setAttribute("href", "#");
-    node.classList.add("harness-file-link");
-    // No target — we're handling navigation in-app, not opening a tab.
-    node.removeAttribute("target");
-    node.setAttribute("rel", "noopener");
-    return;
-  }
-  // External — open in new tab + opaque referrer.
-  node.setAttribute("target", "_blank");
-  node.setAttribute("rel", "noreferrer noopener");
-});
-
-function renderMarkdown(md) {
-  if (!md) return "";
-  let raw;
-  try {
-    raw = marked.parse(String(md));
-  } catch (e) {
-    console.error("markdown parse failed", e);
-    // Fall back to escaped plaintext wrapped in a code block so the
-    // user still sees something. Routed through DOMPurify just like
-    // the happy path so the file-link / external-link hooks fire
-    // consistently and we never bypass the sanitizer.
-    raw = "<pre class=\"md-code\"><code>" +
-      String(md).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") +
-      "</code></pre>";
-  }
-  return DOMPurify.sanitize(raw, {
-    ADD_ATTR: ["target", "rel", "data-lang"],
-  });
-}
-
-// Expose for compass.js (and other module-loaded panes that want
-// the harness's existing markdown pipeline). Cheap one-liner; avoids
-// re-vendoring marked + dompurify + hljs in every pane file.
-if (typeof window !== "undefined") {
-  window.__harness_renderMarkdown = renderMarkdown;
-}
+// markdown rendering: parse / sanitise / math / mermaid pipeline lives
+// in markdown.js. `renderMarkdown` and `hljs` are imported above. We
+// install the post-render observer once, on App mount (see App), so
+// mermaid blocks anywhere in the body get lazy-rendered.
 
 // FilesPane helpers — extension allowlist for what we'll inline-preview
 // and a syntax-highlighted code renderer for non-markdown text files.
@@ -11389,3 +11260,10 @@ function EventItem({ event }) {
 // ------------------------------------------------------------------
 
 render(html`<${App} />`, document.getElementById("app"));
+
+// One-time post-render enhancement install. Watches the body for
+// mermaid placeholders inserted by renderMarkdown anywhere in the
+// app (panes, files preview, compass, decisions, briefings) and
+// lazy-renders them to SVG. Math is already rendered at parse time
+// via the KaTeX extension, so no observer is needed for it.
+enhanceMarkdownIn(document.body);
