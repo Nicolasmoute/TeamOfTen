@@ -64,19 +64,16 @@ def test_public_health_reports_auth_required_when_token_set(
 
 def test_health_detail_requires_token_when_set(fresh_db, monkeypatch) -> None:
     """The verbose endpoint is gated by `require_token`. With a token
-    set in env, an unauthenticated request gets 401."""
-    monkeypatch.setenv("HARNESS_TOKEN", "supersecret")
-    # Force re-read of HARNESS_TOKEN in the module: depending on import
-    # ordering, the cached value may already be "" — but require_token
-    # consults os.environ at request time, so this monkeypatch flows
-    # through.
-    import importlib
+    set in env, an unauthenticated request gets 401.
 
+    Use `setattr` (auto-reverted by pytest) instead of
+    `importlib.reload` — reload mutates module state that persists
+    after the test, contaminating later test files in the same
+    session."""
     import server.main as mainmod
-    importlib.reload(mainmod)
-    from server.main import app
+    monkeypatch.setattr(mainmod, "HARNESS_TOKEN", "supersecret")
 
-    with TestClient(app) as c:
+    with TestClient(mainmod.app) as c:
         r = c.get("/api/health/detail")
         # Exact code depends on require_token's response (401 or 403);
         # what matters is the request was rejected without a token.
@@ -88,14 +85,10 @@ def test_health_detail_succeeds_with_correct_token(
 ) -> None:
     """Auth'd hit returns 200 (or 503 for missing-subsystem details, but
     the full `checks` map is present either way)."""
-    monkeypatch.setenv("HARNESS_TOKEN", "okteapot")
-    import importlib
-
     import server.main as mainmod
-    importlib.reload(mainmod)
-    from server.main import app
+    monkeypatch.setattr(mainmod, "HARNESS_TOKEN", "okteapot")
 
-    with TestClient(app) as c:
+    with TestClient(mainmod.app) as c:
         r = c.get(
             "/api/health/detail",
             headers={"Authorization": "Bearer okteapot"},

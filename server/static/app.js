@@ -1985,9 +1985,14 @@ function App() {
   // Compute which slots have unread activity: they have events newer
   // than their seen ts AND are not currently open (open panes are
   // considered always seen, since the user can see events landing).
+  // Restricted to real agent slots (Coach + Players); pseudo-actors
+  // like "compass" publish events with their own agent_id and would
+  // otherwise inflate the tab-title badge past the 11-slot maximum.
   const unreadSlots = useMemo(() => {
+    const validSlots = new Set(agents.map((a) => a.id));
     const out = new Set();
     for (const [slot, list] of conversations) {
+      if (!validSlots.has(slot)) continue;
       if (openSlots.includes(slot)) continue;
       if (!list.length) continue;
       const last = list[list.length - 1].ts || "";
@@ -1995,7 +2000,7 @@ function App() {
       if (last > (seenTs[slot] || "")) out.add(slot);
     }
     return out;
-  }, [conversations, seenTs, openSlots]);
+  }, [conversations, seenTs, openSlots, agents]);
 
   // Slots in a "problem" state — surfaced as a red box in the rail.
   // Three sources:
@@ -10723,6 +10728,32 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
               <div class="event-body">${streaming.text}<span class="stream-cursor" /></div>
             </div>`
           : null}
+        ${(() => {
+          // Liveness placeholder for the dead window between
+          // agent_started and the first child event (thinking / text /
+          // tool_use). Without this the pane looks stale for the 5–30 s
+          // it takes the SDK subprocess to spin up and the model to
+          // stream its first token. Conditions:
+          //   • agent is working
+          //   • no streaming buffer is active (one of those will
+          //     supersede this placeholder the moment tokens arrive)
+          //   • the most recent event is a start-of-turn meta event
+          //     that emits before any real work shows
+          if (agent?.status !== "working") return null;
+          if (streaming && (streaming.thinking || streaming.text)) return null;
+          const last = allEvents.length > 0 ? allEvents[allEvents.length - 1] : null;
+          if (!last) return null;
+          const startMetaTypes = new Set([
+            "agent_started",
+            "context_applied",
+            "session_compact_requested",
+          ]);
+          if (!startMetaTypes.has(last.type)) return null;
+          return html`<div class="pane-warming">
+            <span class="pane-warming-dots"><i></i><i></i><i></i></span>
+            <span class="pane-warming-label">warming up…</span>
+          </div>`;
+        })()}
       </div>
       <footer class="pane-input">
         ${infoText

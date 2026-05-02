@@ -3314,6 +3314,42 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   51%, 100% { opacity: 0; }
 }
 
+/* Liveness placeholder shown between agent_started and the first
+   child event (thinking/text/tool_use). Three amber dots animate in
+   sequence so the pane reads as "agent is alive" instead of
+   apparently stalled while the SDK subprocess spins up. Replaced by
+   the real streaming bubbles or rendered events the moment they
+   arrive. */
+.pane-warming {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  margin: 4px 8px;
+  color: var(--warn);
+  font-size: 12px;
+  font-style: italic;
+  opacity: 0.85;
+}
+.pane-warming-dots {
+  display: inline-flex;
+  gap: 3px;
+}
+.pane-warming-dots i {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--warn);
+  animation: pane-warming-bounce 1.2s ease-in-out infinite;
+}
+.pane-warming-dots i:nth-child(2) { animation-delay: 0.18s; }
+.pane-warming-dots i:nth-child(3) { animation-delay: 0.36s; }
+@keyframes pane-warming-bounce {
+  0%, 80%, 100% { opacity: 0.3; transform: translateY(0); }
+  40%           { opacity: 1;   transform: translateY(-3px); }
+}
+
 /* Thinking blocks: muted, collapsed by default so a chatty turn
    doesn't drown the timeline. Header is clickable; body pre-wraps
    and is capped so runaway thoughts don't blow out the pane. */

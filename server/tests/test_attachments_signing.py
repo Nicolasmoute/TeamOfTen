@@ -166,16 +166,15 @@ def test_signed_url_remint_endpoint_requires_token(
     fresh_db, monkeypatch
 ) -> None:
     """The re-mint endpoint is auth'd — the audit pattern is "minting
-    requires the token, only the signed URL itself is anonymous"."""
-    monkeypatch.setenv("HARNESS_TOKEN", "tok")
+    requires the token, only the signed URL itself is anonymous".
+
+    Use `setattr` (auto-reverted) instead of `importlib.reload` so the
+    HARNESS_TOKEN binding doesn't leak into later test files."""
     sigmod.reset_cache_for_tests()
-    import importlib
-
     import server.main as mainmod
-    importlib.reload(mainmod)
-    from server.main import app
+    monkeypatch.setattr(mainmod, "HARNESS_TOKEN", "tok")
 
-    with TestClient(app) as c:
+    with TestClient(mainmod.app) as c:
         r = c.get("/api/attachments/anyfile.png/signed-url")
         # Without the token, the request is rejected.
         assert r.status_code in (401, 403)
@@ -185,15 +184,11 @@ def test_legacy_token_endpoint_still_works(fresh_db, monkeypatch) -> None:
     """Backwards compat: the existing `?token=` serve path stays for
     one release so cached UI bundles keep working."""
     import io
-    monkeypatch.setenv("HARNESS_TOKEN", "tok")
     sigmod.reset_cache_for_tests()
-    import importlib
-
     import server.main as mainmod
-    importlib.reload(mainmod)
-    from server.main import app
+    monkeypatch.setattr(mainmod, "HARNESS_TOKEN", "tok")
 
-    with TestClient(app) as c:
+    with TestClient(mainmod.app) as c:
         files = {"file": ("p.png", io.BytesIO(b"\x89PNG\r\n\x1a\n" + b"\x00" * 50), "image/png")}
         upload = c.post(
             "/api/attachments",
