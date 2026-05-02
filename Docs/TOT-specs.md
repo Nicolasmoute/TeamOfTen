@@ -1545,6 +1545,72 @@ Auto-compact:
 - If auto-compact produces no summary, it force-clears the session to escape a
   threshold loop.
 
+Session transfer (compact + runtime flip):
+
+A runtime change normally loses conversation history because `session_id`
+(Claude) and `codex_thread_id` (Codex) are runtime-specific and cannot
+cross over. The session-transfer flow runs the compact summary on the
+**source** runtime first, persists it to `continuity_note`, then flips
+`agents.runtime_override` so the next turn on the **target** runtime
+reads the handoff in its system prompt — same delivery vehicle as a
+plain `/compact`.
+
+- UI: pane gear popover's runtime selector. Picking `claude` / `codex`
+  routes through the transfer endpoint; picking `default` (empty) keeps
+  the legacy blunt-clear `PUT /api/agents/{id}/runtime` (no compact).
+- API: `POST /api/agents/{id}/transfer-runtime {runtime}`.
+- MCP: `coord_set_player_runtime(player_id, runtime)` (Coach-only).
+  An empty `runtime=''` argument retains the legacy blunt-clear semantic.
+
+Dispatch matrix at the entry point:
+
+| Source runtime | Target runtime  | Prior session? | Action                                                                                |
+|----------------|-----------------|----------------|---------------------------------------------------------------------------------------|
+| X              | X (same)        | —              | 200 noop                                                                              |
+| X              | Y               | NO             | flip immediately, emit `runtime_updated` + `session_transferred(note=no_prior_session)` |
+| X              | Y               | YES            | queue `run_agent(COMPACT_PROMPT, compact_mode=True, transfer_to_runtime=Y)`             |
+
+Mid-turn flips (`agents.status='working'`) are 409'd at the entry point —
+the in-flight turn would be on the old runtime while subsequent turns
+use the new one.
+
+Compact-handler branch:
+`transfer_to_runtime` rides through `run_agent` → `TurnContext` →
+`turn_ctx`. Each runtime's compact handler reads it after the
+post-compact bookkeeping (`continuity_note` written, source session id
+cleared) and calls `_perform_runtime_transfer_flip(slot, target)` —
+flips `runtime_override`, nulls **both** runtime session columns
+(defensive against orphaned thread ids from a prior life on the
+target), evicts any cached Codex client, emits `runtime_updated` with
+`source=session_transfer`. Then the handler emits
+`session_transferred(from_runtime, to_runtime, chars, handoff_file)`
+in place of `session_compacted`.
+
+Failure modes:
+
+- Compact yields no summary on Claude → `session_transfer_failed`
+  emits and the runtime stays put. The intent of transfer is "carry
+  forward via summary"; a flip with empty context is a destructive
+  blind switch.
+- Compact yields no summary on Codex → flip still proceeds because
+  `client.compact_thread()` already cleared the thread; not flipping
+  would leave the agent on Codex with no thread to resume, strictly
+  worse than flipping with thin context. Asymmetry intentional.
+- Helper failure on `_clear_codex_thread_id` is logged but doesn't
+  abort; `runtime_updated` still emits so the UI doesn't silently
+  miss the change.
+
+Why not just `/compact` followed by a blunt PUT: atomicity. The flip
+only happens iff the compact succeeded with a non-empty summary
+(Claude side) or the native `compact_thread` call succeeded (Codex
+side). A user who runs the two operations separately gets the flip
+even when the compact failed, leaving the agent on the new runtime
+with no handoff. The transfer flow also emits the right event
+vocabulary so timelines read as a single transfer boundary, not as a
+compact plus an unrelated runtime change.
+
+See `Docs/CODEX_RUNTIME_SPEC.md` §E.8 for the full design.
+
 Compact prompt structure:
 
 `COMPACT_PROMPT` in `server/agents.py` instructs the agent to produce a
@@ -2108,9 +2174,22 @@ The resolver in `server/truth.py` handles approve/deny:
 
 - Coach only.
 - `player_id`: `p1` to `p10` (cannot flip Coach's own runtime via MCP
-  — that path is HTTP-only via `PUT /api/agents/coach/runtime`).
-- `runtime`: `'claude'`, `'codex'`, or empty string to clear (revert
-  to the role default in `team_config`).
+  — that path is HTTP-only via `PUT /api/agents/coach/runtime` or
+  `POST /api/agents/coach/transfer-runtime`).
+- `runtime`:
+  - `'claude'` / `'codex'` — concrete target. Routes through the
+    **session-transfer flow** by default (§10.3): if the Player has a
+    prior session on the source runtime, a transfer-mode compact is
+    queued via `asyncio.create_task` and the tool returns immediately
+    with `queued=True`; on success the runtime flips and
+    `session_transferred` fires. If there's no prior session, the
+    runtime flips immediately + emits `runtime_updated` +
+    `session_transferred(note=no_prior_session)`. Same-runtime target
+    is a no-op.
+  - `''` (empty string) — **blunt clear**. Writes
+    `runtime_override=NULL` (revert to role default), no compact, no
+    transfer event. Use only when an explicit fresh start on the role
+    default is desired.
 - `'codex'` is rejected when `HARNESS_CODEX_ENABLED` is unset; the
   error message tells Coach to call `coord_request_human` so the user
   can flip the env flag on the deployment.
@@ -2128,13 +2207,15 @@ The resolver in `server/truth.py` handles approve/deny:
   proxy token rather than leaving them dangling until the next
   MCP-config change.
 - Emits `runtime_updated` with `agent_id=<player_id>` (NOT the caller),
-  matching the shape of the HTTP `PUT /api/agents/{id}/runtime`
-  endpoint — the event renders in the target Player's pane regardless
-  of whether the human or Coach initiated the flip. Coach's tool_use /
-  tool_result pair already records "Coach called this tool" in Coach's
-  timeline, so logging the state-change event there too would
-  duplicate. No `to` field — `runtime_updated` is not a fan-out type
-  in either the WS-side handler or the `/api/events` SQL filter.
+  matching the shape of the HTTP runtime endpoints — the event
+  renders in the target Player's pane regardless of whether the human
+  or Coach initiated the flip. Coach's tool_use / tool_result pair
+  already records "Coach called this tool" in Coach's timeline, so
+  logging the state-change event there too would duplicate. The
+  `runtime_updated` event also carries `source=session_transfer` when
+  the flip came through the transfer flow rather than the blunt-clear
+  branch. No `to` field — `runtime_updated` is not a fan-out type in
+  either the WS-side handler or the `/api/events` SQL filter.
 - Required precondition for `coord_set_player_model` when Coach wants
   a model from the other runtime family.
 
@@ -2383,7 +2464,22 @@ Emits `claude_auth_updated`.
 | `GET /api/agents/{id}/context` | Context usage estimate |
 | `DELETE /api/agents/{id}/session` | Clear active-project session |
 | `POST /api/agents/{id}/compact` | Queue compact turn |
+| `PUT /api/agents/{id}/runtime` | Blunt set/clear of slot-level runtime override (no compact, no continuity) |
+| `POST /api/agents/{id}/transfer-runtime` | Switch runtime with continuity preserved via compact (§10.3) |
 | `POST /api/agents/sessions/clear` | Batch clear active-project sessions |
+
+`POST /api/agents/{id}/transfer-runtime` body:
+
+```json
+{ "runtime": "claude" }
+```
+
+Returns 200 with `noop=true` when target equals current runtime; 200
+with `queued=false` when no source-runtime session exists (immediate
+flip + `session_transferred(note=no_prior_session)`); 200 with
+`queued=true` when a compact turn is scheduled (watch the pane for
+`session_transferred` or `session_transfer_failed`). 400 on invalid
+slot / runtime / unset `HARNESS_CODEX_ENABLED`. 409 if mid-turn.
 
 `POST /api/agents/start` body:
 
@@ -2698,6 +2794,10 @@ Agent lifecycle:
 - `session_resume_failed`
 - `session_compact_requested`
 - `session_compacted`
+- `session_transfer_requested` — runtime transfer queued (compact + flip on success)
+- `session_transferred` — runtime flipped after a successful transfer compact, or fired immediately when no source-runtime session existed (carries `from_runtime`, `to_runtime`, optional `note=no_prior_session`)
+- `session_transfer_failed` — Claude-side transfer compact returned no summary; runtime stays put
+- `runtime_updated` — `agents.runtime_override` changed (carries `runtime_override`; `source=session_transfer` when fired by the transfer flow rather than a blunt PUT)
 - `auto_compact_triggered`
 - `auto_compact_failed`
 - `compact_empty_forced`
@@ -3531,7 +3631,14 @@ Resolution at spawn time:
 
 `PUT /api/agents/{id}/runtime` sets the per-slot override. `'codex'`
 is rejected when `HARNESS_CODEX_ENABLED` is unset. Mid-turn flips
-return 409.
+return 409. The PUT path is the **blunt** flip — it writes
+`runtime_override` and the next turn on the new runtime starts with
+no memory of the prior conversation. Use `POST /api/agents/{id}/transfer-runtime`
+when the agent has a session worth carrying — see §10.3 for the
+transfer flow that runs `/compact` first and only flips on success.
+The pane gear popover routes through `transfer-runtime` when the
+user picks a concrete runtime and falls back to the blunt PUT only
+when the user picks `default` (clear the override).
 
 Model selection is runtime-aware: Claude defaults
 (`coach_default_model` / `players_default_model`) and Codex defaults

@@ -10740,10 +10740,17 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
               <div class="attachments">
                 ${attachments.map(
                   (a) => {
-                    // Browsers can't set Authorization on <img>; mirror the
-                    // /ws pattern by appending ?token=<...> when one's set.
-                    const tok = (typeof localStorage !== "undefined" && localStorage.getItem("harness_token")) || "";
-                    const src = tok ? `${a.url}?token=${encodeURIComponent(tok)}` : a.url;
+                    // Prefer the signed URL the upload endpoint returned.
+                    // It's HMAC-signed, short-lived, and carries no
+                    // bearer token — so browser history / proxy logs /
+                    // screenshots don't leak HARNESS_TOKEN. Falls back
+                    // to the legacy `?token=` URL for any cached
+                    // attachment from before the security PR.
+                    let src = a.signed_url || a.url || "";
+                    if (!a.signed_url && src) {
+                      const tok = (typeof localStorage !== "undefined" && localStorage.getItem("harness_token")) || "";
+                      if (tok) src = `${src}?token=${encodeURIComponent(tok)}`;
+                    }
                     return html`
                       <div class="attachment" key=${a.id}>
                         <img src=${src} alt=${a.filename} />
