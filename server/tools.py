@@ -2106,6 +2106,329 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         return _ok(f"{pid} model override cleared (will use role default)")
 
     @tool(
+        "coord_set_player_effort",
+        (
+            "Coach-only. Set or clear a Player's reasoning-effort tier. "
+            "Stored on `agent_project_roles.effort_override` for the "
+            "active project. Maps directly to the SDK's thinking-budget "
+            "Literal (low / medium / high / max).\n"
+            "\n"
+            "Resolution order at spawn time (highest first): per-pane "
+            "request value (the human's pane gear popover) → this "
+            "Coach override → no override (SDK default).\n"
+            "\n"
+            "Effort is the EXCEPTION, not the rule. Default is no "
+            "override — the SDK picks a sensible thinking budget. "
+            "Bump up for genuinely hard reasoning ('high' for tricky "
+            "design / refactoring; 'max' for one-shot deep analysis); "
+            "stay default for execution work. Sustained 'high' / 'max' "
+            "burns the Max-plan token budget fast — review your active "
+            "overrides periodically.\n"
+            "\n"
+            "Params:\n"
+            "- player_id: one of p1..p10 (required; cannot set Coach's "
+            "  effort via MCP — ask the human).\n"
+            "- effort: one of 'low' | 'medium' | 'high' | 'max'. Empty "
+            "  string clears (revert to no override). Aliases accepted: "
+            "  'med' → 'medium'. Numeric 1..4 also accepted (1=low … "
+            "  4=max) for symmetry with the UI slider."
+        ),
+        {"player_id": str, "effort": str},
+    )
+    async def set_player_effort(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("Only Coach sets Player effort tiers.")
+        pid = (args.get("player_id") or "").strip()
+        raw = str(args.get("effort") or "").strip().lower()
+        if not re.fullmatch(r"p([1-9]|10)", pid):
+            return _err(f"invalid player_id '{pid}' — expected p1..p10")
+        effort_value: int | None
+        if raw in ("", "default", "clear", "none"):
+            effort_value = None
+        elif raw in ("low", "1"):
+            effort_value = 1
+        elif raw in ("medium", "med", "2"):
+            effort_value = 2
+        elif raw in ("high", "3"):
+            effort_value = 3
+        elif raw in ("max", "maximum", "4"):
+            effort_value = 4
+        else:
+            return _err(
+                f"invalid effort '{args.get('effort')}' — expected one of "
+                "'low' | 'medium' | 'high' | 'max' (or empty to clear)"
+            )
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute("SELECT 1 FROM agents WHERE id = ?", (pid,))
+            if not await cur.fetchone():
+                return _err(f"player '{pid}' not found")
+            cur = await c.execute(
+                "SELECT 1 FROM agent_project_roles "
+                "WHERE slot = ? AND project_id = ?",
+                (pid, project_id),
+            )
+            row_exists = await cur.fetchone() is not None
+            if effort_value is None and not row_exists:
+                pass  # nothing to clear; don't create an all-NULL orphan
+            else:
+                await c.execute(
+                    "INSERT INTO agent_project_roles "
+                    "(slot, project_id, effort_override) VALUES (?, ?, ?) "
+                    "ON CONFLICT(slot, project_id) DO UPDATE SET "
+                    "  effort_override = excluded.effort_override",
+                    (pid, project_id, effort_value),
+                )
+                await c.commit()
+        finally:
+            await c.close()
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "agent_effort_set",
+                "player_id": pid,
+                "to": pid,
+                "effort": effort_value,
+            }
+        )
+        if effort_value is None:
+            return _ok(f"{pid} effort override cleared")
+        label = _EFFORT_VALUE_LABELS[effort_value]
+        return _ok(f"{pid} effort override → {label}")
+
+    @tool(
+        "coord_set_player_plan_mode",
+        (
+            "Coach-only. Set or clear a Player's plan-mode default. "
+            "When plan mode is on, every spawn for the Player runs with "
+            "permission_mode='plan' — the Player drafts an outline and "
+            "uses ExitPlanMode to surface it for human review BEFORE "
+            "touching tools. Stored on "
+            "`agent_project_roles.plan_mode_override`.\n"
+            "\n"
+            "Resolution order at spawn time (highest first): per-pane "
+            "request value (the human's pane gear popover) → this "
+            "Coach override → off.\n"
+            "\n"
+            "Plan mode is a heavy constraint — every turn pauses for "
+            "human approval. Use sparingly: only set it on Players doing "
+            "destructive / hard-to-undo work where you want the human "
+            "to review the approach first. For most work, leave it off "
+            "and rely on per-turn coord_request_human / AskUserQuestion "
+            "checkpoints instead.\n"
+            "\n"
+            "Params:\n"
+            "- player_id: one of p1..p10 (required; cannot set Coach's "
+            "  plan mode via MCP).\n"
+            "- plan_mode: 'on' | 'off' to set explicitly. Empty string "
+            "  clears (revert to no override → off unless the human "
+            "  toggled it per-pane). Aliases: 'true'/'1'/'yes' → on, "
+            "  'false'/'0'/'no' → off."
+        ),
+        {"player_id": str, "plan_mode": str},
+    )
+    async def set_player_plan_mode(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("Only Coach sets Player plan-mode defaults.")
+        pid = (args.get("player_id") or "").strip()
+        raw = str(args.get("plan_mode") or "").strip().lower()
+        if not re.fullmatch(r"p([1-9]|10)", pid):
+            return _err(f"invalid player_id '{pid}' — expected p1..p10")
+        plan_value: int | None
+        if raw in ("", "default", "clear", "none"):
+            plan_value = None
+        elif raw in ("on", "true", "1", "yes", "y"):
+            plan_value = 1
+        elif raw in ("off", "false", "0", "no", "n"):
+            plan_value = 0
+        else:
+            return _err(
+                f"invalid plan_mode '{args.get('plan_mode')}' — expected "
+                "'on' | 'off' (or empty to clear)"
+            )
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute("SELECT 1 FROM agents WHERE id = ?", (pid,))
+            if not await cur.fetchone():
+                return _err(f"player '{pid}' not found")
+            cur = await c.execute(
+                "SELECT 1 FROM agent_project_roles "
+                "WHERE slot = ? AND project_id = ?",
+                (pid, project_id),
+            )
+            row_exists = await cur.fetchone() is not None
+            if plan_value is None and not row_exists:
+                pass
+            else:
+                await c.execute(
+                    "INSERT INTO agent_project_roles "
+                    "(slot, project_id, plan_mode_override) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(slot, project_id) DO UPDATE SET "
+                    "  plan_mode_override = excluded.plan_mode_override",
+                    (pid, project_id, plan_value),
+                )
+                await c.commit()
+        finally:
+            await c.close()
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "agent_plan_mode_set",
+                "player_id": pid,
+                "to": pid,
+                "plan_mode": plan_value,
+            }
+        )
+        if plan_value is None:
+            return _ok(f"{pid} plan-mode override cleared")
+        return _ok(f"{pid} plan-mode override → {'on' if plan_value else 'off'}")
+
+    @tool(
+        "coord_get_player_settings",
+        (
+            "Coach-only. Read the current per-Player overrides in one "
+            "call: runtime, model, effort, plan-mode. For each Player "
+            "the response shows BOTH the override value (what you set "
+            "via coord_set_player_*) AND the resolved value (what the "
+            "Player will actually run with on next spawn, after "
+            "fall-through to role defaults).\n"
+            "\n"
+            "Use before changing settings — confirms what's already in "
+            "place so you don't re-set what's already correct, and so "
+            "you can see at a glance whether a Player has any active "
+            "overrides at all.\n"
+            "\n"
+            "Params:\n"
+            "- player_id: optional. One of p1..p10 to scope to a single "
+            "  Player; omit for the whole roster (incl. Coach for "
+            "  runtime/model — Coach has no effort/plan-mode override "
+            "  surface)."
+        ),
+        {"player_id": str},
+    )
+    async def get_player_settings(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("Only Coach reads team settings via MCP.")
+        from server.agents import (
+            _get_agent_identity,
+            _get_role_default_model,
+            _resolve_runtime_for,
+        )
+        from server.models_catalog import resolve_model_alias
+
+        scope_id = (args.get("player_id") or "").strip()
+        if scope_id and not re.fullmatch(r"(coach|p([1-9]|10))", scope_id):
+            return _err(
+                f"invalid player_id '{scope_id}' — expected p1..p10 or "
+                "'coach' (or omit for the full roster)"
+            )
+
+        slots = [scope_id] if scope_id else (
+            ["coach"] + [f"p{i}" for i in range(1, 11)]
+        )
+
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id, runtime_override FROM agents WHERE id IN ("
+                + ",".join("?" * len(slots)) + ")",
+                slots,
+            )
+            agent_rows = {dict(r)["id"]: dict(r) for r in await cur.fetchall()}
+        finally:
+            await c.close()
+
+        out_rows: list[dict[str, Any]] = []
+        for sid in slots:
+            ident = await _get_agent_identity(sid) or {}
+            runtime_override = (
+                (agent_rows.get(sid, {}).get("runtime_override") or "").lower()
+                or None
+            )
+            resolved_runtime = await _resolve_runtime_for(sid)
+            model_override = ident.get("model_override")
+            effort_override = ident.get("effort_override")
+            plan_override = ident.get("plan_mode_override")
+
+            resolved_model = (
+                model_override
+                or await _get_role_default_model(sid, resolved_runtime)
+                or None
+            )
+            if resolved_model:
+                resolved_model = resolve_model_alias(resolved_model)
+
+            out_rows.append({
+                "slot": sid,
+                "name": ident.get("name"),
+                "runtime": {
+                    "override": runtime_override,
+                    "resolved": resolved_runtime,
+                },
+                "model": {
+                    "override": model_override,
+                    "resolved": resolved_model,
+                },
+                "effort": {
+                    "override": (
+                        _EFFORT_VALUE_LABELS.get(int(effort_override))
+                        if effort_override is not None else None
+                    ),
+                },
+                "plan_mode": {
+                    "override": (
+                        None if plan_override is None
+                        else bool(int(plan_override))
+                    ),
+                },
+            })
+
+        # Render a compact text table — easier for Coach to scan than
+        # raw JSON, and keeps the response under the SDK's per-tool
+        # text limit even at full roster (~11 rows).
+        lines = [
+            "slot   name           runtime          model                          effort      plan",
+            "-----  -------------  ---------------  -----------------------------  ----------  -----",
+        ]
+        for r in out_rows:
+            slot = (r["slot"] or "").ljust(5)
+            name = (r.get("name") or "").ljust(13)[:13]
+            ro = r["runtime"]["override"]
+            rr = r["runtime"]["resolved"]
+            rt_cell = (
+                f"{ro} (override)" if ro
+                else f"{rr} (default)"
+            ).ljust(15)[:15]
+            mo = r["model"]["override"]
+            mr = r["model"]["resolved"] or "(SDK default)"
+            md_cell = (
+                f"{mo} (override)" if mo
+                else f"{mr} (default)"
+            ).ljust(29)[:29]
+            ef_cell = (
+                f"{r['effort']['override']} (override)"
+                if r["effort"]["override"]
+                else "default"
+            ).ljust(10)[:10]
+            pm_cell = (
+                "on" if r["plan_mode"]["override"] is True
+                else "off" if r["plan_mode"]["override"] is False
+                else "default"
+            )
+            lines.append(f"{slot}  {name}  {rt_cell}  {md_cell}  {ef_cell}  {pm_cell}")
+        text = "\n".join(lines)
+        return {"content": [{"type": "text", "text": text}]}
+
+    @tool(
         "coord_answer_question",
         (
             "Coach-only. Resolve a pending AskUserQuestion from a Player. "
@@ -2681,6 +3004,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         set_player_role,
         set_player_runtime,
         set_player_model,
+        set_player_effort,
+        set_player_plan_mode,
+        get_player_settings,
         answer_question,
         answer_plan,
         request_human,
@@ -2713,6 +3039,13 @@ def coord_tool_names() -> list[str]:
     return list(server["_tool_names"])
 
 
+# Reasoning-effort tier labels — keyed by the int stored on
+# agent_project_roles.effort_override (and on the per-pane request).
+# Mirrors agents._EFFORT_LEVELS but lives here so the coord-tool layer
+# can render labels without importing from agents (cyclic).
+_EFFORT_VALUE_LABELS = {1: "low", 2: "medium", 3: "high", 4: "max"}
+
+
 ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_list_tasks",
     "mcp__coord__coord_create_task",
@@ -2736,6 +3069,9 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_set_player_role",
     "mcp__coord__coord_set_player_runtime",
     "mcp__coord__coord_set_player_model",
+    "mcp__coord__coord_set_player_effort",
+    "mcp__coord__coord_set_player_plan_mode",
+    "mcp__coord__coord_get_player_settings",
     "mcp__coord__coord_answer_question",
     "mcp__coord__coord_answer_plan",
     "mcp__coord__coord_request_human",

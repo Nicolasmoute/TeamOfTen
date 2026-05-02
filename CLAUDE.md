@@ -1240,6 +1240,70 @@ tool routing including the empty-clear blunt path and the
 prior-session queued path, and the `TurnContext.transfer_to_runtime`
 schema.
 
+**Recent (2026-05-02, fourth follow-up) — Coach effort + plan-mode overrides:**
+
+Coach already controlled per-Player runtime + model via
+`coord_set_player_runtime` / `coord_set_player_model`. The two
+remaining knobs the human sets per-pane (reasoning effort, plan-mode)
+were Coach-blind — Coach couldn't influence them on auto-wake spawns
+(task assignments, direct messages) and had no way to read their
+current state. Closed both gaps:
+
+- **`agent_project_roles.effort_override`** (INTEGER 1..4) +
+  **`plan_mode_override`** (INTEGER 0/1) columns added via
+  `_ensure_columns` migration, mirroring the `model_override` shape
+  (NULL = no override; per-(slot, project) scoped so switching active
+  projects swaps overrides automatically). Tests in
+  [server/tests/test_player_effort_plan_overrides.py](server/tests/test_player_effort_plan_overrides.py).
+- **Helpers**: `_get_agent_effort_override` /
+  `_get_agent_plan_mode_override` in
+  [server/agents.py](server/agents.py). Effort returns int|None with
+  out-of-range coercion to None (defensive — a future schema check
+  should keep it in range, but a stale value never blocks a spawn).
+  Plan-mode returns bool|None tri-state.
+- **Resolution chain in `run_agent`**: per-pane request value (highest)
+  → Coach override → default (False / no thinking budget). To distinguish
+  "human turned plan-mode off" from "no per-pane override", `plan_mode`
+  param + `StartAgentRequest.plan_mode` flipped to `bool | None` with
+  None = "consult override". The UI already omits the field when its
+  toggle is off, so the wire format stays compatible. `effort` was
+  already `int | None` so no shape change there.
+- **MCP tools** (Coach-only) in
+  [server/tools.py](server/tools.py):
+  - `coord_set_player_effort(player_id, effort)` — accepts
+    'low'/'medium'/'high'/'max', friendly aliases ('med'), or the
+    numeric tier 1..4 for symmetry with the UI slider; empty clears.
+  - `coord_set_player_plan_mode(player_id, plan_mode)` — accepts
+    'on'/'off' + bool aliases; empty clears.
+  - `coord_get_player_settings(player_id?)` — Coach-only read tool.
+    Renders a compact text table (slot / name / runtime / model /
+    effort / plan) showing both override and resolved values for one
+    Player or the full roster. Coach is told to call this BEFORE any
+    `coord_set_player_*` so they don't re-set what's already correct.
+- **Coach prompt visibility**: when at least one override is active,
+  the `## Team composition` block grows an `### Active overrides`
+  sub-section listing the slots and their non-default knobs. Skipped
+  entirely when the team is on defaults — no token cost in the common
+  case. Coach's tool catalogue lists the three new tools alongside
+  the existing `coord_set_player_runtime` / `coord_set_player_model`.
+- **Events**: `agent_effort_set` and `agent_plan_mode_set` mirror
+  `agent_model_set` — `{to: pid, player_id: pid}` shape so the UI's
+  fan-out machinery renders the row in both Coach's pane (actor) and
+  the target Player's pane. `/api/events` SQL filter extended to
+  match the same `payload_to` indexed branch on history reload.
+- **EnvPane**: `EnvModelOverridesSection` generalized into
+  `EnvOverridesSection` covering all four knobs. Renders nothing when
+  no overrides are active.
+- **`GET /api/agents`** now returns `effort_override` /
+  `plan_mode_override` alongside `model_override` so the UI doesn't
+  need a second round-trip.
+- 19 new tests across registration, schema, validation (alias
+  normalization, friendly + numeric forms, invalid value rejection),
+  set/clear round-trip via the new helpers and `_get_agent_identity`,
+  empty-clear no-orphan invariant, event emission, Coach-only
+  enforcement, and the `coord_get_player_settings` shape (single
+  player + full roster). Suite at 878/878.
+
 **Next likely:**
 - **Mobile UI polish** — touch-drag doesn't work with HTML5 DnD;
    layout breakpoints for < 900 px need a rethink.
@@ -1491,6 +1555,19 @@ Planned expansion per spec §3: `server/`, `web/`, `prompts/`, `workspaces/`, `s
   smoke, event-bus round-trip, tool validation constants, task-state
   machine. All tests are DB-level (no FastAPI TestClient yet) so they
   run fast and don't need claude-agent-sdk wired up.
+
+- **Run tests from an isolated worktree**:
+  `bash scripts/bootstrap_worktree.sh && ./pytest`
+  `.venv` is gitignored, so `git worktree add` (and Claude Code's
+  `Agent({isolation: "worktree"})`) lands without Python deps. The
+  bootstrap script reuses the main worktree's `.venv` via a thin
+  `./pytest` shim that exports `PYTHONPATH=<this worktree>`, so
+  `import server.*` resolves to the sub-worktree's source and not
+  the main's editable-install path. No per-worktree `uv sync` —
+  that fails on win32-ARM64 because cryptography / httptools have
+  no prebuilt wheels and need MSVC + Rust to build from source.
+  When you're already in the main worktree the script is a fast
+  no-op (or a normal `uv sync` if there's no `.venv` yet).
 - **Run dev server**: `uv run uvicorn server.main:app --reload`
   — or `uvicorn server.main:app --reload` with a plain venv.
   Default binds :8000.

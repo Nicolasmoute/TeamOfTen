@@ -1772,10 +1772,15 @@ function App() {
         // cancelling / blocking a task assigned to p3) should show up
         // in the owner's pane too.
         if (ev.owner && ev.owner !== ev.agent_id) fanoutTargets.add(ev.owner);
-      } else if (ev.type === "agent_model_set") {
-        // Coach changing my model is context I want to see in my own
-        // pane, not just buried in Coach's timeline. Server emits
-        // {to: pid, player_id: pid} so either field is safe to read.
+      } else if (
+        ev.type === "agent_model_set" ||
+        ev.type === "agent_effort_set" ||
+        ev.type === "agent_plan_mode_set"
+      ) {
+        // Coach changing my model / effort / plan-mode is context I
+        // want to see in my own pane, not just buried in Coach's
+        // timeline. Server emits {to: pid, player_id: pid} so either
+        // field is safe to read.
         if (ev.to) fanoutTargets.add(ev.to);
       }
       setConversations((prev) => {
@@ -5974,6 +5979,21 @@ function RecurrencePane({ rows, onClose, onRefresh, onError }) {
     });
   }
 
+  function enableTick() {
+    // Re-enable a previously-disabled tick row. The server preserves
+    // the existing cadence and schedules the next fire one cadence-
+    // unit out from now.
+    return _http("/api/coach/tick", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: true }),
+    });
+  }
+
+  function deleteTick(id) {
+    return _http(`/api/recurrences/${id}`, { method: "DELETE" });
+  }
+
   function fireNow() {
     return _http("/api/coach/tick", { method: "POST" });
   }
@@ -6108,8 +6128,9 @@ function RecurrencePane({ rows, onClose, onRefresh, onError }) {
                   <div class="rec-actions">
                     <button onClick=${fireNow} disabled=${busy}>fire now</button>
                     ${tick.enabled
-                      ? html`<button class="rec-delete" onClick=${disableTick} disabled=${busy}>disable</button>`
-                      : html`<button onClick=${() => applyTick(parseInt(tick.cadence, 10) || 60)} disabled=${busy}>enable</button>`}
+                      ? html`<button onClick=${disableTick} disabled=${busy}>disable</button>`
+                      : html`<button onClick=${enableTick} disabled=${busy}>enable</button>`}
+                    <button class="rec-delete" onClick=${() => deleteTick(tick.id)} disabled=${busy} title="Remove the tick row entirely">delete</button>
                   </div>
                 </div>`
             : html`<div class="rec-empty">No tick yet — set one below.</div>`}
@@ -6486,7 +6507,7 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, active
           onDismiss=${onDismissAttention}
           onDismissAll=${onDismissAllAttention}
         />
-        <${EnvModelOverridesSection} agents=${agents} />
+        <${EnvOverridesSection} agents=${agents} />
         <${EnvKDriveStatusSection} conversations=${conversations} />
         <${EnvTasksSection} tasks=${tasks} onCreate=${onCreateTask} />
         <${EnvCostSection} agents=${agents} serverStatus=${serverStatus} />
@@ -6508,20 +6529,44 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, active
   `;
 }
 
-// Surfaces Coach-set per-Player model overrides. These come from
-// `coord_set_player_model` and live on `agent_project_roles.model_override`
-// for the active project; `GET /api/agents` returns the column.
-// Renders nothing when no overrides are active — the team is on
-// defaults, no warning needed.
-function EnvModelOverridesSection({ agents }) {
+// Surfaces Coach-set per-Player overrides for runtime, model, effort,
+// and plan-mode. These come from `coord_set_player_runtime` (writes
+// `agents.runtime_override`) and `coord_set_player_{model,effort,plan_mode}`
+// (write `agent_project_roles.{model,effort,plan_mode}_override`);
+// `GET /api/agents` returns all four columns. Renders nothing when no
+// overrides are active — the team is on defaults, no warning needed.
+const _EFFORT_LABEL_BY_INT = { 1: "low", 2: "medium", 3: "high", 4: "max" };
+
+function EnvOverridesSection({ agents }) {
   const overrides = useMemo(() => {
     if (!Array.isArray(agents)) return [];
     return agents
-      .filter((a) => a && a.model_override)
+      .filter((a) => {
+        if (!a) return false;
+        // Only Players carry effort / plan_mode / model overrides;
+        // Coach can carry a runtime_override too. Surface a row when
+        // any of the four is set.
+        const ef = a.effort_override;
+        const pm = a.plan_mode_override;
+        return !!(
+          a.model_override ||
+          (a.runtime_override || "").toLowerCase() ||
+          (ef !== null && ef !== undefined) ||
+          (pm !== null && pm !== undefined)
+        );
+      })
       .map((a) => ({
         id: a.id,
-        model: a.model_override,
-        runtime: (a.runtime_override || "").toLowerCase(),
+        model: a.model_override || null,
+        runtime: (a.runtime_override || "").toLowerCase() || null,
+        effort:
+          a.effort_override === null || a.effort_override === undefined
+            ? null
+            : _EFFORT_LABEL_BY_INT[a.effort_override] || null,
+        planMode:
+          a.plan_mode_override === null || a.plan_mode_override === undefined
+            ? null
+            : !!a.plan_mode_override,
       }));
   }, [agents]);
 
@@ -6530,21 +6575,24 @@ function EnvModelOverridesSection({ agents }) {
   return html`
     <section class="env-section env-model-overrides">
       <h3 class="env-section-title">
-        Model overrides <span class="env-count">${overrides.length}</span>
+        Active overrides <span class="env-count">${overrides.length}</span>
       </h3>
       <div class="env-warn">
-        Coach has set non-default models on
-        ${" "}${overrides.length} Player${overrides.length > 1 ? "s" : ""}.
-        Per the team policy, model changes should be the exception —
-        review the list and clear any that aren't load-bearing.
+        Coach has set non-default knobs on
+        ${" "}${overrides.length} agent${overrides.length > 1 ? "s" : ""}.
+        Per the team policy, model / effort / plan-mode changes should
+        be the exception — review the list and clear anything that
+        isn't load-bearing.
       </div>
       <ul class="env-model-list">
         ${overrides.map((o) => html`
           <li key=${o.id}>
             <span class="env-model-slot">${o.id}</span>
             <span class="env-model-arrow">→</span>
-            <code>${o.model}</code>
-            ${o.runtime ? html`<span class="env-model-runtime">[${o.runtime}]</span>` : null}
+            ${o.runtime ? html`<span class="env-model-runtime">runtime=${o.runtime}</span>` : null}
+            ${o.model ? html`<code>${o.model}</code>` : null}
+            ${o.effort ? html`<span class="env-model-runtime">effort=${o.effort}</span>` : null}
+            ${o.planMode !== null ? html`<span class="env-model-runtime">plan=${o.planMode ? "on" : "off"}</span>` : null}
           </li>
         `)}
       </ul>
@@ -8351,6 +8399,8 @@ const TIMELINE_TYPES = new Set([
   "human_attention",
   "player_assigned",
   "agent_model_set",
+  "agent_effort_set",
+  "agent_plan_mode_set",
   "agent_cancelled",
   "paused",
   "pause_toggled",
@@ -8531,6 +8581,29 @@ function EnvTimelineItem({ event }) {
     const summary = event.model
       ? `${event.player_id} model → ${event.model}`
       : `${event.player_id} model override cleared`;
+    return html`<div class="env-tl-item env-tl-assigned">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">${summary}</span>
+    </div>`;
+  }
+  if (event.type === "agent_effort_set") {
+    const label = event.effort == null
+      ? "cleared"
+      : (_EFFORT_LABEL_BY_INT[event.effort] || String(event.effort));
+    const summary = event.effort == null
+      ? `${event.player_id} effort override cleared`
+      : `${event.player_id} effort → ${label}`;
+    return html`<div class="env-tl-item env-tl-assigned">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">${summary}</span>
+    </div>`;
+  }
+  if (event.type === "agent_plan_mode_set") {
+    const summary = event.plan_mode == null
+      ? `${event.player_id} plan-mode override cleared`
+      : `${event.player_id} plan-mode → ${event.plan_mode ? "on" : "off"}`;
     return html`<div class="env-tl-item env-tl-assigned">
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
@@ -11186,6 +11259,27 @@ function EventItem({ event }) {
     const summary = event.model
       ? `model → ${event.model}`
       : "model override cleared";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ${event.player_id}: ${summary} (by ${event.agent_id})</div>
+    </div>`;
+  }
+
+  if (type === "agent_effort_set") {
+    const label = event.effort == null
+      ? null
+      : (_EFFORT_LABEL_BY_INT[event.effort] || String(event.effort));
+    const summary = label
+      ? `effort → ${label}`
+      : "effort override cleared";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ${event.player_id}: ${summary} (by ${event.agent_id})</div>
+    </div>`;
+  }
+
+  if (type === "agent_plan_mode_set") {
+    const summary = event.plan_mode == null
+      ? "plan-mode override cleared"
+      : `plan-mode → ${event.plan_mode ? "on" : "off"}`;
     return html`<div class="event sys">
       <div class="event-meta">${ts} · ${event.player_id}: ${summary} (by ${event.agent_id})</div>
     </div>`;

@@ -813,10 +813,13 @@ async def upsert_tick(
 ) -> dict[str, Any] | None:
     """Update or create the tick row for `project_id`.
 
-    Pass ``minutes`` to set / update the cadence. Pass ``enabled=False``
-    to disable while preserving the row. Pass both to do both. Returns
-    the resulting row, or None when the caller passed ``enabled=False``
-    on a project that had no tick row.
+    Pass ``minutes`` to set / update the cadence — auto-enables the row
+    (creates enabled, or re-enables a previously-disabled row). Pass
+    ``enabled=False`` to disable while preserving the row. Pass
+    ``enabled=True`` (without minutes) to re-enable an existing row
+    keeping its cadence. Pass both to set cadence and enabled state
+    explicitly. Returns the resulting row, or None when the caller
+    passed ``enabled=False`` on a project that had no tick row.
     """
     if minutes is None and enabled is None:
         raise ValueError("must pass minutes or enabled")
@@ -839,10 +842,14 @@ async def upsert_tick(
                 "tz": None,
                 "prompt": None,
             }
-            new_enabled = (
-                existing_d["enabled"] if enabled is None
-                else (1 if enabled else 0)
-            )
+            if enabled is not None:
+                new_enabled = 1 if enabled else 0
+            else:
+                # Spec: `/tick N` (and the equivalent `PUT {minutes: N}`)
+                # auto-enables a disabled tick — see recurrence-specs.md §351
+                # and TOT-specs.md §1784. Validation above guarantees
+                # minutes is not None on this branch.
+                new_enabled = 1
             new_cadence = (
                 existing_d["cadence"] if minutes is None else str(minutes)
             )

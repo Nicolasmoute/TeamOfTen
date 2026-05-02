@@ -273,12 +273,21 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
 );
 
 CREATE TABLE IF NOT EXISTS agent_project_roles (
-    slot           TEXT NOT NULL,
-    project_id     TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    name           TEXT,
-    role           TEXT,
-    brief          TEXT,
-    model_override TEXT,
+    slot                TEXT NOT NULL,
+    project_id          TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name                TEXT,
+    role                TEXT,
+    brief               TEXT,
+    model_override      TEXT,
+    -- Coach-set per-(slot, project) effort tier. NULL = no override
+    -- (fall through to per-pane request → no effort override). Values:
+    -- 1..4 mapped to "low" | "medium" | "high" | "max" by
+    -- agents.EFFORT_LITERALS at spawn time.
+    effort_override     INTEGER,
+    -- Coach-set per-(slot, project) plan-mode flag. NULL = no override
+    -- (fall through to per-pane request → False). 1 = plan mode on,
+    -- 0 = plan mode explicitly off (overrides per-pane true → false).
+    plan_mode_override  INTEGER,
     PRIMARY KEY (slot, project_id)
 );
 
@@ -518,7 +527,14 @@ async def init_db() -> None:
             await _ensure_columns(
                 db,
                 "agent_project_roles",
-                [("model_override", "model_override TEXT")],
+                [
+                    ("model_override", "model_override TEXT"),
+                    # Coach-set effort/plan_mode overrides — same
+                    # rationale as model_override (NULL = unset; revalidated
+                    # against the current pane / role default at spawn time).
+                    ("effort_override", "effort_override INTEGER"),
+                    ("plan_mode_override", "plan_mode_override INTEGER"),
+                ],
             )
             await _ensure_columns(
                 db,

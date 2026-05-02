@@ -476,7 +476,13 @@ class StartAgentRequest(BaseModel):
     # Per-turn overrides set via the pane settings popover. Any omitted
     # falls back to the SDK / Dockerfile defaults.
     model: str | None = Field(default=None, max_length=120)
-    plan_mode: bool = False
+    # None for both means "no per-pane override" — run_agent then
+    # consults the Coach-set per-(slot, project) plan_mode_override /
+    # effort_override on agent_project_roles before falling back to
+    # the implicit default. The UI omits the field from the request body
+    # whenever its toggle is off, so missing-field semantics already line
+    # up with "no per-pane override."
+    plan_mode: bool | None = None
     effort: int | None = Field(default=None, ge=1, le=4)
 
 
@@ -941,6 +947,8 @@ async def list_agents() -> dict[str, list[dict[str, Any]]]:
             "SELECT a.id, a.kind, "
             "       r.name AS name, r.role AS role, r.brief AS brief, "
             "       r.model_override AS model_override, "
+            "       r.effort_override AS effort_override, "
+            "       r.plan_mode_override AS plan_mode_override, "
             "       a.status, a.current_task_id, a.model, a.workspace_path, "
             "       s.session_id AS session_id, "
             "       s.codex_thread_id AS codex_thread_id, "
@@ -4519,9 +4527,11 @@ async def list_events(
             " OR (type = 'task_assigned' AND payload_to = ?)"
             " OR (type = 'task_updated' AND payload_owner = ?)"
             " OR (type = 'agent_model_set' AND payload_to = ?)"
+            " OR (type = 'agent_effort_set' AND payload_to = ?)"
+            " OR (type = 'agent_plan_mode_set' AND payload_to = ?)"
             ")"
         )
-        params.extend([agent, agent, agent, agent, agent])
+        params.extend([agent, agent, agent, agent, agent, agent, agent])
     if type:
         where_parts.append("type = ?")
         params.append(type)

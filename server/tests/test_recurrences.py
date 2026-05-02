@@ -467,6 +467,40 @@ async def test_upsert_tick_disable_when_missing_returns_none(
     assert row is None
 
 
+async def test_upsert_tick_minutes_auto_enables_disabled_row(
+    fresh_db: str,
+) -> None:
+    """Spec contract: passing `minutes` on a disabled row re-enables it
+    (recurrence-specs.md §351, TOT-specs.md §1784). Lock-in test against
+    the bug where `/tick N` would silently leave a disabled tick off."""
+    await init_db()
+    row = await recmod.upsert_tick(project_id="misc", minutes=60)
+    rid = row["id"]
+    row = await recmod.upsert_tick(project_id="misc", enabled=False)
+    assert row["enabled"] is False
+    row = await recmod.upsert_tick(project_id="misc", minutes=15)
+    assert row is not None and row["id"] == rid
+    assert row["cadence"] == "15"
+    assert row["enabled"] is True
+    assert row["next_fire_at"] is not None
+
+
+async def test_upsert_tick_enabled_true_re_enables_preserving_cadence(
+    fresh_db: str,
+) -> None:
+    """Spec contract: PUT {enabled: true} on a disabled row re-enables
+    without altering the cadence and schedules next_fire_at one cadence
+    out from now."""
+    await init_db()
+    await recmod.upsert_tick(project_id="misc", minutes=60)
+    await recmod.upsert_tick(project_id="misc", enabled=False)
+    row = await recmod.upsert_tick(project_id="misc", enabled=True)
+    assert row is not None
+    assert row["cadence"] == "60"
+    assert row["enabled"] is True
+    assert row["next_fire_at"] is not None
+
+
 async def test_update_recurrence_changes_cadence_and_recomputes(
     fresh_db: str,
 ) -> None:
