@@ -4691,18 +4691,95 @@ async def upload_attachment(file: UploadFile = File(...)) -> dict[str, Any]:
         logger.exception("attachment upload failed mid-stream")
         raise HTTPException(500, detail="upload failed")
 
+    from server.attachments_signing import mint_signed_url
+    filename = f"{att_id}.{ext}"
     return {
         "id": att_id,
-        "filename": f"{att_id}.{ext}",
+        "filename": filename,
         "path": str(target),
-        "url": f"/api/attachments/{att_id}.{ext}",
+        # Legacy URL with `?token=` is kept temporarily for any cached
+        # client; the UI prefers `signed_url` and the auth-required
+        # endpoint will be removed in a future release once we're sure
+        # nothing else points at it.
+        "url": f"/api/attachments/{filename}",
+        "signed_url": mint_signed_url(filename),
         "size": total,
         "media_type": f"image/{ext if ext != 'jpg' else 'jpeg'}",
     }
 
 
+def _validate_attachment_filename(filename: str) -> str:
+    """Reject path traversal + unknown extensions for attachment paths.
+    Shared between the legacy and signed serve endpoints."""
+    if "/" in filename or ".." in filename or "\\" in filename:
+        raise HTTPException(400, detail="invalid filename")
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext not in ALLOWED_EXT:
+        raise HTTPException(404)
+    return ext
+
+
+@app.get(
+    "/api/attachments/{filename}/signed-url",
+    dependencies=[Depends(require_token)],
+)
+async def get_attachment_signed_url(filename: str) -> dict[str, Any]:
+    """Re-mint a fresh signed URL for an existing attachment.
+
+    Used by the UI when re-rendering historical pane content whose
+    original `signed_url` from the upload response has aged out. The
+    auth dependency stops anyone but the harness operator from
+    minting on demand, while the signed URL itself remains
+    short-lived and limited to the specific filename it was minted
+    for.
+    """
+    _validate_attachment_filename(filename)
+    project_id = await resolve_active_project()
+    target = _attachments_dir_for(project_id) / filename
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404)
+    from server.attachments_signing import mint_signed_url
+    return {"filename": filename, "signed_url": mint_signed_url(filename)}
+
+
+@app.get("/api/attachments/{filename}/signed")
+async def get_attachment_signed(
+    filename: str,
+    exp: int = Query(...),
+    sig: str = Query(...),
+):
+    """Serve attachment bytes WITHOUT requiring the bearer token —
+    auth is via the HMAC `sig` (with `exp`) instead. Closes the audit
+    finding "bearer token in URL" for image loads in browser history,
+    proxy logs, screenshots, etc.
+
+    The signed URL is minted by the upload endpoint (or by the
+    auth'd `/signed-url` re-mint endpoint) and lives for ~5 minutes.
+    """
+    from server.attachments_signing import verify_signed
+    if not verify_signed(filename, exp, sig):
+        # Don't tell the caller WHICH part failed (expired vs forged)
+        # — same response shape stops a probing attacker from
+        # learning whether their guess timed out or was simply wrong.
+        raise HTTPException(403, detail="invalid or expired signature")
+    ext = _validate_attachment_filename(filename)
+    project_id = await resolve_active_project()
+    target = _attachments_dir_for(project_id) / filename
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404)
+    media_type = f"image/{ext if ext != 'jpg' else 'jpeg'}"
+    return FileResponse(target, media_type=media_type)
+
+
 @app.get("/api/attachments/{filename}")
 async def get_attachment(filename: str, token: str | None = Query(default=None)):
+    """Legacy bearer-token-in-URL serve endpoint.
+
+    Kept for one release so cached UI bundles + any external code
+    pointing at the old URL keep working. New uploads return
+    `signed_url` instead; the UI prefers that. Removal is tracked in
+    the threat-model section of Docs/TOT-specs.md.
+    """
     # `<img src=...>` browser loads can't set the Authorization header
     # (browsers only attach it on fetch/XHR), so we accept the token via
     # `?token=` query string the same way the /ws endpoint does. The UI
@@ -4710,15 +4787,10 @@ async def get_attachment(filename: str, token: str | None = Query(default=None))
     # still works for fetch-based callers.
     if HARNESS_TOKEN and token != HARNESS_TOKEN:
         raise HTTPException(401, detail="invalid or missing token")
-    # Reject path traversal attempts
-    if "/" in filename or ".." in filename:
-        raise HTTPException(400, detail="invalid filename")
+    ext = _validate_attachment_filename(filename)
     project_id = await resolve_active_project()
     target = _attachments_dir_for(project_id) / filename
     if not target.exists() or not target.is_file():
-        raise HTTPException(404)
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if ext not in ALLOWED_EXT:
         raise HTTPException(404)
     media_type = f"image/{ext if ext != 'jpg' else 'jpeg'}"
     return FileResponse(target, media_type=media_type)
