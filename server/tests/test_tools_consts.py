@@ -77,3 +77,24 @@ def test_both_kinds_share_the_coord_allowlist() -> None:
     for t in ALLOWED_COORD_TOOLS:
         assert t in ALLOWED_COACH_TOOLS
         assert t in ALLOWED_PLAYER_TOOLS
+
+
+def test_every_registered_coord_tool_is_in_the_allowlist() -> None:
+    # Contract test for the kanban regression where new tools were
+    # registered in build_coord_server but omitted from
+    # ALLOWED_COORD_TOOLS — the SDK pre-rejects unallowed tools, so
+    # agents could never reach the new lifecycle handlers. Any future
+    # tool added to the coord server must also be added to the
+    # allowlist (or this test fails).
+    from server.tools import coord_tool_names
+
+    # coord_tool_names() returns the bare tool names (no prefix); the
+    # allowlist uses the SDK-side `mcp__coord__` prefix so the SDK can
+    # match what the runtime emits. Compare apples to apples.
+    registered = {f"mcp__coord__{n}" for n in coord_tool_names()}
+    allowed = set(ALLOWED_COORD_TOOLS)
+    missing = sorted(registered - allowed)
+    assert not missing, (
+        "registered coord tools missing from ALLOWED_COORD_TOOLS: "
+        f"{missing}"
+    )

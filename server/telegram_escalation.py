@@ -126,6 +126,16 @@ def _key_for_pending(ev: dict[str, Any]) -> tuple[str, str] | None:
     """Map a pending-attention event to a (kind, key) handle. Returns
     None when the event isn't one we escalate (or is a route='coach'
     pending_question/plan that Coach handles itself).
+
+    Kanban escalations (Docs/kanban-specs.md §14):
+      - audit_report_submitted{verdict='fail'} → "audit_fail" / task_id
+        (no natural resolution — fires after the grace/delay so the
+        human sees fail loops they'd otherwise miss)
+      - audit_assignment_needed → "audit_assignment_needed" /
+        f"{task_id}:{role}" (cancelled by task_role_assigned for the
+        matching role)
+      - audit_self_review_warning → "audit_self_review" / f"{task_id}:{kind}"
+        (informational, no resolution)
     """
     etype = ev.get("type") or ""
     if etype == "pending_question" and ev.get("route") == "human":
@@ -140,6 +150,23 @@ def _key_for_pending(ev: dict[str, Any]) -> tuple[str, str] | None:
         pid = ev.get("proposal_id")
         if pid is not None:
             return ("proposal", str(pid))
+    elif (
+        etype == "audit_report_submitted"
+        and (ev.get("verdict") or "").lower() == "fail"
+    ):
+        tid = ev.get("task_id")
+        if tid:
+            return ("audit_fail", str(tid))
+    elif etype == "audit_assignment_needed":
+        tid = ev.get("task_id")
+        role = ev.get("role")
+        if tid and role:
+            return ("audit_assignment_needed", f"{tid}:{role}")
+    elif etype == "audit_self_review_warning":
+        tid = ev.get("task_id")
+        kind = ev.get("kind")
+        if tid and kind:
+            return ("audit_self_review", f"{tid}:{kind}")
     return None
 
 
@@ -163,6 +190,13 @@ def _key_for_resolution(ev: dict[str, Any]) -> tuple[str, str] | None:
         pid = ev.get("proposal_id")
         if pid is not None:
             return ("proposal", str(pid))
+    elif etype == "task_role_assigned":
+        # Cancels a matching audit_assignment_needed timer when Coach
+        # finally fills the role.
+        tid = ev.get("task_id")
+        role = ev.get("role")
+        if tid and role:
+            return ("audit_assignment_needed", f"{tid}:{role}")
     return None
 
 
@@ -196,6 +230,60 @@ async def _agent_label(agent_id: str) -> str:
     elif role:
         parts.append(f"({role})")
     return " ".join(parts)
+
+
+async def _task_context(task_id: str) -> dict[str, Any]:
+    """Best-effort task lookup for phone messages.
+
+    Event payloads usually carry the task id but not the title or stage.
+    Task ids are globally unique in the tasks table, so a direct lookup
+    keeps the Telegram body useful without relying on active-project
+    state.
+    """
+    if not task_id or task_id == "?":
+        return {}
+    try:
+        from server.db import configured_conn  # noqa: PLC0415
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT title, status, owner, priority, blocked "
+                "FROM tasks WHERE id = ?",
+                (task_id,),
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+        return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
+async def _task_context_lines(
+    task_id: str, ev: dict[str, Any]
+) -> list[str]:
+    ctx = await _task_context(task_id)
+    title = ctx.get("title") or ev.get("title")
+    status = ctx.get("status") or ev.get("stage") or ev.get("status")
+    owner = ctx.get("owner") or ev.get("owner") or ev.get("executor_id")
+    priority = ctx.get("priority") or ev.get("priority")
+    blocked = ctx.get("blocked")
+
+    lines: list[str] = []
+    if title:
+        lines.append(f"Task: {title}")
+    meta: list[str] = []
+    if status:
+        meta.append(f"stage={status}")
+    if owner:
+        meta.append(f"owner={owner}")
+    if priority:
+        meta.append(f"priority={priority}")
+    if blocked:
+        meta.append("blocked")
+    if meta:
+        lines.append("Context: " + ", ".join(meta))
+    return lines
 
 
 def _truncate(text: str, n: int = _BODY_PREVIEW) -> str:
@@ -315,12 +403,86 @@ async def _format_proposal_msg(ev: dict[str, Any]) -> str:
     parts = [display_path, f"scope={scope}"]
     if isinstance(size, int):
         parts.append(f"{size} chars")
-    lines.append(" — ".join(parts))
+    lines.append(" - ".join(parts))
     if summary:
         lines.append("")
         lines.append(_truncate(summary))
     lines.append("")
     lines.append("Review the diff in the web UI.")
+    return "\n".join(lines).strip()
+
+
+async def _format_audit_fail_msg(ev: dict[str, Any]) -> str:
+    """Compose the Telegram message body for a failed audit. The
+    auditor's verdict bounces the task back to execute; this is
+    typically the kind of regression the human wants to see, even if
+    the kanban dashboard already shows it inline."""
+    tid = ev.get("task_id") or "?"
+    kind = ev.get("kind") or "?"
+    auditor = ev.get("auditor_id") or "?"
+    round_num = ev.get("round")
+    report_path = ev.get("report_path") or ""
+    when = _short_iso(ev.get("ts"))
+
+    lines: list[str] = []
+    round_part = f" (round {round_num})" if round_num else ""
+    lines.append(f"[fail] Audit fail: {tid} - {kind} auditor {auditor}{round_part}")
+    lines.extend(await _task_context_lines(tid, ev))
+    if when:
+        lines.append(f"submitted at {when}")
+    lines.append("Task reverted to execute.")
+    if report_path:
+        lines.append(f"Report: {report_path}")
+    lines.append("")
+    lines.append("Open the kanban to read the audit report.")
+    return "\n".join(lines).strip()
+
+
+async def _format_audit_assignment_needed_msg(ev: dict[str, Any]) -> str:
+    """Compose the Telegram body for a stage that's stuck waiting on
+    a Coach role assignment. Implies Coach is asleep / over-cap or
+    forgot — the human can step in and assign via the UI."""
+    tid = ev.get("task_id") or "?"
+    role = ev.get("role") or "?"
+    when = _short_iso(ev.get("ts"))
+
+    lines: list[str] = []
+    lines.append(f"[needs] Assignment needed: {tid} - {role}")
+    lines.extend(await _task_context_lines(tid, ev))
+    if when:
+        lines.append(f"flagged at {when}")
+    lines.append(
+        "The task is sitting in this stage with no assigned Player. "
+        "Coach hasn't followed up."
+    )
+    lines.append("")
+    lines.append("Open the kanban to assign one (or nudge Coach).")
+    return "\n".join(lines).strip()
+
+
+async def _format_audit_self_review_msg(ev: dict[str, Any]) -> str:
+    """Compose the body for a self-review warning. Soft signal —
+    useful when humans want to spot weak self-review patterns. Doesn't
+    block; just informs."""
+    tid = ev.get("task_id") or "?"
+    kind = ev.get("kind") or "?"
+    auditor = ev.get("auditor_id") or "?"
+    executor = ev.get("executor_id") or "?"
+    when = _short_iso(ev.get("ts"))
+
+    lines: list[str] = []
+    lines.append(f"[note] Self-review: {tid} - {kind}")
+    lines.extend(await _task_context_lines(tid, ev))
+    if when:
+        lines.append(f"flagged at {when}")
+    lines.append(
+        f"Coach assigned {auditor} as {kind} auditor; they're also "
+        f"the executor ({executor})."
+    )
+    lines.append(
+        "Acceptable for small teams or when no one else has the "
+        "context; flag for review on big tasks."
+    )
     return "\n".join(lines).strip()
 
 
@@ -331,6 +493,12 @@ async def _format_message(kind: str, ev: dict[str, Any]) -> str:
         return await _format_plan_msg(ev)
     if kind == "proposal":
         return await _format_proposal_msg(ev)
+    if kind == "audit_fail":
+        return await _format_audit_fail_msg(ev)
+    if kind == "audit_assignment_needed":
+        return await _format_audit_assignment_needed_msg(ev)
+    if kind == "audit_self_review":
+        return await _format_audit_self_review_msg(ev)
     return ""
 
 

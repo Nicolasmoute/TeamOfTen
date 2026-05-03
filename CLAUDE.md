@@ -665,6 +665,20 @@ without touching prompts or migrating DB rows.
   `test_role_defaults_resolved_for_api`, plus the
   forbidden-concrete-ids enforcer above. Suite at 562/562.
 
+**Recent (2026-05-03) - Kanban task lifecycle:**
+
+Tasks now flow through `plan -> execute -> audit_syntax ->
+audit_semantics -> ship -> archive`. Coach plans and delegates;
+Players execute, audit, and ship. Standard tasks use the full path
+with `spec.md`, Player audit reports, and shipper sign-off. Simple
+tasks self-audit before `coord_commit_push` and archive directly.
+
+Key files: [server/tools.py](server/tools.py), [server/kanban.py](server/kanban.py),
+[server/idle_poller.py](server/idle_poller.py), [server/static/kanban.js](server/static/kanban.js),
+[server/tasks_claude_md.py](server/tasks_claude_md.py), and
+[server/telegram_escalation.py](server/telegram_escalation.py). Full
+subsystem detail lives in [Docs/kanban-specs.md](Docs/kanban-specs.md).
+
 **Recent (2026-05-03) — Compass pinned to Sonnet + medium effort:**
 
 Compass was previously letting the Claude Agent SDK fall through to

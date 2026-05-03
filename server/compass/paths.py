@@ -62,6 +62,18 @@ class CompassPaths:
     stale_proposals: Path
     duplicate_proposals: Path
     reconciliation_proposals: Path
+    # Per-audit markdown reports — one .md file per audit, alongside
+    # the structured `audits.jsonl` index. The .md is the human-
+    # readable surface (Files pane, kDrive on phone, attachable to
+    # Coach decisions); the jsonl drives the dashboard. See
+    # Docs/kanban-specs.md §5.3.
+    audit_reports_dir: Path
+
+    def audit_report_for(self, audit_id: str) -> Path:
+        """Path to a single audit's markdown report. Filename is
+        `<audit_id>.md` (audit_id format `audit_<unix_ms>` per
+        store.next_audit_id)."""
+        return self.audit_reports_dir / f"{audit_id}.md"
 
     def briefing_for(self, date_iso: str) -> Path:
         """Path to a single day's briefing. `date_iso` should be
@@ -95,6 +107,7 @@ def compass_paths(project_id: str) -> CompassPaths:
         stale_proposals=proposals / "stale.json",
         duplicate_proposals=proposals / "duplicates.json",
         reconciliation_proposals=proposals / "reconciliation.json",
+        audit_reports_dir=root / "audit_reports",
     )
 
 

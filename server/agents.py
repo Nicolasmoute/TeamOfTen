@@ -2091,15 +2091,21 @@ async def _build_coach_coordination_block() -> str:
             )
             role_map = {dict(r)["slot"]: dict(r) for r in await cur.fetchall()}
 
-            # ---- Open tasks ----------------------------------------
+            # ---- Open tasks (kanban: any non-archive stage) ---------
+            # Sort order matches the kanban flow: tasks deepest in the
+            # pipeline first (ship → audit_* → execute → plan), so Coach
+            # sees what's nearest delivery at the top of the rollup.
             cur = await c.execute(
-                "SELECT id, title, status, owner "
+                "SELECT id, title, status, owner, complexity, blocked "
                 "FROM tasks WHERE project_id = ? "
-                "AND status IN ('claimed', 'in_progress', 'open') "
+                "AND status != 'archive' "
                 "ORDER BY CASE status "
-                "  WHEN 'in_progress' THEN 0 "
-                "  WHEN 'claimed' THEN 1 "
-                "  ELSE 2 END, id ASC LIMIT 20",
+                "  WHEN 'ship' THEN 0 "
+                "  WHEN 'audit_semantics' THEN 1 "
+                "  WHEN 'audit_syntax' THEN 2 "
+                "  WHEN 'execute' THEN 3 "
+                "  WHEN 'plan' THEN 4 "
+                "  ELSE 5 END, id ASC LIMIT 20",
                 (active,),
             )
             open_tasks = [dict(r) for r in await cur.fetchall()]
@@ -2335,13 +2341,79 @@ async def _build_coach_coordination_block() -> str:
             title = (t.get("title") or "").strip()[:80]
             status = t.get("status") or "?"
             owner = t.get("owner") or "—"
-            lines.append(f"- {tid} ({status}) — {owner} — {title}")
+            simple = " SIMPLE" if t.get("complexity") == "simple" else ""
+            blocked = " BLOCKED" if t.get("blocked") else ""
+            lines.append(
+                f"- {tid} ({status}){simple}{blocked} - {owner} - {title}"
+            )
     else:
         lines.append("Open tasks: (none)")
     lines.append("")
     lines.append(f"Inbox: {unread} unread message{'s' if unread != 1 else ''}")
     lines.append("")
     lines.append(f"Last decision: {last_decision_line}")
+    lines.append("")
+    # Static lifecycle policy — same paragraph in every Coach turn so
+    # the role-strict-separation rule is reinforced. Mirror of the
+    # CLAUDE.md kanban block but tighter: Coach already gets the full
+    # tool catalogue elsewhere in the system prompt; here we just
+    # codify policy + decision triggers.
+    lines.append("## Task lifecycle policy")
+    lines.append("")
+    lines.append(
+        "You coordinate; you do NOT execute. Your direct work is "
+        "PLANNING (writing the spec) and DELEGATION (assigning Players "
+        "to roles). Players do execution, audit, and ship."
+    )
+    lines.append("")
+    lines.append(
+        "Stages: plan -> execute -> audit_syntax -> audit_semantics -> "
+        "ship -> archive. Standard tasks traverse the full pipeline; "
+        "simple tasks (typo fixes, one-line bugs, log tweaks) jump "
+        "plan -> execute -> archive on commit and the executor self-audits."
+    )
+    lines.append("")
+    lines.append(
+        "PLAN: write the spec yourself with coord_write_task_spec OR "
+        "delegate to a Player via coord_assign_planner. Standard tasks "
+        "cannot move to execute without a spec.md."
+    )
+    lines.append("")
+    lines.append(
+        "EXECUTE: assign with coord_assign_task. `to` accepts a single "
+        "Player slot (hard-assign) OR a comma-list (post to a pool - "
+        "first to call coord_claim_task wins)."
+    )
+    lines.append("")
+    lines.append(
+        "AUDIT: assign auditors with coord_assign_auditor "
+        "(kind='syntax' or 'semantics'). Auditors call "
+        "coord_submit_audit_report; pass advances the stage, fail "
+        "reverts to execute and re-wakes the executor with the spec + "
+        "latest report. Compass auto-audit is informational, not the "
+        "gate."
+    )
+    lines.append("")
+    lines.append(
+        "SHIP: assign with coord_assign_shipper. They merge, then call "
+        "coord_mark_shipped; task archives."
+    )
+    lines.append("")
+    lines.append(
+        "SIMPLE-TASK DISCIPLINE: when you mark a task simple, tell the "
+        "executor to self-audit (run the relevant tests / sanity-check "
+        "the change) before coord_commit_push, since the board archives "
+        "directly on commit. Mark simple only when self-audit is "
+        "sufficient - typos, log tweaks, single-line fixes."
+    )
+    lines.append("")
+    lines.append(
+        "When a Player is unsure what to do, they can call "
+        "coord_my_assignments to see their full plate. The idle "
+        "poller also auto-wakes them every ~5 min if pool work is "
+        "waiting — so don't worry about un-claimed pool tasks "
+        "stalling indefinitely."
+    )
     lines.append("")
     from server.paths import global_paths
     gp = global_paths()
@@ -2675,11 +2747,42 @@ def _system_prompt_for(agent_id: str) -> str:
             "decompose human goals into tasks, assign them to Players (slots "
             "p1..p10), and orchestrate progress.\n\n"
             "Coordination tools:\n"
-            "  - coord_list_tasks(status?, owner?): see the team board\n"
-            "  - coord_create_task(title, description?, priority?): add top-level tasks\n"
-            "  - coord_assign_task(task_id, to): push-assign an open task directly "
-            "to a Player (faster than waiting for them to self-claim)\n"
-            "  - coord_update_task(task_id, status, note?): you can cancel any task\n"
+            "  - coord_list_tasks(status?, owner?): see the team board "
+            "(status takes kanban stage names: plan / execute / "
+            "audit_syntax / audit_semantics / ship / archive - legacy "
+            "aliases also accepted)\n"
+            "  - coord_create_task(title, description?, parent_id?, "
+            "priority?, complexity?): add tasks. Set complexity='simple' "
+            "for typo-fix-class work that should skip audit + ship.\n"
+            "  - coord_write_task_spec(task_id, body): write the spec.md "
+            "for a task. REQUIRED before a standard task can move "
+            "plan->execute. Coach can write it themselves OR delegate via "
+            "coord_assign_planner - both flows are valid.\n"
+            "  - coord_assign_planner(task_id, to): delegate spec writing "
+            "to a Player (or pool 'p1,p2'). Optional - skip and write "
+            "the spec yourself if the task is in your wheelhouse.\n"
+            "  - coord_assign_task(task_id, to): assign the EXECUTOR. "
+            "`to` accepts a single Player (hard-assign) OR a comma-list "
+            "(post to a pool, first-claim wins).\n"
+            "  - coord_assign_auditor(task_id, to, kind): assign an "
+            "auditor (kind='syntax' or 'semantics'). Same single/list "
+            "shape. Players audit; you don't. Tool warns if you assign "
+            "the executor as their own auditor (weak self-review).\n"
+            "  - coord_assign_shipper(task_id, to): assign a Player to "
+            "merge after both audits pass. They call coord_mark_shipped "
+            "when the merge lands; task archives.\n"
+            "  - coord_set_task_complexity(task_id, complexity): flip "
+            "an existing task between 'simple' and 'standard' if you "
+            "misjudged at create time.\n"
+            "  - coord_advance_task_stage(task_id, stage, note?): "
+            "manually move a task across the kanban gate. Use when an "
+            "audit/ship assignment is stuck.\n"
+            "  - coord_set_task_blocked(task_id, blocked, reason?): "
+            "toggle the orthogonal BLOCKED flag (e.g. waiting on "
+            "stakeholder).\n"
+            "  - coord_update_task(task_id, status, note?): cancel a "
+            "task (status='archive' with cancellation behavior). For "
+            "stage transitions, prefer coord_advance_task_stage.\n"
             "  - coord_send_message(to, body, subject?, priority?): message a Player "
             "or 'broadcast' to the whole team\n"
             "  - coord_read_inbox(): read messages addressed to you or the team\n"
@@ -2786,15 +2889,46 @@ def _system_prompt_for(agent_id: str) -> str:
     return (
         f"You are Player {agent_id} on the TeamOfTen team. Your name and role "
         f"will be assigned by Coach; for now work with your slot id.\n\n"
+        f"Tasks flow through stages: plan -> execute -> audit_syntax -> "
+        f"audit_semantics -> ship -> archive. Your role per task is one of: "
+        f"executor (default), syntax/semantics auditor, shipper, planner. "
+        f"Call coord_my_assignments at the start of any turn where you're "
+        f"not sure what to do - it returns your full plate (active executor "
+        f"task / pending audits / pending ship / eligible pools you could "
+        f"claim).\n\n"
+        f"Always pass task_id to coord_commit_push, coord_submit_audit_report, "
+        f"and coord_mark_shipped so the kanban auto-advances. Without "
+        f"task_id the work still happens but the board doesn't move.\n\n"
         f"Coordination tools:\n"
-        f"  - coord_list_tasks(status?, owner?): see the team board\n"
-        f"  - coord_claim_task(task_id): claim an open task (one at a time)\n"
-        f"  - coord_update_task(task_id, status, note?): report progress\n"
-        f"      valid next states: in_progress, blocked, done, cancelled\n"
+        f"  - coord_my_assignments(): your full plate. Call first when "
+        f"unsure.\n"
+        f"  - coord_list_tasks(status?, owner?): the whole team board (kanban "
+        f"stage names: plan / execute / audit_syntax / audit_semantics / "
+        f"ship / archive)\n"
+        f"  - coord_claim_task(task_id): claim a plan-stage task you're in "
+        f"the eligible pool for (one at a time). Standard tasks need a "
+        f"spec.md before you can claim - Coach will write one.\n"
+        f"  - coord_commit_push(task_id, message): commit + push your work "
+        f"in your worktree. ALWAYS pass task_id so the kanban moves.\n"
+        f"  - coord_submit_audit_report(task_id, kind, body, verdict): when "
+        f"you're the assigned auditor (kind='syntax' or 'semantics'), "
+        f"submit pass/fail with a markdown body. Kanban auto-advances on "
+        f"pass; reverts to execute on fail (with your report attached).\n"
+        f"  - coord_mark_shipped(task_id, note?): when you're the assigned "
+        f"shipper and the merge is in, call this; task archives.\n"
+        f"  - coord_write_task_spec(task_id, body): when Coach assigned "
+        f"you the planner role, draft the spec.md so the executor can "
+        f"start. Goal / done-looks-like / constraints / references.\n"
+        f"  - coord_set_task_blocked(task_id, blocked, reason?): on a task "
+        f"you own, mark blocked when you're stuck waiting on something "
+        f"external (stakeholder, API outage). Stays in current stage.\n"
+        f"  - coord_update_task(task_id, status, note?): rarely needed for "
+        f"Players - most stage transitions auto-advance via the tools "
+        f"above. Use this only when you genuinely need to manually move.\n"
         f"  - coord_create_task(title, ...): create SUBTASKS of tasks you own\n"
-        f"      (you cannot create top-level tasks — that's Coach's job)\n"
+        f"      (you cannot create top-level tasks - that's Coach's job)\n"
         f"  - coord_send_message(to, body, ...): message Coach or a peer for info\n"
-        f"      (you CANNOT use this to assign work — only Coach assigns)\n"
+        f"      (you CANNOT use this to assign work - only Coach assigns)\n"
         f"  - coord_read_inbox(): read messages addressed to you or the team\n"
         f"  - coord_list_memory / coord_read_memory / coord_update_memory:\n"
         f"      shared scratchpad. Read it to see what other agents found; "
@@ -2802,14 +2936,11 @@ def _system_prompt_for(agent_id: str) -> str:
         f"  - coord_list_knowledge / coord_read_knowledge / coord_write_knowledge:\n"
         f"      durable artifact bucket. Check existing paths before producing "
         f"a report to avoid duplicating work. Write long-form output here "
-        f"(e.g. 'reports/2026-04-23-api-audit.md') — not into memory.\n"
+        f"(e.g. 'reports/2026-04-23-api-audit.md') - not into memory.\n"
         f"  - coord_save_output(path, content_base64): ship BINARY deliverables "
         f"(docx, pdf, xlsx, png, zip). Text reports belong in knowledge/; use "
         f"this only for finished binaries the human asked for. Encode with "
         f"`base64 -w0 file.ext` via Bash. Mirrored to kDrive outputs/.\n"
-        f"  - coord_commit_push(message, push?): when you have code changes "
-        f"to ship, use this instead of driving git through Bash — it does "
-        f"git add -A + commit + push and emits a commit_pushed event.\n"
         f"  - AskUserQuestion (built-in): ask Coach a structured multiple-"
         f"choice question (1-4 questions, 2-4 options each). Your turn "
         f"PAUSES until Coach resolves it via coord_answer_question, then "
@@ -4644,8 +4775,9 @@ async def stale_task_watch_loop() -> None:
                     LEFT JOIN events e
                       ON e.agent_id = t.owner AND e.project_id = t.project_id
                     WHERE t.project_id = ?
-                      AND t.status IN ('in_progress', 'claimed')
+                      AND t.status IN ('execute', 'audit_syntax', 'audit_semantics', 'ship')
                       AND t.owner IS NOT NULL
+                      AND t.blocked = 0
                     GROUP BY t.id
                     HAVING last_activity IS NOT NULL
                        AND (julianday('now') - julianday(last_activity)) * 1440 > ?

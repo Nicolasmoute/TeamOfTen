@@ -41,20 +41,26 @@ async def _seed_misc_project_with_team_and_tasks() -> None:
             "(slot, project_id, name, role, brief) VALUES (?, ?, ?, ?, ?)",
             ("p1", MISC_PROJECT_ID, "Alice Rabil", "Lead Developer", None),
         )
+        # Kanban stages: legacy 'in_progress' and 'claimed' both collapse
+        # into 'execute'. T-1 has started_at populated (actively working);
+        # T-2 has it NULL (assigned, not yet started).
         await c.execute(
-            "INSERT INTO tasks (id, project_id, title, status, owner, created_by) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (id, project_id, title, status, owner, "
+            "created_by, claimed_at, started_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 "T-1", MISC_PROJECT_ID, "Refresh deck template",
-                "in_progress", "p1", "coach",
+                "execute", "p1", "coach",
+                "2026-04-25T10:00:00Z", "2026-04-25T10:05:00Z",
             ),
         )
         await c.execute(
-            "INSERT INTO tasks (id, project_id, title, status, owner, created_by) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (id, project_id, title, status, owner, "
+            "created_by, claimed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 "T-2", MISC_PROJECT_ID, "Snapshot tests",
-                "claimed", "p1", "coach",
+                "execute", "p1", "coach", "2026-04-25T10:00:00Z",
             ),
         )
         await c.execute(
@@ -118,8 +124,10 @@ async def test_coordination_block_includes_open_tasks_and_inbox(
     await _seed_misc_project_with_team_and_tasks()
     block = await _build_coach_coordination_block()
     assert "Open tasks (2)" in block
-    assert "T-1 (in_progress)" in block
-    assert "T-2 (claimed)" in block
+    # Both rows now collapse into 'execute' under kanban; the prompt
+    # block surfaces stage as the status label.
+    assert "T-1 (execute)" in block
+    assert "T-2 (execute)" in block
     assert "Inbox: 1 unread message" in block
 
 

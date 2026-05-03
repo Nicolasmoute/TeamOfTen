@@ -65,6 +65,26 @@ async def _drain(seconds: float = 0.05) -> None:
     await asyncio.sleep(seconds)
 
 
+async def _seed_task(
+    task_id: str,
+    *,
+    title: str = "Fix audit target",
+    status: str = "execute",
+    owner: str = "p3",
+    priority: str = "high",
+) -> None:
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO tasks (id, project_id, title, status, owner, "
+            "created_by, priority) VALUES (?, 'misc', ?, ?, ?, 'coach', ?)",
+            (task_id, title, status, owner, priority),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+
 # ----------------------------------------------------- key extraction
 
 
@@ -592,5 +612,182 @@ async def test_full_path_via_bus(
         await _drain(0.2)
         assert len(sent) == 1
         assert "Plan approval from p7" in sent[0]
+    finally:
+        await esc.stop_escalation_watcher()
+
+
+# ----------------------------------------------------- kanban escalations
+
+
+def test_key_for_audit_fail() -> None:
+    """audit_report_submitted with verdict='fail' is escalated; pass is not."""
+    ev_fail = {
+        "type": "audit_report_submitted",
+        "task_id": "t-2026-05-03-aaaaaaaa",
+        "kind": "syntax",
+        "verdict": "fail",
+    }
+    assert esc._key_for_pending(ev_fail) == ("audit_fail", "t-2026-05-03-aaaaaaaa")
+    ev_pass = {**ev_fail, "verdict": "pass"}
+    assert esc._key_for_pending(ev_pass) is None
+
+
+def test_key_for_audit_assignment_needed() -> None:
+    ev = {
+        "type": "audit_assignment_needed",
+        "task_id": "t-2026-05-03-aaaaaaaa",
+        "role": "auditor_syntax",
+    }
+    assert esc._key_for_pending(ev) == (
+        "audit_assignment_needed",
+        "t-2026-05-03-aaaaaaaa:auditor_syntax",
+    )
+
+
+def test_key_for_audit_self_review() -> None:
+    ev = {
+        "type": "audit_self_review_warning",
+        "task_id": "t-2026-05-03-aaaaaaaa",
+        "kind": "semantics",
+    }
+    assert esc._key_for_pending(ev) == (
+        "audit_self_review",
+        "t-2026-05-03-aaaaaaaa:semantics",
+    )
+
+
+def test_resolution_task_role_assigned_cancels_audit_assignment_needed() -> None:
+    """When Coach finally fills the role, the assignment-needed
+    timer should be cancelled."""
+    ev = {
+        "type": "task_role_assigned",
+        "task_id": "t-2026-05-03-aaaaaaaa",
+        "role": "auditor_syntax",
+    }
+    assert esc._key_for_resolution(ev) == (
+        "audit_assignment_needed",
+        "t-2026-05-03-aaaaaaaa:auditor_syntax",
+    )
+
+
+async def test_audit_fail_fires_with_message_body(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: a fail verdict on the bus → watcher schedules timer
+    → no resolution → Telegram outbound fires with a useful body."""
+    await init_db()
+    sent = _stub_send(monkeypatch)
+    monkeypatch.setenv("HARNESS_TELEGRAM_ESCALATION_SECONDS", "1")
+    monkeypatch.setenv("HARNESS_TELEGRAM_ESCALATION_GRACE", "0")
+
+    await esc.start_escalation_watcher()
+    try:
+        await bus.publish({
+            "type": "audit_report_submitted",
+            "task_id": "t-2026-05-03-bbbbbbbb",
+            "kind": "syntax",
+            "verdict": "fail",
+            "auditor_id": "p4",
+            "round": 2,
+            "report_path": "audits/audit_2_syntax.md",
+            "ts": "2026-05-03T14:22:11+00:00",
+        })
+        await _drain(0.2)
+        assert len(sent) == 1
+        body = sent[0]
+        assert "Audit fail" in body
+        assert "t-2026-05-03-bbbbbbbb" in body
+        assert "syntax" in body
+        assert "p4" in body
+        assert "round 2" in body
+        assert "audit_2_syntax.md" in body
+    finally:
+        await esc.stop_escalation_watcher()
+
+
+async def test_audit_fail_formatter_includes_task_context(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed_task(
+        "t-2026-05-03-context1",
+        title="Repair checkout flow",
+        status="execute",
+        owner="p6",
+        priority="urgent",
+    )
+    body = await esc._format_audit_fail_msg({
+        "type": "audit_report_submitted",
+        "task_id": "t-2026-05-03-context1",
+        "kind": "semantics",
+        "verdict": "fail",
+        "auditor_id": "p8",
+        "round": 1,
+    })
+    assert "Repair checkout flow" in body
+    assert "stage=execute" in body
+    assert "owner=p6" in body
+    assert "priority=urgent" in body
+
+
+async def test_audit_assignment_needed_cancelled_by_role_assigned(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If Coach assigns the auditor before the timer expires, no
+    Telegram message goes out."""
+    await init_db()
+    sent = _stub_send(monkeypatch)
+    monkeypatch.setenv("HARNESS_TELEGRAM_ESCALATION_SECONDS", "60")
+    monkeypatch.setenv("HARNESS_TELEGRAM_ESCALATION_GRACE", "60")
+
+    await esc.start_escalation_watcher()
+    try:
+        await bus.publish({
+            "type": "audit_assignment_needed",
+            "task_id": "t-2026-05-03-cccccccc",
+            "role": "auditor_syntax",
+            "ts": "2026-05-03T14:00:00+00:00",
+        })
+        await _drain(0.05)
+        assert esc.pending_count() == 1
+        # Coach assigns the auditor — cancels the timer.
+        await bus.publish({
+            "type": "task_role_assigned",
+            "task_id": "t-2026-05-03-cccccccc",
+            "role": "auditor_syntax",
+        })
+        await _drain(0.1)
+        assert esc.pending_count() == 0
+        assert sent == []
+    finally:
+        await esc.stop_escalation_watcher()
+
+
+async def test_self_review_warning_fires_message(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """audit_self_review_warning is informational; it fires after the
+    grace period because there's no natural resolution event."""
+    await init_db()
+    sent = _stub_send(monkeypatch)
+    monkeypatch.setenv("HARNESS_TELEGRAM_ESCALATION_SECONDS", "1")
+    monkeypatch.setenv("HARNESS_TELEGRAM_ESCALATION_GRACE", "0")
+
+    await esc.start_escalation_watcher()
+    try:
+        await bus.publish({
+            "type": "audit_self_review_warning",
+            "task_id": "t-2026-05-03-dddddddd",
+            "kind": "semantics",
+            "auditor_id": "p3",
+            "executor_id": "p3",
+            "ts": "2026-05-03T14:00:00+00:00",
+        })
+        await _drain(0.2)
+        assert len(sent) == 1
+        body = sent[0]
+        assert "Self-review" in body
+        assert "p3" in body
+        assert "semantics" in body
     finally:
         await esc.stop_escalation_watcher()

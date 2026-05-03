@@ -28,19 +28,226 @@ def _new_task_id() -> str:
     return f"t-{today}-{uuid.uuid4().hex[:8]}"
 
 
-# Task state machine. Reject transitions not listed here.
+# Kanban-shaped task state machine (Docs/kanban-specs.md §2). Reject
+# transitions not listed here. The legacy enum values (open/claimed/
+# in_progress/blocked/done/cancelled) are accepted as input aliases
+# during a one-release deprecation window: 'done'/'cancelled' map to
+# 'archive', 'in_progress' is treated as a no-op for tasks already in
+# 'execute', etc. See `_normalize_status_alias`.
 VALID_TRANSITIONS: dict[str, set[str]] = {
-    "open":        {"claimed", "cancelled"},
-    "claimed":     {"in_progress", "blocked", "done", "cancelled"},
-    "in_progress": {"blocked", "done", "cancelled"},
-    "blocked":     {"in_progress", "cancelled"},
-    "done":        set(),
-    "cancelled":   set(),
+    "plan":            {"execute", "archive"},
+    "execute":         {"audit_syntax", "archive"},
+    "audit_syntax":    {"audit_semantics", "execute"},
+    "audit_semantics": {"ship", "execute"},
+    "ship":            {"archive"},
+    "archive":         set(),
 }
+
+# Stages the kanban subscriber and Coach see as "the audit loop".
+AUDIT_STAGES: frozenset[str] = frozenset({"audit_syntax", "audit_semantics"})
+
+# All valid kanban stages (used by validators that accept any of them).
+ALL_KANBAN_STAGES: frozenset[str] = frozenset(VALID_TRANSITIONS.keys())
+
+# Legacy → kanban status aliases. Accepted for one release so existing
+# Coach prompts and external scripts that still call coord_update_task
+# with 'done' or 'cancelled' don't break. The alias resolver is applied
+# on tool input; the resolved value is what the state-machine validates
+# against. Cancellation has a side-effect (cancelled_at is stamped),
+# handled at the call site.
+_LEGACY_STATUS_ALIASES: dict[str, str] = {
+    "open": "plan",
+    "claimed": "execute",
+    "in_progress": "execute",
+    "blocked": "execute",  # blocked is now an orthogonal flag, not a status
+    "done": "archive",
+    "cancelled": "archive",
+}
+
+
+def _normalize_status_alias(status: str) -> str:
+    """Map a legacy status value to its kanban equivalent. No-op for
+    already-kanban values."""
+    return _LEGACY_STATUS_ALIASES.get(status, status)
 
 
 def _valid_transition(old: str, new: str) -> bool:
     return new in VALID_TRANSITIONS.get(old, set())
+
+
+async def _check_kanban_role_gate(
+    c: Any,
+    project_id: str,
+    task_id: str,
+    old: str,
+    new: str,
+    *,
+    was_cancellation: bool,
+) -> str | None:
+    """Role-completion gate enforcer for non-force stage transitions
+    (Docs/kanban-specs.md §2.3).
+
+    Returns an error string when the requested transition would skip an
+    artifact / role-completion event that should drive it (commit_pushed,
+    audit_report_submitted{pass|fail}, task_shipped). Returns None when
+    the transition is allowed under the gate.
+
+    Bypass paths (must NOT call this function):
+    - `coord_advance_task_stage` (Coach-only override)
+    - `POST /api/tasks/{id}/stage` with `force=true`
+
+    Cancellation (`was_cancellation=True` AND target is `archive`) skips
+    every gate by design — cancelling is always allowed at any stage.
+    """
+    if new == "archive" and was_cancellation:
+        return None
+
+    cur = await c.execute(
+        "SELECT complexity, spec_path FROM tasks "
+        "WHERE id = ? AND project_id = ?",
+        (task_id, project_id),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        # Caller paths already SELECT the row; getting here means a
+        # race or programmer error. Caller will surface the missing
+        # task in its own error message.
+        return None
+    t = dict(row)
+    complexity = (t.get("complexity") or "standard").lower()
+    spec_path = t.get("spec_path")
+
+    if old == "plan" and new == "execute":
+        if complexity == "standard" and not spec_path:
+            return (
+                f"task {task_id} has no spec — write one with "
+                f"coord_write_task_spec (or delegate via "
+                f"coord_assign_planner) before moving plan → execute. "
+                f"Use coord_advance_task_stage to force."
+            )
+        cur = await c.execute(
+            "SELECT 1 FROM task_role_assignments "
+            "WHERE task_id = ? AND role = 'executor' "
+            "AND owner IS NOT NULL AND superseded_by IS NULL "
+            "ORDER BY assigned_at DESC LIMIT 1",
+            (task_id,),
+        )
+        if not await cur.fetchone():
+            return (
+                f"task {task_id} has no claimed executor; assign via "
+                f"coord_assign_task or have a Player call "
+                f"coord_claim_task before moving plan → execute. Use "
+                f"coord_advance_task_stage to force."
+            )
+        return None
+
+    if old == "execute" and new == "audit_syntax":
+        return (
+            f"manual execute → audit_syntax is not allowed; the kanban "
+            f"subscriber auto-advances when the executor calls "
+            f"coord_commit_push(task_id={task_id!r}). Use "
+            f"coord_advance_task_stage to force."
+        )
+
+    if old == "execute" and new == "archive":
+        return (
+            f"manual execute → archive (delivery) is not allowed. "
+            f"Simple-complexity tasks auto-archive when the executor "
+            f"calls coord_commit_push(task_id={task_id!r}); standard "
+            f"tasks must traverse audit + ship. Use "
+            f"coord_advance_task_stage to force, or pass "
+            f"status='cancelled' if the intent is cancellation."
+        )
+
+    if old == "audit_syntax" and new == "audit_semantics":
+        if not await _has_passing_auditor(c, task_id, "auditor_syntax"):
+            return (
+                f"audit_syntax → audit_semantics requires the active "
+                f"syntax auditor to submit verdict='pass' via "
+                f"coord_submit_audit_report. Use "
+                f"coord_advance_task_stage to force."
+            )
+        return None
+
+    if old == "audit_semantics" and new == "ship":
+        if not await _has_passing_auditor(c, task_id, "auditor_semantics"):
+            return (
+                f"audit_semantics → ship requires the active semantic "
+                f"auditor to submit verdict='pass' via "
+                f"coord_submit_audit_report. Use "
+                f"coord_advance_task_stage to force."
+            )
+        return None
+
+    if old == "ship" and new == "archive":
+        if not await _has_completed_shipper(c, task_id):
+            return (
+                f"ship → archive requires the assigned shipper to call "
+                f"coord_mark_shipped(task_id={task_id!r}). Use "
+                f"coord_advance_task_stage to force."
+            )
+        return None
+
+    # audit_* → execute (manual revert) is allowed: it mirrors the
+    # subscriber's auto-revert on a fail verdict, and Coach occasionally
+    # needs to flag work as needing rework even when no auditor verdict
+    # has landed yet.
+    return None
+
+
+async def _has_passing_auditor(c: Any, task_id: str, role: str) -> bool:
+    """True if the active (un-superseded) auditor row for this task +
+    role has `verdict='pass'`."""
+    cur = await c.execute(
+        "SELECT verdict FROM task_role_assignments "
+        "WHERE task_id = ? AND role = ? AND superseded_by IS NULL "
+        "ORDER BY assigned_at DESC LIMIT 1",
+        (task_id, role),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return False
+    return (dict(row).get("verdict") or "").lower() == "pass"
+
+
+async def _has_completed_shipper(c: Any, task_id: str) -> bool:
+    """True if the active shipper assignment has `completed_at` set."""
+    cur = await c.execute(
+        "SELECT completed_at FROM task_role_assignments "
+        "WHERE task_id = ? AND role = 'shipper' AND superseded_by IS NULL "
+        "ORDER BY assigned_at DESC LIMIT 1",
+        (task_id,),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return False
+    return bool(dict(row).get("completed_at"))
+
+
+# Auditor / shipper / planner roles that Coach can assign. Mirror of
+# the task_role_assignments.role CHECK constraint.
+ROLE_NAMES: frozenset[str] = frozenset({
+    "planner", "executor", "auditor_syntax", "auditor_semantics", "shipper",
+})
+
+
+def _resolve_audit_role_kind(kind: str) -> str | None:
+    """Convert a Coach-facing kind ('syntax' / 'semantics') to the
+    underlying role-assignment row's role value."""
+    if kind == "syntax":
+        return "auditor_syntax"
+    if kind == "semantics":
+        return "auditor_semantics"
+    return None
+
+
+def _audit_kind_from_role(role: str) -> str | None:
+    """Inverse of `_resolve_audit_role_kind`."""
+    if role == "auditor_syntax":
+        return "syntax"
+    if role == "auditor_semantics":
+        return "semantics"
+    return None
 
 
 def _ok(text: str) -> dict[str, Any]:
@@ -94,9 +301,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         "coord_list_tasks",
         (
             "List tasks on the team board. Optional filters:\n"
-            "- status: one of 'open', 'claimed', 'in_progress', 'blocked', 'done', 'cancelled'\n"
+            "- status: kanban stage — one of 'plan', 'execute', "
+            "'audit_syntax', 'audit_semantics', 'ship', 'archive'. "
+            "Legacy values (open/claimed/in_progress/blocked/done/cancelled) "
+            "are translated to their kanban equivalent for back-compat.\n"
             "- owner: agent id ('coach', 'p1'..'p10'), or 'null' for unassigned\n"
-            "Returns up to 100 most recent tasks."
+            "Returns up to 100 most recent tasks. Each row shows stage, "
+            "complexity (SIMPLE chip if simple), blocked flag, owner, "
+            "priority, and title."
         ),
         {"status": str, "owner": str},
     )
@@ -108,8 +320,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         where_parts: list[str] = []
         params: list[Any] = []
         if status:
+            # Translate legacy aliases for back-compat. The DB CHECK only
+            # accepts kanban values now; passing 'in_progress' would
+            # quietly return nothing without this.
+            normalized = _normalize_status_alias(status)
             where_parts.append("status = ?")
-            params.append(status)
+            params.append(normalized)
         if owner is not None and owner != "":
             if owner.lower() in ("null", "none", "unassigned"):
                 where_parts.append("owner IS NULL")
@@ -125,7 +341,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         try:
             cur = await c.execute(
                 f"SELECT id, title, status, owner, created_by, parent_id, "
-                f"priority, created_at FROM tasks{clause} "
+                f"priority, complexity, blocked, blocked_reason, created_at "
+                f"FROM tasks{clause} "
                 f"ORDER BY created_at DESC LIMIT 100",
                 params,
             )
@@ -138,10 +355,18 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         lines = []
         for r in rows:
             d = dict(r)
-            parent = f" ↳{d['parent_id']}" if d["parent_id"] else ""
+            parent = f" sub-of:{d['parent_id']}" if d["parent_id"] else ""
+            simple = " SIMPLE" if d.get("complexity") == "simple" else ""
+            blocked = ""
+            if d.get("blocked"):
+                reason = d.get("blocked_reason") or ""
+                blocked = (
+                    f" BLOCKED({reason})" if reason else " BLOCKED"
+                )
             lines.append(
-                f"{d['id']}  [{d['status']}]  owner={d['owner'] or '-'}  "
-                f"pri={d['priority']}  {d['title']}{parent}"
+                f"{d['id']}  [{d['status']}]{simple}{blocked}  "
+                f"owner={d['owner'] or '-'}  pri={d['priority']}  "
+                f"{d['title']}{parent}"
             )
         return _ok("\n".join(lines))
 
@@ -157,9 +382,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- title: short summary (required)\n"
             "- description: longer explanation (optional)\n"
             "- parent_id: parent task id (optional; Players: required unless you have a current task)\n"
-            "- priority: 'low', 'normal', 'high', 'urgent' (default 'normal')"
+            "- priority: 'low', 'normal', 'high', 'urgent' (default 'normal')\n"
+            "- complexity: 'standard' (full pipeline) or 'simple' (skip audit + ship; "
+            "executor self-audits and the board archives directly on commit). "
+            "Default 'standard'. Coach-only — Players inherit the parent's complexity."
         ),
-        {"title": str, "description": str, "parent_id": str, "priority": str},
+        {
+            "title": str, "description": str, "parent_id": str,
+            "priority": str, "complexity": str,
+        },
     )
     async def create_task(args: dict[str, Any]) -> dict[str, Any]:
         title = (args.get("title") or "").strip()
@@ -174,6 +405,22 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"invalid priority '{priority}' "
                 "(must be low, normal, high, or urgent)"
             )
+        # Complexity: Coach can pick simple/standard; Players don't get
+        # to flip an inherited subtask's complexity here (use
+        # coord_set_task_complexity if needed — which is Coach-only).
+        complexity_raw = (args.get("complexity") or "").strip().lower()
+        if complexity_raw and complexity_raw not in ("simple", "standard"):
+            return _err(
+                f"invalid complexity '{complexity_raw}' "
+                "(must be 'simple' or 'standard')"
+            )
+        if complexity_raw and not caller_is_coach:
+            return _err(
+                "Only Coach can set complexity at create time. "
+                "Subtasks inherit; if you need this changed, ask Coach to "
+                "call coord_set_task_complexity."
+            )
+        complexity = complexity_raw or "standard"
 
         project_id = await resolve_active_project()
         c = await configured_conn()
@@ -213,40 +460,65 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                             f"top-level work, message Coach."
                         )
 
+            # Subtask complexity inherits from parent unless Coach
+            # explicitly overrode at create-time.
+            if parent_id and not complexity_raw:
+                cur = await c.execute(
+                    "SELECT complexity FROM tasks WHERE id = ? AND project_id = ?",
+                    (parent_id, project_id),
+                )
+                prow = await cur.fetchone()
+                if prow:
+                    parent_complexity = dict(prow).get("complexity") or "standard"
+                    complexity = parent_complexity
+
             task_id = _new_task_id()
             await c.execute(
                 "INSERT INTO tasks (id, project_id, title, description, parent_id, "
-                "priority, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (task_id, project_id, title, description, parent_id, priority, caller_id),
+                "priority, complexity, created_by) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (task_id, project_id, title, description, parent_id,
+                 priority, complexity, caller_id),
             )
             await c.commit()
         finally:
             await c.close()
 
+        ts = _now_iso()
         await bus.publish(
             {
-                "ts": _now_iso(),
+                "ts": ts,
                 "agent_id": caller_id,
                 "type": "task_created",
                 "task_id": task_id,
                 "title": title,
                 "parent_id": parent_id,
                 "priority": priority,
+                "complexity": complexity,
             }
         )
         return _ok(
             f"Created task {task_id}"
             + (f" (subtask of {parent_id})" if parent_id else " (top-level)")
-            + f", priority={priority}"
+            + f", priority={priority}, complexity={complexity}"
         )
 
     @tool(
         "coord_claim_task",
         (
-            "Claim an open task — sets you as its owner and moves it to "
-            "status=claimed. Only Players can claim (Coach delegates, never "
-            "executes). Fails if: task is not status=open, you're Coach, or "
-            "you already own another task (finish or cancel it first)."
+            "Claim a plan-stage task — sets you as its executor and moves "
+            "it from `plan` → `execute`. Only Players can claim (Coach "
+            "delegates, never executes). Fails if:\n"
+            "  - task is not status=plan\n"
+            "  - you're Coach\n"
+            "  - you already own another task (finish or cancel it first)\n"
+            "  - the task has an executor pool (eligible_owners) and you're "
+            "    not in it\n"
+            "  - the task is standard-complexity and has no spec yet "
+            "    (Coach must call coord_write_task_spec first)\n"
+            "Self-claim is one atomic step: claimed_at + started_at are "
+            "both set to now() because claim IS starting from the Player's "
+            "perspective."
         ),
         {"task_id": str},
     )
@@ -278,17 +550,84 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 )
 
             project_id = await resolve_active_project()
-            # Atomic claim — race-safe via status='open' guard.
+            # Pre-checks: task exists in plan stage, has a spec (if standard),
+            # and (if posted to a pool) the caller is eligible.
             cur = await c.execute(
-                "UPDATE tasks SET owner = ?, status = 'claimed', "
-                "claimed_at = ? WHERE id = ? AND status = 'open' "
-                "AND project_id = ? RETURNING id",
-                (caller_id, _now_iso(), task_id, project_id),
+                "SELECT status, owner, complexity, spec_path "
+                "FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            existing = await cur.fetchone()
+            if not existing:
+                return _err(f"task {task_id} not found")
+            ed = dict(existing)
+            if ed["status"] != "plan":
+                return _err(
+                    f"task {task_id} is not claimable "
+                    f"(status={ed['status']}, owner={ed['owner'] or '-'}). "
+                    f"Only plan-stage tasks can be claimed."
+                )
+            if (
+                ed["complexity"] == "standard"
+                and not ed.get("spec_path")
+            ):
+                return _err(
+                    f"task {task_id} has no spec — Coach must call "
+                    f"coord_write_task_spec before this can move to execute. "
+                    f"(Simple-complexity tasks skip this gate.)"
+                )
+
+            # Pool eligibility: if there's an active executor role row
+            # with non-empty eligible_owners, the caller must be in the
+            # list. If no active executor row exists yet (back-compat
+            # path: Coach pushed via legacy coord_assign_task that didn't
+            # write a row), allow the claim — production migrations
+            # don't require pre-existing role rows.
+            import json as _json
+            cur = await c.execute(
+                "SELECT id, eligible_owners, owner FROM task_role_assignments "
+                "WHERE task_id = ? AND role = 'executor' "
+                "AND completed_at IS NULL AND superseded_by IS NULL "
+                "ORDER BY assigned_at DESC LIMIT 1",
+                (task_id,),
+            )
+            role_row = await cur.fetchone()
+            if role_row:
+                rd = dict(role_row)
+                if rd.get("owner") and rd["owner"] != caller_id:
+                    return _err(
+                        f"task {task_id} already has executor "
+                        f"{rd['owner']} on the role-assignment row."
+                    )
+                eligible = []
+                try:
+                    eligible = _json.loads(rd.get("eligible_owners") or "[]")
+                except Exception:
+                    eligible = []
+                if eligible and caller_id not in eligible:
+                    return _err(
+                        f"task {task_id} is posted to executors "
+                        f"{eligible}; {caller_id} is not in the pool."
+                    )
+
+            # Atomic claim — race-safe via status='plan' guard. Both
+            # claimed_at AND started_at are set to now (self-claim IS
+            # starting; no separate "assigned but not picked up" window).
+            now = _now_iso()
+            cur = await c.execute(
+                "UPDATE tasks SET owner = ?, status = 'execute', "
+                "claimed_at = ?, started_at = ? "
+                "WHERE id = ? AND status = 'plan' AND project_id = ? "
+                "RETURNING id",
+                (caller_id, now, now, task_id, project_id),
             )
             updated = await cur.fetchone()
             if not updated:
+                # Race-loss path — someone else claimed between our pre-check
+                # and the UPDATE. Re-read to give a precise error.
                 cur = await c.execute(
-                    "SELECT status, owner FROM tasks WHERE id = ? AND project_id = ?",
+                    "SELECT status, owner FROM tasks "
+                    "WHERE id = ? AND project_id = ?",
                     (task_id, project_id),
                 )
                 current = await cur.fetchone()
@@ -296,8 +635,27 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     return _err(f"task {task_id} not found")
                 d = dict(current)
                 return _err(
-                    f"task {task_id} is not open (status={d['status']}, "
-                    f"owner={d['owner'] or '-'})"
+                    f"task {task_id} race-lost during claim "
+                    f"(status={d['status']}, owner={d['owner'] or '-'})"
+                )
+
+            # Update or insert the executor role-assignment row. If
+            # there's a posted-pool row, claim it; otherwise insert a
+            # fresh hard-assign row so the audit trail is complete.
+            if role_row:
+                await c.execute(
+                    "UPDATE task_role_assignments "
+                    "SET owner = ?, claimed_at = ?, started_at = ? "
+                    "WHERE id = ?",
+                    (caller_id, now, now, dict(role_row)["id"]),
+                )
+            else:
+                await c.execute(
+                    "INSERT INTO task_role_assignments "
+                    "(task_id, role, eligible_owners, owner, "
+                    "assigned_at, claimed_at, started_at) "
+                    "VALUES (?, 'executor', '[]', ?, ?, ?, ?)",
+                    (task_id, caller_id, now, now, now),
                 )
 
             await c.execute(
@@ -321,29 +679,45 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     @tool(
         "coord_update_task",
         (
-            "Update task status. Valid transitions:\n"
-            "  open → claimed, cancelled\n"
-            "  claimed → in_progress, blocked, done, cancelled\n"
-            "  in_progress → blocked, done, cancelled\n"
-            "  blocked → in_progress, cancelled\n"
-            "  done/cancelled: terminal\n"
+            "Update a task's kanban stage. Valid transitions:\n"
+            "  plan → execute, archive\n"
+            "  execute → audit_syntax, archive\n"
+            "  audit_syntax → audit_semantics, execute\n"
+            "  audit_semantics → ship, execute\n"
+            "  ship → archive\n"
+            "  archive: terminal\n"
+            "\n"
+            "For most transitions you should NOT call this tool directly — "
+            "the kanban subscriber auto-advances on the right events "
+            "(coord_commit_push, coord_submit_audit_report, "
+            "coord_mark_shipped). Use this for cancellation (any stage → "
+            "archive with note) or other manual one-off moves.\n"
+            "\n"
+            "Legacy aliases accepted for one release: 'open'→'plan', "
+            "'claimed'/'in_progress'/'blocked'→'execute', 'done'→'archive', "
+            "'cancelled'→'archive' (sets cancelled_at).\n"
+            "\n"
             "Only the current owner can update the task; Coach can also "
-            "cancel any task. Players: when you mark a task done or "
-            "cancelled, your current_task_id is cleared so you can claim "
-            "the next one. Optional 'note' is logged in the event stream."
+            "cancel any task. When a task moves to archive, the owner's "
+            "current_task_id is cleared. Optional 'note' is logged."
         ),
         {"task_id": str, "status": str, "note": str},
     )
     async def update_task(args: dict[str, Any]) -> dict[str, Any]:
         task_id = (args.get("task_id") or "").strip()
-        new_status = (args.get("status") or "").strip().lower()
+        raw_status = (args.get("status") or "").strip().lower()
         note = args.get("note") or ""
         if not task_id:
             return _err("task_id is required")
-        if new_status not in ("claimed", "in_progress", "blocked", "done", "cancelled"):
+        # Cancellation has a side-effect: the original input is preserved
+        # so we can stamp cancelled_at iff the caller asked for "cancelled"
+        # specifically, vs. a clean "archive" move (delivery).
+        was_cancellation = raw_status == "cancelled"
+        new_status = _normalize_status_alias(raw_status)
+        if new_status not in ALL_KANBAN_STAGES:
             return _err(
-                f"invalid status '{new_status}' (must be claimed, "
-                "in_progress, blocked, done, or cancelled)"
+                f"invalid status '{raw_status}' (must be one of "
+                f"{sorted(ALL_KANBAN_STAGES)} or a legacy alias)"
             )
 
         project_id = await resolve_active_project()
@@ -364,21 +738,20 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             task_title: str = d.get("title") or ""
 
             # Permission check.
+            is_archive_move = new_status == "archive"
             if current_owner is None:
-                # task has no owner yet (still 'open'). Only Coach (or
-                # 'cancelled' moves by anyone) — actually still only Coach
-                # can touch unowned tasks.
+                # No owner yet — only Coach can touch.
                 if not caller_is_coach:
                     return _err(
                         f"task {task_id} has no owner; only Coach can "
-                        f"change an open task's status."
+                        f"change a plan-stage task's status."
                     )
             elif current_owner != caller_id:
-                # task owned by someone else. Only Coach can cancel.
-                if not (caller_is_coach and new_status == "cancelled"):
+                # Owned by someone else. Only Coach can cancel/archive.
+                if not (caller_is_coach and is_archive_move):
                     return _err(
                         f"only the task's owner ({current_owner}) can "
-                        f"update it. Coach can additionally cancel any task."
+                        f"update it. Coach can additionally archive any task."
                     )
 
             if not _valid_transition(old_status, new_status):
@@ -386,14 +759,41 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"invalid transition: {old_status} → {new_status}"
                 )
 
+            # Role-completion gate (Docs/kanban-specs.md §2.3). Rejects
+            # manual transitions that should be event-driven (commit /
+            # audit / ship). Coach uses coord_advance_task_stage to
+            # force; cancellation paths skip the gate.
+            gate_err = await _check_kanban_role_gate(
+                c,
+                project_id,
+                task_id,
+                old_status,
+                new_status,
+                was_cancellation=was_cancellation,
+            )
+            if gate_err is not None:
+                return _err(gate_err)
+
             now = _now_iso()
-            if new_status in ("done", "cancelled"):
-                await c.execute(
-                    "UPDATE tasks SET status = ?, completed_at = ? "
-                    "WHERE id = ? AND project_id = ?",
-                    (new_status, now, task_id, project_id),
-                )
-                # Free up the player who was on this task.
+            if is_archive_move:
+                if was_cancellation:
+                    # Distinguish cancellation from delivery — both land
+                    # in archive but the archive view's "show cancelled"
+                    # toggle keys on cancelled_at.
+                    await c.execute(
+                        "UPDATE tasks SET status = 'archive', "
+                        "completed_at = ?, archived_at = ?, cancelled_at = ? "
+                        "WHERE id = ? AND project_id = ?",
+                        (now, now, now, task_id, project_id),
+                    )
+                else:
+                    await c.execute(
+                        "UPDATE tasks SET status = 'archive', "
+                        "completed_at = ?, archived_at = ? "
+                        "WHERE id = ? AND project_id = ?",
+                        (now, now, task_id, project_id),
+                    )
+                # Free the executor.
                 if current_owner is not None:
                     await c.execute(
                         "UPDATE agents SET current_task_id = NULL "
@@ -402,13 +802,29 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     )
             else:
                 await c.execute(
-                    "UPDATE tasks SET status = ? WHERE id = ? AND project_id = ?",
+                    "UPDATE tasks SET status = ? "
+                    "WHERE id = ? AND project_id = ?",
                     (new_status, task_id, project_id),
                 )
             await c.commit()
         finally:
             await c.close()
 
+        # Emit both the kanban-shaped event AND the legacy back-compat
+        # event so downstream listeners that haven't migrated still work.
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "task_stage_changed",
+                "task_id": task_id,
+                "from": old_status,
+                "to": new_status,
+                "reason": "manual",
+                "note": note,
+                "owner": current_owner,
+            }
+        )
         await bus.publish(
             {
                 "ts": _now_iso(),
@@ -418,33 +834,23 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "old_status": old_status,
                 "new_status": new_status,
                 "note": note,
-                # Include owner so the UI can fan out this event to the
-                # owner's pane — Coach cancelling/blocking a task assigned
-                # to p3 should be visible from p3 even when the update
-                # didn't originate there.
                 "owner": current_owner,
             }
         )
-        # Notify the creator when a Player finishes work they didn't
-        # assign to themselves. Without this, Coach has to poll the
-        # board to notice done/blocked/cancelled transitions. Skip the
-        # self-notify case (a Player both creating and completing a
-        # subtask) and the creator-is-caller case. We fire on done,
-        # blocked, and cancelled — all three are moments Coach cares
-        # about since they change the available work pool.
+        # Notify the creator when work they handed off finishes (or is
+        # cancelled). Same heuristic as before — skip self-notify and
+        # human-creator. The "blocked" branch is gone (blocked is now
+        # an orthogonal flag, not a status); a Player blocking a task
+        # should call coord_set_task_blocked, which has its own event.
         if (
-            new_status in ("done", "blocked", "cancelled")
+            is_archive_move
             and created_by
             and created_by != caller_id
             and created_by != "human"
         ):
             try:
                 from server.agents import _deliver_system_message
-                verb = {
-                    "done": "finished",
-                    "blocked": "marked blocked",
-                    "cancelled": "cancelled",
-                }[new_status]
+                verb = "cancelled" if was_cancellation else "finished"
                 note_line = f"\nNote: {note}" if note else ""
                 await _deliver_system_message(
                     from_id=caller_id,
@@ -464,16 +870,28 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     @tool(
         "coord_assign_task",
         (
-            "Coach-only. Directly assign an open task to a specific Player — "
-            "sets owner + status='claimed' without waiting for the Player to "
-            "self-claim via coord_claim_task. Useful for push-assignment "
-            "workflows.\n"
+            "Coach-only. Assign a plan-stage task as the EXECUTOR.\n"
             "Params:\n"
             "- task_id: the task to assign (required)\n"
-            "- to: target Player slot id ('p1'..'p10'; not 'coach', not 'broadcast')\n"
+            "- to: either a single Player slot id (e.g. 'p3') for hard-assign, "
+            "OR a comma-separated list (e.g. 'p1,p2,p3') to post the task to "
+            "an executor pool — the first eligible Player to call "
+            "coord_claim_task wins via atomic UPDATE.\n"
+            "\n"
+            "Hard-assign: task moves plan→execute immediately, owner is set, "
+            "the assignee is auto-woken. Pool: task stays in `plan` with the "
+            "eligible_owners list set on a task_role_assignments row; all "
+            "eligible Players are auto-woken with an 'available task' prompt.\n"
+            "\n"
+            "Standard-complexity tasks must have a spec.md before they can "
+            "move to execute (write one with coord_write_task_spec, or "
+            "delegate via coord_assign_planner). Simple-complexity tasks "
+            "skip the spec gate.\n"
+            "\n"
             "Fails if: you're a Player (Players report, don't assign), the "
-            "task isn't status=open, the Player already owns another task, "
-            "or the target isn't a valid Player slot."
+            "task isn't status=plan, the target isn't a valid Player slot, "
+            "the spec gate trips for a standard task, or (hard-assign) the "
+            "Player already owns another task."
         ),
         {"task_id": str, "to": str},
     )
@@ -481,112 +899,231 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         if not caller_is_coach:
             return _err(
                 "Only Coach can push-assign tasks. Players report and claim "
-                "open tasks themselves via coord_claim_task."
+                "plan-stage tasks themselves via coord_claim_task."
             )
         task_id = (args.get("task_id") or "").strip()
-        to = (args.get("to") or "").strip().lower()
+        to_raw = (args.get("to") or "").strip()
         if not task_id:
             return _err("task_id is required")
-        if not to:
-            return _err("'to' is required (Player slot id)")
-        if to == "coach" or to == "broadcast":
-            return _err("can only assign to a Player (p1..p10), not coach or broadcast")
-        if to not in VALID_RECIPIENTS:
-            return _err(f"invalid target '{to}' — must be p1..p10")
+        if not to_raw:
+            return _err("'to' is required (Player slot id, or comma-list for pool)")
 
-        # Lock: human can mark a Player off-limits for Coach. When set,
-        # Coach cannot push work; Player still reads docs + answers
-        # human prompts. Fail explicitly so the LLM knows to pick a
-        # different Player rather than retrying.
-        if await _is_locked(to):
-            return _err(
-                f"Player {to} is locked (human marked them off-limits "
-                f"for Coach orchestration). Pick an unlocked Player, or "
-                f"ask the human to unlock {to}."
-            )
+        # Parse `to`: comma → pool; otherwise single hard-assign.
+        if "," in to_raw:
+            pool = [p.strip().lower() for p in to_raw.split(",") if p.strip()]
+        else:
+            pool = [to_raw.lower()]
+        if not pool:
+            return _err("'to' resolved to an empty list of Players")
+        for slot in pool:
+            if slot in ("coach", "broadcast"):
+                return _err(
+                    f"can only assign to Players (p1..p10), not {slot!r}"
+                )
+            if slot not in VALID_RECIPIENTS:
+                return _err(f"invalid target '{slot}' — must be p1..p10")
+        # Dedupe + locked check.
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for slot in pool:
+            if slot in seen:
+                continue
+            seen.add(slot)
+            if await _is_locked(slot):
+                return _err(
+                    f"Player {slot} is locked (human marked them off-limits "
+                    f"for Coach orchestration). Pick unlocked Players."
+                )
+            deduped.append(slot)
+        is_pool = len(deduped) > 1
 
         c = await configured_conn()
         try:
-            # Target Player must exist and be free.
-            cur = await c.execute(
-                "SELECT current_task_id FROM agents WHERE id = ?", (to,)
-            )
-            row = await cur.fetchone()
-            if not row:
-                return _err(f"Player '{to}' not found")
-            busy_with = dict(row)["current_task_id"]
-            if busy_with:
-                return _err(
-                    f"Player {to} already owns task {busy_with}; cancel or "
-                    f"complete it before reassigning."
-                )
-
             project_id = await resolve_active_project()
-            # Atomic assign — status='open' guard ensures we don't
-            # clobber a task that was claimed between our SELECT and UPDATE.
+            # Read the task: must be in plan, must have spec if standard.
             cur = await c.execute(
-                "UPDATE tasks SET owner = ?, status = 'claimed', "
-                "claimed_at = ? WHERE id = ? AND status = 'open' "
-                "AND project_id = ? RETURNING id",
-                (to, _now_iso(), task_id, project_id),
+                "SELECT status, owner, complexity, spec_path "
+                "FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
             )
-            updated = await cur.fetchone()
-            if not updated:
-                cur = await c.execute(
-                    "SELECT status, owner FROM tasks WHERE id = ? AND project_id = ?",
-                    (task_id, project_id),
-                )
-                current = await cur.fetchone()
-                if not current:
-                    return _err(f"task {task_id} not found")
-                d = dict(current)
+            existing = await cur.fetchone()
+            if not existing:
+                return _err(f"task {task_id} not found")
+            ed = dict(existing)
+            if ed["status"] != "plan":
                 return _err(
-                    f"task {task_id} is not open "
-                    f"(status={d['status']}, owner={d['owner'] or '-'})"
+                    f"task {task_id} is not in plan stage "
+                    f"(status={ed['status']}, owner={ed['owner'] or '-'}). "
+                    f"Use coord_advance_task_stage to force a transition, "
+                    f"or send a message if you want to nudge an in-flight task."
+                )
+            if (
+                ed["complexity"] == "standard"
+                and not ed.get("spec_path")
+            ):
+                return _err(
+                    f"task {task_id} has no spec — write one with "
+                    f"coord_write_task_spec or delegate via "
+                    f"coord_assign_planner before assigning the executor. "
+                    f"(Simple-complexity tasks skip this gate.)"
                 )
 
-            await c.execute(
-                "UPDATE agents SET current_task_id = ? WHERE id = ?",
-                (task_id, to),
-            )
-            await c.commit()
+            now = _now_iso()
+            import json as _json
+
+            if is_pool:
+                # Pool form: leave tasks.owner NULL, status stays `plan`,
+                # but record the eligible_owners on a fresh executor
+                # role-assignment row. The first eligible Player to
+                # call coord_claim_task wins.
+                eligible_json = _json.dumps(deduped)
+                # Don't preemptively reject if some pool members are
+                # busy — the auto-wake will still fire for everyone in
+                # the list and busy Players will simply ignore it. The
+                # idle poller picks up posted-pool work later for any
+                # Player that becomes free.
+                await c.execute(
+                    "INSERT INTO task_role_assignments "
+                    "(task_id, role, eligible_owners, owner, assigned_at) "
+                    "VALUES (?, 'executor', ?, NULL, ?)",
+                    (task_id, eligible_json, now),
+                )
+                await c.commit()
+            else:
+                # Hard-assign: single Player.
+                slot = deduped[0]
+                # Target Player must exist and be free.
+                cur = await c.execute(
+                    "SELECT current_task_id FROM agents WHERE id = ?", (slot,)
+                )
+                row = await cur.fetchone()
+                if not row:
+                    return _err(f"Player '{slot}' not found")
+                busy_with = dict(row)["current_task_id"]
+                if busy_with:
+                    return _err(
+                        f"Player {slot} already owns task {busy_with}; cancel "
+                        f"or complete it before reassigning."
+                    )
+                # Atomic transition plan → execute. status='plan' guard
+                # is race-safe.
+                cur = await c.execute(
+                    "UPDATE tasks SET owner = ?, status = 'execute', "
+                    "claimed_at = ?, started_at = NULL "
+                    "WHERE id = ? AND status = 'plan' "
+                    "AND project_id = ? RETURNING id",
+                    (slot, now, task_id, project_id),
+                )
+                updated = await cur.fetchone()
+                if not updated:
+                    cur = await c.execute(
+                        "SELECT status, owner FROM tasks "
+                        "WHERE id = ? AND project_id = ?",
+                        (task_id, project_id),
+                    )
+                    current = await cur.fetchone()
+                    if not current:
+                        return _err(f"task {task_id} not found")
+                    d = dict(current)
+                    return _err(
+                        f"task {task_id} race-lost during assign "
+                        f"(status={d['status']}, owner={d['owner'] or '-'})"
+                    )
+                await c.execute(
+                    "INSERT INTO task_role_assignments "
+                    "(task_id, role, eligible_owners, owner, "
+                    "assigned_at, claimed_at) "
+                    "VALUES (?, 'executor', '[]', ?, ?, ?)",
+                    (task_id, slot, now, now),
+                )
+                await c.execute(
+                    "UPDATE agents SET current_task_id = ? WHERE id = ?",
+                    (task_id, slot),
+                )
+                await c.commit()
         finally:
             await c.close()
 
+        # Read task complexity again for the wake prompt branching.
+        # Cheap second-read is fine; the bus.publish below already
+        # closed our connection.
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT complexity FROM tasks WHERE id = ?", (task_id,)
+            )
+            crow = await cur.fetchone()
+            complexity = (dict(crow)["complexity"] if crow else "standard")
+        finally:
+            await c.close()
+
+        # Emit task_role_assigned (kanban event family). The legacy
+        # task_assigned is also emitted for back-compat; the kanban
+        # subscriber listens for both.
         await bus.publish(
             {
                 "ts": _now_iso(),
                 "agent_id": caller_id,
-                "type": "task_assigned",
+                "type": "task_role_assigned",
                 "task_id": task_id,
-                "to": to,
+                "role": "executor",
+                "eligible_owners": deduped,
+                "owner": (None if is_pool else deduped[0]),
+                "to": (deduped[0] if not is_pool else None),
             }
         )
-        # Auto-wake the assignee so the task actually starts moving
-        # instead of waiting for someone to poke them. Debounced +
-        # pause-respecting inside maybe_wake_agent; late import to
-        # avoid a circular tools.py ↔ agents.py dependency at load
-        # time.
+        if not is_pool:
+            await bus.publish(
+                {
+                    "ts": _now_iso(),
+                    "agent_id": caller_id,
+                    "type": "task_assigned",
+                    "task_id": task_id,
+                    "to": deduped[0],
+                }
+            )
+        # Auto-wake. Late import to avoid the tools↔agents circular dep.
         try:
             from server.agents import maybe_wake_agent
-            # Task assignment is a discrete action (not conversational)
-            # so bypass the ping-pong debounce — Coach should be able to
-            # push a new task to a Player even if the Player just
-            # finished the previous turn a few seconds ago. The task is
-            # already at status='claimed' with owner=<to> (atomic UPDATE
-            # above), so the wake prompt tells the Player to move it to
-            # in_progress + start — not to "claim".
-            await maybe_wake_agent(
-                to,
-                f"Coach assigned you task {task_id} (status=claimed, "
-                f"you're the owner). Use coord_list_tasks to see the "
-                f"title/description, coord_update_task to move it to "
-                f"in_progress, then start the work.",
-                bypass_debounce=True,
-            )
+            simple_hint = ""
+            if complexity == "simple":
+                simple_hint = (
+                    " This task is marked SIMPLE — self-audit (run tests / "
+                    "sanity-check the change) before coord_commit_push because "
+                    "the board archives directly on commit, no separate audit "
+                    "pass."
+                )
+            if is_pool:
+                pool_str = ", ".join(deduped)
+                wake_prompt = (
+                    f"Coach posted task {task_id} to a pool of {pool_str}. "
+                    f"Read the spec + decide if you want to take it; first "
+                    f"to call coord_claim_task wins.{simple_hint}"
+                )
+                for slot in deduped:
+                    try:
+                        await maybe_wake_agent(
+                            slot, wake_prompt, bypass_debounce=True
+                        )
+                    except Exception:
+                        pass
+            else:
+                slot = deduped[0]
+                wake_prompt = (
+                    f"Coach assigned you task {task_id} as executor "
+                    f"(status=execute, owner={slot}). Read spec.md from "
+                    f"the task folder, do the work, then call "
+                    f"coord_commit_push(task_id={task_id!r}, ...) when "
+                    f"the work is in.{simple_hint}"
+                )
+                await maybe_wake_agent(slot, wake_prompt, bypass_debounce=True)
         except Exception:
             pass
-        return _ok(f"assigned {task_id} → {to}")
+        if is_pool:
+            return _ok(
+                f"posted {task_id} to executor pool: {', '.join(deduped)}"
+            )
+        return _ok(f"assigned {task_id} → {deduped[0]}")
 
     @tool(
         "coord_send_message",
@@ -1086,12 +1623,18 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "Params:\n"
             "- message: commit message (required)\n"
             "- push: 'true' (default) or 'false' to skip the push.\n"
+            "- task_id: the kanban task this commit is delivering against "
+            "(optional but STRONGLY RECOMMENDED). When provided, the "
+            "kanban subscriber sees `commit_pushed` with task_id and "
+            "auto-advances the task: standard → audit_syntax, simple → "
+            "archive. Without task_id the commit still works but the "
+            "kanban board doesn't move (Coach has to advance manually).\n"
             "Returns 'nothing to commit' as a soft-OK if the working tree "
             "is clean. Requires HARNESS_PROJECT_REPO to be configured; "
             "push also needs pushable credentials (typically a PAT "
             "embedded in the project repo URL)."
         ),
-        {"message": str, "push": str},
+        {"message": str, "push": str, "task_id": str},
     )
     async def commit_push(args: dict[str, Any]) -> dict[str, Any]:
         if caller_is_coach:
@@ -1113,6 +1656,64 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
 
         push_raw = str(args.get("push") or "true").strip().lower()
         do_push = push_raw not in ("false", "0", "no", "off")
+
+        # Optional task_id — empty string treated as None.
+        task_id_raw = (args.get("task_id") or "").strip()
+        task_id_in: str | None = task_id_raw or None
+
+        # Bind task_id to the caller's executor role at entry — before
+        # we run any git work — so a Player can't pass another Player's
+        # task_id (or a stale id) and ride it into the kanban
+        # subscriber. Validation: task is in the active project, sits
+        # in `execute`, has `owner=caller_id`, and an active executor
+        # role assignment owned by caller exists with completed_at NULL.
+        if task_id_in:
+            project_id = await resolve_active_project()
+            c = await configured_conn()
+            try:
+                cur = await c.execute(
+                    "SELECT t.status, t.owner, "
+                    "(SELECT 1 FROM task_role_assignments "
+                    " WHERE task_id = t.id AND role = 'executor' "
+                    " AND owner = ? AND completed_at IS NULL "
+                    " AND superseded_by IS NULL "
+                    " ORDER BY assigned_at DESC LIMIT 1) AS has_role "
+                    "FROM tasks t "
+                    "WHERE t.id = ? AND t.project_id = ?",
+                    (caller_id, task_id_in, project_id),
+                )
+                row = await cur.fetchone()
+            finally:
+                await c.close()
+            if row is None:
+                return _err(
+                    f"task {task_id_in} not found in the active project. "
+                    f"Pass a valid task_id from your active executor "
+                    f"assignment, or omit task_id to commit without "
+                    f"driving the kanban."
+                )
+            t = dict(row)
+            if t.get("status") != "execute":
+                return _err(
+                    f"task {task_id_in} is in stage "
+                    f"'{t.get('status')}', not 'execute'; "
+                    f"coord_commit_push can only deliver against an "
+                    f"executor task currently in execute."
+                )
+            if t.get("owner") != caller_id:
+                return _err(
+                    f"task {task_id_in} is owned by "
+                    f"{t.get('owner') or 'no one'}, not {caller_id}. "
+                    f"You can only call coord_commit_push for your own "
+                    f"executor task."
+                )
+            if not t.get("has_role"):
+                return _err(
+                    f"task {task_id_in} has no active uncompleted "
+                    f"executor role for {caller_id}. The role may have "
+                    f"been superseded by a re-assignment, or already "
+                    f"completed by a prior commit."
+                )
 
         cwd = workspace_dir(caller_id)
         if not (cwd / ".git").exists():
@@ -1175,6 +1776,33 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         else:
             push_note = " (local only)"
 
+        # Auto-advance only when the push actually succeeded (or the
+        # caller explicitly asked for local-only via push=false — that
+        # is the documented escape hatch). A failed push must not
+        # drive the kanban; otherwise a Player whose creds are broken
+        # could ride a local-only commit into archive.
+        push_failed = do_push and not pushed_ok
+        kanban_task_id = None if push_failed else task_id_in
+
+        # Mark the executor role-assignment row complete only when the
+        # commit is going to drive auto-advance. Entry validation
+        # guarantees the UPDATE will match exactly one row when
+        # task_id_in is set.
+        if kanban_task_id:
+            c = await configured_conn()
+            try:
+                await c.execute(
+                    "UPDATE task_role_assignments "
+                    "SET completed_at = ? "
+                    "WHERE task_id = ? AND role = 'executor' "
+                    "AND owner = ? AND completed_at IS NULL "
+                    "AND superseded_by IS NULL",
+                    (_now_iso(), kanban_task_id, caller_id),
+                )
+                await c.commit()
+            finally:
+                await c.close()
+
         await bus.publish(
             {
                 "ts": _now_iso(),
@@ -1184,6 +1812,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "message": message,
                 "pushed": pushed_ok,
                 "push_requested": do_push,
+                # task_id drives the kanban auto-advance subscriber.
+                # Cleared on push failure so a broken push can't ride a
+                # local-only commit into the audit pipeline. The
+                # original task_id is preserved on the row above for
+                # the explicit `push=false` mode.
+                "task_id": kanban_task_id,
             }
         )
         return _ok(f"committed {sha}: {message}{push_note}")
@@ -2996,12 +3630,1181 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         ]
         return _ok("\n".join(lines))
 
+    # ====================================================================
+    # Kanban tools (Docs/kanban-specs.md). The state-machine + existing
+    # tool updates (claim_task, assign_task, update_task, commit_push)
+    # live above; the new tools below add the role-assignment surface
+    # (planner / auditor / shipper), the spec/audit artifact writers,
+    # and the introspection / meta knobs.
+    # ====================================================================
+
+    @tool(
+        "coord_write_task_spec",
+        (
+            "Write the spec.md for a task. Required before a standard-"
+            "complexity task can move plan→execute (gate enforced in "
+            "coord_assign_task / coord_claim_task). Simple tasks don't "
+            "need a spec — title + description on the row are enough.\n"
+            "\n"
+            "Permission: Coach can spec any task. A Player can spec a "
+            "task if they (a) have an active planner role assignment, "
+            "(b) are the executor (re-spec during a fail loop), or "
+            "(c) it's a subtask of their current task.\n"
+            "\n"
+            "Body is a full markdown document. Frontmatter is added "
+            "automatically (task_id / title / created_by / priority / "
+            "complexity / spec_author / spec_written_at). The body "
+            "should cover Goal, 'Done looks like', Constraints, References. "
+            "Existing spec is overwritten — rolling history lives in events.\n"
+            "\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- body: full markdown body, required (max 40000 chars)"
+        ),
+        {"task_id": str, "body": str},
+    )
+    async def write_task_spec(args: dict[str, Any]) -> dict[str, Any]:
+        task_id = (args.get("task_id") or "").strip()
+        body = args.get("body") or ""
+        if not task_id:
+            return _err("task_id is required")
+        if not body.strip():
+            return _err("body is required (empty specs are not useful)")
+        if len(body) > 40_000:
+            return _err(f"body too long ({len(body)} chars, max 40000)")
+
+        from server.tasks import (
+            is_valid_task_id, write_task_spec as _write_spec,
+            spec_relative_path,
+        )
+        if not is_valid_task_id(task_id):
+            return _err(f"invalid task_id format: {task_id!r}")
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            # Read task metadata + permission check.
+            cur = await c.execute(
+                "SELECT title, owner, created_by, created_at, priority, "
+                "complexity, status, parent_id "
+                "FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"task {task_id} not found")
+            t = dict(row)
+
+            # Permission: Coach can always spec. Players need one of:
+            #   (a) active planner role for this task
+            #   (b) executor (== tasks.owner)
+            #   (c) parent is the caller's current task
+            allowed = False
+            if caller_is_coach:
+                allowed = True
+            elif t["owner"] == caller_id:
+                allowed = True
+            else:
+                # Active planner row check.
+                cur = await c.execute(
+                    "SELECT 1 FROM task_role_assignments "
+                    "WHERE task_id = ? AND role = 'planner' AND owner = ? "
+                    "AND completed_at IS NULL AND superseded_by IS NULL "
+                    "LIMIT 1",
+                    (task_id, caller_id),
+                )
+                if await cur.fetchone():
+                    allowed = True
+                else:
+                    # Subtask under caller's current task?
+                    cur = await c.execute(
+                        "SELECT current_task_id FROM agents WHERE id = ?",
+                        (caller_id,),
+                    )
+                    arow = await cur.fetchone()
+                    cur_task = dict(arow)["current_task_id"] if arow else None
+                    if cur_task and t["parent_id"] == cur_task:
+                        allowed = True
+
+            if not allowed:
+                return _err(
+                    f"you can't spec task {task_id} — Coach can spec any "
+                    f"task; Players need an active planner assignment, to "
+                    f"be the executor, or to spec a subtask of their "
+                    f"current task."
+                )
+        finally:
+            await c.close()
+
+        try:
+            target, rel, written_at = await _write_spec(
+                project_id=project_id,
+                task_id=task_id,
+                title=t["title"],
+                body=body,
+                author=caller_id,
+                created_by=t["created_by"],
+                created_at=t["created_at"],
+                priority=t["priority"],
+                complexity=t["complexity"],
+            )
+        except ValueError as exc:
+            return _err(str(exc))
+        except Exception as exc:
+            return _err(f"spec write failed: {exc}")
+
+        # Update tasks.spec_path + spec_written_at; mark planner role
+        # complete if there's an active row owned by the caller.
+        completed_planner = False
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE tasks SET spec_path = ?, spec_written_at = ? "
+                "WHERE id = ? AND project_id = ?",
+                (rel, written_at, task_id, project_id),
+            )
+            cur = await c.execute(
+                "UPDATE task_role_assignments SET completed_at = ? "
+                "WHERE task_id = ? AND role = 'planner' AND owner = ? "
+                "AND completed_at IS NULL AND superseded_by IS NULL",
+                (written_at, task_id, caller_id),
+            )
+            completed_planner = bool(cur.rowcount)
+            await c.commit()
+        finally:
+            await c.close()
+
+        ts = _now_iso()
+        await bus.publish(
+            {
+                "ts": ts,
+                "agent_id": caller_id,
+                "type": "task_spec_written",
+                "task_id": task_id,
+                "spec_path": rel,
+                "to": t["owner"],
+            }
+        )
+        if completed_planner:
+            await bus.publish(
+                {
+                    "ts": ts,
+                    "agent_id": caller_id,
+                    "type": "task_role_completed",
+                    "task_id": task_id,
+                    "role": "planner",
+                    "owner": caller_id,
+                    "artifact_path": rel,
+                    "to": t["owner"],
+                }
+            )
+        return _ok(
+            f"wrote spec for {task_id} ({len(body)} chars) → {rel}"
+        )
+
+    # --------------------------------------------------------------
+    # Role assignment tools (Coach-only). Pattern shared across
+    # planner / auditor / shipper: accept single Player or list-as-pool;
+    # validate target slots; insert task_role_assignments row(s); auto-wake.
+    # --------------------------------------------------------------
+
+    async def _assign_role_helper(
+        c,
+        *,
+        task_id: str,
+        role: str,
+        targets: list[str],
+        wake_prompt_for_role: str,
+    ) -> tuple[bool, str, list[str]]:
+        """Insert a task_role_assignments row for the given role and
+        wake eligible Players. Returns (ok, message, woken_slots).
+
+        For hard-assign (single target) the row's `owner` is set
+        immediately. For pool (multi-target) `owner` stays NULL until
+        a Player claims via coord_claim_task (executor pool only —
+        for planner / auditor / shipper, the first to act on the
+        wake prompt by writing the artifact "wins" implicitly via
+        the role's completed_at column).
+        """
+        import json as _json
+        is_pool = len(targets) > 1
+        now = _now_iso()
+        eligible_json = _json.dumps(targets)
+        if is_pool:
+            await c.execute(
+                "INSERT INTO task_role_assignments "
+                "(task_id, role, eligible_owners, owner, assigned_at) "
+                "VALUES (?, ?, ?, NULL, ?)",
+                (task_id, role, eligible_json, now),
+            )
+        else:
+            await c.execute(
+                "INSERT INTO task_role_assignments "
+                "(task_id, role, eligible_owners, owner, "
+                "assigned_at, claimed_at) "
+                "VALUES (?, ?, '[]', ?, ?, ?)",
+                (task_id, role, targets[0], now, now),
+            )
+        await c.commit()
+
+        # Auto-wake eligible Players. Late import to dodge circular dep.
+        try:
+            from server.agents import maybe_wake_agent
+            for slot in targets:
+                try:
+                    await maybe_wake_agent(
+                        slot, wake_prompt_for_role, bypass_debounce=True
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if is_pool:
+            return True, (
+                f"posted {task_id} to {role} pool: {', '.join(targets)}"
+            ), targets
+        return True, f"assigned {task_id} {role} → {targets[0]}", targets
+
+    async def _validate_role_targets(
+        targets_raw: str, *, role_label: str
+    ) -> tuple[list[str] | None, str | None]:
+        """Parse and validate a `to=` argument: comma-list → pool;
+        single → hard-assign. Returns `(slots, None)` or `(None, error)`."""
+        if not targets_raw:
+            return None, f"'to' is required (Player slot id, or comma-list for {role_label} pool)"
+        if "," in targets_raw:
+            parts = [p.strip().lower() for p in targets_raw.split(",") if p.strip()]
+        else:
+            parts = [targets_raw.strip().lower()]
+        if not parts:
+            return None, "'to' resolved to empty list"
+        for slot in parts:
+            if slot in ("coach", "broadcast"):
+                return None, f"can only assign Players (p1..p10), not {slot!r}"
+            if slot not in VALID_RECIPIENTS:
+                return None, f"invalid target '{slot}' — must be p1..p10"
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for slot in parts:
+            if slot in seen:
+                continue
+            seen.add(slot)
+            if await _is_locked(slot):
+                return None, (
+                    f"Player {slot} is locked. Pick unlocked Players."
+                )
+            deduped.append(slot)
+        return deduped, None
+
+    @tool(
+        "coord_assign_planner",
+        (
+            "Coach-only. Delegate writing the spec for a task. Both "
+            "single-Player hard-assign and comma-list pool are accepted "
+            "(same shape as coord_assign_task).\n"
+            "\n"
+            "Optional: if Coach is happy writing the spec themselves, "
+            "they SKIP this tool and just call coord_write_task_spec "
+            "directly. Both flows are valid.\n"
+            "\n"
+            "Standard-complexity tasks need a spec to leave the plan "
+            "stage; simple tasks can skip the planner role entirely.\n"
+            "\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- to: 'p3' or 'p1,p2,p3' (planner pool)"
+        ),
+        {"task_id": str, "to": str},
+    )
+    async def assign_planner(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("Only Coach assigns planners.")
+        task_id = (args.get("task_id") or "").strip()
+        to_raw = (args.get("to") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+        targets, err = await _validate_role_targets(to_raw, role_label="planner")
+        if err:
+            return _err(err)
+        if targets is None:
+            return _err("internal: target validation returned None")
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT status, complexity FROM tasks "
+                "WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"task {task_id} not found")
+            t = dict(row)
+            if t["status"] != "plan":
+                return _err(
+                    f"planner only makes sense in `plan` stage; "
+                    f"task is currently {t['status']}."
+                )
+            wake_prompt = (
+                f"Coach asked you to draft the spec for task {task_id}. "
+                f"Read coord_list_tasks output for the title/description, "
+                f"then call coord_write_task_spec(task_id={task_id!r}, "
+                f"body=...) with the goal, 'done looks like', constraints, "
+                f"and references."
+            )
+            ok, msg, slots = await _assign_role_helper(
+                c, task_id=task_id, role="planner", targets=targets,
+                wake_prompt_for_role=wake_prompt,
+            )
+        finally:
+            await c.close()
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "task_role_assigned",
+                "task_id": task_id,
+                "role": "planner",
+                "eligible_owners": targets,
+                "owner": (None if len(targets) > 1 else targets[0]),
+                "to": (targets[0] if len(targets) == 1 else None),
+            }
+        )
+        return _ok(msg)
+
+    @tool(
+        "coord_assign_auditor",
+        (
+            "Coach-only. Assign a Player to audit a task. Two kinds:\n"
+            "  - 'syntax':    tests/CI/lint/code review (mechanical correctness)\n"
+            "  - 'semantics': alignment with spec / project goals / lattice\n"
+            "\n"
+            "Single-Player or comma-list pool. The auditor reads the "
+            "spec + commit + (semantics only) Compass audit report, then "
+            "calls coord_submit_audit_report(verdict='pass'|'fail').\n"
+            "\n"
+            "If you assign the executor as their own auditor, an "
+            "audit_self_review_warning event fires (does NOT block — "
+            "useful when the team is small).\n"
+            "\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- to: 'p4' or 'p4,p5'\n"
+            "- kind: 'syntax' or 'semantics' (required)"
+        ),
+        {"task_id": str, "to": str, "kind": str},
+    )
+    async def assign_auditor(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("Only Coach assigns auditors.")
+        task_id = (args.get("task_id") or "").strip()
+        to_raw = (args.get("to") or "").strip()
+        kind = (args.get("kind") or "").strip().lower()
+        if not task_id:
+            return _err("task_id is required")
+        role = _resolve_audit_role_kind(kind)
+        if role is None:
+            return _err("kind must be 'syntax' or 'semantics'")
+        targets, err = await _validate_role_targets(to_raw, role_label=f"{kind} auditor")
+        if err:
+            return _err(err)
+        if targets is None:
+            return _err("internal: target validation returned None")
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT status, owner FROM tasks "
+                "WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"task {task_id} not found")
+            t = dict(row)
+            executor = t.get("owner")
+            self_review = bool(executor and executor in targets)
+            wake_prompt = (
+                f"Coach asked you to audit task {task_id} ({kind}). "
+                f"Read the spec at /data/projects/.../tasks/{task_id}/spec.md, "
+                f"the commit history, and (for semantics) any Compass "
+                f"audit report linked from the kanban card. When done, "
+                f"call coord_submit_audit_report(task_id={task_id!r}, "
+                f"kind={kind!r}, verdict='pass'|'fail', body=...)"
+            )
+            ok, msg, slots = await _assign_role_helper(
+                c, task_id=task_id, role=role, targets=targets,
+                wake_prompt_for_role=wake_prompt,
+            )
+            if ok:
+                cur = await c.execute(
+                    "SELECT id FROM task_role_assignments "
+                    "WHERE task_id = ? AND role = ? "
+                    "ORDER BY assigned_at DESC, id DESC LIMIT 1",
+                    (task_id, role),
+                )
+                new_row = await cur.fetchone()
+                if new_row:
+                    new_id = dict(new_row)["id"]
+                    await c.execute(
+                        "UPDATE task_role_assignments SET superseded_by = ? "
+                        "WHERE task_id = ? AND role = ? AND id <> ? "
+                        "AND verdict = 'fail' AND completed_at IS NOT NULL "
+                        "AND superseded_by IS NULL",
+                        (new_id, task_id, role, new_id),
+                    )
+                    await c.commit()
+        finally:
+            await c.close()
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "task_role_assigned",
+                "task_id": task_id,
+                "role": role,
+                "eligible_owners": targets,
+                "owner": (None if len(targets) > 1 else targets[0]),
+                "to": (targets[0] if len(targets) == 1 else None),
+            }
+        )
+        if self_review:
+            await bus.publish(
+                {
+                    "ts": _now_iso(),
+                    "agent_id": caller_id,
+                    "type": "audit_self_review_warning",
+                    "task_id": task_id,
+                    "kind": kind,
+                    "auditor_id": targets[0] if len(targets) == 1 else None,
+                    "executor_id": executor,
+                }
+            )
+        return _ok(msg)
+
+    @tool(
+        "coord_assign_shipper",
+        (
+            "Coach-only. Assign a Player to handle the merge for a task "
+            "(after both audits pass). Single Player or pool.\n"
+            "\n"
+            "The shipper opens the PR / runs the merge / calls "
+            "coord_mark_shipped(task_id) when the work is in main. "
+            "Coach doesn't merge — that's Player work.\n"
+            "\n"
+            "Often the shipper is the executor (they know the change "
+            "best); pick someone different if you want a second pair "
+            "of eyes on the merge.\n"
+            "\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- to: 'p3' or 'p3,p4'"
+        ),
+        {"task_id": str, "to": str},
+    )
+    async def assign_shipper(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("Only Coach assigns shippers.")
+        task_id = (args.get("task_id") or "").strip()
+        to_raw = (args.get("to") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+        targets, err = await _validate_role_targets(to_raw, role_label="shipper")
+        if err:
+            return _err(err)
+        if targets is None:
+            return _err("internal: target validation returned None")
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT status FROM tasks "
+                "WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"task {task_id} not found")
+            wake_prompt = (
+                f"Coach assigned you to ship task {task_id}. Open the PR, "
+                f"run the merge, then call coord_mark_shipped("
+                f"task_id={task_id!r}). The kanban will then archive "
+                f"the task."
+            )
+            ok, msg, slots = await _assign_role_helper(
+                c, task_id=task_id, role="shipper", targets=targets,
+                wake_prompt_for_role=wake_prompt,
+            )
+        finally:
+            await c.close()
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "task_role_assigned",
+                "task_id": task_id,
+                "role": "shipper",
+                "eligible_owners": targets,
+                "owner": (None if len(targets) > 1 else targets[0]),
+                "to": (targets[0] if len(targets) == 1 else None),
+            }
+        )
+        return _ok(msg)
+
+    @tool(
+        "coord_submit_audit_report",
+        (
+            "Player-only. Submit your audit report for a task. Validates "
+            "you have an active auditor assignment (matching kind) for "
+            "this task — you can't audit something you weren't assigned to.\n"
+            "\n"
+            "Writes the markdown report to "
+            "/data/projects/<id>/working/tasks/<task_id>/audits/"
+            "audit_<round>_<kind>.md and triggers the kanban subscriber:\n"
+            "  - verdict='pass' on syntax → task moves to audit_semantics\n"
+            "  - verdict='pass' on semantics → task moves to ship\n"
+            "  - verdict='fail' on either → task reverts to execute "
+            "(executor gets the spec + your report attached on auto-wake)\n"
+            "\n"
+            "Body should explain what you checked, what you found, and "
+            "(on fail) specifically what needs to be fixed.\n"
+            "\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- kind: 'syntax' or 'semantics' (required, must match assignment)\n"
+            "- body: full markdown report (required, max 40000 chars)\n"
+            "- verdict: 'pass' or 'fail' (required)"
+        ),
+        {"task_id": str, "kind": str, "body": str, "verdict": str},
+    )
+    async def submit_audit_report(args: dict[str, Any]) -> dict[str, Any]:
+        if caller_is_coach:
+            return _err(
+                "Coach doesn't audit — assign a Player auditor with "
+                "coord_assign_auditor and let them submit."
+            )
+        task_id = (args.get("task_id") or "").strip()
+        kind = (args.get("kind") or "").strip().lower()
+        body = args.get("body") or ""
+        verdict = (args.get("verdict") or "").strip().lower()
+        if not task_id:
+            return _err("task_id is required")
+        role = _resolve_audit_role_kind(kind)
+        if role is None:
+            return _err("kind must be 'syntax' or 'semantics'")
+        if verdict not in ("pass", "fail"):
+            return _err("verdict must be 'pass' or 'fail'")
+        if not body.strip():
+            return _err("body is required")
+        if len(body) > 40_000:
+            return _err(f"body too long ({len(body)} chars, max 40000)")
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            # Find the active auditor assignment for the caller. Must
+            # exist, be uncompleted, and not superseded.
+            cur = await c.execute(
+                "SELECT id FROM task_role_assignments "
+                "WHERE task_id = ? AND role = ? AND owner = ? "
+                "AND completed_at IS NULL AND superseded_by IS NULL "
+                "ORDER BY assigned_at DESC LIMIT 1",
+                (task_id, role, caller_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(
+                    f"no active {kind} auditor assignment for {caller_id} "
+                    f"on task {task_id}. Coach must call "
+                    f"coord_assign_auditor before you can submit."
+                )
+            assignment_id = dict(row)["id"]
+
+            # Compute round number = count of prior assignments for this
+            # (task, kind) PLUS 1. Includes this one (we just SELECTed it).
+            cur = await c.execute(
+                "SELECT COUNT(*) AS n FROM task_role_assignments "
+                "WHERE task_id = ? AND role = ?",
+                (task_id, role),
+            )
+            count_row = await cur.fetchone()
+            round_num = int(dict(count_row)["n"])
+        finally:
+            await c.close()
+
+        # Write the report .md.
+        from server.tasks import (
+            write_audit_report as _write_audit, audit_report_relative_path,
+        )
+        try:
+            target, rel, submitted_at = await _write_audit(
+                project_id=project_id,
+                task_id=task_id,
+                kind=kind,
+                round_num=round_num,
+                body=body,
+                auditor=caller_id,
+                verdict=verdict,
+            )
+        except ValueError as exc:
+            return _err(str(exc))
+        except Exception as exc:
+            return _err(f"audit report write failed: {exc}")
+
+        # Update the role row + tasks.latest_audit_* surface fields.
+        executor_owner = None
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE task_role_assignments "
+                "SET report_path = ?, verdict = ?, completed_at = ? "
+                "WHERE id = ?",
+                (rel, verdict, submitted_at, assignment_id),
+            )
+            await c.execute(
+                "UPDATE tasks SET latest_audit_report_path = ?, "
+                "latest_audit_kind = ?, latest_audit_verdict = ? "
+                "WHERE id = ? AND project_id = ?",
+                (rel, kind, verdict, task_id, project_id),
+            )
+            cur = await c.execute(
+                "SELECT owner FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            task_row = await cur.fetchone()
+            if task_row:
+                executor_owner = dict(task_row).get("owner")
+            await c.commit()
+        finally:
+            await c.close()
+
+        # Emit the kanban-driving event. The auto-advance subscriber
+        # (server/kanban.py — landing in a future iteration) listens.
+        ts = _now_iso()
+        await bus.publish(
+            {
+                "ts": ts,
+                "agent_id": caller_id,
+                "type": "task_role_completed",
+                "task_id": task_id,
+                "role": role,
+                "owner": caller_id,
+                "artifact_path": rel,
+                "verdict": verdict,
+                "to": executor_owner,
+            }
+        )
+        await bus.publish(
+            {
+                "ts": ts,
+                "agent_id": caller_id,
+                "type": "audit_report_submitted",
+                "task_id": task_id,
+                "kind": kind,
+                "verdict": verdict,
+                "report_path": rel,
+                "round": round_num,
+                "auditor_id": caller_id,
+                "to": executor_owner,
+                # 'to' = executor — surfaces the event in their pane so
+                # they see fail verdicts immediately. Read from tasks.owner.
+            }
+        )
+        return _ok(
+            f"submitted {kind} audit (round {round_num}, {verdict}) "
+            f"for {task_id} → {rel}"
+        )
+
+    @tool(
+        "coord_mark_shipped",
+        (
+            "Player-only. Call after merging the task's PR / pushing the "
+            "release. Validates you have an active shipper assignment for "
+            "this task. Triggers the kanban subscriber to move the task "
+            "from `ship` → `archive`.\n"
+            "\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- note: optional one-line note (e.g. merge SHA / PR URL)"
+        ),
+        {"task_id": str, "note": str},
+    )
+    async def mark_shipped(args: dict[str, Any]) -> dict[str, Any]:
+        if caller_is_coach:
+            return _err("Coach doesn't ship — assign a shipper Player.")
+        task_id = (args.get("task_id") or "").strip()
+        note = (args.get("note") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+
+        project_id = await resolve_active_project()
+        executor_owner = None
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id FROM task_role_assignments "
+                "WHERE task_id = ? AND role = 'shipper' AND owner = ? "
+                "AND completed_at IS NULL AND superseded_by IS NULL "
+                "ORDER BY assigned_at DESC LIMIT 1",
+                (task_id, caller_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(
+                    f"no active shipper assignment for {caller_id} on "
+                    f"task {task_id}. Coach must call coord_assign_shipper."
+                )
+            assignment_id = dict(row)["id"]
+            cur = await c.execute(
+                "SELECT owner FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            task_row = await cur.fetchone()
+            if task_row:
+                executor_owner = dict(task_row).get("owner")
+            now = _now_iso()
+            await c.execute(
+                "UPDATE task_role_assignments SET completed_at = ? "
+                "WHERE id = ?",
+                (now, assignment_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+
+        ts = _now_iso()
+        await bus.publish(
+            {
+                "ts": ts,
+                "agent_id": caller_id,
+                "type": "task_role_completed",
+                "task_id": task_id,
+                "role": "shipper",
+                "owner": caller_id,
+                "to": executor_owner,
+            }
+        )
+        await bus.publish(
+            {
+                "ts": ts,
+                "agent_id": caller_id,
+                "type": "task_shipped",
+                "task_id": task_id,
+                "shipper_id": caller_id,
+                "note": note or None,
+                "to": executor_owner,
+            }
+        )
+        return _ok(f"marked {task_id} shipped" + (f" — {note}" if note else ""))
+
+    @tool(
+        "coord_my_assignments",
+        (
+            "Player-only. Returns your full plate in four buckets:\n"
+            "  1. Active executor task (the one in agents.current_task_id)\n"
+            "  2. Pending auditor assignments (syntax + semantics)\n"
+            "  3. Pending shipper assignments\n"
+            "  4. Eligible-pool tasks you could claim\n"
+            "\n"
+            "Call at turn start when you're not sure what to do. Returns "
+            "an empty plate if nothing is on you (and the idle poller "
+            "will eventually wake you when there's pool work)."
+        ),
+        {},
+    )
+    async def my_assignments(args: dict[str, Any]) -> dict[str, Any]:
+        if caller_is_coach:
+            return _err(
+                "coord_my_assignments is Player-only — Coach uses "
+                "coord_list_tasks to see the full board."
+            )
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            # Bucket 1: active executor task.
+            cur = await c.execute(
+                "SELECT a.current_task_id, t.title, t.status, t.priority, "
+                "t.complexity, t.spec_path "
+                "FROM agents a LEFT JOIN tasks t ON t.id = a.current_task_id "
+                "WHERE a.id = ?",
+                (caller_id,),
+            )
+            arow = await cur.fetchone()
+            executor_task = None
+            if arow:
+                ad = dict(arow)
+                if ad.get("current_task_id"):
+                    executor_task = {
+                        "id": ad["current_task_id"],
+                        "title": ad.get("title") or "(unknown)",
+                        "status": ad.get("status") or "?",
+                        "priority": ad.get("priority") or "normal",
+                        "complexity": ad.get("complexity") or "standard",
+                        "has_spec": bool(ad.get("spec_path")),
+                    }
+
+            # Bucket 2 + 3: pending auditor + shipper assignments.
+            cur = await c.execute(
+                "SELECT r.task_id, r.role, r.assigned_at, t.title, t.priority "
+                "FROM task_role_assignments r "
+                "JOIN tasks t ON t.id = r.task_id "
+                "WHERE r.owner = ? AND r.role IN "
+                "  ('auditor_syntax','auditor_semantics','shipper') "
+                "AND r.completed_at IS NULL AND r.superseded_by IS NULL "
+                "AND t.project_id = ? "
+                "ORDER BY r.assigned_at",
+                (caller_id, project_id),
+            )
+            pending_audits: list[dict[str, Any]] = []
+            pending_ships: list[dict[str, Any]] = []
+            for r in await cur.fetchall():
+                rd = dict(r)
+                entry = {
+                    "task_id": rd["task_id"],
+                    "title": rd["title"],
+                    "priority": rd["priority"],
+                    "assigned_at": rd["assigned_at"],
+                }
+                if rd["role"] == "shipper":
+                    pending_ships.append(entry)
+                else:
+                    entry["kind"] = _audit_kind_from_role(rd["role"])
+                    pending_audits.append(entry)
+
+            # Bucket 4: eligible-pool tasks. JSON1 json_each scans the
+            # eligible_owners array; cheap because we already filter on
+            # role + status.
+            cur = await c.execute(
+                "SELECT DISTINCT r.task_id, r.role, r.eligible_owners, "
+                "t.title, t.priority, t.complexity "
+                "FROM task_role_assignments r "
+                "JOIN tasks t ON t.id = r.task_id, "
+                "json_each(r.eligible_owners) je "
+                "WHERE je.value = ? "
+                "AND r.owner IS NULL "
+                "AND r.completed_at IS NULL AND r.superseded_by IS NULL "
+                "AND t.project_id = ? "
+                "ORDER BY r.assigned_at",
+                (caller_id, project_id),
+            )
+            eligible: list[dict[str, Any]] = []
+            for r in await cur.fetchall():
+                rd = dict(r)
+                eligible.append({
+                    "task_id": rd["task_id"],
+                    "title": rd["title"],
+                    "priority": rd["priority"],
+                    "complexity": rd["complexity"],
+                    "role": rd["role"],
+                })
+        finally:
+            await c.close()
+
+        # Compose a concise text response.
+        lines: list[str] = []
+        if executor_task:
+            spec_marker = "" if executor_task["has_spec"] else " [no spec]"
+            lines.append(
+                f"## Executor: {executor_task['id']} "
+                f"\"{executor_task['title']}\" "
+                f"(stage={executor_task['status']}, "
+                f"pri={executor_task['priority']}, "
+                f"complexity={executor_task['complexity']}{spec_marker})"
+            )
+        else:
+            lines.append("## Executor: (none — you have no active task)")
+
+        lines.append("")
+        lines.append("## Pending audits:")
+        if pending_audits:
+            for e in pending_audits:
+                lines.append(
+                    f"  - {e['task_id']} ({e['kind']}, pri={e['priority']}): "
+                    f"{e['title']}"
+                )
+        else:
+            lines.append("  (none)")
+
+        lines.append("")
+        lines.append("## Pending ship assignments:")
+        if pending_ships:
+            for e in pending_ships:
+                lines.append(
+                    f"  - {e['task_id']} (pri={e['priority']}): {e['title']}"
+                )
+        else:
+            lines.append("  (none)")
+
+        lines.append("")
+        lines.append("## Available to claim (eligible pools):")
+        if eligible:
+            for e in eligible:
+                role_label = {
+                    "executor": "executor",
+                    "auditor_syntax": "syntax auditor",
+                    "auditor_semantics": "semantic auditor",
+                    "shipper": "shipper",
+                    "planner": "planner",
+                }.get(e["role"], e["role"])
+                simple = " SIMPLE" if e["complexity"] == "simple" else ""
+                lines.append(
+                    f"  - {e['task_id']} ({role_label}, "
+                    f"pri={e['priority']}{simple}): {e['title']}"
+                )
+        else:
+            lines.append("  (none)")
+
+        return _ok("\n".join(lines))
+
+    @tool(
+        "coord_set_task_complexity",
+        (
+            "Coach-only. Mark a task simple or standard. Simple tasks "
+            "skip audit + ship — they go plan → execute → archive on "
+            "commit, and the executor self-audits. Use simple for typo "
+            "fixes, log-message tweaks, single-line bug fixes — anything "
+            "well-bounded enough that the executor's diligence is enough "
+            "review. Default at create time is 'standard'.\n"
+            "\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- complexity: 'simple' or 'standard'"
+        ),
+        {"task_id": str, "complexity": str},
+    )
+    async def set_task_complexity(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("Only Coach can set task complexity.")
+        task_id = (args.get("task_id") or "").strip()
+        complexity = (args.get("complexity") or "").strip().lower()
+        if not task_id:
+            return _err("task_id is required")
+        if complexity not in ("simple", "standard"):
+            return _err("complexity must be 'simple' or 'standard'")
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT owner FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"task {task_id} not found")
+            owner = dict(row).get("owner")
+            await c.execute(
+                "UPDATE tasks SET complexity = ? "
+                "WHERE id = ? AND project_id = ?",
+                (complexity, task_id, project_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "task_complexity_set",
+                "task_id": task_id,
+                "complexity": complexity,
+                "to": owner,
+            }
+        )
+        return _ok(f"task {task_id} → complexity={complexity}")
+
+    @tool(
+        "coord_advance_task_stage",
+        (
+            "Coach-only. Manually move a task to a new kanban stage, "
+            "bypassing the role-completion gate. Use when an audit or "
+            "ship assignment is stuck and you need to push the task "
+            "through (e.g. an auditor went silent and you've decided "
+            "the work is good enough to advance).\n"
+            "\n"
+            "Validates the transition against the state machine "
+            "(plan → execute → audit_syntax → audit_semantics → ship → "
+            "archive, plus revert audit_*→execute and execute→archive).\n"
+            "\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- stage: target stage (kanban value)\n"
+            "- note: optional reason; rendered on the timeline + carried "
+            "in the task_stage_changed event"
+        ),
+        {"task_id": str, "stage": str, "note": str},
+    )
+    async def advance_task_stage(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("Only Coach can force a stage transition.")
+        task_id = (args.get("task_id") or "").strip()
+        stage = (args.get("stage") or "").strip().lower()
+        note = (args.get("note") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+        if stage not in ALL_KANBAN_STAGES:
+            return _err(
+                f"invalid stage '{stage}' (must be one of "
+                f"{sorted(ALL_KANBAN_STAGES)})"
+            )
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT status, owner FROM tasks "
+                "WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"task {task_id} not found")
+            t = dict(row)
+            old_status = t["status"]
+            owner = t.get("owner")
+            if not _valid_transition(old_status, stage):
+                return _err(
+                    f"invalid transition: {old_status} → {stage}"
+                )
+            now = _now_iso()
+            if stage == "archive":
+                await c.execute(
+                    "UPDATE tasks SET status = 'archive', "
+                    "completed_at = ?, archived_at = ? "
+                    "WHERE id = ? AND project_id = ?",
+                    (now, now, task_id, project_id),
+                )
+                if owner:
+                    await c.execute(
+                        "UPDATE agents SET current_task_id = NULL "
+                        "WHERE id = ? AND current_task_id = ?",
+                        (owner, task_id),
+                    )
+            else:
+                await c.execute(
+                    "UPDATE tasks SET status = ? "
+                    "WHERE id = ? AND project_id = ?",
+                    (stage, task_id, project_id),
+                )
+            await c.commit()
+        finally:
+            await c.close()
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "task_stage_changed",
+                "task_id": task_id,
+                "from": old_status,
+                "to": stage,
+                "reason": "manual",
+                "note": note or None,
+                "owner": owner,
+            }
+        )
+        return _ok(
+            f"advanced {task_id}: {old_status} → {stage}"
+            + (f" — {note}" if note else "")
+        )
+
+    @tool(
+        "coord_set_task_blocked",
+        (
+            "Toggle the orthogonal blocked flag on a task. Owner + Coach "
+            "only. Blocked tasks stay in their current stage but are "
+            "rendered with a BLOCKED badge so the human / Coach knows "
+            "to unstick them. Use for 'waiting on stakeholder', "
+            "'external API down', etc.\n"
+            "\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- blocked: 'true' or 'false'\n"
+            "- reason: short note shown on the card (max 500 chars)"
+        ),
+        {"task_id": str, "blocked": str, "reason": str},
+    )
+    async def set_task_blocked(args: dict[str, Any]) -> dict[str, Any]:
+        task_id = (args.get("task_id") or "").strip()
+        blocked_raw = str(args.get("blocked") or "").strip().lower()
+        reason = (args.get("reason") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+        if blocked_raw in ("true", "1", "yes", "on"):
+            blocked = 1
+        elif blocked_raw in ("false", "0", "no", "off"):
+            blocked = 0
+        else:
+            return _err("blocked must be 'true' or 'false'")
+        if len(reason) > 500:
+            return _err(f"reason too long ({len(reason)} chars, max 500)")
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT owner, status FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"task {task_id} not found")
+            task_row = dict(row)
+            owner = task_row.get("owner")
+            if task_row.get("status") == "archive":
+                return _err(
+                    f"task {task_id} is archived; archived tasks are read-only."
+                )
+            if not caller_is_coach and owner != caller_id:
+                return _err(
+                    f"only the task's owner ({owner or 'nobody'}) or "
+                    f"Coach can set the blocked flag."
+                )
+            await c.execute(
+                "UPDATE tasks SET blocked = ?, "
+                "blocked_reason = ? "
+                "WHERE id = ? AND project_id = ?",
+                (blocked, reason or None, task_id, project_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "task_blocked_changed",
+                "task_id": task_id,
+                "blocked": bool(blocked),
+                "reason": reason or None,
+                "to": owner,
+            }
+        )
+        return _ok(
+            f"task {task_id} blocked={'true' if blocked else 'false'}"
+            + (f" — {reason}" if reason else "")
+        )
+
     _tools = [
         list_tasks,
         create_task,
         claim_task,
         update_task,
         assign_task,
+        # Kanban additions
+        write_task_spec,
+        assign_planner,
+        assign_auditor,
+        assign_shipper,
+        submit_audit_report,
+        mark_shipped,
+        my_assignments,
+        set_task_complexity,
+        advance_task_stage,
+        set_task_blocked,
         send_message,
         read_inbox,
         list_memory,
@@ -3100,6 +4903,23 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__compass_audit",
     "mcp__coord__compass_brief",
     "mcp__coord__compass_status",
+    # Kanban lifecycle — Docs/kanban-specs.md §6. Same convention as
+    # compass: Coach-only assignment/meta tools are listed here too so
+    # the SDK doesn't pre-reject; the caller_is_coach gate inside each
+    # handler enforces the Coach-only invariant. Player-only tools
+    # (coord_my_assignments / coord_submit_audit_report /
+    # coord_mark_shipped) validate the caller has the relevant role
+    # assignment in their handler.
+    "mcp__coord__coord_write_task_spec",
+    "mcp__coord__coord_assign_planner",
+    "mcp__coord__coord_assign_auditor",
+    "mcp__coord__coord_assign_shipper",
+    "mcp__coord__coord_submit_audit_report",
+    "mcp__coord__coord_mark_shipped",
+    "mcp__coord__coord_my_assignments",
+    "mcp__coord__coord_set_task_complexity",
+    "mcp__coord__coord_advance_task_stage",
+    "mcp__coord__coord_set_task_blocked",
 ]
 
 MEMORY_TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")

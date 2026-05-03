@@ -59,32 +59,125 @@ CREATE TABLE IF NOT EXISTS agents (
     -- ignore role defaults. See Docs/CODEX_RUNTIME_SPEC.md §B.1.
     runtime_override      TEXT
                           CHECK (runtime_override IS NULL
-                                 OR runtime_override IN ('claude','codex'))
+                                 OR runtime_override IN ('claude','codex')),
+    -- Idle-poller debounce timestamp. NULL = never woken by the poller.
+    -- The poller skips a Player whose last_idle_wake_at is within
+    -- HARNESS_IDLE_POLL_DEBOUNCE_SECONDS of now (default 30 min) so a
+    -- Player who declined a wake isn't pestered every cycle. See
+    -- Docs/kanban-specs.md §10.
+    last_idle_wake_at     TEXT
 );
 
+-- Kanban-shaped task lifecycle (Docs/kanban-specs.md). Status enum is
+-- the kanban stage (`plan` / `execute` / `audit_syntax` / `audit_semantics`
+-- / `ship` / `archive`). The legacy enum (open/claimed/in_progress/
+-- blocked/done/cancelled) was migrated to this shape via a one-shot
+-- table rebuild in `_rebuild_tasks_if_kanban_outdated` — see that
+-- function for the mapping. `blocked` is now an orthogonal flag, not a
+-- status value, so a task can be "blocked while in audit_syntax"
+-- without losing its workflow position.
 CREATE TABLE IF NOT EXISTS tasks (
-    id            TEXT PRIMARY KEY,
-    project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    title         TEXT NOT NULL,
-    description   TEXT NOT NULL DEFAULT '',
-    status        TEXT NOT NULL DEFAULT 'open'
-                  CHECK (status IN ('open', 'claimed', 'in_progress', 'blocked', 'done', 'cancelled')),
-    owner         TEXT REFERENCES agents(id),
-    created_by    TEXT NOT NULL,
-    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    claimed_at    TEXT,
-    completed_at  TEXT,
-    parent_id     TEXT REFERENCES tasks(id),
-    priority      TEXT NOT NULL DEFAULT 'normal'
-                  CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
-    tags          TEXT NOT NULL DEFAULT '[]',
-    artifacts     TEXT NOT NULL DEFAULT '[]'
+    id                          TEXT PRIMARY KEY,
+    project_id                  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title                       TEXT NOT NULL,
+    description                 TEXT NOT NULL DEFAULT '',
+    status                      TEXT NOT NULL DEFAULT 'plan'
+                                CHECK (status IN ('plan', 'execute', 'audit_syntax', 'audit_semantics', 'ship', 'archive')),
+    owner                       TEXT REFERENCES agents(id),
+    created_by                  TEXT NOT NULL,
+    created_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    claimed_at                  TEXT,
+    -- First time the executor's turn actually fired after assign/claim.
+    -- NULL when a task is hard-assigned but the auto-wake hasn't run
+    -- (cost-cap miss / harness paused) — distinguishes "assigned, not
+    -- started" from "actively working" within the execute stage.
+    started_at                  TEXT,
+    completed_at                TEXT,
+    -- Set on entry to `archive` for any reason (delivery OR cancel).
+    -- Indexed DESC for the archive view's newest-first list.
+    archived_at                 TEXT,
+    -- Set when status moves to `archive` because a human cancelled.
+    -- Distinguishes cancelled-archive from delivered-archive in the
+    -- archive view's "show cancelled" toggle.
+    cancelled_at                TEXT,
+    parent_id                   TEXT REFERENCES tasks(id),
+    priority                    TEXT NOT NULL DEFAULT 'normal'
+                                CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
+    -- Coach-set complexity. `simple` skips audit + ship — the executor
+    -- self-audits and `commit_pushed` jumps the task straight to archive.
+    complexity                  TEXT NOT NULL DEFAULT 'standard'
+                                CHECK (complexity IN ('simple', 'standard')),
+    -- Orthogonal blocked flag. `blocked_reason` is a short note for
+    -- the card. Toggleable via coord_set_task_blocked.
+    blocked                     INTEGER NOT NULL DEFAULT 0,
+    blocked_reason              TEXT,
+    -- Spec markdown path, written by Coach (or delegated planner) before
+    -- the task can transition plan→execute (standard tasks only). Mirrors
+    -- to kDrive at the same relative path. Required gate; see
+    -- `_assert_spec_present` in tools.py.
+    spec_path                   TEXT,
+    spec_written_at             TEXT,
+    -- Latest Player auditor report (the gating audit). Format:
+    -- `projects/<id>/working/tasks/<task_id>/audits/audit_<round>_<kind>.md`.
+    -- Older rounds stay on disk; the card surfaces only the latest.
+    latest_audit_report_path    TEXT,
+    latest_audit_kind           TEXT,
+    latest_audit_verdict        TEXT,
+    -- Compass auto-audit's parallel report (informational, not a gate).
+    -- Format: `projects/<id>/working/compass/audit_reports/<audit_id>.md`.
+    compass_audit_report_path   TEXT,
+    compass_audit_verdict       TEXT,
+    tags                        TEXT NOT NULL DEFAULT '[]',
+    artifacts                   TEXT NOT NULL DEFAULT '[]'
 );
 
-CREATE INDEX IF NOT EXISTS idx_tasks_status  ON tasks(status);
-CREATE INDEX IF NOT EXISTS idx_tasks_owner   ON tasks(owner);
-CREATE INDEX IF NOT EXISTS idx_tasks_parent  ON tasks(parent_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_status     ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_owner      ON tasks(owner);
+CREATE INDEX IF NOT EXISTS idx_tasks_parent     ON tasks(parent_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_project    ON tasks(project_id);
+-- Note: indexes referencing kanban-new columns (`complexity`, `archived_at`)
+-- live in `_ensure_tasks_kanban_indexes`, called from init_db AFTER the
+-- migration runs. SQLite validates column existence at CREATE INDEX time,
+-- so an upgraded DB whose tasks table still has the legacy schema would
+-- crash here on every boot.
+
+-- Task role assignments (Docs/kanban-specs.md §4). A task has multiple
+-- Players involved in different roles across stages: planner (optional —
+-- Coach by default), executor, syntax auditor, semantic auditor, shipper.
+-- Each role can be hard-assigned to one Player or posted to a pool of
+-- eligible Players (`eligible_owners` JSON array) where the first to
+-- claim wins. Multiple rows per (task, role) accumulate over time — an
+-- audit-fail loop produces a fresh auditor row each round; the active
+-- one is `superseded_by IS NULL` AND most-recent `assigned_at`.
+CREATE TABLE IF NOT EXISTS task_role_assignments (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         TEXT NOT NULL REFERENCES tasks(id),
+    role            TEXT NOT NULL CHECK(role IN
+                      ('planner','executor','auditor_syntax','auditor_semantics','shipper')),
+    -- JSON array of slot ids. Empty `[]` = "this row is hard-assigned
+    -- (owner must be set at insert time)". Non-empty = posted to a pool;
+    -- owner is NULL until a Player claims via coord_claim_task.
+    eligible_owners TEXT NOT NULL DEFAULT '[]',
+    owner           TEXT REFERENCES agents(id),
+    assigned_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    claimed_at      TEXT,
+    started_at      TEXT,
+    completed_at    TEXT,
+    -- Auditor roles only: relative path to the audit_<round>_<kind>.md
+    -- this auditor produced. NULL until coord_submit_audit_report fires.
+    report_path     TEXT,
+    -- Auditor roles only: 'pass' | 'fail'. NULL until submitted.
+    verdict         TEXT CHECK(verdict IS NULL OR verdict IN ('pass','fail')),
+    -- Self-reference: when a fail verdict creates a fresh auditor row
+    -- on the next round, the previous one points forward via this column.
+    -- `WHERE superseded_by IS NULL` filters to active rows.
+    superseded_by   INTEGER REFERENCES task_role_assignments(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_role_assignments_task   ON task_role_assignments(task_id);
+CREATE INDEX IF NOT EXISTS idx_role_assignments_owner  ON task_role_assignments(owner);
+CREATE INDEX IF NOT EXISTS idx_role_assignments_role   ON task_role_assignments(task_id, role);
+CREATE INDEX IF NOT EXISTS idx_role_assignments_active ON task_role_assignments(task_id, role, superseded_by, assigned_at);
 
 -- payload_to / payload_owner: virtual generated columns over the
 -- two JSON fields the pane-history fan-out filter cares about. Lets
@@ -390,25 +483,50 @@ async def crash_recover() -> dict[str, int]:
     """Reset orphaned state left behind by an unclean shutdown.
 
     If the server died mid-turn, the DB still says agents are
-    `working` and tasks are `in_progress`, but no subprocess is
-    actually running any of that. Reset:
+    `working` and tasks have `started_at` set on their executor
+    role-assignment row, but no subprocess is actually running.
+
+    Resets:
       - agents.status ∈ {working, waiting} → idle
-      - tasks.status = 'in_progress' → claimed (owner kept so the
-        Player knows what they were doing when next spawned)
+      - tasks.status='execute' rows whose owner had a working/waiting
+        agents.status: clear `tasks.started_at` so the next auto-wake
+        cleanly re-flips the avatar from hollow → filled. Owner stays
+        (so the Player knows what they were doing on next spawn).
+      - task_role_assignments rows whose owner was a zombie agent: clear
+        their `started_at` too — the role's spawn-side state mirrors
+        tasks.started_at and recovers the same way.
 
     Returns a dict of how many rows were touched for logging. Safe
     to call repeatedly — a no-op on a clean DB.
     """
     async with aiosqlite.connect(DB_PATH, timeout=10.0) as db:
+        # Snapshot the slot ids that were zombie BEFORE we reset their
+        # status, so we can scope the started_at resets to just those.
+        cur = await db.execute(
+            "SELECT id FROM agents WHERE status IN ('working', 'waiting')"
+        )
+        zombie_slots = [row[0] for row in await cur.fetchall()]
         cur = await db.execute(
             "UPDATE agents SET status = 'idle' "
             "WHERE status IN ('working', 'waiting')"
         )
         agents_reset = cur.rowcount
-        cur = await db.execute(
-            "UPDATE tasks SET status = 'claimed' WHERE status = 'in_progress'"
-        )
-        tasks_reset = cur.rowcount
+
+        tasks_reset = 0
+        if zombie_slots:
+            placeholders = ",".join("?" for _ in zombie_slots)
+            cur = await db.execute(
+                f"UPDATE tasks SET started_at = NULL "
+                f"WHERE status = 'execute' AND owner IN ({placeholders})",
+                zombie_slots,
+            )
+            tasks_reset = cur.rowcount
+            await db.execute(
+                f"UPDATE task_role_assignments SET started_at = NULL "
+                f"WHERE owner IN ({placeholders}) "
+                f"AND completed_at IS NULL AND superseded_by IS NULL",
+                zombie_slots,
+            )
         await db.commit()
     return {"agents_reset": agents_reset, "tasks_reset": tasks_reset}
 
@@ -515,7 +633,11 @@ async def init_db() -> None:
             await _ensure_columns(
                 db,
                 "agents",
-                [("runtime_override", "runtime_override TEXT")],
+                [
+                    ("runtime_override", "runtime_override TEXT"),
+                    # Idle-poller debounce timestamp; see Docs/kanban-specs.md §10.
+                    ("last_idle_wake_at", "last_idle_wake_at TEXT"),
+                ],
             )
             await _ensure_columns(
                 db,
@@ -570,6 +692,18 @@ async def init_db() -> None:
             # only when 'superseded' is missing so this is a no-op on
             # fresh installs (which already have the right constraint).
             await _rebuild_file_write_proposals_if_check_outdated(db)
+
+            # Kanban lifecycle migration — rebuilds the tasks table
+            # from the legacy status enum (open/claimed/in_progress/
+            # blocked/done/cancelled) to the kanban enum (plan/execute/
+            # audit_syntax/audit_semantics/ship/archive) and populates
+            # the new lifecycle columns. Idempotent; no-op once
+            # team_config['tasks_kanban_v1_migrated'] is set.
+            await _rebuild_tasks_if_kanban_outdated(db)
+            # Indexes that reference kanban-new columns. Live outside
+            # SCHEMA because their columns don't exist on legacy DBs
+            # until the migration above runs.
+            await _ensure_tasks_kanban_indexes(db)
 
             logger.info("init_db: schema ok, ensuring misc project")
             # Ensure the fallback project + active-project pointer
@@ -726,6 +860,227 @@ async def _rebuild_file_write_proposals_if_check_outdated(
                     f"file_write_proposals rebuild left {len(violations)} "
                     f"FK violations: {violations}"
                 )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    finally:
+        await db.execute("PRAGMA foreign_keys = ON")
+
+
+async def _ensure_tasks_kanban_indexes(db: aiosqlite.Connection) -> None:
+    """Create indexes that reference kanban-only columns (`complexity`,
+    `archived_at`). Lives outside the SCHEMA constant because SQLite
+    validates index columns at create time — running these at SCHEMA
+    time on a legacy DB (before migration converts the table) would
+    fail with `no such column: complexity`. Called from init_db AFTER
+    `_rebuild_tasks_if_kanban_outdated`, so the columns are guaranteed
+    to exist by then."""
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_complexity ON tasks(complexity)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_archived ON tasks(archived_at DESC)"
+    )
+
+
+async def _rebuild_tasks_if_kanban_outdated(
+    db: aiosqlite.Connection,
+) -> None:
+    """One-shot migration: rebuild the `tasks` table from the legacy
+    status enum (open/claimed/in_progress/blocked/done/cancelled) to the
+    kanban enum (plan/execute/audit_syntax/audit_semantics/ship/archive)
+    and populate the new lifecycle columns from existing data.
+
+    Detection: `'open'` in the table's CREATE statement. The new SCHEMA
+    doesn't include any of the legacy status values, so its presence is
+    a reliable "needs migration" signal. Fresh DBs created from the
+    current SCHEMA already have the new CHECK and skip the rebuild.
+
+    Status mapping (OLD → NEW):
+      open         → plan
+      claimed      → execute
+      in_progress  → execute (started_at backfilled from claimed_at)
+      blocked      → execute (with blocked=1)
+      done         → archive (archived_at = completed_at)
+      cancelled    → archive (cancelled_at = archived_at = completed_at)
+
+    Idempotent via the team_config['tasks_kanban_v1_migrated'] marker —
+    once the rebuild succeeds, subsequent boots skip the whole function.
+    """
+    cur = await db.execute(
+        "SELECT value FROM team_config WHERE key = 'tasks_kanban_v1_migrated'"
+    )
+    if await cur.fetchone():
+        return  # already migrated
+    cur = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'"
+    )
+    row = await cur.fetchone()
+    if not row:
+        # Fresh install: tasks doesn't exist yet (schema runs after this
+        # in some legacy paths). Mark migrated so we don't re-check.
+        await db.execute(
+            "INSERT OR IGNORE INTO team_config (key, value) VALUES "
+            "('tasks_kanban_v1_migrated', '1')"
+        )
+        await db.commit()
+        return
+    create_sql = row[0] or ""
+    # The old CHECK enumerates 'open' as the lowest value. The new
+    # CHECK doesn't have it. So presence of `'open'` is the migration
+    # signal. (Any of in_progress/claimed would work too; 'open' is
+    # the cleanest single-token check.)
+    if "'open'" not in create_sql:
+        # Already on the kanban schema (either fresh install or already
+        # migrated by an earlier boot before the marker was set). Just
+        # mark migrated and exit.
+        await db.execute(
+            "INSERT OR IGNORE INTO team_config (key, value) VALUES "
+            "('tasks_kanban_v1_migrated', '1')"
+        )
+        await db.commit()
+        return
+
+    logger.info(
+        "init_db: rebuilding tasks table for kanban lifecycle "
+        "(status enum + new columns)"
+    )
+    # Per SQLite's canonical table-rebuild guidance: disable FK
+    # enforcement, do the rename dance, foreign_key_check, re-enable.
+    await db.execute("PRAGMA foreign_keys = OFF")
+    try:
+        await db.execute("BEGIN")
+        try:
+            await db.execute(
+                """
+                CREATE TABLE tasks_new (
+                    id                          TEXT PRIMARY KEY,
+                    project_id                  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    title                       TEXT NOT NULL,
+                    description                 TEXT NOT NULL DEFAULT '',
+                    status                      TEXT NOT NULL DEFAULT 'plan'
+                                                CHECK (status IN ('plan', 'execute', 'audit_syntax', 'audit_semantics', 'ship', 'archive')),
+                    owner                       TEXT REFERENCES agents(id),
+                    created_by                  TEXT NOT NULL,
+                    created_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    claimed_at                  TEXT,
+                    started_at                  TEXT,
+                    completed_at                TEXT,
+                    archived_at                 TEXT,
+                    cancelled_at                TEXT,
+                    parent_id                   TEXT REFERENCES tasks(id),
+                    priority                    TEXT NOT NULL DEFAULT 'normal'
+                                                CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
+                    complexity                  TEXT NOT NULL DEFAULT 'standard'
+                                                CHECK (complexity IN ('simple', 'standard')),
+                    blocked                     INTEGER NOT NULL DEFAULT 0,
+                    blocked_reason              TEXT,
+                    spec_path                   TEXT,
+                    spec_written_at             TEXT,
+                    latest_audit_report_path    TEXT,
+                    latest_audit_kind           TEXT,
+                    latest_audit_verdict        TEXT,
+                    compass_audit_report_path   TEXT,
+                    compass_audit_verdict       TEXT,
+                    tags                        TEXT NOT NULL DEFAULT '[]',
+                    artifacts                   TEXT NOT NULL DEFAULT '[]'
+                )
+                """
+            )
+            # Migrate rows with status mapping + derived columns. The
+            # CASE chains compute everything in one pass so we don't have
+            # to rescan the table.
+            await db.execute(
+                """
+                INSERT INTO tasks_new
+                    (id, project_id, title, description, status, owner,
+                     created_by, created_at, claimed_at, started_at,
+                     completed_at, archived_at, cancelled_at, parent_id,
+                     priority, complexity, blocked, tags, artifacts)
+                SELECT
+                    id,
+                    project_id,
+                    title,
+                    description,
+                    CASE status
+                        WHEN 'open'        THEN 'plan'
+                        WHEN 'claimed'     THEN 'execute'
+                        WHEN 'in_progress' THEN 'execute'
+                        WHEN 'blocked'     THEN 'execute'
+                        WHEN 'done'        THEN 'archive'
+                        WHEN 'cancelled'   THEN 'archive'
+                        ELSE 'plan'
+                    END AS status,
+                    owner,
+                    created_by,
+                    created_at,
+                    claimed_at,
+                    -- started_at: best-effort backfill — if the old
+                    -- status was in_progress, claimed_at is the closest
+                    -- timestamp we have for "owner began work". For the
+                    -- merely claimed case we leave NULL so the card
+                    -- reads "assigned, not started" until the next turn
+                    -- fires.
+                    CASE
+                        WHEN status = 'in_progress'    THEN claimed_at
+                        WHEN status IN ('done', 'blocked') AND owner IS NOT NULL THEN claimed_at
+                        ELSE NULL
+                    END AS started_at,
+                    completed_at,
+                    -- archived_at = completed_at on terminal rows.
+                    CASE WHEN status IN ('done', 'cancelled') THEN completed_at END
+                        AS archived_at,
+                    -- cancelled_at distinguishes cancellation from delivery.
+                    CASE WHEN status = 'cancelled' THEN completed_at END
+                        AS cancelled_at,
+                    parent_id,
+                    priority,
+                    'standard' AS complexity,
+                    CASE WHEN status = 'blocked' THEN 1 ELSE 0 END AS blocked,
+                    tags,
+                    artifacts
+                FROM tasks
+                """
+            )
+            await db.execute("DROP TABLE tasks")
+            await db.execute("ALTER TABLE tasks_new RENAME TO tasks")
+            # Recreate every index on the new table.
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_status "
+                "ON tasks(status)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_owner "
+                "ON tasks(owner)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_parent "
+                "ON tasks(parent_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_project "
+                "ON tasks(project_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_complexity "
+                "ON tasks(complexity)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_archived "
+                "ON tasks(archived_at DESC)"
+            )
+            cur = await db.execute("PRAGMA foreign_key_check")
+            violations = await cur.fetchall()
+            if violations:
+                raise RuntimeError(
+                    f"tasks rebuild left {len(violations)} FK violations: "
+                    f"{violations}"
+                )
+            await db.execute(
+                "INSERT OR IGNORE INTO team_config (key, value) VALUES "
+                "('tasks_kanban_v1_migrated', '1')"
+            )
             await db.commit()
         except Exception:
             await db.rollback()

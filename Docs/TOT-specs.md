@@ -24,6 +24,11 @@ Dependent specs (subordinate to this document):
   `project-objectives.md`).
 - `Docs/compass-specs.md` — Compass autonomous strategy engine
   (lattice, regions, truth corpus, audits, briefings).
+- `Docs/kanban-specs.md` — Kanban-shaped task lifecycle. Tasks flow
+  plan → execute → audit_syntax → audit_semantics → ship → archive,
+  with strict role separation (Coach plans + assigns; Players
+  execute, audit, ship). Standard tasks traverse the full pipeline;
+  simple tasks bypass audit + ship via executor self-audit.
 
 These docs are subordinate: when a dependent disagrees with this one,
 TOT-specs.md wins. Dependents may go deeper on their own subject but

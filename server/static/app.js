@@ -18,12 +18,36 @@ import {
   renderDiffBody,
 } from "/static/tools.js";
 import { CompassPane, createCompassEventRouter } from "/static/compass.js?v=1777718517";
+import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js";
 
 const html = htm.bind(h);
 // Module-level event router for compass events. CompassPane(s) subscribe;
 // the WS handler below publishes incoming compass_* events. The router
 // is per-window — multiple panes can mount and unmount cleanly.
 const compassEvents = createCompassEventRouter();
+// Same shape for the kanban dashboard. Subscribers are open KanbanPane
+// instances; the WS dispatch publishes task_* / commit_pushed /
+// compass_audit_logged events here so the board refreshes live.
+const kanbanEvents = createKanbanEventRouter();
+const KANBAN_FORWARD_TYPES = new Set([
+  "task_created", "task_claimed", "task_assigned",
+  "task_updated", "task_stage_changed",
+  "task_complexity_set", "task_blocked_changed",
+  "task_spec_written", "task_role_assigned", "task_role_claimed",
+  "task_role_completed", "task_drift_detected", "task_shipped",
+  "audit_report_submitted", "compass_audit_logged",
+  "commit_pushed", "project_switched", "socket_connected",
+]);
+// Short labels for the pane-header current-task chip. Keeps the
+// chip from blowing up when a task is in audit_*; archive isn't
+// rendered (the task is gone from current_task_id by then).
+const KANBAN_STAGE_SHORT = {
+  plan: "plan",
+  execute: "exec",
+  audit_syntax: "syn",
+  audit_semantics: "sem",
+  ship: "ship",
+};
 
 // markdown rendering: parse / sanitise / math / mermaid pipeline lives
 // in markdown.js. `renderMarkdown` and `hljs` are imported above. We
@@ -1184,23 +1208,6 @@ function App() {
     });
   }, [authedFetch]);
 
-  const createHumanTask = useCallback(
-    async ({ title, description, priority }) => {
-      const res = await authedFetch("/api/tasks", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          title,
-          description: description || "",
-          priority: priority || "normal",
-        }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      await loadTasks();
-    },
-    [loadTasks, authedFetch]
-  );
-
   const loadStatus = useCallback(async () => {
     try {
       const res = await authedFetch("/api/status");
@@ -1723,6 +1730,7 @@ function App() {
       loadAgents();
       loadTasks();
       loadStatus();
+      try { kanbanEvents.publish({ type: "socket_connected" }); } catch (_) {}
     };
     ws.onclose = () => {
       setWsConnected(false);
@@ -1750,6 +1758,13 @@ function App() {
       // here, just publish + continue.
       if (ev.type && typeof ev.type === "string" && ev.type.startsWith("compass_")) {
         try { compassEvents.publish(ev); } catch (_) {}
+      }
+      // Kanban dashboard live updates. Forward task lifecycle events
+      // and the audit/commit triggers it watches. Includes
+      // compass_audit_logged because the kanban surfaces an
+      // informational Compass pip on cards.
+      if (ev.type && KANBAN_FORWARD_TYPES.has(ev.type)) {
+        try { kanbanEvents.publish(ev); } catch (_) {}
       }
       // Pending interactions targeted at the human (AskUserQuestion or
       // ExitPlanMode with route=human) are blocking the agent right
@@ -2745,7 +2760,13 @@ function App() {
         switchingProject=${switchingProject}
         onActivateProject=${onActivateProject}
         onCreateProject=${onCreateProject}
-        onOpen=${openPane}
+        onOpen=${(slot) => {
+          if (slot === "__kanban" && openSlots.includes("__kanban")) {
+            closePane("__kanban");
+          } else {
+            openPane(slot);
+          }
+        }}
         onStackInLast=${stackInLast}
         wsConnected=${wsConnected}
         envOpen=${envOpen}
@@ -2808,6 +2829,23 @@ function App() {
                           compassEvents=${compassEvents}
                         />`;
                       }
+                      if (slot === "__kanban") {
+                        return html`<${KanbanPane}
+                          key=${slot}
+                          slot=${slot}
+                          authedFetch=${authedFetch}
+                          onClose=${() => closePane(slot)}
+                          onDropEdge=${dropOnPaneEdge}
+                          onPopOut=${moveToNewColumn}
+                          stacked=${col.length > 1}
+                          isMaximized=${maximizedSlot === slot}
+                          onToggleMaximize=${() => toggleMaximize(slot)}
+                          kanbanEvents=${kanbanEvents}
+                          activeProjectId=${activeProjectId}
+                          projectEpoch=${projectEpoch}
+                          wsConnected=${wsConnected}
+                        />`;
+                      }
                       const agent = agents.find((a) => a.id === slot);
                       const currentTask = agent?.current_task_id
                         ? tasks.find((t) => t.id === agent.current_task_id)
@@ -2868,7 +2906,7 @@ function App() {
             attentionOpen=${attentionOpen}
             onDismissAttention=${dismissAttention}
             onDismissAllAttention=${dismissAllAttention}
-            onCreateTask=${createHumanTask}
+            onOpenKanban=${() => openPane("__kanban")}
             onClose=${() => setEnvOpen(false)}
             onResizerDown=${onEnvResizerDown}
           />`
@@ -3452,6 +3490,13 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
                 <path d="M4 12 L12 10.6 L20 12 L12 13.4 Z" fill="currentColor" opacity="0.55"/>
               </svg>
             </span>
+          </button>
+          <button
+            class=${"gear kanban-open" + (openSlots.includes("__kanban") ? " active" : "")}
+            title="Open the Kanban board — tasks by lifecycle stage"
+            onClick=${() => onOpen("__kanban")}
+          >
+            <span class="kanban-icon" aria-hidden="true"><span></span></span>
           </button>
         </div>
         <div class="rail-group rail-controls">
@@ -6361,7 +6406,7 @@ function RecurrencePane({ rows, error, onClose, onRefresh, onError, onClearError
 // environment pane (right side): tasks + cost + timeline
 // ------------------------------------------------------------------
 
-function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, activeProjectId, attentionOpen, onDismissAttention, onDismissAllAttention, onCreateTask, onClose, onResizerDown }) {
+function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, activeProjectId, attentionOpen, onDismissAttention, onDismissAllAttention, onOpenKanban, onClose, onResizerDown }) {
   const [exporting, setExporting] = useState(false);
 
   const exportTeam = useCallback(async () => {
@@ -6559,7 +6604,9 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, active
         />
         <${EnvOverridesSection} agents=${agents} />
         <${EnvKDriveStatusSection} conversations=${conversations} />
-        <${EnvTasksSection} tasks=${tasks} onCreate=${onCreateTask} />
+        ${openSlots.includes("__kanban")
+          ? null
+          : html`<${EnvKanbanHint} onOpen=${onOpenKanban} />`}
         <${EnvCostSection} agents=${agents} serverStatus=${serverStatus} />
         <${EnvObjectivesSection}
           conversations=${conversations}
@@ -8019,160 +8066,23 @@ function EnvFileWriteProposalsSection({ conversations }) {
   `;
 }
 
-const TASK_STATUS_FILTERS = [
-  { key: "active", label: "active", match: (s) => s !== "done" && s !== "cancelled" },
-  { key: "all", label: "all", match: () => true },
-  { key: "done", label: "done", match: (s) => s === "done" },
-];
-
-function EnvTasksSection({ tasks, onCreate }) {
-  const [title, setTitle] = useState("");
-  const [description, setDescription] = useState("");
-  const [priority, setPriority] = useState("normal");
-  const [submitting, setSubmitting] = useState(false);
-  const [filterKey, setFilterKey] = useState(
-    () => localStorage.getItem("harness_task_filter_v1") || "active"
-  );
-  useEffect(() => {
-    try { localStorage.setItem("harness_task_filter_v1", filterKey); }
-    catch (_) { /* private mode */ }
-  }, [filterKey]);
-
-  const submit = useCallback(async (e) => {
-    e.preventDefault();
-    if (!title.trim()) return;
-    setSubmitting(true);
-    try {
-      await onCreate({ title: title.trim(), description, priority });
-      setTitle("");
-      setDescription("");
-      setPriority("normal");
-    } catch (err) {
-      console.error("create task failed", err);
-    } finally {
-      setSubmitting(false);
-    }
-  }, [title, description, priority, onCreate]);
-
-  // show open/claimed/in_progress first, then blocked, then done/cancelled
-  const statusOrder = { open: 0, claimed: 1, in_progress: 2, blocked: 3, done: 4, cancelled: 5 };
-  const filter = TASK_STATUS_FILTERS.find((f) => f.key === filterKey) || TASK_STATUS_FILTERS[0];
-  const filtered = tasks.filter((t) => filter.match(t.status));
-
-  // Hierarchical layout: render roots first, then their children
-  // indented below each. "Root" = no parent, or parent not in the
-  // filtered set (so a filter hiding a parent still surfaces the
-  // children as roots instead of making them disappear).
-  const filteredIds = new Set(filtered.map((t) => t.id));
-  const childrenOf = new Map();
-  for (const t of filtered) {
-    if (t.parent_id && filteredIds.has(t.parent_id)) {
-      const arr = childrenOf.get(t.parent_id) || [];
-      arr.push(t);
-      childrenOf.set(t.parent_id, arr);
-    }
-  }
-  const cmp = (a, b) => (statusOrder[a.status] ?? 9) - (statusOrder[b.status] ?? 9);
-  const roots = filtered
-    .filter((t) => !t.parent_id || !filteredIds.has(t.parent_id))
-    .sort(cmp);
-  for (const arr of childrenOf.values()) arr.sort(cmp);
-
-  // Flatten tree with depth info for render. `seen` guards against
-  // pathological parent_id cycles — current root-detection excludes
-  // cycle members from the walk, but a future refactor that starts
-  // from arbitrary tasks would infinite-loop without this check.
-  const flatWithDepth = [];
-  const seen = new Set();
-  const walk = (task, depth) => {
-    if (seen.has(task.id)) return;
-    seen.add(task.id);
-    flatWithDepth.push({ task, depth });
-    const kids = childrenOf.get(task.id) || [];
-    for (const k of kids) walk(k, depth + 1);
-  };
-  for (const r of roots) walk(r, 0);
-  const sorted = flatWithDepth;
-
+// Replaces the old EnvTasksSection. Tasks now live in the Kanban
+// pane (slot __kanban). When the Kanban isn't open this short hint
+// renders in the EnvPane to point users at it; clicking opens the
+// pane. Hidden when the Kanban is already open.
+function EnvKanbanHint({ onOpen }) {
   return html`
-    <section class="env-section collapsible">
-      <h3 class="env-section-title">
-        Tasks <span class="env-count">${sorted.length}/${tasks.length}</span>
-        <span class="env-task-filter-group" style="margin-left: auto; display: flex; gap: 3px;">
-          ${TASK_STATUS_FILTERS.map(
-            (f) => html`<button
-              class=${"env-task-filter" + (f.key === filterKey ? " active" : "")}
-              onClick=${() => setFilterKey(f.key)}
+    <section class="env-section">
+      <div class="kbn-env-hint">
+        Tasks live in the
+        ${onOpen
+          ? html`<button
+              class="kbn-env-hint-link"
               type="button"
-            >${f.label}</button>`
-          )}
-        </span>
-      </h3>
-      <div class="env-task-list">
-        ${sorted.length === 0
-          ? html`<div class="env-empty">
-              ${tasks.length === 0 ? "(no tasks yet)" : `(no ${filter.label} tasks)`}
-            </div>`
-          : sorted.map(
-              ({ task: t, depth }) => {
-                const active = t.status !== "done" && t.status !== "cancelled";
-                return html`
-                  <div
-                    class=${"env-task status-" + t.status + (depth > 0 ? " env-task-child" : "")}
-                    style=${depth > 0 ? `margin-left: ${depth * 14}px` : ""}
-                    key=${t.id}
-                  >
-                    <div class="env-task-head">
-                      ${depth > 0 ? html`<span class="env-task-branch">↳</span>` : null}
-                      <span class="env-task-status">${t.status}</span>
-                      <span class="env-task-id">${t.id}</span>
-                      ${active
-                        ? html`<button
-                            class="env-task-cancel"
-                            onClick=${async () => {
-                              if (!confirm(`Cancel task ${t.id}?\n${t.title}`)) return;
-                              await authFetch("/api/tasks/" + encodeURIComponent(t.id) + "/cancel", { method: "POST" });
-                            }}
-                            title="Cancel this task"
-                          >×</button>`
-                        : null}
-                    </div>
-                    <div class="env-task-title">${t.title}</div>
-                    <div class="env-task-meta">
-                      by ${t.created_by} · owner ${t.owner || "-"} · pri ${t.priority}
-                    </div>
-                  </div>
-                `;
-              }
-            )}
+              onClick=${onOpen}
+            >Kanban pane</button>`
+          : html`Kanban pane`} (open from the rail).
       </div>
-      <form class="env-task-form" onSubmit=${submit}>
-        <input
-          class="env-task-title-input"
-          placeholder="new task title"
-          value=${title}
-          onInput=${(e) => setTitle(e.target.value)}
-          autocomplete="off"
-        />
-        <textarea
-          class="env-task-desc-input"
-          placeholder="description (optional)"
-          value=${description}
-          onInput=${(e) => setDescription(e.target.value)}
-          rows=${2}
-        ></textarea>
-        <div class="env-task-row">
-          <select value=${priority} onChange=${(e) => setPriority(e.target.value)}>
-            <option value="low">low</option>
-            <option value="normal">normal</option>
-            <option value="high">high</option>
-            <option value="urgent">urgent</option>
-          </select>
-          <button class="primary" type="submit" disabled=${submitting || !title.trim()}>
-            ${submitting ? "…" : "create"}
-          </button>
-        </div>
-      </form>
     </section>
   `;
 }
@@ -10675,7 +10585,9 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
           ? html`<span
               class="pane-current-task pane-current-task-icon"
               title=${"current task: " + currentTask.title + " (" + currentTask.id + ", " + currentTask.status + ")"}
-            >⚑</span>`
+            >⚑${KANBAN_STAGE_SHORT[currentTask.status]
+              ? html`<span class="pane-current-task-stage"> ${KANBAN_STAGE_SHORT[currentTask.status]}</span>`
+              : null}</span>`
           : null}
         ${slot !== "coach"
           ? html`<button

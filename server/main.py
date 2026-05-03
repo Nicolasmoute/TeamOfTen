@@ -364,10 +364,53 @@ async def lifespan(app: FastAPI):
         await start_escalation_watcher()
     except Exception:
         logger.exception("telegram escalation watcher failed to start (non-fatal)")
+    # Kanban auto-advance subscriber — listens for commit_pushed /
+    # audit_report_submitted / task_shipped / compass_audit_logged
+    # events and applies the resulting stage transitions. Sibling of
+    # the audit-watcher; same own-task-handle pattern.
+    from server.kanban import (
+        start_kanban_subscriber, stop_kanban_subscriber,
+    )
+    try:
+        await start_kanban_subscriber()
+    except Exception:
+        logger.exception("kanban subscriber failed to start (non-fatal)")
+    # Idle-Player poller — periodic safety-net wake for Players who
+    # could be doing pool / pending work but aren't.
+    from server.idle_poller import start_idle_poller, stop_idle_poller
+    try:
+        await start_idle_poller()
+    except Exception:
+        logger.exception("idle player poller failed to start (non-fatal)")
+    # Kanban CLAUDE.md block — inject the static lifecycle paragraph
+    # into every project's CLAUDE.md so Coach + Players see the same
+    # baseline rules every turn. Idempotent; no-op when the block is
+    # already present and matches the canonical text. See
+    # Docs/kanban-specs.md §13.
+    try:
+        from server.tasks_claude_md import inject_into_all_projects
+        injected = await inject_into_all_projects()
+        if injected:
+            logger.info(
+                "tasks_claude_md: injected kanban block into %d project(s)",
+                injected,
+            )
+    except Exception:
+        logger.exception(
+            "tasks_claude_md: inject_into_all_projects failed (non-fatal)"
+        )
     bg_tasks = (snapshot_task, project_sync_task, global_sync_task, recurrence_task, stale_task_task, trim_task, att_trim_task, sessions_trim_task, compass_task)
     try:
         yield
     finally:
+        try:
+            await stop_idle_poller()
+        except Exception:
+            logger.exception("idle player poller shutdown failed")
+        try:
+            await stop_kanban_subscriber()
+        except Exception:
+            logger.exception("kanban subscriber shutdown failed")
         try:
             await stop_escalation_watcher()
         except Exception:
@@ -509,6 +552,51 @@ class CreateTaskRequest(BaseModel):
     description: str = Field(default="", max_length=10_000)
     parent_id: str | None = None
     priority: str = Field(default="normal", pattern=r"^(low|normal|high|urgent)$")
+    # Kanban: optional complexity at create time. Default 'standard';
+    # human composer in the kanban can flip to 'simple' to skip the
+    # audit + ship pipeline.
+    complexity: str = Field(
+        default="standard", pattern=r"^(simple|standard)$"
+    )
+
+
+# ------- kanban-specific request models (Docs/kanban-specs.md §7) -------
+
+
+class TaskStageRequest(BaseModel):
+    """POST /api/tasks/{id}/stage. Human override of the kanban
+    transition. `force=True` bypasses the role-completion gate (Coach
+    is asleep / over-cap, human just wants the task to move)."""
+    stage: str = Field(
+        pattern=r"^(plan|execute|audit_syntax|audit_semantics|ship|archive)$"
+    )
+    note: str = Field(default="", max_length=500)
+    force: bool = False
+
+
+class TaskComplexityRequest(BaseModel):
+    complexity: str = Field(pattern=r"^(simple|standard)$")
+
+
+class TaskBlockedRequest(BaseModel):
+    blocked: bool
+    reason: str = Field(default="", max_length=500)
+
+
+class TaskSpecRequest(BaseModel):
+    """POST /api/tasks/{id}/spec. Human-side spec writer (no
+    permission check beyond HARNESS_TOKEN). Same effect as
+    coord_write_task_spec — writes spec.md and updates spec_path."""
+    body: str = Field(min_length=1, max_length=40_000)
+
+
+class TaskAssignRequest(BaseModel):
+    """POST /api/tasks/{id}/assign. Human-side role assignment. `to`
+    accepts a single slot or a list (pool form)."""
+    role: str = Field(
+        pattern=r"^(planner|executor|auditor_syntax|auditor_semantics|shipper)$"
+    )
+    to: str | list[str]
 
 
 # ------------------------------------------------------------------
@@ -3389,9 +3477,13 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
             if (await cur.fetchone()) is None:
                 raise HTTPException(404, detail=f"parent_id {parent_id} not found")
         await c.execute(
-            "INSERT INTO tasks (id, project_id, title, description, parent_id, priority, created_by) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'human')",
-            (task_id, project_id, req.title, req.description, parent_id, req.priority),
+            "INSERT INTO tasks (id, project_id, title, description, "
+            "parent_id, priority, complexity, created_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'human')",
+            (
+                task_id, project_id, req.title, req.description,
+                parent_id, req.priority, req.complexity,
+            ),
         )
         await c.commit()
     finally:
@@ -3406,9 +3498,10 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
             "title": req.title,
             "parent_id": parent_id,
             "priority": req.priority,
+            "complexity": req.complexity,
         }
     )
-    return {"ok": True, "task_id": task_id}
+    return {"ok": True, "task_id": task_id, "complexity": req.complexity}
 
 
 @app.post("/api/tasks/{task_id}/cancel", dependencies=[Depends(require_token)])
@@ -3429,12 +3522,20 @@ async def cancel_task_from_human(task_id: str) -> dict[str, Any]:
         if row is None:
             raise HTTPException(404, detail=f"task {task_id} not found")
         task = dict(row)
-        if task["status"] in ("done", "cancelled"):
-            return {"ok": True, "task_id": task_id, "already": task["status"]}
+        # Already-archive case: idempotent return so the UI can fire-and-
+        # forget cancels without racing.
+        if task["status"] == "archive":
+            return {"ok": True, "task_id": task_id, "already": "archive"}
         old_status = task["status"]
+        now = datetime.now(timezone.utc).isoformat()
+        # Cancellation lands in archive with cancelled_at + archived_at +
+        # completed_at populated. The archive view's "show cancelled"
+        # toggle filters on cancelled_at.
         await c.execute(
-            "UPDATE tasks SET status = 'cancelled' WHERE id = ? AND project_id = ?",
-            (task_id, project_id),
+            "UPDATE tasks SET status = 'archive', "
+            "completed_at = ?, archived_at = ?, cancelled_at = ? "
+            "WHERE id = ? AND project_id = ?",
+            (now, now, now, task_id, project_id),
         )
         if task["owner"]:
             await c.execute(
@@ -3446,6 +3547,20 @@ async def cancel_task_from_human(task_id: str) -> dict[str, Any]:
     finally:
         await c.close()
 
+    # Emit the kanban-shaped event AND the legacy event for back-compat.
+    await bus.publish(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": "human",
+            "type": "task_stage_changed",
+            "task_id": task_id,
+            "from": old_status,
+            "to": "archive",
+            "reason": "manual",
+            "note": "cancelled by human",
+            "owner": task["owner"],
+        }
+    )
     await bus.publish(
         {
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -3453,11 +3568,555 @@ async def cancel_task_from_human(task_id: str) -> dict[str, Any]:
             "type": "task_updated",
             "task_id": task_id,
             "old_status": old_status,
-            "new_status": "cancelled",
+            "new_status": "archive",
             "note": "cancelled by human",
+            "owner": task["owner"],
         }
     )
     return {"ok": True, "task_id": task_id, "old_status": old_status}
+
+
+# ------------------------------------------------------------------
+# Kanban-shaped views + human overrides (Docs/kanban-specs.md §7)
+# ------------------------------------------------------------------
+
+
+def _priority_sort_key(row: dict[str, Any]) -> tuple[int, str]:
+    """Card sort: priority first (urgent floats), then created_at."""
+    pri_rank = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
+    return (
+        pri_rank.get(row.get("priority") or "normal", 2),
+        row.get("created_at") or "",
+    )
+
+
+async def _load_active_role_assignments(
+    task_ids: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """For the given task ids, fetch every active role-assignment row
+    (un-completed, un-superseded) keyed by task_id. Lets the board
+    response embed `assignments: [...]` per card without N+1 queries."""
+    if not task_ids:
+        return {}
+    placeholders = ",".join("?" * len(task_ids))
+    out: dict[str, list[dict[str, Any]]] = {tid: [] for tid in task_ids}
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            f"SELECT id, task_id, role, eligible_owners, owner, "
+            f"assigned_at, claimed_at, started_at, completed_at, "
+            f"report_path, verdict "
+            f"FROM task_role_assignments "
+            f"WHERE task_id IN ({placeholders}) "
+            f"AND completed_at IS NULL AND superseded_by IS NULL "
+            f"ORDER BY assigned_at",
+            task_ids,
+        )
+        for row in await cur.fetchall():
+            d = dict(row)
+            out.setdefault(d["task_id"], []).append(d)
+    finally:
+        await c.close()
+    return out
+
+
+async def _load_role_assignment_history(
+    task_ids: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Fetch full assignment history keyed by task_id.
+
+    Archive cards use this so completed and superseded role rows remain
+    visible after the task leaves the active board.
+    """
+    if not task_ids:
+        return {}
+    placeholders = ",".join("?" * len(task_ids))
+    out: dict[str, list[dict[str, Any]]] = {tid: [] for tid in task_ids}
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            f"SELECT id, task_id, role, eligible_owners, owner, "
+            f"assigned_at, claimed_at, started_at, completed_at, "
+            f"report_path, verdict, superseded_by "
+            f"FROM task_role_assignments "
+            f"WHERE task_id IN ({placeholders}) "
+            f"ORDER BY assigned_at",
+            task_ids,
+        )
+        for row in await cur.fetchall():
+            d = dict(row)
+            out.setdefault(d["task_id"], []).append(d)
+    finally:
+        await c.close()
+    return out
+
+
+@app.get("/api/tasks/board", dependencies=[Depends(require_token)])
+async def get_tasks_board() -> dict[str, Any]:
+    """Active kanban board: tasks grouped by stage, sorted by priority
+    then created_at. No `archive` bucket — see GET /api/tasks/archive
+    for the paginated archive view. Each task includes its full active
+    role-assignment list so the card can render assignees."""
+    project_id = await resolve_active_project()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT * FROM tasks WHERE project_id = ? AND status != 'archive'",
+            (project_id,),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+    finally:
+        await c.close()
+
+    role_map = await _load_active_role_assignments([r["id"] for r in rows])
+
+    buckets: dict[str, list[dict[str, Any]]] = {
+        "plan": [],
+        "execute": [],
+        "audit_syntax": [],
+        "audit_semantics": [],
+        "ship": [],
+    }
+    for row in rows:
+        row["assignments"] = role_map.get(row["id"], [])
+        buckets.setdefault(row["status"], []).append(row)
+    for stage in buckets:
+        buckets[stage].sort(key=_priority_sort_key)
+    return {"board": buckets, **buckets}
+
+
+@app.get("/api/tasks/archive", dependencies=[Depends(require_token)])
+async def get_tasks_archive(
+    limit: int = 50,
+    offset: int = 0,
+    q: str | None = None,
+    include_cancelled: bool = False,
+) -> dict[str, Any]:
+    """Paginated archive view for the drawer. Newest-first by
+    archived_at. `q` does case-insensitive title+description LIKE
+    when supplied. `include_cancelled=False` (default) hides
+    cancelled tasks; `True` shows them with their CANCELLED chip."""
+    project_id = await resolve_active_project()
+    limit = max(1, min(200, limit))
+    offset = max(0, offset)
+    where = ["project_id = ?", "status = 'archive'"]
+    params: list[Any] = [project_id]
+    if not include_cancelled:
+        where.append("cancelled_at IS NULL")
+    if q:
+        where.append("(LOWER(title) LIKE ? OR LOWER(description) LIKE ?)")
+        like = f"%{q.lower()}%"
+        params.extend([like, like])
+    clause = " WHERE " + " AND ".join(where)
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            f"SELECT * FROM tasks{clause} "
+            f"ORDER BY archived_at DESC LIMIT ? OFFSET ?",
+            params + [limit, offset],
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+        # Total count for pagination UI.
+        cur = await c.execute(
+            f"SELECT COUNT(*) AS n FROM tasks{clause}", params
+        )
+        total = int(dict(await cur.fetchone())["n"])
+    finally:
+        await c.close()
+    role_map = await _load_role_assignment_history([r["id"] for r in rows])
+    for row in rows:
+        row["assignments"] = role_map.get(row["id"], [])
+    return {"tasks": rows, "total": total, "limit": limit, "offset": offset}
+
+
+@app.get(
+    "/api/tasks/{task_id}/assignments", dependencies=[Depends(require_token)]
+)
+async def get_task_assignments(task_id: str) -> dict[str, Any]:
+    """Full role-assignment history for one task — every row,
+    including superseded + completed. Used by the card-expansion UI
+    to render the audit-loop history (round 1 syntax fail → round 1
+    syntax pass → round 1 semantics fail → round 2 semantics pass →
+    ship)."""
+    project_id = await resolve_active_project()
+    c = await configured_conn()
+    try:
+        # Confirm task exists in this project (avoids fishing).
+        cur = await c.execute(
+            "SELECT 1 FROM tasks WHERE id = ? AND project_id = ?",
+            (task_id, project_id),
+        )
+        if (await cur.fetchone()) is None:
+            raise HTTPException(404, detail=f"task {task_id} not found")
+        cur = await c.execute(
+            "SELECT id, task_id, role, eligible_owners, owner, "
+            "assigned_at, claimed_at, started_at, completed_at, "
+            "report_path, verdict, superseded_by "
+            "FROM task_role_assignments "
+            "WHERE task_id = ? "
+            "ORDER BY assigned_at",
+            (task_id,),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+    finally:
+        await c.close()
+    return {"task_id": task_id, "assignments": rows}
+
+
+# Kanban transitions / overrides ------------------------------------
+
+# Reuse the in-tools state machine so the human override path goes
+# through the same validator as Coach's MCP-tool override.
+from server.tools import (  # noqa: E402
+    ALL_KANBAN_STAGES,
+    _check_kanban_role_gate,
+    _valid_transition,
+)
+
+
+@app.post(
+    "/api/tasks/{task_id}/stage", dependencies=[Depends(require_token)]
+)
+async def post_task_stage(
+    task_id: str, req: TaskStageRequest
+) -> dict[str, Any]:
+    """Human-side stage override. Validates against the state machine
+    unless `force=True`."""
+    if req.stage not in ALL_KANBAN_STAGES:
+        raise HTTPException(400, detail=f"invalid stage: {req.stage}")
+    project_id = await resolve_active_project()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT status, owner FROM tasks "
+            "WHERE id = ? AND project_id = ?",
+            (task_id, project_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(404, detail=f"task {task_id} not found")
+        t = dict(row)
+        old_status = t["status"]
+        if not req.force and not _valid_transition(old_status, req.stage):
+            raise HTTPException(
+                400,
+                detail=(
+                    f"invalid transition: {old_status} → {req.stage} "
+                    f"(pass force=true to bypass the gate)"
+                ),
+            )
+        # Role-completion gate (Docs/kanban-specs.md §2.3). Skipped on
+        # `force=true` (the documented escape hatch). Cancellation has
+        # its own endpoint (POST /api/tasks/{id}/cancel) so the stage
+        # endpoint's archive moves are always treated as delivery.
+        if not req.force:
+            gate_err = await _check_kanban_role_gate(
+                c,
+                project_id,
+                task_id,
+                old_status,
+                req.stage,
+                was_cancellation=False,
+            )
+            if gate_err is not None:
+                raise HTTPException(
+                    400,
+                    detail=f"{gate_err} (pass force=true to bypass)",
+                )
+        now = datetime.now(timezone.utc).isoformat()
+        if req.stage == "archive":
+            await c.execute(
+                "UPDATE tasks SET status = 'archive', "
+                "completed_at = ?, archived_at = ? "
+                "WHERE id = ? AND project_id = ?",
+                (now, now, task_id, project_id),
+            )
+            if t["owner"]:
+                await c.execute(
+                    "UPDATE agents SET current_task_id = NULL "
+                    "WHERE id = ? AND current_task_id = ?",
+                    (t["owner"], task_id),
+                )
+        else:
+            await c.execute(
+                "UPDATE tasks SET status = ? "
+                "WHERE id = ? AND project_id = ?",
+                (req.stage, task_id, project_id),
+            )
+        await c.commit()
+    finally:
+        await c.close()
+
+    await bus.publish({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": "human",
+        "type": "task_stage_changed",
+        "task_id": task_id,
+        "from": old_status,
+        "to": req.stage,
+        "reason": "manual",
+        "note": req.note or None,
+        "owner": t["owner"],
+    })
+    return {"ok": True, "task_id": task_id, "from": old_status, "to": req.stage}
+
+
+@app.post(
+    "/api/tasks/{task_id}/complexity", dependencies=[Depends(require_token)]
+)
+async def post_task_complexity(
+    task_id: str, req: TaskComplexityRequest
+) -> dict[str, Any]:
+    project_id = await resolve_active_project()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT owner, status FROM tasks WHERE id = ? AND project_id = ?",
+            (task_id, project_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(404, detail=f"task {task_id} not found")
+        task_row = dict(row)
+        owner = task_row["owner"]
+        if task_row.get("status") == "archive":
+            raise HTTPException(
+                400, detail="archived tasks are read-only"
+            )
+        await c.execute(
+            "UPDATE tasks SET complexity = ? "
+            "WHERE id = ? AND project_id = ?",
+            (req.complexity, task_id, project_id),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    await bus.publish({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": "human",
+        "type": "task_complexity_set",
+        "task_id": task_id,
+        "complexity": req.complexity,
+        "to": owner,
+    })
+    return {"ok": True, "task_id": task_id, "complexity": req.complexity}
+
+
+@app.post(
+    "/api/tasks/{task_id}/blocked", dependencies=[Depends(require_token)]
+)
+async def post_task_blocked(
+    task_id: str, req: TaskBlockedRequest
+) -> dict[str, Any]:
+    project_id = await resolve_active_project()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT owner, status FROM tasks WHERE id = ? AND project_id = ?",
+            (task_id, project_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(404, detail=f"task {task_id} not found")
+        task_row = dict(row)
+        owner = task_row["owner"]
+        if task_row.get("status") == "archive":
+            raise HTTPException(
+                400, detail="archived tasks are read-only"
+            )
+        await c.execute(
+            "UPDATE tasks SET blocked = ?, blocked_reason = ? "
+            "WHERE id = ? AND project_id = ?",
+            (1 if req.blocked else 0, req.reason or None, task_id, project_id),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    await bus.publish({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": "human",
+        "type": "task_blocked_changed",
+        "task_id": task_id,
+        "blocked": bool(req.blocked),
+        "reason": req.reason or None,
+        "to": owner,
+    })
+    return {
+        "ok": True, "task_id": task_id, "blocked": bool(req.blocked),
+    }
+
+
+@app.post(
+    "/api/tasks/{task_id}/spec", dependencies=[Depends(require_token)]
+)
+async def post_task_spec(
+    task_id: str, req: TaskSpecRequest
+) -> dict[str, Any]:
+    """Human-side spec writer. Same effect as coord_write_task_spec
+    but bypasses the Player permission check (HARNESS_TOKEN is the
+    only gate for human-side endpoints)."""
+    from server.tasks import is_valid_task_id, write_task_spec
+    if not is_valid_task_id(task_id):
+        raise HTTPException(400, detail=f"invalid task_id: {task_id}")
+    project_id = await resolve_active_project()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT title, owner, created_by, created_at, priority, "
+            "complexity FROM tasks "
+            "WHERE id = ? AND project_id = ?",
+            (task_id, project_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(404, detail=f"task {task_id} not found")
+        t = dict(row)
+    finally:
+        await c.close()
+
+    try:
+        target, rel, written_at = await write_task_spec(
+            project_id=project_id,
+            task_id=task_id,
+            title=t["title"],
+            body=req.body,
+            author="human",
+            created_by=t["created_by"],
+            created_at=t["created_at"],
+            priority=t["priority"],
+            complexity=t["complexity"],
+        )
+    except ValueError as exc:
+        raise HTTPException(400, detail=str(exc)) from exc
+
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE tasks SET spec_path = ?, spec_written_at = ? "
+            "WHERE id = ? AND project_id = ?",
+            (rel, written_at, task_id, project_id),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    await bus.publish({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": "human",
+        "type": "task_spec_written",
+        "task_id": task_id,
+        "spec_path": rel,
+        "to": t["owner"],
+    })
+    return {"ok": True, "task_id": task_id, "spec_path": rel}
+
+
+@app.post(
+    "/api/tasks/{task_id}/assign", dependencies=[Depends(require_token)]
+)
+async def post_task_assign(
+    task_id: str, req: TaskAssignRequest
+) -> dict[str, Any]:
+    """Human-side role assignment — useful when Coach is asleep or
+    over-cap. Inserts a task_role_assignments row. `to` accepts a
+    single slot or a list (pool form). Same auto-wake behavior as
+    the Coach MCP tools."""
+    import json
+    from server.tools import VALID_RECIPIENTS  # noqa: WPS433
+    targets_raw = req.to
+    if isinstance(targets_raw, str):
+        targets = [targets_raw.strip().lower()] if targets_raw.strip() else []
+    else:
+        targets = [str(s).strip().lower() for s in targets_raw if str(s).strip()]
+    if not targets:
+        raise HTTPException(400, detail="'to' is empty")
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for slot in targets:
+        if slot in seen:
+            continue
+        seen.add(slot)
+        if slot in ("coach", "broadcast"):
+            raise HTTPException(
+                400, detail=f"can only assign Players (p1..p10), not {slot!r}"
+            )
+        if slot not in VALID_RECIPIENTS:
+            raise HTTPException(400, detail=f"invalid slot: {slot}")
+        deduped.append(slot)
+
+    project_id = await resolve_active_project()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT status FROM tasks WHERE id = ? AND project_id = ?",
+            (task_id, project_id),
+        )
+        task_row = await cur.fetchone()
+        if task_row is None:
+            raise HTTPException(404, detail=f"task {task_id} not found")
+        if dict(task_row).get("status") == "archive":
+            raise HTTPException(
+                400, detail="archived tasks are read-only"
+            )
+        now = datetime.now(timezone.utc).isoformat()
+        if len(deduped) > 1:
+            insert_cur = await c.execute(
+                "INSERT INTO task_role_assignments "
+                "(task_id, role, eligible_owners, owner, assigned_at) "
+                "VALUES (?, ?, ?, NULL, ?)",
+                (task_id, req.role, json.dumps(deduped), now),
+            )
+        else:
+            insert_cur = await c.execute(
+                "INSERT INTO task_role_assignments "
+                "(task_id, role, eligible_owners, owner, "
+                "assigned_at, claimed_at) "
+                "VALUES (?, ?, '[]', ?, ?, ?)",
+                (task_id, req.role, deduped[0], now, now),
+            )
+        new_assignment_id = insert_cur.lastrowid
+        if (
+            req.role in ("auditor_syntax", "auditor_semantics")
+            and new_assignment_id
+        ):
+            await c.execute(
+                "UPDATE task_role_assignments SET superseded_by = ? "
+                "WHERE task_id = ? AND role = ? AND id <> ? "
+                "AND verdict = 'fail' AND completed_at IS NOT NULL "
+                "AND superseded_by IS NULL",
+                (new_assignment_id, task_id, req.role, new_assignment_id),
+            )
+        await c.commit()
+    finally:
+        await c.close()
+
+    await bus.publish({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": "human",
+        "type": "task_role_assigned",
+        "task_id": task_id,
+        "role": req.role,
+        "eligible_owners": deduped,
+        "owner": (None if len(deduped) > 1 else deduped[0]),
+        "to": (deduped[0] if len(deduped) == 1 else None),
+    })
+
+    # Auto-wake eligible Players (best-effort).
+    try:
+        from server.agents import maybe_wake_agent
+        wake_text = (
+            f"Human assigned you the {req.role} role on task {task_id}. "
+            f"Call coord_my_assignments to see context."
+        )
+        for slot in deduped:
+            try:
+                await maybe_wake_agent(slot, wake_text, bypass_debounce=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return {"ok": True, "task_id": task_id, "role": req.role, "to": deduped}
 
 
 # ------------------------------------------------------------------
