@@ -3298,6 +3298,21 @@ Pending-prompt queue (optimistic local echo + auto-retry):
   re-POSTed with the original cached `reqBody` (model / plan_mode /
   effort overrides preserved). FIFO order; one retry per idle
   transition.
+- Reject-loop throttle: when reconciliation flips an entry to `queued`
+  it stamps `rejectedAt` with the `spawn_rejected` event ts. The
+  auto-retry effect won't re-fire that entry until either a boundary
+  event for this slot (`agent_stopped` / `agent_cancelled` / `result`)
+  arrives strictly after `rejectedAt`, or a 2s ceiling elapses
+  (whichever comes first). A `setTimeout` nudges `pending` so the
+  effect re-evaluates exactly when the ceiling expires. Without this
+  gate, a tight reject→retry round-trip (~30ms) produces a storm of
+  `spawn_rejected` rows when something else (recurrence tick,
+  auto-wake, the brief window between `_set_status('idle')` and
+  `_running_tasks.pop()`) keeps reclaiming the slot the moment it
+  frees. With the gate, contention degrades to one attempt per ~2s
+  until the contender lets go. The stamp clears when the retry
+  actually fires so a fresh rejection on the next round-trip
+  re-stamps with a current ts.
 - Cancel: each pending card has an `×` button to discard.
 - Per-pane state, in-memory only (lost on refresh — acceptable since
   prompts not yet started leave no server-side trace anyway).

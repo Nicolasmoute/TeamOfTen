@@ -32,6 +32,7 @@ There is no `ANTHROPIC_API_KEY` path here — by design.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import re
@@ -85,18 +86,60 @@ _VALID_EFFORTS: frozenset[str] = frozenset({"low", "medium", "high", "max"})
 def _resolve_model(model: str | None) -> str | None:
     """Pick the model for this Compass call.
 
-    Precedence: explicit param > `HARNESS_COMPASS_MODEL` env >
-    `LLM_MODEL_DEFAULT_ALIAS` (default `latest_sonnet`). The resolved
-    value runs through `models_catalog.resolve_model_alias` so
-    aliases (`latest_sonnet`, `latest_opus`, etc.) are turned into
-    concrete model ids before being handed to the SDK + recorded in
-    the turns ledger. The catalog alias map is the single point of
-    update when newer models ship.
+    Precedence: explicit param > `LLM_MODEL_DEFAULT_ALIAS` (the team-
+    wide hardcoded default `latest_sonnet`). The resolved value runs
+    through `models_catalog.resolve_model_alias` so aliases
+    (`latest_sonnet`, `latest_opus`, etc.) are turned into concrete
+    model ids before being handed to the SDK + recorded in the turns
+    ledger. The catalog alias map is the single point of update when
+    newer models ship.
+
+    No env-var or UI override exists by design: Compass model + effort
+    are team-wide policy, not per-deploy knobs.
     """
     from server.models_catalog import resolve_model_alias  # noqa: PLC0415
 
-    raw = model or config.LLM_MODEL_OVERRIDE or config.LLM_MODEL_DEFAULT_ALIAS
+    raw = model or config.LLM_MODEL_DEFAULT_ALIAS
     return resolve_model_alias(raw)
+
+
+# Per-run fallback latch. The runner sets this to False at the start
+# of `runner.run()` and resets it at the end via the returned token.
+# `call()` flips it to True on the first Claude failure inside a run
+# so subsequent stages skip Claude and go straight to Codex — saves
+# the per-call CompassLLMError + retry cost during a Max-plan 5h
+# block or auth outage.
+#
+# Standalone calls (audit watcher) inherit the parent's value (False)
+# and don't latch beyond the single call: each audit independently
+# tries Claude first.
+_FALLBACK_LATCHED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "compass_fallback_latched", default=False,
+)
+
+
+def is_fallback_latched() -> bool:
+    """Return True if the current async context has flipped to Codex
+    fallback mode. Read-only probe for tests + diagnostics."""
+    return _FALLBACK_LATCHED.get()
+
+
+def begin_run_latch_scope() -> contextvars.Token[bool]:
+    """Reset the fallback latch to False at the start of a Compass
+    run. Returns a token; pair with `end_run_latch_scope(token)` in
+    a try/finally so the contextvar restores to its parent-context
+    value when the run exits.
+
+    Required because `call()` may flip the latch to True mid-run; if
+    we don't reset between runs, every subsequent run on the same
+    asyncio task would skip Claude even after the outage is over.
+    """
+    return _FALLBACK_LATCHED.set(False)
+
+
+def end_run_latch_scope(token: contextvars.Token[bool]) -> None:
+    """Pair with `begin_run_latch_scope`."""
+    _FALLBACK_LATCHED.reset(token)
 
 
 def _resolve_effort() -> str | None:
@@ -119,17 +162,107 @@ async def call(
     project_id: str | None = None,
     label: str = "compass",
 ) -> CompassLLMResult:
-    """Run one round-trip Claude call. Returns the assistant's final
-    text plus usage metrics. Raises `CompassLLMError` only if the
-    SDK never produces a `ResultMessage` (i.e. the subprocess died
-    before it could finish — distinct from a soft `is_error=True`
-    result, which is captured in the return value).
+    """Run one round-trip Compass LLM call.
+
+    Routes Claude (primary) → Codex (fallback) per the rules in
+    `Docs/compass-specs.md` §5.5.2. The fallback fires when:
+      - The Claude path raises `CompassLLMError` (SDK never produced
+        a `ResultMessage` — subprocess died, auth gone, rate-limited).
+      - The Claude path returned a `ResultMessage(is_error=True)` —
+        the CLI surfaced an error result.
+
+    Per-run latching: inside a `runner.run()` scope (use
+    `begin_run_latch_scope` / `end_run_latch_scope`), the first
+    Claude failure flips the latch and every subsequent call in the
+    same scope goes straight to Codex. Standalone calls (audit
+    watcher) inherit `latched=False` and retry on Codex per call.
+
+    Raises `CompassLLMError` only if BOTH runtimes failed, or if the
+    fallback is disabled and Claude failed.
 
     `label` is recorded in the `turns` ledger's `cost_basis` field so
     a query like `SELECT * FROM turns WHERE agent_id='compass' AND
     cost_basis='compass:audit'` discriminates pipeline stages without
     a separate table. Limited to short identifiers ("compass:digest",
-    "compass:audit", etc.).
+    "compass:audit", etc.). The Codex fallback writes the same label
+    so cost rollup is unified across runtimes.
+    """
+    # Latched: skip Claude entirely.
+    if config.LLM_FALLBACK_ENABLED and _FALLBACK_LATCHED.get():
+        return await _call_codex_via_helper(
+            system, user, project_id=project_id, label=label,
+        )
+
+    # Primary: try Claude. On failure (raise OR is_error), fall back
+    # if enabled.
+    try:
+        result = await _call_claude(
+            system, user, max_tokens=max_tokens, model=model,
+            project_id=project_id, label=label,
+        )
+    except CompassLLMError as exc:
+        if not config.LLM_FALLBACK_ENABLED:
+            raise
+        logger.warning(
+            "compass.llm: Claude path raised %s — latching fallback to Codex",
+            type(exc).__name__,
+        )
+        _FALLBACK_LATCHED.set(True)
+        return await _call_codex_via_helper(
+            system, user, project_id=project_id, label=label,
+        )
+
+    if result.is_error and config.LLM_FALLBACK_ENABLED:
+        logger.warning(
+            "compass.llm: Claude path returned is_error=True — latching "
+            "fallback to Codex"
+        )
+        _FALLBACK_LATCHED.set(True)
+        try:
+            return await _call_codex_via_helper(
+                system, user, project_id=project_id, label=label,
+            )
+        except CompassLLMError:
+            # Both runtimes failed — return the original (Claude)
+            # error result so the caller still sees usage + label data.
+            logger.exception(
+                "compass.llm: Codex fallback also failed — returning "
+                "the Claude error result"
+            )
+            return result
+    return result
+
+
+async def _call_codex_via_helper(
+    system: str,
+    user: str,
+    *,
+    project_id: str | None,
+    label: str,
+) -> CompassLLMResult:
+    """Indirection so tests can monkeypatch the Codex path on this
+    module without importing `compass.codex_llm` (which has a hard
+    dependency on the Codex SDK)."""
+    from server.compass.codex_llm import call_codex  # noqa: PLC0415
+
+    return await call_codex(
+        system, user, project_id=project_id, label=label,
+    )
+
+
+async def _call_claude(
+    system: str,
+    user: str,
+    *,
+    max_tokens: int | None = None,
+    model: str | None = None,
+    project_id: str | None = None,
+    label: str = "compass",
+) -> CompassLLMResult:
+    """Claude-side implementation of `call()`. Same shape, no fallback
+    logic — that lives in `call()`. Kept as a private helper so tests
+    can stub the Codex path while still exercising real Claude
+    behavior, and vice-versa.
     """
     # Lazy import — claude_agent_sdk is a heavy import; test fixtures
     # without an installed SDK still load this module. The SDK is
@@ -463,6 +596,9 @@ __all__ = [
     "CompassLLMError",
     "CompassLLMResult",
     "call",
+    "is_fallback_latched",
+    "begin_run_latch_scope",
+    "end_run_latch_scope",
     "parse_json_safe",
     "expect_dict",
     "expect_list",

@@ -797,6 +797,78 @@ Spec mirror: [Docs/kanban-specs.md](Docs/kanban-specs.md) bumped to
 v0.3 (new §3 Trajectory, §17 Coach quality feedback, §18 Flow
 continuity & observability). Suite at 1064/1064.
 
+**Recent (2026-05-04) — Compass Codex fallback:**
+
+When the primary Claude path fails inside Compass — token exhaustion
+during a 5h Max-plan block, auth rotation, transient subprocess
+crash, network outage — Compass now falls back to a one-shot Codex
+call instead of skipping the stage. Two trigger conditions: (a)
+`_call_claude` raises `CompassLLMError` (no `ResultMessage`
+produced); (b) `_call_claude` returns
+`CompassLLMResult(is_error=True)`. Fallback model is `latest_mini`
+at `medium` effort — hardcoded, no env var, no UI knob, same
+team-wide-policy posture as the primary `latest_sonnet` /
+`medium`. Bumping the tier when OpenAI ships a newer mini means
+editing only `_ALIAS_TO_CONCRETE` in
+[server/models_catalog.py](server/models_catalog.py).
+
+- **Per-run latching** —
+  [server/compass/llm.py](server/compass/llm.py) holds a
+  `_FALLBACK_LATCHED: ContextVar[bool]`.
+  [server/compass/runner.py](server/compass/runner.py) wraps the
+  pipeline in `begin_run_latch_scope()` / `end_run_latch_scope()`;
+  inside that scope the first Claude failure flips the latch and
+  every subsequent stage in the same run skips Claude entirely —
+  saves the wasted `CompassLLMError + retry` cost across a
+  multi-stage pipeline during a real outage. Standalone calls
+  (the auto-audit watcher's `audit_work` task) inherit
+  `latched=False` and retry on Codex per call — each audit gets
+  its own contextvar copy via `asyncio.create_task`.
+- **One-shot Codex helper** —
+  [server/compass/codex_llm.py](server/compass/codex_llm.py)
+  spawns a fresh `codex app-server` subprocess per call, starts
+  an ephemeral thread (no `agent_sessions` row), sends the prompt
+  with `mcp_servers={}` and `sandbox="read-only"`, accumulates
+  the assistant text from `agentMessage` items, then closes the
+  thread + client. Reuses `_import_codex_sdk` / `_await_if_needed`
+  / `resolve_auth` / `_read_codex_token_count_from_rollout` /
+  `_codex_usage_from_rollout_info` from
+  [server/runtimes/codex.py](server/runtimes/codex.py) so usage
+  extraction + auth resolution are identical to the agent runtime.
+- **Cost path mirrored** — ChatGPT auth →
+  `cost_basis="plan_included"` ($0.0); api_key auth → priced via
+  `codex_cost_usd`. Ledger row under `agent_id="compass"`,
+  `runtime="codex"` with the same `cost_basis` label as the
+  equivalent Claude call (`compass:audit`, `compass:digest`,
+  etc.) so cost rollups stay unified across runtimes. The
+  `compass_llm_call` bus event also carries `runtime: "codex"`
+  for the dashboard's live counter.
+- **Both-runtime-fail behavior** — if Codex also fails (no auth /
+  SDK missing / fresh failure), the call returns the original
+  Claude error result (when Claude returned `is_error=True`) or
+  raises `CompassLLMError` (when Claude raised). The caller's
+  existing `parse_json_safe + skip on None` machinery handles the
+  rest — a fully-down LLM tier degrades to "skip the stage" same
+  as before.
+- **No env vars / UI knobs added.** The hardcoded constants in
+  [server/compass/config.py](server/compass/config.py) —
+  `LLM_MODEL_DEFAULT_ALIAS`, `LLM_EFFORT`,
+  `LLM_FALLBACK_MODEL_ALIAS`, `LLM_FALLBACK_EFFORT`,
+  `LLM_FALLBACK_ENABLED` — are the single source of truth.
+  `HARNESS_COMPASS_MODEL` / `HARNESS_COMPASS_EFFORT` env reads
+  removed; the env-override `LLM_MODEL_OVERRIDE` constant +
+  associated tests dropped.
+- **15 new tests** in
+  [server/tests/test_compass_codex_fallback.py](server/tests/test_compass_codex_fallback.py)
+  cover: happy path, raise + is_error fallback paths, both-
+  runtime-fail (raise + soft), fallback-disabled propagation,
+  per-run latch (call 1 fails Claude → calls 2 + 3 skip Claude),
+  latch resets between runs, standalone-call-no-scope per-task
+  isolation, plus `_resolve_codex_model` + `_resolve_codex_effort`
+  defaults + validation. Suite at 1078/1078.
+
+Spec mirror: [Docs/compass-specs.md](Docs/compass-specs.md) §5.5.2.
+
 **Recent (2026-05-03) — Compass pinned to Sonnet + medium effort:**
 
 Compass was previously letting the Claude Agent SDK fall through to

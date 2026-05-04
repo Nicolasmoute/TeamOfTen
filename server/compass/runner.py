@@ -28,7 +28,7 @@ from typing import Any
 
 from server.events import bus
 
-from server.compass import config, mutate, presence, store
+from server.compass import config, llm, mutate, presence, store
 from server.compass.pipeline import (
     briefing as pl_briefing,
     claude_md as pl_claude_md,
@@ -103,7 +103,17 @@ async def run(project_id: str, mode: str = "daily") -> dict[str, Any]:
         return {"run_id": None, "skipped": True, "skipped_reason": "already running"}
 
     async with lock:
-        return await _run_locked(project_id, mode)
+        # Reset the Codex fallback latch at run boundary. Inside this
+        # scope, the first `compass.llm.call` failure flips the latch
+        # to True and every subsequent stage in this run goes straight
+        # to Codex. The reset on exit means the next run starts fresh
+        # on Claude — important for short-lived outages (Max-plan 5h
+        # block expired by the next daily run).
+        latch_token = llm.begin_run_latch_scope()
+        try:
+            return await _run_locked(project_id, mode)
+        finally:
+            llm.end_run_latch_scope(latch_token)
 
 
 async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:

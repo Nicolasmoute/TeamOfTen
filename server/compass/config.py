@@ -138,21 +138,38 @@ LLM_MAX_TOKENS_AUDIT = _env_int("HARNESS_COMPASS_LLM_MAX_TOKENS_AUDIT", 1200)
 # Compass uses a Sonnet-tier model by default — capable enough for
 # strategy reasoning over the lattice + truth corpus, cheap enough
 # that a few daily runs + a handful of audits per project costs
-# pennies. The default is the **alias** `latest_sonnet` (resolved at
+# pennies. The value is the **alias** `latest_sonnet` (resolved at
 # call time via `models_catalog.resolve_model_alias`) so when
 # Anthropic ships a newer Sonnet, only the catalog alias map needs
-# bumping — no compass-side change. Override with
-# `HARNESS_COMPASS_MODEL=<alias-or-concrete-id>` to pin a specific
-# model (e.g. `latest_opus` for hard reasoning, `latest_haiku` for
-# cost-constrained deploys).
+# bumping — no compass-side change. Hardcoded by design: there is
+# no env knob and no UI knob, so the team-wide policy ("Compass
+# runs on Sonnet at medium effort") is enforced uniformly across
+# every deploy.
 LLM_MODEL_DEFAULT_ALIAS = "latest_sonnet"
-LLM_MODEL_OVERRIDE = os.environ.get("HARNESS_COMPASS_MODEL", "").strip() or None
 
 # Reasoning-effort knob passed through to `ClaudeAgentOptions(effort=...)`.
 # "medium" balances signal quality with token cost for Compass's
 # mid-stakes pipeline (digest / audit / question generation / Tier B
-# output body review). Override with `HARNESS_COMPASS_EFFORT=low|medium|high|max`.
-LLM_EFFORT = os.environ.get("HARNESS_COMPASS_EFFORT", "").strip().lower() or "medium"
+# output body review).
+LLM_EFFORT = "medium"
+
+# ----------------------------------------------------- Codex fallback
+# When the primary Claude call fails (CompassLLMError raised before
+# ResultMessage, or ResultMessage with is_error=True), Compass falls
+# back to a one-shot Codex call. Triggered by token exhaustion (5h
+# Max block), auth rotation, network outage, or transient subprocess
+# crash on the Claude side. Fallback is per-run latched: the first
+# failure inside a `runner.run()` flips a contextvar and every
+# subsequent stage in that run goes straight to Codex; the next run
+# starts fresh on Claude. Standalone calls (audit watcher) don't
+# latch — each call independently retries on Codex if Claude fails.
+#
+# Hardcoded values (no env, no UI). The fallback model is the cheap
+# Codex tier — Codex is the safety net, not a daily driver, so a
+# mini-tier model is the right cost shape.
+LLM_FALLBACK_MODEL_ALIAS = "latest_mini"
+LLM_FALLBACK_EFFORT = "medium"
+LLM_FALLBACK_ENABLED = True
 
 # ---------------------------------------------------- CLAUDE.md markers
 # Marker pair delimiting Compass's managed block in the project
@@ -219,8 +236,10 @@ __all__ = [
     "LLM_MAX_TOKENS_BRIEFING",
     "LLM_MAX_TOKENS_AUDIT",
     "LLM_MODEL_DEFAULT_ALIAS",
-    "LLM_MODEL_OVERRIDE",
     "LLM_EFFORT",
+    "LLM_FALLBACK_MODEL_ALIAS",
+    "LLM_FALLBACK_EFFORT",
+    "LLM_FALLBACK_ENABLED",
     "CLAUDE_MD_START_MARKER",
     "CLAUDE_MD_END_MARKER",
     "enabled_key",

@@ -9836,7 +9836,18 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
         if (rejected && p.status === "sending") {
           changed = true;
           if (rejected.__id != null) consumed.add(rejected.__id);
-          next.push({ ...p, status: "queued" });
+          // Stamp rejection time so the auto-retry effect can throttle
+          // a tight reject→retry→reject loop. Without this, when a
+          // turn ends but another spawner immediately reclaims the
+          // slot (recurrence tick, auto-wake, or the brief window
+          // between _set_status('idle') and _running_tasks.pop()), we'd
+          // fire a fresh POST per round-trip and produce a storm of
+          // spawn_rejected rows in the timeline.
+          next.push({
+            ...p,
+            status: "queued",
+            rejectedAt: rejected.ts || new Date().toISOString(),
+          });
           continue;
         }
         // cost_capped: server emits this when daily-cap blocks the
@@ -9864,13 +9875,53 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
   // again, which can happen if the agent flipped working again before
   // we got there). The retry uses the cached reqBody so per-pane
   // overrides (model / plan_mode / effort) match the original submit.
+  //
+  // Throttle reject loops: if the entry has a `rejectedAt` stamp from
+  // a recent spawn_rejected, only retry once we've seen a boundary
+  // event (agent_stopped / agent_cancelled / result) for this slot
+  // newer than the rejection. Falls back to a 2s ceiling so a missed
+  // boundary never leaves the prompt queued forever. Without this
+  // gate, a fast reject→retry round-trip (~30ms) produces dozens of
+  // spawn_rejected rows per second when something else (recurrence
+  // tick, auto-wake) keeps reclaiming the slot.
   useEffect(() => {
     if (agent?.status === "working") return;
     const next = pending.find((p) => p.status === "queued");
     if (!next) return;
+    if (next.rejectedAt) {
+      const rejectedMs = Date.parse(next.rejectedAt);
+      if (Number.isFinite(rejectedMs)) {
+        const boundary = allEvents.find((ev) => {
+          if (
+            ev.type !== "agent_stopped" &&
+            ev.type !== "agent_cancelled" &&
+            ev.type !== "result"
+          ) return false;
+          const evMs = Date.parse(ev.ts || "");
+          return Number.isFinite(evMs) && evMs > rejectedMs;
+        });
+        const sinceReject = Date.now() - rejectedMs;
+        if (!boundary && sinceReject < 2000) {
+          // Schedule a retry-attempt re-trigger so we don't sit
+          // indefinitely if no boundary event arrives.
+          const t = setTimeout(() => {
+            setPending((prev) =>
+              prev.map((p) =>
+                p.id === next.id ? { ...p, _retryNudge: Date.now() } : p
+              )
+            );
+          }, 2000 - sinceReject + 50);
+          return () => clearTimeout(t);
+        }
+      }
+    }
     let cancelled = false;
     setPending((prev) =>
-      prev.map((p) => (p.id === next.id ? { ...p, status: "sending" } : p))
+      prev.map((p) =>
+        p.id === next.id
+          ? { ...p, status: "sending", rejectedAt: undefined }
+          : p
+      )
     );
     (async () => {
       const outcome = await postStart(next.reqBody);
@@ -9885,7 +9936,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
       // if the lock raced and the agent was busy again.
     })();
     return () => { cancelled = true; };
-  }, [agent?.status, pending, postStart]);
+  }, [agent?.status, pending, postStart, allEvents]);
 
   // Auto-scroll to bottom as new content arrives. Two modes:
   //   - Normal (between turns): respect user scroll position — if they

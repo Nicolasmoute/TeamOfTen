@@ -234,15 +234,15 @@ def test_parse_json_safe_returns_none_on_garbage() -> None:
 
 
 def test_resolve_model_defaults_to_latest_sonnet_concrete() -> None:
-    """No param, no env override → falls through to the catalog's
-    `latest_sonnet` alias and resolves to a concrete Sonnet id. Must
-    not return the alias string itself, and must not return None."""
-    from server.compass import config as cmp_config
-    from server.compass.llm import _resolve_model
+    """No param → falls through to the catalog's `latest_sonnet` alias
+    and resolves to a concrete Sonnet id. Must not return the alias
+    string itself, and must not return None.
 
-    # Confirm the test environment has no override leaking through.
-    if cmp_config.LLM_MODEL_OVERRIDE:
-        pytest.skip("HARNESS_COMPASS_MODEL set in env; skipping default test")
+    Compass model is hardcoded — no env override, no UI knob — so this
+    test is the single guarantee that the team-wide policy ("Compass
+    runs on Sonnet") holds across every deploy.
+    """
+    from server.compass.llm import _resolve_model
 
     resolved = _resolve_model(None)
     assert resolved is not None
@@ -250,45 +250,21 @@ def test_resolve_model_defaults_to_latest_sonnet_concrete() -> None:
     assert "sonnet" in resolved.lower()
 
 
-def test_resolve_model_explicit_param_wins(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An explicit `model=` param beats both the env override and the
-    default alias. Concrete ids pass through `resolve_model_alias`
-    unchanged."""
-    from server.compass import config as cmp_config
+def test_resolve_model_explicit_param_wins() -> None:
+    """An explicit `model=` param beats the default alias. Concrete
+    ids pass through `resolve_model_alias` unchanged."""
     from server.compass.llm import _resolve_model
 
-    monkeypatch.setattr(cmp_config, "LLM_MODEL_OVERRIDE", "claude-haiku-4-5-20251001")
     resolved = _resolve_model("claude-opus-4-7")
     assert resolved == "claude-opus-4-7"
 
 
-def test_resolve_model_env_override_used_when_no_param(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When `HARNESS_COMPASS_MODEL` is set and no param is given, the
-    env value wins over the default alias. Aliases in the env are
-    resolved through the catalog same as the default."""
-    from server.compass import config as cmp_config
-    from server.compass.llm import _resolve_model
-
-    monkeypatch.setattr(cmp_config, "LLM_MODEL_OVERRIDE", "latest_opus")
-    resolved = _resolve_model(None)
-    assert resolved is not None
-    # `latest_opus` resolves to a concrete Opus id, not the alias string.
-    assert resolved != "latest_opus"
-    assert "opus" in resolved.lower()
-
-
 def test_resolve_effort_returns_medium_by_default() -> None:
-    """No env override → `LLM_EFFORT` defaults to `"medium"`, which is
-    the agreed-on Compass setting."""
+    """`LLM_EFFORT` is hardcoded to `"medium"`."""
     from server.compass import config as cmp_config
     from server.compass.llm import _resolve_effort
 
-    if cmp_config.LLM_EFFORT != "medium":
-        pytest.skip("HARNESS_COMPASS_EFFORT set in env; skipping default test")
+    assert cmp_config.LLM_EFFORT == "medium"
     assert _resolve_effort() == "medium"
 
 
