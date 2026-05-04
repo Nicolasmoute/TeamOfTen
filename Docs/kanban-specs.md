@@ -112,15 +112,15 @@ On a fail revert, the auditor's role-assignment row stays **terminal** — its `
 1. `tasks.latest_audit_report_path` / `latest_audit_kind` / `latest_audit_verdict='fail'` are written before the event fires.
 2. The subscriber transitions the task to `execute`, clears `started_at`, stamps `last_stage_change_at`.
 3. The executor's auto-wake prompt includes verbatim:
-   - the path to `tasks.spec_path` (so the executor can re-read the goal),
+   - the path to `tasks.spec_path` (read fresh from the task row so a re-spec mid-execution gets picked up),
    - the path to `tasks.latest_audit_report_path` (so the executor can read **what failed and why**),
-   - one line per failed acceptance criterion if the auditor inlined them in the report body.
+   - the **failed-criteria section verbatim** when the audit report contains a `## Failed criteria`, `## Failed acceptance criteria`, `## Acceptance criteria failed`, or `### Failed criteria` heading. Extracted by `_extract_failed_criteria()` in [server/kanban.py](server/kanban.py); capped at 1500 chars so a giant report doesn't blow the wake-prompt budget. The section ends at the next `## ` / `# ` heading. Missing section, missing file, or unreadable text degrades cleanly to "no extra context appended" — the executor still gets the report path.
 4. The card flips to `EXECUTE` column with a red drift banner; clicking the banner opens the audit report in the Files pane.
 5. The subscriber **also** publishes an `audit_fail_notification` event routed to Coach (`to: 'coach'`). This event carries `{task_id, kind, kind_round, escalate, auditor_id, executor_id, report_path}` where `kind_round` is the number of fail verdicts so far for this task and audit kind, and `escalate = (kind_round >= 2)`. Coach sees the event in their pane and (subject to the existing escalation watcher) on Telegram. The first fail of any kind is informational; the second fail of the **same kind** is the escalation signal — see §17 for how Coach acts on it.
 
 There is no cap on revert rounds — a task can iterate `execute → audit → execute → audit → ...` indefinitely. Coach sees the notification on every fail but is told to expect a first fail as normal correction noise; quality intervention happens on the second fail of the same kind.
 
-Every successful transition stamps `tasks.last_stage_change_at = now()` in the same DB write as the status update. This drives the stall sweeper (§10.5) and the `## Stalled tasks` Coach rollup.
+Every successful transition stamps `tasks.last_stage_change_at = now()` and clears `tasks.stale_alert_at` in the same DB write as the status update. **This applies to every path** — the kanban subscriber's `_transition()` helper, `coord_claim_task`, `coord_assign_task` (plan→execute hard-assign), `coord_update_task`, `coord_advance_task_stage`, `POST /api/tasks/{id}/stage`, `POST /api/tasks/{id}/cancel`, the `coord_create_task` initial insert, and the cancel paths. This is what drives the stall sweeper (§10.5) and the `## Stalled tasks` Coach rollup; if a code path moves a task between stages without touching these columns, stall detection silently lies.
 
 `coord_advance_task_stage` is the explicit Coach-override tool that bypasses the trajectory gate when an assignment stalls. The human `/api/tasks/{id}/stage` endpoint uses the same gate unless `force=true`.
 
@@ -198,9 +198,9 @@ If at least one audit stage is configured, the reminder is omitted (a downstream
 
 ### 3.8 Mid-flight reroute
 
-`coord_set_task_trajectory(task_id, trajectory)` (Coach-only) rewrites the trajectory while a task is in flight. Cannot remove a stage the task has already entered (e.g., you can't drop `execute` mid-execution). Removed-stage role rows are marked `superseded_by` the new corresponding row; added-stage rows are inserted fresh. Emits `task_trajectory_changed` event.
+`coord_set_task_trajectory(task_id, trajectory)` (Coach-only) rewrites the trajectory while a task is in flight. **Cannot remove any stage the task has already entered** — the validator walks the OLD trajectory up to and including the current stage and rejects the call when any of those stages are missing from the new trajectory. (E.g. a task currently in `audit_semantics` cannot drop the already-passed `audit_syntax` stage.) Removed-stage role rows are deactivated by setting `completed_at = now()` (the active-row filter is `completed_at IS NULL AND superseded_by IS NULL` — `completed_at` deactivates without violating the `superseded_by` self-FK that fires under `PRAGMA foreign_keys = ON`). Added-stage rows are inserted fresh. Emits `task_trajectory_changed`. The HTTP sibling is `POST /api/tasks/{id}/trajectory` with the same validator + storage shape.
 
-`coord_assign_planner / auditor / shipper / task` are the per-stage candidate-list edits — they replace the `eligible_owners` of the trajectory's pre-existing role row for that stage, supersede the old row if it had `owner` set, and re-wake.
+`coord_assign_planner / auditor / shipper / task` are the per-stage candidate-list edits. v0.3 behavior: insert a fresh `task_role_assignments` row, supersede any prior active row for the same `(task_id, role)` via `superseded_by = <new_row_id>` (so the board's "first active matching row" pick stays correct), and mirror the new candidate list back into `tasks.trajectory.to` for the matching stage (so the stored trajectory + Coach prompt + UI marker stay in sync with the role rows). Re-wake fires only when the role's stage is the task's current stage; future-stage reservations are stored but inactive.
 
 ### 3.9 Compass auto-audit
 
@@ -356,11 +356,11 @@ All new tools are registered in [server/tools.py](server/tools.py)'s `_tools` ma
 
 | Tool | Params | Purpose |
 |---|---|---|
-| `coord_set_task_trajectory` | `task_id, trajectory` | **New.** Mid-flight reroute. Validates against current stage (cannot drop a stage already entered); supersedes removed-stage role rows; inserts added-stage rows; emits `task_trajectory_changed`. |
-| `coord_assign_planner` | `task_id, to` | Edit the existing `planner` role row's `eligible_owners`. Hard-assign wakes the owner if the task is still in `plan`; pool-form calls candidates who must `coord_accept_role`. |
-| `coord_assign_task` | `task_id, to` | Edit the existing `executor` role row's `eligible_owners`. Spec gate enforced when `plan` is in the trajectory and `spec_path` is unset. Auto-wake prompt is trajectory-aware (executors with no audit stage configured get the self-audit reminder verbatim). |
-| `coord_assign_auditor` | `task_id, to, kind` | `kind ∈ {'formal'/'syntax', 'semantic'/'semantics'}`. Edits the matching auditor role row. Emits `audit_self_review_warning` if reviewer == executor. Future-stage reservations are not woken until active. |
-| `coord_assign_shipper` | `task_id, to` | Edits the `shipper` role row. Future-stage reservations wake only when the task enters `ship`. |
+| `coord_set_task_trajectory` | `task_id, trajectory` | **New.** Mid-flight reroute. Validates against the OLD trajectory walked up to the current stage — rejects removing any **already-entered** stage (not just the current one). Removed-stage role rows are deactivated by setting `completed_at = now()` (the active-row filter is `completed_at IS NULL AND superseded_by IS NULL`; we don't use `superseded_by = -1` because the column is a self-FK and that violates the constraint under `PRAGMA foreign_keys = ON`). Added-stage rows are inserted. Emits `task_trajectory_changed`. |
+| `coord_assign_planner` | `task_id, to` | Inserts a fresh `planner` role row, supersedes any prior active row for the same `(task_id, role)` via `superseded_by = <new_row_id>`, and mirrors the new candidate list back into `tasks.trajectory.to` for the matching stage. Hard-assign wakes the owner if the task is still in `plan`; pool-form calls candidates who must `coord_accept_role`. |
+| `coord_assign_task` | `task_id, to` | Inserts a fresh `executor` role row, supersedes any prior active executor row, and mirrors the new candidate list back into `tasks.trajectory.to`. Spec gate enforced when `plan` is in the trajectory and `spec_path` is unset. Stamps `last_stage_change_at` + clears `stale_alert_at` on the plan→execute transition. Auto-wake prompt is trajectory-aware (executors with no audit stage configured get the self-audit reminder verbatim). |
+| `coord_assign_auditor` | `task_id, to, kind` | `kind ∈ {'formal'/'syntax', 'semantic'/'semantics'}`. Same supersede + trajectory-mirror behavior as `coord_assign_planner`. Emits `audit_self_review_warning` if reviewer == executor. Future-stage reservations are not woken until active. |
+| `coord_assign_shipper` | `task_id, to` | Same supersede + trajectory-mirror behavior. Future-stage reservations wake only when the task enters `ship`. |
 | `coord_set_task_workflow` | `task_id, workflow?, tracking_reason?` | Sets the workflow / tracking-reason metadata. Routing has moved to trajectory; this tool no longer accepts review/ship knobs. |
 | `coord_advance_task_stage` | `task_id, stage, note?` | Explicit override. Bypasses the trajectory gate. |
 
@@ -389,7 +389,9 @@ All new tools are registered in [server/tools.py](server/tools.py)'s `_tools` ma
 
 ### 6.5 Modified existing tools
 
-- `coord_create_task` accepts `trajectory` (new in v0.3 — list of `{stage, to}` objects, validated by `_validate_trajectory()`), `workflow`, `tracking_reason` (now optional). The `complexity`, `required_reviews`, and `ship_required` params are **removed**. When `trajectory` is provided, the tool plants the matching `task_role_assignments` rows in the same transaction. The default trajectory when omitted is `[{"stage":"execute","to":[]}]` — Coach must follow up with the assign tools. The tool does **not** write `spec.md`; planner Players or the human do that.
+- `coord_create_task` accepts `trajectory` (new in v0.3 — list of `{stage, to}` objects, validated by `_validate_trajectory()`), `workflow`, `tracking_reason` (now optional). The `complexity`, `required_reviews`, and `ship_required` params are **removed**. When `trajectory` is provided, the tool plants the matching `task_role_assignments` rows in the same transaction.
+
+  **Initial activation (v0.3).** The new task's `tasks.status` is set to the trajectory's **first stage** (not the schema default `plan`). When the first stage carries a single hard-assignee, `tasks.owner` is hard-set in the same insert. Immediately after `task_created` is published, the tool emits `task_stage_changed` with `from=null` → `to=<first_stage>` so the subscriber's `_on_stage_changed` handler wakes the first-stage assignee. Without this, an execute-only trajectory like `[{"stage":"execute","to":"p2"}]` would sit silently in `plan` behind the spec gate. The default trajectory when omitted is `[{"stage":"execute","to":[]}]` — Coach can follow up with the assign tools, or the idle-poller will pick up the unassigned pool. The tool does **not** write `spec.md`; planner Players or the human do that.
 - `coord_commit_push` accepts optional `task_id`. When provided, it validates that the caller owns that active execute-stage task and has an uncompleted executor role row. On a successful push, or on explicit `push=false` local-only mode, the emitted `commit_pushed` event carries the `task_id` and the executor role row is marked complete. If `git push` was requested and fails, `task_id` is cleared from the event and the executor role remains open so the kanban cannot advance on an unpushed commit. Without `task_id`, behavior is unchanged (Compass auto-audit still fires regardless).
 - `coord_update_task` validates against the new transition map. Legacy aliases (`done` → `archive`, `cancelled` → `archive` + `cancelled_at`) are accepted for one release.
 
@@ -465,13 +467,14 @@ The legacy `task_updated` event keeps firing for back-compat. `/api/events` SQL 
 
 | Event | Action |
 |---|---|
-| `commit_pushed` with `task_id`, stage=execute | Route via `_next_stage(task, "execute")` — walks `tasks.trajectory` to find the next stage. If `execute` is the last entry, archives directly. |
+| `commit_pushed` with `task_id`, stage=execute | Route via `_next_stage(task, "execute")` — walks `tasks.trajectory` to find the next stage. If `execute` is the last entry, archives directly. Stamps `(project_id, sha) → task_id` in the per-project commit cache so a later `compass_audit_logged` can correlate. |
 | `task_execution_completed`, stage=execute | Same route as `commit_pushed`, but for non-git artifacts. |
-| `task_stage_changed` entering a non-terminal stage | Stamp `last_stage_change_at = now()`. Wake the current-stage owner/candidates (`task_role_called`) or emit `stage_assignment_needed` to Coach if no active row exists. Future-stage reservations are activated here. |
+| `task_spec_written` (stage=plan, trajectory has `plan`) | Advance `plan → _next_stage(task, "plan")`. Triggered by `coord_write_task_spec` (or the human-side spec endpoint) once `tasks.spec_path` is set and the planner role row is marked completed. Skipped when the task isn't in `plan` (re-spec on an executing task is informational) or when the trajectory has no `plan` stage. |
+| `task_stage_changed` entering a non-terminal stage | The transition itself stamps `last_stage_change_at = now()` + clears `stale_alert_at`. The handler then wakes the current-stage owner/candidates (`task_role_called`) or emits `stage_assignment_needed` to Coach if no active row exists. Future-stage reservations are activated here. The same `from=null → to=<first_stage>` event is emitted by `coord_create_task` / `POST /api/tasks` so creation activates the first stage. |
 | `audit_report_submitted{verdict=pass}` | Route via `_next_stage(task, current_stage)`. |
-| `audit_report_submitted{verdict=fail}` | Revert to `execute` (always — independent of trajectory shape). Clear `started_at`. Re-wake executor with the **spec path AND latest audit report path** in the wake prompt body so they can read what failed without hunting. (`coord_submit_audit_report` already wrote `latest_audit_*` before emitting.) See §2.3 "Audit-fail loop guarantee" for full details. |
+| `audit_report_submitted{verdict=fail}` | Revert to `execute` (always — independent of trajectory shape). Clear `started_at`. Re-wake executor with the **spec path AND latest audit report path** read fresh from `tasks.spec_path` / `tasks.latest_audit_report_path`. The wake also extracts a `## Failed criteria` (or `## Failed acceptance criteria` / `### Failed criteria`) section verbatim from the audit report when present, capped at 1500 chars. See §2.3 "Audit-fail loop guarantee" for full details. |
 | `task_shipped` | Advance `ship → archive` via `_next_stage(task, "ship")` (always archive since `ship` is canonical-last). |
-| `compass_audit_logged` | Best-effort update of `compass_audit_*` columns on the most-recently cached `commit_pushed` task. **No stage change.** |
+| `compass_audit_logged` | Best-effort update of `compass_audit_*` columns. Correlation prefers the per-project cache (`_recent_commit_per_project[project_id]`) — falls back to the global tail only when the event lacks `project_id`. **No stage change.** |
 
 The subscriber records its `subscriber_last_event_at` (in-memory ISO timestamp) on every event it processes. Read by the `/api/tasks/flow_health` endpoint for "is the engine alive?" visibility.
 
@@ -546,6 +549,7 @@ Failure isolation: per-task try/except.
 |---|---|---|
 | `HARNESS_KANBAN_STALL_ENABLED` | `true` | Master switch for the sweeper. |
 | `HARNESS_KANBAN_STALL_SECONDS` | `14400` | 4 h. Threshold beyond which a non-blocked, non-archive task is considered stalled. |
+| `HARNESS_KANBAN_STALL_RE_ALERT_SECONDS` | `86400` | 24 h. After this much over-threshold, re-alert even though the task hasn't progressed (long-stuck escalation). |
 
 ---
 
@@ -762,14 +766,14 @@ In addition to the static CLAUDE.md block (which Coach reads alongside Players),
 - assign/call Players by current stage; future-stage reservations are allowed but inactive;
 - Players complete work with `coord_commit_push`, `coord_complete_execution`, `coord_submit_audit_report`, or `coord_mark_shipped` so the board flows event-by-event.
 
-## 14 ? Telegram escalation hooks
+## 14 · Telegram escalation hooks
 
-[server/telegram_escalation.py](server/telegram_escalation.py) gains formatters + key-extractors for three new event types:
+[server/telegram_escalation.py](server/telegram_escalation.py) gains formatters + key-extractors for the kanban event types:
 
 | Event | Formatter |
 |---|---|
-| `audit_report_submitted{verdict='fail'}` | `"Audit fail: t-... '<title>' — <kind> auditor <slot> returned fail (round N). Reverted to execute. Open the kanban to read the report."` |
-| `audit_assignment_needed` | `"Assignment needed: t-... '<title>' is in <stage> with no <role> assigned. Open the kanban to assign one."` |
+| `audit_fail_notification` (v0.3, `escalate=True` only) | `"Audit fail: t-... '<title>' — <kind> auditor <slot> returned fail (round N). Reverted to execute. Open the kanban to read the report."` First-fail noise (`escalate=False`) is filtered out at the key-extractor — only `kind_round >= 2` of the same kind reaches Telegram. (See §17 for the dual-surface design.) |
+| `stage_assignment_needed` (v0.3 rename of `audit_assignment_needed`) | `"Assignment needed: t-... '<title>' is in <stage> with no <role> assigned. Open the kanban to assign one."` Covers all stages (plan/execute/audit/ship). The legacy `audit_assignment_needed` event is also emitted as a back-compat alias for one release; resolution still keys under the new name via `task_role_assigned`. |
 | `audit_self_review_warning` | `"Self-review: t-... '<title>' — Coach assigned <slot> as <kind> auditor; they're also the executor. Acceptable for small teams; flag for review on big tasks."` |
 
 Same web-active vs grace timing as the existing pending-question / pending-plan escalations. The kanban itself shows everything inline regardless.
