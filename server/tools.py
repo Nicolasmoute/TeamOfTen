@@ -848,6 +848,23 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                         "VALUES (?, ?, ?, NULL, ?, ?)",
                         (task_id, role, eligible_json, now_iso, focus_value),
                     )
+            # When the first stage is `execute` with a single hard-
+            # assigned owner, propagate to agents.current_task_id so
+            # `coord_my_assignments` Bucket 1 surfaces the task. Without
+            # this, a task created with trajectory=[{stage:execute,
+            # to:p8}] has tasks.owner=p8 but agents.current_task_id is
+            # still NULL — the executor can't find their own task. The
+            # mid-flight `coord_assign_task` path already does this; the
+            # create-time path was missing it. Idempotent: guarded with
+            # `WHERE current_task_id IS NULL` so we don't stomp an
+            # existing assignment if the same Player already owns
+            # something else (the idle poller / pane will sort it out).
+            if initial_status == "execute" and initial_owner:
+                await c.execute(
+                    "UPDATE agents SET current_task_id = ? "
+                    "WHERE id = ? AND current_task_id IS NULL",
+                    (task_id, initial_owner),
+                )
             await c.commit()
         finally:
             await c.close()
@@ -5732,6 +5749,50 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                         "trajectory": ad_stages,
                         "has_spec": bool(ad.get("spec_path")),
                     }
+
+            # Defensive Bucket 1b: if `agents.current_task_id` is out
+            # of sync with the executor role row (the production bug
+            # where a hard-assigned create-time executor never had
+            # current_task_id written), still surface the task by
+            # walking the role table directly. Filtered to status =
+            # 'execute' so future-stage executor reservations don't
+            # leak in. Also self-heals current_task_id so subsequent
+            # callers / wakes find the right task.
+            if executor_task is None:
+                cur = await c.execute(
+                    "SELECT t.id, t.title, t.status, t.priority, "
+                    "t.trajectory, t.spec_path "
+                    "FROM task_role_assignments r "
+                    "JOIN tasks t ON t.id = r.task_id "
+                    "WHERE r.owner = ? AND r.role = 'executor' "
+                    "AND r.completed_at IS NULL "
+                    "AND r.superseded_by IS NULL "
+                    "AND t.project_id = ? AND t.status = 'execute' "
+                    "ORDER BY r.assigned_at DESC LIMIT 1",
+                    (caller_id, project_id),
+                )
+                row = await cur.fetchone()
+                if row:
+                    rd = dict(row)
+                    rd_stages = _trajectory_stages_from_row(rd)
+                    executor_task = {
+                        "id": rd["id"],
+                        "title": rd.get("title") or "(unknown)",
+                        "status": rd.get("status") or "?",
+                        "priority": rd.get("priority") or "normal",
+                        "trajectory": rd_stages,
+                        "has_spec": bool(rd.get("spec_path")),
+                    }
+                    # Self-heal: write back current_task_id so the
+                    # next read goes through Bucket 1's fast path.
+                    # Guarded with `IS NULL` so we don't stomp a
+                    # legitimately different active task.
+                    await c.execute(
+                        "UPDATE agents SET current_task_id = ? "
+                        "WHERE id = ? AND current_task_id IS NULL",
+                        (rd["id"], caller_id),
+                    )
+                    await c.commit()
 
             # Bucket 2 + 3: pending planner / reviewer / shipper
             # assignments, filtered to the card's current stage so

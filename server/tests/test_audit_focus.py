@@ -578,3 +578,166 @@ async def test_set_trajectory_overwrites_focus_when_entry_provides(
     }))
     focus = await _row_focus("t-2026-05-04-aud00001", "auditor_syntax")
     assert focus == "new"
+
+
+# ----------------------------------------------------------- create-time current_task_id
+
+
+async def test_create_task_hard_assigned_executor_sets_current_task_id(
+    fresh_db: str,
+) -> None:
+    """When `coord_create_task` plants an executor row with a single
+    hard-assignee AND the first stage is execute, agents.current_task_id
+    must be set so the assignee's coord_my_assignments finds it.
+
+    Production bug: a task created with trajectory=[{stage:execute,
+    to:p8}] left agents.current_task_id NULL, so p8's
+    coord_my_assignments returned an empty plate despite owning the
+    task.
+    """
+    await init_db()
+    coach = _server_for("coach")
+    text = _ok_text(await _handler(coach, "create_task")({
+        "title": "diagnose math",
+        "trajectory": [{"stage": "execute", "to": "p8"}],
+    }))
+    import re
+    m = re.search(r"t-\d{4}-\d{2}-\d{2}-[a-f0-9]{8}", text)
+    assert m, f"no task id in response: {text}"
+    task_id = m.group(0)
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT current_task_id FROM agents WHERE id = 'p8'"
+        )
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    assert row["current_task_id"] == task_id
+
+
+async def test_create_task_does_not_stomp_existing_current_task_id(
+    fresh_db: str,
+) -> None:
+    """If the assignee already has a current_task_id, the create-time
+    update is guarded by `WHERE current_task_id IS NULL` so we don't
+    silently overwrite an in-flight assignment."""
+    await init_db()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO tasks (id, project_id, title, status, owner, "
+            "created_by, trajectory) "
+            "VALUES ('t-2026-05-04-existing0', 'misc', 'existing', "
+            "'execute', 'p8', 'coach', "
+            "'[{\"stage\":\"execute\",\"to\":[\"p8\"]}]')",
+        )
+        await c.execute(
+            "UPDATE agents SET current_task_id = 't-2026-05-04-existing0' "
+            "WHERE id = 'p8'",
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    coach = _server_for("coach")
+    _ok_text(await _handler(coach, "create_task")({
+        "title": "second task",
+        "trajectory": [{"stage": "execute", "to": "p8"}],
+    }))
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT current_task_id FROM agents WHERE id = 'p8'"
+        )
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    assert row["current_task_id"] == "t-2026-05-04-existing0"
+
+
+# ----------------------------------------------------------- my_assignments self-heal
+
+
+async def test_my_assignments_self_heals_desynced_current_task_id(
+    fresh_db: str,
+) -> None:
+    """Defensive Bucket 1b: even when agents.current_task_id is NULL
+    but an active executor role row exists for an in-execute task,
+    coord_my_assignments must surface it AND self-heal current_task_id.
+    """
+    await init_db()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO tasks (id, project_id, title, status, owner, "
+            "created_by, trajectory) "
+            "VALUES ('t-2026-05-04-desynced0', 'misc', 'orphaned', "
+            "'execute', 'p8', 'coach', "
+            "'[{\"stage\":\"execute\",\"to\":[\"p8\"]}]')",
+        )
+        await c.execute(
+            "INSERT INTO task_role_assignments "
+            "(task_id, role, eligible_owners, owner, "
+            "assigned_at, claimed_at) "
+            "VALUES ('t-2026-05-04-desynced0', 'executor', '[]', 'p8', "
+            "'2026-05-04T18:00:00Z', '2026-05-04T18:00:00Z')",
+        )
+        await c.execute(
+            "UPDATE agents SET current_task_id = NULL WHERE id = 'p8'",
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    p8 = _server_for("p8")
+    text = _ok_text(await _handler(p8, "my_assignments")({}))
+    assert "t-2026-05-04-desynced0" in text
+    assert "orphaned" in text
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT current_task_id FROM agents WHERE id = 'p8'"
+        )
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    assert row["current_task_id"] == "t-2026-05-04-desynced0"
+
+
+async def test_my_assignments_b1b_filters_future_executor_reservation(
+    fresh_db: str,
+) -> None:
+    """The defensive bucket must filter on t.status='execute' so a
+    future-stage executor reservation (task currently in plan) does
+    NOT leak in as 'actionable'."""
+    await init_db()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO tasks (id, project_id, title, status, owner, "
+            "created_by, trajectory) "
+            "VALUES ('t-2026-05-04-future001', 'misc', 'still planning', "
+            "'plan', NULL, 'coach', "
+            "'[{\"stage\":\"plan\",\"to\":[]},"
+            "{\"stage\":\"execute\",\"to\":[\"p8\"]}]')",
+        )
+        await c.execute(
+            "INSERT INTO task_role_assignments "
+            "(task_id, role, eligible_owners, owner, "
+            "assigned_at, claimed_at) "
+            "VALUES ('t-2026-05-04-future001', 'executor', '[]', 'p8', "
+            "'2026-05-04T18:00:00Z', '2026-05-04T18:00:00Z')",
+        )
+        await c.execute(
+            "UPDATE agents SET current_task_id = NULL WHERE id = 'p8'",
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    p8 = _server_for("p8")
+    text = _ok_text(await _handler(p8, "my_assignments")({}))
+    assert "t-2026-05-04-future001" not in text
+    assert "(none — you have no active task)" in text

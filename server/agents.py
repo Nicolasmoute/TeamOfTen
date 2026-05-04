@@ -2682,6 +2682,22 @@ async def _build_coach_coordination_block() -> str:
     )
     lines.append("")
     lines.append(
+        "DO NOT follow `coord_create_task` / `coord_assign_*` with a "
+        "`coord_send_message` to the assignee. The kanban subscriber "
+        "auto-wakes the current-stage assignee with a wake prompt "
+        "that already names the task, the focus (for audits), the "
+        "contract or context, and the exact completion tool to call. "
+        "An extra DM duplicates the wake, burns tokens on both sides, "
+        "and creates two competing instructions for the Player to "
+        "reconcile. Use `coord_send_message` only when (a) you need "
+        "to clarify something specific to the Player AFTER they've "
+        "already accepted the role or surfaced a question, or (b) "
+        "the stall sweeper has flagged the task and you're nudging a "
+        "blocker. Initial assignment is silent on Coach's side — "
+        "the kanban does the wake."
+    )
+    lines.append("")
+    lines.append(
         "QUALITY FEEDBACK: from the 2nd fail of the same audit kind, "
         "inspect the executor's current effort/model. Bump effort "
         "first (coord_set_player_effort 'high'/'max'), then model "
