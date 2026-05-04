@@ -579,6 +579,114 @@ def _role_label(role: str) -> str:
     }.get(role, role)
 
 
+async def collect_superseded_role_owners(
+    c, *, task_id: str, role: str, new_row_id: int | None
+) -> list[str]:
+    """Return slot ids that own (or are pooled into) prior active rows
+    for this (task_id, role) — i.e. the owners about to be displaced
+    by a new assignment. Caller is expected to issue the supersede
+    UPDATE itself; this is just a pre-read so the caller can wake the
+    displaced slots after committing.
+
+    Empty `new_row_id` means "treat all active rows as displaced"
+    (e.g. a hard cancel). When provided, the row with that id is
+    excluded so a same-id refresh isn't flagged.
+    """
+    import json as _json
+    if new_row_id is None:
+        cur = await c.execute(
+            "SELECT owner, eligible_owners FROM task_role_assignments "
+            "WHERE task_id = ? AND role = ? "
+            "AND completed_at IS NULL AND superseded_by IS NULL",
+            (task_id, role),
+        )
+    else:
+        cur = await c.execute(
+            "SELECT owner, eligible_owners FROM task_role_assignments "
+            "WHERE task_id = ? AND role = ? AND id != ? "
+            "AND completed_at IS NULL AND superseded_by IS NULL",
+            (task_id, role, new_row_id),
+        )
+    rows = await cur.fetchall()
+    out: list[str] = []
+    for r in rows:
+        d = dict(r)
+        if d.get("owner"):
+            out.append(str(d["owner"]))
+        else:
+            try:
+                lst = _json.loads(d.get("eligible_owners") or "[]")
+                if isinstance(lst, list):
+                    out.extend(str(s) for s in lst if isinstance(s, str))
+            except Exception:
+                pass
+    return out
+
+
+async def send_role_stand_down(
+    *, task_id: str, role: str, displaced: list[str], new_owners: list[str]
+) -> list[str]:
+    """Wake the displaced role assignees with a stop-work message and
+    emit a `task_role_stand_down` event so the supersede is visible in
+    the timeline (not just an invisible row update).
+
+    Same-slot refresh is filtered out: a slot in `new_owners` is not
+    woken (their next wake comes from `_wake_role_or_emit_needed` for
+    the new row anyway). De-dups across multiple displaced rows.
+
+    Returns the list of slots actually woken (post-filter, post-dedup)
+    so callers / tests can assert on it.
+    """
+    if not displaced:
+        return []
+    new_set = {s for s in (new_owners or []) if isinstance(s, str)}
+    woken: list[str] = []
+    seen: set[str] = set()
+    for slot in displaced:
+        if slot in seen or slot in new_set:
+            continue
+        seen.add(slot)
+        woken.append(slot)
+    if not woken:
+        return []
+    role_label = _role_label(role)
+    new_label = ", ".join(new_owners) if new_owners else "(unassigned)"
+    body = (
+        f"Coach reassigned the {role_label} role on task {task_id} "
+        f"from you to {new_label}. STOP work on {task_id} now: do not "
+        f"edit, commit, push, or publish anything for this task. The "
+        f"kanban will not credit further work from you on it. If you "
+        f"have local uncommitted changes that may matter, message "
+        f"Coach via coord_send_message(to='coach', body='task "
+        f"{task_id} stand-down: I had local changes — keep / discard?') "
+        f"BEFORE discarding them."
+    )
+    try:
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).isoformat()
+        await bus.publish({
+            "ts": ts,
+            "type": "task_role_stand_down",
+            "task_id": task_id,
+            "role": role,
+            "displaced": woken,
+            "new_owners": list(new_set),
+            "to": "coach",
+        })
+    except Exception:
+        pass
+    try:
+        from server.agents import maybe_wake_agent
+        for slot in woken:
+            try:
+                await maybe_wake_agent(slot, body, bypass_debounce=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return woken
+
+
 async def _transition(
     *,
     task_id: str,
@@ -757,7 +865,14 @@ _TOOL_NOT_VISIBLE_ESCAPE = (
     "coord_send_message(to='coach', body='need to deliver task ... "
     "but the named coord_* tool is not visible to me') so Coach can "
     "advance the task on your behalf. coord_request_human() is the "
-    "human-facing escalation if Coach is also unreachable."
+    "human-facing escalation if Coach is also unreachable.\n\n"
+    "AND: do NOT route around the missing coord_* tool by using raw "
+    "git/Bash/Edit to commit, push, or publish the deliverable "
+    "yourself. Those bypass every kanban guardrail — your work lands "
+    "on a branch the board has no record of, the assignee in the "
+    "kanban (which may already be someone else after a reassignment) "
+    "stays uncredited, and the next stage never wakes. Stop and "
+    "message Coach instead."
 )
 
 
@@ -917,7 +1032,14 @@ async def _wake_role_or_emit_needed(*, task_id: str, role: str) -> None:
     if assignment.get("owner"):
         prompt = (
             f"Task {task_id} has entered your active {role_label} stage. "
-            f"Call coord_my_assignments for the spec/context, do the "
+            f"BEFORE editing, committing, or publishing anything: call "
+            f"coord_my_assignments and confirm task {task_id} appears "
+            f"under your active roles with role={role!r}. If you do NOT "
+            f"see it there, you have been reassigned or the task moved "
+            f"on — STOP and message Coach via coord_send_message(to="
+            f"'coach', body='clarify status of {task_id}'). Do not act "
+            f"on this wake message alone — it can be stale by the time "
+            f"you read it.\n\nIf you ARE the active assignee, do the "
             f"role work, then call the completion tool below — the "
             f"kanban does NOT advance until you do.\n\n{completion_hint}"
         )
@@ -927,8 +1049,10 @@ async def _wake_role_or_emit_needed(*, task_id: str, role: str) -> None:
             f"candidate call. If you can take it, call "
             f"coord_accept_role(task_id={task_id!r}, role={role!r}); "
             f"first accepted claim wins. If it is already claimed by the "
-            f"time you answer, there is nothing to do.\n\nOnce you have "
-            f"the role, the next step is:\n{completion_hint}"
+            f"time you answer, there is nothing to do — do NOT do the "
+            f"role work without an accepted claim, the kanban will not "
+            f"credit it.\n\nOnce you have the role, the next step is:"
+            f"\n{completion_hint}"
         )
 
     try:

@@ -1595,6 +1595,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             now = _now_iso()
             import json as _json
 
+            # Pre-read the slots that own the about-to-be-superseded
+            # active executor row(s), so we can wake them with a
+            # stand-down message after commit (v0.3.6: production p1
+            # incident — Coach reassigned, p1 didn't see it, kept
+            # working and pushed raw git past the kanban).
+            from server.kanban import collect_superseded_role_owners
+            displaced_executor: list[str] = []
+
             if is_pool:
                 # Pool form: leave tasks.owner NULL, status stays `plan`,
                 # but record the eligible_owners on a fresh executor
@@ -1613,6 +1621,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     (task_id, eligible_json, now),
                 )
                 new_role_id = cur.lastrowid
+                # Capture displaced owners BEFORE the supersede UPDATE
+                # rewrites their rows out of the "active" set.
+                displaced_executor = await collect_superseded_role_owners(
+                    c, task_id=task_id, role="executor", new_row_id=new_role_id,
+                )
                 # Supersede any prior active executor row + mirror the
                 # candidate list into tasks.trajectory.to (audit
                 # 2026-05-04 items 7 + 8).
@@ -1677,6 +1690,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     (task_id, slot, now, now),
                 )
                 new_role_id = cur.lastrowid
+                # Capture displaced owners BEFORE the supersede UPDATE.
+                displaced_executor = await collect_superseded_role_owners(
+                    c, task_id=task_id, role="executor", new_row_id=new_role_id,
+                )
                 # Supersede prior active executor row + mirror the
                 # candidate list (audit-2026-05-04 items 7+8).
                 await c.execute(
@@ -1710,6 +1727,22 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         finally:
             await c.close()
         no_audit_configured = not _trajectory_has_audit(wake_stages)
+
+        # Stand-down wake to any executor displaced by this assignment
+        # (v0.3.6). Same-slot refresh is filtered inside the helper.
+        # Sent BEFORE the new-target wake so the timeline reads as
+        # "old owner stops, new owner starts" rather than the reverse.
+        if displaced_executor:
+            try:
+                from server.kanban import send_role_stand_down
+                await send_role_stand_down(
+                    task_id=task_id,
+                    role="executor",
+                    displaced=displaced_executor,
+                    new_owners=deduped,
+                )
+            except Exception:
+                pass
 
         # Emit task_role_assigned (kanban event family). The legacy
         # task_assigned is also emitted for back-compat; the kanban
@@ -4869,6 +4902,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 (task_id, role, targets[0], now, now),
             )
         new_id = cur.lastrowid
+        # Capture displaced owners BEFORE the supersede UPDATE so we
+        # can wake them with a stand-down message after commit (v0.3.6
+        # — the p1 raw-git incident was a planner reassignment that
+        # the prior planner never learned about).
+        from server.kanban import (
+            collect_superseded_role_owners,
+            send_role_stand_down,
+        )
+        displaced_role_owners = await collect_superseded_role_owners(
+            c, task_id=task_id, role=role, new_row_id=new_id,
+        )
         # Supersede any prior active row for the same (task_id, role)
         # so the board's "first active matching row" pick stays correct.
         await c.execute(
@@ -4884,6 +4928,19 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             c, task_id=task_id, role=role, targets=targets
         )
         await c.commit()
+
+        # Stand-down wake to displaced assignees (post-commit). Helper
+        # filters same-slot refresh and dedups.
+        if displaced_role_owners:
+            try:
+                await send_role_stand_down(
+                    task_id=task_id,
+                    role=role,
+                    displaced=displaced_role_owners,
+                    new_owners=targets,
+                )
+            except Exception:
+                pass
 
         # Auto-wake only when the role is active for the card's current
         # stage. Coach may reserve future formal/semantic/ship roles up
@@ -5813,8 +5870,22 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "audit_semantics": "auditor_semantics",
                 "ship": "shipper",
             }
+            # v0.3.6: collect displaced assignees from BOTH removed
+            # stages AND in-place eligible_owners changes on remaining
+            # stages, so the previous assignees get a stand-down wake
+            # after commit.
+            from server.kanban import (
+                collect_superseded_role_owners,
+                send_role_stand_down,
+            )
+            stand_down_plan: list[tuple[str, list[str], list[str]]] = []
             for stage in removed:
                 role = role_for_stage[stage]
+                displaced = await collect_superseded_role_owners(
+                    c, task_id=task_id, role=role, new_row_id=None,
+                )
+                if displaced:
+                    stand_down_plan.append((role, displaced, []))
                 await c.execute(
                     "UPDATE task_role_assignments "
                     "SET completed_at = ? "
@@ -5831,7 +5902,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 eligible_json = json.dumps(to_list, separators=(",", ":"))
                 # Find the active role row (if any). If none, insert fresh.
                 cur = await c.execute(
-                    "SELECT id, owner FROM task_role_assignments "
+                    "SELECT id, owner, eligible_owners "
+                    "FROM task_role_assignments "
                     "WHERE task_id = ? AND role = ? "
                     "AND completed_at IS NULL AND superseded_by IS NULL "
                     "ORDER BY assigned_at DESC LIMIT 1",
@@ -5857,12 +5929,29 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                             (task_id, role, eligible_json, now_iso),
                         )
                 else:
+                    # Diff prior assignees vs new to_list; anyone who's
+                    # dropped gets a stand-down. Same-slot keeps
+                    # working without a spurious ping.
+                    rd = dict(rrow)
+                    prior: list[str] = []
+                    if rd.get("owner"):
+                        prior = [str(rd["owner"])]
+                    else:
+                        try:
+                            lst = json.loads(rd.get("eligible_owners") or "[]")
+                            if isinstance(lst, list):
+                                prior = [str(s) for s in lst if isinstance(s, str)]
+                        except Exception:
+                            prior = []
+                    dropped = [s for s in prior if s not in to_list]
+                    if dropped:
+                        stand_down_plan.append((role, dropped, list(to_list)))
                     # Update eligible_owners on the existing active row;
                     # don't disturb owner / claimed_at if already set.
                     await c.execute(
                         "UPDATE task_role_assignments "
                         "SET eligible_owners = ? WHERE id = ?",
-                        (eligible_json, rrow[0]),
+                        (eligible_json, rd["id"]),
                     )
 
             traj_json = json.dumps(trajectory, separators=(",", ":"))
@@ -5874,6 +5963,18 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             await c.commit()
         finally:
             await c.close()
+
+        # Post-commit stand-down wakes for displaced assignees.
+        for role, displaced, new_owners in stand_down_plan:
+            try:
+                await send_role_stand_down(
+                    task_id=task_id,
+                    role=role,
+                    displaced=displaced,
+                    new_owners=new_owners,
+                )
+            except Exception:
+                pass
 
         await bus.publish({
             "ts": _now_iso(),

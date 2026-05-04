@@ -195,9 +195,20 @@ Each task produces durable markdown artifacts under
   on the task (otherwise Coach is crediting a random slot — the
   override rejects).
 - **Players** execute, review, and ship. The relevant tools:
-    - `coord_my_assignments` — call this any time you're not sure
-      what to do; returns your actionable current-stage plate.
-      Future-stage reservations are hidden until active.
+    - `coord_my_assignments` — **call this BEFORE editing,
+      committing, or publishing anything** when you receive a wake
+      message. The wake can be stale: by the time you read it, Coach
+      may have reassigned the role to someone else, or the task may
+      have moved on. The wake message is a **notification**, not a
+      grant of authority — `coord_my_assignments` is the
+      authoritative answer to "do I actually own this right now?"
+      If the task you were woken about does NOT appear under your
+      active roles with the role you expected, STOP and message
+      Coach via `coord_send_message(to='coach', body='clarify
+      status of <task_id>')`. Do not act on the wake message alone.
+      Players who skip this step and act on stale wakes corrupt
+      whichever branch the kanban now believes belongs to the new
+      assignee. Future-stage reservations are hidden until active.
     - `coord_accept_role(task_id, role)` — answer a current-stage
       pool/call. First accept wins.
     - `coord_claim_task(task_id)` — legacy executor pool claim.
@@ -246,6 +257,15 @@ Coach won't learn about your work. Instead:
 3. If Coach is also unreachable, escalate via
    `coord_request_human(subject=..., body=..., urgency='high')`.
 
+**Do NOT route around the missing tool by using raw `git`, `Bash`,
+or `Edit` to commit, push, or publish the deliverable yourself.**
+Those bypass every kanban guardrail. Your work lands on a branch
+the board has no record of; the assignee in the kanban (which may
+already be someone else after a reassignment you didn't see) stays
+uncredited; the next stage never wakes; and the branch becomes a
+mess that has to be untangled by hand. Stop and message Coach
+instead — Coach has the override paths below.
+
 Coach has stage-specific override paths — the audit body / spec
 body you wrote to disk gets copied in:
 
@@ -264,6 +284,26 @@ body you wrote to disk gets copied in:
 
 Use the escape the moment you notice the tool is missing, not after
 a 15-minute stall.
+
+#### If you receive a "STOP work on task X" message
+
+When Coach reassigns a role mid-flight, the displaced Player gets
+an explicit stand-down wake naming the new owner. The body starts
+with "Coach reassigned the <role> role on task X from you to
+<new>." If you receive this:
+
+1. STOP work on that task immediately. Do not edit, commit, push,
+   or publish anything else for it. The kanban will not credit
+   further work from you on it.
+2. If you have local uncommitted changes that may matter (a partial
+   spec draft, a half-finished review, a code change), message
+   Coach via `coord_send_message(to='coach', body='task X
+   stand-down: I had local changes — keep / discard?')` BEFORE
+   discarding them. Coach decides whether to forward your work to
+   the new assignee or drop it.
+3. Do not retaliate or argue with the new assignee. The kanban is
+   the source of truth on who owns what; Coach's reassignment is
+   final unless you successfully escalate to the human.
 
 ### Contract before implementation
 
