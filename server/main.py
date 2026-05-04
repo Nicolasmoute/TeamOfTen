@@ -552,12 +552,16 @@ class CreateTaskRequest(BaseModel):
     description: str = Field(default="", max_length=10_000)
     parent_id: str | None = None
     priority: str = Field(default="normal", pattern=r"^(low|normal|high|urgent)$")
-    # Kanban: optional complexity at create time. Default 'standard';
-    # human composer in the kanban can flip to 'simple' to skip the
-    # audit + ship pipeline.
-    complexity: str = Field(
-        default="standard", pattern=r"^(simple|standard)$"
+    workflow: str = Field(
+        default="generic",
+        pattern=r"^(code|research|writing|marketing|ops|generic)$",
     )
+    # Optional informational tag in v0.3 (no enum gate).
+    tracking_reason: str | None = Field(default=None, max_length=80)
+    # Trajectory: ordered list of {stage, to} objects. None → default
+    # `[{"stage":"execute","to":[]}]`. The harness validates via
+    # tools.py:_validate_trajectory.
+    trajectory: list[dict[str, Any]] | None = None
 
 
 # ------- kanban-specific request models (Docs/kanban-specs.md §7) -------
@@ -574,8 +578,18 @@ class TaskStageRequest(BaseModel):
     force: bool = False
 
 
-class TaskComplexityRequest(BaseModel):
-    complexity: str = Field(pattern=r"^(simple|standard)$")
+class TaskTrajectoryRequest(BaseModel):
+    """POST /api/tasks/{id}/trajectory. Human-side mid-flight reroute,
+    sibling of `coord_set_task_trajectory`."""
+    trajectory: list[dict[str, Any]] = Field(min_length=1)
+
+
+class TaskWorkflowRequest(BaseModel):
+    workflow: str | None = Field(
+        default=None,
+        pattern=r"^(code|research|writing|marketing|ops|generic)$",
+    )
+    tracking_reason: str | None = Field(default=None, max_length=80)
 
 
 class TaskBlockedRequest(BaseModel):
@@ -3462,10 +3476,42 @@ async def list_tasks(status: str | None = None, owner: str | None = None) -> dic
 
 @app.post("/api/tasks", dependencies=[Depends(require_token)])
 async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
-    """Create a top-level task from the UI (attributed to 'human')."""
+    """Create a top-level task from the UI (attributed to 'human').
+
+    v0.3: routing is driven by the `trajectory` field (ordered list of
+    `{stage, to}` objects). Defaults to `[{stage:'execute', to:[]}]`
+    when omitted — Coach can add stages later via
+    POST /api/tasks/{id}/trajectory.
+    """
+    from server.tools import _validate_trajectory
     task_id = f"t-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:8]}"
     parent_id = req.parent_id or None
     project_id = await resolve_active_project()
+    tracking_reason = (
+        req.tracking_reason.strip()
+        if isinstance(req.tracking_reason, str) and req.tracking_reason.strip()
+        else None
+    )
+
+    # Validate trajectory (or default to bare execute).
+    if req.trajectory is None:
+        trajectory = [{"stage": "execute", "to": []}]
+    else:
+        validated, err = _validate_trajectory(req.trajectory)
+        if err:
+            raise HTTPException(400, detail=f"invalid trajectory: {err}")
+        assert validated is not None
+        trajectory = validated
+    trajectory_json = json.dumps(trajectory, separators=(",", ":"))
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    role_for_stage = {
+        "plan": "planner",
+        "execute": "executor",
+        "audit_syntax": "auditor_syntax",
+        "audit_semantics": "auditor_semantics",
+        "ship": "shipper",
+    }
 
     c = await configured_conn()
     try:
@@ -3476,32 +3522,88 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
             )
             if (await cur.fetchone()) is None:
                 raise HTTPException(404, detail=f"parent_id {parent_id} not found")
+        # v0.3 audit fix: initial status = first stage in trajectory.
+        initial_status = trajectory[0]["stage"]
+        first_stage_to = trajectory[0].get("to") or []
+        if isinstance(first_stage_to, str):
+            first_stage_to = [first_stage_to] if first_stage_to else []
+        initial_owner = (
+            first_stage_to[0] if len(first_stage_to) == 1 else None
+        )
         await c.execute(
             "INSERT INTO tasks (id, project_id, title, description, "
-            "parent_id, priority, complexity, created_by) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 'human')",
+            "parent_id, priority, workflow, tracking_reason, "
+            "trajectory, status, owner, last_stage_change_at, "
+            "created_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'human')",
             (
                 task_id, project_id, req.title, req.description,
-                parent_id, req.priority, req.complexity,
+                parent_id, req.priority, req.workflow,
+                tracking_reason, trajectory_json,
+                initial_status, initial_owner, now_iso,
             ),
         )
+        # Plant role rows for each stage in the trajectory.
+        for entry in trajectory:
+            stage = entry["stage"]
+            to_list: list[str] = entry.get("to") or []
+            role = role_for_stage[stage]
+            eligible_json = json.dumps(to_list, separators=(",", ":"))
+            if len(to_list) == 1:
+                await c.execute(
+                    "INSERT INTO task_role_assignments "
+                    "(task_id, role, eligible_owners, owner, "
+                    "assigned_at, claimed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (task_id, role, eligible_json, to_list[0],
+                     now_iso, now_iso),
+                )
+            else:
+                await c.execute(
+                    "INSERT INTO task_role_assignments "
+                    "(task_id, role, eligible_owners, owner, "
+                    "assigned_at) "
+                    "VALUES (?, ?, ?, NULL, ?)",
+                    (task_id, role, eligible_json, now_iso),
+                )
         await c.commit()
     finally:
         await c.close()
 
     await bus.publish(
         {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": now_iso,
             "agent_id": "human",
             "type": "task_created",
             "task_id": task_id,
             "title": req.title,
             "parent_id": parent_id,
             "priority": req.priority,
-            "complexity": req.complexity,
+            "workflow": req.workflow,
+            "tracking_reason": tracking_reason,
+            "trajectory": trajectory,
         }
     )
-    return {"ok": True, "task_id": task_id, "complexity": req.complexity}
+    # v0.3 audit fix (item 2): emit task_stage_changed for the initial
+    # stage so the kanban subscriber wakes the first-stage assignee.
+    await bus.publish(
+        {
+            "ts": now_iso,
+            "agent_id": "system",
+            "type": "task_stage_changed",
+            "task_id": task_id,
+            "from": None,
+            "to": initial_status,
+            "reason": "task_created",
+            "owner": initial_owner,
+        }
+    )
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "workflow": req.workflow,
+        "trajectory": trajectory,
+    }
 
 
 @app.post("/api/tasks/{task_id}/cancel", dependencies=[Depends(require_token)])
@@ -3530,12 +3632,14 @@ async def cancel_task_from_human(task_id: str) -> dict[str, Any]:
         now = datetime.now(timezone.utc).isoformat()
         # Cancellation lands in archive with cancelled_at + archived_at +
         # completed_at populated. The archive view's "show cancelled"
-        # toggle filters on cancelled_at.
+        # toggle filters on cancelled_at. Stamp last_stage_change_at +
+        # clear stale_alert_at (audit-2026-05-04 item 6).
         await c.execute(
             "UPDATE tasks SET status = 'archive', "
-            "completed_at = ?, archived_at = ?, cancelled_at = ? "
+            "completed_at = ?, archived_at = ?, cancelled_at = ?, "
+            "last_stage_change_at = ?, stale_alert_at = NULL "
             "WHERE id = ? AND project_id = ?",
-            (now, now, now, task_id, project_id),
+            (now, now, now, now, task_id, project_id),
         )
         if task["owner"]:
             await c.execute(
@@ -3772,6 +3876,7 @@ from server.tools import (  # noqa: E402
     ALL_KANBAN_STAGES,
     _check_kanban_role_gate,
     _valid_transition,
+    _validate_trajectory,
 )
 
 
@@ -3825,12 +3930,15 @@ async def post_task_stage(
                     detail=f"{gate_err} (pass force=true to bypass)",
                 )
         now = datetime.now(timezone.utc).isoformat()
+        # Stamp last_stage_change_at + clear stale_alert_at on every
+        # status change (audit-2026-05-04 item 6).
         if req.stage == "archive":
             await c.execute(
                 "UPDATE tasks SET status = 'archive', "
-                "completed_at = ?, archived_at = ? "
+                "completed_at = ?, archived_at = ?, "
+                "last_stage_change_at = ?, stale_alert_at = NULL "
                 "WHERE id = ? AND project_id = ?",
-                (now, now, task_id, project_id),
+                (now, now, now, task_id, project_id),
             )
             if t["owner"]:
                 await c.execute(
@@ -3840,9 +3948,10 @@ async def post_task_stage(
                 )
         else:
             await c.execute(
-                "UPDATE tasks SET status = ? "
+                "UPDATE tasks SET status = ?, "
+                "last_stage_change_at = ?, stale_alert_at = NULL "
                 "WHERE id = ? AND project_id = ?",
-                (req.stage, task_id, project_id),
+                (req.stage, now, task_id, project_id),
             )
         await c.commit()
     finally:
@@ -3862,45 +3971,270 @@ async def post_task_stage(
     return {"ok": True, "task_id": task_id, "from": old_status, "to": req.stage}
 
 
+# NOTE: POST /api/tasks/{id}/complexity was removed in v0.3 — routing
+# moved to the trajectory column. Use POST /api/tasks/{id}/trajectory.
+
+
 @app.post(
-    "/api/tasks/{task_id}/complexity", dependencies=[Depends(require_token)]
+    "/api/tasks/{task_id}/workflow", dependencies=[Depends(require_token)]
 )
-async def post_task_complexity(
-    task_id: str, req: TaskComplexityRequest
+async def post_task_workflow(
+    task_id: str, req: TaskWorkflowRequest
 ) -> dict[str, Any]:
+    """Update workflow tag and/or tracking_reason. v0.3: routing knobs
+    (required_reviews / ship_required / complexity) moved to the
+    trajectory column — use POST /api/tasks/{id}/trajectory instead."""
     project_id = await resolve_active_project()
+    tracking_reason = (
+        req.tracking_reason.strip()
+        if isinstance(req.tracking_reason, str) and req.tracking_reason.strip()
+        else None
+    )
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT owner, status FROM tasks WHERE id = ? AND project_id = ?",
+            "SELECT owner, status, workflow, tracking_reason "
+            "FROM tasks WHERE id = ? AND project_id = ?",
             (task_id, project_id),
         )
         row = await cur.fetchone()
         if row is None:
             raise HTTPException(404, detail=f"task {task_id} not found")
-        task_row = dict(row)
-        owner = task_row["owner"]
-        if task_row.get("status") == "archive":
-            raise HTTPException(
-                400, detail="archived tasks are read-only"
-            )
+        t = dict(row)
+        if t.get("status") == "archive":
+            raise HTTPException(400, detail="archived tasks are read-only")
+        workflow = req.workflow or t.get("workflow") or "generic"
+        next_reason = tracking_reason or t.get("tracking_reason")
         await c.execute(
-            "UPDATE tasks SET complexity = ? "
+            "UPDATE tasks SET workflow = ?, tracking_reason = ? "
             "WHERE id = ? AND project_id = ?",
-            (req.complexity, task_id, project_id),
+            (workflow, next_reason, task_id, project_id),
         )
         await c.commit()
     finally:
         await c.close()
+
     await bus.publish({
         "ts": datetime.now(timezone.utc).isoformat(),
         "agent_id": "human",
-        "type": "task_complexity_set",
+        "type": "task_workflow_set",
         "task_id": task_id,
-        "complexity": req.complexity,
-        "to": owner,
+        "workflow": workflow,
+        "tracking_reason": next_reason,
+        "to": t["owner"],
     })
-    return {"ok": True, "task_id": task_id, "complexity": req.complexity}
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "workflow": workflow,
+        "tracking_reason": next_reason,
+    }
+
+
+@app.post(
+    "/api/tasks/{task_id}/trajectory",
+    dependencies=[Depends(require_token)],
+)
+async def post_task_trajectory(
+    task_id: str, req: TaskTrajectoryRequest
+) -> dict[str, Any]:
+    """Human-side mid-flight reroute, sibling of
+    `coord_set_task_trajectory`. Validates that stages already entered
+    cannot be removed; supersedes role rows for removed stages and
+    upserts rows for added stages. Emits `task_trajectory_changed`.
+    """
+    validated, err = _validate_trajectory(req.trajectory)
+    if err:
+        raise HTTPException(400, detail=f"invalid trajectory: {err}")
+    assert validated is not None
+    new_trajectory = validated
+    new_stages = [s["stage"] for s in new_trajectory]
+
+    role_for_stage = {
+        "plan": "planner",
+        "execute": "executor",
+        "audit_syntax": "auditor_syntax",
+        "audit_semantics": "auditor_semantics",
+        "ship": "shipper",
+    }
+
+    project_id = await resolve_active_project()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT id, status, owner, trajectory FROM tasks "
+            "WHERE id = ? AND project_id = ?",
+            (task_id, project_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(404, detail=f"task {task_id} not found")
+        t = dict(row)
+        if t.get("status") == "archive":
+            raise HTTPException(400, detail="archived tasks are read-only")
+
+        try:
+            old_trajectory = json.loads(t.get("trajectory") or "[]")
+        except (TypeError, ValueError):
+            old_trajectory = []
+        old_stages = [
+            s["stage"]
+            for s in old_trajectory
+            if isinstance(s, dict) and "stage" in s
+        ]
+
+        # Cannot remove a stage the task has already entered.
+        current_stage = t.get("status")
+        if current_stage in old_stages:
+            current_idx = old_stages.index(current_stage)
+            entered = set(old_stages[: current_idx + 1])
+            removed = entered - set(new_stages)
+            if removed:
+                raise HTTPException(
+                    400,
+                    detail=(
+                        "cannot remove already-entered stages: "
+                        + ",".join(sorted(removed))
+                    ),
+                )
+
+        # Update trajectory column.
+        await c.execute(
+            "UPDATE tasks SET trajectory = ? "
+            "WHERE id = ? AND project_id = ?",
+            (
+                json.dumps(new_trajectory, separators=(",", ":")),
+                task_id,
+                project_id,
+            ),
+        )
+
+        # Deactivate role rows for removed stages. The schema has
+        # `superseded_by` (FK self-ref to a replacement row) and
+        # `completed_at` (role's work is done). Trajectory removal has
+        # no replacement row, so we use `completed_at = now()` to drop
+        # the row from active filters (`completed_at IS NULL AND
+        # superseded_by IS NULL`). The audit trail is preserved.
+        removed_stages = set(old_stages) - set(new_stages)
+        for stage in removed_stages:
+            role = role_for_stage.get(stage)
+            if not role:
+                continue
+            await c.execute(
+                "UPDATE task_role_assignments "
+                "SET completed_at = ? "
+                "WHERE task_id = ? AND role = ? "
+                "AND completed_at IS NULL AND superseded_by IS NULL",
+                (now_iso, task_id, role),
+            )
+
+        # Upsert rows for stages in the new trajectory.
+        for stage_obj in new_trajectory:
+            stage = stage_obj["stage"]
+            role = role_for_stage.get(stage)
+            if not role:
+                continue
+            to_field = stage_obj.get("to") or []
+            if isinstance(to_field, str):
+                eligible = [to_field] if to_field else []
+            else:
+                eligible = list(to_field)
+            owner_val = eligible[0] if len(eligible) == 1 else None
+            eligible_json = json.dumps(eligible, separators=(",", ":"))
+
+            cur = await c.execute(
+                "SELECT id, owner, eligible_owners FROM task_role_assignments "
+                "WHERE task_id = ? AND role = ? "
+                "AND completed_at IS NULL AND superseded_by IS NULL "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id, role),
+            )
+            existing = await cur.fetchone()
+            if existing is None:
+                await c.execute(
+                    "INSERT INTO task_role_assignments "
+                    "(task_id, role, owner, eligible_owners, "
+                    "assigned_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (task_id, role, owner_val, eligible_json, now_iso),
+                )
+            else:
+                ex = dict(existing)
+                if (
+                    ex.get("owner") != owner_val
+                    or ex.get("eligible_owners") != eligible_json
+                ):
+                    await c.execute(
+                        "UPDATE task_role_assignments "
+                        "SET owner = ?, eligible_owners = ? "
+                        "WHERE id = ?",
+                        (owner_val, eligible_json, ex["id"]),
+                    )
+
+        await c.commit()
+    finally:
+        await c.close()
+
+    await bus.publish({
+        "ts": now_iso,
+        "agent_id": "human",
+        "type": "task_trajectory_changed",
+        "task_id": task_id,
+        "trajectory": new_trajectory,
+        "stages_added": list(set(new_stages) - set(old_stages)),
+        "stages_removed": list(set(old_stages) - set(new_stages)),
+        "to": t.get("owner"),
+    })
+    return {"ok": True, "task_id": task_id, "trajectory": new_trajectory}
+
+
+@app.get("/api/tasks/flow_health", dependencies=[Depends(require_token)])
+async def get_tasks_flow_health() -> dict[str, Any]:
+    """Per-stage counts + oldest stage-change timestamp + stalled count
+    + kanban subscriber liveness. Lets the human inspect 'is the engine
+    actually moving' without scraping events."""
+    from server import kanban as kanban_mod
+    project_id = await resolve_active_project()
+    stages = ["plan", "execute", "audit_syntax", "audit_semantics", "ship"]
+    out_stages: dict[str, dict[str, Any]] = {}
+    stalled_count = 0
+
+    c = await configured_conn()
+    try:
+        for stage in stages:
+            cur = await c.execute(
+                "SELECT COUNT(*) AS cnt, MIN(last_stage_change_at) AS oldest "
+                "FROM tasks WHERE project_id = ? AND status = ?",
+                (project_id, stage),
+            )
+            row = await cur.fetchone()
+            d = dict(row) if row else {"cnt": 0, "oldest": None}
+            out_stages[stage] = {
+                "count": int(d.get("cnt") or 0),
+                "oldest_stage_change": d.get("oldest"),
+            }
+
+        cur = await c.execute(
+            "SELECT COUNT(*) AS cnt FROM tasks "
+            "WHERE project_id = ? AND status NOT IN ('archive') "
+            "AND stale_alert_at IS NOT NULL "
+            "AND last_stage_change_at IS NOT NULL "
+            "AND last_stage_change_at = stale_alert_at",
+            (project_id,),
+        )
+        row = await cur.fetchone()
+        stalled_count = int(dict(row).get("cnt") or 0) if row else 0
+    finally:
+        await c.close()
+
+    return {
+        "stages": out_stages,
+        "stalled_count": stalled_count,
+        "subscriber_last_event_at": kanban_mod.subscriber_last_event_at(),
+        "subscriber_alive": kanban_mod.is_running(),
+    }
 
 
 @app.post(
@@ -3963,8 +4297,8 @@ async def post_task_spec(
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT title, owner, created_by, created_at, priority, "
-            "complexity FROM tasks "
+            "SELECT title, owner, created_by, created_at, priority "
+            "FROM tasks "
             "WHERE id = ? AND project_id = ?",
             (task_id, project_id),
         )
@@ -3985,7 +4319,6 @@ async def post_task_spec(
             created_by=t["created_by"],
             created_at=t["created_at"],
             priority=t["priority"],
-            complexity=t["complexity"],
         )
     except ValueError as exc:
         raise HTTPException(400, detail=str(exc)) from exc
@@ -4054,7 +4387,8 @@ async def post_task_assign(
         task_row = await cur.fetchone()
         if task_row is None:
             raise HTTPException(404, detail=f"task {task_id} not found")
-        if dict(task_row).get("status") == "archive":
+        task_status = dict(task_row).get("status")
+        if task_status == "archive":
             raise HTTPException(
                 400, detail="archived tasks are read-only"
             )
@@ -4102,19 +4436,35 @@ async def post_task_assign(
     })
 
     # Auto-wake eligible Players (best-effort).
-    try:
-        from server.agents import maybe_wake_agent
-        wake_text = (
-            f"Human assigned you the {req.role} role on task {task_id}. "
-            f"Call coord_my_assignments to see context."
-        )
-        for slot in deduped:
-            try:
-                await maybe_wake_agent(slot, wake_text, bypass_debounce=True)
-            except Exception:
-                pass
-    except Exception:
-        pass
+    role_stage = {
+        "planner": "plan",
+        "executor": "plan",
+        "auditor_syntax": "audit_syntax",
+        "auditor_semantics": "audit_semantics",
+        "shipper": "ship",
+    }.get(req.role)
+    if role_stage == task_status:
+        try:
+            from server.agents import maybe_wake_agent
+            if len(deduped) > 1:
+                wake_text = (
+                    f"Human called you as a candidate for {req.role} "
+                    f"on task {task_id}. Call coord_accept_role("
+                    f"task_id={task_id!r}, role={req.role!r}) if you "
+                    f"can take it; first accepted claim wins."
+                )
+            else:
+                wake_text = (
+                    f"Human assigned you the {req.role} role on task {task_id}. "
+                    f"Call coord_my_assignments to see context."
+                )
+            for slot in deduped:
+                try:
+                    await maybe_wake_agent(slot, wake_text, bypass_debounce=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     return {"ok": True, "task_id": task_id, "role": req.role, "to": deduped}
 
@@ -5202,13 +5552,18 @@ async def list_events(
             "     payload_to = ? OR payload_to = 'broadcast'"
             "))"
             " OR (type = 'task_assigned' AND payload_to = ?)"
+            " OR (type = 'task_role_assigned' AND payload_to = ?)"
+            " OR (type = 'task_role_called' AND payload_to = ?)"
+            " OR (type = 'task_role_claimed' AND payload_to = ?)"
             " OR (type = 'task_updated' AND payload_owner = ?)"
             " OR (type = 'agent_model_set' AND payload_to = ?)"
             " OR (type = 'agent_effort_set' AND payload_to = ?)"
             " OR (type = 'agent_plan_mode_set' AND payload_to = ?)"
             ")"
         )
-        params.extend([agent, agent, agent, agent, agent, agent, agent])
+        params.extend([
+            agent, agent, agent, agent, agent, agent, agent, agent, agent, agent,
+        ])
     if type:
         where_parts.append("type = ?")
         params.append(type)

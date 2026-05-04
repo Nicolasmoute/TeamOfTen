@@ -323,7 +323,7 @@ def test_reconcile_replace_archives_old_and_inserts_new() -> None:
     assert new_stmt.id != "s5"
     assert new_stmt.text == "Pricing is per-task per the corpus"
     assert new_stmt.weight == pytest.approx(0.75)
-    assert new_stmt.created_by == "compass-truth"
+    assert new_stmt.created_by == "compass-intent"
     assert new_stmt.merged_from == ["s5"]
 
 

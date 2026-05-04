@@ -1,14 +1,15 @@
 """Reconciliation — Stage 0b of the Compass pipeline (spec §3.0.1).
 
-Fires after truth-derive on runs where the corpus hash changed AND
+Fires after intent-derive on runs where the corpus hash changed AND
 the pre-derive lattice was non-empty. Asks the LLM to identify
 existing lattice rows (active OR archived/settled) that the new
-corpus now contradicts. Each conflict becomes a `ReconciliationProposal`
-the human resolves on the dashboard.
+corpus now contradicts as a binding constraint or counter-direction.
+Each conflict becomes a `ReconciliationProposal` the human resolves
+on the dashboard.
 
 Not in the original spec §8 — added during the truth-folder
 integration. The runner sequences this immediately after Stage 0a
-(truth-derive); both share the corpus hash for idempotency.
+(intent-derive); both share the corpus hash for idempotency.
 """
 
 from __future__ import annotations

@@ -22,15 +22,15 @@ async def test_task_insert_with_valid_status(fresh_db: str) -> None:
         )
         await c.commit()
         cur = await c.execute(
-            "SELECT status, complexity, blocked FROM tasks WHERE id = 't-1'"
+            "SELECT status, trajectory, blocked FROM tasks WHERE id = 't-1'"
         )
         row = await cur.fetchone()
     finally:
         await c.close()
-    # Kanban default: status='plan', complexity='standard', blocked=0.
+    # Kanban v0.3 default: status='plan', trajectory=bare execute, blocked=0.
     d = dict(row)
     assert d["status"] == "plan"
-    assert d["complexity"] == "standard"
+    assert d["trajectory"] == '[{"stage":"execute","to":[]}]'
     assert d["blocked"] == 0
 
 

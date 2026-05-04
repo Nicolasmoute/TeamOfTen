@@ -679,6 +679,120 @@ Key files: [server/tools.py](server/tools.py), [server/kanban.py](server/kanban.
 [server/telegram_escalation.py](server/telegram_escalation.py). Full
 subsystem detail lives in [Docs/kanban-specs.md](Docs/kanban-specs.md).
 
+**Recent (2026-05-04) — Compass refocused as a compass of intent:**
+
+Compass shifted from "extract facts the corpus implies" to "extract
+INTENT the corpus implies" — what the project is trying to achieve,
+who it serves, what it deliberately is NOT, what's implied beyond
+what's literally specced. Two changes:
+
+- **Reading lens, not source list.** The corpus (specs in `truth/` +
+  `project-objectives.md` + `wiki/`) is unchanged; what changed is
+  the prompt. `INTENT_DERIVE_SYSTEM` (renamed from `TRUTH_DERIVE_SYSTEM`)
+  in [server/compass/prompts.py](server/compass/prompts.py) now extracts
+  directional claims ("we want real-time collaboration", "we are NOT
+  targeting enterprise customers in v1") instead of literal facts ("the
+  API uses GraphQL"). Specs play a **dual role**: intent material when
+  they encode a what-to-build decision, AND a binding constraint layer
+  used by truth-check (§3.7) when a Q&A answer would push the lattice
+  into spec contradiction. `QUESTION_BATCH_SYSTEM` /
+  `QUESTION_SINGLE_SYSTEM` got a new top priority — pin down the **new
+  landscape**: what's implied but not stated, what could come next, what
+  we should explicitly NOT do. `RECONCILIATION_SYSTEM` /
+  `BRIEFING_SYSTEM` / `CLAUDE_MD_BLOCK_SYSTEM` / `COACH_QUERY_SYSTEM`
+  got terminology shifts — settled lattice rows are "validated
+  direction," not "binding facts."
+
+- **Audit only the plan.** The auto-audit watcher
+  ([server/compass/audit_watcher.py](server/compass/audit_watcher.py))
+  dropped its four artifact-event subscriptions
+  (`commit_pushed` / `decision_written` / `knowledge_written` /
+  `output_saved`) and now subscribes to a single event family —
+  `task_stage_changed` — with a strict filter on `from='plan'
+  to='execute'`. Compass checks that the **plan** aligns with intent;
+  kanban v0.3's downstream auditor stages (`auditor_syntax`,
+  `auditor_semantics`, `shipper`) handle whether execution aligns with
+  the plan. Single check upstream, no redundant checks downstream.
+  Artifact shape: `[task-plan] task <id>: <title>\n\nTrajectory: ...\n\n--- spec ---\n<spec.md body>`.
+  Debounce key changed to `(project, task_id)`. The `output_extractor`
+  module + office-format dependencies (pypdf / python-docx / openpyxl
+  / python-pptx) stay in the codebase as latent capability for a
+  potential future Tier B revival.
+
+Code rename: `server/compass/pipeline/truth_derive.py` →
+`intent_derive.py`. New rows tagged `created_by="compass-intent"`;
+legacy `compass-truth` rows stay in lattices unchanged (no migration
+script). The runner accepts both tags as "this row was derived from
+the corpus." `truth_derive` shim re-exports the new symbols for any
+straggling import. The `compass_truth_hash_<id>` team_config key keeps
+its legacy name (it's still a hash over the same corpus contents).
+The `compass_truth_derived` event also keeps its name for back-compat
+with dashboard listeners.
+
+Spec mirror: [Docs/compass-specs.md](Docs/compass-specs.md) §1.4
+(reframed sources as "intent material" with the dual-role note),
+§3.0 (renamed Stage 0a to "intent-derive"), §4 (questions section gets
+a "new landscape" priority), §5.5 (auto-audit scope rewritten —
+kanban plan-exit only), §A.13 (corpus walking machinery unchanged but
+intro clarifies the dual role).
+
+Tests: [server/tests/test_compass_audit_watcher.py](server/tests/test_compass_audit_watcher.py)
+rewritten — every test is a `task_stage_changed{plan→execute}` flow
+now; legacy event types explicitly tested as no-ops; trajectory-
+without-plan skip case covered; missing-spec.md fallback to
+description verified.
+
+**Recent (2026-05-04) — Kanban v0.3: trajectory-driven gating:**
+
+The v0.2 admission gate + `complexity` + `required_reviews` +
+`ship_required` triple was replaced by a single `trajectory` column
+on `tasks`: an ordered JSON list of `{stage, to}` dicts that Coach
+defines on `coord_create_task`. Every Coach delegation is now a
+kanban task — the "answer-directly vs track" admission decision is
+gone. Coach's lifecycle policy steers hard toward
+`coord_assign_planner`; `coord_write_task_spec` stays as an
+emergency override only.
+
+Key new code: `_validate_trajectory` and `coord_set_task_trajectory`
+in [server/tools.py](server/tools.py); `_next_stage` walker +
+`audit_fail_notification` (sibling to `audit_report_submitted{fail}`,
+routed to Coach) + `stage_assignment_needed` in
+[server/kanban.py](server/kanban.py); the stall sweeper +
+`task_stage_stale` event in
+[server/idle_poller.py](server/idle_poller.py) (env knobs:
+`HARNESS_KANBAN_STALL_SECONDS` / `_RE_ALERT_SECONDS` /
+`_ENABLED`); `GET /api/tasks/flow_health` +
+`POST /api/tasks/{id}/trajectory` in [server/main.py](server/main.py).
+
+Coach's per-turn block grew two new rollups: `## Active task health`
+(surfaces tasks with `kind_fail_count >= 2` so first-fail noise is
+ignored but repeated same-kind fails trigger an effort/model bump
+suggestion) and `## Stalled tasks` (tasks past the stall threshold
+with no progress). Quality-feedback ladder: bump effort first, then
+model tier — never runtime (human decision).
+
+Schema migration: `_rebuild_tasks_for_kanban_v3` in
+[server/db.py](server/db.py) derives `trajectory` from
+each pre-existing row's `(complexity, required_reviews, ship_required,
+spec_path)` quadruple, backfills `last_stage_change_at` from the
+event log, and drops the three legacy columns. Idempotent via
+`team_config['tasks_kanban_v3_migrated']`. Per-row v0.2 detection
+uses `PRAGMA table_info` (substring search on the CREATE statement
+false-positives on fresh DBs whose v0.3 SCHEMA comments mention
+"complexity").
+
+UI: kanban cards now render a compact trajectory marker like
+`P → [E] → AY → S` (current stage in brackets) instead of the
+SIMPLE chip. Composer modal uses 5 trajectory presets (execute-only,
+plan+execute, code-with-formal-review, marketing-with-semantic, full
+pipeline). New `.kanban-flow-health` footer polls
+`/api/tasks/flow_health` every 30s + on subscriber events; turns red
+when subscriber is down or stalled count > 0.
+
+Spec mirror: [Docs/kanban-specs.md](Docs/kanban-specs.md) bumped to
+v0.3 (new §3 Trajectory, §17 Coach quality feedback, §18 Flow
+continuity & observability). Suite at 1064/1064.
+
 **Recent (2026-05-03) — Compass pinned to Sonnet + medium effort:**
 
 Compass was previously letting the Claude Agent SDK fall through to

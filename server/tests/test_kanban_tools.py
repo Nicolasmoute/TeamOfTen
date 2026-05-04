@@ -8,7 +8,6 @@ Covers the happy-path + key error-path branches for:
   - coord_submit_audit_report
   - coord_mark_shipped
   - coord_my_assignments
-  - coord_set_task_complexity
   - coord_advance_task_stage
   - coord_set_task_blocked
 
@@ -29,6 +28,19 @@ from server.tools import build_coord_server
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
+
+# v0.3 trajectory presets used by `_seed_task`. The standard preset is
+# the full code-with-formal-and-semantic-review path; tests that need
+# something narrower (simple self-audit, formal-only, etc.) pass an
+# override to `_seed_task(trajectory=...)`.
+_STANDARD_TRAJECTORY = (
+    '[{"stage":"plan","to":[]},'
+    '{"stage":"execute","to":[]},'
+    '{"stage":"audit_syntax","to":[]},'
+    '{"stage":"audit_semantics","to":[]},'
+    '{"stage":"ship","to":[]}]'
+)
+
 
 def _server_for(slot: str) -> Any:
     """Build a coord server with proxy metadata so we can grab handlers."""
@@ -58,7 +70,7 @@ async def _seed_task(
     task_id: str = "t-2026-05-03-abc12345",
     title: str = "demo task",
     status: str = "plan",
-    complexity: str = "standard",
+    trajectory: str = _STANDARD_TRAJECTORY,
     owner: str | None = None,
     spec_path: str | None = None,
 ) -> None:
@@ -66,9 +78,9 @@ async def _seed_task(
     try:
         await c.execute(
             "INSERT INTO tasks (id, project_id, title, status, owner, "
-            "created_by, complexity, spec_path) "
+            "created_by, trajectory, spec_path) "
             "VALUES (?, 'misc', ?, ?, ?, 'coach', ?, ?)",
-            (task_id, title, status, owner, complexity, spec_path),
+            (task_id, title, status, owner, trajectory, spec_path),
         )
         await c.commit()
     finally:
@@ -210,6 +222,31 @@ async def test_assign_planner_player_rejected(fresh_db: str) -> None:
     assert "Only Coach" in err
 
 
+async def test_accept_role_pool_first_claim_wins(fresh_db: str) -> None:
+    await init_db()
+    await _seed_task(status="audit_semantics", owner="p3")
+    coach = _server_for("coach")
+    _ok_text(await _handler(coach, "assign_auditor")({
+        "task_id": "t-2026-05-03-abc12345",
+        "to": "p4,p5",
+        "kind": "semantic",
+    }))
+
+    p4 = _server_for("p4")
+    text = _ok_text(await _handler(p4, "accept_role")({
+        "task_id": "t-2026-05-03-abc12345",
+        "role": "semantic",
+    }))
+    assert "accepted auditor_semantics" in text
+
+    p5 = _server_for("p5")
+    err = _err_text(await _handler(p5, "accept_role")({
+        "task_id": "t-2026-05-03-abc12345",
+        "role": "semantic",
+    }))
+    assert "already accepted" in err
+
+
 async def test_assign_auditor_self_review_warning(fresh_db: str) -> None:
     """Coach assigning the executor as their own auditor emits an
     `audit_self_review_warning` event but doesn't block. Verify by
@@ -225,7 +262,7 @@ async def test_assign_auditor_self_review_warning(fresh_db: str) -> None:
     queue = bus.subscribe()
     try:
         server = _server_for("coach")
-        # Coach assigns p3 as syntax auditor of their own work.
+        # Coach assigns p3 as formal reviewer of their own work.
         text = _ok_text(await _handler(server, "assign_auditor")({
             "task_id": "t-2026-05-03-abc12345",
             "to": "p3",
@@ -294,7 +331,7 @@ async def test_submit_audit_report_no_assignment_rejected(fresh_db: str) -> None
         "body": "x",
         "verdict": "pass",
     }))
-    assert "no active syntax auditor assignment" in err
+    assert "no active formal reviewer assignment" in err
 
 
 async def test_submit_audit_report_writes_md_and_updates_row(fresh_db: str) -> None:
@@ -338,6 +375,29 @@ async def test_submit_audit_report_writes_md_and_updates_row(fresh_db: str) -> N
     assert trow["latest_audit_report_path"] == row["report_path"]
     assert trow["latest_audit_kind"] == "syntax"
     assert trow["latest_audit_verdict"] == "pass"
+
+
+async def test_future_semantic_assignment_not_actionable_early(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed_task(status="audit_syntax", owner="p3")
+    coach = _server_for("coach")
+    await _handler(coach, "assign_auditor")({
+        "task_id": "t-2026-05-03-abc12345",
+        "to": "p8",
+        "kind": "semantic",
+    })
+    p8 = _server_for("p8")
+    text = _ok_text(await _handler(p8, "my_assignments")({}))
+    assert "t-2026-05-03-abc12345" not in text
+    err = _err_text(await _handler(p8, "submit_audit_report")({
+        "task_id": "t-2026-05-03-abc12345",
+        "kind": "semantic",
+        "body": "too early",
+        "verdict": "pass",
+    }))
+    assert "not active" in err
 
 
 async def test_submit_audit_report_round_increments(fresh_db: str) -> None:
@@ -416,6 +476,43 @@ async def test_mark_shipped_completes_role(fresh_db: str) -> None:
     assert row["completed_at"] is not None
 
 
+async def test_complete_execution_non_git_marks_executor_done(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed_task(status="execute", owner="p3", spec_path="x")
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO task_role_assignments "
+            "(task_id, role, eligible_owners, owner, assigned_at) "
+            "VALUES ('t-2026-05-03-abc12345', 'executor', '[]', "
+            "'p3', '2026-05-03T00:00:00Z')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    p3 = _server_for("p3")
+    text = _ok_text(await _handler(p3, "complete_execution")({
+        "task_id": "t-2026-05-03-abc12345",
+        "summary": "Wrote the research report.",
+        "artifact_path": "knowledge/reports/demo.md",
+        "completion_kind": "research",
+    }))
+    assert "completed execution" in text
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT completed_at FROM task_role_assignments "
+            "WHERE task_id = 't-2026-05-03-abc12345' "
+            "AND role = 'executor'"
+        )
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    assert row["completed_at"] is not None
+
+
 # ------------------------------------------------------------
 # coord_my_assignments
 # ------------------------------------------------------------
@@ -425,7 +522,7 @@ async def test_my_assignments_empty_plate(fresh_db: str) -> None:
     server = _server_for("p3")
     text = _ok_text(await _handler(server, "my_assignments")({}))
     assert "## Executor: (none" in text
-    assert "Pending audits:" in text
+    assert "Pending reviews:" in text
     assert "Pending ship assignments:" in text
     assert "Available to claim" in text
 
@@ -447,7 +544,7 @@ async def test_my_assignments_full_plate(fresh_db: str) -> None:
     finally:
         await c.close()
 
-    # p3 is the syntax auditor for task B.
+    # p3 is the formal reviewer for task B.
     await _seed_task(
         task_id="t-2026-05-03-bbbbbbbb", title="audit-task",
         status="audit_syntax", owner="p7",
@@ -497,38 +594,8 @@ async def test_my_assignments_coach_rejected(fresh_db: str) -> None:
 
 
 # ------------------------------------------------------------
-# coord_set_task_complexity / advance_task_stage / set_task_blocked
+# coord_advance_task_stage / set_task_blocked
 # ------------------------------------------------------------
-
-async def test_set_task_complexity(fresh_db: str) -> None:
-    await init_db()
-    await _seed_task()
-    server = _server_for("coach")
-    text = _ok_text(await _handler(server, "set_task_complexity")({
-        "task_id": "t-2026-05-03-abc12345",
-        "complexity": "simple",
-    }))
-    assert "simple" in text
-    c = await configured_conn()
-    try:
-        cur = await c.execute(
-            "SELECT complexity FROM tasks WHERE id = 't-2026-05-03-abc12345'"
-        )
-        row = dict(await cur.fetchone())
-    finally:
-        await c.close()
-    assert row["complexity"] == "simple"
-
-
-async def test_set_task_complexity_player_rejected(fresh_db: str) -> None:
-    await init_db()
-    await _seed_task()
-    server = _server_for("p3")
-    err = _err_text(await _handler(server, "set_task_complexity")({
-        "task_id": "t-2026-05-03-abc12345",
-        "complexity": "simple",
-    }))
-    assert "Only Coach" in err
 
 
 async def test_advance_task_stage_validates_transition(fresh_db: str) -> None:
@@ -616,3 +683,329 @@ async def test_set_task_blocked_validates_input(fresh_db: str) -> None:
         "blocked": "maybe",
     }))
     assert "must be" in err
+
+
+# ---------------------------------------------------------------------
+# coord_set_task_trajectory (audit-2026-05-04 items 4 + 5)
+# ---------------------------------------------------------------------
+
+_REROUTE_FULL = (
+    '[{"stage":"plan","to":[]},'
+    '{"stage":"execute","to":[]},'
+    '{"stage":"audit_syntax","to":[]},'
+    '{"stage":"audit_semantics","to":[]},'
+    '{"stage":"ship","to":[]}]'
+)
+
+
+async def test_set_task_trajectory_drops_removed_stage_role_rows(
+    fresh_db: str,
+) -> None:
+    """Trajectory removal must deactivate the orphaned role row WITHOUT
+    a FK violation on `superseded_by`. The active-row filter is
+    `completed_at IS NULL AND superseded_by IS NULL`; we use
+    completed_at = now() to deactivate."""
+    await init_db()
+    await _seed_task(
+        status="execute", trajectory=_REROUTE_FULL, owner="p3",
+        spec_path="x",
+    )
+    # Pre-seed a planner role row that will be left behind when we
+    # remove `plan` from the trajectory (we're already past it).
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO task_role_assignments "
+            "(task_id, role, eligible_owners, owner, assigned_at) "
+            "VALUES ('t-2026-05-03-abc12345', 'auditor_syntax', "
+            "'[]', 'p4', '2026-05-03T10:00:00Z')",
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    server = _server_for("coach")
+    # Drop audit_syntax + audit_semantics + ship; keep plan + execute.
+    # (We're CURRENTLY in execute, so removing later stages is allowed.)
+    result = await _handler(server, "set_task_trajectory")({
+        "task_id": "t-2026-05-03-abc12345",
+        "trajectory": [
+            {"stage": "plan", "to": []},
+            {"stage": "execute", "to": []},
+        ],
+    })
+    assert not result.get("isError"), f"unexpected error: {result}"
+    # The auditor_syntax role row must now be inactive.
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT completed_at FROM task_role_assignments "
+            "WHERE task_id = 't-2026-05-03-abc12345' "
+            "AND role = 'auditor_syntax'"
+        )
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    assert row["completed_at"] is not None
+
+
+async def test_set_task_trajectory_rejects_removing_already_entered_stage(
+    fresh_db: str,
+) -> None:
+    """Item 5: a task in audit_semantics cannot remove the
+    already-entered audit_syntax stage."""
+    await init_db()
+    await _seed_task(
+        status="audit_semantics",
+        trajectory=_REROUTE_FULL,
+        owner="p3",
+        spec_path="x",
+    )
+    server = _server_for("coach")
+    err = _err_text(await _handler(server, "set_task_trajectory")({
+        "task_id": "t-2026-05-03-abc12345",
+        "trajectory": [
+            {"stage": "plan", "to": []},
+            {"stage": "execute", "to": []},
+            {"stage": "audit_semantics", "to": []},
+            {"stage": "ship", "to": []},
+        ],
+    }))
+    assert "already-entered" in err
+    assert "audit_syntax" in err
+
+
+async def test_set_task_trajectory_allows_adding_future_stage(
+    fresh_db: str,
+) -> None:
+    """A task in execute can add audit_syntax + ship to the trajectory."""
+    await init_db()
+    await _seed_task(
+        status="execute",
+        trajectory='[{"stage":"execute","to":[]}]',
+        owner="p3",
+    )
+    server = _server_for("coach")
+    result = await _handler(server, "set_task_trajectory")({
+        "task_id": "t-2026-05-03-abc12345",
+        "trajectory": [
+            {"stage": "execute", "to": []},
+            {"stage": "audit_syntax", "to": ["p4"]},
+            {"stage": "ship", "to": "p2"},
+        ],
+    })
+    assert not result.get("isError"), f"unexpected error: {result}"
+    # The new auditor_syntax + shipper role rows landed.
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT role, owner, eligible_owners FROM task_role_assignments "
+            "WHERE task_id = 't-2026-05-03-abc12345' "
+            "AND completed_at IS NULL AND superseded_by IS NULL "
+            "ORDER BY role"
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+    finally:
+        await c.close()
+    role_names = {r["role"] for r in rows}
+    assert "auditor_syntax" in role_names
+    assert "shipper" in role_names
+
+
+# ---------------------------------------------------------------------
+# last_stage_change_at stamping (audit-2026-05-04 item 6)
+# ---------------------------------------------------------------------
+
+
+async def _read_stage_change_at(task_id: str) -> str | None:
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT last_stage_change_at FROM tasks WHERE id = ?",
+            (task_id,),
+        )
+        row = await cur.fetchone()
+        return dict(row).get("last_stage_change_at") if row else None
+    finally:
+        await c.close()
+
+
+async def test_advance_task_stage_stamps_last_stage_change_at(
+    fresh_db: str,
+) -> None:
+    """coord_advance_task_stage must update last_stage_change_at so
+    the stall sweeper sees the move."""
+    await init_db()
+    await _seed_task(
+        status="execute",
+        trajectory='[{"stage":"execute","to":[]},'
+                   '{"stage":"audit_syntax","to":[]}]',
+        owner="p3",
+    )
+    server = _server_for("coach")
+    result = await _handler(server, "advance_task_stage")({
+        "task_id": "t-2026-05-03-abc12345",
+        "stage": "audit_syntax",
+    })
+    assert not result.get("isError"), f"unexpected error: {result}"
+    stamp = await _read_stage_change_at("t-2026-05-03-abc12345")
+    assert stamp is not None
+
+
+async def test_claim_task_stamps_last_stage_change_at(
+    fresh_db: str,
+) -> None:
+    """coord_claim_task moves the task plan→execute; the timestamp
+    column must be stamped (it powers the stall sweeper)."""
+    await init_db()
+    await _seed_task(
+        status="plan",
+        trajectory='[{"stage":"plan","to":[]},'
+                   '{"stage":"execute","to":[]}]',
+        owner=None,
+        spec_path="x",
+    )
+    server = _server_for("p3")
+    result = await _handler(server, "claim_task")({
+        "task_id": "t-2026-05-03-abc12345",
+    })
+    assert not result.get("isError"), f"unexpected error: {result}"
+    stamp = await _read_stage_change_at("t-2026-05-03-abc12345")
+    assert stamp is not None
+
+
+async def test_update_task_archive_stamps_last_stage_change_at(
+    fresh_db: str,
+) -> None:
+    """Cancellation via coord_update_task lands the task in archive;
+    last_stage_change_at must reflect the move."""
+    await init_db()
+    await _seed_task(status="execute", owner="p3")
+    server = _server_for("coach")
+    result = await _handler(server, "update_task")({
+        "task_id": "t-2026-05-03-abc12345",
+        "status": "cancelled",
+        "note": "no longer needed",
+    })
+    assert not result.get("isError"), f"unexpected error: {result}"
+    stamp = await _read_stage_change_at("t-2026-05-03-abc12345")
+    assert stamp is not None
+
+
+# ---------------------------------------------------------------------
+# Reassignment supersedes prior active rows + mirrors to trajectory.to
+# (audit-2026-05-04 items 7 + 8)
+# ---------------------------------------------------------------------
+
+
+async def test_assign_auditor_supersedes_prior_active_row(
+    fresh_db: str,
+) -> None:
+    """The board picks the first active matching row; reassignment
+    must supersede the prior row so the new pick wins."""
+    await init_db()
+    await _seed_task(
+        status="audit_syntax",
+        trajectory='[{"stage":"execute","to":[]},'
+                   '{"stage":"audit_syntax","to":["p4"]}]',
+        owner="p3",
+        spec_path="x",
+    )
+    # Pre-seed an existing auditor_syntax row hard-assigned to p4.
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO task_role_assignments "
+            "(task_id, role, eligible_owners, owner, "
+            "assigned_at, claimed_at) "
+            "VALUES ('t-2026-05-03-abc12345', 'auditor_syntax', '[]', "
+            "'p4', '2026-05-03T10:00:00Z', '2026-05-03T10:00:00Z')",
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    server = _server_for("coach")
+    result = await _handler(server, "assign_auditor")({
+        "task_id": "t-2026-05-03-abc12345",
+        "to": "p7",
+        "kind": "syntax",
+    })
+    assert not result.get("isError"), f"unexpected error: {result}"
+    # Only ONE active auditor_syntax row, owned by p7.
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT owner, superseded_by FROM task_role_assignments "
+            "WHERE task_id = 't-2026-05-03-abc12345' "
+            "AND role = 'auditor_syntax' "
+            "ORDER BY id"
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+    finally:
+        await c.close()
+    assert len(rows) == 2
+    # First row (the original p4 assignment) is superseded by row #2.
+    assert rows[0]["superseded_by"] is not None
+    # Second row is active and owned by p7.
+    assert rows[1]["owner"] == "p7"
+    assert rows[1]["superseded_by"] is None
+
+
+async def test_assign_auditor_mirrors_to_trajectory(fresh_db: str) -> None:
+    """Item 8: reassignment must update tasks.trajectory.to so the
+    stored trajectory + UI marker stay in sync with the role rows."""
+    await init_db()
+    await _seed_task(
+        status="audit_syntax",
+        trajectory='[{"stage":"execute","to":[]},'
+                   '{"stage":"audit_syntax","to":["p4"]}]',
+        owner="p3",
+        spec_path="x",
+    )
+    server = _server_for("coach")
+    result = await _handler(server, "assign_auditor")({
+        "task_id": "t-2026-05-03-abc12345",
+        "to": "p7",
+        "kind": "syntax",
+    })
+    assert not result.get("isError"), f"unexpected error: {result}"
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT trajectory FROM tasks WHERE id = 't-2026-05-03-abc12345'"
+        )
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    traj = json.loads(row["trajectory"])
+    audit_entry = next(s for s in traj if s["stage"] == "audit_syntax")
+    assert audit_entry["to"] == ["p7"]
+
+
+async def test_assign_task_pool_mirrors_trajectory_to(fresh_db: str) -> None:
+    """coord_assign_task pool form also mirrors deduped candidates
+    into tasks.trajectory.to."""
+    await init_db()
+    await _seed_task(
+        status="plan",
+        trajectory='[{"stage":"plan","to":[]},'
+                   '{"stage":"execute","to":[]}]',
+        owner=None,
+        spec_path="x",
+    )
+    server = _server_for("coach")
+    result = await _handler(server, "assign_task")({
+        "task_id": "t-2026-05-03-abc12345",
+        "to": "p2,p3",
+    })
+    assert not result.get("isError"), f"unexpected error: {result}"
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT trajectory FROM tasks WHERE id = 't-2026-05-03-abc12345'"
+        )
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    traj = json.loads(row["trajectory"])
+    exec_entry = next(s for s in traj if s["stage"] == "execute")
+    assert exec_entry["to"] == ["p2", "p3"]

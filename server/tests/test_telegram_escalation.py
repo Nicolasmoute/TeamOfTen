@@ -620,26 +620,29 @@ async def test_full_path_via_bus(
 
 
 def test_key_for_audit_fail() -> None:
-    """audit_report_submitted with verdict='fail' is escalated; pass is not."""
-    ev_fail = {
-        "type": "audit_report_submitted",
+    """v0.3: audit_fail_notification with escalate=True is escalated;
+    escalate=False (first fail of the kind) is filtered out so first-fail
+    noise stays out of Telegram."""
+    ev_escalate = {
+        "type": "audit_fail_notification",
         "task_id": "t-2026-05-03-aaaaaaaa",
         "kind": "syntax",
-        "verdict": "fail",
+        "kind_round": 2,
+        "escalate": True,
     }
-    assert esc._key_for_pending(ev_fail) == ("audit_fail", "t-2026-05-03-aaaaaaaa")
-    ev_pass = {**ev_fail, "verdict": "pass"}
-    assert esc._key_for_pending(ev_pass) is None
+    assert esc._key_for_pending(ev_escalate) == ("audit_fail", "t-2026-05-03-aaaaaaaa")
+    ev_first = {**ev_escalate, "kind_round": 1, "escalate": False}
+    assert esc._key_for_pending(ev_first) is None
 
 
-def test_key_for_audit_assignment_needed() -> None:
+def test_key_for_stage_assignment_needed() -> None:
     ev = {
-        "type": "audit_assignment_needed",
+        "type": "stage_assignment_needed",
         "task_id": "t-2026-05-03-aaaaaaaa",
         "role": "auditor_syntax",
     }
     assert esc._key_for_pending(ev) == (
-        "audit_assignment_needed",
+        "stage_assignment_needed",
         "t-2026-05-03-aaaaaaaa:auditor_syntax",
     )
 
@@ -656,16 +659,17 @@ def test_key_for_audit_self_review() -> None:
     )
 
 
-def test_resolution_task_role_assigned_cancels_audit_assignment_needed() -> None:
+def test_resolution_task_role_assigned_cancels_stage_assignment_needed() -> None:
     """When Coach finally fills the role, the assignment-needed
-    timer should be cancelled."""
+    timer should be cancelled (v0.3: now keyed under
+    stage_assignment_needed)."""
     ev = {
         "type": "task_role_assigned",
         "task_id": "t-2026-05-03-aaaaaaaa",
         "role": "auditor_syntax",
     }
     assert esc._key_for_resolution(ev) == (
-        "audit_assignment_needed",
+        "stage_assignment_needed",
         "t-2026-05-03-aaaaaaaa:auditor_syntax",
     )
 
@@ -682,13 +686,17 @@ async def test_audit_fail_fires_with_message_body(
 
     await esc.start_escalation_watcher()
     try:
+        # v0.3: watcher now listens for audit_fail_notification with
+        # escalate=True (set by the kanban subscriber on second fail
+        # of the same kind).
         await bus.publish({
-            "type": "audit_report_submitted",
+            "type": "audit_fail_notification",
             "task_id": "t-2026-05-03-bbbbbbbb",
             "kind": "syntax",
-            "verdict": "fail",
+            "kind_round": 2,
+            "escalate": True,
             "auditor_id": "p4",
-            "round": 2,
+            "executor_id": "p3",
             "report_path": "audits/audit_2_syntax.md",
             "ts": "2026-05-03T14:22:11+00:00",
         })
@@ -699,7 +707,6 @@ async def test_audit_fail_fires_with_message_body(
         assert "t-2026-05-03-bbbbbbbb" in body
         assert "syntax" in body
         assert "p4" in body
-        assert "round 2" in body
         assert "audit_2_syntax.md" in body
     finally:
         await esc.stop_escalation_watcher()
@@ -730,11 +737,11 @@ async def test_audit_fail_formatter_includes_task_context(
     assert "priority=urgent" in body
 
 
-async def test_audit_assignment_needed_cancelled_by_role_assigned(
+async def test_stage_assignment_needed_cancelled_by_role_assigned(
     fresh_db: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If Coach assigns the auditor before the timer expires, no
-    Telegram message goes out."""
+    Telegram message goes out (v0.3 event name)."""
     await init_db()
     sent = _stub_send(monkeypatch)
     monkeypatch.setenv("HARNESS_TELEGRAM_ESCALATION_SECONDS", "60")
@@ -743,7 +750,7 @@ async def test_audit_assignment_needed_cancelled_by_role_assigned(
     await esc.start_escalation_watcher()
     try:
         await bus.publish({
-            "type": "audit_assignment_needed",
+            "type": "stage_assignment_needed",
             "task_id": "t-2026-05-03-cccccccc",
             "role": "auditor_syntax",
             "ts": "2026-05-03T14:00:00+00:00",

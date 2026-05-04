@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 
@@ -103,10 +105,24 @@ CREATE TABLE IF NOT EXISTS tasks (
     parent_id                   TEXT REFERENCES tasks(id),
     priority                    TEXT NOT NULL DEFAULT 'normal'
                                 CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
-    -- Coach-set complexity. `simple` skips audit + ship — the executor
-    -- self-audits and `commit_pushed` jumps the task straight to archive.
-    complexity                  TEXT NOT NULL DEFAULT 'standard'
-                                CHECK (complexity IN ('simple', 'standard')),
+    -- Trajectory drives all routing in v0.3. JSON list of {stage, to}
+    -- objects; ordered list of stages this task will traverse, with the
+    -- per-stage candidate pool. Replaces v0.2's complexity / required_reviews
+    -- / ship_required triple. Validation lives in tools.py:_validate_trajectory.
+    trajectory                  TEXT NOT NULL DEFAULT '[{"stage":"execute","to":[]}]',
+    -- Stamped by the kanban subscriber on every status transition. Drives
+    -- the stall sweeper in idle_poller.py.
+    last_stage_change_at        TEXT,
+    -- Stamped by the stall sweeper when it fires task_stage_stale.
+    -- Suppresses re-alerts until the task progresses or 24h escalation.
+    stale_alert_at              TEXT,
+    -- Workflow metadata drives prompt wording (code/research/writing/
+    -- marketing/ops/generic). Does NOT drive routing — the trajectory does.
+    workflow                    TEXT NOT NULL DEFAULT 'generic',
+    -- Optional informational tag; no longer required, no longer enum-validated
+    -- (the v0.2 admission gate is removed in v0.3 — every Coach delegation
+    -- goes through kanban).
+    tracking_reason             TEXT,
     -- Orthogonal blocked flag. `blocked_reason` is a short note for
     -- the card. Toggleable via coord_set_task_blocked.
     blocked                     INTEGER NOT NULL DEFAULT 0,
@@ -135,15 +151,15 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status     ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_owner      ON tasks(owner);
 CREATE INDEX IF NOT EXISTS idx_tasks_parent     ON tasks(parent_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_project    ON tasks(project_id);
--- Note: indexes referencing kanban-new columns (`complexity`, `archived_at`)
--- live in `_ensure_tasks_kanban_indexes`, called from init_db AFTER the
--- migration runs. SQLite validates column existence at CREATE INDEX time,
--- so an upgraded DB whose tasks table still has the legacy schema would
--- crash here on every boot.
+-- Note: indexes referencing kanban-new columns (`archived_at`,
+-- `last_stage_change_at`) live in `_ensure_tasks_kanban_indexes`, called
+-- from init_db AFTER the migrations run. SQLite validates column
+-- existence at CREATE INDEX time, so an upgraded DB whose tasks table
+-- still has the legacy schema would crash here on every boot.
 
 -- Task role assignments (Docs/kanban-specs.md §4). A task has multiple
 -- Players involved in different roles across stages: planner (optional —
--- Coach by default), executor, syntax auditor, semantic auditor, shipper.
+-- Coach by default), executor, formal reviewer, semantic reviewer, shipper.
 -- Each role can be hard-assigned to one Player or posted to a pool of
 -- eligible Players (`eligible_owners` JSON array) where the first to
 -- claim wins. Multiple rows per (task, role) accumulate over time — an
@@ -693,13 +709,31 @@ async def init_db() -> None:
             # fresh installs (which already have the right constraint).
             await _rebuild_file_write_proposals_if_check_outdated(db)
 
-            # Kanban lifecycle migration — rebuilds the tasks table
-            # from the legacy status enum (open/claimed/in_progress/
+            # Kanban lifecycle migration v0.1 → v0.2 — rebuilds the tasks
+            # table from the legacy status enum (open/claimed/in_progress/
             # blocked/done/cancelled) to the kanban enum (plan/execute/
             # audit_syntax/audit_semantics/ship/archive) and populates
-            # the new lifecycle columns. Idempotent; no-op once
+            # the v0.2 lifecycle columns. Idempotent; no-op once
             # team_config['tasks_kanban_v1_migrated'] is set.
             await _rebuild_tasks_if_kanban_outdated(db)
+            # Retrofit columns added in v0.2 (workflow / tracking_reason)
+            # for DBs that already migrated to v0.2 but lack these. The
+            # v0.3 migration drops `required_reviews` / `ship_required` /
+            # `complexity` so they're not in this list anymore.
+            await _ensure_columns(
+                db,
+                "tasks",
+                [
+                    ("workflow", "workflow TEXT NOT NULL DEFAULT 'generic'"),
+                    ("tracking_reason", "tracking_reason TEXT"),
+                ],
+            )
+            # Kanban lifecycle migration v0.2 → v0.3 — rebuilds the tasks
+            # table to drop complexity / required_reviews / ship_required
+            # and add trajectory / last_stage_change_at / stale_alert_at.
+            # Idempotent; no-op once team_config['tasks_kanban_v3_migrated']
+            # is set.
+            await _rebuild_tasks_for_kanban_v3(db)
             # Indexes that reference kanban-new columns. Live outside
             # SCHEMA because their columns don't exist on legacy DBs
             # until the migration above runs.
@@ -869,18 +903,26 @@ async def _rebuild_file_write_proposals_if_check_outdated(
 
 
 async def _ensure_tasks_kanban_indexes(db: aiosqlite.Connection) -> None:
-    """Create indexes that reference kanban-only columns (`complexity`,
-    `archived_at`). Lives outside the SCHEMA constant because SQLite
-    validates index columns at create time — running these at SCHEMA
-    time on a legacy DB (before migration converts the table) would
-    fail with `no such column: complexity`. Called from init_db AFTER
-    `_rebuild_tasks_if_kanban_outdated`, so the columns are guaranteed
-    to exist by then."""
-    await db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_complexity ON tasks(complexity)"
-    )
+    """Create indexes that reference kanban-only columns (`archived_at`,
+    `last_stage_change_at`). Lives outside the SCHEMA constant because
+    SQLite validates index columns at create time — running these at
+    SCHEMA time on a legacy DB (before migration converts the table)
+    would fail with "no such column". Called from init_db AFTER
+    `_rebuild_tasks_if_kanban_outdated` and `_rebuild_tasks_for_kanban_v3`,
+    so the columns are guaranteed to exist by then.
+
+    The v0.2 `idx_tasks_complexity` index is dropped along with the
+    `complexity` column in the v0.3 rebuild — its DROP INDEX runs inside
+    the rebuild's table-rename dance.
+    """
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_archived ON tasks(archived_at DESC)"
+    )
+    # Index for the stall sweeper — bounded scan over non-archive,
+    # non-blocked rows whose last_stage_change_at exceeded the threshold.
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_stage_change "
+        "ON tasks(last_stage_change_at)"
     )
 
 
@@ -974,6 +1016,10 @@ async def _rebuild_tasks_if_kanban_outdated(
                                                 CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
                     complexity                  TEXT NOT NULL DEFAULT 'standard'
                                                 CHECK (complexity IN ('simple', 'standard')),
+                    workflow                    TEXT NOT NULL DEFAULT 'generic',
+                    tracking_reason             TEXT,
+                    required_reviews            TEXT NOT NULL DEFAULT '["formal","semantic"]',
+                    ship_required               INTEGER NOT NULL DEFAULT 1,
                     blocked                     INTEGER NOT NULL DEFAULT 0,
                     blocked_reason              TEXT,
                     spec_path                   TEXT,
@@ -997,7 +1043,9 @@ async def _rebuild_tasks_if_kanban_outdated(
                     (id, project_id, title, description, status, owner,
                      created_by, created_at, claimed_at, started_at,
                      completed_at, archived_at, cancelled_at, parent_id,
-                     priority, complexity, blocked, tags, artifacts)
+                     priority, complexity, workflow, tracking_reason,
+                     required_reviews, ship_required, blocked, tags,
+                     artifacts)
                 SELECT
                     id,
                     project_id,
@@ -1037,6 +1085,10 @@ async def _rebuild_tasks_if_kanban_outdated(
                     parent_id,
                     priority,
                     'standard' AS complexity,
+                    'generic' AS workflow,
+                    NULL AS tracking_reason,
+                    '["formal","semantic"]' AS required_reviews,
+                    1 AS ship_required,
                     CASE WHEN status = 'blocked' THEN 1 ELSE 0 END AS blocked,
                     tags,
                     artifacts
@@ -1080,6 +1132,287 @@ async def _rebuild_tasks_if_kanban_outdated(
             await db.execute(
                 "INSERT OR IGNORE INTO team_config (key, value) VALUES "
                 "('tasks_kanban_v1_migrated', '1')"
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    finally:
+        await db.execute("PRAGMA foreign_keys = ON")
+
+
+async def _rebuild_tasks_for_kanban_v3(
+    db: aiosqlite.Connection,
+) -> None:
+    """One-shot migration v0.2 → v0.3: rebuild the tasks table to drop
+    `complexity` / `required_reviews` / `ship_required` and add
+    `trajectory` / `last_stage_change_at` / `stale_alert_at`.
+
+    Detection: presence of `complexity` column in the table's CREATE
+    statement. Fresh installs from the v0.3 SCHEMA already have the new
+    shape and short-circuit on the marker.
+
+    Trajectory derivation per row:
+      - complexity='simple' → [{"stage":"execute","to":[<owner>?]}]
+      - complexity='standard' → walk: optional plan (if spec_path set),
+        always execute, audit_syntax (if 'formal'/'syntax' in
+        required_reviews), audit_semantics (if 'semantic'/'semantics'
+        in required_reviews), ship (if ship_required=1). Per-stage
+        `to` is read from active task_role_assignments rows.
+
+    Backfill `last_stage_change_at` from the most recent
+    `task_stage_changed` event for each task, falling back to
+    `claimed_at` then `created_at`.
+
+    Idempotent via team_config['tasks_kanban_v3_migrated'].
+    """
+    cur = await db.execute(
+        "SELECT value FROM team_config WHERE key = 'tasks_kanban_v3_migrated'"
+    )
+    if await cur.fetchone():
+        return  # already migrated
+
+    cur = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'"
+    )
+    row = await cur.fetchone()
+    if not row:
+        # Fresh install path: tasks doesn't exist yet. Mark migrated.
+        await db.execute(
+            "INSERT OR IGNORE INTO team_config (key, value) VALUES "
+            "('tasks_kanban_v3_migrated', '1')"
+        )
+        await db.commit()
+        return
+    # Detect v0.2 schema by checking actual columns (PRAGMA table_info).
+    # A substring search on the CREATE statement is unreliable because
+    # the v0.3 SCHEMA mentions "complexity" in a comment — we'd false-
+    # positive on every fresh install.
+    cur = await db.execute("PRAGMA table_info(tasks)")
+    cols = {r[1] for r in await cur.fetchall()}
+    if "complexity" not in cols:
+        # Already on v0.3 schema (fresh install or earlier v3 boot).
+        await db.execute(
+            "INSERT OR IGNORE INTO team_config (key, value) VALUES "
+            "('tasks_kanban_v3_migrated', '1')"
+        )
+        await db.commit()
+        return
+
+    logger.info(
+        "init_db: rebuilding tasks table for kanban v0.3 "
+        "(trajectory + last_stage_change_at)"
+    )
+
+    # Read every existing row plus the data we need to derive trajectory
+    # in Python. Doing the trajectory build in SQL would be possible via
+    # json_group_array + CASE, but the readability cost is high; a one-shot
+    # Python loop over O(rows × 5 roles) is fine for the kind of DB sizes
+    # this harness sees. Tuple-indexed because init_db's connection does
+    # not set aiosqlite.Row as the row_factory.
+    cur = await db.execute(
+        "SELECT id, status, owner, complexity, required_reviews, "
+        "ship_required, spec_path, claimed_at, created_at FROM tasks"
+    )
+    legacy_rows = list(await cur.fetchall())
+
+    async def _role_owner_for(tid: str, role: str) -> str | None:
+        cur = await db.execute(
+            "SELECT owner FROM task_role_assignments "
+            "WHERE task_id = ? AND role = ? AND superseded_by IS NULL "
+            "ORDER BY assigned_at DESC LIMIT 1",
+            (tid, role),
+        )
+        row = await cur.fetchone()
+        return (row[0] if row else None) or None
+
+    derived: dict[str, dict[str, Any]] = {}
+    for r in legacy_rows:
+        tid: str = r[0]
+        owner: str | None = r[2]
+        complexity = (r[3] or "standard").strip().lower()
+        try:
+            reviews = json.loads(r[4] or "[]")
+            if not isinstance(reviews, list):
+                reviews = []
+        except Exception:
+            reviews = []
+        review_kinds = {str(x).strip().lower() for x in reviews}
+        ship_required = bool(r[5])
+        spec_path: str | None = r[6]
+        claimed_at: str | None = r[7]
+        created_at: str | None = r[8]
+
+        trajectory: list[dict[str, Any]] = []
+        if complexity == "simple":
+            trajectory.append({
+                "stage": "execute",
+                "to": [owner] if owner else [],
+            })
+        else:
+            if spec_path:
+                planner = await _role_owner_for(tid, "planner")
+                trajectory.append({
+                    "stage": "plan",
+                    "to": [planner] if planner else [],
+                })
+            trajectory.append({
+                "stage": "execute",
+                "to": [owner] if owner else [],
+            })
+            if review_kinds & {"formal", "syntax"}:
+                aud_s = await _role_owner_for(tid, "auditor_syntax")
+                trajectory.append({
+                    "stage": "audit_syntax",
+                    "to": [aud_s] if aud_s else [],
+                })
+            if review_kinds & {"semantic", "semantics"}:
+                aud_e = await _role_owner_for(tid, "auditor_semantics")
+                trajectory.append({
+                    "stage": "audit_semantics",
+                    "to": [aud_e] if aud_e else [],
+                })
+            if ship_required:
+                shipper = await _role_owner_for(tid, "shipper")
+                trajectory.append({
+                    "stage": "ship",
+                    "to": [shipper] if shipper else [],
+                })
+
+        # last_stage_change_at: most recent task_stage_changed event for
+        # this task, fall back to claimed_at, then created_at.
+        cur = await db.execute(
+            "SELECT ts FROM events WHERE type = 'task_stage_changed' "
+            "AND json_extract(payload, '$.task_id') = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (tid,),
+        )
+        ev = await cur.fetchone()
+        last_change = (ev[0] if ev else None) or claimed_at or created_at
+
+        derived[tid] = {
+            "trajectory": json.dumps(trajectory),
+            "last_stage_change_at": last_change,
+        }
+
+    # Per SQLite's canonical table-rebuild guidance: disable FK
+    # enforcement, do the rename dance, foreign_key_check, re-enable.
+    await db.execute("PRAGMA foreign_keys = OFF")
+    try:
+        await db.execute("BEGIN")
+        try:
+            await db.execute(
+                """
+                CREATE TABLE tasks_v3 (
+                    id                          TEXT PRIMARY KEY,
+                    project_id                  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    title                       TEXT NOT NULL,
+                    description                 TEXT NOT NULL DEFAULT '',
+                    status                      TEXT NOT NULL DEFAULT 'plan'
+                                                CHECK (status IN ('plan', 'execute', 'audit_syntax', 'audit_semantics', 'ship', 'archive')),
+                    owner                       TEXT REFERENCES agents(id),
+                    created_by                  TEXT NOT NULL,
+                    created_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    claimed_at                  TEXT,
+                    started_at                  TEXT,
+                    completed_at                TEXT,
+                    archived_at                 TEXT,
+                    cancelled_at                TEXT,
+                    parent_id                   TEXT REFERENCES tasks(id),
+                    priority                    TEXT NOT NULL DEFAULT 'normal'
+                                                CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
+                    trajectory                  TEXT NOT NULL DEFAULT '[{"stage":"execute","to":[]}]',
+                    last_stage_change_at        TEXT,
+                    stale_alert_at              TEXT,
+                    workflow                    TEXT NOT NULL DEFAULT 'generic',
+                    tracking_reason             TEXT,
+                    blocked                     INTEGER NOT NULL DEFAULT 0,
+                    blocked_reason              TEXT,
+                    spec_path                   TEXT,
+                    spec_written_at             TEXT,
+                    latest_audit_report_path    TEXT,
+                    latest_audit_kind           TEXT,
+                    latest_audit_verdict        TEXT,
+                    compass_audit_report_path   TEXT,
+                    compass_audit_verdict       TEXT,
+                    tags                        TEXT NOT NULL DEFAULT '[]',
+                    artifacts                   TEXT NOT NULL DEFAULT '[]'
+                )
+                """
+            )
+            # Copy rows over with derived trajectory + last_stage_change_at.
+            # We hand each task its derived values via UPDATE after the
+            # column-preserving copy; cleaner than building a giant
+            # CASE-per-row INSERT with N parameter bindings.
+            await db.execute(
+                """
+                INSERT INTO tasks_v3
+                    (id, project_id, title, description, status, owner,
+                     created_by, created_at, claimed_at, started_at,
+                     completed_at, archived_at, cancelled_at, parent_id,
+                     priority, workflow, tracking_reason,
+                     blocked, blocked_reason, spec_path, spec_written_at,
+                     latest_audit_report_path, latest_audit_kind,
+                     latest_audit_verdict, compass_audit_report_path,
+                     compass_audit_verdict, tags, artifacts)
+                SELECT
+                    id, project_id, title, description, status, owner,
+                    created_by, created_at, claimed_at, started_at,
+                    completed_at, archived_at, cancelled_at, parent_id,
+                    priority,
+                    COALESCE(workflow, 'generic'),
+                    tracking_reason,
+                    blocked, blocked_reason, spec_path, spec_written_at,
+                    latest_audit_report_path, latest_audit_kind,
+                    latest_audit_verdict, compass_audit_report_path,
+                    compass_audit_verdict, tags, artifacts
+                FROM tasks
+                """
+            )
+            # Apply per-row derived trajectory + last_stage_change_at.
+            for tid, vals in derived.items():
+                await db.execute(
+                    "UPDATE tasks_v3 SET trajectory = ?, "
+                    "last_stage_change_at = ? WHERE id = ?",
+                    (vals["trajectory"], vals["last_stage_change_at"], tid),
+                )
+            # Drop dependent indexes then the old table.
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_complexity")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_status")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_owner")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_parent")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_project")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_archived")
+            await db.execute("DROP TABLE tasks")
+            await db.execute("ALTER TABLE tasks_v3 RENAME TO tasks")
+            # Recreate the always-on indexes (kanban-specific ones live
+            # in _ensure_tasks_kanban_indexes which runs after this).
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_status "
+                "ON tasks(status)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_owner "
+                "ON tasks(owner)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_parent "
+                "ON tasks(parent_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_project "
+                "ON tasks(project_id)"
+            )
+            cur = await db.execute("PRAGMA foreign_key_check")
+            violations = await cur.fetchall()
+            if violations:
+                raise RuntimeError(
+                    f"tasks v3 rebuild left {len(violations)} FK "
+                    f"violations: {violations}"
+                )
+            await db.execute(
+                "INSERT OR IGNORE INTO team_config (key, value) VALUES "
+                "('tasks_kanban_v3_migrated', '1')"
             )
             await db.commit()
         except Exception:

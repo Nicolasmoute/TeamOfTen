@@ -17,8 +17,31 @@ from server.kanban import (
     _on_audit_submitted,
     _on_commit_pushed,
     _on_compass_audit_logged,
+    _on_spec_written,
     _on_task_shipped,
     _recent_commit_task,
+)
+
+
+# v0.3 trajectories. Each element is a {stage, to} dict per the new schema.
+# `[execute, audit_syntax, audit_semantics, ship]` is the standard full path
+# (no `plan` because tests seed without spec_path).
+_STANDARD_TRAJECTORY = (
+    '[{"stage":"execute","to":[]},'
+    '{"stage":"audit_syntax","to":[]},'
+    '{"stage":"audit_semantics","to":[]},'
+    '{"stage":"ship","to":[]}]'
+)
+_SIMPLE_TRAJECTORY = '[{"stage":"execute","to":[]}]'
+_SEMANTIC_ONLY_TRAJECTORY = (
+    '[{"stage":"execute","to":[]},'
+    '{"stage":"audit_semantics","to":[]},'
+    '{"stage":"ship","to":[]}]'
+)
+_FORMAL_ONLY_TRAJECTORY = (
+    '[{"stage":"execute","to":[]},'
+    '{"stage":"audit_syntax","to":[]},'
+    '{"stage":"ship","to":[]}]'
 )
 
 
@@ -26,15 +49,16 @@ async def _seed(
     *,
     task_id: str = "t-2026-05-03-abc12345",
     status: str,
-    complexity: str = "standard",
+    trajectory: str = _STANDARD_TRAJECTORY,
     owner: str | None = None,
 ) -> None:
     c = await configured_conn()
     try:
         await c.execute(
             "INSERT INTO tasks (id, project_id, title, status, owner, "
-            "created_by, complexity) VALUES (?, 'misc', 't', ?, ?, 'coach', ?)",
-            (task_id, status, owner, complexity),
+            "created_by, trajectory) "
+            "VALUES (?, 'misc', 't', ?, ?, 'coach', ?)",
+            (task_id, status, owner, trajectory),
         )
         await c.commit()
     finally:
@@ -63,7 +87,7 @@ async def test_commit_pushed_standard_advances_to_audit_syntax(
     fresh_db: str,
 ) -> None:
     await init_db()
-    await _seed(status="execute", complexity="standard", owner="p3")
+    await _seed(status="execute", trajectory=_STANDARD_TRAJECTORY, owner="p3")
     await _on_commit_pushed({
         "type": "commit_pushed",
         "task_id": "t-2026-05-03-abc12345",
@@ -72,9 +96,29 @@ async def test_commit_pushed_standard_advances_to_audit_syntax(
     assert (await _read_status("t-2026-05-03-abc12345"))["status"] == "audit_syntax"
 
 
+async def test_execution_complete_semantic_only_skips_formal(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed(
+        status="execute",
+        trajectory=_SEMANTIC_ONLY_TRAJECTORY,
+        owner="p3",
+    )
+    from server.kanban import _on_task_execution_completed
+
+    await _on_task_execution_completed({
+        "type": "task_execution_completed",
+        "task_id": "t-2026-05-03-abc12345",
+    })
+    assert (await _read_status("t-2026-05-03-abc12345"))["status"] == "audit_semantics"
+
+
 async def test_commit_pushed_simple_jumps_to_archive(fresh_db: str) -> None:
     await init_db()
-    await _seed(status="execute", complexity="simple", owner="p3")
+    await _seed(
+        status="execute", trajectory=_SIMPLE_TRAJECTORY, owner="p3",
+    )
     # Mirror the executor's current_task_id so the archive transition
     # has someone to free up.
     c = await configured_conn()
@@ -163,6 +207,23 @@ async def test_audit_pass_syntax_advances_to_semantics(fresh_db: str) -> None:
     assert (await _read_status("t-2026-05-03-abc12345"))["status"] == "audit_semantics"
 
 
+async def test_formal_only_review_routes_to_ship(fresh_db: str) -> None:
+    await init_db()
+    await _seed(
+        status="audit_syntax",
+        trajectory=_FORMAL_ONLY_TRAJECTORY,
+        owner="p3",
+    )
+    await _on_audit_submitted({
+        "type": "audit_report_submitted",
+        "task_id": "t-2026-05-03-abc12345",
+        "kind": "syntax",
+        "verdict": "pass",
+        "round": 1,
+    })
+    assert (await _read_status("t-2026-05-03-abc12345"))["status"] == "ship"
+
+
 async def test_audit_pass_semantics_advances_to_ship(fresh_db: str) -> None:
     await init_db()
     await _seed(status="audit_semantics", owner="p3")
@@ -186,10 +247,11 @@ async def test_audit_fail_reverts_to_execute_resets_started_at(
     try:
         await c.execute(
             "INSERT INTO tasks (id, project_id, title, status, owner, "
-            "created_by, complexity, started_at) "
+            "created_by, trajectory, started_at) "
             "VALUES ('t-2026-05-03-abc12345', 'misc', 't', "
-            "'audit_syntax', 'p3', 'coach', 'standard', "
-            "'2026-05-01T10:00:00Z')"
+            "'audit_syntax', 'p3', 'coach', ?, "
+            "'2026-05-01T10:00:00Z')",
+            (_STANDARD_TRAJECTORY,),
         )
         await c.commit()
     finally:
@@ -334,6 +396,222 @@ async def test_compass_audit_logged_without_recent_commit_is_noop(
     })
     row = await _read_status("t-2026-05-03-abc12345")
     assert row["compass_audit_verdict"] is None
+
+
+# ------------------------------------------------------------
+# task_spec_written → plan→execute (audit-2026-05-04 item 1 fix)
+# ------------------------------------------------------------
+
+_PLAN_EXECUTE_TRAJECTORY = (
+    '[{"stage":"plan","to":[]},'
+    '{"stage":"execute","to":[]}]'
+)
+
+
+async def test_spec_written_advances_plan_to_execute(fresh_db: str) -> None:
+    """coord_write_task_spec emits task_spec_written; the subscriber
+    transitions plan-stage tasks to the next trajectory stage."""
+    await init_db()
+    await _seed(
+        status="plan",
+        trajectory=_PLAN_EXECUTE_TRAJECTORY,
+        owner="p3",
+    )
+    await _on_spec_written({
+        "type": "task_spec_written",
+        "task_id": "t-2026-05-03-abc12345",
+        "spec_path": "projects/misc/working/tasks/t-2026-05-03-abc12345/spec.md",
+    })
+    row = await _read_status("t-2026-05-03-abc12345")
+    assert row["status"] == "execute"
+
+
+async def test_spec_written_noop_when_already_past_plan(fresh_db: str) -> None:
+    """A re-spec on an executing task does not bump it backwards or
+    re-trigger the transition."""
+    await init_db()
+    await _seed(
+        status="execute",
+        trajectory=_PLAN_EXECUTE_TRAJECTORY,
+        owner="p3",
+    )
+    await _on_spec_written({
+        "type": "task_spec_written",
+        "task_id": "t-2026-05-03-abc12345",
+        "spec_path": "projects/misc/working/tasks/t-2026-05-03-abc12345/spec.md",
+    })
+    row = await _read_status("t-2026-05-03-abc12345")
+    assert row["status"] == "execute"
+
+
+async def test_spec_written_noop_when_no_plan_stage(fresh_db: str) -> None:
+    """A trajectory without a plan stage means spec writes are
+    informational — no transition fires."""
+    await init_db()
+    await _seed(
+        status="plan",
+        trajectory=_SIMPLE_TRAJECTORY,  # only execute, no plan
+        owner="p3",
+    )
+    await _on_spec_written({
+        "type": "task_spec_written",
+        "task_id": "t-2026-05-03-abc12345",
+        "spec_path": "x",
+    })
+    row = await _read_status("t-2026-05-03-abc12345")
+    # Status unchanged — the task was in plan because of seed data,
+    # not because of a planned route. Nothing for the handler to do.
+    assert row["status"] == "plan"
+
+
+async def test_spec_written_stamps_last_stage_change_at(fresh_db: str) -> None:
+    """The transition runs through _transition() which updates
+    last_stage_change_at — the stall sweeper relies on this signal."""
+    await init_db()
+    await _seed(
+        status="plan",
+        trajectory=_PLAN_EXECUTE_TRAJECTORY,
+        owner="p3",
+    )
+    await _on_spec_written({
+        "type": "task_spec_written",
+        "task_id": "t-2026-05-03-abc12345",
+        "spec_path": "x",
+    })
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT last_stage_change_at FROM tasks WHERE id = ?",
+            ("t-2026-05-03-abc12345",),
+        )
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    assert row["last_stage_change_at"] is not None
+
+
+# ------------------------------------------------------------
+# audit-2026-05-04 item 12: per-project Compass commit correlation
+# ------------------------------------------------------------
+
+
+async def test_compass_audit_attaches_to_correct_project_commit(
+    fresh_db: str,
+) -> None:
+    """When two projects each commit, the next compass_audit_logged
+    must attach to the project named in the event's project_id, not
+    to the global tail."""
+    import asyncio
+    from server import kanban as kanban_mod
+    await init_db()
+    # Reset module-level caches.
+    kanban_mod._recent_commit_task.clear()
+    kanban_mod._recent_commit_per_project.clear()
+    # Seed two tasks under different projects.
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO projects (id, name) VALUES ('alpha', 'Alpha')"
+        )
+        await c.execute(
+            "INSERT INTO projects (id, name) VALUES ('beta', 'Beta')"
+        )
+        await c.execute(
+            "INSERT INTO tasks (id, project_id, title, status, owner, "
+            "created_by, trajectory) VALUES "
+            "('t-2026-05-04-aaaaaaaa', 'alpha', 't', 'execute', 'p3', "
+            "'coach', '[{\"stage\":\"execute\",\"to\":[]}]')"
+        )
+        await c.execute(
+            "INSERT INTO tasks (id, project_id, title, status, owner, "
+            "created_by, trajectory) VALUES "
+            "('t-2026-05-04-bbbbbbbb', 'beta', 't', 'execute', 'p3', "
+            "'coach', '[{\"stage\":\"execute\",\"to\":[]}]')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    # Both projects commit. Beta is last globally.
+    await _on_commit_pushed({
+        "type": "commit_pushed",
+        "task_id": "t-2026-05-04-aaaaaaaa",
+        "sha": "alpha_sha",
+        "project_id": "alpha",
+    })
+    await _on_commit_pushed({
+        "type": "commit_pushed",
+        "task_id": "t-2026-05-04-bbbbbbbb",
+        "sha": "beta_sha",
+        "project_id": "beta",
+    })
+    # Compass logs an audit naming alpha — should NOT attach to beta
+    # just because beta was the global tail.
+    await kanban_mod._on_compass_audit_logged({
+        "type": "compass_audit_logged",
+        "audit_id": "audit_alpha",
+        "verdict": "aligned",
+        "report_path": "alpha_report.md",
+        "project_id": "alpha",
+    })
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT compass_audit_verdict, compass_audit_report_path "
+            "FROM tasks WHERE id = 't-2026-05-04-aaaaaaaa'"
+        )
+        alpha_row = dict(await cur.fetchone())
+        cur = await c.execute(
+            "SELECT compass_audit_verdict, compass_audit_report_path "
+            "FROM tasks WHERE id = 't-2026-05-04-bbbbbbbb'"
+        )
+        beta_row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    assert alpha_row["compass_audit_verdict"] == "aligned"
+    assert alpha_row["compass_audit_report_path"] == "alpha_report.md"
+    # Beta is untouched — different project_id.
+    assert beta_row["compass_audit_verdict"] is None
+    assert beta_row["compass_audit_report_path"] is None
+
+
+# ------------------------------------------------------------
+# audit-2026-05-04 item 11: revert wake reads spec_path + criteria
+# ------------------------------------------------------------
+
+
+def test_extract_failed_criteria_from_report(tmp_path) -> None:
+    """The helper pulls a `## Failed criteria` section verbatim from
+    a markdown audit report. Other sections are not included."""
+    from server.kanban import _extract_failed_criteria
+    report = tmp_path / "report.md"
+    report.write_text(
+        "## Summary\n"
+        "Looks bad.\n\n"
+        "## Failed criteria\n"
+        "- Login button is misaligned\n"
+        "- Help text overflows on mobile\n\n"
+        "## Other notes\n"
+        "Will revisit.\n",
+        encoding="utf-8",
+    )
+    out = _extract_failed_criteria(str(report))
+    assert "Login button is misaligned" in out
+    assert "Help text overflows on mobile" in out
+    assert "Other notes" not in out  # next-section marker stops extraction
+    assert "Will revisit" not in out
+
+
+def test_extract_failed_criteria_missing_section_returns_empty(tmp_path) -> None:
+    from server.kanban import _extract_failed_criteria
+    report = tmp_path / "report.md"
+    report.write_text("## Summary\nNo failed-criteria section.", encoding="utf-8")
+    assert _extract_failed_criteria(str(report)) == ""
+
+
+def test_extract_failed_criteria_missing_file_returns_empty() -> None:
+    from server.kanban import _extract_failed_criteria
+    assert _extract_failed_criteria("does/not/exist.md") == ""
+    assert _extract_failed_criteria("") == ""
 
 
 # ------------------------------------------------------------

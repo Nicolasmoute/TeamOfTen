@@ -53,43 +53,59 @@ KANBAN_MD_END_MARKER = "<!-- KANBAN-LIFECYCLE-END -->"
 # rewrites every project's CLAUDE.md to match.
 _KANBAN_BLOCK_BODY = """## Task lifecycle (kanban)
 
-Tasks flow through stages: **plan → execute → audit_syntax → audit_semantics → ship → archive**.
-Standard tasks traverse the full pipeline. Simple tasks (typos, log tweaks, one-line fixes)
-jump plan → execute → archive directly.
+Every task Coach delegates to a Player goes through the kanban. Conversational
+replies remain conversational — but if Coach is handing work to a Player, that's
+a kanban task with an explicit trajectory.
+
+Tasks flow through stored stages: **plan -> execute -> audit_syntax (formal
+review) -> audit_semantics (semantic review) -> ship -> archive**. The
+trajectory Coach defines on `coord_create_task` decides which stages the task
+visits — a quick mechanical fix may be `[{"stage":"execute"}]` only; a code
+change with formal review walks `plan -> execute -> audit_syntax -> ship`; a
+marketing piece walks `plan -> execute -> audit_semantics -> ship`.
 
 Each task produces durable markdown artifacts under
 `/data/projects/<project_id>/working/tasks/<task_id>/`:
 
-- `spec.md` — the plan, written before execute (required for standard tasks; optional for simple)
-- `audits/audit_<round>_<kind>.md` — Player auditor reports (kind = syntax | semantics; one file per round)
+- `spec.md` - the plan, written before execute (required when the trajectory includes a `plan` stage)
+- `audits/audit_<round>_<kind>.md` - Player review reports (kind = syntax | semantics; one file per round)
 
 ### Strict role boundaries
 
-- **Coach** plans (or delegates planning) and assigns Players to roles. Coach does NOT
-  execute, audit, or merge. Coach's task tools: `coord_write_task_spec`,
-  `coord_assign_planner`, `coord_assign_task` (executor; accepts a single Player slot or
-  a list-as-pool), `coord_assign_auditor` (kind=syntax|semantics), `coord_assign_shipper`,
-  `coord_set_task_complexity`, `coord_advance_task_stage`, `coord_set_task_blocked`.
-- **Players** execute, audit, and ship. The relevant tools:
-    - `coord_my_assignments` — call this any time you're not sure what to do; returns your
-      full plate (active executor task / pending audits / pending ship / eligible pools).
-    - `coord_claim_task(task_id)` — pull yourself into a posted pool task. First-claim wins.
-    - `coord_commit_push(task_id, message)` — pass `task_id` so the kanban auto-advances.
-    - `coord_submit_audit_report(task_id, kind, body, verdict)` — auditors submit pass/fail.
-    - `coord_mark_shipped(task_id)` — shipper calls after the merge lands.
+- **Coach** plans (by delegation) and calls/assigns Players to roles. Coach
+  does NOT execute, review, or merge. Coach's task tools:
+  `coord_create_task(title, ..., trajectory=[{stage, to}, ...])`,
+  `coord_set_task_trajectory(task_id, trajectory)` for mid-flight reroute,
+  `coord_assign_planner / coord_assign_task / coord_assign_auditor /
+  coord_assign_shipper` to swap candidates within a stage,
+  `coord_advance_task_stage` for explicit overrides, `coord_set_task_blocked`,
+  `coord_set_task_workflow`. `coord_write_task_spec` exists as an EMERGENCY
+  OVERRIDE only — when no Player is reachable for the planner role.
+- **Players** execute, review, and ship. The relevant tools:
+    - `coord_my_assignments` - call this any time you're not sure what to do; returns your
+      actionable current-stage plate. Future-stage reservations are hidden until active.
+    - `coord_accept_role(task_id, role)` - answer a current-stage pool/call. First accept wins.
+    - `coord_claim_task(task_id)` - legacy executor pool claim. First-claim wins.
+    - `coord_commit_push(task_id, message)` - for code changes; pass `task_id` so kanban routes.
+    - `coord_complete_execution(task_id, summary, artifact_path?)` - for non-git deliverables.
+    - `coord_submit_audit_report(task_id, kind, body, verdict)` - reviewers submit pass/fail.
+    - `coord_mark_shipped(task_id)` - shipper calls after merge/publish/handoff or no-op closure.
 
-### Audit verdict routing
+### Review verdict routing
 
-Pass → next stage. Fail → reverts to execute; the spec + latest audit report attach to
-the task and the executor is auto-woken with both. Compass auto-audit fires informationally
-on every commit; the assigned Player auditor is the gate, not Compass.
+Execution completion routes to the next stage in the trajectory (or `archive`
+if execute is the last stage). Audit pass -> next configured stage. Audit fail
+-> reverts to execute; the spec + latest review report attach to the task and
+the executor is auto-woken with both. Compass auto-audit fires informationally
+on every commit; the assigned Player reviewer is the gate, not Compass.
 
-### Simple-task discipline
+### Self-audit when the trajectory has no audit stage
 
-When Coach marks a task simple, the executor SELF-AUDITS: run the relevant tests, sanity-check
-the change, then `coord_commit_push`. The board archives directly on commit; there is no
-separate audit pass. Coach should mark a task simple only when the change is small and
-well-bounded enough that self-audit is sufficient."""
+If the trajectory has no `audit_syntax` and no `audit_semantics` after
+`execute`, the executor SELF-AUDITS before `coord_commit_push` /
+`coord_complete_execution`: run the relevant tests, sanity-check the output,
+then commit. The board archives (or advances to ship) directly — there is no
+separate review pass."""
 
 
 def render_kanban_block() -> str:

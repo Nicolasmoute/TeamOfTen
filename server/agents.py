@@ -2029,6 +2029,159 @@ async def _locked_players() -> list[str]:
     return [dict(r)["id"] for r in rows]
 
 
+_TRAJECTORY_TOKENS = {
+    "plan": "P",
+    "execute": "E",
+    "audit_syntax": "AY",
+    "audit_semantics": "AE",
+    "ship": "S",
+}
+
+
+def _trajectory_marker(trajectory_json: Any, current_stage: str | None) -> str:
+    """Render a trajectory like `P → [E] → AY → S` with the current
+    stage in brackets. Returns '' if the trajectory column is empty
+    or unparseable. Pure rendering helper — used in Coach's open-tasks
+    rollup and (mirrored shape) on the kanban card UI."""
+    try:
+        traj = json.loads(trajectory_json or "[]")
+    except (TypeError, ValueError):
+        return ""
+    tokens: list[str] = []
+    for stage_obj in traj:
+        if not isinstance(stage_obj, dict):
+            continue
+        stage = stage_obj.get("stage")
+        token = _TRAJECTORY_TOKENS.get(stage)
+        if not token:
+            continue
+        if stage == current_stage:
+            tokens.append(f"[{token}]")
+        else:
+            tokens.append(token)
+    if not tokens:
+        return ""
+    return "→".join(tokens)
+
+
+async def _build_active_task_health_rows(
+    project_id: str,
+) -> list[dict[str, Any]]:
+    """Surface tasks where the SAME audit kind has failed >= 2 times.
+    Coach reads this to decide whether to bump the executor's effort
+    or model tier. First fail = expected correction noise (per the
+    quality-feedback policy); 2nd+ fail = signal."""
+    rows: list[dict[str, Any]] = []
+    try:
+        c = await configured_conn()
+        try:
+            # Read every non-archived task with an executor + count fails per kind.
+            cur = await c.execute(
+                """
+                SELECT t.id AS task_id, t.title, t.owner AS executor,
+                       SUM(CASE WHEN tra.role = 'auditor_syntax'
+                                AND tra.verdict = 'fail'
+                           THEN 1 ELSE 0 END) AS syntax_fails,
+                       SUM(CASE WHEN tra.role = 'auditor_semantics'
+                                AND tra.verdict = 'fail'
+                           THEN 1 ELSE 0 END) AS semantics_fails,
+                       MAX(CASE WHEN tra.role IN ('auditor_syntax', 'auditor_semantics')
+                                THEN tra.verdict END) AS latest_verdict
+                FROM tasks t
+                LEFT JOIN task_role_assignments tra
+                  ON tra.task_id = t.id
+                WHERE t.project_id = ? AND t.status != 'archive'
+                GROUP BY t.id
+                """,
+                (project_id,),
+            )
+            raw = [dict(r) for r in await cur.fetchall()]
+
+            # Resolve executor effort/model overrides per row.
+            for r in raw:
+                syn = int(r.get("syntax_fails") or 0)
+                sem = int(r.get("semantics_fails") or 0)
+                kind = None
+                fail_count = 0
+                if syn >= 2 and syn >= sem:
+                    kind, fail_count = "audit_syntax", syn
+                elif sem >= 2:
+                    kind, fail_count = "audit_semantics", sem
+                if not kind:
+                    continue
+                executor = r.get("executor") or "—"
+                effort = (
+                    await _get_agent_effort_override(executor)
+                    if executor and executor != "—"
+                    else None
+                )
+                model = (
+                    await _get_agent_model_override(executor)
+                    if executor and executor != "—"
+                    else None
+                )
+                rows.append({
+                    "task_id": r["task_id"],
+                    "title": (r.get("title") or "").strip()[:80],
+                    "executor": executor,
+                    "kind": kind,
+                    "kind_fail_count": fail_count,
+                    "latest_verdict": r.get("latest_verdict") or "?",
+                    "executor_effort": effort,
+                    "executor_model": model,
+                })
+        finally:
+            await c.close()
+    except Exception:
+        return []
+    return rows
+
+
+async def _build_stalled_tasks_rows(
+    project_id: str,
+) -> list[dict[str, Any]]:
+    """Tasks that crossed the stall threshold and have not progressed
+    since (`stale_alert_at IS NOT NULL AND last_stage_change_at =
+    stale_alert_at`)."""
+    rows: list[dict[str, Any]] = []
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id, title, status, owner, last_stage_change_at, "
+                "stale_alert_at FROM tasks "
+                "WHERE project_id = ? AND status != 'archive' "
+                "AND stale_alert_at IS NOT NULL "
+                "AND last_stage_change_at IS NOT NULL "
+                "AND last_stage_change_at = stale_alert_at "
+                "ORDER BY last_stage_change_at ASC LIMIT 10",
+                (project_id,),
+            )
+            raw = [dict(r) for r in await cur.fetchall()]
+        finally:
+            await c.close()
+    except Exception:
+        return []
+
+    now = datetime.now(timezone.utc)
+    for r in raw:
+        try:
+            last = datetime.fromisoformat(
+                (r.get("last_stage_change_at") or "").replace("Z", "+00:00")
+            )
+            age_hours = max(0.0, (now - last).total_seconds() / 3600.0)
+        except (TypeError, ValueError):
+            age_hours = 0.0
+        rows.append({
+            "task_id": r["id"],
+            "title": (r.get("title") or "").strip()[:80],
+            "stage": r.get("status") or "?",
+            "owner": r.get("owner") or "(unassigned)",
+            "age_hours": round(age_hours, 1),
+        })
+    return rows
+
+
 async def _build_coach_coordination_block() -> str:
     """Phase 7 (PROJECTS_SPEC.md §10): Coach-only per-turn coordination
     block. Built fresh on every Coach turn from `projects`,
@@ -2096,7 +2249,7 @@ async def _build_coach_coordination_block() -> str:
             # pipeline first (ship → audit_* → execute → plan), so Coach
             # sees what's nearest delivery at the top of the rollup.
             cur = await c.execute(
-                "SELECT id, title, status, owner, complexity, blocked "
+                "SELECT id, title, status, owner, trajectory, blocked "
                 "FROM tasks WHERE project_id = ? "
                 "AND status != 'archive' "
                 "ORDER BY CASE status "
@@ -2341,10 +2494,10 @@ async def _build_coach_coordination_block() -> str:
             title = (t.get("title") or "").strip()[:80]
             status = t.get("status") or "?"
             owner = t.get("owner") or "—"
-            simple = " SIMPLE" if t.get("complexity") == "simple" else ""
+            traj_marker = _trajectory_marker(t.get("trajectory"), status)
             blocked = " BLOCKED" if t.get("blocked") else ""
             lines.append(
-                f"- {tid} ({status}){simple}{blocked} - {owner} - {title}"
+                f"- {tid} ({status}) {traj_marker}{blocked} - {owner} - {title}"
             )
     else:
         lines.append("Open tasks: (none)")
@@ -2353,66 +2506,129 @@ async def _build_coach_coordination_block() -> str:
     lines.append("")
     lines.append(f"Last decision: {last_decision_line}")
     lines.append("")
-    # Static lifecycle policy — same paragraph in every Coach turn so
-    # the role-strict-separation rule is reinforced. Mirror of the
-    # CLAUDE.md kanban block but tighter: Coach already gets the full
-    # tool catalogue elsewhere in the system prompt; here we just
-    # codify policy + decision triggers.
+
+    # ---- Active task health (kind_fail_count >= 2) -----------------
+    health_rows = await _build_active_task_health_rows(active)
+    if health_rows:
+        lines.append("## Active task health")
+        lines.append("")
+        for row in health_rows:
+            effort = row.get("executor_effort") or "default"
+            model = row.get("executor_model") or "default"
+            lines.append(
+                f"- {row['task_id']} \"{row['title']}\" — executor "
+                f"{row['executor']} (effort={effort}, model={model}) — "
+                f"{row['kind']} fail count {row['kind_fail_count']} "
+                f"(latest verdict: {row['latest_verdict']})"
+            )
+        lines.append("")
+        lines.append(
+            "First fail of an audit kind is expected correction noise "
+            "— ignore. From the 2nd fail of the same kind, treat "
+            "quality as the bottleneck: bump the executor's effort "
+            "with coord_set_player_effort, then model tier with "
+            "coord_set_player_model. NEVER change runtime — that's a "
+            "human decision."
+        )
+        lines.append("")
+
+    # ---- Stalled tasks (stage_change >= threshold, no progress) ----
+    stalled_rows = await _build_stalled_tasks_rows(active)
+    if stalled_rows:
+        lines.append("## Stalled tasks")
+        lines.append("")
+        for row in stalled_rows:
+            lines.append(
+                f"- {row['task_id']} \"{row['title']}\" — stage "
+                f"{row['stage']}, owner {row['owner']}, stale for "
+                f"{row['age_hours']}h"
+            )
+        lines.append("")
+        lines.append(
+            "If a Player has gone silent, send them a "
+            "coord_send_message nudge or reassign with "
+            "coord_assign_*. If no one is assigned to this stage, fix "
+            "the trajectory with coord_set_task_trajectory or use "
+            "coord_advance_task_stage if you intended a different route."
+        )
+        lines.append("")
+
+    # ---- Lifecycle policy (v0.3 — trajectory-driven) ---------------
     lines.append("## Task lifecycle policy")
     lines.append("")
     lines.append(
-        "You coordinate; you do NOT execute. Your direct work is "
-        "PLANNING (writing the spec) and DELEGATION (assigning Players "
-        "to roles). Players do execution, audit, and ship."
+        "You coordinate; you do NOT execute. Anything you delegate to "
+        "a Player goes through the kanban as a tracked task. "
+        "Conversational replies remain conversational — but if you're "
+        "handing work to a Player, create the task."
     )
     lines.append("")
     lines.append(
-        "Stages: plan -> execute -> audit_syntax -> audit_semantics -> "
-        "ship -> archive. Standard tasks traverse the full pipeline; "
-        "simple tasks (typo fixes, one-line bugs, log tweaks) jump "
-        "plan -> execute -> archive on commit and the executor self-audits."
+        "Stages: plan -> execute -> audit_syntax -> audit_semantics "
+        "-> ship -> archive."
     )
     lines.append("")
     lines.append(
-        "PLAN: write the spec yourself with coord_write_task_spec OR "
-        "delegate to a Player via coord_assign_planner. Standard tasks "
-        "cannot move to execute without a spec.md."
+        "DEFINE THE TRAJECTORY UPFRONT. Pass `trajectory=[...]` to "
+        "coord_create_task — an ordered list of {stage, to} dicts. "
+        "`to` accepts a single Player slot or a list (pool; first "
+        "free picks up). Examples:"
     )
     lines.append("")
     lines.append(
-        "EXECUTE: assign with coord_assign_task. `to` accepts a single "
-        "Player slot (hard-assign) OR a comma-list (post to a pool - "
-        "first to call coord_claim_task wins)."
+        "  - Quick mechanical work: "
+        "[{\"stage\":\"execute\",\"to\":[\"p2\",\"p3\"]}]"
+    )
+    lines.append(
+        "  - Needs a spec but no audit: "
+        "[{\"stage\":\"plan\",\"to\":\"p5\"},"
+        "{\"stage\":\"execute\",\"to\":\"p2\"}]"
+    )
+    lines.append(
+        "  - Code change with formal review: "
+        "[{\"stage\":\"plan\",\"to\":\"p5\"},"
+        "{\"stage\":\"execute\",\"to\":\"p2\"},"
+        "{\"stage\":\"audit_syntax\",\"to\":\"p4\"},"
+        "{\"stage\":\"ship\",\"to\":\"p2\"}]"
+    )
+    lines.append(
+        "  - Marketing blog post: "
+        "[{\"stage\":\"plan\",\"to\":\"p3\"},"
+        "{\"stage\":\"execute\",\"to\":\"p5\"},"
+        "{\"stage\":\"audit_semantics\",\"to\":\"p7\"},"
+        "{\"stage\":\"ship\",\"to\":\"p4\"}]"
     )
     lines.append("")
     lines.append(
-        "AUDIT: assign auditors with coord_assign_auditor "
-        "(kind='syntax' or 'semantics'). Auditors call "
-        "coord_submit_audit_report; pass advances the stage, fail "
-        "reverts to execute and re-wakes the executor with the spec + "
-        "latest report. Compass auto-audit is informational, not the "
+        "Always delegate planning to a Player (coord_assign_planner "
+        "if rerouting mid-flight). coord_write_task_spec exists for "
+        "emergency override only — when no Player is reachable for "
+        "the planner role."
+    )
+    lines.append("")
+    lines.append(
+        "Mid-flight reroute: coord_set_task_trajectory rewrites the "
+        "route; coord_assign_planner / auditor / shipper / task swap "
+        "candidates within one stage; coord_advance_task_stage is "
+        "the explicit Coach override that bypasses the role-completion "
         "gate."
     )
     lines.append("")
     lines.append(
-        "SHIP: assign with coord_assign_shipper. They merge, then call "
-        "coord_mark_shipped; task archives."
-    )
-    lines.append("")
-    lines.append(
-        "SIMPLE-TASK DISCIPLINE: when you mark a task simple, tell the "
-        "executor to self-audit (run the relevant tests / sanity-check "
-        "the change) before coord_commit_push, since the board archives "
-        "directly on commit. Mark simple only when self-audit is "
-        "sufficient - typos, log tweaks, single-line fixes."
-    )
-    lines.append("")
-    lines.append(
         "When a Player is unsure what to do, they can call "
-        "coord_my_assignments to see their full plate. The idle "
-        "poller also auto-wakes them every ~5 min if pool work is "
-        "waiting — so don't worry about un-claimed pool tasks "
-        "stalling indefinitely."
+        "coord_my_assignments. The idle poller also auto-wakes them "
+        "every ~5 min if current-stage pool work is waiting — and a "
+        "stall sweeper surfaces tasks with no progress in the past "
+        "few hours under '## Stalled tasks' above."
+    )
+    lines.append("")
+    lines.append(
+        "QUALITY FEEDBACK: from the 2nd fail of the same audit kind, "
+        "inspect the executor's current effort/model. Bump effort "
+        "first (coord_set_player_effort 'high'/'max'), then model "
+        "tier (coord_set_player_model 'latest_opus'). NEVER change "
+        "runtime — that's a human decision. Read current settings "
+        "via coord_get_player_settings before bumping."
     )
     lines.append("")
     from server.paths import global_paths
@@ -2752,15 +2968,20 @@ def _system_prompt_for(agent_id: str) -> str:
             "audit_syntax / audit_semantics / ship / archive - legacy "
             "aliases also accepted)\n"
             "  - coord_create_task(title, description?, parent_id?, "
-            "priority?, complexity?): add tasks. Set complexity='simple' "
-            "for typo-fix-class work that should skip audit + ship.\n"
-            "  - coord_write_task_spec(task_id, body): write the spec.md "
-            "for a task. REQUIRED before a standard task can move "
-            "plan->execute. Coach can write it themselves OR delegate via "
-            "coord_assign_planner - both flows are valid.\n"
-            "  - coord_assign_planner(task_id, to): delegate spec writing "
-            "to a Player (or pool 'p1,p2'). Optional - skip and write "
-            "the spec yourself if the task is in your wheelhouse.\n"
+            "priority?, trajectory?): add tasks. `trajectory` is an "
+            "ordered list of {stage, to} dicts that defines the route "
+            "the task will take through the kanban (defaults to bare "
+            "[{\"stage\":\"execute\",\"to\":[]}] if omitted). See the "
+            "lifecycle policy block for examples.\n"
+            "  - coord_set_task_trajectory(task_id, trajectory): "
+            "rewrite the route mid-flight. Cannot remove a stage the "
+            "task has already entered.\n"
+            "  - coord_assign_planner(task_id, to): delegate spec "
+            "writing to a Player (or pool 'p1,p2'). Use this rather "
+            "than writing the spec yourself.\n"
+            "  - coord_write_task_spec(task_id, body): EMERGENCY "
+            "OVERRIDE — only when no Player is reachable for the "
+            "planner role. Default path is coord_assign_planner.\n"
             "  - coord_assign_task(task_id, to): assign the EXECUTOR. "
             "`to` accepts a single Player (hard-assign) OR a comma-list "
             "(post to a pool, first-claim wins).\n"
@@ -2771,9 +2992,6 @@ def _system_prompt_for(agent_id: str) -> str:
             "  - coord_assign_shipper(task_id, to): assign a Player to "
             "merge after both audits pass. They call coord_mark_shipped "
             "when the merge lands; task archives.\n"
-            "  - coord_set_task_complexity(task_id, complexity): flip "
-            "an existing task between 'simple' and 'standard' if you "
-            "misjudged at create time.\n"
             "  - coord_advance_task_stage(task_id, stage, note?): "
             "manually move a task across the kanban gate. Use when an "
             "audit/ship assignment is stuck.\n"
@@ -2891,16 +3109,16 @@ def _system_prompt_for(agent_id: str) -> str:
         f"will be assigned by Coach; for now work with your slot id.\n\n"
         f"Tasks flow through stages: plan -> execute -> audit_syntax -> "
         f"audit_semantics -> ship -> archive. Your role per task is one of: "
-        f"executor (default), syntax/semantics auditor, shipper, planner. "
+        f"executor (default), formal/semantic reviewer, shipper, planner. "
         f"Call coord_my_assignments at the start of any turn where you're "
-        f"not sure what to do - it returns your full plate (active executor "
-        f"task / pending audits / pending ship / eligible pools you could "
-        f"claim).\n\n"
+        f"not sure what to do - it returns your current actionable plate "
+        f"(active executor task / pending reviews / pending ship / eligible "
+        f"current-stage pools you could claim).\n\n"
         f"Always pass task_id to coord_commit_push, coord_submit_audit_report, "
         f"and coord_mark_shipped so the kanban auto-advances. Without "
         f"task_id the work still happens but the board doesn't move.\n\n"
         f"Coordination tools:\n"
-        f"  - coord_my_assignments(): your full plate. Call first when "
+        f"  - coord_my_assignments(): your current actionable plate. Call first when "
         f"unsure.\n"
         f"  - coord_list_tasks(status?, owner?): the whole team board (kanban "
         f"stage names: plan / execute / audit_syntax / audit_semantics / "

@@ -24,11 +24,15 @@ Dependent specs (subordinate to this document):
   `project-objectives.md`).
 - `Docs/compass-specs.md` — Compass autonomous strategy engine
   (lattice, regions, truth corpus, audits, briefings).
-- `Docs/kanban-specs.md` — Kanban-shaped task lifecycle. Tasks flow
-  plan → execute → audit_syntax → audit_semantics → ship → archive,
-  with strict role separation (Coach plans + assigns; Players
-  execute, audit, ship). Standard tasks traverse the full pipeline;
-  simple tasks bypass audit + ship via executor self-audit.
+- `Docs/kanban-specs.md` — Kanban-shaped task lifecycle. Every Coach
+  delegation is a tracked task; routing is driven by an explicit
+  `trajectory` Coach defines on `coord_create_task` (ordered list of
+  `{stage, to}` dicts). Stages: plan → execute → audit_syntax →
+  audit_semantics → ship → archive. Strict role separation (Coach
+  plans by delegation; Players execute, review, ship). Stall sweeper
+  surfaces tasks with no progress under Coach's `## Stalled tasks`
+  block; `GET /api/tasks/flow_health` exposes per-stage counts +
+  subscriber liveness for human inspection.
 
 These docs are subordinate: when a dependent disagrees with this one,
 TOT-specs.md wins. Dependents may go deeper on their own subject but

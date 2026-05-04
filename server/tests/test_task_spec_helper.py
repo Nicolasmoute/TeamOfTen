@@ -97,7 +97,6 @@ async def test_write_task_spec_creates_file_with_frontmatter(fresh_db: str) -> N
         created_by="human",
         created_at="2026-05-03T10:00:00+00:00",
         priority="normal",
-        complexity="standard",
     )
     assert target.exists()
     text = target.read_text(encoding="utf-8")
@@ -108,7 +107,8 @@ async def test_write_task_spec_creates_file_with_frontmatter(fresh_db: str) -> N
     assert "spec_author: coach" in text
     assert f"spec_written_at: {written_at}" in text
     assert "priority: normal" in text
-    assert "complexity: standard" in text
+    # v0.3 dropped the complexity field from spec frontmatter.
+    assert "complexity:" not in text
     # Body preserved verbatim after the frontmatter terminator.
     assert "## Goal\nLet the user switch themes." in text
     assert text.endswith("\n")
@@ -127,7 +127,6 @@ async def test_write_task_spec_overwrites_existing(fresh_db: str) -> None:
         created_by="coach",
         created_at="2026-05-03T10:00:00+00:00",
         priority="normal",
-        complexity="standard",
     )
     target, _, _ = await write_task_spec(body="first version", **common)
     first_text = target.read_text(encoding="utf-8")
@@ -150,7 +149,6 @@ async def test_write_task_spec_atomic_no_tmp_file_left(fresh_db: str) -> None:
         created_by="coach",
         created_at="2026-05-03T10:00:00+00:00",
         priority="normal",
-        complexity="standard",
     )
     # The atomic-write helper uses a sibling tempfile + os.replace.
     # No `.tmp` siblings should remain after a successful write.
@@ -171,8 +169,7 @@ async def test_write_task_spec_rejects_invalid_task_id(fresh_db: str) -> None:
             created_by="coach",
             created_at="2026-05-03T10:00:00+00:00",
             priority="normal",
-            complexity="standard",
-        )
+            )
 
 
 # -------- write_audit_report --------
@@ -252,13 +249,13 @@ async def test_read_task_spec_round_trip(fresh_db: str) -> None:
         created_by="human",
         created_at="2026-05-03T10:00:00+00:00",
         priority="urgent",
-        complexity="simple",
     )
     text = read_task_spec("misc", "t-2026-05-03-abc12345")
     assert text is not None
     assert "hello world" in text
     assert "priority: urgent" in text
-    assert "complexity: simple" in text
+    # v0.3 dropped the complexity field from spec frontmatter.
+    assert "complexity:" not in text
 
 
 async def test_path_helpers_within_project(fresh_db: str) -> None:
@@ -293,7 +290,6 @@ async def test_relative_paths_match_local_layout(fresh_db: str) -> None:
         created_by="human",
         created_at="2026-05-03T10:00:00+00:00",
         priority="normal",
-        complexity="standard",
     )
     # rel is "projects/misc/working/tasks/<id>/spec.md". The local
     # absolute path's tail must end with the same segments.

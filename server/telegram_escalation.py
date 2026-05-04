@@ -127,13 +127,16 @@ def _key_for_pending(ev: dict[str, Any]) -> tuple[str, str] | None:
     None when the event isn't one we escalate (or is a route='coach'
     pending_question/plan that Coach handles itself).
 
-    Kanban escalations (Docs/kanban-specs.md §14):
-      - audit_report_submitted{verdict='fail'} → "audit_fail" / task_id
-        (no natural resolution — fires after the grace/delay so the
-        human sees fail loops they'd otherwise miss)
-      - audit_assignment_needed → "audit_assignment_needed" /
-        f"{task_id}:{role}" (cancelled by task_role_assigned for the
-        matching role)
+    Kanban escalations (Docs/kanban-specs.md §14, v0.3 §17/§18):
+      - audit_fail_notification → "audit_fail" / task_id
+        (the v0.3 Coach-routed notification — replaced the prior
+        audit_report_submitted{verdict='fail'} listener per items
+        9+10. Escalates only on the second fail of the same kind
+        via the `escalate` flag set by the kanban subscriber.)
+      - stage_assignment_needed → "stage_assignment_needed" /
+        f"{task_id}:{role}" (renamed from audit_assignment_needed
+        in v0.3 to cover plan/execute gaps too. Cancelled by
+        task_role_assigned for the matching role.)
       - audit_self_review_warning → "audit_self_review" / f"{task_id}:{kind}"
         (informational, no resolution)
     """
@@ -150,18 +153,21 @@ def _key_for_pending(ev: dict[str, Any]) -> tuple[str, str] | None:
         pid = ev.get("proposal_id")
         if pid is not None:
             return ("proposal", str(pid))
-    elif (
-        etype == "audit_report_submitted"
-        and (ev.get("verdict") or "").lower() == "fail"
-    ):
+    elif etype == "audit_fail_notification":
+        # v0.3 surface: escalate only on the second fail of the same
+        # kind. The kanban subscriber sets `escalate=True` when
+        # `kind_round >= 2` per spec §17. First-fail noise stays out
+        # of Telegram.
+        if not bool(ev.get("escalate")):
+            return None
         tid = ev.get("task_id")
         if tid:
             return ("audit_fail", str(tid))
-    elif etype == "audit_assignment_needed":
+    elif etype == "stage_assignment_needed":
         tid = ev.get("task_id")
         role = ev.get("role")
         if tid and role:
-            return ("audit_assignment_needed", f"{tid}:{role}")
+            return ("stage_assignment_needed", f"{tid}:{role}")
     elif etype == "audit_self_review_warning":
         tid = ev.get("task_id")
         kind = ev.get("kind")
@@ -191,12 +197,12 @@ def _key_for_resolution(ev: dict[str, Any]) -> tuple[str, str] | None:
         if pid is not None:
             return ("proposal", str(pid))
     elif etype == "task_role_assigned":
-        # Cancels a matching audit_assignment_needed timer when Coach
-        # finally fills the role.
+        # Cancels a matching stage_assignment_needed timer when Coach
+        # finally fills the role (v0.3 rename of audit_assignment_needed).
         tid = ev.get("task_id")
         role = ev.get("role")
         if tid and role:
-            return ("audit_assignment_needed", f"{tid}:{role}")
+            return ("stage_assignment_needed", f"{tid}:{role}")
     return None
 
 
@@ -438,10 +444,12 @@ async def _format_audit_fail_msg(ev: dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
-async def _format_audit_assignment_needed_msg(ev: dict[str, Any]) -> str:
+async def _format_stage_assignment_needed_msg(ev: dict[str, Any]) -> str:
     """Compose the Telegram body for a stage that's stuck waiting on
     a Coach role assignment. Implies Coach is asleep / over-cap or
-    forgot — the human can step in and assign via the UI."""
+    forgot — the human can step in and assign via the UI.
+
+    v0.3: covers all stages (plan/execute/audit/ship), not just audit/ship."""
     tid = ev.get("task_id") or "?"
     role = ev.get("role") or "?"
     when = _short_iso(ev.get("ts"))
@@ -495,8 +503,8 @@ async def _format_message(kind: str, ev: dict[str, Any]) -> str:
         return await _format_proposal_msg(ev)
     if kind == "audit_fail":
         return await _format_audit_fail_msg(ev)
-    if kind == "audit_assignment_needed":
-        return await _format_audit_assignment_needed_msg(ev)
+    if kind == "stage_assignment_needed":
+        return await _format_stage_assignment_needed_msg(ev)
     if kind == "audit_self_review":
         return await _format_audit_self_review_msg(ev)
     return ""

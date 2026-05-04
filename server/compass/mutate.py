@@ -550,8 +550,8 @@ def reconcile_replace(
     insert a fresh truth-grounded equivalent in its place. Returns
     (old_archived, new_active) on success.
 
-    The new row uses `created_by="compass-truth"` and weight 0.75 so
-    it reads identically to a Stage 0 truth-derive row. The old row
+    The new row uses `created_by="compass-intent"` and weight 0.75 so
+    it reads identically to a Stage 0 intent-derive row. The old row
     keeps its history but is archived with `settled_as="reconciled"`.
     """
     s = state.find_statement(sid)
@@ -585,7 +585,7 @@ def reconcile_replace(
         region=region,
         weight=0.75,
         created_at=now,
-        created_by="compass-truth",
+        created_by="compass-intent",
         merged=True,
         merged_from=[s.id],
         history=[{

@@ -13,7 +13,7 @@
 
 ## 0 · One-paragraph summary
 
-Compass is an autonomous strategy engine that runs alongside (not inside) the TeamOfTen coordinator. It maintains a **lattice of statements** about the project — atomic claims, each with a probability-of-truth weight in [0, 1] — and a small set of **truth-protected facts** that are sacred. Compass updates the lattice from human signals, asks the human focused questions when uncertainty is highest, and exposes its current best guess to the coach via a query interface and a daily briefing. It also audits work artifacts on coach demand. Compass never dispatches work, never amends truth without human approval, and never holds up worker activity. Its job is to be a quiet, learning source of project direction.
+Compass is an autonomous strategy engine that runs alongside (not inside) the TeamOfTen coordinator. It is a **compass of intent** — its lattice maps what the project is TRYING TO ACHIEVE (and trying to AVOID), one atomic directional claim at a time, each weighted with a probability-of-truth in [0, 1]. The lattice is built from a corpus of human-vetted material (specs, objectives, wiki) read through an intent lens, plus the human's answers to compass's targeted questions. Specs play a dual role — intent material when they encode a what-to-build decision, and a binding constraint layer that truth-check uses orthogonally. Compass exposes its current best-guess direction to the coach via a query interface and a daily briefing, and audits each kanban task plan on `plan → execute` to check the plan even pursues the right direction. It never dispatches work, never amends the corpus without human approval, and never holds up worker activity. Its job is to be a quiet, learning source of project direction.
 
 ---
 
@@ -21,21 +21,22 @@ Compass is an autonomous strategy engine that runs alongside (not inside) the Te
 
 ### 1.1 The lattice
 
-The world model is a list of **statements**. Each statement is an atomic, falsifiable claim about the project.
+The world model is a list of **statements** — atomic, falsifiable claims about the project's **direction** (what it's trying to achieve, who it serves, what it deliberately is NOT). Compass is a compass of intent: the lattice tracks where the project is heading, not the literal facts of the codebase. (Mechanical specs like "API uses GraphQL" are NOT lattice rows — they live in the corpus and feed truth-check as binding constraints.)
 
 A statement is good if:
 - It can be answered with "yes" or "no" by the human if asked directly
-- It is at the right granularity — coarse enough that the LLM can infer fine specifics from it, fine enough that workers and coach can act on it as a constraint
-- Its negation is meaningful (a confident NO is as useful as a confident YES — coord uses the negation as a binding fact)
+- It is at the right granularity — coarse enough that the LLM can infer fine specifics from it, fine enough that workers and coach can act on it as a directional constraint
+- Its negation is meaningful (a confident NO is as useful as a confident YES — coord uses the negation as a validated direction the project is NOT pursuing)
 
 Examples of well-formed statements (project = Stripe billing for TeamOfTen):
-- "Pricing model favors usage-based over flat-rate" (region: pricing)
-- "First customers will be small teams of 2–10 people" (region: customers)
-- "Stripe webhooks must be processed idempotently" (region: architecture)
+- "We want pricing to be usage-based over flat-rate" (region: pricing) — directional, intent-bearing
+- "First customers are small teams of 2–10, not solo developers or enterprise" (region: customers) — encodes both YES (small teams) and NO (solo / enterprise)
+- "We are NOT pursuing seat-based pricing in v1" (region: pricing) — explicit negation
 
 Examples of poorly-formed statements (avoid):
 - "Pricing strategy" (not falsifiable, not a claim)
-- "Stripe webhook signatures must be verified using HMAC-SHA256 with timing-safe comparison" (too specific — the LLM can infer this from a higher-level statement)
+- "Stripe webhook signatures must be verified using HMAC-SHA256 with timing-safe comparison" (too specific AND a literal mechanical fact, not a directional claim — belongs in the spec, not the lattice)
+- "The API uses GraphQL" (literal fact about implementation, not intent — feeds truth-check as a constraint, doesn't belong in the lattice)
 - "Should we use Stripe?" (a question, not a statement)
 
 ### 1.2 Weights
@@ -44,11 +45,11 @@ Each statement carries a `weight ∈ [0.0, 1.0]` interpreted as **P(statement is
 
 | Range | Meaning | Coach should treat as |
 |---|---|---|
-| `> 0.85` | Confident YES — eligible to settle | Binding constraint |
-| `0.65 – 0.85` | Leaning yes | Working hypothesis, verify when cheap |
+| `> 0.85` | Confident YES — eligible to settle | Validated direction the project IS pursuing |
+| `0.65 – 0.85` | Leaning yes | Working directional hypothesis, verify when cheap |
 | `0.35 – 0.65` | Genuine uncertainty | Do not commit expensive work; needs human input |
 | `0.15 – 0.35` | Leaning no | Working anti-hypothesis |
-| `< 0.15` | Confident NO — eligible to settle (negation is binding) | The negation is a binding constraint |
+| `< 0.15` | Confident NO — eligible to settle (negation is validated) | Validated direction the project is NOT pursuing |
 
 The job of the loop is to **push weights away from 0.5** toward whichever pole reality lives at. Drift in either direction is progress. Sitting at 0.5 means compass has learned nothing about that statement.
 
@@ -69,45 +70,52 @@ Why regions matter:
 - They surface coverage gaps — under-populated regions become a question-generation priority
 - They keep the human's mental model of the project taxonomy small and stable
 
-### 1.4 Truth
+### 1.4 Intent material — the corpus and how Compass reads it
 
 ### 1.4.1 The world model and its sources
 
-Compass maintains a single **world model**: the lattice of weighted statements plus the archive of finalized ones. From the perspective of downstream consumers — Coach calling `compass_ask`, the audit subsystem checking worker output, the daily briefing, the CLAUDE.md block — the world model **is the operative truth**. They don't separately consult original source documents per query; they consult what compass currently believes.
+Compass is a **compass of intent** — the lattice maps what the project is TRYING TO ACHIEVE (and what it's deliberately NOT pursuing). It maintains a single **world model**: the lattice of weighted intent statements plus the archive of finalized ones. From the perspective of downstream consumers — Coach calling `compass_ask`, the audit subsystem checking the upcoming task plan, the daily briefing, the CLAUDE.md block — the world model **is the operative direction**. They don't separately consult original source documents per query; they consult what compass currently believes about direction.
 
-The world model is built from multiple **sources**, each treated differently when ingested:
+The world model is built from multiple **sources**, all read through one lens — *"what are we trying to achieve, what should we NOT do, what's implied beyond what's literally written"*:
 
-- **Truth corpus** — long-form human-vetted reference material in `<project>/truth/` (specs, goals, brand guidelines, contracts, scope docs, role definitions). Authored or approved by the human directly. Compass **never modifies** the corpus; it only reads it. On every run, Compass reads the corpus and derives atomic short claims for the lattice (Stage 0 truth-derive, §3.0 / Appendix A.14). Idempotent via a corpus hash — unchanged corpus → no fresh derivation.
-- **Human Q&A answers** — the human answers Compass's targeted questions. Each answer reweights statements (digest, §3.1). Larger deltas (±0.5 max) than passive signals because the human is replying with intent.
+- **Project corpus** — long-form human-vetted material spanning three lanes: `<project>/truth/` (specs, brand guidelines, contracts, scope docs), `<project>/project-objectives.md` (the human's authored objectives), and `/data/wiki/<project_id>/**` (agent-curated knowledge — gotchas, stakeholder preferences, glossary, domain rules). Compass **never modifies** the corpus; it only reads it. On every run, Compass reads the corpus and derives intent statements for the lattice (Stage 0a intent-derive, §3.0 / Appendix A.14). Idempotent via a corpus hash — unchanged corpus → no fresh derivation. Specs play a **dual role**: (a) intent material when they encode a decision about *what to build*; (b) the binding constraint layer used by truth-check (§3.7) when a Q&A answer would push the lattice into spec contradiction.
+- **Human Q&A answers** — the human answers Compass's targeted questions. Each answer reweights statements (digest, §3.1). Larger deltas (±0.5 max) than passive signals. Questions explicitly cover both the **territory** (what's already implied by corpus + lattice) and the **new landscape** (what's implied beyond the specs, what could come next, what we should explicitly NOT do).
 - **Passive signals** — human messages to Coach in the inbox since the last run, recent commits, manually-recorded notes. Smaller deltas (±0.15 max) because the signal is incidental.
-- **Audit drift** — work artifacts that contradict mid-confidence statements queue uncertain-drift questions back to the human for clarification (§5).
+- **Audit drift** — task plans that contradict mid-confidence intent statements queue uncertain-drift questions back to the human for clarification (§5).
 
-Compass differentiates the sources at **build time** — distinct prompts, delta caps, idempotency rules, and history `source` markers (`truth_derive`, `answer:qN`, `passive`, `merge`, `manual`, …). But once a source's contribution lands in the lattice, it's just a weighted statement: indistinguishable downstream from a Q&A-derived row, indistinguishable from a passive-digest row. The lattice IS the world model — the operative truth from `compass_ask`'s point of view.
+Compass differentiates the sources at **build time** — distinct prompts, delta caps, idempotency rules, and history `source` markers (`intent_derive`, `answer:qN`, `passive`, `merge`, `manual`, …). But once a source's contribution lands in the lattice, it's just a weighted statement: indistinguishable downstream from a Q&A-derived row, indistinguishable from a passive-digest row. The lattice IS the world model — the operative direction from `compass_ask`'s point of view.
 
-### 1.4.2 Why the corpus is still special
+### 1.4.2 The dual role of specs — intent material AND binding constraint
 
-Two narrow ways the truth corpus differs from other sources, despite the world model being the operative reference:
+The truth corpus is read **twice** by different parts of Compass, with different goals:
+
+1. **Intent reading (Stage 0a intent-derive, §3.0).** Compass walks the corpus through the *"what are we trying to achieve"* lens. When a spec says "API supports real-time collaboration", the intent reading is "we want real-time collaboration to be a v1 capability" — that's a directional claim about what the project is pursuing, fair game for a lattice row. When a spec is purely mechanical ("returns JSON", "uses HTTP/2"), there's no intent decision to extract — it gets skipped during derive.
+2. **Binding-constraint reading (truth-check §3.7, reconciliation §3.0.1).** When a human's Q&A answer would push the lattice into contradiction with a spec ("we want batch-only" vs spec mandating real-time), truth-check fires and flags the conflict. Specs serve as the constraint floor here, regardless of whether they were intent material in the derivation pass.
+
+Two narrow ways the corpus still differs from other sources, despite the world model being the operative reference:
 
 1. **Compass never amends it.** The human edits truth files via the Files pane; Coach proposes via `coord_propose_file_write` (human-approved); agents are blocked by a PreToolUse hook from writing under `truth/`. Compass reads only — it derives lattice statements but never writes back to the corpus.
-2. **The truth-check subroutine** (§3.7) consults the corpus directly when digesting a human's Q&A answer. This catches the case where an answer would push the lattice into contradiction with the human-authored floor — protecting the lattice from drifting away via mistakenly-digested answers. It's NOT a per-query check that downstream consumers run.
+2. **The truth-check subroutine** (§3.7) consults the corpus directly when digesting a human's Q&A answer. This catches the case where an answer would push the lattice into contradiction with the human-authored floor. It's NOT a per-query check that downstream consumers run.
 
-Truth-corpus examples (real TeamOfTen):
+Corpus examples (real TeamOfTen):
 - `truth/specs.md` — "TeamOfTen is a personal harness for one Coach + ten Players over Max-OAuth. State persists on a single VPS with kDrive-backed cloud sync. There is one human operator…"
 - `truth/billing.md` — "Workers consume Anthropic billing under the human's Max plan; the harness does not bill end-users…"
 
-Lattice statements derived from those (Stage 0 truth-derive, weight 0.75, region-tagged, `created_by="compass-truth"`):
-- s1 (architecture, 0.75) — "TeamOfTen runs on a single VPS." [from specs.md]
-- s2 (ops, 0.75) — "There is exactly one human operator." [from specs.md]
-- s3 (pricing, 0.75) — "Players are billed via the operator's Max plan, not the customer." [from billing.md]
+Intent statements derived from those (Stage 0a intent-derive, weight 0.75, region-tagged, `created_by="compass-intent"`):
+- s1 (architecture, 0.75) — "We want TeamOfTen to be a personal-scale harness, not a multi-tenant product." [from specs.md, intent reading]
+- s2 (users, 0.75) — "We are NOT building this for teams of operators — single human is the target." [from specs.md, implied negation]
+- s3 (pricing, 0.75) — "We rely on the operator's Max plan; we are NOT billing end-users." [from billing.md, intent reading]
 
-After a few rounds of Q&A, those same statements might sit at 0.92 (eligible to settle), or have drifted to 0.55 (a Q&A answer surprised compass), or been merged with a duplicate, or been reformulated. They're lattice rows — the world model — and downstream consumers see them at whatever weight compass currently believes. The corpus hasn't changed; the lattice's representation has.
+After a few rounds of Q&A, those same statements might sit at 0.92 (eligible to settle), or have drifted to 0.55 (a Q&A answer surprised compass), or been merged with a duplicate, or been reformulated. They're lattice rows — the world model — and downstream consumers see them at whatever weight compass currently believes. The corpus hasn't changed; the lattice's representation of direction has.
+
+> **Provenance tagging note (post 2026-05-04 refocus).** New rows from intent-derive use `created_by="compass-intent"`. Pre-refocus rows tagged `created_by="compass-truth"` stay in the lattice as legacy — they fade or get reinforced via normal Q&A. The runner accepts both tags as "this row was derived from the corpus."
 
 > **Implementation note (TeamOfTen):** The truth corpus is **folder-backed** and spans **three** lanes (see Appendix A.13 for the full integration spec):
 > 1. `<project>/truth/**/*.{md,markdown,txt}` — the dedicated truth lane (specs, brand guidelines, contracts). Strongest authority — fully human-vetted and write-protected from agents.
 > 2. `<project>/project-objectives.md` — the human's authored objectives file at the project root.
 > 3. `/data/wiki/<project_id>/**/*.{md,markdown,txt}` — the per-project wiki tree (agent-curated knowledge that compounds across sessions: gotchas, stakeholder preferences, glossary entries, domain rules). Less vetted than the first two — agents author wiki entries — but the human keeps a curating role and the corpus captures intent / users / UX / context that the truth lane often omits. Folding wiki into the corpus is strictly better than letting Compass run blind to the project's working memory.
 >
-> All three drive truth-derive (Stage 0a) and truth-check (§3.7) identically. The dashboard distinguishes them by relpath prefix — `truth/...`, `project-objectives.md`, and `wiki/...` — for display and link-routing only; the LLM treats them uniformly. The original spec §6.2 modeled truth as a Compass-managed `truth.json` of short atomic statements; in the harness implementation those atomic statements live in the LATTICE as truth-grounded rows, and the corpus holds the long-form vetted documents instead.
+> All three drive intent-derive (Stage 0a, §3.0) and truth-check (§3.7) identically. The dashboard distinguishes them by relpath prefix — `truth/...`, `project-objectives.md`, and `wiki/...` — for display and link-routing only; the LLM treats them uniformly. The original spec §6.2 modeled truth as a Compass-managed `truth.json` of short atomic statements; in the harness implementation those atomic statements live in the LATTICE as corpus-derived rows (`created_by="compass-intent"`, or legacy `compass-truth`), and the corpus holds the long-form vetted documents instead.
 
 ### 1.5 The actors
 
@@ -169,9 +177,9 @@ Separate from the run lifecycle, compass supports an interactive **Q&A session**
 
 Q&A sessions are the highest-bandwidth interaction with compass. Use them when the human has 10+ minutes and wants to push the lattice forward fast.
 
-### 2.4 Audits — coach-triggered, asynchronous
+### 2.4 Audits — auto-fired on kanban plan exits, asynchronous
 
-Audits are a separate path, not part of the daily/bootstrap run. Coach calls `compass_audit(artifact)` whenever a worker produces something coach considers a meaningful unit of work. Compass returns a verdict (see §3.6). Audits never block work — they are advisory.
+Audits are a separate path, not part of the daily/bootstrap run. The auto-audit watcher (§5.5) subscribes to the event bus and calls `compass_audit(artifact)` whenever a kanban task transitions `plan → execute` — that's when the planner has finished writing spec.md and the executor is about to start. Compass checks plan-vs-intent upstream; kanban's downstream auditor stages handle execution-vs-plan. Coach can also call `compass_audit` directly via MCP for ad-hoc audits. Compass returns a verdict (see §5.2). Audits never block work — they are advisory.
 
 ---
 
@@ -179,22 +187,24 @@ Audits are a separate path, not part of the daily/bootstrap run. Coach calls `co
 
 A `daily` or `bootstrap` run executes the following stages in order. Each stage may be skipped if it has nothing to do, but the order is strict.
 
-### 3.0 Truth-derive (seed / enrich the lattice from the corpus)
+### 3.0 Intent-derive (seed / enrich the lattice from the corpus)
 
-Runs FIRST on every mode (`bootstrap`, `daily`, `on_demand`), before any answer digest. The user's principle: as long as truth-corpus material exists, the lattice should have an immediate basis — the world model isn't gated on the human running a Q&A session.
+Runs FIRST on every mode (`bootstrap`, `daily`, `on_demand`), before any answer digest. The user's principle: as long as corpus material exists, the lattice should have an immediate basis — the world model isn't gated on the human running a Q&A session.
 
-1. Read the truth corpus (the project's `truth/` folder; see §1.4 + Appendix A.13). Each allowed file → one synthesized truth fact.
-2. Compute a stable hash over the corpus content. Compare against the previous run's hash, persisted out-of-band (in TeamOfTen, `team_config['compass_truth_hash_<id>']`).
-3. **Short-circuit** the LLM call when the hash is unchanged AND the lattice already contains truth-derived rows. Idempotent — "if truth doesn't change, no new statements are inferred."
-4. Otherwise, feed the LLM the corpus AND the existing active lattice. The prompt asks for atomic short YES/NO claims that REPRESENT what the corpus implies, **explicitly skipping statements already present**. Capped at 8 per run to avoid noise.
+The reading is **intent-lensed**: Compass extracts directional claims ("we want real-time collaboration", "we are NOT targeting enterprise customers in v1"), not literal facts ("the API uses GraphQL"). Specs purely mechanical (no decision about *what* to build) are skipped here — they still feed truth-check (§3.7) as binding constraints.
+
+1. Read the project corpus (the project's `truth/` folder, `project-objectives.md`, and `wiki/<project_id>/` tree; see §1.4 + Appendix A.13). Each allowed file → one synthesized fact entry.
+2. Compute a stable hash over the corpus content. Compare against the previous run's hash, persisted out-of-band (in TeamOfTen, `team_config['compass_truth_hash_<id>']` — the key keeps its legacy name; only the prompt-side interpretation changed).
+3. **Short-circuit** the LLM call when the hash is unchanged AND the lattice already contains corpus-derived rows (`created_by` in `{"compass-intent", "compass-truth"}` — the latter is the legacy tag from before the refocus). Idempotent — "if the corpus doesn't change, no new statements are inferred."
+4. Otherwise, feed the LLM the corpus AND the existing active lattice. The prompt asks for atomic short YES/NO directional claims that REPRESENT what the corpus implies as intent, **explicitly skipping statements already present**. Capped at 8 per run to avoid noise.
 5. Materialize each proposal as a lattice row with:
    - `weight = 0.75` — well-grounded but compass-INTERPRETED. Sits in the LEANING-YES band so the settle proposal flow ignores it until it earns confidence; not pinned at 1.0 because the corpus is the floor, the lattice's representation is the working layer.
-   - `created_by = "compass-truth"` — distinguishes from Q&A / passive / merge origins in the audit trail.
-   - One history entry with `source = "truth_derive"` and a rationale citing the corpus file.
+   - `created_by = "compass-intent"` — distinguishes from Q&A / passive / merge origins in the audit trail. (Pre-refocus rows tagged `compass-truth` still exist in legacy lattices; the runner treats both as corpus-derived.)
+   - One history entry with `source = "intent_derive"` and a rationale citing the corpus file.
 6. Persist the new corpus hash regardless of how many statements landed (the corpus has been considered).
-7. Emit a `compass_truth_derived` event so the dashboard can highlight the new rows.
+7. Emit a `compass_truth_derived` event (legacy name kept for back-compat with dashboard listeners) so the dashboard can highlight the new rows.
 
-If the corpus is empty (no truth files), the stage is a no-op — Compass continues with the rest of the pipeline (Q&A digest, passive, etc.) and the lattice stays free-form. The world model just lacks a corpus-grounded floor until truth files appear.
+If the corpus is empty, the stage is a no-op — Compass continues with the rest of the pipeline (Q&A digest, passive, etc.) and the lattice stays free-form. The world model just lacks a corpus-grounded floor until corpus files appear.
 
 ### 3.0.1 Reconciliation (truth ↔ lattice)
 
@@ -205,13 +215,13 @@ The world model can drift away from the corpus over time even when the corpus is
 
 Either way, **a conflict between the corpus and a settled statement is a high-stakes signal** — settled rows are what Coach treats as binding, what the audit subsystem checks against, and what the CLAUDE.md block surfaces to workers. Compass must not silently leave them inconsistent with truth.
 
-The reconciliation pass fires immediately after truth-derive (§3.0), only when the corpus hash changed since the last successful run (cheap idempotency: an unchanged corpus can't have introduced new conflicts).
+The reconciliation pass fires immediately after intent-derive (§3.0), only when the corpus hash changed since the last successful run (cheap idempotency: an unchanged corpus can't have introduced new conflicts).
 
 1. Feed the LLM: the full corpus + the active lattice (with weights) + the archived lattice (with `settled_as` markers).
 2. Ask: "For each lattice row that the corpus contradicts, list the row id, the conflicting truth file(s), and a one-sentence explanation. Be conservative — only flag clear contradictions, not topical overlap."
 3. For each conflict the LLM returns, create a **reconciliation proposal**. Persist alongside settle/stale/dupe proposals.
 4. The human resolves on the dashboard:
-   - **Update lattice** — the corpus is right, the lattice is wrong. Choices: un-archive (returning the row to the active lattice with a lower starting weight, e.g. 0.5, so subsequent runs re-evaluate); flip-archive (re-archive at the opposite `settled_as`); reformulate; or replace with the truth-derived equivalent.
+   - **Update lattice** — the corpus is right, the lattice is wrong. Choices: un-archive (returning the row to the active lattice with a lower starting weight, e.g. 0.5, so subsequent runs re-evaluate); flip-archive (re-archive at the opposite `settled_as`); reformulate; or replace with the corpus-derived equivalent.
    - **Update truth** — the lattice is right, the corpus is lagging. Routes the human to the Files pane on the offending truth file. Compass re-reads truth on the next run and the conflict resolves automatically (or surfaces again if the edit didn't actually fix it).
    - **Accept ambiguity** — leave both. Marks the row `reconciliation_ambiguity=True` and clears the open proposal. The flag suppresses re-detection until the corpus changes again — at the start of the next run where the corpus hash has shifted, the flag is cleared automatically and the row is re-evaluated. The LLM may re-flag (and the human can accept ambiguity again) or stay silent (still ambiguous, no change). This is stricter than §3.5 stale-keep, which suppresses indefinitely; reconciliation ties the suppression to the corpus rather than to time.
 5. Until the human resolves a reconciliation proposal, it stays open and is re-displayed on every dashboard load. Like settle/stale/dupe, it expires after `PROPOSAL_EXPIRY_RUNS` runs of being ignored — clears the flag, and on the next run with a still-conflicting corpus it returns fresh.
@@ -281,10 +291,12 @@ Compass never silently reweights in the face of a truth contradiction.
 
 ### 3.8 Generate new questions
 
-Compass generates up to 3 new questions for the human (5 in `bootstrap` mode). Selection priorities, in order:
-1. Statements with weights in 0.35–0.65 (max entropy → max info gain per answer)
-2. Under-populated regions (coverage gaps)
-3. Contested clusters (multiple related statements all hovering near 0.5)
+Compass generates up to 3 new questions for the human (5 in `bootstrap` mode). Selection priorities, in order (post 2026-05-04 refocus — questions map both the *territory* and the *new landscape*):
+1. **NEW LANDSCAPE** — questions that pin down what's IMPLIED by the corpus but not literally stated, propose the next direction ("given current trajectory, should we also pursue Z?"), or pin down NEGATION ("are we NOT targeting [audience]? not building [feature]?"). This is where Compass earns its keep — chart territory the specs alone don't. Aim for at least one new-landscape question per batch.
+2. Statements with weights in 0.35–0.65 (max entropy → max info gain per answer).
+3. Under-populated dimensions — if the lattice is over-indexed on architecture/code, prefer questions about intent / users / UX / domain content / ethics / market.
+4. Under-populated regions within whichever dimension you pick (coverage gaps).
+5. Contested clusters (multiple related statements all hovering near 0.5).
 
 Each question carries:
 - The question text
@@ -296,14 +308,14 @@ Questions accumulate in a queue. The human answers when convenient. Answers are 
 
 ### 3.9 Generate the daily briefing
 
-A markdown document for the coach. Sections:
-1. **CONFIRMED YES** (>0.8) — list as binding constraints
-2. **CONFIRMED NO** (<0.2) — list NEGATIONS as binding (e.g. "s5 at 0.10 → customers are NOT technical")
-3. **LEANING** (0.2–0.4 or 0.6–0.8) — working hypotheses, verify when cheap
-4. **OPEN** (0.4–0.6) — genuine uncertainty, no expensive work here
-5. **COVERAGE** — region density, thin regions
-6. **DRIFT** — recent events contradicting the lattice, significant weight shifts
-7. **RECOMMENDATION** — one sentence: where coach should focus next
+A markdown document for the coach. The lattice is read as a **compass of intent** — settled rows are VALIDATED DIRECTION, not "binding facts." Specs in `truth/` are the orthogonal binding-constraint layer (truth-check handles those). Sections:
+1. **VALIDATED DIRECTION** (YES, >0.8) — confirmed intent the project is pursuing.
+2. **VALIDATED NEGATION** (NO, <0.2) — confirmed direction the project is NOT pursuing (e.g. "s5 at 0.10 → customers are NOT technical"). Equally binding for planning.
+3. **LEANING** (0.2–0.4 or 0.6–0.8) — working directional hypotheses, verify when cheap.
+4. **OPEN** (0.4–0.6) — genuine uncertainty, no expensive commits here.
+5. **COVERAGE** — region density, thin regions.
+6. **DRIFT** — recent events suggesting the project's direction has shifted vs the lattice.
+7. **RECOMMENDATION** — one sentence: where coach should focus next.
 
 Persisted to `memory/compass/briefings/briefing-{YYYY-MM-DD}.md`.
 
@@ -353,7 +365,7 @@ Differences from the daily-run question generation:
 
 ### 5.1 Purpose
 
-To detect when worker output contradicts the world model, without holding up work and without bothering the human unnecessarily. Coach decides when to call audit — typically when a worker produces a meaningful unit of work (commit, decision, design choice). Audits are advisory only.
+To detect when a task's PLAN is pursuing a direction the lattice contradicts, before the executor starts work — without holding up work and without bothering the human unnecessarily. The auto-audit watcher (§5.5) fires on the kanban `plan → execute` transition; Coach can also audit ad-hoc via the MCP tool. Audits are advisory only — Compass never blocks a transition.
 
 ### 5.2 Verdicts
 
@@ -361,11 +373,11 @@ The audit returns one of three verdicts:
 
 | Verdict | When | Escalation |
 |---|---|---|
-| `aligned` | Work is consistent with the lattice, or touches no high-stakes statements | Silent OK to coach. Logged. Human not notified. |
-| `confident_drift` | Work clearly contradicts a HIGH-CONFIDENCE statement (>0.8 or <0.2) | Direct message to coach with conflicting statement ids. Human can review log when curious. **Human not pushed.** |
-| `uncertain_drift` | Work seems off, but relevant statements are 0.3–0.7 | Coach told to proceed cautiously. Question queued for human (with a prediction). |
+| `aligned` | Plan is consistent with the lattice's intent, or touches no high-stakes settled rows | Silent OK to coach. Logged. Human not notified. |
+| `confident_drift` | Plan clearly contradicts a HIGH-CONFIDENCE intent statement (>0.8 or <0.2) | Direct message to coach with conflicting statement ids. Human can review log when curious. **Human not pushed.** |
+| `uncertain_drift` | Plan seems off-direction, but the relevant statements are 0.3–0.7 | Coach told to proceed cautiously. Question queued for human (with a prediction). |
 
-The conservatism gradient is intentional. Default verdict is `aligned`. Drift is only flagged when there is real evidence of contradiction.
+The conservatism gradient is intentional. Default verdict is `aligned`. Drift is only flagged when there is real evidence the plan pursues a direction the lattice contradicts.
 
 ### 5.3 The audit log
 
@@ -373,26 +385,39 @@ All audits — including aligned ones — are logged. The human can read the log
 
 ### 5.4 Rollup safety net
 
-Compass should periodically (suggested: every 5 audits, or weekly) review the audit log itself. If many recent audits in the same region drifted (confident or uncertain), that's a signal the **lattice may be wrong, not the work**. Compass surfaces this as a meta-question:
+Compass should periodically (suggested: every 5 audits, or weekly) review the audit log itself. If many recent audits in the same region drifted (confident or uncertain), that's a signal the **lattice may be wrong, not the plans**. Compass surfaces this as a meta-question:
 
-> "Most recent worker outputs in the 'pricing' region have drifted from the lattice. Is the lattice wrong about pricing?"
+> "Most recent task plans in the 'pricing' region have drifted from the lattice. Is the lattice wrong about pricing?"
 
 This catches the case where compass's high-confidence statements are themselves stale or mistaken.
 
-### 5.5 Auto-audit on artifact events
+### 5.5 Auto-audit on kanban plan exits
 
-The original spec put the burden on Coach to "decide when to call audit". In practice Coach forgets, and humans don't manually paste artifacts (humans don't produce them — agents do). The TeamOfTen harness closes this loop with an **auto-audit watcher** ([server/compass/audit_watcher.py](../server/compass/audit_watcher.py)) that subscribes to the event bus and dispatches `compass_audit` automatically when meaningful units of work land:
+The original spec put the burden on Coach to "decide when to call audit". The first auto-audit pass (early 2026-05) fired on every artifact event the team produced — `commit_pushed`, `decision_written`, `knowledge_written`, `output_saved` — but most of those are intermediate execution work, and the kanban v0.3 lifecycle (Docs/kanban-specs.md, shipped 2026-05-04) already runs syntactic + semantic Player audits and shipper review at every stage transition. Compass's downstream auditing was duplicative noise.
 
-- **`commit_pushed`** — Player commits via `coord_commit_push`. Artifact = `[commit] <slot> <pushed|local-only> <sha>\n\n<message>`.
-- **`decision_written`** — Coach writes a decision via `coord_write_decision`. Artifact = `[decision] <actor> wrote: <title> (<size> chars)`. The decision body itself isn't on the event payload (only title + size are); Coach can call `compass_audit` directly with the body if deeper reasoning is wanted.
-- **`knowledge_written`** — agent saves a knowledge artifact via `coord_write_knowledge`. Artifact = `[knowledge] <actor> saved knowledge[<path>] (<size> chars)`.
-- **`output_saved`** — agent saves a binary deliverable via `coord_save_output` (Tier B body audit). Artifact = `[output] <actor> saved outputs[<path>] (<bytes>)` for path-only formats; for text-native and office formats the audit also folds in the **extracted document body** (see §5.5.2). Outputs are infrequent (a few per week typically) but high-stakes — they're what the human consumes — so the LLM-token cost of opening the document is the right tradeoff.
+The refocused watcher ([server/compass/audit_watcher.py](../server/compass/audit_watcher.py)) sits one layer **upstream**: it subscribes to a single event family — `task_stage_changed` — and audits **only the `from='plan' to='execute'` transition**. That's the moment a planner has finished writing `spec.md` and the executor is about to start. Compass checks that the **plan aligns with intent** (the lattice's directional claims); kanban's own auditor / shipper stages handle whether execution aligns with the plan.
+
+Single check upstream, no redundant checks downstream. Net: one strategic audit per task plan, only when there's a plan to check.
+
+The artifact composed by the watcher has shape:
+
+```
+[task-plan] task <id>: <title>
+
+Trajectory: plan → execute → audit_syntax → ship
+
+--- spec ---
+<spec.md body, truncated to 16,000 chars>
+```
+
+When the task's spec.md is missing on disk (rare — should not happen for a real plan→execute transition), the watcher falls back to including the task's `description` field instead. The audit fires on title + trajectory in the worst case; we never silently drop the event.
 
 The watcher is gated on multiple axes:
 
-  - **Per-project enable flag.** `compass_enabled_<project_id>` must be truthy. Events on disabled projects are dropped silently. Project scoping uses the event's auto-stamped `project_id` (set by `EventBus.publish` from `resolve_active_project()` if the publisher didn't set it explicitly), so an inactive project still gets audited when its commits land — same "iterate all projects" rule as the daily scheduler.
-  - **Team daily cost cap.** `_within_cost_cap()` reads `_today_spend()` against `TEAM_DAILY_CAP_USD` before each audit; if over, the audit is dropped silently. This is the same gate Player turns hit pre-spawn (`agents._spawn_allowed`). The check is done in the watcher rather than in `audit_work` because the only prior callers were Coach (via MCP) and the dashboard (rare manual use), neither of which needed pre-call gating.
-  - **Per-(project, agent, type) debounce.** A burst of commits on the same Player within `HARNESS_COMPASS_AUTO_AUDIT_DEBOUNCE` (default 30s) collapses into one audit per window. Different agents and different event types bypass the debounce — the tuple `(project_id, agent_id, event_type)` is the key. A 0 value disables debouncing entirely.
+  - **Per-project enable flag.** `compass_enabled_<project_id>` must be truthy. Events on disabled projects are dropped silently. Project scoping uses the event's auto-stamped `project_id`, with a fallback lookup against the task row when the event payload omits it.
+  - **Trajectory gate.** Watcher reads the task row and checks `trajectory` includes a `plan` stage. By construction a `from='plan'` transition only happens on tasks whose trajectory has a plan stage, but the guard is cheap and protects against future trajectory-shape changes.
+  - **Team daily cost cap.** `_within_cost_cap()` reads `_today_spend()` against `TEAM_DAILY_CAP_USD` before each audit; if over, the audit is dropped silently. Same gate Player turns hit pre-spawn.
+  - **Per-(project, task_id) debounce.** Plan→execute fires once per task by construction; the debounce window (`HARNESS_COMPASS_AUTO_AUDIT_DEBOUNCE`, default 30s) just guards against weird re-emits. Different tasks bypass the debounce — each gets its own plan-audit.
   - **Global feature flag.** `HARNESS_COMPASS_AUTO_AUDIT=false` disables the watcher entirely (it doesn't even start). For cost-constrained deploys that prefer manual-only audits via the MCP tool.
 
 The watcher dispatches `audit_work` as a fire-and-forget task — a slow LLM call does not backpressure the bus, and an audit failure does not propagate back to the originating tool call (Compass §10.6: audits never block work). `audit_work` itself catches LLM errors and degrades to an `aligned` verdict; the watcher's outer wrapper logs any remaining unhandled exceptions and keeps consuming.
@@ -401,37 +426,25 @@ The watcher dispatches `audit_work` as a fire-and-forget task — a slow LLM cal
 
 `start_audit_watcher` calls `bus.subscribe()` **synchronously** before scheduling the consumer task. Deferring the subscribe to inside the task would create a race window where events published between `create_task` returning and the task body actually running would be lost. Lifespan calls `start` once during boot; the watcher owns its own task handle (mirrors the telegram bridge pattern) and is stopped during teardown by `stop_audit_watcher` so a redeploy doesn't drop in-flight audits.
 
-#### 5.5.2 Output body extraction (Tier B)
+#### 5.5.2 Audit prompt + intent-vs-direction verdict
 
-`output_saved` events have richer treatment than the other three watched types. Compass actually **opens the saved file** for text-native and office formats, extracts the body text, and folds it into the audit artifact under a `--- document body (.ext extracted) ---` separator. The LLM then reasons over the document's framing, claims, and conclusions — not just the path.
+`AUDIT_SYSTEM` ([server/compass/prompts.py](../server/compass/prompts.py)) is shaped specifically for plan artifacts. The verdict is about whether the plan's *direction* matches the lattice's intent, not about prose style or implementation details. Verdict bands are unchanged from §5.2 (`aligned` / `confident_drift` / `uncertain_drift`); what's intent-aware is the framing — the LLM treats settled lattice rows as VALIDATED DIRECTION the plan should respect.
 
-Format coverage ([server/compass/output_extractor.py](../server/compass/output_extractor.py)):
+  - **Model choice**: Compass calls run on the latest Sonnet at `medium` effort by default — cheap enough for routine audits and the daily run, capable enough to reason over the lattice + corpus + plan body. The default is the **alias** `latest_sonnet` resolved at call time via `models_catalog.resolve_model_alias`. Override per-deploy with `HARNESS_COMPASS_MODEL=<alias-or-concrete-id>` (e.g. `latest_opus` for hard reasoning) and `HARNESS_COMPASS_EFFORT=low|medium|high|max`.
+  - **Per-deploy cost**: a typical project produces a handful of plans per week; with plan audits at ~$0.01–0.05 each, that's pennies per week. The cost cap and per-task debounce gates from §5.5 still apply.
+  - **Body cap**: the spec body is truncated at `_PLAN_BODY_MAX=16_000` (≈ 4k tokens). The composed artifact is then capped at `_ARTIFACT_TRUNCATE=18_000` as a final outer bound.
 
-| Family | Extensions | Extraction |
-|---|---|---|
-| **Text-native** | `md`, `markdown`, `txt`, `csv`, `tsv`, `html`, `htm`, `json` | UTF-8 read with `errors='replace'` |
-| **PDF** | `pdf` | `pypdf` page-text concat |
-| **Word** | `docx` | `python-docx` paragraphs + table cells |
-| **Spreadsheet** | `xlsx` | `openpyxl` read-only mode, TSV-style rows per sheet |
-| **Slides** | `pptx` | `python-pptx` per-slide text frames |
-| **Archive** | `zip`, `tar`, `gz` | Filename listing only (no recursion); first 200 entries |
-| **Image** | `png`, `jpg`, `jpeg`, `gif`, `webp`, `svg` | **Skipped** (Tier C / vision is deferred); falls back to path-only audit |
-| **Unknown** | anything else | Path-only |
+#### 5.5.3 Why not Tier B output / commit / knowledge audits anymore?
 
-Discipline:
+The earlier Tier B output-body audit pass (extracting PDF / DOCX / XLSX / PPTX text via `output_extractor`) was deprecated by this refocus. The reasoning: kanban's Player auditor stages (`auditor_syntax`, `auditor_semantics`, `shipper`) already gate every output the team produces. By the time `output_saved` fires, the work has already been shipped through those checks. Re-auditing every commit / decision / knowledge / output against the lattice was paying for the same review twice.
 
-  - **Lazy imports**: each office-format parser is imported inside its extractor. A missing parser (e.g. an operator chose to skip the office deps in their venv) downgrades that one format to path-only, doesn't crash anything else.
-  - **Per-format exception isolation**: a malformed PDF that crashes pypdf doesn't tank the watcher — the outer handler in `extract_body` returns `None`, the watcher composer treats that as "no body", and the audit fires on path + size as if the format were unsupported.
-  - **Truncation**: extracted bodies are capped at `MAX_BODY_CHARS=16_000` (≈ 4k tokens) before insertion. The composed artifact is then capped again at `_OUTPUT_ARTIFACT_TRUNCATE=18_000` as a final outer bound. A 200-page PDF can't blow up the prompt.
-  - **Audit prompt awareness**: `AUDIT_SYSTEM` ([server/compass/prompts.py](../server/compass/prompts.py)) explicitly mentions the body-included artifact shape so the LLM knows when it's reading a header vs a full deliverable. No separate prompt variant — the same prompt handles both shapes.
-  - **Per-deploy cost**: a typical project produces 5–10 outputs per week; with body audits at ~$0.01–0.05 each, that's pennies per week. The cost cap and 30s debounce gates from §5.5 still apply, so a runaway can't escalate.
-  - **Model choice**: Compass calls run on the latest Sonnet at `medium` effort by default — cheap enough for routine audits and the daily run, capable enough to reason over the lattice + truth corpus + extracted document body. The default is the **alias** `latest_sonnet` resolved at call time via `models_catalog.resolve_model_alias`, so when Anthropic ships a newer Sonnet only the catalog map needs bumping. Override per-deploy with `HARNESS_COMPASS_MODEL=<alias-or-concrete-id>` (e.g. `latest_opus` for hard reasoning) and `HARNESS_COMPASS_EFFORT=low|medium|high|max`.
+Compass now plays an **upstream** role only: it makes sure the *plan* the executor is about to follow is even pursuing the right direction. If the plan is right, kanban's machinery ensures execution stays aligned. If the plan is wrong, no amount of downstream auditing fixes that — the executor will faithfully build the wrong thing.
 
-Tier C (image content via Claude vision) is a deliberate non-goal for v1. Charts and diagrams that matter usually get cited from a markdown knowledge note that already gets audited; standalone images rarely contradict strategy on their own.
+The `output_extractor` module + the office-format dependencies (pypdf / python-docx / openpyxl / python-pptx) stay in the codebase as latent capability — a future revision could revive Tier B output audits if the kanban auditors prove insufficient. They aren't wired into the watcher today.
 
-#### 5.5.3 Dashboard implications
+#### 5.5.4 Dashboard implications
 
-The dashboard's manual paste UI (the textarea + "Audit" button in the Audits section) is **removed** as of this spec. Audits are auto-fired by the watcher; humans read the log when curious (§5.3). The audit log + filter pills remain, with explanatory copy noting the auto-fire sources. The `POST /api/compass/audit` HTTP endpoint is kept as a debug backstop (curl-able for testing) but not surfaced in the UI.
+The dashboard's manual paste UI (the textarea + "Audit" button in the Audits section) was removed when auto-audit shipped; that's still the case. Audits are auto-fired by the watcher; humans read the log when curious (§5.3). The audit log + filter pills remain, with explanatory copy noting the new "fires on kanban plan→execute" trigger. The `POST /api/compass/audit` HTTP endpoint is kept as a debug backstop (curl-able for testing) but not surfaced in the UI.
 
 ---
 
@@ -471,7 +484,7 @@ memory/compass/
             "weight": 0.55,                    # current P(true)
             "history": [                       # list of deltas applied over time
                 {"run_id": "r3", "delta": 0.05, "rationale": "...",
-                 "source": "passive|answer:q12|manual|merge|reformulation|truth_derive|reconcile:unarchive|reconcile:flip|reconcile:reformulate|reconcile:replace"}
+                 "source": "passive|answer:q12|manual|merge|reformulation|intent_derive|truth_derive|reconcile:unarchive|reconcile:flip|reconcile:reformulate|reconcile:replace"}
             ],
             "archived": false,
             "archived_at": null,               # ISO timestamp when archived
@@ -488,7 +501,7 @@ memory/compass/
             "reconciliation_ambiguity": false, # human accepted ambiguity; clears on corpus change
             "kept_stale": false,               # human said "keep, still important"
             "created_at": "...",
-            "created_by": "compass|compass-truth|human"  # compass-truth = derived from corpus (§3.0)
+            "created_by": "compass|compass-intent|compass-truth|human"  # compass-intent = derived from corpus through intent lens (§3.0); compass-truth = legacy pre-2026-05-04 derive (still in old lattices)
         }
     ]
 }
@@ -606,7 +619,7 @@ One JSON object per line:
     "truth_candidates": ["..."],
     "briefing_path": "memory/compass/briefings/briefing-2025-05-01.md",
     "notes": [                            # human-readable Stage 0 notes
-        "truth_derive: 3 new statement(s)",
+        "intent_derive: 3 new statement(s)",
         "reconciliation: 1 ambiguity flag(s) cleared on corpus change"
     ],
     "skipped": false,                     # true when daily presence-gated
@@ -754,21 +767,37 @@ Output ONLY:
 
 ### 8.3 Question generation (batch, daily run)
 
+Compass is a COMPASS OF INTENT — questions map both the **territory**
+(what's already implied by the corpus / lattice) and the **new
+landscape** (what's implied beyond the specs, what could come next,
+what we should explicitly NOT do).
+
 ```
-You are Compass. Generate up to {N} questions to ask the human. Maximize information
-gain across the lattice.
+You are Compass. Generate up to {N} questions to ask the human.
+Maximize information gain about direction across the lattice.
 
 {shared_semantics}
 
 Question selection priorities, in order:
-1. Statements with weights in 0.35–0.65 (max entropy) — biggest info gain per answer.
-2. Under-populated regions (few statements relative to apparent project importance) —
-   coverage gaps.
-3. Contested clusters — multiple related statements all hovering near 0.5 suggest a
-   structural ambiguity.
+1. NEW LANDSCAPE — questions that pin down what's IMPLIED by the
+   corpus but not literally stated, propose the next direction
+   ("given current trajectory, should we also pursue Z?"), or pin
+   down NEGATION ("are we NOT targeting [audience]? not building
+   [feature]?"). Aim for at least one new-landscape question per
+   batch.
+2. Statements with weights in 0.35–0.65 (max entropy) — biggest info
+   gain per answer.
+3. Under-populated dimensions — if the lattice is over-indexed on
+   architecture/code, prefer questions about intent / users / UX /
+   domain content / ethics / market.
+4. Under-populated regions within whichever dimension you pick
+   (coverage gaps).
+5. Contested clusters — multiple related statements all hovering
+   near 0.5 suggest a structural ambiguity.
 
-For each question: commit to a specific, falsifiable prediction. Don't repeat pending
-questions. Cite which statement ids the question targets (1–3 ids).
+For each question: commit to a specific, falsifiable prediction.
+Don't repeat pending questions. Cite which statement ids the question
+targets (1–3 ids).
 
 Output ONLY:
 {
@@ -890,24 +919,35 @@ Output ONLY:
 
 ### 8.10 Audit
 
+Post 2026-05-04 refocus: the artifact under audit is a **task plan** (kanban spec.md), not an arbitrary commit/output. The auto-audit watcher fires on `task_stage_changed{from=plan, to=execute}`. Coach can also call `compass_audit` directly via MCP for ad-hoc audits. The verdict is about plan-vs-intent alignment.
+
 ```
-You are Compass auditing a piece of work against the lattice. Coach has submitted a
-work artifact (commit, decision, worker output) and wants to know if it aligns with
-current beliefs about the project.
+You are Compass auditing a TASK PLAN against the lattice of intent.
+The auto-audit watcher fires on plan→execute transitions; downstream
+kanban auditor stages handle execution-vs-plan, so you check upstream:
+does this plan even pursue the right direction?
 
 {shared_semantics}
 
-Verdict rules:
-- "aligned": work is consistent with the lattice, or touches no high-stakes statements.
-- "confident_drift": work clearly contradicts at least one HIGH-CONFIDENCE statement
-  (>0.8 or <0.2). You're sure something is wrong. Coach gets a direct message;
-  human is NOT bothered.
-- "uncertain_drift": work seems off but the relevant statements are at 0.3–0.7 — you
-  can't tell if work is wrong or if the lattice is wrong. Coach proceeds cautiously;
-  a question is generated for the human (with a prediction).
+Artifact shape: a `[task-plan] task <id>: <title>` header, a
+`Trajectory: <stages>` line, then a `--- spec ---` separator
+followed by the planner's spec.md body.
 
-Be conservative — most work should come back "aligned." Only flag drift when there's
-real evidence of contradiction.
+Verdict rules:
+- "aligned": plan is consistent with the lattice's intent, or touches
+  no high-stakes settled rows.
+- "confident_drift": plan clearly contradicts at least one
+  HIGH-CONFIDENCE intent statement (>0.8 or <0.2). You're sure the
+  plan pursues the wrong direction. Coach gets a direct message;
+  human is NOT bothered.
+- "uncertain_drift": plan seems off-direction but the relevant
+  statements are at 0.3–0.7 — you can't tell if the plan is wrong or
+  if the lattice is wrong. Coach proceeds cautiously; a question is
+  generated for the human (with a prediction).
+
+Be conservative — most plans should come back "aligned." Only flag
+drift when there's real evidence the plan pursues a direction the
+lattice contradicts.
 
 Output ONLY:
 {
@@ -918,10 +958,11 @@ Output ONLY:
   "question_for_human": {"q": string, "prediction": string, "targets": [string]} | null
 }
 
-If "aligned", message_to_coach is short ("OK · aligned with lattice"), question_for_human
-is null. If "confident_drift", message_to_coach explains the conflict directly to coach.
-If "uncertain_drift", message_to_coach tells coach you've flagged it for human review,
-and question_for_human is the question to queue.
+If "aligned", message_to_coach is short ("OK · plan aligned with intent"),
+question_for_human is null. If "confident_drift", message_to_coach
+explains the directional conflict directly to coach. If
+"uncertain_drift", message_to_coach tells coach you've flagged it for
+human review, and question_for_human is the question to queue.
 ```
 
 ### 8.11 Daily briefing
@@ -1319,7 +1360,7 @@ Confident drift means compass is sure something is wrong. Coach is told directly
 
 ### 10.6 Don't block work on audit results
 
-Audits are advisory. The work has already been produced. Coach decides what to do with the verdict (halt the worker, redirect, accept). Compass never has the authority to halt anything — it only informs.
+Audits are advisory. The plan-exit transition has already happened by the time the audit runs (compass is fired by the kanban subscriber AFTER the stage moves, asynchronously). Coach decides what to do with the verdict (interrupt the executor, redirect, accept). Compass never has the authority to halt anything — it only informs.
 
 ### 10.7 Don't generate questions when nothing is uncertain
 
@@ -2150,6 +2191,12 @@ region so the queue doesn't grow unbounded.
 
 Spec §1.4 / §6.2 modeled truth as a Compass-managed list (`truth.json` with `{index, text, added_at, added_by}` rows of short atomic claims). The TeamOfTen harness already has a canonical truth lane that holds **long-form vetted documents** (specs, goals, brand guidelines, contracts, role docs), plus an authored objectives file at the project root, plus a per-project wiki tree of agent-curated knowledge. Maintaining a parallel list inside Compass would create yet another source of truth, and there can be only one consolidated corpus. So Compass adapts: it reads the harness's truth-bearing material from these three lanes and synthesizes `TruthFact`s on demand, with a small set of well-defined rules.
 
+**Dual role of the corpus** (introduced when Compass refocused as a *compass of intent*, 2026-05-04). The same corpus files feed two Compass paths:
+1. **Intent-derive (Stage 0a, §3.0).** Walked through the lens *"what are we trying to achieve, what should we NOT do, what's implied beyond what's literally written"* to seed the lattice with directional claims. Specs that encode a decision about *what to build* are intent material; purely mechanical specs ("returns JSON") are skipped at this stage.
+2. **Truth-check / reconciliation (§3.7, §3.0.1).** The same corpus serves as the binding constraint floor when a Q&A answer would push the lattice into spec contradiction, and when the corpus shifts and previously-settled lattice rows now disagree. Specs that were skipped at intent-derive still participate here.
+
+The corpus walking machinery below is **unchanged** — only the prompt-side interpretation differs between paths. The `compass_truth_hash_<id>` team_config key keeps its legacy name (it's still a hash over the same corpus contents).
+
 #### A.13.1 Where truth lives
 
 Compass treats three on-disk lanes as a single conceptual corpus:
@@ -2192,7 +2239,7 @@ The truth-lane manifest (`truth-index.md`) is **just another truth file** from C
 
 A SHA-256 over the concatenated corpus text (`text` field, file-by-file, with a separator) — covering all three lanes uniformly. Stored in `team_config['compass_truth_hash_<project_id>']` after every successful Stage 0 run. The hash drives two short-circuits:
 
-  - **Stage 0 truth-derive (§3.0 / Appendix A.14)** — skip the LLM call when the hash is unchanged AND the lattice already has rows with `created_by="compass-truth"`.
+  - **Stage 0a intent-derive (§3.0 / Appendix A.14)** — skip the LLM call when the hash is unchanged AND the lattice already has rows with `created_by` in `{"compass-intent", "compass-truth"}` (the latter is the legacy tag from before the 2026-05-04 refocus).
   - **Stage 0.1 reconciliation (§3.0.1)** — only fire when the hash changed since the last run; an unchanged corpus can't have introduced new conflicts.
 
 A wiki edit changes the hash same as a truth/ edit or an objectives edit. No source has special hash treatment.
@@ -2218,7 +2265,7 @@ Per §1.4, the corpus is special in only two narrow ways. Implementation specifi
   - **Wiped**: `data/projects/<id>/working/compass/` (lattice, regions, questions, audits, runs, briefings, proposals, claude_md_block) plus `team_config` keys `compass_bootstrapped_<id>`, `compass_last_run_<id>`, `compass_heartbeat_<id>`, `compass_truth_hash_<id>`.
   - **Untouched**: `data/projects/<id>/truth/`, `data/projects/<id>/project-objectives.md`, `data/wiki/<id>/**`, and the kDrive mirrors of all three. The corpus is the floor; reset is a Compass-side operation.
 
-After a reset, the next Compass run sees `corpus_hash` as missing, runs Stage 0 truth-derive fresh against all three lanes, and re-seeds the lattice from the corpus — restoring the truth-grounded floor automatically.
+After a reset, the next Compass run sees `corpus_hash` as missing, runs Stage 0a intent-derive fresh against all three lanes, and re-seeds the lattice from the corpus — restoring the corpus-grounded floor automatically.
 
 ### A.14 · Stage 0 mechanics — derive + reconcile
 
@@ -2227,8 +2274,8 @@ This appendix entry covers the Stage 0 implementation glue, complementing the co
 #### A.14.1 Pipeline order
 
 ```
-Stage 0   Read truth corpus, compute hash.
-Stage 0a  Truth-derive (§3.0)         → propose new lattice rows from corpus.
+Stage 0   Read project corpus, compute hash.
+Stage 0a  Intent-derive (§3.0)        → propose new lattice rows from corpus, intent lens.
 Stage 0b  Reconciliation (§3.0.1)     → flag corpus↔lattice conflicts.
 Stage 1   Digest answered questions   (the original §3.1).
 …
@@ -2238,24 +2285,24 @@ Sub-stages 0a and 0b both read the same `state.truth` populated by `load_state`.
 
 #### A.14.2 Idempotency
 
-Both sub-stages short-circuit when `corpus_hash == previous_hash`. 0a additionally requires `lattice_has_rows_with(created_by="compass-truth")` — if a reset cleared compass-truth rows but the corpus didn't change, we still want to re-seed.
+Both sub-stages short-circuit when `corpus_hash == previous_hash`. 0a additionally requires the lattice to already have at least one corpus-grounded row (`created_by` in `{"compass-intent", "compass-truth"}` — the latter is the legacy tag from before the 2026-05-04 refocus). If a reset cleared those rows but the corpus didn't change, we still want to re-seed.
 
 The hash is persisted at the END of Stage 0, after both sub-stages complete, so a partial failure (e.g. LLM error in 0b) doesn't mark the corpus "considered" and skip the next run.
 
-#### A.14.3 Initial weight (truth-derived rows)
+#### A.14.3 Initial weight (corpus-derived rows)
 
-`weight=0.75`. Sits in the LEANING-YES band (between 0.5 ignorance and 0.85 settle threshold). The settle proposal flow ignores rows in this band, so truth-derived statements aren't auto-promoted to settled — they have to earn it via subsequent Q&A reinforcement. This keeps the corpus as the floor and the lattice as the working layer above it.
+`weight=0.75`. Sits in the LEANING-YES band (between 0.5 ignorance and 0.85 settle threshold). The settle proposal flow ignores rows in this band, so corpus-derived statements aren't auto-promoted to settled — they have to earn it via subsequent Q&A reinforcement. This keeps the corpus as the floor and the lattice as the working layer above it.
 
 #### A.14.4 LLM caps
 
-  - **Truth-derive**: max 8 statements per run. Caps prompt + reduces noise on a fresh project. The LLM is also told to skip statements already represented in the lattice — so re-runs against an unchanged-but-larger lattice don't re-propose duplicates.
+  - **Intent-derive**: max 8 statements per run. Caps prompt + reduces noise on a fresh project. The LLM is also told to skip statements already represented in the lattice — so re-runs against an unchanged-but-larger lattice don't re-propose duplicates.
   - **Reconciliation**: no hard cap on the LLM's output; we expect 0–2 conflicts in practice. Every flagged conflict becomes a proposal; the human decides scope.
 
 #### A.14.5 Bus events
 
-  - `compass_truth_derived` — emitted after 0a if any rows were added. Payload: `{added: [statement_ids], run_id}`. Dashboard highlights the new rows.
+  - `compass_truth_derived` — emitted after 0a if any rows were added. Payload: `{added: [statement_ids], run_id}`. Dashboard highlights the new rows. **Event name kept for back-compat** with dashboard listeners — the conceptual stage is now intent-derive but the wire-format event name is unchanged.
   - `compass_reconciliation_proposed` — emitted after 0b if any proposals were created. Payload: `{count, conflicting_statement_ids, run_id}`. Dashboard surfaces the proposals card.
-  - `compass_phase` — emitted at stage entry/exit so the run-button pulse text reads `truth-derive…` / `reconciliation…`.
+  - `compass_phase` — emitted at stage entry/exit. The runner now emits phase `intent_derive` (renamed from `truth_derive` post-refocus) so the run-button pulse text reads `intent-derive…` / `reconciliation…`.
 
 #### A.14.6 Net effect
 

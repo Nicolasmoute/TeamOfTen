@@ -1,23 +1,28 @@
 """Tests for `server.compass.audit_watcher`.
 
-The watcher is the auto-audit substrate: it subscribes to the bus,
-filters for artifact events (`commit_pushed` / `decision_written` /
-`knowledge_written`), and dispatches `audit_work` for each — gated on
-the per-project enable flag, the team daily cost cap, and a per-
-(project, agent, type) debounce window.
+Compass refocused (2026-05-04): the watcher now subscribes to a single
+event family — `task_stage_changed` — and audits only the
+`from='plan' to='execute'` transition. Kanban's own auditor /
+shipper stages handle execution-vs-plan downstream; Compass checks
+plan-vs-intent upstream.
 
 What we cover here:
-  - Watched event types fire `audit_work`; unrelated events don't.
-  - Per-project enable flag short-circuits before any LLM gets called.
-  - Debounce drops back-to-back same-(project, agent, type) events.
+  - `task_stage_changed{from=plan, to=execute}` fires `audit_work`.
+  - The artifact includes title + trajectory + spec body.
+  - Other transitions (audit_syntax → audit_semantics, etc.) don't fire.
+  - Other event families (commit_pushed, decision_written,
+    knowledge_written, output_saved, task_shipped) don't fire.
+  - Trajectory without a `plan` stage skips the audit.
+  - Per-(project, task_id) debounce drops re-emits.
+  - Per-project enable flag short-circuits.
   - Cost-cap gate prevents firing when the team daily cap is hit.
-  - Artifact composition produces a meaningful blob per event flavor.
   - `start` is idempotent and respects the global feature flag.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +61,39 @@ async def _disable_compass(project_id: str) -> None:
     await _set_team_config(cmp_config.enabled_key(project_id), "false")
 
 
+async def _create_task(
+    *,
+    task_id: str,
+    project_id: str,
+    title: str = "Test task",
+    description: str = "",
+    trajectory: list[dict[str, Any]] | None = None,
+) -> None:
+    """Insert a task row directly. The watcher reads via SELECT, not
+    via the kanban API, so we don't need to go through the MCP tool."""
+    if trajectory is None:
+        trajectory = [
+            {"stage": "plan", "to": ["p2"]},
+            {"stage": "execute", "to": ["p1"]},
+        ]
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO projects (id, name) VALUES (?, ?) "
+            "ON CONFLICT(id) DO NOTHING",
+            (project_id, project_id),
+        )
+        await c.execute(
+            "INSERT INTO tasks (id, project_id, title, description, "
+            "status, created_by, trajectory) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (task_id, project_id, title, description, "execute",
+             "coach", json.dumps(trajectory)),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+
 def _stub_audit_work(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
     """Replace `cmp_audit.audit_work` with a recorder. Returns the
     list it appends to — `(project_id, artifact)` per call."""
@@ -71,9 +109,7 @@ def _stub_audit_work(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
 
 async def _wait_for(predicate, timeout: float = 1.0, step: float = 0.01) -> bool:
     """Poll-loop helper: spin the event loop briefly while waiting for
-    the watcher's background task to drain a published event. The
-    background task drains within microseconds in practice; we cap at
-    `timeout` so a stuck condition fails the test instead of hanging."""
+    the watcher's background task to drain a published event."""
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         if predicate():
@@ -82,273 +118,323 @@ async def _wait_for(predicate, timeout: float = 1.0, step: float = 0.01) -> bool
     return predicate()
 
 
+def _valid_task_id() -> str:
+    return "t-2026-05-04-deadbeef"
+
+
+def _other_task_id() -> str:
+    return "t-2026-05-04-cafef00d"
+
+
+def _spec_for(project_id: str, task_id: str, body: str) -> Path:
+    """Write a spec.md and return its path. Uses the real filesystem
+    via `server.tasks.spec_path`; CWD is a tmp_path under the test
+    fixture so we don't pollute /data."""
+    from server.tasks import spec_path
+
+    target = spec_path(project_id, task_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding="utf-8")
+    return target
+
+
 # ----------------------------------------------------- fixtures
 
 
 @pytest.fixture(autouse=True)
 async def _isolate_watcher(
-    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> Any:
     """Bring up a fresh DB and reset the watcher's per-process state
     around every test. Yields after the test so we can stop the
-    watcher cleanly even on failure paths."""
+    watcher cleanly even on failure paths.
+
+    Also redirects DATA_ROOT to tmp_path so spec.md writes don't
+    pollute /data.
+
+    Defense-in-depth: stop any leftover watcher AND clear `_last_fire`
+    at fixture entry too. The watcher's own `start_audit_watcher`
+    clears `_last_fire`, but an aborted prior test that didn't reach
+    its cleanup could leave `_current_task` pointing at a dead task
+    and `_last_fire` populated with stale debounce entries.
+    """
     await init_db()
+    # Defensive: ensure no leftover watcher / debounce state.
+    await watcher.stop_audit_watcher()
+    watcher._last_fire.clear()
+
     monkeypatch.setattr(cmp_config, "AUTO_AUDIT_ENABLED", True)
     monkeypatch.setattr(cmp_config, "AUTO_AUDIT_DEBOUNCE_SECONDS", 30)
     # Disable the cost cap by default — individual tests can flip it on.
     from server import agents as agents_mod
-
     monkeypatch.setattr(agents_mod, "TEAM_DAILY_CAP_USD", 0.0)
+
+    # Redirect DATA_ROOT via paths module so spec_path() lands in tmp.
+    from server import paths as paths_mod
+    monkeypatch.setattr(paths_mod, "DATA_ROOT", tmp_path)
     yield
     await watcher.stop_audit_watcher()
+    watcher._last_fire.clear()
 
 
 # ----------------------------------------------------- tests
 
 
 @pytest.mark.asyncio
-async def test_commit_pushed_triggers_audit(
+async def test_plan_to_execute_fires_audit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A `commit_pushed` event on an enabled project fires `audit_work`
-    with a composed artifact string."""
+    """The plan→execute transition on a task with a plan stage in its
+    trajectory fires `audit_work` with title + trajectory + spec body."""
     await _enable_compass("misc")
+    task_id = _valid_task_id()
+    await _create_task(
+        task_id=task_id, project_id="misc",
+        title="implement per-task billing",
+    )
+    _spec_for("misc", task_id,
+              "# Plan\n\nRefactor billing module to per-task model.")
+
     calls = _stub_audit_work(monkeypatch)
     await watcher.start_audit_watcher()
 
     await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p1",
-        "type": "commit_pushed",
-        "sha": "abc123",
-        "message": "implement per-task billing",
-        "pushed": True,
+        "ts": "2026-05-04T12:00:00+00:00",
+        "agent_id": "system",
+        "type": "task_stage_changed",
+        "task_id": task_id,
+        "from": "plan",
+        "to": "execute",
+        "reason": "spec_ready",
+        "owner": "p1",
         "project_id": "misc",
     })
     assert await _wait_for(lambda: len(calls) == 1)
     project_id, artifact = calls[0]
     assert project_id == "misc"
-    assert "[commit]" in artifact
-    assert "abc123" in artifact
-    assert "per-task billing" in artifact
+    assert "[task-plan]" in artifact
+    assert task_id in artifact
+    assert "implement per-task billing" in artifact
+    assert "Trajectory:" in artifact
+    assert "plan" in artifact and "execute" in artifact
+    assert "--- spec ---" in artifact
+    assert "Refactor billing" in artifact  # spec body inlined
 
 
 @pytest.mark.asyncio
-async def test_decision_written_triggers_audit(
+async def test_other_transitions_do_not_fire(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """audit_syntax → audit_semantics, execute → audit_syntax, etc.
+    must not fire Compass audits — kanban handles execution-vs-plan."""
     await _enable_compass("misc")
+    task_id = _valid_task_id()
+    await _create_task(task_id=task_id, project_id="misc")
+    _spec_for("misc", task_id, "x")
+
     calls = _stub_audit_work(monkeypatch)
     await watcher.start_audit_watcher()
 
-    await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "coach",
-        "type": "decision_written",
-        "title": "switch to per-task billing",
-        "filename": "2026-05-02-switch-billing.md",
-        "size": 800,
-        "project_id": "misc",
-    })
-    assert await _wait_for(lambda: len(calls) == 1)
-    _, artifact = calls[0]
-    assert "[decision]" in artifact
-    assert "switch to per-task billing" in artifact
-
-
-@pytest.mark.asyncio
-async def test_knowledge_written_triggers_audit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    await _enable_compass("misc")
-    calls = _stub_audit_work(monkeypatch)
-    await watcher.start_audit_watcher()
-
-    await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p2",
-        "type": "knowledge_written",
-        "path": "research/competitor-pricing.md",
-        "size": 4200,
-        "project_id": "misc",
-    })
-    assert await _wait_for(lambda: len(calls) == 1)
-    _, artifact = calls[0]
-    assert "[knowledge]" in artifact
-    assert "competitor-pricing.md" in artifact
-
-
-@pytest.mark.asyncio
-async def test_output_saved_text_format_includes_body(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """`output_saved` for a text-native format reads the file body and
-    folds it into the audit artifact (Tier B per compass-specs §5.5).
-    The audit prompt should see the actual document content."""
-    from server import outputs as outmod
-
-    monkeypatch.setattr(outmod, "OUTPUTS_DIR", tmp_path)
-    f = tmp_path / "report.md"
-    f.write_text(
-        "# Pricing analysis\n\nPer-task billing is the recommended model.",
-        encoding="utf-8",
-    )
-
-    await _enable_compass("misc")
-    calls = _stub_audit_work(monkeypatch)
-    await watcher.start_audit_watcher()
-
-    await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p1",
-        "type": "output_saved",
-        "path": "report.md",
-        "bytes": 80,
-        "project_id": "misc",
-    })
-    assert await _wait_for(lambda: len(calls) == 1)
-    _, artifact = calls[0]
-    assert "[output]" in artifact
-    assert "report.md" in artifact
-    assert "Per-task billing" in artifact  # body extracted
-    assert "document body" in artifact  # body separator marker
-
-
-@pytest.mark.asyncio
-async def test_output_saved_image_falls_back_to_path_only(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Images are skipped for body extraction (Tier C / vision deferred)
-    — the audit fires with path + size only, no body separator."""
-    from server import outputs as outmod
-
-    monkeypatch.setattr(outmod, "OUTPUTS_DIR", tmp_path)
-    f = tmp_path / "chart.png"
-    f.write_bytes(b"\x89PNG\r\n\x1a\n")
-
-    await _enable_compass("misc")
-    calls = _stub_audit_work(monkeypatch)
-    await watcher.start_audit_watcher()
-
-    await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p1",
-        "type": "output_saved",
-        "path": "chart.png",
-        "bytes": 6,
-        "project_id": "misc",
-    })
-    assert await _wait_for(lambda: len(calls) == 1)
-    _, artifact = calls[0]
-    assert "[output]" in artifact
-    assert "chart.png" in artifact
-    assert "document body" not in artifact  # path-only, no body separator
-
-
-@pytest.mark.asyncio
-async def test_output_saved_missing_file_falls_back_to_path_only(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """If the file vanished between event-publish and audit dispatch
-    (race / cleanup), the audit still fires on path + size — no crash,
-    no missing-audit hole."""
-    from server import outputs as outmod
-
-    monkeypatch.setattr(outmod, "OUTPUTS_DIR", tmp_path)
-    # Don't create the file — simulate a vanished output.
-
-    await _enable_compass("misc")
-    calls = _stub_audit_work(monkeypatch)
-    await watcher.start_audit_watcher()
-
-    await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p1",
-        "type": "output_saved",
-        "path": "ghost.md",
-        "bytes": 100,
-        "project_id": "misc",
-    })
-    assert await _wait_for(lambda: len(calls) == 1)
-    _, artifact = calls[0]
-    assert "[output]" in artifact
-    assert "ghost.md" in artifact
-    assert "document body" not in artifact
-
-
-@pytest.mark.asyncio
-async def test_output_saved_extractor_crash_falls_back(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """If the extractor itself crashes (e.g. unexpected parser error
-    not caught by the per-format guard), the watcher must still fire
-    a path-only audit instead of dropping the event."""
-    from server import outputs as outmod
-    from server.compass import output_extractor as oe
-
-    monkeypatch.setattr(outmod, "OUTPUTS_DIR", tmp_path)
-    f = tmp_path / "report.md"
-    f.write_text("real content", encoding="utf-8")
-
-    def _boom(_path: Any) -> None:
-        raise RuntimeError("simulated extractor explosion")
-
-    monkeypatch.setattr(oe, "extract_body", _boom)
-
-    await _enable_compass("misc")
-    calls = _stub_audit_work(monkeypatch)
-    await watcher.start_audit_watcher()
-
-    await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p1",
-        "type": "output_saved",
-        "path": "report.md",
-        "bytes": 12,
-        "project_id": "misc",
-    })
-    assert await _wait_for(lambda: len(calls) == 1)
-    _, artifact = calls[0]
-    assert "[output]" in artifact
-    assert "document body" not in artifact
-
-
-@pytest.mark.asyncio
-async def test_unrelated_event_ignored(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Events not in `WATCHED_EVENT_TYPES` shouldn't fire an audit."""
-    await _enable_compass("misc")
-    calls = _stub_audit_work(monkeypatch)
-    await watcher.start_audit_watcher()
-
-    await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p1",
-        "type": "agent_started",
-        "project_id": "misc",
-    })
-    # Give the watcher a moment to (not) process.
+    for from_, to in (
+        ("execute", "audit_syntax"),
+        ("audit_syntax", "audit_semantics"),
+        ("audit_semantics", "ship"),
+        ("ship", "archive"),
+        ("execute", "execute"),  # re-emit same stage
+    ):
+        await bus.publish({
+            "ts": "2026-05-04T12:00:00+00:00",
+            "agent_id": "system",
+            "type": "task_stage_changed",
+            "task_id": task_id,
+            "from": from_,
+            "to": to,
+            "owner": "p1",
+            "project_id": "misc",
+        })
     await asyncio.sleep(0.05)
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_event_types_do_not_fire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-refocus event types are no longer watched —
+    commit_pushed / decision_written / knowledge_written / output_saved /
+    task_shipped all flow through without firing Compass audits."""
+    await _enable_compass("misc")
+    calls = _stub_audit_work(monkeypatch)
+    await watcher.start_audit_watcher()
+
+    for ev in (
+        {"type": "commit_pushed", "sha": "abc", "message": "x",
+         "agent_id": "p1"},
+        {"type": "decision_written", "title": "x", "size": 100,
+         "agent_id": "coach"},
+        {"type": "knowledge_written", "path": "k.md", "size": 50,
+         "agent_id": "p2"},
+        {"type": "output_saved", "path": "out.pdf", "bytes": 100,
+         "agent_id": "p1"},
+        {"type": "task_shipped", "task_id": "t-x", "agent_id": "p1"},
+    ):
+        ev["ts"] = "2026-05-04T12:00:00+00:00"
+        ev["project_id"] = "misc"
+        await bus.publish(ev)
+    await asyncio.sleep(0.05)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_trajectory_without_plan_skips_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If a task's trajectory doesn't include a plan stage (shouldn't
+    happen for a real plan→execute transition, but the guard is cheap),
+    the audit is skipped."""
+    await _enable_compass("misc")
+    task_id = _valid_task_id()
+    # Trajectory has no 'plan' stage at all.
+    await _create_task(
+        task_id=task_id, project_id="misc",
+        trajectory=[{"stage": "execute", "to": []}],
+    )
+
+    calls = _stub_audit_work(monkeypatch)
+    await watcher.start_audit_watcher()
+
+    await bus.publish({
+        "ts": "2026-05-04T12:00:00+00:00",
+        "agent_id": "system",
+        "type": "task_stage_changed",
+        "task_id": task_id,
+        "from": "plan",
+        "to": "execute",
+        "owner": "p1",
+        "project_id": "misc",
+    })
+    await asyncio.sleep(0.05)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_missing_spec_falls_back_to_description(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If spec.md doesn't exist on disk, the watcher still fires the
+    audit using title + trajectory + description as the artifact."""
+    await _enable_compass("misc")
+    task_id = _valid_task_id()
+    await _create_task(
+        task_id=task_id, project_id="misc",
+        title="some task", description="A task description for fallback.",
+    )
+    # Don't write spec.md.
+
+    calls = _stub_audit_work(monkeypatch)
+    await watcher.start_audit_watcher()
+
+    await bus.publish({
+        "ts": "2026-05-04T12:00:00+00:00",
+        "agent_id": "system",
+        "type": "task_stage_changed",
+        "task_id": task_id,
+        "from": "plan",
+        "to": "execute",
+        "owner": "p1",
+        "project_id": "misc",
+    })
+    assert await _wait_for(lambda: len(calls) == 1)
+    _, artifact = calls[0]
+    assert "[task-plan]" in artifact
+    assert "--- spec ---" not in artifact
+    assert "description" in artifact.lower()
+    assert "fallback" in artifact
+
+
+@pytest.mark.asyncio
+async def test_debounce_drops_reemit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two plan→execute events on the same task within the debounce
+    window collapse into one audit. Per-task debounce, not per-agent."""
+    await _enable_compass("misc")
+    task_id = _valid_task_id()
+    await _create_task(task_id=task_id, project_id="misc")
+    _spec_for("misc", task_id, "spec body")
+
+    calls = _stub_audit_work(monkeypatch)
+    monkeypatch.setattr(cmp_config, "AUTO_AUDIT_DEBOUNCE_SECONDS", 60)
+    await watcher.start_audit_watcher()
+
+    for _ in range(2):
+        await bus.publish({
+            "ts": "2026-05-04T12:00:00+00:00",
+            "agent_id": "system",
+            "type": "task_stage_changed",
+            "task_id": task_id,
+            "from": "plan",
+            "to": "execute",
+            "owner": "p1",
+            "project_id": "misc",
+        })
+    await asyncio.sleep(0.05)
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_debounce_distinct_tasks_both_fire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Different tasks share the project but bypass the debounce —
+    each task gets its own plan-audit."""
+    await _enable_compass("misc")
+    t1 = _valid_task_id()
+    t2 = _other_task_id()
+    await _create_task(task_id=t1, project_id="misc")
+    await _create_task(task_id=t2, project_id="misc")
+    _spec_for("misc", t1, "spec a")
+    _spec_for("misc", t2, "spec b")
+
+    calls = _stub_audit_work(monkeypatch)
+    monkeypatch.setattr(cmp_config, "AUTO_AUDIT_DEBOUNCE_SECONDS", 60)
+    await watcher.start_audit_watcher()
+
+    for tid in (t1, t2):
+        await bus.publish({
+            "ts": "2026-05-04T12:00:00+00:00",
+            "agent_id": "system",
+            "type": "task_stage_changed",
+            "task_id": tid,
+            "from": "plan",
+            "to": "execute",
+            "owner": "p1",
+            "project_id": "misc",
+        })
+    assert await _wait_for(lambda: len(calls) == 2)
 
 
 @pytest.mark.asyncio
 async def test_disabled_project_skipped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An event on a project where `compass_enabled_<id>` is unset
-    should not fire an audit even though the type matches."""
-    # Note: NOT calling _enable_compass here.
+    """Plan→execute on a project where compass_enabled_<id> is unset
+    should not fire."""
+    task_id = _valid_task_id()
+    await _create_task(task_id=task_id, project_id="misc")
+    _spec_for("misc", task_id, "spec")
+
     calls = _stub_audit_work(monkeypatch)
     await watcher.start_audit_watcher()
 
     await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p1",
-        "type": "commit_pushed",
-        "sha": "abc",
-        "message": "test",
+        "ts": "2026-05-04T12:00:00+00:00",
+        "agent_id": "system",
+        "type": "task_stage_changed",
+        "task_id": task_id,
+        "from": "plan",
+        "to": "execute",
+        "owner": "p1",
         "project_id": "misc",
     })
     await asyncio.sleep(0.05)
@@ -359,106 +445,26 @@ async def test_disabled_project_skipped(
 async def test_disabled_project_explicit_false_skipped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Explicit `false` value also short-circuits."""
     await _disable_compass("misc")
+    task_id = _valid_task_id()
+    await _create_task(task_id=task_id, project_id="misc")
+    _spec_for("misc", task_id, "spec")
+
     calls = _stub_audit_work(monkeypatch)
     await watcher.start_audit_watcher()
 
     await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p1",
-        "type": "commit_pushed",
-        "sha": "abc",
-        "message": "test",
+        "ts": "2026-05-04T12:00:00+00:00",
+        "agent_id": "system",
+        "type": "task_stage_changed",
+        "task_id": task_id,
+        "from": "plan",
+        "to": "execute",
+        "owner": "p1",
         "project_id": "misc",
     })
     await asyncio.sleep(0.05)
     assert calls == []
-
-
-@pytest.mark.asyncio
-async def test_debounce_collapses_burst(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Two same-(project, agent, type) events within the debounce
-    window collapse into one audit; the second is dropped silently."""
-    await _enable_compass("misc")
-    calls = _stub_audit_work(monkeypatch)
-    monkeypatch.setattr(cmp_config, "AUTO_AUDIT_DEBOUNCE_SECONDS", 60)
-    await watcher.start_audit_watcher()
-
-    for sha in ("aaa111", "bbb222"):
-        await bus.publish({
-            "ts": "2026-05-02T12:00:00+00:00",
-            "agent_id": "p1",
-            "type": "commit_pushed",
-            "sha": sha,
-            "message": f"commit {sha}",
-            "project_id": "misc",
-        })
-    # Wait a moment for both events to drain.
-    await asyncio.sleep(0.05)
-    assert len(calls) == 1
-    assert "aaa111" in calls[0][1]
-
-
-@pytest.mark.asyncio
-async def test_debounce_distinct_keys_both_fire(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Different agents (or different event types) bypass the
-    debounce window — the (project, agent, type) tuple is the key."""
-    await _enable_compass("misc")
-    calls = _stub_audit_work(monkeypatch)
-    monkeypatch.setattr(cmp_config, "AUTO_AUDIT_DEBOUNCE_SECONDS", 60)
-    await watcher.start_audit_watcher()
-
-    await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p1",
-        "type": "commit_pushed",
-        "sha": "aaa",
-        "message": "x",
-        "project_id": "misc",
-    })
-    await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p2",  # different agent
-        "type": "commit_pushed",
-        "sha": "bbb",
-        "message": "y",
-        "project_id": "misc",
-    })
-    await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p1",
-        "type": "decision_written",  # different event type
-        "title": "z",
-        "size": 100,
-        "project_id": "misc",
-    })
-    assert await _wait_for(lambda: len(calls) == 3)
-
-
-@pytest.mark.asyncio
-async def test_zero_debounce_lets_every_event_through(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    await _enable_compass("misc")
-    calls = _stub_audit_work(monkeypatch)
-    monkeypatch.setattr(cmp_config, "AUTO_AUDIT_DEBOUNCE_SECONDS", 0)
-    await watcher.start_audit_watcher()
-
-    for sha in ("a", "b", "c"):
-        await bus.publish({
-            "ts": "2026-05-02T12:00:00+00:00",
-            "agent_id": "p1",
-            "type": "commit_pushed",
-            "sha": sha,
-            "message": "x",
-            "project_id": "misc",
-        })
-    assert await _wait_for(lambda: len(calls) == 3)
 
 
 @pytest.mark.asyncio
@@ -468,6 +474,10 @@ async def test_cost_cap_blocks_audit(
     """When `_today_spend()` exceeds `TEAM_DAILY_CAP_USD`, no audit
     fires. Mirrors the agents.py pre-spawn cap behavior."""
     await _enable_compass("misc")
+    task_id = _valid_task_id()
+    await _create_task(task_id=task_id, project_id="misc")
+    _spec_for("misc", task_id, "spec")
+
     calls = _stub_audit_work(monkeypatch)
     from server import agents as agents_mod
 
@@ -480,11 +490,13 @@ async def test_cost_cap_blocks_audit(
     await watcher.start_audit_watcher()
 
     await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p1",
-        "type": "commit_pushed",
-        "sha": "abc",
-        "message": "test",
+        "ts": "2026-05-04T12:00:00+00:00",
+        "agent_id": "system",
+        "type": "task_stage_changed",
+        "task_id": task_id,
+        "from": "plan",
+        "to": "execute",
+        "owner": "p1",
         "project_id": "misc",
     })
     await asyncio.sleep(0.05)
@@ -496,6 +508,10 @@ async def test_cost_cap_allows_under_threshold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await _enable_compass("misc")
+    task_id = _valid_task_id()
+    await _create_task(task_id=task_id, project_id="misc")
+    _spec_for("misc", task_id, "spec")
+
     calls = _stub_audit_work(monkeypatch)
     from server import agents as agents_mod
 
@@ -508,11 +524,13 @@ async def test_cost_cap_allows_under_threshold(
     await watcher.start_audit_watcher()
 
     await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p1",
-        "type": "commit_pushed",
-        "sha": "abc",
-        "message": "test",
+        "ts": "2026-05-04T12:00:00+00:00",
+        "agent_id": "system",
+        "type": "task_stage_changed",
+        "task_id": task_id,
+        "from": "plan",
+        "to": "execute",
+        "owner": "p1",
         "project_id": "misc",
     })
     assert await _wait_for(lambda: len(calls) == 1)
@@ -525,6 +543,12 @@ async def test_audit_work_failure_does_not_kill_watcher(
     """If `audit_work` raises, the watcher logs and keeps consuming
     events — a single bad LLM call must not break the subscriber."""
     await _enable_compass("misc")
+    t1 = _valid_task_id()
+    t2 = _other_task_id()
+    await _create_task(task_id=t1, project_id="misc")
+    await _create_task(task_id=t2, project_id="misc")
+    _spec_for("misc", t1, "x")
+    _spec_for("misc", t2, "y")
 
     fail_count = {"n": 0}
 
@@ -538,22 +562,17 @@ async def test_audit_work_failure_does_not_kill_watcher(
     monkeypatch.setattr(cmp_config, "AUTO_AUDIT_DEBOUNCE_SECONDS", 0)
     await watcher.start_audit_watcher()
 
-    await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p1",
-        "type": "commit_pushed",
-        "sha": "first",
-        "message": "boom",
-        "project_id": "misc",
-    })
-    await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p1",
-        "type": "commit_pushed",
-        "sha": "second",
-        "message": "ok",
-        "project_id": "misc",
-    })
+    for tid in (t1, t2):
+        await bus.publish({
+            "ts": "2026-05-04T12:00:00+00:00",
+            "agent_id": "system",
+            "type": "task_stage_changed",
+            "task_id": tid,
+            "from": "plan",
+            "to": "execute",
+            "owner": "p1",
+            "project_id": "misc",
+        })
     assert await _wait_for(lambda: fail_count["n"] == 2)
     assert watcher.is_running()
 
@@ -565,17 +584,23 @@ async def test_watcher_disabled_via_flag(
     """When `HARNESS_COMPASS_AUTO_AUDIT=false`, the watcher refuses to
     start — events flow but no audits fire."""
     await _enable_compass("misc")
+    task_id = _valid_task_id()
+    await _create_task(task_id=task_id, project_id="misc")
+    _spec_for("misc", task_id, "spec")
+
     calls = _stub_audit_work(monkeypatch)
     monkeypatch.setattr(cmp_config, "AUTO_AUDIT_ENABLED", False)
     await watcher.start_audit_watcher()
     assert not watcher.is_running()
 
     await bus.publish({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p1",
-        "type": "commit_pushed",
-        "sha": "abc",
-        "message": "test",
+        "ts": "2026-05-04T12:00:00+00:00",
+        "agent_id": "system",
+        "type": "task_stage_changed",
+        "task_id": task_id,
+        "from": "plan",
+        "to": "execute",
+        "owner": "p1",
         "project_id": "misc",
     })
     await asyncio.sleep(0.05)
@@ -596,26 +621,54 @@ async def test_start_is_idempotent(
 
 
 @pytest.mark.asyncio
-async def test_event_without_project_id_skipped(
+async def test_event_without_project_id_uses_task_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If somehow an event lands without a project_id (shouldn't
-    happen since `EventBus.publish` auto-stamps it, but guard
-    anyway), the watcher drops it instead of asserting."""
+    """If somehow an event lands without a project_id, the watcher
+    falls back to looking up the task row to recover it."""
+    await _enable_compass("misc")
+    task_id = _valid_task_id()
+    await _create_task(task_id=task_id, project_id="misc")
+    _spec_for("misc", task_id, "fallback test")
+
+    calls = _stub_audit_work(monkeypatch)
+    await watcher.start_audit_watcher()
+
+    queue = next(iter(bus._queues), None)
+    assert queue is not None
+    await queue.put({
+        "ts": "2026-05-04T12:00:00+00:00",
+        "agent_id": "system",
+        "type": "task_stage_changed",
+        "task_id": task_id,
+        "from": "plan",
+        "to": "execute",
+        # no project_id — must be recovered via task row lookup
+    })
+    assert await _wait_for(lambda: len(calls) == 1)
+    project_id, _ = calls[0]
+    assert project_id == "misc"
+
+
+@pytest.mark.asyncio
+async def test_unknown_task_id_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plan→execute event referencing a task id that doesn't exist
+    (race / stale event) is dropped silently."""
     await _enable_compass("misc")
     calls = _stub_audit_work(monkeypatch)
     await watcher.start_audit_watcher()
 
-    # Bypass the bus's auto-stamp by directly poking the queue.
-    queue = next(iter(bus._queues), None)
-    assert queue is not None
-    await queue.put({
-        "ts": "2026-05-02T12:00:00+00:00",
-        "agent_id": "p1",
-        "type": "commit_pushed",
-        "sha": "abc",
-        "message": "test",
-        # no project_id
+    await bus.publish({
+        "ts": "2026-05-04T12:00:00+00:00",
+        "agent_id": "system",
+        "type": "task_stage_changed",
+        "task_id": _valid_task_id(),  # not inserted
+        "from": "plan",
+        "to": "execute",
+        "owner": "p1",
+        "project_id": "misc",
     })
     await asyncio.sleep(0.05)
     assert calls == []

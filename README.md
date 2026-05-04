@@ -22,12 +22,13 @@
 
 A wrong assumption made on turn 3, baked in by turn 30. A constraint missed. A subtle drift from the spec — subtle, then sudden, then everywhere. **Longer prompts don't fix this.** Bigger swarms make it worse. Existing tools either hide drift behind a dashboard or trap you in one-on-one chat.
 
-TeamOfTen is the opposite shape. Three things, working together:
+TeamOfTen is the opposite shape. Four things, working together:
 
 | | | |
 |--|--|--|
 | 🧭 | **Compass** | A probabilistic strategy engine maintains a YES/NO world-model of your project. Asks *you* the high-uncertainty questions. Audits every artifact. Catches drift before it ships. |
 | 🔒 | **Truth** | A `truth/` folder agents *cannot write to.* Coach proposes diffs; you approve. The source-of-truth doesn't drift behind your back. |
+| 🗂️ | **Kanban lifecycle** | Tasks move through plan → execute → syntax audit → semantic audit → ship → archive. Every stage has an owner, a gate, and a markdown artifact. Execution drift has to show itself. |
 | 🪟 | **All glass** | Eleven panes, every tool call live, every agent steerable. The agent chatter *is* the interface. |
 
 One Coach. Ten Players. One operator. One VPS.
@@ -40,6 +41,7 @@ One Coach. Ten Players. One operator. One VPS.
 
 - [Compass — a strategy engine for your team](#compass--a-strategy-engine-for-your-team)
 - [Truth — write-protected by default](#truth--write-protected-by-default)
+- [Kanban — drift control for execution](#kanban--drift-control-for-execution)
 - [All glass — eleven panes, no black box](#all-glass--eleven-panes-no-black-box)
 - [Two runtimes — Claude Code & OpenAI Codex](#two-runtimes--claude-code--openai-codex)
 - [What it actually does, end-to-end](#what-it-actually-does-end-to-end)
@@ -107,6 +109,22 @@ Coach proposes diffs. You approve in the UI. The agents propose; the human dispo
 
 ---
 
+## Kanban — drift control for execution
+
+The task board is no longer a loose todo list. It is a **kanban-shaped lifecycle**:
+
+```
+plan → execute → audit_syntax → audit_semantics → ship → archive
+```
+
+Coach plans and assigns. Players execute, review, and ship. Standard tasks need a `spec.md` before execution, then a configured route through formal review, semantic review, or both, plus shipper sign-off when required. Simple tasks bypass the review columns, but only with an explicit self-audit reminder before `coord_commit_push` or `coord_complete_execution`.
+
+That matters for drift control because the work now has intermediate artifacts, not just final output: `spec.md`, `audits/audit_<round>_<kind>.md`, Compass audit reports, role assignments, stage-change events, and kDrive-mirrored task folders. Compass still provides the strategic drift signal; kanban makes the operational drift visible while there is still a responsible Player and a concrete next gate.
+
+Full subsystem spec: [Docs/kanban-specs.md](Docs/kanban-specs.md).
+
+---
+
 ## All glass — eleven panes, no black box
 
 Most multi-agent orchestrators abstract agents behind dashboards, tickets, or pipeline logs. You see the org chart and the deliverables, but you lose contact with what the agents are actually doing.
@@ -118,6 +136,7 @@ Here, **the agent chatter *is* the interface.** A tileable multi-pane web UI str
 - **Live token/context bar** in every pane header — knows when an auto-compact is about to fire.
 - **Image paste** into any agent's input. Drop a screenshot, the agent reads it.
 - **Slash commands** — `/plan` `/model` `/effort` `/brief` `/tools` `/clear` `/loop` `/tick` `/status` `/spend` `/compact`.
+- **Kanban pane** — Plan / Execute / Audit / Ship columns, archive drawer, card expansion, role history, and links straight into task specs + audit reports.
 - **Files pane** — browse + preview/edit `.md` files across memory, knowledge, decisions, outputs, uploads, attachments.
 - **Mobile layout.** Sub-700px reflows the whole app: bottom rail, swipeable pane deck, full-screen env overlay. Watch the team from your phone.
 - **Telegram bridge.** Whitelist-gated bot. Send goals to Coach from anywhere; `coord_request_human` escalations ping you back.
@@ -141,25 +160,27 @@ Coach on Claude, half the Players on Codex, slot p7 on whichever model writes th
 ## What it actually does, end-to-end
 
 1. You send a goal to **Coach** in the UI (or by Telegram).
-2. Coach reads the **Compass briefing** to ground itself in the current strategy, then decomposes the goal into tasks on a shared board and push-assigns them to specific **Players** (`p1`–`p10`, auto-named after lacrosse legends by default — Coach can rename + brief them per project).
-3. The assignee **auto-wakes** the moment a task lands, reads their inbox, claims the task, and works in their **own git worktree** on your project repo — full direct git access, `git commit + push` straight back to GitHub.
-4. Players message each other peer-to-peer for info, drop notes in **shared memory**, write **knowledge artifacts** (plain markdown), save **binary outputs** (docx, pdf, png, zip), record durable **decisions** (Coach-only, immutable), and ask **structured questions** of you when blocked.
-5. Every artifact gets **audited against the Compass lattice.** Drift is flagged. Coach decides; you sleep.
-6. Agents can use **external MCP servers** (Notion, Slack, Linear, Sentry — anything MCP-shaped), credentials in an encrypted on-disk vault.
-7. You're part of the team: open any agent's pane to read what they're saying, send them a direct prompt, watch the live tool-use stream, override their model / runtime / effort / plan-mode, or pause/cancel a runaway turn.
-8. Everything human-readable mirrors to your **WebDAV cloud drive** (kDrive, Nextcloud, ownCloud, Fastmail) so you can read/edit it from anywhere — even with the harness offline. Point Obsidian at the synced folder and you have a live second-brain the agents write into.
+2. Coach reads the **Compass briefing** to ground itself in the current strategy, then decomposes the goal into kanban tasks. Standard work starts in `plan` with a durable `spec.md`; simple work is explicitly marked as self-audit.
+3. Coach assigns Players by role — planner, executor, formal reviewer, semantic reviewer, shipper — and the assignee **auto-wakes** the moment their stage is ready.
+4. The executor works in their **own git worktree** on your project repo — full direct git access, `git commit + push` straight back to GitHub. A pushed commit advances the card into audit.
+5. Players message each other peer-to-peer for info, drop notes in **shared memory**, write **knowledge artifacts** (plain markdown), save **binary outputs** (docx, pdf, png, zip), record durable **decisions** (Coach-only, immutable), and ask **structured questions** of you when blocked.
+6. Standard tasks pass through the configured review route: formal review, semantic review, or both, plus shipper sign-off when required. In parallel, every artifact gets **audited against the Compass lattice.** Drift is flagged. Coach decides; you sleep.
+7. Agents can use **external MCP servers** (Notion, Slack, Linear, Sentry — anything MCP-shaped), credentials in an encrypted on-disk vault.
+8. You're part of the team: open any agent's pane to read what they're saying, send them a direct prompt, watch the live tool-use stream, override their model / runtime / effort / plan-mode, or pause/cancel a runaway turn.
+9. Everything human-readable mirrors to your **WebDAV cloud drive** (kDrive, Nextcloud, ownCloud, Fastmail) so you can read/edit it from anywhere — even with the harness offline. Point Obsidian at the synced folder and you have a live second-brain the agents write into.
 
-Full details: [Docs/TOT-specs.md](Docs/TOT-specs.md). Rules agents follow when editing this repo: [CLAUDE.md](CLAUDE.md).
+Full details: [Docs/TOT-specs.md](Docs/TOT-specs.md). Kanban subsystem detail: [Docs/kanban-specs.md](Docs/kanban-specs.md). Rules agents follow when editing this repo: [CLAUDE.md](CLAUDE.md).
 
 ---
 
 ## Coordination tools (MCP, internal)
 
-~25 `coord_*` tools the agents call directly:
+30+ `coord_*` tools the agents call directly:
 
 | | |
 |--|--|
-| **Tasks** | `coord_list_tasks`, `coord_create_task`, `coord_claim_task`, `coord_assign_task`, `coord_update_task` |
+| **Tasks** | `coord_list_tasks`, `coord_create_task`, `coord_update_task`, `coord_set_task_blocked` |
+| **Kanban roles** | `coord_assign_planner`, `coord_write_task_spec`, `coord_assign_task`, `coord_claim_task`, `coord_my_assignments`, `coord_assign_auditor`, `coord_submit_audit_report`, `coord_assign_shipper`, `coord_mark_shipped` |
 | **Messaging** | `coord_send_message`, `coord_read_inbox` |
 | **Shared memory** | `coord_list_memory`, `coord_read_memory`, `coord_update_memory` |
 | **Durable decisions** | `coord_write_decision` |
@@ -272,6 +293,7 @@ Dockerfile                    Python 3.12 + Node 20 + claude CLI + codex CLI + g
 mcp-servers.example.json      Template for wiring external MCP servers
 truth/                        The project's source-of-truth (write-protected for agents)
 Docs/TOT-specs.md             Full spec (data model, coordination, tool surface, UI)
+Docs/kanban-specs.md          Kanban task lifecycle — stages, roles, audits, auto-advance
 Docs/COMPASS_SPEC.md          Compass design — lattice, Q&A, audit semantics
 Docs/CODEX_RUNTIME_SPEC.md    Codex runtime design + parser specifics
 CLAUDE.md                     Rules for any agent editing this codebase

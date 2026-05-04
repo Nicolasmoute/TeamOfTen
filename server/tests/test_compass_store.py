@@ -186,7 +186,7 @@ async def test_read_project_meta_missing_project_returns_id_only(fresh_db: str) 
 def test_project_anchor_excludes_objectives_section() -> None:
     """Objectives moved from steering context (project_meta) to the
     truth corpus. The anchor block surfaces only name + description +
-    the dimensions guidance; it must NOT have a separate Objectives
+    the intent-lens guidance; it must NOT have a separate Objectives
     section because that would duplicate what's in the truth listing."""
     from server.compass.prompts import _project_anchor
 
@@ -199,10 +199,15 @@ def test_project_anchor_excludes_objectives_section() -> None:
     assert "Stripe Billing" in anchor
     assert "Usage-based pricing" in anchor
     # Anchor mentions objectives only as a pointer, not a duplicated body.
-    assert "Objectives" not in anchor.split("**Description:**", 1)[-1].split(
-        "Treat the lattice", 1
-    )[0]
-    assert "MULTIPLE project dimensions" in anchor or "multiple project" in anchor.lower()
+    after_desc = anchor.split("**Description:**", 1)[-1]
+    # "Objectives" appears in "project-objectives.md" reference, but the body
+    # should not have a standalone "Objectives" heading or section.
+    assert "## Objectives" not in after_desc
+    assert "**Objectives" not in after_desc
+    # Post-2026-05-04 refocus: anchor introduces the intent lens and asks the
+    # LLM to cover MULTIPLE intent dimensions.
+    assert "MULTIPLE intent dimensions" in anchor or "multiple intent" in anchor.lower()
+    assert "intent" in anchor.lower()
 
 
 def test_project_anchor_returns_empty_without_metadata() -> None:

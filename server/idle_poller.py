@@ -101,6 +101,35 @@ def _flag_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+# Stall sweeper (Docs/kanban-specs.md §10.5). Sibling pass in this
+# tick loop — detects tasks whose `last_stage_change_at` is older than
+# `HARNESS_KANBAN_STALL_SECONDS` and emits one `task_stage_stale` per
+# threshold-crossing (gated by `tasks.stale_alert_at`).
+def _stall_threshold_seconds() -> int:
+    raw = os.environ.get("HARNESS_KANBAN_STALL_SECONDS", "14400").strip()
+    try:
+        return max(60, int(raw))
+    except ValueError:
+        return 14400
+
+
+def _stall_re_alert_seconds() -> int:
+    """Long-stuck escalation: re-fire if the task has been stalled for
+    this much longer than the threshold without progressing."""
+    raw = os.environ.get("HARNESS_KANBAN_STALL_REALERT_SECONDS", "86400").strip()
+    try:
+        return max(60, int(raw))
+    except ValueError:
+        return 86400
+
+
+def _stall_flag_enabled() -> bool:
+    raw = os.environ.get(
+        "HARNESS_KANBAN_STALL_ENABLED", "true"
+    ).strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 # ---------------------------------------------------------------- state
 
 _current_task: asyncio.Task[None] | None = None
@@ -174,7 +203,8 @@ async def _run() -> None:
 
 
 async def sweep_once() -> int:
-    """Run a single sweep. Returns the number of wake-up calls made.
+    """Run a single sweep. Returns the number of wake-up calls made
+    (player-side; the stall sweeper's emits aren't counted here).
     Exposed for tests so they can drive the loop deterministically
     instead of waiting for the asyncio sleep cycle."""
     woken = 0
@@ -186,7 +216,163 @@ async def sweep_once() -> int:
             logger.exception(
                 "idle_poller: per-slot wake failed (slot=%s)", slot
             )
+    # Stall sweeper runs after the per-Player wakes so a freshly woken
+    # Player doesn't simultaneously trigger a stale alert (tiny race
+    # but worth avoiding).
+    try:
+        await stall_sweep_once()
+    except Exception:
+        logger.exception("idle_poller: stall sweep crashed")
     return woken
+
+
+async def stall_sweep_once() -> int:
+    """Find non-archive, non-blocked tasks whose `last_stage_change_at`
+    is older than `HARNESS_KANBAN_STALL_SECONDS`. Emit
+    `task_stage_stale` once per (task, threshold-crossing). Returns
+    the number of tasks alerted.
+
+    Per-task once-per-crossing semantics: `tasks.stale_alert_at` is
+    stamped when we alert. We only re-alert if `last_stage_change_at`
+    advanced since then (handled by the kanban subscriber's
+    `_transition`, which clears `stale_alert_at`) OR the threshold has
+    been exceeded by `HARNESS_KANBAN_STALL_REALERT_SECONDS` without
+    progress (long-stuck escalation)."""
+    if not _stall_flag_enabled():
+        return 0
+    threshold = _stall_threshold_seconds()
+    re_alert_after = _stall_re_alert_seconds()
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            """
+            SELECT id, status, owner, project_id,
+                   last_stage_change_at, stale_alert_at
+              FROM tasks
+             WHERE status NOT IN ('archive')
+               AND blocked = 0
+               AND last_stage_change_at IS NOT NULL
+               AND (julianday('now') - julianday(last_stage_change_at))
+                   * 86400.0 > ?
+            """,
+            (threshold,),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+    finally:
+        await c.close()
+
+    if not rows:
+        return 0
+
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
+    alerted = 0
+    for r in rows:
+        try:
+            last_change = _parse_iso(r.get("last_stage_change_at"))
+            stale_alert = _parse_iso(r.get("stale_alert_at"))
+            age_seconds = int((now_dt - last_change).total_seconds())
+            # Suppress re-alert if we already alerted at the current
+            # last_stage_change_at value, unless the long-stuck escalation
+            # window has elapsed since the last alert.
+            should_alert = True
+            if stale_alert is not None:
+                # Already alerted on the current crossing.
+                if age_seconds < threshold + re_alert_after:
+                    should_alert = False
+            if not should_alert:
+                continue
+
+            # Pull the active role-row for the current stage to surface
+            # eligible_owners + owner in the event payload.
+            stage = r["status"]
+            role = _role_for_stage(stage)
+            eligible: list[str] = []
+            if role:
+                c = await configured_conn()
+                try:
+                    cur = await c.execute(
+                        "SELECT eligible_owners, owner FROM "
+                        "task_role_assignments WHERE task_id = ? "
+                        "AND role = ? AND superseded_by IS NULL "
+                        "ORDER BY assigned_at DESC LIMIT 1",
+                        (r["id"], role),
+                    )
+                    rrow = await cur.fetchone()
+                finally:
+                    await c.close()
+                if rrow:
+                    rd = dict(rrow)
+                    try:
+                        parsed = json.loads(rd.get("eligible_owners") or "[]")
+                        if isinstance(parsed, list):
+                            eligible = [str(x) for x in parsed]
+                    except Exception:
+                        eligible = []
+
+            await bus.publish({
+                "ts": now_iso,
+                "agent_id": "system",
+                "type": "task_stage_stale",
+                "task_id": r["id"],
+                "stage": stage,
+                "age_seconds": age_seconds,
+                "owner": r.get("owner"),
+                "eligible_owners": eligible,
+                "to": "coach",
+            })
+            # Stamp stale_alert_at so we don't re-fire until either the
+            # task progresses (subscriber clears the column) or the
+            # long-stuck escalation window passes.
+            c = await configured_conn()
+            try:
+                await c.execute(
+                    "UPDATE tasks SET stale_alert_at = ? WHERE id = ?",
+                    (now_iso, r["id"]),
+                )
+                await c.commit()
+            finally:
+                await c.close()
+            # Also nudge the assigned Player (if any) before pinging
+            # Coach via the event — one more wake before escalation.
+            if r.get("owner"):
+                try:
+                    from server.agents import maybe_wake_agent
+                    await maybe_wake_agent(
+                        r["owner"],
+                        f"Reminder: task {r['id']} has been waiting in "
+                        f"{stage} for >{threshold // 3600}h. Pick it up "
+                        f"or escalate to Coach.",
+                        bypass_debounce=False,
+                    )
+                except Exception:
+                    pass
+            alerted += 1
+        except Exception:
+            logger.exception(
+                "idle_poller: stall alert failed for task %s", r.get("id")
+            )
+    return alerted
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _role_for_stage(stage: str) -> str | None:
+    return {
+        "plan": "planner",
+        "execute": "executor",
+        "audit_syntax": "auditor_syntax",
+        "audit_semantics": "auditor_semantics",
+        "ship": "shipper",
+    }.get(stage)
 
 
 async def _maybe_wake_idle(slot: str) -> bool:
@@ -233,8 +419,8 @@ async def _maybe_wake_idle(slot: str) -> bool:
         from server.agents import maybe_wake_agent
         wake_text = (
             "There may be tasks waiting for you. Call coord_my_assignments "
-            "to see your full plate (active executor task, pending audits, "
-            "pending ship, eligible pools)."
+            "to see your current actionable plate (active executor task, "
+            "pending reviews, pending ship, eligible pools)."
         )
         did_wake = await maybe_wake_agent(
             slot, wake_text, bypass_debounce=False
@@ -287,12 +473,20 @@ async def _has_available_work(slot: str) -> tuple[str, str | None] | None:
         cur = await c.execute(
             """
             SELECT r.task_id
-              FROM task_role_assignments r,
+              FROM task_role_assignments r
+              JOIN tasks t ON t.id = r.task_id,
                    json_each(r.eligible_owners) je
              WHERE je.value = ?
                AND r.owner IS NULL
                AND r.completed_at IS NULL
                AND r.superseded_by IS NULL
+               AND (
+                    (r.role = 'executor' AND t.status = 'plan')
+                 OR (r.role = 'planner' AND t.status = 'plan')
+                 OR (r.role = 'auditor_syntax' AND t.status = 'audit_syntax')
+                 OR (r.role = 'auditor_semantics' AND t.status = 'audit_semantics')
+                 OR (r.role = 'shipper' AND t.status = 'ship')
+               )
                AND (julianday('now') - julianday(r.assigned_at)) * 86400.0 > ?
              ORDER BY r.assigned_at
              LIMIT 1
@@ -307,9 +501,16 @@ async def _has_available_work(slot: str) -> tuple[str, str | None] | None:
         # owned by `slot` that hasn't completed. The first assign-time
         # wake might have missed; we re-fire here.
         cur = await c.execute(
-            "SELECT task_id FROM task_role_assignments "
-            "WHERE owner = ? AND completed_at IS NULL "
-            "AND superseded_by IS NULL "
+            "SELECT r.task_id FROM task_role_assignments r "
+            "JOIN tasks t ON t.id = r.task_id "
+            "WHERE r.owner = ? AND r.completed_at IS NULL "
+            "AND r.superseded_by IS NULL "
+            "AND ("
+            "  (r.role = 'planner' AND t.status = 'plan') "
+            "  OR (r.role = 'auditor_syntax' AND t.status = 'audit_syntax') "
+            "  OR (r.role = 'auditor_semantics' AND t.status = 'audit_semantics') "
+            "  OR (r.role = 'shipper' AND t.status = 'ship')"
+            ") "
             "ORDER BY assigned_at LIMIT 1",
             (slot,),
         )

@@ -25,12 +25,12 @@ from server.compass.pipeline import (
     briefing as pl_briefing,
     claude_md as pl_claude_md,
     digest as pl_digest,
+    intent_derive as pl_intent_derive,
     questions as pl_questions,
     reconciliation as pl_reconciliation,
     regions as pl_regions,
     reviews as pl_reviews,
     truth_check as pl_truth_check,
-    truth_derive as pl_truth_derive,
 )
 
 
@@ -197,7 +197,7 @@ def _stub_pipeline(
     monkeypatch.setattr(pl_briefing, "generate", _briefing_gen)
     monkeypatch.setattr(pl_claude_md, "generate", _claude_md_generate)
     monkeypatch.setattr(pl_claude_md, "inject", _claude_md_inject)
-    monkeypatch.setattr(pl_truth_derive, "derive_from_truth", _truth_derive_stub)
+    monkeypatch.setattr(pl_intent_derive, "derive_from_corpus", _truth_derive_stub)
 
     async def _detect_conflicts_stub(
         state: Any, *, run_id: str, run_iso: str,
@@ -531,7 +531,7 @@ async def test_truth_derive_seeds_lattice_on_first_run(
 ) -> None:
     """Drop a truth file in the project's truth/ folder; the runner's
     Stage 0 should pick it up and derive lattice statements at weight
-    0.75 with `created_by='compass-truth'`."""
+    0.75 with `created_by='compass-intent'` (post 2026-05-04 refocus)."""
     from server.db import init_db, set_active_project
     from server.paths import project_paths
     await init_db()
@@ -559,16 +559,18 @@ async def test_truth_derive_seeds_lattice_on_first_run(
              "region": "compliance", "rationale": "from T1: pricing.md"},
         ])
 
-    monkeypatch.setattr(pl_truth_derive, "derive_from_truth", _truth_derive)
+    monkeypatch.setattr(pl_intent_derive, "derive_from_corpus", _truth_derive)
 
     log = await runner.run("misc", mode="bootstrap")
     assert log["completed"] is True
     state = store.load_state("misc")
-    truth_grounded = [s for s in state.statements if s.created_by == "compass-truth"]
-    assert len(truth_grounded) == 2
-    assert all(abs(s.weight - 0.75) < 1e-9 for s in truth_grounded)
-    # Truth-derive note recorded in the run log.
-    assert any("truth_derive" in n for n in (log.get("notes") or []))
+    intent_grounded = [
+        s for s in state.statements if s.created_by == "compass-intent"
+    ]
+    assert len(intent_grounded) == 2
+    assert all(abs(s.weight - 0.75) < 1e-9 for s in intent_grounded)
+    # Intent-derive note recorded in the run log.
+    assert any("intent_derive" in n for n in (log.get("notes") or []))
 
 
 @pytest.mark.asyncio
@@ -602,7 +604,7 @@ async def test_truth_derive_idempotent_on_unchanged_truth(
             {"text": "Stable claim", "region": "x", "rationale": "from T1"},
         ])
 
-    monkeypatch.setattr(pl_truth_derive, "derive_from_truth", _truth_derive)
+    monkeypatch.setattr(pl_intent_derive, "derive_from_corpus", _truth_derive)
 
     # Run #1 — derives.
     await runner.run("misc", mode="bootstrap")
@@ -642,7 +644,7 @@ async def test_truth_derive_re_runs_when_truth_changes(
             {"text": f"Claim v{call_count['n']}", "region": "x", "rationale": "from T1"},
         ])
 
-    monkeypatch.setattr(pl_truth_derive, "derive_from_truth", _truth_derive)
+    monkeypatch.setattr(pl_intent_derive, "derive_from_corpus", _truth_derive)
 
     await runner.run("misc", mode="bootstrap")
     assert call_count["n"] == 1
@@ -674,13 +676,19 @@ async def test_truth_derive_skips_when_truth_folder_empty(
         call_count["n"] += 1
         return _TDRes()
 
-    monkeypatch.setattr(pl_truth_derive, "derive_from_truth", _truth_derive)
+    monkeypatch.setattr(pl_intent_derive, "derive_from_corpus", _truth_derive)
 
     log = await runner.run("misc", mode="bootstrap")
     assert call_count["n"] == 0
     state = store.load_state("misc")
-    assert all(s.created_by != "compass-truth" for s in state.statements)
-    assert any("truth/" in n for n in (log.get("notes") or []))
+    assert all(
+        s.created_by not in ("compass-truth", "compass-intent")
+        for s in state.statements
+    )
+    assert any(
+        ("corpus" in n) or ("truth/" in n) or ("intent_derive" in n)
+        for n in (log.get("notes") or [])
+    )
 
 
 # ============================================================

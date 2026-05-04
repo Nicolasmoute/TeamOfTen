@@ -84,12 +84,20 @@ async def _seed_hard_assign(
     assigned_at: str = "2020-01-01T00:00:00Z",
 ) -> None:
     """Insert a hard-assigned role row that hasn't completed."""
+    status_by_role = {
+        "executor": "execute",
+        "planner": "plan",
+        "auditor_syntax": "audit_syntax",
+        "auditor_semantics": "audit_semantics",
+        "shipper": "ship",
+    }
+    status = status_by_role.get(role, "execute")
     c = await configured_conn()
     try:
         await c.execute(
             "INSERT INTO tasks (id, project_id, title, status, owner, "
-            "created_by) VALUES (?, 'misc', 't', 'execute', ?, 'coach')",
-            (task_id, owner if role == "executor" else None),
+            "created_by) VALUES (?, 'misc', 't', ?, ?, 'coach')",
+            (task_id, status, owner if role == "executor" else None),
         )
         await c.execute(
             "INSERT INTO task_role_assignments "

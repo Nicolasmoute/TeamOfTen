@@ -33,7 +33,7 @@ def test_render_block_includes_role_boundaries() -> None:
     # role-assignment tools so an agent reading the per-project
     # CLAUDE.md sees the kanban surface verbatim.
     assert "Coach** plans" in out
-    assert "Players** execute, audit, and ship" in out
+    assert "Players** execute, review, and ship" in out
     assert "coord_my_assignments" in out
     assert "coord_assign_planner" in out
     assert "coord_assign_auditor" in out
@@ -44,15 +44,18 @@ def test_render_block_includes_role_boundaries() -> None:
 
 def test_render_block_describes_audit_routing() -> None:
     out = render_kanban_block()
-    assert "Pass → next stage" in out  # → unicode arrow
-    assert "Fail → reverts to execute" in out
+    assert "Audit pass -> next configured stage" in out
+    assert "Audit fail" in out and "reverts to execute" in out
     # Compass is informational, not the gate.
     assert "Compass auto-audit fires informationally" in out
 
 
-def test_render_block_describes_simple_self_audit() -> None:
+def test_render_block_describes_self_audit_when_no_audit_stage() -> None:
+    """v0.3: self-audit reminder is trajectory-driven, not
+    complexity-driven — fires when the trajectory has no audit
+    stage after execute."""
     out = render_kanban_block()
-    assert "Simple-task discipline" in out
+    assert "Self-audit when the trajectory has no audit stage" in out
     assert "executor SELF-AUDITS" in out
 
 

@@ -6,9 +6,9 @@
 > subscriber, the idle-Player poller) but cannot redefine fields,
 > endpoints, events, or invariants that TOT-specs declares.
 
-**Status:** Shipped (2026-05-03).
+**Status:** Shipped (2026-05-04, v0.3 trajectory-driven gating).
 **Target:** TeamOfTen multi-agent harness (Python, Claude Agent SDK, kDrive-backed shared state, single-VPS)
-**Version:** 0.1
+**Version:** 0.3
 
 ---
 
@@ -16,32 +16,41 @@
 
 ### 1.1 Purpose
 
-Tasks in TeamOfTen flow through an explicit **kanban-shaped lifecycle**: every task is in exactly one of six stages — `plan` → `execute` → `audit_syntax` → `audit_semantics` → `ship` → `archive` — and each stage produces durable, browseable markdown artifacts. The shape is event-driven: commits and audit-report submissions auto-advance tasks; Coach assigns Players to roles at each stage; Coach never executes work themselves.
+Every Coach delegation in TeamOfTen flows through an explicit **kanban-shaped lifecycle**. There is no admission gate: if Coach is handing work to a Player, it goes on the board. Conversational replies (broadcasts, clarification questions, nudges) remain conversational and are not tracked.
+
+Each task is in exactly one stored stage — `plan` → `execute` → `audit_syntax` (formal review) → `audit_semantics` (semantic review) → `ship` → `archive` — and each task carries an explicit **trajectory** Coach defines on creation: an ordered list of stages to traverse, with per-stage assignees (single Player or pool). The storage names remain `audit_syntax` / `audit_semantics` for back-compat, but the product language is **Formal Review** / **Semantic Review**.
+
+The shape is event-driven: execution-completion, commit, review, and ship events auto-route tasks along the trajectory; Coach calls Players into roles upfront and never executes work themselves. Coach watches the per-turn rollup for audit-loop quality issues and stalled tasks, and adjusts via per-Player effort/model bumps or trajectory rewrites.
 
 ### 1.2 Scope
 
 This spec covers:
-- The six-stage state machine and its valid transitions.
+- The trajectory model, six-stage state machine, and valid transitions.
 - The five **roles** (planner / executor / auditor_syntax / auditor_semantics / shipper) that Players can be assigned to.
 - The artifacts produced at each stage (`spec.md`, `audits/audit_<round>_<kind>.md`, plus the parallel informational Compass audit report).
-- The MCP tools Coach uses to plan + assign and Players use to execute / audit / ship.
+- The MCP tools Coach uses to plan + call/assign and Players use to execute / review / ship.
 - The HTTP endpoints, bus events, and UI surface (`__kanban` slot).
-- The schema (`tasks.status` enum, `task_role_assignments` table, denormalized card-render columns).
-- The auto-advance subscriber, idle-Player poller, CLAUDE.md kanban block, and Telegram escalation hooks.
+- The schema (`tasks.status` enum, `tasks.trajectory`, `task_role_assignments` table, denormalized card-render columns).
+- The auto-advance subscriber, idle-Player poller + stall sweeper, flow-health endpoint, CLAUDE.md kanban block, and Telegram escalation hooks.
+- The Coach quality-feedback rollup (audit-loop signal + stalled-tasks signal).
 
-Out of scope: drag-to-move on the board (deferred to v2), per-task priority changes from the UI (priority is set at create time only — kanban v1 does not include reprioritization tooling), per-task time-estimation features.
+Out of scope: drag-to-move on the board (deferred to v2), per-task priority changes from the UI (priority is set at create time only), per-task time-estimation features.
 
 ### 1.3 Glossary
 
 | Term | Meaning |
 |---|---|
-| **Stage** | One of `plan` / `execute` / `audit_syntax` / `audit_semantics` / `ship` / `archive`. Stored in `tasks.status` (the enum is reused for what was previously called "task status"). |
-| **Role** | A function a Player performs on a specific task: `planner`, `executor`, `auditor_syntax`, `auditor_semantics`, `shipper`. Stored as rows in `task_role_assignments`. |
-| **Pool** | A list of eligible Players (`eligible_owners`) on a role assignment. The first Player to call `coord_claim_task` (or be auto-claimed via the executor pool) wins; the others' wakes degrade gracefully. |
-| **Round** | The Nth audit cycle on a task. A task that fails syntax-audit twice has rounds 1 (fail) and 2 in `audits/audit_1_syntax.md` / `audit_2_syntax.md`. |
-| **Verdict** | An auditor's decision: `pass` or `fail`. Drives the auto-advance subscriber. |
-| **Spec** | The `spec.md` markdown file produced in the plan stage. Required for `standard`-complexity tasks; optional for `simple`. |
+| **Stage** | One of `plan` / `execute` / `audit_syntax` / `audit_semantics` / `ship` / `archive`. Stored in `tasks.status`. |
+| **Trajectory** | The ordered list of stages a task will traverse, plus per-stage `eligible_owners`. Stored in `tasks.trajectory` as a JSON array of `{stage, to}` objects. Coach defines it on `coord_create_task`; mid-flight reroute via `coord_set_task_trajectory`. Replaces the v0.2 `required_reviews` + `ship_required` + `complexity` triple. |
+| **Role** | A function a Player performs on a specific task: `planner`, `executor`, `auditor_syntax`, `auditor_semantics`, `shipper`. Stored as rows in `task_role_assignments`, populated up front from the trajectory. |
+| **Workflow** | The domain flavor of the task: `code`, `research`, `writing`, `marketing`, `ops`, or `generic`. Stored in `tasks.workflow`; shapes prompt wording, not routing. |
+| **Tracking reason** | Optional informational tag. Stored in `tasks.tracking_reason`. Not required, not validated against an enum. Kept for filtering/analytics. |
+| **Call / Pool** | A list of eligible Players (`eligible_owners`) on a role assignment. The current-stage candidates are woken; the first Player to `coord_accept_role` wins atomically. Executor pools can also use the legacy `coord_claim_task`. Future-stage reservations are not actionable until the card reaches that stage. |
+| **Round** | The Nth review cycle on a task. A task that fails formal review twice has rounds 1 (fail) and 2 in `audits/audit_1_syntax.md` / `audit_2_syntax.md`. |
+| **Verdict** | A reviewer decision: `pass` or `fail`. Drives the auto-advance subscriber. |
+| **Spec** | The `spec.md` markdown file produced in the plan stage. Required when the trajectory includes `plan`; optional when omitted. |
 | **Active assignment** | The row in `task_role_assignments` for `(task_id, role)` with `superseded_by IS NULL` and the most recent `assigned_at`. |
+| **Stall** | A non-archive task whose `last_stage_change_at` is older than `HARNESS_KANBAN_STALL_SECONDS` (default 4 h). Detected by the stall sweeper in `idle_poller.py`. |
 
 ---
 
@@ -50,54 +59,70 @@ Out of scope: drag-to-move on the board (deferred to v2), per-task priority chan
 ### 2.1 Stages
 
 - **plan** — task created, no executor yet (or has a planner working on the spec). Cards in this stage may have `spec_path = NULL` if the spec hasn't been written yet.
-- **execute** — owned by a Player. Sub-state inside execute: `started_at IS NULL` (assigned but not yet picked up; hollow avatar) vs `started_at` populated (actively working; filled avatar).
-- **audit_syntax** — commit pushed, awaiting tests/CI/lint confirmation by the assigned syntax auditor.
-- **audit_semantics** — syntax green, awaiting alignment-with-goals confirmation by the assigned semantic auditor.
-- **ship** — both audits green, ready for the assigned shipper to merge / publish.
+- **execute** — owned by a Player. Sub-state inside execute: `started_at IS NULL` (hard-assigned or reset after audit fail; hollow avatar) vs `started_at` populated (self-claimed executor work; filled avatar).
+- **audit_syntax** — formal review. For code this means tests/CI/lint/mechanical correctness; for research it means citations, structure, and traceability; for writing/marketing it means format, tone guide, and required-message compliance.
+- **audit_semantics** — semantic review. For code this means “does it solve the user need?”; for research it means argument quality and rigor; for writing/marketing it means positioning, audience fit, and substantive usefulness.
+- **ship** — required reviews are green, ready for the assigned shipper to merge, publish, send, hand off, or explicitly close as “nothing to merge/publish”.
 - **archive** — terminal. `archived_at` set. `cancelled_at` non-null distinguishes a cancellation from a delivered task.
 
-The two timestamp columns inside `execute` (`claimed_at` and `started_at`) carry the "actively working" signal:
+The two timestamp columns inside `execute` (`claimed_at` and `started_at`) distinguish assignment/claim from self-started work:
 
 | Entry path | `claimed_at` | `started_at` |
 |---|---|---|
-| Hard-assign (`coord_assign_task(to='p3')`) | now | NULL until p3's first auto-wake fires |
+| Hard-assign (`coord_assign_task(to='p3')`) | now | NULL (the current implementation does not stamp `started_at` merely because the wake turn was launched) |
 | Pool-claim (`coord_claim_task` from `eligible_owners`) | now | now (self-claim **is** starting) |
 | Self-claim (Player picks up an unowned plan-stage task) | now | now |
 
-Both are kept across the audit-fail revert: `started_at` is cleared so the card flips to "assigned, not started" and the next auto-wake will repopulate it; `claimed_at` is preserved (the executor still owns the task; they just haven't re-engaged yet).
+Across an audit-fail revert, `started_at` is cleared so the card flips back to "assigned, not self-started"; `claimed_at` is preserved (the executor still owns the task). The next executor turn is triggered by auto-wake, but `started_at` will remain NULL unless the task is claimed again through the self-claim path or a future implementation adds an explicit turn-start stamp.
 
 ### 2.2 Valid transitions
 
 ```
-plan          → {execute, archive}
-execute       → {audit_syntax, archive}
-audit_syntax  → {audit_semantics, execute}
-audit_semantics → {ship, execute}
-ship          → {archive}
-archive       → {}
+plan            → {execute, archive}
+execute         → {audit_syntax, audit_semantics, ship, archive}
+audit_syntax    → {audit_semantics, ship, archive, execute}
+audit_semantics → {ship, archive, execute}
+ship            → {archive}
+archive         → {}
 ```
+
+The broader transition map is **trajectory-driven**: the stages above are the universe of valid transitions, but the actual path a task walks is the ordered list in `tasks.trajectory`. A trajectory of `[execute]` routes `execute → archive` directly; `[plan, execute, audit_semantics, ship]` routes `plan → execute → audit_semantics → ship → archive`. The auto-advance subscriber walks the trajectory in order; pass goes to the next stage in the list, fail reverts to `execute`, terminal step archives.
 
 Cancellation is `<any non-terminal stage> → archive` with `cancelled_at = now()`. The `blocked` flag is orthogonal and toggleable in any non-terminal stage; it does not change `tasks.status`.
 
 The validator lives at [server/tools.py:VALID_TRANSITIONS](server/tools.py).
 
-### 2.3 Role-completion gating
+### 2.3 Trajectory-walking gate
 
-Stage transitions are gated by **role-completion events**, not by Coach's manual call alone:
+Stage transitions are driven by **role-completion events** and routed by the trajectory walker `_next_stage()` in [server/kanban.py](server/kanban.py):
 
 | Transition | Required condition |
 |---|---|
-| `plan → execute` | `tasks.spec_path IS NOT NULL` (standard) AND active executor assignment with `owner IS NOT NULL`. |
-| `execute → audit_syntax` | `commit_pushed` event with the task's id (standard complexity). |
-| `execute → archive` | `commit_pushed` event with the task's id AND `complexity = 'simple'`. |
-| `audit_syntax → audit_semantics` | Active syntax-auditor assignment has `verdict = 'pass'`. |
-| `audit_semantics → ship` | Active semantic-auditor assignment has `verdict = 'pass'`. |
+| `plan → execute` | `tasks.spec_path IS NOT NULL` AND active executor assignment with `owner IS NOT NULL`. The spec gate fires only when `plan` is in the trajectory; trajectories that omit `plan` skip the spec gate entirely. |
+| `execute → next stage in trajectory` | `commit_pushed` with task id for code work, or `task_execution_completed` from `coord_complete_execution` for non-code artifacts. `coord_commit_push` only preserves the id after a successful push, or explicit `push=false` local-only delivery. The next stage is `_next_stage(task, "execute")`. |
+| `audit_syntax → next stage in trajectory` | Active formal reviewer has `verdict = 'pass'`. Walker returns the next stage in `tasks.trajectory` after `audit_syntax`. |
+| `audit_semantics → next stage in trajectory` | Active semantic reviewer has `verdict = 'pass'`. Walker returns the next stage in `tasks.trajectory` after `audit_semantics`. |
 | `ship → archive` | `task_shipped` event from the assigned shipper. |
-| `audit_* → execute` (revert) | Active auditor assignment has `verdict = 'fail'`. Auto-fires; clears `tasks.started_at` so the executor's resume is clean. |
+| `audit_* → execute` (revert) | Active auditor assignment has `verdict = 'fail'`. Auto-fires; clears `tasks.started_at` so the card no longer looks self-started. |
 
-On a fail revert, the auditor's role-assignment row stays **terminal** — its `verdict` and `report_path` are written, `completed_at` set, and that audit round is done. The next round (after the executor re-commits) gets a **new** `auditor_<kind>` row inserted by `coord_assign_auditor` and the `round` counter on the next report increments. The executor's role row, by contrast, is **not** superseded — they're still the executor — but `tasks.started_at` is cleared so the next auto-wake can repopulate it cleanly. This split is what lets the card-expansion view render the audit history (round 1 fail → round 2 pass → ...) while the latest-only fields on the row stay accurate for cheap card rendering.
+On a fail revert, the auditor's role-assignment row stays **terminal** — its `verdict` and `report_path` are written, `completed_at` set, and that audit round is done. The next round (after the executor re-commits) gets a **new** `auditor_<kind>` row inserted by `coord_assign_auditor` and the `round` counter on the next report increments. The executor's role row, by contrast, is **not** superseded — they're still the executor — but `tasks.started_at` is cleared so the active card reads as "assigned after failed audit" rather than "already self-started." This split is what lets the card-expansion view render the audit history (round 1 fail → round 2 pass → ...) while the latest-only fields on the row stay accurate for cheap card rendering.
 
-`coord_advance_task_stage` is the explicit Coach-override tool that bypasses the role-completion gate when an assignment stalls.
+**Audit-fail loop guarantee.** A `verdict='fail'` from any review stage **always** loops the task back to `execute`, regardless of trajectory shape, and the executor is re-woken with the latest audit report attached. This is the inner correction loop that makes the kanban work: the executor doesn't have to chase the report down, the system delivers it. Concretely, when `coord_submit_audit_report{verdict='fail'}` lands:
+
+1. `tasks.latest_audit_report_path` / `latest_audit_kind` / `latest_audit_verdict='fail'` are written before the event fires.
+2. The subscriber transitions the task to `execute`, clears `started_at`, stamps `last_stage_change_at`.
+3. The executor's auto-wake prompt includes verbatim:
+   - the path to `tasks.spec_path` (so the executor can re-read the goal),
+   - the path to `tasks.latest_audit_report_path` (so the executor can read **what failed and why**),
+   - one line per failed acceptance criterion if the auditor inlined them in the report body.
+4. The card flips to `EXECUTE` column with a red drift banner; clicking the banner opens the audit report in the Files pane.
+5. The subscriber **also** publishes an `audit_fail_notification` event routed to Coach (`to: 'coach'`). This event carries `{task_id, kind, kind_round, escalate, auditor_id, executor_id, report_path}` where `kind_round` is the number of fail verdicts so far for this task and audit kind, and `escalate = (kind_round >= 2)`. Coach sees the event in their pane and (subject to the existing escalation watcher) on Telegram. The first fail of any kind is informational; the second fail of the **same kind** is the escalation signal — see §17 for how Coach acts on it.
+
+There is no cap on revert rounds — a task can iterate `execute → audit → execute → audit → ...` indefinitely. Coach sees the notification on every fail but is told to expect a first fail as normal correction noise; quality intervention happens on the second fail of the same kind.
+
+Every successful transition stamps `tasks.last_stage_change_at = now()` in the same DB write as the status update. This drives the stall sweeper (§10.5) and the `## Stalled tasks` Coach rollup.
+
+`coord_advance_task_stage` is the explicit Coach-override tool that bypasses the trajectory gate when an assignment stalls. The human `/api/tasks/{id}/stage` endpoint uses the same gate unless `force=true`.
 
 ### 2.4 Blocked flag
 
@@ -109,34 +134,77 @@ On a fail revert, the auditor's role-assignment row stays **terminal** — its `
 
 ---
 
-## 3 · Complexity
+## 3 · Trajectory
 
-### 3.1 Standard vs simple
+The trajectory replaces the v0.2 admission gate, the `required_reviews` + `ship_required` route hints, and the `complexity` column.
 
-`tasks.complexity ∈ {'standard', 'simple'}` (default `standard`). Set at create time or with `coord_set_task_complexity`.
+### 3.1 Shape
 
-### 3.2 Spec gate
+`tasks.trajectory` is a JSON list of `{stage, to}` objects:
 
-| Complexity | Spec required for `plan → execute` |
+```json
+[
+  {"stage": "plan",            "to": "p5"},
+  {"stage": "execute",         "to": "p2"},
+  {"stage": "audit_syntax",    "to": ["p4", "p7"]},
+  {"stage": "ship",            "to": "p2"}
+]
+```
+
+- `stage` ∈ `{plan, execute, audit_syntax, audit_semantics, ship}` (no `archive` — it is implicit/terminal).
+- `to` accepts a single Player slot string (hard-assign) or a list of slot strings (pool; first free wins).
+
+### 3.2 Validation rules
+
+`_validate_trajectory()` in [server/tools.py](server/tools.py) enforces:
+
+- Non-empty list.
+- Each `stage` is one of the five valid stages above.
+- No duplicate stages.
+- Stages appear in canonical order (`plan` < `execute` < `audit_syntax` < `audit_semantics` < `ship`).
+- `execute` is mandatory.
+- Each `to` resolves to a `list[str]` of valid Player slots (`p1`..`p10`).
+
+The validator returns `(trajectory_json, role_inserts)` so `coord_create_task` can plant the matching `task_role_assignments` rows in the same transaction.
+
+### 3.3 Examples
+
+| Use case | Trajectory |
 |---|---|
-| standard | yes (reject `coord_assign_task` / `coord_claim_task` until `spec_path` is set) |
-| simple | no (title + description on the row are sufficient) |
+| Quick mechanical work, "simple" | `[{"stage":"execute","to":["p2","p3"]}]` |
+| Needs a spec but no audit | `[{"stage":"plan","to":"p5"},{"stage":"execute","to":"p2"}]` |
+| Code change with formal review | `[{"stage":"plan","to":"p5"},{"stage":"execute","to":"p2"},{"stage":"audit_syntax","to":"p4"},{"stage":"ship","to":"p2"}]` |
+| Marketing blog post | `[{"stage":"plan","to":"p3"},{"stage":"execute","to":"p5"},{"stage":"audit_semantics","to":"p7"},{"stage":"ship","to":"p4"}]` |
 
-The gate is also enforced by `POST /api/tasks/{id}/stage` unless `force=true`. `coord_assign_planner` is the one tool that succeeds without a spec — it's the path that produces one.
+### 3.4 Spec gate
 
-### 3.3 Simple-task self-audit discipline
+If `plan` is in the trajectory, the executor cannot start until `spec_path IS NOT NULL`. The planner's `coord_write_task_spec` call sets `spec_path`, marks the planner role complete, and triggers `plan → execute`. If `plan` is **not** in the trajectory, no spec is required — Coach signaled "no plan needed" by omitting the stage. `coord_write_task_spec` is callable as a documented emergency override regardless.
 
-`simple` tasks bypass `audit_syntax` / `audit_semantics` / `ship` entirely: a `commit_pushed` while the task is in `execute` jumps straight to `archive`. The auto-wake prompt sent to the executor of a simple task includes verbatim text instructing them to **self-audit** (run the relevant tests, sanity-check the change) before pushing — the board archives directly on commit, with no separate audit pass.
+### 3.5 Self-audit reminder (trajectory-driven)
 
-The verbatim auto-wake text (must appear in the spawn prompt's `entry_prompt` field; verifiable in the `agent_started` event payload):
+If the trajectory has no `audit_syntax` and no `audit_semantics` stage after `execute`, the executor's wake prompt includes the verbatim:
 
-> *task &lt;task_id&gt; is marked simple — self-audit (run tests / sanity-check the change) before coord_commit_push because the board archives directly on commit, no separate audit pass.*
+> *no audit stage configured for task &lt;task_id&gt; — self-audit (run tests / sanity-check the change) before coord_commit_push or coord_complete_execution. The board archives directly on completion; there is no separate review pass.*
 
-Coach is told in their lifecycle-policy prompt block (see §13.4) to mark a task simple **only** when the change is small and well-bounded enough that self-audit is sufficient. If in doubt, Coach leaves it standard and assigns auditors.
+If at least one audit stage is configured, the reminder is omitted (a downstream reviewer is the gate).
 
-### 3.4 Compass auto-audit
+### 3.6 Workflow metadata
 
-Compass auto-audit fires on `commit_pushed` regardless of complexity (see [compass-specs.md §5.5](compass-specs.md)). Its verdict is **informational** — written to `tasks.compass_audit_verdict` + `tasks.compass_audit_report_path` for the card pip, never advancing or reverting a stage. The Player auditor (for standard tasks) is the gate.
+`tasks.workflow` is one of `code`, `research`, `writing`, `marketing`, `ops`, `generic`. It shapes prompt wording (e.g., "merge the PR" vs "publish the post"), but it does **not** drive routing — the trajectory is the only routing source.
+
+### 3.7 Tracking reason
+
+`tasks.tracking_reason` is optional informational metadata. The v0.2 enum requirement on Coach top-level tasks is removed in v0.3: every Coach delegation goes through kanban, so there is nothing to gate.
+
+### 3.8 Mid-flight reroute
+
+`coord_set_task_trajectory(task_id, trajectory)` (Coach-only) rewrites the trajectory while a task is in flight. Cannot remove a stage the task has already entered (e.g., you can't drop `execute` mid-execution). Removed-stage role rows are marked `superseded_by` the new corresponding row; added-stage rows are inserted fresh. Emits `task_trajectory_changed` event.
+
+`coord_assign_planner / auditor / shipper / task` are the per-stage candidate-list edits — they replace the `eligible_owners` of the trajectory's pre-existing role row for that stage, supersede the old row if it had `owner` set, and re-wake.
+
+### 3.9 Compass auto-audit
+
+Compass auto-audit fires on `commit_pushed` regardless of trajectory shape (see [compass-specs.md §5.5](compass-specs.md)). Its verdict is **informational** — written to `tasks.compass_audit_verdict` + `tasks.compass_audit_report_path` for the card pip, never advancing or reverting a stage. The assigned Player reviewer is the gate.
 
 ---
 
@@ -145,29 +213,31 @@ Compass auto-audit fires on `commit_pushed` regardless of complexity (see [compa
 ### 4.1 Strict separation
 
 - **Coach** plans (writes the spec) and delegates everything else. Coach never executes, audits, or merges.
-- **Players** execute, audit, and ship. Coach can also delegate planning to a Player via `coord_assign_planner`.
+- **Players** execute, review, and ship. Coach can also delegate planning to a Player via `coord_assign_planner`.
 
 ### 4.2 Role inventory
 
 | Role | Stage entered | Tool that completes the role |
 |---|---|---|
 | `planner` | plan | `coord_write_task_spec` (sets the row's `completed_at`) |
-| `executor` | execute | `coord_commit_push(task_id=...)` |
-| `auditor_syntax` | audit_syntax | `coord_submit_audit_report(kind='syntax', ...)` |
-| `auditor_semantics` | audit_semantics | `coord_submit_audit_report(kind='semantics', ...)` |
+| `executor` | execute | `coord_commit_push(task_id=...)` for code, or `coord_complete_execution(task_id=...)` for non-code artifacts |
+| `auditor_syntax` | audit_syntax / Formal Review | `coord_submit_audit_report(kind='syntax'|'formal', ...)` |
+| `auditor_semantics` | audit_semantics / Semantic Review | `coord_submit_audit_report(kind='semantics'|'semantic', ...)` |
 | `shipper` | ship | `coord_mark_shipped(task_id, note?)` |
 
 ### 4.3 Single-Player vs pool assignment
 
-`coord_assign_*` tools accept `to` as either a string (`'p3'` — hard-assign) or a comma-list (`'p1,p2,p3'` — pool). Pool-form leaves `tasks.owner` NULL until a Player calls `coord_claim_task`; all eligible Players are auto-woken at post time. Atomic UPDATE on claim ensures only one wins; losers' wakes see the row already claimed and degrade gracefully.
+`coord_assign_task` accepts `to` as either a string (`'p3'` — hard-assign) or a comma-list (`'p1,p2,p3'` — executor pool). Executor pool-form leaves `tasks.owner` NULL and keeps the task in `plan` until an eligible Player calls `coord_claim_task` or `coord_accept_role(role='executor')`; all eligible Players are called at post time. Atomic UPDATE on claim ensures only one wins; losers' wakes see the row already claimed and degrade gracefully.
 
-### 4.4 Auditor-equals-executor warning
+Planner / reviewer / shipper assignment tools also accept comma-list calls. For those roles the row stays `owner=NULL` until the first eligible Player calls `coord_accept_role(task_id, role)`. The completion tools still validate `owner = caller`, which is exactly what `coord_accept_role` sets. Future-stage rows are reservations only: they are not shown by `coord_my_assignments`, not woken by the idle poller, and not valid for completion until the card reaches the matching stage.
 
-`coord_assign_auditor` does **not** block the case where the auditor matches the executor. It emits an `audit_self_review_warning` event (rendered in Coach's pane and forwarded to Telegram) so the human can spot weak self-review patterns. Useful when the team is small or specialists are scarce; not desirable on big-stakes tasks.
+### 4.4 Reviewer-equals-executor warning
+
+`coord_assign_auditor` does **not** block the case where the reviewer matches the executor. It emits an `audit_self_review_warning` event (rendered in Coach's pane and forwarded to Telegram) so the human can spot weak self-review patterns. Useful when the team is small or specialists are scarce; not desirable on big-stakes tasks.
 
 ### 4.5 Idle-Player polling
 
-A periodic loop (default 5 min, see [server/idle_poller.py](server/idle_poller.py)) wakes idle Players who could be claiming pool work but aren't (e.g. their initial wake landed while they were over-cap; the harness was paused; the Player ignored the wake). See §10 for full design.
+A periodic loop (default 5 min, see [server/idle_poller.py](server/idle_poller.py)) wakes idle Players who have current-stage pool work or current-stage hard-assigned pending roles but are not currently running (e.g. their initial wake landed while they were over-cap; the harness was paused; the Player ignored the wake). Future-stage reservations are deliberately invisible. See §10 for full design.
 
 ---
 
@@ -181,17 +251,21 @@ Path: `/data/projects/<project_id>/working/tasks/<task_id>/spec.md`. Synchronous
 
 Helper: [server/tasks.py:write_task_spec](server/tasks.py).
 
-**Spec template** — `coord_write_task_spec` writes a starter when first called with no body, and accepts an explicit body otherwise. The starter shape:
+**Spec file shape** — `coord_write_task_spec` and `POST /api/tasks/{id}/spec` require a non-empty markdown body (max 40k chars). The helper prepends YAML frontmatter and then writes the body verbatim. Recommended body shape:
 
 ```markdown
-# <task title>
+---
+task_id: t-2026-05-03-abc12345
+title: <task title>
+created_by: human | coach | p3
+created_at: 2026-05-03T14:22:11Z
+priority: urgent | high | normal | low
+complexity: standard | simple
+spec_author: coach | p3
+spec_written_at: 2026-05-03T14:23:00Z
+---
 
-- **Task ID:** t-2026-05-03-abc12345
-- **Created by:** human | coach | p3
-- **Created at:** 2026-05-03 14:22:11 UTC
-- **Priority:** urgent | high | normal | low
-- **Complexity:** standard | simple
-- **Owner:** (assigned at execute time)
+# <task title>
 
 ## Goal
 <one or two sentences: what is this task trying to achieve>
@@ -216,6 +290,8 @@ The helper does **not** auto-merge with prior content — every write is a full 
 Player audit reports. Written by `coord_submit_audit_report`; one file per (round, kind). The latest is surfaced on the card; older rounds stay on disk for human review (and link from the card-expansion view).
 
 Path: `/data/projects/<project_id>/working/tasks/<task_id>/audits/audit_<round>_<kind>.md`. kDrive mirror at `TOT/projects/<project_id>/tasks/<task_id>/audits/...`.
+
+The helper prepends YAML frontmatter (`task_id`, `audit_kind`, `audit_round`, `auditor`, `verdict`, `submitted_at`) and writes the auditor's markdown body verbatim.
 
 The card surface fields are denormalized for cheap rendering:
 - `tasks.latest_audit_report_path`
@@ -268,7 +344,7 @@ Path-traversal defense: `task_id` is validated against `r"t-\d{4}-\d{2}-\d{2}-[a
 
 ### 5.5 Files-pane integration
 
-Cards render `[spec]`, `[audit (kind, round N)]`, and `[compass]` links via the existing `data-harness-path` mechanism (see [server/static/app.js](server/static/app.js)'s document-level click listener). Clicking opens the `__files` pane and longest-prefix-matches the absolute path against `/api/files/roots`.
+Cards render `[spec]`, `[audit (kind, verdict)]`, and `[compass]` links via the existing `data-harness-path` mechanism (see [server/static/app.js](server/static/app.js)'s document-level click listener). Clicking opens the `__files` pane and longest-prefix-matches the absolute path against `/api/files/roots`. Audit round is visible in the report filename and in the expansion/history rows, not in a stored `latest_audit_round` field.
 
 ---
 
@@ -280,12 +356,13 @@ All new tools are registered in [server/tools.py](server/tools.py)'s `_tools` ma
 
 | Tool | Params | Purpose |
 |---|---|---|
-| `coord_assign_planner` | `task_id, to` | Optional: delegate spec writing to a Player. Inserts a `planner` role assignment. Auto-wakes the Player(s). |
-| `coord_assign_task` | `task_id, to` | **Modified.** Hard-assign (`to='p3'`) or pool (`to='p1,p2'`). Inserts `executor` role assignment. Spec gate enforced for standard tasks. Auto-wake prompt is complexity-aware (simple tasks get the self-audit reminder verbatim). |
-| `coord_assign_auditor` | `task_id, to, kind` | `kind ∈ {'syntax', 'semantics'}`. Single or pool. Emits `audit_self_review_warning` if auditor == executor (does not block). |
-| `coord_assign_shipper` | `task_id, to` | Single or pool. Auto-wakes with merge prompt. |
-| `coord_set_task_complexity` | `task_id, complexity` | `'simple' | 'standard'`. Toggles the bypass. |
-| `coord_advance_task_stage` | `task_id, stage, note?` | Explicit override. Bypasses role-completion gate. |
+| `coord_set_task_trajectory` | `task_id, trajectory` | **New.** Mid-flight reroute. Validates against current stage (cannot drop a stage already entered); supersedes removed-stage role rows; inserts added-stage rows; emits `task_trajectory_changed`. |
+| `coord_assign_planner` | `task_id, to` | Edit the existing `planner` role row's `eligible_owners`. Hard-assign wakes the owner if the task is still in `plan`; pool-form calls candidates who must `coord_accept_role`. |
+| `coord_assign_task` | `task_id, to` | Edit the existing `executor` role row's `eligible_owners`. Spec gate enforced when `plan` is in the trajectory and `spec_path` is unset. Auto-wake prompt is trajectory-aware (executors with no audit stage configured get the self-audit reminder verbatim). |
+| `coord_assign_auditor` | `task_id, to, kind` | `kind ∈ {'formal'/'syntax', 'semantic'/'semantics'}`. Edits the matching auditor role row. Emits `audit_self_review_warning` if reviewer == executor. Future-stage reservations are not woken until active. |
+| `coord_assign_shipper` | `task_id, to` | Edits the `shipper` role row. Future-stage reservations wake only when the task enters `ship`. |
+| `coord_set_task_workflow` | `task_id, workflow?, tracking_reason?` | Sets the workflow / tracking-reason metadata. Routing has moved to trajectory; this tool no longer accepts review/ship knobs. |
+| `coord_advance_task_stage` | `task_id, stage, note?` | Explicit override. Bypasses the trajectory gate. |
 
 ### 6.2 Coach + planner + owner — spec authoring
 
@@ -297,10 +374,12 @@ All new tools are registered in [server/tools.py](server/tools.py)'s `_tools` ma
 
 | Tool | Params | Purpose |
 |---|---|---|
-| `coord_my_assignments` | (none) | Returns the caller's full plate in four buckets: active executor task / pending audits / pending ship / eligible pools. |
-| `coord_submit_audit_report` | `task_id, kind, body, verdict` | Validates active `auditor_<kind>` role for caller. Writes the audit `.md`, marks the role row complete with verdict, emits `audit_report_submitted`. |
-| `coord_mark_shipped` | `task_id, note?` | Validates active `shipper` role. Marks complete + emits `task_shipped`. |
-| `coord_claim_task` | `task_id` | **Modified.** Validates `eligible_owners` membership (or empty pool + plan stage). Atomic UPDATE. Sets `tasks.owner` + `claimed_at = started_at = now()`. |
+| `coord_my_assignments` | (none) | Returns only current actionable work: active executor task, pending planner/reviewer/shipper roles whose stage is active, and current-stage eligible pools. Future reservations are hidden. |
+| `coord_accept_role` | `task_id, role?` | Player answers a current-stage role call. Atomic first-claim wins; losers get a stale/already-accepted error. |
+| `coord_complete_execution` | `task_id, summary, artifact_path?, completion_kind?` | Non-git execution completion for research, writing, marketing, ops, or no-diff artifacts. Marks executor row complete and emits `task_execution_completed`. |
+| `coord_submit_audit_report` | `task_id, kind, body, verdict` | Validates active current-stage reviewer role for caller. Writes the review `.md`, marks the role row complete with verdict, emits `audit_report_submitted`. |
+| `coord_mark_shipped` | `task_id, note?` | Validates active current-stage `shipper` role. Marks complete + emits `task_shipped`. |
+| `coord_claim_task` | `task_id` | **Modified.** Executor-only claim path. Validates plan-stage task, standard-task spec gate, and executor-pool `eligible_owners` membership when an executor pool row exists. Atomic UPDATE. Sets `tasks.owner` + `claimed_at = started_at = now()` and claims/inserts the active executor role row. |
 
 ### 6.4 Owner + Coach
 
@@ -310,29 +389,37 @@ All new tools are registered in [server/tools.py](server/tools.py)'s `_tools` ma
 
 ### 6.5 Modified existing tools
 
-- `coord_create_task` accepts three new optional kwargs:
-  - `complexity` (default `'standard'`) — `'simple'` flips on the audit-bypass discipline.
-  - `spec` (markdown body) — when provided, writes `spec.md` in the same call so a standard task can land already-spec'd. Equivalent to a `coord_create_task` followed by `coord_write_task_spec` but atomic.
-  - `eligible_executors` (list of Player slots) — pre-populates the executor pool so a `coord_assign_task` is not strictly required for Players to discover the task via `coord_my_assignments`. Coach is still expected to call `coord_assign_task` when ready; the pre-pool just lowers the latency of "task exists; could you grab it" surfacing.
-- `coord_commit_push` accepts new optional `task_id`. When provided, the emitted `commit_pushed` event carries it; the kanban subscriber reads it and advances. Without `task_id`, behavior is unchanged (Compass auto-audit still fires regardless).
+- `coord_create_task` accepts `trajectory` (new in v0.3 — list of `{stage, to}` objects, validated by `_validate_trajectory()`), `workflow`, `tracking_reason` (now optional). The `complexity`, `required_reviews`, and `ship_required` params are **removed**. When `trajectory` is provided, the tool plants the matching `task_role_assignments` rows in the same transaction. The default trajectory when omitted is `[{"stage":"execute","to":[]}]` — Coach must follow up with the assign tools. The tool does **not** write `spec.md`; planner Players or the human do that.
+- `coord_commit_push` accepts optional `task_id`. When provided, it validates that the caller owns that active execute-stage task and has an uncompleted executor role row. On a successful push, or on explicit `push=false` local-only mode, the emitted `commit_pushed` event carries the `task_id` and the executor role row is marked complete. If `git push` was requested and fails, `task_id` is cleared from the event and the executor role remains open so the kanban cannot advance on an unpushed commit. Without `task_id`, behavior is unchanged (Compass auto-audit still fires regardless).
 - `coord_update_task` validates against the new transition map. Legacy aliases (`done` → `archive`, `cancelled` → `archive` + `cancelled_at`) are accepted for one release.
+
+### 6.6 Removed tools
+
+- `coord_set_task_complexity` — column gone, tool gone. Same routing decision is now expressed by passing or rewriting the trajectory.
 
 ---
 
 ## 7 · HTTP endpoints
 
-All under `/api/tasks/*`, gated by `HARNESS_TOKEN`.
+All under `/api/tasks` or `/api/tasks/*`, gated by `HARNESS_TOKEN`.
 
 | Method | Path | Purpose |
 |---|---|---|
+| GET | `/api/tasks` | Legacy/list view endpoint for tools and older UI paths. Optional `status` and `owner` filters; returns rows for the active project ordered newest-first. |
+| POST | `/api/tasks` | Human task composer. Body `{title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?}`. Creates a top-level or child task in `plan` with `created_by='human'`. The composer omits `trajectory` for default `[{"stage":"execute","to":[]}]`. |
 | GET | `/api/tasks/board` | Active 5 buckets (`plan` / `execute` / `audit_syntax` / `audit_semantics` / `ship`), priority-sorted then by `created_at`. Each card includes its active role-assignment list. **No archive.** |
 | GET | `/api/tasks/archive` | Paginated archive view. Query params: `limit` (default 50, max 200), `offset`, `q` (text search title + description), `include_cancelled` (default false). |
+| GET | `/api/tasks/flow_health` | **New.** Returns `{stages: {<stage>: {count, oldest_stage_change}}, stalled_count, subscriber_last_event_at, subscriber_alive}`. Lets the human inspect "is the engine actually moving" without scraping events. |
 | GET | `/api/tasks/{id}/assignments` | Full role-assignment history for one task (every row, not just active). Used by the card-expansion view to render the audit-loop history. |
 | POST | `/api/tasks/{id}/stage` | Body `{stage, note?, force?: bool}`. Human override. `force=true` bypasses the role-completion gate. |
-| POST | `/api/tasks/{id}/complexity` | Body `{complexity}`. |
+| POST | `/api/tasks/{id}/cancel` | Human cancellation. Idempotently moves any non-archive task to `archive`, sets `completed_at`, `archived_at`, `cancelled_at`, clears the owner's `current_task_id`, and emits both `task_stage_changed` and legacy `task_updated`. |
+| POST | `/api/tasks/{id}/trajectory` | **New.** Body `{trajectory}`. Human-side equivalent of `coord_set_task_trajectory`. |
+| POST | `/api/tasks/{id}/workflow` | Body `{workflow?, tracking_reason?}`. Routing has moved to the trajectory endpoint; this is metadata-only. |
 | POST | `/api/tasks/{id}/blocked` | Body `{blocked: bool, reason?}`. |
 | POST | `/api/tasks/{id}/spec` | Body `{body: <markdown>}`. Same effect as `coord_write_task_spec`. |
-| POST | `/api/tasks/{id}/assign` | Body `{role, to}`. Human-side equivalent of the Coach assignment tools. |
+| POST | `/api/tasks/{id}/assign` | Body `{role, to}` where `to` is a slot string or list of slot strings. Human-side equivalent of the Coach assignment tools; refuses archived tasks. For auditor roles, a new assignment supersedes prior completed failed rounds of the same kind. |
+
+**Removed**: `POST /api/tasks/{id}/complexity` (column gone). The `complexity` field on `POST /api/tasks` is also gone.
 
 ---
 
@@ -343,18 +430,28 @@ All published via the existing `EventBus` ([server/events.py](server/events.py))
 | Type | Payload |
 |---|---|
 | `task_stage_changed` | `{ts, agent_id, type, task_id, from, to, reason: 'commit_pushed'|'audit_pass'|'audit_fail'|'shipped'|'manual', note?, owner}` |
-| `task_complexity_set` | `{ts, agent_id, type, task_id, complexity, to: owner}` |
+| `task_trajectory_changed` | `{ts, agent_id, type, task_id, trajectory, to: owner}` |
 | `task_blocked_changed` | `{ts, agent_id, type, task_id, blocked, reason?, to: owner}` |
 | `task_spec_written` | `{ts, agent_id, type, task_id, spec_path, to: owner}` |
 | `task_role_assigned` | `{ts, agent_id, type, task_id, role, eligible_owners, owner?, to: owner}` |
-| `task_role_claimed` | `{ts, agent_id, type, task_id, role, owner, to: owner}` |
-| `task_claimed` | `{ts, agent_id, type, task_id, owner, to: owner}` — fired by `coord_claim_task` when a Player pulls a task into `execute`. Distinct from `task_role_claimed` (which fires for any role pool); `task_claimed` is the executor-specific signal kept for back-compat with consumers that pre-date the role-assignments table. |
-| `task_role_completed` | `{ts, agent_id, type, task_id, role, owner, completion_artifact?, to: owner}` |
+| `task_role_called` | `{ts, agent_id: 'system', type, task_id, role, owner?, eligible_owners, to?}` — fired when a stage becomes active and the reserved owner/candidates are woken. |
+| `task_role_claimed` | `{ts, agent_id, type, task_id, role, owner, to: owner}` — fired by `coord_accept_role` when a Player wins a role call. |
+| `task_claimed` | `{ts, agent_id, type, task_id}` — legacy executor-specific event fired by `coord_claim_task` and executor `coord_accept_role`. |
+| `task_role_completed` | `{ts, agent_id, type, task_id, role, owner, artifact_path?, verdict?, to: owner}` |
+| `task_execution_completed` | `{ts, agent_id, type, task_id, summary, artifact_path?, completion_kind?, to: executor}` |
+| `task_workflow_set` | `{ts, agent_id, type, task_id, workflow, tracking_reason?, to: owner}` |
 | `audit_report_submitted` | `{ts, agent_id, type, task_id, kind, verdict, report_path, round, auditor_id, to: <executor>}` |
 | `audit_self_review_warning` | `{ts, agent_id, type, task_id, kind, auditor_id, executor_id}` |
-| `audit_assignment_needed` | `{ts, agent_id: 'system', type, task_id, kind|role, to: 'coach'}` |
+| `audit_fail_notification` | `{ts, agent_id: 'system', type, task_id, kind, kind_round, escalate, auditor_id, executor_id, report_path, to: 'coach'}` — fired by the kanban subscriber on every audit fail, in addition to the executor revert. `kind_round` counts fails of this kind only. `escalate=True` when `kind_round >= 2` (Coach should intervene). |
+| `stage_assignment_needed` | `{ts, agent_id: 'system', type, task_id, role, stage, to: 'coach', owner?}` — fired when a stage becomes active and no active role row exists. Renamed from `audit_assignment_needed`; back-compat alias retained for one release. |
 | `task_shipped` | `{ts, agent_id, type, task_id, shipper_id, note?, to: <executor>}` |
+| `task_stage_stale` | `{ts, agent_id: 'system', type, task_id, stage, age_seconds, owner?, eligible_owners, to: 'coach'}` — fired by the stall sweeper when a non-archive task's `last_stage_change_at` exceeds `HARNESS_KANBAN_STALL_SECONDS`. |
 | `idle_player_woken` | `{ts, agent_id: <slot>, type, reason, task_id?}` |
+
+**Removed events**:
+- `task_complexity_set` — column gone, event gone.
+
+The existing `commit_pushed` event now has optional `task_id`, `pushed`, and `push_requested` fields. `task_id` is omitted/null when a requested push fails so the subscriber cannot advance a task whose commit never reached the remote; explicit `push=false` keeps `task_id`.
 
 The legacy `task_updated` event keeps firing for back-compat. `/api/events` SQL filter extended to fan-out the new types via the `payload_to` / `payload_owner` indexed branches.
 
@@ -368,14 +465,15 @@ The legacy `task_updated` event keeps firing for back-compat. `/api/events` SQL 
 
 | Event | Action |
 |---|---|
-| `commit_pushed` with `task_id`, complexity=standard, stage=execute | Advance to `audit_syntax`. Wake assigned syntax auditor; emit `audit_assignment_needed` if none assigned. |
-| `commit_pushed` with `task_id`, complexity=simple, stage=execute | Jump straight to `archive`. Set `archived_at = now`. Clear executor's `current_task_id`. |
-| `audit_report_submitted{kind=syntax, verdict=pass}` | Advance to `audit_semantics`. |
-| `audit_report_submitted{kind=syntax, verdict=fail}` | Revert to `execute`. Clear `started_at`. Update `latest_audit_*` fields. Re-wake executor with spec + latest report. |
-| `audit_report_submitted{kind=semantics, verdict=pass}` | Advance to `ship`. |
-| `audit_report_submitted{kind=semantics, verdict=fail}` | Revert to `execute` (same shape as syntax fail). |
-| `task_shipped` | Advance `ship → archive`. |
-| `compass_audit_logged` | Update `compass_audit_*` columns on the most-recently committed task with the matching sha. **No stage change.** |
+| `commit_pushed` with `task_id`, stage=execute | Route via `_next_stage(task, "execute")` — walks `tasks.trajectory` to find the next stage. If `execute` is the last entry, archives directly. |
+| `task_execution_completed`, stage=execute | Same route as `commit_pushed`, but for non-git artifacts. |
+| `task_stage_changed` entering a non-terminal stage | Stamp `last_stage_change_at = now()`. Wake the current-stage owner/candidates (`task_role_called`) or emit `stage_assignment_needed` to Coach if no active row exists. Future-stage reservations are activated here. |
+| `audit_report_submitted{verdict=pass}` | Route via `_next_stage(task, current_stage)`. |
+| `audit_report_submitted{verdict=fail}` | Revert to `execute` (always — independent of trajectory shape). Clear `started_at`. Re-wake executor with the **spec path AND latest audit report path** in the wake prompt body so they can read what failed without hunting. (`coord_submit_audit_report` already wrote `latest_audit_*` before emitting.) See §2.3 "Audit-fail loop guarantee" for full details. |
+| `task_shipped` | Advance `ship → archive` via `_next_stage(task, "ship")` (always archive since `ship` is canonical-last). |
+| `compass_audit_logged` | Best-effort update of `compass_audit_*` columns on the most-recently cached `commit_pushed` task. **No stage change.** |
+
+The subscriber records its `subscriber_last_event_at` (in-memory ISO timestamp) on every event it processes. Read by the `/api/tasks/flow_health` endpoint for "is the engine alive?" visibility.
 
 ### 9.2 Feature flag
 
@@ -387,7 +485,7 @@ Per-event `try/except` so a single bad row doesn't kill the loop. Unrecognized e
 
 ### 9.4 Compass independence
 
-The subscriber treats `compass_audit_logged` as informational. It writes `compass_audit_*` columns and triggers a `task_updated` for the live UI but never moves the task between stages. The Player auditor is the gate.
+The subscriber treats `compass_audit_logged` as informational. It writes `compass_audit_*` columns when it can correlate the event to a recent commit, but never moves the task between stages. The live kanban pane refreshes from the `compass_audit_logged` event itself; no separate `task_updated` event is emitted for this mirror write. The Player reviewer is the gate.
 
 ---
 
@@ -413,13 +511,41 @@ Tracked in `agents.last_idle_wake_at` (added by the kanban migration). NULL init
 For each (Player slot, sweep tick), skip if any of:
 - `agents.locked = 1`
 - `agents.current_task_id IS NOT NULL`
-- `agents.status = 'working'`
+- `agents.status ∈ {'working', 'waiting'}`
 - Player is over their daily cost cap
 - `last_idle_wake_at` within debounce window
 
 ### 10.4 Telemetry
 
 Emits `idle_player_woken` events with `reason ∈ {'pool_task_available', 'pending_role_assignment'}`.
+
+### 10.5 Stall sweeper
+
+Sibling pass in the same tick loop. After the per-Player wake checks, runs a single SQL pass to find tasks that haven't progressed:
+
+```sql
+SELECT id, status, last_stage_change_at, owner
+  FROM tasks
+ WHERE status NOT IN ('archive')
+   AND blocked = 0
+   AND (julianday('now') - julianday(last_stage_change_at)) * 86400.0
+       > :stall_threshold_seconds
+```
+
+Per-task once-per-threshold-crossing semantics: `tasks.stale_alert_at` records when we last alerted; we only re-alert if `last_stage_change_at` advanced since then OR the threshold has been exceeded by ≥ 24 h (long-stuck escalation).
+
+For each stalled row:
+
+1. Emit `task_stage_stale` event: `{task_id, stage, age_seconds, owner, eligible_owners, to: 'coach'}`.
+2. Update `tasks.stale_alert_at = now()`.
+3. If the stage has an `owner` Player, also call `maybe_wake_agent(owner, ...)` — the original wake might have been ignored or rejected; one more nudge before pinging Coach.
+
+Failure isolation: per-task try/except.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `HARNESS_KANBAN_STALL_ENABLED` | `true` | Master switch for the sweeper. |
+| `HARNESS_KANBAN_STALL_SECONDS` | `14400` | 4 h. Threshold beyond which a non-blocked, non-archive task is considered stalled. |
 
 ---
 
@@ -431,36 +557,49 @@ A CSS-drawn three-column-of-rectangles glyph (`.kanban-icon` in [server/static/s
 
 ### 11.2 Four active columns + Archive drawer
 
-Columns: **Plan / Execute / Audit / Ship**. Audit fuses `audit_syntax` + `audit_semantics` into one column; the per-card `kbn-stage-label` (e.g. `AUDIT-SYN`, `AUDIT-SEM`) preserves the sub-stage signal.
+Columns: **Plan / Execute / Review / Ship**. Review fuses `audit_syntax` + `audit_semantics` into one column; the per-card `kbn-stage-label` (`FORMAL`, `SEMANTIC`) preserves the sub-stage signal.
 
-Archive is **not** a column. It opens as an inline drawer above the columns via the toolbar's `Archive ▾` button. Drawer features: search, pagination (50 per page), `show cancelled` toggle.
+Archive is **not** a column. It opens as an inline drawer above the columns via the toolbar's `Archive ▾` button. Drawer features: search, pagination (50 per page), `show cancelled` toggle, client-side start/end date filters, and localStorage persistence for drawer/filter state (`tot-kanban-archive`).
+
+The pane header renders `Kanban` and the active project id as separate flex children under `.pane-head-label`; CSS keeps an 8px gap so labels like `Kanban dynamichypergraph` never collapse together.
 
 ### 11.3 Card content
 
 - **Title** (1–2 lines, truncated).
-- **Stage label** (`PLAN` / `EXECUTE` / `AUDIT-SYN` / `AUDIT-SEM` / `SHIP`) — kanban column conveys it visually, but the explicit per-card text is rendered so the stage stays unambiguous when the card is dragged or quoted out of context.
-- **Assignee avatar** for the Player driving the work at the current stage (plan → planner if delegated else "coach" chip; execute → executor; audit_* → matching auditor; ship → shipper). Avatar variants:
+- **Stage label** (`PLAN` / `EXECUTE` / `FORMAL` / `SEMANTIC` / `SHIP`) — kanban column conveys it visually, but the explicit per-card text is rendered so the stage stays unambiguous when the card is dragged or quoted out of context.
+- **Trajectory marker** (`.kbn-trajectory`) — short abbreviation strip rendered top-right or beneath the stage label. Each stage in `tasks.trajectory` is shown as a one- or two-letter token; the **current** stage is highlighted (bold + accent color), past stages are dimmed, future stages are normal-weight. Tokens:
+
+  | Stage | Marker |
+  |---|---|
+  | `plan` | `P` |
+  | `execute` | `E` |
+  | `audit_syntax` | `AY` |
+  | `audit_semantics` | `AE` |
+  | `ship` | `S` |
+
+  Examples: `[E]` for self-audit-only; `[P→E]` for plan-then-execute; `[P→E→AY→S]` for code-with-formal-review; `[P→E→AE→S]` for marketing-blog. The marker gives Coach + the human a glance-readable snapshot of "where this task is going" without expanding the card.
+- **Assignee avatar** for the Player driving the work at the current stage (plan → planner if delegated else "coach" chip; execute → executor; review → matching reviewer; ship → shipper). Future-stage reservations do not affect the current avatar or Player assignment queues.
   - **Hollow ring** — assigned, not yet started (`started_at IS NULL`).
-  - **Filled ring** — started.
-  - **Filled + pulse glow** — started AND the agent's `agents.status = 'working'` right now (live signal, not a stored flag).
+  - **Filled ring** — the active assignment row has `started_at` or `completed_at` set. On the active board this mainly appears for executor self-claims; hard-assigned planner/auditor/shipper rows do not currently get a separate "started" stamp before completion.
   - **`pool: N` chip** — stage's role is posted to a pool of N Players and not yet claimed.
-  - **Italic `unassigned` chip** — stage's role is needed but no row exists yet. Clickable; opens a quick-assign popover that POSTs to `/api/tasks/{id}/assign`.
+  - **Italic `unassigned` chip** — stage's role is needed but no row exists yet. Clickable; opens a quick-assign modal that POSTs to `/api/tasks/{id}/assign`.
   - **`coach` chip** — plan-stage tasks Coach is self-planning (no `planner` role assignment exists).
 
-  Clicking a populated avatar opens that Player's pane (existing `openSlots` + dispatch path).
+  Populated avatars are display-only in the shipped pane; opening a Player still happens from the LeftRail.
 - **Status flag** badge encoding orthogonal state:
   - `URGENT` (red) — `priority = 'urgent'`.
   - `BLOCKED` (red) — `tasks.blocked = 1`.
-  - `STALE` (amber) — active assignment hasn't progressed in `HARNESS_KANBAN_STALE_HOURS` hours (config; default 48).
   - Nothing when the card is progressing normally.
+  - If both urgent and blocked are true, `BLOCKED` wins because it is actionable.
 - **Markdown links** — single-click `data-harness-path` opens in the Files pane:
   - `[spec]` — `tasks.spec_path` (always shown when set).
-  - `[audit (kind, round N)]` — `tasks.latest_audit_report_path` (only when `latest_audit_*` is populated; the kind + round are part of the label so the human knows which audit they're opening).
-  - `[compass]` — `tasks.compass_audit_report_path` (informational; only shown in audit_semantics or after; muted color to signal "secondary").
-- **Complexity chip** (`SIMPLE` top-right) for simple-mode tasks; nothing for standard.
-- **Drift banner** (red bar) when the card is in `execute` post-audit-fail (driven by `latest_audit_verdict = 'fail'`).
+  - `[audit (kind, verdict)]` — `tasks.latest_audit_report_path` (only when `latest_audit_*` is populated; the round is inferred from the filename / role-history rows because no `latest_audit_round` column is stored).
+  - `[compass]` — `tasks.compass_audit_report_path` (informational; shown whenever the pointer is set).
+- **Drift banner** (red bar) when the card is in `execute` post-audit-fail (driven by `latest_audit_verdict = 'fail'`). The banner links to the latest audit report so Coach + the executor can see *why* the task was reverted at a glance.
 
-Clicking the card body (not a link) expands it inline. Expansion shows: full description, recent `task_stage_changed` events, and the full audit-round history rendered from `/api/tasks/{id}/assignments` (round 1 syntax fail → round 1 syntax pass → round 1 semantics fail → round 2 semantics pass → ship, etc.) with each round linking to its own `audit_<round>_<kind>.md`.
+The v0.2 `SIMPLE` complexity chip is removed — the trajectory marker (e.g., `[E]`) already encodes "no audit, archives on commit."
+
+Clicking the card body (not a link) expands it inline. Expansion shows: full description, task facts (`id`, created age, blocked reason), and the full role/audit history rendered from `/api/tasks/{id}/assignments`; rows with `report_path` link to their own `audit_<round>_<kind>.md`.
 
 Older audit reports (rounds before the current latest) live on disk + kDrive in the task's `audits/` folder. The card surfaces only the latest; the human browses older rounds via the expansion panel or directly in the Files pane.
 
@@ -508,25 +647,30 @@ CREATE TABLE task_role_assignments (
                     ('planner','executor','auditor_syntax','auditor_semantics','shipper')),
   eligible_owners TEXT NOT NULL DEFAULT '[]',
   owner           TEXT REFERENCES agents(id),
-  assigned_at     TEXT NOT NULL,
+  assigned_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
   claimed_at      TEXT,
   started_at      TEXT,
   completed_at    TEXT,
   report_path     TEXT,
-  verdict         TEXT CHECK(verdict IN ('pass','fail')),
+  verdict         TEXT CHECK(verdict IS NULL OR verdict IN ('pass','fail')),
   superseded_by   INTEGER REFERENCES task_role_assignments(id)
 );
 
 CREATE INDEX idx_role_assignments_task ON task_role_assignments(task_id);
 CREATE INDEX idx_role_assignments_owner ON task_role_assignments(owner);
 CREATE INDEX idx_role_assignments_role ON task_role_assignments(task_id, role);
+CREATE INDEX idx_role_assignments_active ON task_role_assignments(task_id, role, superseded_by, assigned_at);
 ```
 
 ### 12.2 New tasks columns
 
 | Column | Type | Default | Meaning |
 |---|---|---|---|
-| `complexity` | TEXT | `'standard'` | `'simple' | 'standard'` |
+| `trajectory` | TEXT JSON | `'[{"stage":"execute","to":[]}]'` | Ordered list of `{stage, to}` objects. Drives all routing. |
+| `last_stage_change_at` | TEXT | NULL | Stamped by the kanban subscriber on every transition. Drives the stall sweeper. |
+| `stale_alert_at` | TEXT | NULL | Stamped by the stall sweeper when it fires `task_stage_stale` for the task. Suppresses re-alerts until the task progresses or 24 h escalation kicks in. |
+| `workflow` | TEXT | `'generic'` | `code | research | writing | marketing | ops | generic` — prompt wording, not routing. |
+| `tracking_reason` | TEXT | NULL | Optional informational tag. No longer required, no longer enum-validated. |
 | `blocked` | INTEGER | `0` | Orthogonal flag |
 | `blocked_reason` | TEXT | NULL | Note when blocked=1 |
 | `cancelled_at` | TEXT | NULL | Set on cancellation path |
@@ -540,11 +684,13 @@ CREATE INDEX idx_role_assignments_role ON task_role_assignments(task_id, role);
 | `compass_audit_report_path` | TEXT | NULL | Informational Compass report pointer |
 | `compass_audit_verdict` | TEXT | NULL | Informational Compass verdict |
 
+**Removed in v0.3**: `complexity`, `required_reviews`, `ship_required`. All folded into `trajectory`.
+
 ### 12.3 Indexes
 
-`idx_tasks_status` (existing, on the new enum), `idx_tasks_complexity` (added by migration). Created in `_ensure_tasks_kanban_indexes` after the migration runs (CHECK constraints can't be ALTERed, so the index lives outside the table-rebuild block).
+`idx_tasks_status` (existing). The v0.2 `idx_tasks_complexity` is dropped along with the column. Created/updated in `_ensure_tasks_kanban_indexes` after the migration runs.
 
-### 12.4 Status enum migration
+### 12.4 Status enum migration (v0.1 → v0.2)
 
 Old → new:
 
@@ -561,6 +707,22 @@ Idempotent via `team_config['tasks_kanban_v1_migrated']` marker. Runs in `_rebui
 
 `crash_recover()` updated: zombie-reset condition is now `tasks.status = 'execute' AND owner_status = 'zombie'` (was `in_progress`). Owner is preserved.
 
+### 12.5 Trajectory migration (v0.2 → v0.3)
+
+For each pre-existing task row, derive `trajectory` from the deprecated triple `(complexity, required_reviews, ship_required)`:
+
+- `complexity = 'simple'` → `[{"stage":"execute","to":[<owner if any>]}]`
+- `complexity = 'standard'`:
+  - prepend `{"stage":"plan","to":<planner_owner from active task_role_assignments row, or []>}` if `spec_path IS NOT NULL`
+  - append `{"stage":"execute","to":<executor_owner or []>}`
+  - append `{"stage":"audit_syntax","to":<auditor_syntax_owner or []>}` if `'formal'` or `'syntax'` in `required_reviews`
+  - append `{"stage":"audit_semantics","to":<auditor_semantics_owner or []>}` if `'semantic'` or `'semantics'` in `required_reviews`
+  - append `{"stage":"ship","to":<shipper_owner or []>}` if `ship_required = 1`
+
+Backfill `last_stage_change_at` from the most recent `task_stage_changed` event in the event log; fall back to `claimed_at` or `created_at`.
+
+Drop the columns `complexity`, `required_reviews`, `ship_required`. Idempotent via `team_config['tasks_kanban_v3_migrated']` marker. Runs in `_rebuild_tasks_if_kanban_outdated` after the v0.1→v0.2 step has settled.
+
 ---
 
 ## 13 · CLAUDE.md kanban block
@@ -569,56 +731,22 @@ Idempotent via `team_config['tasks_kanban_v1_migrated']` marker. Runs in `_rebui
 
 ### 13.1 The paragraph
 
-Marker convention: `<!-- KANBAN-LIFECYCLE-START -->` / `<!-- KANBAN-LIFECYCLE-END -->`. Verbatim body that lands in every project's CLAUDE.md:
+Marker convention: `<!-- KANBAN-LIFECYCLE-START -->` / `<!-- KANBAN-LIFECYCLE-END -->`. The source constant in `server/tasks_claude_md.py` is canonical; this spec lists the required behavioral content instead of duplicating the full block:
 
-```markdown
-<!-- KANBAN-LIFECYCLE-START -->
-## Task lifecycle (kanban)
-
-Tasks flow through stages: **plan → execute → audit_syntax → audit_semantics → ship → archive**.
-Standard tasks traverse the full pipeline. Simple tasks (typos, log tweaks, one-line fixes)
-jump plan → execute → archive directly.
-
-Each task produces durable markdown artifacts under
-`/data/projects/<project_id>/working/tasks/<task_id>/`:
-- `spec.md` — the plan, written before execute (required for standard tasks; optional for simple)
-- `audits/audit_<round>_<kind>.md` — Player auditor reports (kind = syntax | semantics; one file per round)
-
-### Strict role boundaries
-
-- **Coach** plans (or delegates planning) and assigns Players to roles. Coach does NOT
-  execute, audit, or merge. Coach's task tools: `coord_write_task_spec`,
-  `coord_assign_planner`, `coord_assign_task` (executor; accepts a single Player slot or
-  a list-as-pool), `coord_assign_auditor` (kind=syntax|semantics), `coord_assign_shipper`,
-  `coord_set_task_complexity`, `coord_advance_task_stage`, `coord_set_task_blocked`.
-- **Players** execute, audit, and ship. The relevant tools:
-  - `coord_my_assignments` — call this any time you're not sure what to do; returns your
-    full plate (active executor task / pending audits / pending ship / eligible pools).
-  - `coord_claim_task(task_id)` — pull yourself into a posted pool task. First-claim wins.
-  - `coord_commit_push(task_id, message)` — pass `task_id` so the kanban auto-advances.
-  - `coord_submit_audit_report(task_id, kind, body, verdict)` — auditors submit pass/fail.
-  - `coord_mark_shipped(task_id)` — shipper calls after the merge lands.
-
-### Audit verdict routing
-
-Pass → next stage. Fail → reverts to execute; the spec + latest audit report attach to
-the task and the executor is auto-woken with both. Compass auto-audit fires informationally
-on every commit; the assigned Player auditor is the gate, not Compass.
-
-### Simple-task discipline
-
-When Coach marks a task simple, the executor SELF-AUDITS: run the relevant tests, sanity-check
-the change, then `coord_commit_push`. The board archives directly on commit; there is no
-separate audit pass. Coach should mark a task simple only when the change is small and
-well-bounded enough that self-audit is sufficient.
-<!-- KANBAN-LIFECYCLE-END -->
-```
+- every Coach delegation goes through kanban — no admission gate; conversational replies remain conversational;
+- stored stages with product labels: `audit_syntax` = formal review, `audit_semantics` = semantic review;
+- Coach defines the trajectory upfront on `coord_create_task` — an ordered list of `{stage, to}` objects;
+- if `plan` is in the trajectory, the executor cannot start until the planner's `coord_write_task_spec` lands;
+- if no audit stage is in the trajectory after `execute`, the executor self-audits before completion;
+- Players use `coord_accept_role` for current-stage calls, `coord_commit_push` for code, and `coord_complete_execution` for non-git artifacts;
+- future-stage reservations are hidden until the card reaches that stage;
+- pass walks the trajectory to the next stage, fail reverts to execute, and Compass remains informational.
 
 ### 13.2 inject_kanban_block flow
 
-`render_kanban_block()` returns the wrapped paragraph. `inject_kanban_block(project_id)` reads the project's CLAUDE.md, replaces the block between markers if present, otherwise appends it; writes back atomically + kDrive mirror. Idempotent (no-op when content matches). `inject_into_all_projects()` walks every project on boot.
+`render_kanban_block()` returns the wrapped paragraph. `inject_kanban_block(project_id)` reads the project's CLAUDE.md, replaces the block between markers if present, otherwise appends it; writes back + kDrive mirror. Idempotent (no-op when content matches). `inject_into_all_projects()` walks every non-archived project on boot.
 
-The block is also part of the harness-level **starter CLAUDE.md** used when a fresh project folder is provisioned. New projects pick it up via the same `render_kanban_block()` call so a freshly-created project has the lifecycle paragraph in its CLAUDE.md from turn 1 — no waiting for the next boot's `inject_into_all_projects` sweep to land it.
+The block is **not** baked into the static per-project starter template. The project scaffold writes the ordinary `CLAUDE.md` stub first; the kanban injector appends/replaces the marker block during the next harness boot's `inject_into_all_projects()` sweep. Existing projects therefore acquire or refresh the section by boot-time injection, not by template regeneration.
 
 ### 13.3 Why static + idempotent
 
@@ -626,91 +754,15 @@ The content is the same in every project — no per-project tailoring. Updates r
 
 ### 13.4 Coach lifecycle-policy prompt block
 
-In addition to the static CLAUDE.md block (which Coach reads alongside Players), Coach's per-turn system prompt gains a dynamic `## Task lifecycle policy` section assembled by `_build_coach_coordination_block` in [server/agents.py](server/agents.py). It's inserted after the open-tasks rollup and before the inbox / decisions / wiki summaries. Verbatim text:
+In addition to the static CLAUDE.md block (which Coach reads alongside Players), Coach's per-turn system prompt includes lifecycle policy assembled by `_build_coach_coordination_block` in [server/agents.py](server/agents.py). The policy must reinforce:
 
-```
-You coordinate; you do not execute. Your direct work is PLANNING (writing the
-spec) and DELEGATION (assigning Players to roles). Players do execution, audit,
-and ship.
+- Coach coordinates and does not execute/review/ship;
+- answer ordinary questions directly instead of creating kanban tasks;
+- create tracked tasks with `workflow`, `tracking_reason`, and review routing;
+- assign/call Players by current stage; future-stage reservations are allowed but inactive;
+- Players complete work with `coord_commit_push`, `coord_complete_execution`, `coord_submit_audit_report`, or `coord_mark_shipped` so the board flows event-by-event.
 
-Tasks flow: plan → execute → audit_syntax → audit_semantics → ship → archive.
-Standard complexity: full pipeline. Simple complexity: plan → execute → archive
-(no spec required, no audit or ship).
-
-PLAN: write the spec yourself with coord_write_task_spec, OR delegate by calling
-coord_assign_planner. Both flows are valid — use the planner role when a Player
-has more domain context than you, or when you want to keep your turn budget for
-coordination. Standard tasks cannot move to execute without a spec.
-
-SIMPLE-TASK DISCIPLINE: when you mark a task simple (skipping the formal audit
-stages), the executor SELF-AUDITS as part of execute. Tell them so in your
-assignment message: "self-audit your fix (run the relevant tests / sanity-check
-the change) before coord_commit_push, since this is simple-mode and the board
-archives directly on commit". Mark a task simple only when you trust the
-executor's self-audit on a small, well-bounded change. If in doubt, leave it
-standard and assign auditors.
-
-EXECUTE: assign with coord_assign_task. `to` accepts a single Player slot for
-hard-assign, OR a list of slots to post to a pool — the first eligible Player
-to call coord_claim_task wins. Use the pool form when several Players could do
-the work and you want first-free-claims.
-
-AUDIT: assign auditors with coord_assign_auditor (kind='syntax' or 'semantics').
-Auditors are Players too — same single-or-list shape. The tool warns if you
-assign the same Player who executed (weak self-review); decide whether that's
-acceptable for the task at hand. Auditors call coord_submit_audit_report with
-verdict='pass' or 'fail'. Pass → next stage. Fail → task reverts to execute,
-the executor is auto-woken with the spec + the latest audit report attached.
-
-SHIP: assign a shipper with coord_assign_shipper. They merge, then call
-coord_mark_shipped → task archives.
-
-Compass auto-audit fires on every commit_pushed — it's INFORMATIONAL, not the
-gate. The semantic auditor can read its report (linked from the card) as one
-input but their own verdict is what advances the task.
-
-You can force any transition with coord_advance_task_stage when role assignments
-stall. Mark a task simple with coord_set_task_complexity when it's a typo, log
-tweak, or genuinely minor bug fix.
-
-Always pass task_id to Players when assigning and remind them to include it in
-coord_commit_push / coord_submit_audit_report / coord_mark_shipped so the board
-auto-advances.
-
-Players can call coord_my_assignments at any time to see their full plate —
-active executor task, pending audits, pending ship, eligible pools. Idle
-Players are auto-polled every 5 minutes and woken if they could be claiming
-pool work — so don't worry about Players sitting on un-claimed pool tasks
-indefinitely; the poller will eventually pick it up. But hard-assigning is
-still faster when you have a specific Player in mind.
-```
-
-Coach's tool catalogue is also extended in this order so the prompt's tool list lines up with the policy block above:
-
-1. **Planning** — `coord_write_task_spec`, `coord_assign_planner`.
-2. **Execution** — `coord_assign_task` (modified — accepts a single slot or a comma-list pool).
-3. **Audit** — `coord_assign_auditor` (kind ∈ {syntax, semantics}).
-4. **Ship** — `coord_assign_shipper`.
-5. **Meta** — `coord_set_task_complexity`, `coord_advance_task_stage`, `coord_set_task_blocked`.
-
-### 13.5 Player system prompt addition
-
-Players' system prompt gets a short paragraph (kept tight to keep token cost low — the static CLAUDE.md block already carries the heavy content):
-
-```
-Tasks have stages and roles. You may have an executor, auditor, planner, or
-shipper assignment.
-
-Call coord_my_assignments at the start of any turn where you're not sure what to
-do — it returns your full plate.
-
-Pass task_id to coord_commit_push / coord_submit_audit_report / coord_mark_shipped
-so the kanban auto-advances.
-```
-
----
-
-## 14 · Telegram escalation hooks
+## 14 ? Telegram escalation hooks
 
 [server/telegram_escalation.py](server/telegram_escalation.py) gains formatters + key-extractors for three new event types:
 
@@ -728,13 +780,13 @@ Same web-active vs grace timing as the existing pending-question / pending-plan 
 
 ### 15.1 Why Compass is informational
 
-Two separate concerns: the Player auditor checks the **artifact against the spec** (does this code do what the task said?). Compass checks the **artifact against the lattice** (does this drift from the project's stated direction?). Both signals are useful but they're not the same thing — the task can be specced wrong, in which case a Compass drift verdict matters more than a syntax-pass; or the spec can be aligned but the implementation buggy, in which case the auditor is the right gate.
+Two separate concerns: the Player reviewer checks the **artifact against the spec** (does this artifact do what the task said?). Compass checks the **artifact against the lattice** (does this drift from the project's stated direction?). Both signals are useful but they're not the same thing — the task can be specced wrong, in which case a Compass drift verdict matters more than a formal pass; or the spec can be aligned but the implementation/artifact buggy, in which case the assigned reviewer is the right gate.
 
-Putting Compass on the gate would conflate the two. The kanban v1 keeps them separate: the Player auditor gates; Compass surfaces a pip on the card so the semantic auditor can read it as one input.
+Putting Compass on the gate would conflate the two. The kanban v1 keeps them separate: the Player reviewer gates; Compass surfaces a pip on the card so the semantic reviewer can read it as one input.
 
-### 15.2 How the semantic auditor uses Compass
+### 15.2 How the semantic reviewer uses Compass
 
-The auto-wake prompt for the semantic auditor includes the spec, the commit, and (when set) the path to `compass_audit_report_path`. The auditor reads it, factors it into their own verdict, and submits.
+The auto-wake prompt for the semantic reviewer includes the spec, the delivered artifact/commit, and (when set) the path to `compass_audit_report_path`. The reviewer reads it, factors it into their own verdict, and submits.
 
 ### 15.3 Drift escalation path
 
@@ -760,21 +812,106 @@ A full schema rollback is **not supported** in v1 — the migration drops the le
 
 ### 16.3 Cost considerations
 
-Every commit on a standard-complexity task triggers up to 2× Player audits (syntax then semantics) plus 1× Compass auto-audit. The audit prompts are bounded at ~16 KB per artifact body (see [compass-specs.md §5.5.2](compass-specs.md)) so cost stays predictable, but a project with 30 commits/day and a `latest_sonnet` audit budget will see meaningfully higher daily spend than the pre-kanban harness.
+Every code commit on a task with both audit stages can trigger up to 2× Player reviews (formal then semantic, depending on the trajectory) plus 1× Compass auto-audit. The review prompts are bounded at ~16 KB per artifact body (see [compass-specs.md §5.5.2](compass-specs.md)) so cost stays predictable, but a project with 30 commits/day and a `latest_sonnet` review budget will see meaningfully higher daily spend than the pre-kanban harness.
 
-Mitigations: mark genuinely-small tasks `simple` (skips both Player audits + ship); set `HARNESS_TEAM_DAILY_CAP` to a hard ceiling; disable `HARNESS_COMPASS_AUTO_AUDIT` on cost-constrained deploys.
+Mitigations: keep trajectories tight (omit audit stages for low-stakes work); use `[{"stage":"execute","to":[...]}]` self-audit shape for genuinely small changes; set `HARNESS_TEAM_DAILY_CAP` to a hard ceiling; disable `HARNESS_COMPASS_AUTO_AUDIT` on cost-constrained deploys.
 
 ### 16.4 What needs verification
 
 End-to-end on a deployed Zeabur instance:
 
-1. Standard task pipeline with hard-assigned roles (plan → execute → audit_syntax → audit_semantics → ship → archive).
-2. Standard task with multi-Player executor pool — race-safe `coord_claim_task`.
-3. Simple task — auto-wake prompt verbatim contains the self-audit instruction; `commit_pushed` jumps straight to archive.
+1. Full code-and-review pipeline with hard-assigned roles via inline `trajectory=[plan, execute, audit_syntax, ship]`.
+2. Pool-style trajectory with multiple candidates per stage — race-safe `coord_claim_task` / `coord_accept_role`.
+3. Self-audit-only trajectory `[{"stage":"execute","to":[...]}]` — auto-wake prompt contains the self-audit instruction; `commit_pushed` or `task_execution_completed` jumps straight to archive.
 4. Idle-Player polling — pool task posted while all eligible Players are over-cap; caps reset; poller wakes one within the next sweep.
-5. Audit fail loop — round 1 fail, round 2 pass; card shows only latest; `audits/` folder on disk has both rounds.
+5. Review fail loop — round 1 fail, round 2 pass; card shows only latest; `audits/` folder on disk has both rounds.
 6. Telegram escalation: `audit_fail` ping arrives on the phone after the configured grace period.
 7. CLAUDE.md kanban block injected on boot; surviving a manual edit + restart (idempotent re-injection).
+8. **Stall detection**: lock the executor of an in-flight task; after `HARNESS_KANBAN_STALL_SECONDS` the sweeper fires `task_stage_stale` and Coach's next prompt shows `## Stalled tasks`.
+9. **Flow health**: `GET /api/tasks/flow_health` returns expected shape; `subscriber_alive: false` after manually cancelling the lifespan task; UI footer goes red.
+
+---
+
+## 17 · Coach quality feedback
+
+There are **two distinct surfaces** for audit-fail signals:
+
+### 17.1 Per-fail bus notification (every fail)
+
+Every `audit_report_submitted{verdict='fail'}` causes the kanban subscriber to publish a sibling `audit_fail_notification` event routed to Coach (see §8). This event lands in Coach's pane and is forwarded to Telegram by the existing escalation watcher. **Coach sees every fail** — no silent fails — but is instructed (in the lifecycle-policy prompt block) to treat the **first** fail of any audit kind as normal correction noise and not act.
+
+### 17.2 Per-turn rollup (escalation only)
+
+The `## Active task health` section in Coach's coordination block (rendered by `_build_active_task_health_rows` in [server/agents.py](server/agents.py)) surfaces tasks **only** when the same audit kind has failed **two or more times** on the same task. The trigger is per-(task, kind), not per-task:
+
+**Trigger**: a task is non-archive AND there exists an audit kind `K ∈ {syntax, semantic}` such that the count of `task_role_assignments` rows for that task with `role = 'auditor_<K>'` AND `verdict = 'fail'` is ≥ 2.
+
+This matches the rule "expect first fail as normal; act on the second fail of the same kind."
+
+**Row contents**: `(task_id, title, executor_slot, executor_runtime, executor_model, executor_effort, kind, kind_fail_count, latest_round)`. Resolved by joining `tasks` to the active executor + counting fails per kind, then resolving the executor's runtime/model/effort via the existing helpers `_get_agent_runtime` / `_get_agent_model_override` / `_get_agent_effort_override` and role defaults.
+
+**Pointer**: each rollup ends with the explicit ladder:
+
+> If quality is the bottleneck (this is the 2nd fail of the same audit kind), bump the executor's effort first with `coord_set_player_effort(player_id, 'high'|'max')`, then model tier with `coord_set_player_model(player_id, 'latest_opus')`. Do **not** change runtime — that's a human decision. Read the executor's current settings via `coord_get_player_settings` before bumping so you don't re-set what's already correct.
+
+### 17.3 Why two surfaces
+
+Coach needs to **know** about every fail (visibility) but should **act** only on patterns (signal). The bus notification is the visibility layer; the rollup is the action layer. Without the visibility layer Coach is blind to single fails (which may still warrant a `coord_send_message` nudge or a clarifying question to the executor); without the action filter Coach over-reacts to normal first-correction cycles.
+
+The same ladder is in `MODEL_GUIDANCE` ([server/models_catalog.py](server/models_catalog.py)) — Coach reads it twice (once as policy, once as actionable signal) so the connection between symptom and remedy is unmistakable.
+
+---
+
+## 18 · Flow continuity & observability
+
+Three surfaces let the human (and Coach) answer "is the engine actually moving?"
+
+### 18.1 Stage-entry wake guarantees
+
+Every status transition stamps `tasks.last_stage_change_at = now()` in the same DB write as the status update. The subscriber then walks the next stage's role row:
+
+- Active row with `owner` set → wake that Player.
+- Active row with empty `owner` and non-empty `eligible_owners` → wake every eligible Player (pool call).
+- Active row with both `owner` and `eligible_owners` empty, OR no active row → emit `stage_assignment_needed` routed to Coach.
+
+Renamed from v0.2's `audit_assignment_needed` — the new event covers `plan` and `execute` too, not just audit/ship. The old name is retained as a back-compat alias for one release.
+
+### 18.2 Stall sweeper
+
+See §10.5. Sibling pass in `idle_poller.py`. Detects `last_stage_change_at` older than `HARNESS_KANBAN_STALL_SECONDS` (default 4 h). Emits `task_stage_stale` once per threshold-crossing (gated by `tasks.stale_alert_at`).
+
+### 18.3 Coach's `## Stalled tasks` rollup
+
+Sibling to `## Active task health` in `_build_coach_coordination_block`. Lists every task where `stale_alert_at IS NOT NULL` AND `last_stage_change_at = stale_alert_at` (i.e., still stalled, not yet progressed).
+
+Format: `- t-... "<title>" — stage <stage>, owner <slot|pool: N|unassigned>, stale for <hours>h`.
+
+Followed by the actionable pointer: "If a Player has gone silent, send them a `coord_send_message` nudge or reassign with `coord_assign_*`. If no one is assigned to this stage, fix the trajectory or use `coord_advance_task_stage` if you intended a different route."
+
+### 18.4 `GET /api/tasks/flow_health` endpoint
+
+Returns:
+
+```json
+{
+  "stages": {
+    "plan":            {"count": 3, "oldest_stage_change": "2026-05-04T08:12:01Z"},
+    "execute":         {"count": 5, "oldest_stage_change": "..."},
+    "audit_syntax":    {"count": 1, "oldest_stage_change": "..."},
+    "audit_semantics": {"count": 0, "oldest_stage_change": null},
+    "ship":            {"count": 2, "oldest_stage_change": "..."}
+  },
+  "stalled_count": 2,
+  "subscriber_last_event_at": "2026-05-04T11:05:33Z",
+  "subscriber_alive": true
+}
+```
+
+`subscriber_last_event_at` is recorded in module-level state by [server/kanban.py](server/kanban.py)'s consumer task on every event it processes (a single ISO timestamp written in-memory; not DB-persistent). `subscriber_alive` is `True` iff the lifespan task handle exists and is not `done()`.
+
+### 18.5 UI surface
+
+`.kanban-flow-health` strip at the bottom of [server/static/kanban.js](server/static/kanban.js) shows `Subscriber: alive · Stalled: 2 · Last event: 11:05:33`. Polls `/api/tasks/flow_health` every 30 s and refreshes on `task_stage_changed` / `task_stage_stale` events. Red tint when the subscriber is not alive or stalled count > 0.
 
 ---
 

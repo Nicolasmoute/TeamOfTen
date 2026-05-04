@@ -39,21 +39,33 @@ def _err_text(result: dict[str, Any]) -> str:
     return result["content"][0]["text"]
 
 
+_FULL_TRAJECTORY = (
+    '[{"stage":"plan","to":[]},'
+    '{"stage":"execute","to":[]},'
+    '{"stage":"audit_syntax","to":[]},'
+    '{"stage":"audit_semantics","to":[]},'
+    '{"stage":"ship","to":[]}]'
+)
+_BARE_TRAJECTORY = '[{"stage":"execute","to":[]}]'
+
+
 async def _seed_task(
     *,
     task_id: str = "t-2026-05-03-abc12345",
     status: str = "plan",
-    complexity: str = "standard",
+    trajectory: str | None = None,
     owner: str | None = None,
     spec_path: str | None = None,
 ) -> None:
+    if trajectory is None:
+        trajectory = _FULL_TRAJECTORY
     c = await configured_conn()
     try:
         await c.execute(
             "INSERT INTO tasks (id, project_id, title, status, owner, "
-            "created_by, complexity, spec_path) "
+            "created_by, trajectory, spec_path) "
             "VALUES (?, 'misc', 'demo', ?, ?, 'coach', ?, ?)",
-            (task_id, status, owner, complexity, spec_path),
+            (task_id, status, owner, trajectory, spec_path),
         )
         await c.commit()
     finally:
@@ -118,7 +130,7 @@ async def test_update_task_audit_syntax_to_audit_semantics_requires_pass_verdict
         "status": "audit_semantics",
     })
     msg = _err_text(result)
-    assert "syntax auditor" in msg
+    assert "formal reviewer" in msg
     assert "verdict='pass'" in msg
 
 
@@ -207,7 +219,7 @@ async def test_update_task_plan_to_execute_rejected_without_spec(
     fresh_db: str,
 ) -> None:
     await init_db()
-    await _seed_task(status="plan", complexity="standard", spec_path=None)
+    await _seed_task(status="plan", spec_path=None)
     await _insert_role_row(role="executor", owner="p3")
     server = _server_for("coach")
     result = await _handler(server, "update_task")({
@@ -224,7 +236,7 @@ async def test_update_task_plan_to_execute_rejected_without_executor(
 ) -> None:
     await init_db()
     await _seed_task(
-        status="plan", complexity="standard",
+        status="plan",
         spec_path="projects/misc/working/tasks/t-2026-05-03-abc12345/spec.md",
     )
     server = _server_for("coach")

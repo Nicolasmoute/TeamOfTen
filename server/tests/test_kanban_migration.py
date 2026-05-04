@@ -128,14 +128,18 @@ async def _seed_legacy_db(path: str) -> None:
 async def test_migration_maps_every_legacy_status(fresh_db: str) -> None:
     """Every legacy status value migrates to the right kanban stage +
     derived columns are populated correctly."""
+    import json as _json
+
     await _seed_legacy_db(dbmod.DB_PATH)
-    # init_db detects the legacy schema and runs the rebuild.
+    # init_db detects the legacy schema and runs both rebuilds (v0.1→v0.2
+    # and v0.2→v0.3).
     await init_db()
     c = await configured_conn()
     try:
         cur = await c.execute(
             "SELECT id, status, owner, started_at, archived_at, "
-            "cancelled_at, blocked, complexity FROM tasks ORDER BY id"
+            "cancelled_at, blocked, trajectory, last_stage_change_at "
+            "FROM tasks ORDER BY id"
         )
         rows = {dict(r)["id"]: dict(r) for r in await cur.fetchall()}
     finally:
@@ -173,9 +177,51 @@ async def test_migration_maps_every_legacy_status(fresh_db: str) -> None:
     assert rows["t-cancelled"]["cancelled_at"] == "2026-04-01T07:30:00Z"
     assert rows["t-cancelled"]["archived_at"] == "2026-04-01T07:30:00Z"
 
-    # Every row gets complexity='standard' as the migration default.
+    # Every row gets a non-null trajectory. The v0.1→v0.2 step seeds
+    # complexity='standard' + required_reviews=['formal','semantic'] +
+    # ship_required=1 for legacy rows; the v0.2→v0.3 step then derives
+    # the trajectory: no spec_path so no `plan` stage, then execute,
+    # audit_syntax, audit_semantics, ship.
     for row in rows.values():
-        assert row["complexity"] == "standard"
+        traj = _json.loads(row["trajectory"])
+        stages = [s["stage"] for s in traj]
+        assert stages == ["execute", "audit_syntax", "audit_semantics", "ship"]
+
+
+async def test_v3_marks_migrated(fresh_db: str) -> None:
+    """Fresh installs and post-migration boots stamp the v3 marker."""
+    await init_db()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT value FROM team_config "
+            "WHERE key = 'tasks_kanban_v3_migrated'"
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    assert row is not None
+    assert row[0] == "1"
+
+
+async def test_v3_drops_legacy_columns(fresh_db: str) -> None:
+    """Post-migration the dropped columns must not exist."""
+    await _seed_legacy_db(dbmod.DB_PATH)
+    await init_db()
+    c = await configured_conn()
+    try:
+        cur = await c.execute("PRAGMA table_info(tasks)")
+        cols = {dict(r)["name"] for r in await cur.fetchall()}
+    finally:
+        await c.close()
+    # v0.3 schema: trajectory replaces these
+    assert "complexity" not in cols
+    assert "required_reviews" not in cols
+    assert "ship_required" not in cols
+    # New v0.3 columns
+    assert "trajectory" in cols
+    assert "last_stage_change_at" in cols
+    assert "stale_alert_at" in cols
 
 
 async def test_migration_idempotent(fresh_db: str) -> None:

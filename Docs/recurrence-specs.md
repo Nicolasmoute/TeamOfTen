@@ -796,7 +796,7 @@ distinction matters for anyone editing either system.
 
 | Axis | Coach recurrences (this doc) | Compass auto-audit |
 |---|---|---|
-| **Trigger** | Wall clock (interval / cron) | Event bus (commit/decision/knowledge events) |
+| **Trigger** | Wall clock (interval / cron) | Event bus (`task_stage_changed{from=plan,to=execute}` — kanban plan-exit only) |
 | **Cardinality** | Per-project, persisted in `coach_recurrence` | Singleton background subscriber, not persisted |
 | **Subject** | Spawns a Coach turn (`run_agent`) | Calls `compass.audit.audit_work` (one-shot LLM call, no Coach session) |
 | **Cost cap** | Per-agent + team daily caps inside `agents._spawn_allowed` | Team daily cap inside the watcher itself, before the LLM call |

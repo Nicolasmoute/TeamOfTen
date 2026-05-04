@@ -145,12 +145,12 @@ def _spec_frontmatter(
     created_by: str,
     created_at: str,
     priority: str,
-    complexity: str,
     author: str,
     written_at: str,
 ) -> str:
     """YAML frontmatter for spec.md. Same shape as decisions so the
-    Files-pane preview renders consistently."""
+    Files-pane preview renders consistently. v0.3 dropped the
+    `complexity` field — routing lives on tasks.trajectory now."""
     return (
         f"---\n"
         f"task_id: {task_id}\n"
@@ -158,7 +158,6 @@ def _spec_frontmatter(
         f"created_by: {created_by}\n"
         f"created_at: {created_at}\n"
         f"priority: {priority}\n"
-        f"complexity: {complexity}\n"
         f"spec_author: {author}\n"
         f"spec_written_at: {written_at}\n"
         f"---\n\n"
@@ -196,7 +195,6 @@ async def write_task_spec(
     created_by: str,
     created_at: str,
     priority: str,
-    complexity: str,
 ) -> tuple[Path, str, str]:
     """Write the task's spec.md atomically + mirror to kDrive.
 
@@ -218,7 +216,6 @@ async def write_task_spec(
         created_by=created_by,
         created_at=created_at,
         priority=priority,
-        complexity=complexity,
         author=author,
         written_at=written_at,
     )

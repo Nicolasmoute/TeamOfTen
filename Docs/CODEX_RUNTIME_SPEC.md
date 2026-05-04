@@ -997,8 +997,11 @@ Explicit `packages = [...]` would silently miss the subpackage.
 
 ### I.4 Dockerfile
 `ENV CODEX_HOME=/data/codex`. `npm install -g @openai/codex` for the
-Codex CLI. Build smoke-tests `codex app-server --help` to fail fast
-on install breakage.
+Codex CLI. Install the OS `bubblewrap` package alongside the shell
+tooling; Codex's sandbox expects `bwrap` on `PATH`, and relying on the
+vendored fallback has produced stdio transport exits in hosted Linux
+containers. Build smoke-tests `bwrap --version` and
+`codex app-server --help` to fail fast on install breakage.
 
 ---
 

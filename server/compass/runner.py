@@ -33,12 +33,12 @@ from server.compass.pipeline import (
     briefing as pl_briefing,
     claude_md as pl_claude_md,
     digest as pl_digest,
+    intent_derive as pl_intent_derive,
     questions as pl_questions,
     reconciliation as pl_reconciliation,
     regions as pl_regions,
     reviews as pl_reviews,
     truth_check as pl_truth_check,
-    truth_derive as pl_truth_derive,
 )
 from server.compass.store import Question, RunLog, Statement
 
@@ -169,26 +169,30 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
     #    Hash is persisted at the END of Stage 0 so a partial failure
     #    doesn't mark the corpus "considered" and skip the next run.
     # ============================================================
-    truth_hash = pl_truth_derive.truth_corpus_hash(state.truth)
+    truth_hash = pl_intent_derive.corpus_hash(state.truth)
     last_hash = await _read_team_config(_truth_hash_key(project_id))
     corpus_changed = truth_hash != last_hash
-    has_truth_grounded = any(
-        s.created_by == "compass-truth" for s in state.statements
+    # Pre-2026-05-04 rows use the legacy `compass-truth` tag; post-refocus
+    # rows use `compass-intent`. Either tag counts as "we've already
+    # derived from this corpus before" for the should-derive gate.
+    has_corpus_grounded = any(
+        s.created_by in ("compass-truth", "compass-intent")
+        for s in state.statements
     )
     pre_derive_statement_count = len(state.statements)
     stage_0_ok = True
 
-    # ---------- 0a: Truth-derive ----------
-    should_derive = bool(state.truth) and (corpus_changed or not has_truth_grounded)
+    # ---------- 0a: Intent-derive ----------
+    should_derive = bool(state.truth) and (corpus_changed or not has_corpus_grounded)
     if should_derive:
         await _emit_phase(
-            project_id, run_id, "truth_derive",
+            project_id, run_id, "intent_derive",
             truth_files=len(state.truth),
         )
         try:
-            td_res = await pl_truth_derive.derive_from_truth(state)
+            td_res = await pl_intent_derive.derive_from_corpus(state)
         except Exception:
-            logger.exception("compass.runner: truth_derive raised")
+            logger.exception("compass.runner: intent_derive raised")
             td_res = None
             stage_0_ok = False
         if td_res and td_res.statements:
@@ -201,19 +205,19 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
                     id=sid,
                     text=proposal["text"],
                     region=proposal["region"],
-                    weight=pl_truth_derive.TRUTH_DERIVED_WEIGHT,
+                    weight=pl_intent_derive.INTENT_DERIVED_WEIGHT,
                     created_at=now,
-                    created_by="compass-truth",
+                    created_by=pl_intent_derive.INTENT_DERIVED_CREATED_BY,
                     history=[{
                         "run_id": run_id,
                         "delta": 0.0,
-                        "rationale": proposal.get("rationale") or "derived from truth",
-                        "source": "truth_derive",
+                        "rationale": proposal.get("rationale") or "derived from corpus",
+                        "source": "intent_derive",
                     }],
                 )
                 state.statements.append(stmt)
                 added.append(stmt)
-            log.notes.append(f"truth_derive: {len(added)} new statement(s)")
+            log.notes.append(f"intent_derive: {len(added)} new statement(s)")
             if added:
                 await store.save_lattice(project_id, state.statements)
                 await store.save_regions(
@@ -228,11 +232,11 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
                     "run_id": run_id,
                 })
     elif not state.truth:
-        log.notes.append("truth_derive: skipped (truth/ folder empty)")
+        log.notes.append("intent_derive: skipped (corpus empty)")
 
     # ---------- 0b: Reconciliation ----------
     # Run when: corpus changed AND there was something in the lattice
-    # BEFORE truth-derive (so Stage 0a's brand-new rows aren't flagged
+    # BEFORE intent-derive (so Stage 0a's brand-new rows aren't flagged
     # as conflicting with the corpus they came from). Also bump
     # pending_runs on existing proposals + drop expired ones each run
     # — same treatment as settle/stale/dupe.
@@ -441,7 +445,7 @@ async def _run_locked(project_id: str, mode: str) -> dict[str, Any]:
     # Ingest mode early-exit. The user clicked Ingest specifically to
     # process pending answered questions; we DON'T want to also pull
     # passive-digest noise, run reviews, or generate fresh questions.
-    # Stage 0 (truth-derive + reconciliation) is already done above
+    # Stage 0 (intent-derive + reconciliation) is already done above
     # because it's idempotent and the corpus may have shifted; Stage 1
     # (answer digest) is the main reason the user clicked. Everything
     # else waits for the next full run.

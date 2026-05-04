@@ -22,12 +22,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # and api.anthropic.com is reachable from the same regions, so npm install
 # followed by `claude /login` device-code flow works at runtime.
 # git is needed so Player agents can commit/push their work via Bash, and
-# so M4 worktree provisioning works.
+# so M4 worktree provisioning works. bubblewrap is required by Codex's
+# sandbox layer; without it, app-server falls back to a vendored binary and
+# can terminate the stdio transport on sandboxed turns.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates git ripgrep \
+    && apt-get install -y --no-install-recommends curl ca-certificates git ripgrep bubblewrap \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm install -g @anthropic-ai/claude-code @openai/codex \
+    && bwrap --version > /dev/null \
     && codex app-server --help > /dev/null \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*

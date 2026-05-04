@@ -95,7 +95,11 @@ class Statement:
     region: str
     weight: float
     created_at: str
-    created_by: str = "compass"  # "compass" | "human"
+    # Provenance tag: "compass" (passive/answer digest), "human"
+    # (manual lattice add), "compass-intent" (Stage 0a intent-derive +
+    # reconciliation replace, post 2026-05-04 refocus), or
+    # "compass-truth" (legacy — pre-refocus Stage 0a).
+    created_by: str = "compass"
     history: list[dict[str, Any]] = field(default_factory=list)
     archived: bool = False
     archived_at: str | None = None
@@ -971,7 +975,7 @@ async def read_project_meta(project_id: str) -> dict[str, str]:
     `<project>/truth/*.md`), not a steering layer. The human's
     authored objectives are vetted source-of-truth-like documents
     and Compass treats them with the same authority as the truth/
-    folder — they drive truth-derive (lattice seeding) and
+    folder — they drive intent-derive (lattice seeding) and
     truth-check (contradiction detection).
 
     Returns `{"id": project_id}` on DB error or missing row — prompts

@@ -1,40 +1,47 @@
-"""Compass audit watcher — auto-fires `compass_audit` on artifact events.
+"""Compass audit watcher — auto-fires `compass_audit` on kanban plan exits.
 
-The §5 spec puts Coach in charge of calling `compass_audit(artifact)`
-"whenever a worker produces a meaningful unit of work". In practice
-Coach forgets, and the only fall-back was the dashboard's manual
-paste UI — which is the wrong path (humans don't produce the
-artifacts, agents do). This subscriber closes the loop: it watches
-the event bus for the four artifact events the harness already
-publishes — `commit_pushed`, `decision_written`, `knowledge_written`,
-and `output_saved` — and calls `audit.audit_work` for each one,
-without any human or Coach action.
+Compass is a COMPASS OF INTENT — its job is to check that a task's
+PLAN aligns with the project's intent (the lattice + corpus). The
+kanban v0.3 lifecycle (Docs/kanban-specs.md) already runs syntactic +
+semantic Player audits and shipper review on every stage transition;
+those check that EXECUTION aligns with the plan. Compass sits one
+layer up: the upstream check that the plan even pursues the right
+direction.
 
-`output_saved` events get richer treatment than the other three
-(Tier B per compass-specs §5.5.2): the watcher reads the saved file's
-body via `output_extractor` for text-native and office formats and
-folds the extracted text into the audit artifact. Images and unknown
-formats fall back to a path-only header. This matters because
-binary deliverables are what the human consumes — auditing only
-their path is a false economy on the highest-stakes lane.
+So this watcher subscribes to a single event family — `task_stage_changed`
+— and acts only on the `from='plan' to='execute'` transition: the
+moment a planner has finished writing spec.md and the executor is
+about to start. We read the spec body, hand it to `audit_work` along
+with the task's title + trajectory, and let the audit verdict surface
+to coach (or queue a question for the human on uncertain drift).
+
+Pre-2026-05-04 design (deprecated): the watcher fired on every
+`commit_pushed` / `decision_written` / `knowledge_written` /
+`output_saved` event, auditing each artifact against the lattice.
+That was duplicative — kanban's own auditor stages already check
+execution alignment with the plan, so Compass was double-paying for
+downstream review. The refocus moved Compass upstream: one strategic
+check per task plan, only when there's a plan stage to check.
 
 Design constraints:
   - **Project-scoped, not actor-scoped.** Each event carries a
     `project_id` (auto-stamped by `EventBus.publish`); the watcher
     audits that project regardless of which project is currently
     active in the UI. So an inactive project still gets audited when
-    its commits land, matching the scheduler's "iterate all projects"
-    rule. We don't audit when Compass is disabled for the event's
-    project (`compass_enabled_<id>` flag).
+    its plan exits land. We don't audit when Compass is disabled
+    for the event's project (`compass_enabled_<id>` flag).
   - **Cost-gated.** Auto-audits respect the team daily cap
     (`HARNESS_TEAM_DAILY_CAP`) and the per-project enable flag.
     `audit_work` itself doesn't gate on cost (the only prior caller
     was Coach via MCP, which already saw the cap in its own prompts).
-    We add the gate here so a busy commit day doesn't blow the budget.
-  - **Debounced.** A burst of commits on the same slot in the same
-    project shouldn't fan out to N parallel audits — that's
-    expensive and the verdicts would all read against the same
-    lattice anyway. Debounce window is per-(project, agent, type).
+  - **Trajectory gate.** The watcher reads the task row and skips
+    when `trajectory` doesn't include a `plan` stage. By construction
+    a `from='plan'` transition can only happen on tasks with a plan
+    stage, but the guard is cheap and protects against future
+    trajectory-shape changes.
+  - **Debounced per task.** Debounce key is `(project, task_id)` —
+    one plan-audit per task ever in the natural flow. Window stays
+    at 30s; effectively a one-shot guard against weird re-emits.
   - **Fire-and-forget.** The watcher pushes audit_work onto a
     background task so a slow LLM call doesn't backpressure the bus.
     Audit failures are logged and dropped — never block the
@@ -43,16 +50,16 @@ Design constraints:
     the watcher entirely (e.g. for cost-constrained deploys that
     only want manual audits via the MCP tool).
 
-The dashboard's manual paste UI is removed in the same change —
-audits are now driven by events; the audit log is read-only on the
-human's side, matching §5.3 ("the human reads the log when curious").
-The `POST /api/compass/audit` HTTP endpoint is kept as a debug
+The dashboard's manual paste UI was removed earlier — audits are
+event-driven, the audit log is read-only on the human's side.
+The `POST /api/compass/audit` HTTP endpoint stays as a debug
 backstop (curl-able for testing) but is not surfaced in the UI.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 import time
@@ -71,19 +78,21 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-# Event types that represent "a meaningful unit of work" worth auditing.
-# Keep this list tight — every entry costs an LLM call per event burst.
+# Single event type. Compass audits the PLAN of a kanban task — the
+# upstream check. Kanban's own auditor stages handle execution-vs-plan
+# downstream.
 WATCHED_EVENT_TYPES: frozenset[str] = frozenset({
-    "commit_pushed",
-    "decision_written",
-    "knowledge_written",
-    # `output_saved` audits binary deliverables (Tier B per
-    # compass-specs §5.5). The artifact composer reads the file body
-    # via `output_extractor` for office/text formats and falls back to
-    # path-only for images. Outputs are infrequent but high-stakes —
-    # they're what the human consumes, so a real review pays for itself.
-    "output_saved",
+    "task_stage_changed",
 })
+
+
+# Cap on the artifact text we shove into the audit prompt. Plan specs
+# are typically a few hundred to a few thousand chars; ~16k char body
+# room (matching output_extractor.MAX_BODY_CHARS) plus header is enough
+# headroom for any reasonable plan. Larger specs get truncated with a
+# marker.
+_PLAN_BODY_MAX = 16_000
+_ARTIFACT_TRUNCATE = 18_000
 
 
 # ---------------------------------------------------------------- state
@@ -92,9 +101,9 @@ WATCHED_EVENT_TYPES: frozenset[str] = frozenset({
 # Module-level lifecycle handles, mirroring the telegram bridge pattern.
 _current_task: asyncio.Task[None] | None = None
 _stopping = False
-# Per-(project, agent, type) timestamp of the last audit fired. Read +
+# Per-(project, task_id) timestamp of the last audit fired. Read +
 # written from the bus-consumer task only, so no lock needed.
-_last_fire: dict[tuple[str, str, str], float] = {}
+_last_fire: dict[tuple[str, str], float] = {}
 
 
 def is_running() -> bool:
@@ -180,15 +189,44 @@ async def _handle_event(ev: dict[str, Any]) -> None:
     etype = ev.get("type") or ""
     if etype not in WATCHED_EVENT_TYPES:
         return
-    project_id = (ev.get("project_id") or "").strip()
-    if not project_id:
+
+    # Only the plan→execute transition is a Compass-relevant event.
+    # Any other stage change is execution-side, handled by kanban's
+    # own auditors / shipper.
+    if (ev.get("from") or "") != "plan" or (ev.get("to") or "") != "execute":
         return
-    agent_id = (ev.get("agent_id") or "").strip() or "system"
+
+    task_id = (ev.get("task_id") or "").strip()
+    if not task_id:
+        return
+    project_id = (ev.get("project_id") or "").strip()
+
+    if not project_id:
+        # Defensive: kanban transitions normally carry project_id, but
+        # we look it up from the task row anyway in case a future emit
+        # path skips the auto-stamp.
+        task = await _fetch_task(task_id)
+        if task is None:
+            return
+        project_id = task.get("project_id") or ""
+        if not project_id:
+            return
+    else:
+        task = await _fetch_task(task_id)
+        if task is None:
+            return
 
     if not await _is_compass_enabled(project_id):
         return
 
-    if not _debounce_ok(project_id, agent_id, etype):
+    # Trajectory gate: only audit when the task's trajectory actually
+    # has a plan stage. By construction this is always true for a
+    # from='plan' transition, but the guard is cheap and future-proofs
+    # against trajectory-shape changes.
+    if "plan" not in _trajectory_stages(task):
+        return
+
+    if not _debounce_ok(project_id, task_id):
         return
 
     # Cost gate — read live so a deploy bumping the cap mid-day takes
@@ -198,17 +236,17 @@ async def _handle_event(ev: dict[str, Any]) -> None:
     if not await _within_cost_cap():
         return
 
-    artifact = _compose_artifact(ev)
+    artifact = _compose_plan_artifact(task)
     if not artifact:
         return
 
     asyncio.create_task(
-        _safe_audit(project_id, artifact, etype),
-        name=f"compass.audit_watcher.fire:{etype}:{project_id}:{agent_id}",
+        _safe_audit(project_id, artifact, task_id),
+        name=f"compass.audit_watcher.fire:plan:{project_id}:{task_id}",
     )
 
 
-async def _safe_audit(project_id: str, artifact: str, etype: str) -> None:
+async def _safe_audit(project_id: str, artifact: str, task_id: str) -> None:
     """Run audit_work in a background task and never raise.
 
     `audit_work` itself catches LLM errors and degrades to an
@@ -219,23 +257,24 @@ async def _safe_audit(project_id: str, artifact: str, etype: str) -> None:
         await cmp_audit.audit_work(project_id, artifact)
     except Exception:
         logger.exception(
-            "compass.audit_watcher: audit_work failed (project=%s, src=%s)",
-            project_id, etype,
+            "compass.audit_watcher: audit_work failed (project=%s, task=%s)",
+            project_id, task_id,
         )
 
 
 # --------------------------------------------------------- predicates
 
 
-def _debounce_ok(project_id: str, agent_id: str, etype: str) -> bool:
+def _debounce_ok(project_id: str, task_id: str) -> bool:
     """Return True if enough time has passed since the last fire for
-    this (project, agent, event_type) tuple. Updates the timestamp on
-    success.
+    this (project, task_id) tuple. Updates the timestamp on success.
+    Window irrelevant in steady state — plan→execute fires once per
+    task by construction; debounce just guards against weird re-emits.
     """
     window = config.AUTO_AUDIT_DEBOUNCE_SECONDS
     if window <= 0:
         return True
-    key = (project_id, agent_id, etype)
+    key = (project_id, task_id)
     now = time.monotonic()
     last = _last_fire.get(key, 0.0)
     if now - last < window:
@@ -286,102 +325,144 @@ async def _within_cost_cap() -> bool:
     return spent < TEAM_DAILY_CAP_USD
 
 
+# --------------------------------------------------------- task lookup
+
+
+async def _fetch_task(task_id: str) -> dict[str, Any] | None:
+    """Read the task row needed to compose a plan artifact. Returns
+    None if the task doesn't exist (already deleted, race) — the
+    handler then drops the event silently.
+    """
+    from server.db import configured_conn  # noqa: PLC0415
+
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id, project_id, title, description, trajectory, "
+                "spec_path FROM tasks WHERE id = ?",
+                (task_id,),
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception(
+            "compass.audit_watcher: task lookup failed for %s", task_id,
+        )
+        return None
+    if not row:
+        return None
+    return dict(row)
+
+
+def _trajectory_stages(task: dict[str, Any]) -> list[str]:
+    """Mirror of `kanban._trajectory_stages` — kept local to avoid an
+    import cycle (kanban imports from compass elsewhere). Returns the
+    ordered list of stage names from the task's trajectory column."""
+    raw = task.get("trajectory")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    out: list[str] = []
+    for entry in parsed:
+        if isinstance(entry, dict):
+            stage = str(entry.get("stage", ""))
+            if stage:
+                out.append(stage)
+    return out
+
+
 # --------------------------------------------------------- artifact prep
 
 
-# Cap on the artifact text we shove into the audit prompt for short-
-# header artifacts (commit / decision / knowledge / output-metadata
-# only). Long commit bodies and decision documents are common; the
-# audit verdict only needs the gist. Keeps prompts cheap and
-# predictable.
-_ARTIFACT_TRUNCATE = 4000
+def _compose_plan_artifact(task: dict[str, Any]) -> str:
+    """Render a one-shot plan artifact for the audit prompt.
 
-# Cap for body-included output artifacts. Higher than `_ARTIFACT_TRUNCATE`
-# because we deliberately fold extracted document text in — but still
-# bounded so a 200-page PDF can't blow up the prompt. The extractor
-# does its own per-format truncation at MAX_BODY_CHARS; this is the
-# final outer cap that includes the metadata header + body.
-_OUTPUT_ARTIFACT_TRUNCATE = 18_000
+    Shape:
+        [task-plan] task <id>: <title>
 
+        Trajectory: stage1 → stage2 → stage3
 
-def _compose_artifact(ev: dict[str, Any]) -> str:
-    """Render a one-shot artifact string for the audit prompt.
+        --- spec ---
+        <spec.md body, truncated>
 
-    Each event type has its own shape; the helper normalizes them into
-    a short, self-describing blob so the audit prompt has enough to
-    reason about without needing the full DB context.
+    When spec.md is missing or unreadable we still fire the audit with
+    a header-only artifact — the title + trajectory alone gives the
+    auditor signal about whether the task pursues the right direction.
+    spec.md may be absent on tasks that genuinely skipped the plan
+    stage (shouldn't happen — we already gated on trajectory having
+    'plan' — but defensive).
     """
-    etype = ev.get("type") or ""
-    actor = (ev.get("agent_id") or "system").strip()
-    if etype == "commit_pushed":
-        sha = (ev.get("sha") or "?").strip()
-        message = (ev.get("message") or "").strip()
-        pushed = "pushed" if ev.get("pushed") else "local-only"
-        return _truncate(
-            f"[commit] {actor} {pushed} {sha}\n\n{message}"
-        )
-    if etype == "decision_written":
-        title = (ev.get("title") or "").strip()
-        size = ev.get("size") or 0
-        # Decision body isn't on the event payload (only title + size)
-        # — that's by design; reading the file would couple this module
-        # to the decisions storage layer. Title is usually informative
-        # enough for an audit verdict; if Coach wants deeper reasoning
-        # they call `compass_audit` directly with the body.
-        return _truncate(
-            f"[decision] {actor} wrote: {title} ({size} chars)"
-        )
-    if etype == "knowledge_written":
-        path = (ev.get("path") or "").strip()
-        size = ev.get("size") or 0
-        return _truncate(
-            f"[knowledge] {actor} saved knowledge[{path}] ({size} chars)"
-        )
-    if etype == "output_saved":
-        return _compose_output_artifact(ev, actor)
-    return ""
+    task_id = (task.get("id") or "").strip()
+    title = (task.get("title") or "").strip() or "(no title)"
+    trajectory = _trajectory_stages(task)
+    trajectory_str = " → ".join(trajectory) if trajectory else "(unknown)"
+
+    head = f"[task-plan] task {task_id}: {title}\n\nTrajectory: {trajectory_str}"
+
+    body = _read_spec_body(task)
+    if body:
+        artifact = f"{head}\n\n--- spec ---\n{body}"
+    else:
+        # No spec body — include description as a fallback so the
+        # auditor isn't reading title alone. Description is set on
+        # task creation and usually has the gist.
+        desc = (task.get("description") or "").strip()
+        if desc:
+            artifact = f"{head}\n\n--- description (no spec.md available) ---\n{desc}"
+        else:
+            artifact = head
+
+    return _truncate(artifact)
 
 
-def _compose_output_artifact(ev: dict[str, Any], actor: str) -> str:
-    """Render an audit artifact for `output_saved`. For text-native and
-    office formats we extract the body and inline it; for images and
-    unknown formats we fall back to a path + size header.
+def _read_spec_body(task: dict[str, Any]) -> str | None:
+    """Read spec.md for the task. Returns the body (truncated to
+    `_PLAN_BODY_MAX`) or None when the spec doesn't exist / can't
+    be read.
 
-    The on-disk file is at `outputs.OUTPUTS_DIR / path` — outputs are
-    a global lane (not per-project), so resolution doesn't depend on
-    the event's `project_id` field. Lazy import of `outputs` to avoid
-    pulling that module into the import graph for the other event
-    types.
+    spec.md lives at `/data/projects/<project_id>/working/tasks/<task_id>/spec.md`
+    — outside OUTPUTS_DIR, so we can't reuse `output_extractor.extract_body`
+    (its boundary check refuses paths outside the outputs lane).
+    spec.md is always .md / UTF-8 text by construction (kanban writers
+    only emit markdown), so a direct read is sufficient.
     """
-    from server.outputs import OUTPUTS_DIR  # noqa: PLC0415
-    from server.compass import output_extractor  # noqa: PLC0415
+    from server.tasks import is_valid_task_id, spec_path  # noqa: PLC0415
 
-    path = (ev.get("path") or "").strip()
-    size = ev.get("bytes") or 0
-    if not path:
-        return ""
-    full = OUTPUTS_DIR / path
-    head = f"[output] {actor} saved outputs[{path}] ({size} bytes)"
-    body = None
+    task_id = (task.get("id") or "").strip()
+    project_id = (task.get("project_id") or "").strip()
+    if not task_id or not project_id:
+        return None
+    if not is_valid_task_id(task_id):
+        return None
+
     try:
-        if full.exists() and full.is_file():
-            body = output_extractor.extract_body(full)
+        path = spec_path(project_id, task_id)
+    except ValueError:
+        return None
+
+    try:
+        if not path.is_file():
+            return None
+        text = path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         logger.exception(
-            "compass.audit_watcher: output extractor crashed on %s", path,
+            "compass.audit_watcher: spec read failed for task %s", task_id,
         )
-        body = None
-    if body:
-        # Use the extension as the format hint in the separator. If the
-        # path somehow has no extension (shouldn't happen — `coord_save_output`
-        # rejects extension-less leaves at write time — but defensive),
-        # render a generic separator instead of `( extracted)`.
-        ext = full.suffix.lower() or "(no ext)"
-        artifact = (
-            f"{head}\n\n--- document body ({ext} extracted) ---\n{body}"
+        return None
+
+    if len(text) > _PLAN_BODY_MAX:
+        return (
+            text[:_PLAN_BODY_MAX]
+            + f"\n\n[truncated — spec was {len(text)} chars]"
         )
-        return _truncate_long(artifact)
-    return _truncate(head)
+    return text
 
 
 def _truncate(s: str) -> str:
@@ -389,17 +470,6 @@ def _truncate(s: str) -> str:
     if len(s) <= _ARTIFACT_TRUNCATE:
         return s
     return s[:_ARTIFACT_TRUNCATE] + f"\n\n[truncated — was {len(s)} chars]"
-
-
-def _truncate_long(s: str) -> str:
-    """Higher cap for body-included output artifacts."""
-    s = (s or "").strip()
-    if len(s) <= _OUTPUT_ARTIFACT_TRUNCATE:
-        return s
-    return (
-        s[:_OUTPUT_ARTIFACT_TRUNCATE]
-        + f"\n\n[truncated — artifact was {len(s)} chars]"
-    )
 
 
 __all__ = [

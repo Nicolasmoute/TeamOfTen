@@ -1,8 +1,8 @@
 // Kanban dashboard (Docs/kanban-specs.md section 11).
 //
 // Single-file Preact pane mounted under slot `__kanban`. The active board
-// renders Plan / Execute / Audit / Ship, with audit split into syntax and
-// semantics bands. Archived tasks live in a separate drawer.
+// renders Plan / Execute / Review / Ship, with review split into formal and
+// semantic bands. Archived tasks live in a separate drawer.
 
 import { h } from "https://esm.sh/preact@10";
 import { useCallback, useEffect, useMemo, useState } from "https://esm.sh/preact@10/hooks";
@@ -41,11 +41,79 @@ async function apiPost(authedFetch, path, body) {
 const STAGE_LABELS = {
   plan: "PLAN",
   execute: "EXECUTE",
-  audit_syntax: "AUDIT-SYN",
-  audit_semantics: "AUDIT-SEM",
+  audit_syntax: "FORMAL",
+  audit_semantics: "SEMANTIC",
   ship: "SHIP",
   archive: "ARCHIVE",
 };
+
+const TRAJECTORY_TOKENS = {
+  plan: "P",
+  execute: "E",
+  audit_syntax: "AY",
+  audit_semantics: "AE",
+  ship: "S",
+};
+
+// Render a compact trajectory marker like `P → [E] → AY → S` with the
+// current stage in brackets. Returns null if the trajectory is empty
+// or unparseable. Mirror of agents.py:_trajectory_marker.
+function renderTrajectoryMarker(trajectory, currentStage) {
+  let traj = trajectory;
+  if (typeof traj === "string") {
+    try { traj = JSON.parse(traj); } catch (_) { return null; }
+  }
+  if (!Array.isArray(traj) || traj.length === 0) return null;
+  const tokens = [];
+  for (const stageObj of traj) {
+    if (!stageObj || typeof stageObj !== "object") continue;
+    const stage = stageObj.stage;
+    const tok = TRAJECTORY_TOKENS[stage];
+    if (!tok) continue;
+    tokens.push({ tok, current: stage === currentStage });
+  }
+  if (tokens.length === 0) return null;
+  return html`<span class="kbn-trajectory" title="trajectory">
+    ${tokens.map((t, i) => html`
+      ${i > 0 ? html`<span class="kbn-traj-arrow">→</span>` : null}
+      <span class=${`kbn-traj-stage ${t.current ? "current" : ""}`}>${t.tok}</span>
+    `)}
+  </span>`;
+}
+
+// Trajectory presets used by the composer. Lifted from
+// Docs/kanban-specs.md §3 examples.
+const TRAJECTORY_PRESETS = [
+  { id: "execute_only", label: "Execute only (quick mechanical)",
+    trajectory: [{ stage: "execute", to: [] }] },
+  { id: "plan_execute", label: "Plan + Execute (no audit)",
+    trajectory: [
+      { stage: "plan", to: [] },
+      { stage: "execute", to: [] },
+    ] },
+  { id: "code_formal", label: "Code with formal review",
+    trajectory: [
+      { stage: "plan", to: [] },
+      { stage: "execute", to: [] },
+      { stage: "audit_syntax", to: [] },
+      { stage: "ship", to: [] },
+    ] },
+  { id: "marketing_semantic", label: "Marketing/writing with semantic review",
+    trajectory: [
+      { stage: "plan", to: [] },
+      { stage: "execute", to: [] },
+      { stage: "audit_semantics", to: [] },
+      { stage: "ship", to: [] },
+    ] },
+  { id: "full_pipeline", label: "Full pipeline (plan + both audits + ship)",
+    trajectory: [
+      { stage: "plan", to: [] },
+      { stage: "execute", to: [] },
+      { stage: "audit_syntax", to: [] },
+      { stage: "audit_semantics", to: [] },
+      { stage: "ship", to: [] },
+    ] },
+];
 
 const PRIORITY_TONE = {
   urgent: "var(--err)",
@@ -57,8 +125,8 @@ const PRIORITY_TONE = {
 const ROLE_LABELS = {
   planner: "planner",
   executor: "executor",
-  auditor_syntax: "syntax auditor",
-  auditor_semantics: "semantics auditor",
+  auditor_syntax: "formal reviewer",
+  auditor_semantics: "semantic reviewer",
   shipper: "shipper",
 };
 
@@ -313,9 +381,7 @@ function Card({
           aria-label=${`priority: ${task.priority || "normal"}`}
           style=${`background:${PRIORITY_TONE[task.priority] || "var(--muted)"}`}
         ></span>
-        ${task.complexity === "simple"
-          ? html`<span class="kbn-simple-chip">SIMPLE</span>`
-          : null}
+        ${renderTrajectoryMarker(task.trajectory, task.status)}
       </div>
       <div class="kbn-card-title">${task.title || "(untitled)"}</div>
       <div class="kbn-stage-label">${stageLabel}</div>
@@ -356,6 +422,8 @@ function Card({
               <div class="kbn-card-facts">
                 <span>${task.id}</span>
                 <span>${task.created_at ? `created ${timeAgo(task.created_at)}` : "created unknown"}</span>
+                ${task.workflow ? html`<span>${task.workflow}</span>` : null}
+                ${task.required_reviews ? html`<span>reviews ${task.required_reviews}</span>` : null}
                 ${task.blocked_reason ? html`<span>${task.blocked_reason}</span>` : null}
               </div>
               <div class="kbn-expanded-head">Role history</div>
@@ -433,10 +501,10 @@ function AuditColumn(props) {
   return html`
     <section class="kbn-column kbn-audit-column">
       <div class="kbn-column-head">
-        Audit <span class="kbn-count">${syntax.length + semantics.length}</span>
+        Review <span class="kbn-count">${syntax.length + semantics.length}</span>
       </div>
       <${AuditBand}
-        label="Syntax"
+        label="Formal"
         tasks=${syntax}
         expandedId=${props.expandedId}
         historyByTask=${props.historyByTask}
@@ -445,7 +513,7 @@ function AuditColumn(props) {
         onAssignRole=${props.onAssignRole}
       />
       <${AuditBand}
-        label="Semantics"
+        label="Semantic"
         tasks=${semantics}
         expandedId=${props.expandedId}
         historyByTask=${props.historyByTask}
@@ -465,7 +533,9 @@ function ComposerModal({ open, onClose, onCreate }) {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [priority, setPriority] = useState("normal");
-  const [complexity, setComplexity] = useState("standard");
+  const [presetId, setPresetId] = useState("code_formal");
+  const [workflow, setWorkflow] = useState("generic");
+  const [trackingReason, setTrackingReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
 
@@ -477,6 +547,8 @@ function ComposerModal({ open, onClose, onCreate }) {
       setErr("title is required");
       return;
     }
+    const preset = TRAJECTORY_PRESETS.find((p) => p.id === presetId)
+      || TRAJECTORY_PRESETS[0];
     setBusy(true);
     setErr(null);
     try {
@@ -484,12 +556,16 @@ function ComposerModal({ open, onClose, onCreate }) {
         title: title.trim(),
         description: description.trim(),
         priority,
-        complexity,
+        trajectory: preset.trajectory,
+        workflow,
+        tracking_reason: trackingReason.trim() || null,
       });
       setTitle("");
       setDescription("");
       setPriority("normal");
-      setComplexity("standard");
+      setPresetId("code_formal");
+      setWorkflow("generic");
+      setTrackingReason("");
       onClose();
     } catch (e) {
       setErr(e.message || String(e));
@@ -529,12 +605,39 @@ function ComposerModal({ open, onClose, onCreate }) {
                 <option value="urgent">urgent</option>
               </select>
             </label>
-            <label class="kbn-label">Complexity
-              <select class="kbn-select" value=${complexity} onChange=${(e) => setComplexity(e.target.value)}>
-                <option value="standard">standard (full pipeline)</option>
-                <option value="simple">simple (skip audit + ship)</option>
+            <label class="kbn-label">Trajectory
+              <select class="kbn-select" value=${presetId} onChange=${(e) => setPresetId(e.target.value)}>
+                ${TRAJECTORY_PRESETS.map((p) => html`<option value=${p.id}>${p.label}</option>`)}
               </select>
             </label>
+          </div>
+          <div class="kbn-row">
+            <label class="kbn-label">Workflow
+              <select class="kbn-select" value=${workflow} onChange=${(e) => setWorkflow(e.target.value)}>
+                <option value="generic">generic</option>
+                <option value="code">code</option>
+                <option value="research">research</option>
+                <option value="writing">writing</option>
+                <option value="marketing">marketing</option>
+                <option value="ops">ops</option>
+              </select>
+            </label>
+            <label class="kbn-label">Tracking reason (optional)
+              <input
+                class="kbn-input"
+                type="text"
+                value=${trackingReason}
+                onInput=${(e) => setTrackingReason(e.target.value)}
+                placeholder="(free text, optional)"
+                maxlength="80"
+              />
+            </label>
+          </div>
+          <div class="kbn-help">
+            Coach can later reroute via coord_set_task_trajectory or
+            POST /api/tasks/&lt;id&gt;/trajectory. Per-stage assignees
+            default to the unassigned pool — assign Players from the
+            board.
           </div>
           ${err ? html`<div class="kbn-error">${err}</div>` : null}
           <div class="kbn-modal-actions">
@@ -714,7 +817,7 @@ function ArchiveDrawer({ open, onClose, authedFetch }) {
                     <${Avatar} primary=${primary} />
                     <span>${t.title || "(untitled)"}</span>
                     ${t.cancelled_at ? html`<span class="kbn-cancelled-chip">CANCELLED</span>` : null}
-                    ${t.complexity === "simple" ? html`<span class="kbn-simple-chip">SIMPLE</span>` : null}
+                    ${renderTrajectoryMarker(t.trajectory, "archive")}
                   </div>
                   <div class="kbn-archive-row-meta">
                     <span>${t.id}</span>
@@ -752,6 +855,62 @@ function ArchiveDrawer({ open, onClose, authedFetch }) {
         </button>
       </div>
     </section>
+  `;
+}
+
+
+// ---------------------------------------------------------------- flow health
+
+
+function FlowHealthFooter({ authedFetch, kanbanEvents }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const r = await authedFetch("/api/tasks/flow_health");
+      if (!r.ok) throw new Error(`flow_health -> ${r.status}`);
+      const json = await r.json();
+      setData(json);
+      setError(null);
+    } catch (e) {
+      setError(e.message || String(e));
+    }
+  }, [authedFetch]);
+
+  useEffect(() => {
+    refresh();
+    const id = setInterval(refresh, 30_000);
+    return () => clearInterval(id);
+  }, [refresh]);
+
+  useEffect(() => {
+    if (!kanbanEvents) return;
+    const watched = new Set([
+      "task_stage_changed", "task_stage_stale", "task_trajectory_changed",
+    ]);
+    return kanbanEvents.subscribe((evt) => {
+      if (evt && watched.has(evt.type)) refresh();
+    });
+  }, [kanbanEvents, refresh]);
+
+  if (error) {
+    return html`<div class="kanban-flow-health alert">Flow: ${error}</div>`;
+  }
+  if (!data) {
+    return html`<div class="kanban-flow-health">Flow: loading…</div>`;
+  }
+  const aliveCls = data.subscriber_alive && data.stalled_count === 0
+    ? "ok" : "alert";
+  const last = data.subscriber_last_event_at
+    ? new Date(data.subscriber_last_event_at).toLocaleTimeString()
+    : "never";
+  return html`
+    <div class=${`kanban-flow-health ${aliveCls}`}>
+      Subscriber: ${data.subscriber_alive ? "alive" : "DOWN"}
+      · Stalled: ${data.stalled_count}
+      · Last event: ${last}
+    </div>
   `;
 }
 
@@ -800,10 +959,12 @@ export function KanbanPane({
     const watched = new Set([
       "task_created", "task_claimed", "task_assigned",
       "task_updated", "task_stage_changed",
-      "task_complexity_set", "task_blocked_changed",
+      "task_trajectory_changed", "task_blocked_changed",
       "task_spec_written", "task_role_assigned", "task_role_claimed",
-      "task_role_completed", "task_drift_detected", "task_shipped",
-      "audit_report_submitted", "compass_audit_logged",
+      "task_role_called", "task_role_completed", "task_execution_completed",
+      "task_workflow_set", "task_drift_detected", "task_shipped",
+      "task_stage_stale", "audit_report_submitted",
+      "audit_fail_notification", "compass_audit_logged",
       "commit_pushed", "project_switched", "socket_connected",
     ]);
     return kanbanEvents.subscribe((evt) => {
@@ -933,6 +1094,10 @@ export function KanbanPane({
           open=${archiveOpen}
           onClose=${() => setArchiveOpen(false)}
           authedFetch=${authedFetch}
+        />
+        <${FlowHealthFooter}
+          authedFetch=${authedFetch}
+          kanbanEvents=${kanbanEvents}
         />
       </div>
       <${ComposerModal}

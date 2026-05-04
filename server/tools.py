@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import subprocess
@@ -36,9 +37,9 @@ def _new_task_id() -> str:
 # 'execute', etc. See `_normalize_status_alias`.
 VALID_TRANSITIONS: dict[str, set[str]] = {
     "plan":            {"execute", "archive"},
-    "execute":         {"audit_syntax", "archive"},
-    "audit_syntax":    {"audit_semantics", "execute"},
-    "audit_semantics": {"ship", "execute"},
+    "execute":         {"audit_syntax", "audit_semantics", "ship", "archive"},
+    "audit_syntax":    {"audit_semantics", "ship", "archive", "execute"},
+    "audit_semantics": {"ship", "archive", "execute"},
     "ship":            {"archive"},
     "archive":         set(),
 }
@@ -48,6 +49,41 @@ AUDIT_STAGES: frozenset[str] = frozenset({"audit_syntax", "audit_semantics"})
 
 # All valid kanban stages (used by validators that accept any of them).
 ALL_KANBAN_STAGES: frozenset[str] = frozenset(VALID_TRANSITIONS.keys())
+
+# Workflow metadata. The DB stores these as text/JSON for migration
+# friendliness; these constants are the tool/API validation contract.
+WORKFLOW_TYPES: frozenset[str] = frozenset({
+    "code", "research", "writing", "marketing", "ops", "generic",
+})
+# `tracking_reason` is informational metadata in v0.3 (the v0.2 admission
+# gate was dropped — every Coach delegation goes through kanban). The
+# field accepts any non-empty string; no enum validation. Kept for
+# filtering / analytics consumers.
+
+# Canonical stage order for trajectory validation. Trajectory entries
+# must appear in this order; `execute` is mandatory; `archive` is
+# implicit/terminal and not stored in trajectory rows.
+TRAJECTORY_STAGES: tuple[str, ...] = (
+    "plan", "execute", "audit_syntax", "audit_semantics", "ship",
+)
+TRAJECTORY_STAGE_INDEX: dict[str, int] = {
+    s: i for i, s in enumerate(TRAJECTORY_STAGES)
+}
+
+ROLE_STAGE: dict[str, str] = {
+    "planner": "plan",
+    "executor": "plan",
+    "auditor_syntax": "audit_syntax",
+    "auditor_semantics": "audit_semantics",
+    "shipper": "ship",
+}
+STAGE_ROLE: dict[str, str] = {
+    "plan": "planner",
+    "execute": "executor",
+    "audit_syntax": "auditor_syntax",
+    "audit_semantics": "auditor_semantics",
+    "ship": "shipper",
+}
 
 # Legacy → kanban status aliases. Accepted for one release so existing
 # Coach prompts and external scripts that still call coord_update_task
@@ -73,6 +109,202 @@ def _normalize_status_alias(status: str) -> str:
 
 def _valid_transition(old: str, new: str) -> bool:
     return new in VALID_TRANSITIONS.get(old, set())
+
+
+def _parse_boolish(raw: Any, *, default: bool) -> bool:
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _trajectory_stages_from_row(row: Any) -> list[str]:
+    """Return the ordered list of stage names from a task row's
+    `trajectory` JSON column. Defensive against malformed JSON / wrong
+    shape — returns [] on any parse failure (callers treat this as
+    'no trajectory configured', which routes execute → archive)."""
+    raw = None
+    try:
+        if hasattr(row, "get"):
+            raw = row.get("trajectory")
+        else:
+            raw = row["trajectory"]  # mapping-like via __getitem__
+    except Exception:
+        return []
+    if not raw:
+        return []
+    try:
+        traj = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(traj, list):
+        return []
+    out: list[str] = []
+    for s in traj:
+        if isinstance(s, dict):
+            stage = str(s.get("stage", ""))
+            if stage in TRAJECTORY_STAGES:
+                out.append(stage)
+    return out
+
+
+def _trajectory_has_audit(stages: list[str]) -> bool:
+    """True iff the trajectory configures at least one audit stage. Used
+    by the executor wake prompt to decide whether to inject the self-audit
+    reminder."""
+    return "audit_syntax" in stages or "audit_semantics" in stages
+
+
+def _next_stage_from_trajectory(
+    stages: list[str], current: str
+) -> str:
+    """Walk the trajectory list. Returns the stage that follows `current`,
+    or 'archive' if `current` is the last stage in the list (or absent)."""
+    try:
+        idx = stages.index(current)
+    except ValueError:
+        return "archive"
+    if idx + 1 >= len(stages):
+        return "archive"
+    return stages[idx + 1]
+
+
+_VALID_SLOT_RE = re.compile(r"^p(?:[1-9]|10)$")
+
+
+def _coerce_player_slots(value: Any) -> list[str] | str:
+    """Normalize a `to` value to `list[str]` of valid Player slots.
+
+    Accepts:
+      - a single slot string ('p3' or 'p1,p2,p3')
+      - a list of slot strings
+      - JSON-ish list
+      - empty / None → []
+
+    Returns either the validated list, or an error string explaining why
+    the input is invalid. Empty strings inside the list are skipped.
+    """
+    if value is None or value == "":
+        return []
+    raw_list: list[Any]
+    if isinstance(value, list):
+        raw_list = list(value)
+    else:
+        text = str(value).strip()
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return "trajectory `to` JSON list could not be parsed"
+            if not isinstance(parsed, list):
+                return "trajectory `to` must be a slot string or list"
+            raw_list = list(parsed)
+        else:
+            raw_list = [p for p in re.split(r"[,\s]+", text) if p]
+    out: list[str] = []
+    for item in raw_list:
+        slot = str(item).strip().lower()
+        if not slot:
+            continue
+        if not _VALID_SLOT_RE.match(slot):
+            return f"invalid Player slot {slot!r} in trajectory `to`"
+        if slot not in out:
+            out.append(slot)
+    return out
+
+
+def _validate_trajectory(
+    raw: Any,
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Validate a trajectory list per Docs/kanban-specs.md §3.2.
+
+    Accepts a Python list of `{stage, to}` dicts OR a JSON-encoded string
+    of the same. On success returns the normalized list (each entry
+    `{stage: str, to: list[str]}`); on failure returns `(None, error)`.
+
+    Rules:
+      - non-empty list
+      - each entry has `stage` in TRAJECTORY_STAGES (no `archive`)
+      - no duplicate stages
+      - stages appear in canonical order
+      - `execute` is mandatory
+      - `to` is a slot string or list of slot strings
+    """
+    if raw is None:
+        return None, "trajectory is required"
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None, "trajectory is required"
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return None, "trajectory JSON could not be parsed"
+        return _validate_trajectory(parsed)
+    if not isinstance(raw, list):
+        return None, "trajectory must be a list of {stage, to} objects"
+    if not raw:
+        return None, "trajectory cannot be empty"
+
+    normalized: list[dict[str, Any]] = []
+    seen_stages: set[str] = set()
+    last_idx = -1
+    for entry in raw:
+        if not isinstance(entry, dict):
+            return None, "trajectory entries must be {stage, to} objects"
+        stage = str(entry.get("stage", "")).strip().lower()
+        if stage not in TRAJECTORY_STAGES:
+            return None, (
+                f"unknown stage {stage!r}; valid stages: "
+                f"{', '.join(TRAJECTORY_STAGES)}"
+            )
+        if stage in seen_stages:
+            return None, f"duplicate stage {stage!r} in trajectory"
+        idx = TRAJECTORY_STAGE_INDEX[stage]
+        if idx <= last_idx:
+            return None, (
+                f"stage {stage!r} appears out of canonical order; "
+                f"trajectory must be ordered "
+                f"{', '.join(TRAJECTORY_STAGES)}"
+            )
+        last_idx = idx
+        seen_stages.add(stage)
+        slots_or_err = _coerce_player_slots(entry.get("to"))
+        if isinstance(slots_or_err, str):
+            return None, slots_or_err
+        normalized.append({"stage": stage, "to": slots_or_err})
+
+    if "execute" not in seen_stages:
+        return None, "trajectory must include 'execute'"
+
+    return normalized, None
+
+
+def _role_matches_stage(role: str, stage: str) -> bool:
+    if role == "executor":
+        return stage in ("plan", "execute")
+    return ROLE_STAGE.get(role) == stage
+
+
+def _normalize_role_alias(role: str) -> str | None:
+    r = (role or "").strip().lower()
+    aliases = {
+        "formal": "auditor_syntax",
+        "syntax": "auditor_syntax",
+        "syntactic": "auditor_syntax",
+        "formal_review": "auditor_syntax",
+        "semantic": "auditor_semantics",
+        "semantics": "auditor_semantics",
+        "semantic_review": "auditor_semantics",
+    }
+    r = aliases.get(r, r)
+    return r if r in ROLE_NAMES else None
 
 
 async def _check_kanban_role_gate(
@@ -103,7 +335,7 @@ async def _check_kanban_role_gate(
         return None
 
     cur = await c.execute(
-        "SELECT complexity, spec_path FROM tasks "
+        "SELECT trajectory, spec_path FROM tasks "
         "WHERE id = ? AND project_id = ?",
         (task_id, project_id),
     )
@@ -114,11 +346,13 @@ async def _check_kanban_role_gate(
         # task in its own error message.
         return None
     t = dict(row)
-    complexity = (t.get("complexity") or "standard").lower()
     spec_path = t.get("spec_path")
+    stages = _trajectory_stages_from_row(t)
+    expected_next = _next_stage_from_trajectory(stages, old)
 
     if old == "plan" and new == "execute":
-        if complexity == "standard" and not spec_path:
+        # Spec gate: trajectory has `plan` → spec required.
+        if "plan" in stages and not spec_path:
             return (
                 f"task {task_id} has no spec — write one with "
                 f"coord_write_task_spec (or delegate via "
@@ -141,40 +375,47 @@ async def _check_kanban_role_gate(
             )
         return None
 
-    if old == "execute" and new == "audit_syntax":
+    if old == "execute" and new in ("audit_syntax", "audit_semantics", "ship", "archive"):
         return (
-            f"manual execute → audit_syntax is not allowed; the kanban "
-            f"subscriber auto-advances when the executor calls "
-            f"coord_commit_push(task_id={task_id!r}). Use "
-            f"coord_advance_task_stage to force."
-        )
-
-    if old == "execute" and new == "archive":
-        return (
-            f"manual execute → archive (delivery) is not allowed. "
-            f"Simple-complexity tasks auto-archive when the executor "
-            f"calls coord_commit_push(task_id={task_id!r}); standard "
-            f"tasks must traverse audit + ship. Use "
+            f"manual execute → {new} is not allowed. The kanban "
+            f"subscriber routes the task when the executor calls "
+            f"coord_commit_push(task_id={task_id!r}) for code work or "
+            f"coord_complete_execution(task_id={task_id!r}, ...) for "
+            f"non-code artifacts. Use "
             f"coord_advance_task_stage to force, or pass "
             f"status='cancelled' if the intent is cancellation."
         )
 
-    if old == "audit_syntax" and new == "audit_semantics":
+    if old == "audit_syntax" and new in ("audit_semantics", "ship", "archive"):
         if not await _has_passing_auditor(c, task_id, "auditor_syntax"):
             return (
-                f"audit_syntax → audit_semantics requires the active "
-                f"syntax auditor to submit verdict='pass' via "
+                f"leaving formal review requires the active formal "
+                f"reviewer to submit verdict='pass' via "
                 f"coord_submit_audit_report. Use "
+                f"coord_advance_task_stage to force."
+            )
+        if new != expected_next:
+            return (
+                f"task {task_id} trajectory expects {expected_next!r} "
+                f"after formal-review pass. Update via "
+                f"coord_set_task_trajectory or use "
                 f"coord_advance_task_stage to force."
             )
         return None
 
-    if old == "audit_semantics" and new == "ship":
+    if old == "audit_semantics" and new in ("ship", "archive"):
         if not await _has_passing_auditor(c, task_id, "auditor_semantics"):
             return (
-                f"audit_semantics → ship requires the active semantic "
-                f"auditor to submit verdict='pass' via "
+                f"leaving semantic review requires the active semantic "
+                f"reviewer to submit verdict='pass' via "
                 f"coord_submit_audit_report. Use "
+                f"coord_advance_task_stage to force."
+            )
+        if new != expected_next:
+            return (
+                f"task {task_id} trajectory expects {expected_next!r} "
+                f"after semantic-review pass. Update via "
+                f"coord_set_task_trajectory or use "
                 f"coord_advance_task_stage to force."
             )
         return None
@@ -232,11 +473,11 @@ ROLE_NAMES: frozenset[str] = frozenset({
 
 
 def _resolve_audit_role_kind(kind: str) -> str | None:
-    """Convert a Coach-facing kind ('syntax' / 'semantics') to the
+    """Convert a Coach-facing kind ('formal' / 'semantic') to the
     underlying role-assignment row's role value."""
-    if kind == "syntax":
+    if kind in ("syntax", "formal", "syntactic", "mechanical"):
         return "auditor_syntax"
-    if kind == "semantics":
+    if kind in ("semantics", "semantic"):
         return "auditor_semantics"
     return None
 
@@ -307,7 +548,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "are translated to their kanban equivalent for back-compat.\n"
             "- owner: agent id ('coach', 'p1'..'p10'), or 'null' for unassigned\n"
             "Returns up to 100 most recent tasks. Each row shows stage, "
-            "complexity (SIMPLE chip if simple), blocked flag, owner, "
+            "trajectory ([P,E,AY,AE,S] tokens), blocked flag, owner, "
             "priority, and title."
         ),
         {"status": str, "owner": str},
@@ -341,7 +582,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         try:
             cur = await c.execute(
                 f"SELECT id, title, status, owner, created_by, parent_id, "
-                f"priority, complexity, blocked, blocked_reason, created_at "
+                f"priority, trajectory, blocked, blocked_reason, created_at "
                 f"FROM tasks{clause} "
                 f"ORDER BY created_at DESC LIMIT 100",
                 params,
@@ -356,7 +597,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         for r in rows:
             d = dict(r)
             parent = f" sub-of:{d['parent_id']}" if d["parent_id"] else ""
-            simple = " SIMPLE" if d.get("complexity") == "simple" else ""
+            stages = _trajectory_stages_from_row(d)
+            traj = " trajectory=[" + ",".join(stages) + "]" if stages else ""
             blocked = ""
             if d.get("blocked"):
                 reason = d.get("blocked_reason") or ""
@@ -364,7 +606,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f" BLOCKED({reason})" if reason else " BLOCKED"
                 )
             lines.append(
-                f"{d['id']}  [{d['status']}]{simple}{blocked}  "
+                f"{d['id']}  [{d['status']}]{traj}{blocked}  "
                 f"owner={d['owner'] or '-'}  pri={d['priority']}  "
                 f"{d['title']}{parent}"
             )
@@ -383,13 +625,23 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- description: longer explanation (optional)\n"
             "- parent_id: parent task id (optional; Players: required unless you have a current task)\n"
             "- priority: 'low', 'normal', 'high', 'urgent' (default 'normal')\n"
-            "- complexity: 'standard' (full pipeline) or 'simple' (skip audit + ship; "
-            "executor self-audits and the board archives directly on commit). "
-            "Default 'standard'. Coach-only — Players inherit the parent's complexity."
+            "- workflow: code | research | writing | marketing | ops | generic (default generic). "
+            "Shapes prompt wording; does not drive routing — the trajectory does.\n"
+            "- tracking_reason: optional informational tag.\n"
+            "- trajectory: REQUIRED for Coach. Ordered list of {stage, to} objects defining "
+            "which stages this task will traverse and who covers each. `stage` ∈ "
+            "{plan, execute, audit_syntax, audit_semantics, ship}; canonical order; "
+            "execute is mandatory. `to` is a single Player slot string ('p3'), a list "
+            "(['p1','p2'] — pool, first free wins), or a comma list ('p1,p2'). "
+            "Examples: [{stage:'execute',to:['p2','p3']}] (self-audit, archives on "
+            "commit), [{stage:'plan',to:'p5'},{stage:'execute',to:'p2'},"
+            "{stage:'audit_syntax',to:'p4'},{stage:'ship',to:'p2'}] (full code path). "
+            "Players inherit the parent's trajectory when subtasking."
         ),
         {
             "title": str, "description": str, "parent_id": str,
-            "priority": str, "complexity": str,
+            "priority": str, "workflow": str,
+            "tracking_reason": str, "trajectory": Any,
         },
     )
     async def create_task(args: dict[str, Any]) -> dict[str, Any]:
@@ -405,22 +657,35 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"invalid priority '{priority}' "
                 "(must be low, normal, high, or urgent)"
             )
-        # Complexity: Coach can pick simple/standard; Players don't get
-        # to flip an inherited subtask's complexity here (use
-        # coord_set_task_complexity if needed — which is Coach-only).
-        complexity_raw = (args.get("complexity") or "").strip().lower()
-        if complexity_raw and complexity_raw not in ("simple", "standard"):
+
+        workflow = (args.get("workflow") or "generic").strip().lower()
+        if workflow not in WORKFLOW_TYPES:
             return _err(
-                f"invalid complexity '{complexity_raw}' "
-                "(must be 'simple' or 'standard')"
+                f"invalid workflow '{workflow}' "
+                f"(must be one of {sorted(WORKFLOW_TYPES)})"
             )
-        if complexity_raw and not caller_is_coach:
+        tracking_reason_raw = args.get("tracking_reason")
+        tracking_reason = (
+            str(tracking_reason_raw).strip()
+            if tracking_reason_raw else ""
+        )
+
+        trajectory_raw = args.get("trajectory")
+        trajectory: list[dict[str, Any]] | None = None
+        if trajectory_raw not in (None, "", []):
+            trajectory, traj_err = _validate_trajectory(trajectory_raw)
+            if traj_err:
+                return _err(f"invalid trajectory: {traj_err}")
+        if trajectory is None and caller_is_coach and parent_id is None:
             return _err(
-                "Only Coach can set complexity at create time. "
-                "Subtasks inherit; if you need this changed, ask Coach to "
-                "call coord_set_task_complexity."
+                "trajectory is required for Coach top-level tasks. Pass an "
+                "ordered list of {stage, to} objects, e.g. "
+                "[{stage:'execute',to:['p2','p3']}] for quick self-audit "
+                "work, or "
+                "[{stage:'plan',to:'p5'},{stage:'execute',to:'p2'},"
+                "{stage:'audit_syntax',to:'p4'},{stage:'ship',to:'p2'}] "
+                "for code-with-formal-review."
             )
-        complexity = complexity_raw or "standard"
 
         project_id = await resolve_active_project()
         c = await configured_conn()
@@ -460,26 +725,97 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                             f"top-level work, message Coach."
                         )
 
-            # Subtask complexity inherits from parent unless Coach
-            # explicitly overrode at create-time.
-            if parent_id and not complexity_raw:
+            # Subtask trajectory inherits from parent unless explicitly
+            # provided. The inherited trajectory keeps the parent's stage
+            # shape but resets per-stage assignees to empty pools (subtask
+            # ownership is independent).
+            if parent_id and trajectory is None:
                 cur = await c.execute(
-                    "SELECT complexity FROM tasks WHERE id = ? AND project_id = ?",
+                    "SELECT trajectory, workflow FROM tasks "
+                    "WHERE id = ? AND project_id = ?",
                     (parent_id, project_id),
                 )
                 prow = await cur.fetchone()
                 if prow:
-                    parent_complexity = dict(prow).get("complexity") or "standard"
-                    complexity = parent_complexity
+                    pd = dict(prow)
+                    workflow = pd.get("workflow") or workflow
+                    tracking_reason = tracking_reason or "subtask"
+                    parent_stages = _trajectory_stages_from_row(pd)
+                    if parent_stages:
+                        trajectory = [
+                            {"stage": s, "to": []} for s in parent_stages
+                        ]
+
+            # Default trajectory if still unset (e.g. Player making a
+            # subtask of a task without a stored trajectory).
+            if trajectory is None:
+                trajectory = [{"stage": "execute", "to": []}]
+
+            trajectory_json = json.dumps(trajectory, separators=(",", ":"))
+
+            # v0.3 audit fix: initial status = first stage in the
+            # trajectory. An execute-only trajectory must NOT start in
+            # `plan` (the executor row is already plantable, but the
+            # task would be stuck behind the spec gate / can't be
+            # claimed via coord_accept_role).
+            initial_status = trajectory[0]["stage"]
 
             task_id = _new_task_id()
+            now_iso = _now_iso()
+            # Hard-assign owner on tasks.owner when the first stage has
+            # exactly one slot — the column is the executor's identity
+            # for downstream gates (idle poller, current_task_id wake).
+            first_stage_to = trajectory[0].get("to") or []
+            if isinstance(first_stage_to, str):
+                first_stage_to = [first_stage_to] if first_stage_to else []
+            initial_owner = (
+                first_stage_to[0] if len(first_stage_to) == 1 else None
+            )
             await c.execute(
                 "INSERT INTO tasks (id, project_id, title, description, parent_id, "
-                "priority, complexity, created_by) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "priority, workflow, tracking_reason, trajectory, status, owner, "
+                "last_stage_change_at, created_by) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (task_id, project_id, title, description, parent_id,
-                 priority, complexity, caller_id),
+                 priority, workflow, tracking_reason or None,
+                 trajectory_json, initial_status, initial_owner,
+                 now_iso, caller_id),
             )
+            # Plant one task_role_assignments row per trajectory stage.
+            # Hard-assigns (single slot) get owner+claimed_at set; pool
+            # rows leave owner NULL and rely on coord_accept_role / the
+            # idle poller's pool path.
+            role_for_stage = {
+                "plan": "planner",
+                "execute": "executor",
+                "audit_syntax": "auditor_syntax",
+                "audit_semantics": "auditor_semantics",
+                "ship": "shipper",
+            }
+            for entry in trajectory:
+                stage = entry["stage"]
+                to_list: list[str] = entry.get("to") or []
+                role = role_for_stage[stage]
+                eligible_json = json.dumps(to_list, separators=(",", ":"))
+                if len(to_list) == 1:
+                    # Hard-assign.
+                    await c.execute(
+                        "INSERT INTO task_role_assignments "
+                        "(task_id, role, eligible_owners, owner, "
+                        "assigned_at, claimed_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (task_id, role, eligible_json, to_list[0],
+                         now_iso, now_iso),
+                    )
+                else:
+                    # Empty list (no candidates yet) or pool (>1).
+                    await c.execute(
+                        "INSERT INTO task_role_assignments "
+                        "(task_id, role, eligible_owners, owner, "
+                        "assigned_at) "
+                        "VALUES (?, ?, ?, NULL, ?)",
+                        (task_id, role, eligible_json, now_iso),
+                    )
             await c.commit()
         finally:
             await c.close()
@@ -494,13 +830,36 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "title": title,
                 "parent_id": parent_id,
                 "priority": priority,
-                "complexity": complexity,
+                "workflow": workflow,
+                "tracking_reason": tracking_reason or None,
+                "trajectory": trajectory,
+            }
+        )
+        # v0.3 audit fix (item 2): emit task_stage_changed for the
+        # initial stage so the kanban subscriber's _on_stage_changed
+        # handler wakes the first-stage assignee. Without this, a task
+        # with hard-assigned `to` slots in the trajectory sits silently
+        # — the executor never knows they own work, and the idle poller
+        # only nudges pool calls (not single-owner reservations until
+        # the stage is "current").
+        await bus.publish(
+            {
+                "ts": ts,
+                "agent_id": "system",
+                "type": "task_stage_changed",
+                "task_id": task_id,
+                "from": None,
+                "to": initial_status,
+                "reason": "task_created",
+                "owner": initial_owner,
             }
         )
         return _ok(
             f"Created task {task_id}"
             + (f" (subtask of {parent_id})" if parent_id else " (top-level)")
-            + f", priority={priority}, complexity={complexity}"
+            + f", priority={priority}, "
+            + f"workflow={workflow}, "
+            + f"trajectory=[{', '.join(s['stage'] for s in trajectory)}]"
         )
 
     @tool(
@@ -514,8 +873,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "  - you already own another task (finish or cancel it first)\n"
             "  - the task has an executor pool (eligible_owners) and you're "
             "    not in it\n"
-            "  - the task is standard-complexity and has no spec yet "
-            "    (Coach must call coord_write_task_spec first)\n"
+            "  - the trajectory has a `plan` stage and no spec.md exists "
+            "    yet (the planner must call coord_write_task_spec first)\n"
             "Self-claim is one atomic step: claimed_at + started_at are "
             "both set to now() because claim IS starting from the Player's "
             "perspective."
@@ -550,10 +909,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 )
 
             project_id = await resolve_active_project()
-            # Pre-checks: task exists in plan stage, has a spec (if standard),
-            # and (if posted to a pool) the caller is eligible.
+            # Pre-checks: task exists in plan stage, has a spec (when the
+            # trajectory has a `plan` stage), and (if posted to a pool)
+            # the caller is eligible.
             cur = await c.execute(
-                "SELECT status, owner, complexity, spec_path "
+                "SELECT status, owner, trajectory, spec_path "
                 "FROM tasks WHERE id = ? AND project_id = ?",
                 (task_id, project_id),
             )
@@ -567,14 +927,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"(status={ed['status']}, owner={ed['owner'] or '-'}). "
                     f"Only plan-stage tasks can be claimed."
                 )
-            if (
-                ed["complexity"] == "standard"
-                and not ed.get("spec_path")
-            ):
+            stages = _trajectory_stages_from_row(ed)
+            if "plan" in stages and not ed.get("spec_path"):
                 return _err(
-                    f"task {task_id} has no spec — Coach must call "
-                    f"coord_write_task_spec before this can move to execute. "
-                    f"(Simple-complexity tasks skip this gate.)"
+                    f"task {task_id} has no spec — write it (planner) "
+                    f"with coord_write_task_spec before this can move "
+                    f"to execute. (Trajectories without `plan` skip "
+                    f"this gate.)"
                 )
 
             # Pool eligibility: if there's an active executor role row
@@ -613,13 +972,16 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             # Atomic claim — race-safe via status='plan' guard. Both
             # claimed_at AND started_at are set to now (self-claim IS
             # starting; no separate "assigned but not picked up" window).
+            # Stamp last_stage_change_at + clear stale_alert_at so the
+            # stall sweeper sees the move (audit-2026-05-04 item 6).
             now = _now_iso()
             cur = await c.execute(
                 "UPDATE tasks SET owner = ?, status = 'execute', "
-                "claimed_at = ?, started_at = ? "
+                "claimed_at = ?, started_at = ?, "
+                "last_stage_change_at = ?, stale_alert_at = NULL "
                 "WHERE id = ? AND status = 'plan' AND project_id = ? "
                 "RETURNING id",
-                (caller_id, now, now, task_id, project_id),
+                (caller_id, now, now, now, task_id, project_id),
             )
             updated = await cur.fetchone()
             if not updated:
@@ -675,6 +1037,219 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             }
         )
         return _ok(f"claimed {task_id}")
+
+    @tool(
+        "coord_accept_role",
+        (
+            "Player-only. Answer a kanban role call. Coach may post a "
+            "current-stage role to several candidates; the first eligible "
+            "Player to call this tool wins atomically. Future-stage "
+            "reservations are not actionable until the card reaches that "
+            "stage.\n"
+            "\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- role: optional role or alias. Valid roles: planner, "
+            "executor, auditor_syntax/formal, auditor_semantics/semantic, "
+            "shipper. If omitted, the tool infers the only current-stage "
+            "pool row you are eligible for."
+        ),
+        {"task_id": str, "role": str},
+    )
+    async def accept_role(args: dict[str, Any]) -> dict[str, Any]:
+        if caller_is_coach:
+            return _err("Coach assigns roles; only Players answer role calls.")
+        task_id = (args.get("task_id") or "").strip()
+        role_raw = (args.get("role") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+
+        role = _normalize_role_alias(role_raw) if role_raw else None
+        if role_raw and role is None:
+            return _err(
+                "role must be planner, executor, formal/syntax, "
+                "semantic/semantics, or shipper"
+            )
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT current_task_id FROM agents WHERE id = ?",
+                (caller_id,),
+            )
+            agent_row = await cur.fetchone()
+            if not agent_row:
+                return _err(f"caller '{caller_id}' not in agents table")
+            current_task = dict(agent_row).get("current_task_id")
+
+            cur = await c.execute(
+                "SELECT id, status, owner, trajectory, spec_path "
+                "FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            task_row = await cur.fetchone()
+            if not task_row:
+                return _err(f"task {task_id} not found")
+            task = dict(task_row)
+            stage = task.get("status")
+            if stage == "archive":
+                return _err(f"task {task_id} is archived")
+            task_stages = _trajectory_stages_from_row(task)
+
+            if role is None:
+                cur = await c.execute(
+                    "SELECT id, role, eligible_owners FROM task_role_assignments "
+                    "WHERE task_id = ? AND owner IS NULL "
+                    "AND completed_at IS NULL AND superseded_by IS NULL "
+                    "ORDER BY assigned_at",
+                    (task_id,),
+                )
+                candidates = []
+                for rr in await cur.fetchall():
+                    rd = dict(rr)
+                    if not _role_matches_stage(rd["role"], stage):
+                        continue
+                    try:
+                        eligible = json.loads(rd.get("eligible_owners") or "[]")
+                    except Exception:
+                        eligible = []
+                    if caller_id in eligible:
+                        candidates.append(rd)
+                if not candidates:
+                    return _err(
+                        f"no current-stage role call for {caller_id} "
+                        f"on task {task_id}"
+                    )
+                if len(candidates) > 1:
+                    roles = ", ".join(sorted({c["role"] for c in candidates}))
+                    return _err(
+                        f"multiple role calls are available ({roles}); "
+                        f"pass role explicitly."
+                    )
+                role = candidates[0]["role"]
+
+            if not _role_matches_stage(role, stage):
+                return _err(
+                    f"role {role} is not active while task {task_id} "
+                    f"is in stage {stage}. Future-stage reservations are "
+                    f"not actionable yet."
+                )
+            if role == "executor" and current_task:
+                return _err(
+                    f"you already own task {current_task}; complete or "
+                    f"cancel it before accepting another executor role."
+                )
+            if (
+                role == "executor"
+                and "plan" in task_stages
+                and not task.get("spec_path")
+            ):
+                return _err(
+                    f"task {task_id} has no spec — the planner must call "
+                    f"coord_write_task_spec before this can move to execute."
+                )
+
+            cur = await c.execute(
+                "SELECT id, eligible_owners, owner FROM task_role_assignments "
+                "WHERE task_id = ? AND role = ? "
+                "AND completed_at IS NULL AND superseded_by IS NULL "
+                "ORDER BY assigned_at DESC LIMIT 1",
+                (task_id, role),
+            )
+            role_row = await cur.fetchone()
+            if not role_row:
+                return _err(
+                    f"no active {role} role row exists for task {task_id}"
+                )
+            rd = dict(role_row)
+            if rd.get("owner"):
+                return _err(
+                    f"task {task_id} {role} was already accepted by "
+                    f"{rd['owner']}"
+                )
+            try:
+                eligible = json.loads(rd.get("eligible_owners") or "[]")
+            except Exception:
+                eligible = []
+            if caller_id not in eligible:
+                return _err(
+                    f"{caller_id} is not in the candidate call for "
+                    f"task {task_id} {role}"
+                )
+
+            now = _now_iso()
+            if role == "executor":
+                await c.execute("BEGIN")
+                # Stamp last_stage_change_at on plan→execute transition
+                # (audit-2026-05-04 item 6).
+                cur = await c.execute(
+                    "UPDATE tasks SET owner = ?, status = 'execute', "
+                    "claimed_at = ?, started_at = ?, "
+                    "last_stage_change_at = ?, stale_alert_at = NULL "
+                    "WHERE id = ? AND status = 'plan' AND project_id = ? "
+                    "RETURNING id",
+                    (caller_id, now, now, now, task_id, project_id),
+                )
+                if not await cur.fetchone():
+                    await c.rollback()
+                    return _err(
+                        f"task {task_id} could not be claimed; it may "
+                        f"have moved out of plan."
+                    )
+                cur = await c.execute(
+                    "UPDATE task_role_assignments "
+                    "SET owner = ?, claimed_at = ?, started_at = ? "
+                    "WHERE id = ? AND owner IS NULL "
+                    "AND completed_at IS NULL AND superseded_by IS NULL "
+                    "RETURNING id",
+                    (caller_id, now, now, rd["id"]),
+                )
+                if not await cur.fetchone():
+                    await c.rollback()
+                    return _err(
+                        f"task {task_id} executor role was already accepted"
+                    )
+                await c.execute(
+                    "UPDATE agents SET current_task_id = ? WHERE id = ?",
+                    (task_id, caller_id),
+                )
+                await c.commit()
+            else:
+                cur = await c.execute(
+                    "UPDATE task_role_assignments "
+                    "SET owner = ?, claimed_at = ?, started_at = ? "
+                    "WHERE id = ? AND owner IS NULL "
+                    "AND completed_at IS NULL AND superseded_by IS NULL "
+                    "RETURNING id",
+                    (caller_id, now, now, rd["id"]),
+                )
+                if not await cur.fetchone():
+                    return _err(
+                        f"task {task_id} {role} was already accepted"
+                    )
+                await c.commit()
+        finally:
+            await c.close()
+
+        ts = _now_iso()
+        await bus.publish({
+            "ts": ts,
+            "agent_id": caller_id,
+            "type": "task_role_claimed",
+            "task_id": task_id,
+            "role": role,
+            "owner": caller_id,
+            "to": caller_id,
+        })
+        if role == "executor":
+            await bus.publish({
+                "ts": ts,
+                "agent_id": caller_id,
+                "type": "task_claimed",
+                "task_id": task_id,
+            })
+        return _ok(f"accepted {role} on {task_id}")
 
     @tool(
         "coord_update_task",
@@ -775,6 +1350,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 return _err(gate_err)
 
             now = _now_iso()
+            # Stamp last_stage_change_at + clear stale_alert_at on every
+            # status change (audit-2026-05-04 item 6).
             if is_archive_move:
                 if was_cancellation:
                     # Distinguish cancellation from delivery — both land
@@ -782,16 +1359,18 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     # toggle keys on cancelled_at.
                     await c.execute(
                         "UPDATE tasks SET status = 'archive', "
-                        "completed_at = ?, archived_at = ?, cancelled_at = ? "
+                        "completed_at = ?, archived_at = ?, cancelled_at = ?, "
+                        "last_stage_change_at = ?, stale_alert_at = NULL "
                         "WHERE id = ? AND project_id = ?",
-                        (now, now, now, task_id, project_id),
+                        (now, now, now, now, task_id, project_id),
                     )
                 else:
                     await c.execute(
                         "UPDATE tasks SET status = 'archive', "
-                        "completed_at = ?, archived_at = ? "
+                        "completed_at = ?, archived_at = ?, "
+                        "last_stage_change_at = ?, stale_alert_at = NULL "
                         "WHERE id = ? AND project_id = ?",
-                        (now, now, task_id, project_id),
+                        (now, now, now, task_id, project_id),
                     )
                 # Free the executor.
                 if current_owner is not None:
@@ -802,9 +1381,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     )
             else:
                 await c.execute(
-                    "UPDATE tasks SET status = ? "
+                    "UPDATE tasks SET status = ?, "
+                    "last_stage_change_at = ?, stale_alert_at = NULL "
                     "WHERE id = ? AND project_id = ?",
-                    (new_status, task_id, project_id),
+                    (new_status, now, task_id, project_id),
                 )
             await c.commit()
         finally:
@@ -883,10 +1463,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "eligible_owners list set on a task_role_assignments row; all "
             "eligible Players are auto-woken with an 'available task' prompt.\n"
             "\n"
-            "Standard-complexity tasks must have a spec.md before they can "
-            "move to execute (write one with coord_write_task_spec, or "
-            "delegate via coord_assign_planner). Simple-complexity tasks "
-            "skip the spec gate.\n"
+            "Tasks whose trajectory includes `plan` must have a spec.md "
+            "before they can move to execute (the planner writes one via "
+            "coord_write_task_spec). Trajectories without `plan` skip the "
+            "spec gate.\n"
             "\n"
             "Fails if: you're a Player (Players report, don't assign), the "
             "task isn't status=plan, the target isn't a valid Player slot, "
@@ -942,7 +1522,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             project_id = await resolve_active_project()
             # Read the task: must be in plan, must have spec if standard.
             cur = await c.execute(
-                "SELECT status, owner, complexity, spec_path "
+                "SELECT status, owner, trajectory, spec_path "
                 "FROM tasks WHERE id = ? AND project_id = ?",
                 (task_id, project_id),
             )
@@ -957,15 +1537,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"Use coord_advance_task_stage to force a transition, "
                     f"or send a message if you want to nudge an in-flight task."
                 )
-            if (
-                ed["complexity"] == "standard"
-                and not ed.get("spec_path")
-            ):
+            ed_stages = _trajectory_stages_from_row(ed)
+            if "plan" in ed_stages and not ed.get("spec_path"):
                 return _err(
-                    f"task {task_id} has no spec — write one with "
-                    f"coord_write_task_spec or delegate via "
-                    f"coord_assign_planner before assigning the executor. "
-                    f"(Simple-complexity tasks skip this gate.)"
+                    f"task {task_id} has no spec — the planner must call "
+                    f"coord_write_task_spec before assigning the "
+                    f"executor. (Trajectories without `plan` skip this "
+                    f"gate.)"
                 )
 
             now = _now_iso()
@@ -982,11 +1560,25 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 # the list and busy Players will simply ignore it. The
                 # idle poller picks up posted-pool work later for any
                 # Player that becomes free.
-                await c.execute(
+                cur = await c.execute(
                     "INSERT INTO task_role_assignments "
                     "(task_id, role, eligible_owners, owner, assigned_at) "
                     "VALUES (?, 'executor', ?, NULL, ?)",
                     (task_id, eligible_json, now),
+                )
+                new_role_id = cur.lastrowid
+                # Supersede any prior active executor row + mirror the
+                # candidate list into tasks.trajectory.to (audit
+                # 2026-05-04 items 7 + 8).
+                await c.execute(
+                    "UPDATE task_role_assignments SET superseded_by = ? "
+                    "WHERE task_id = ? AND role = 'executor' "
+                    "AND id != ? "
+                    "AND completed_at IS NULL AND superseded_by IS NULL",
+                    (new_role_id, task_id, new_role_id),
+                )
+                await _mirror_assign_targets_to_trajectory(
+                    c, task_id=task_id, role="executor", targets=deduped
                 )
                 await c.commit()
             else:
@@ -1006,13 +1598,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                         f"or complete it before reassigning."
                     )
                 # Atomic transition plan → execute. status='plan' guard
-                # is race-safe.
+                # is race-safe. Stamp last_stage_change_at + clear
+                # stale_alert_at (audit-2026-05-04 item 6).
                 cur = await c.execute(
                     "UPDATE tasks SET owner = ?, status = 'execute', "
-                    "claimed_at = ?, started_at = NULL "
+                    "claimed_at = ?, started_at = NULL, "
+                    "last_stage_change_at = ?, stale_alert_at = NULL "
                     "WHERE id = ? AND status = 'plan' "
                     "AND project_id = ? RETURNING id",
-                    (slot, now, task_id, project_id),
+                    (slot, now, now, task_id, project_id),
                 )
                 updated = await cur.fetchone()
                 if not updated:
@@ -1029,12 +1623,25 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                         f"task {task_id} race-lost during assign "
                         f"(status={d['status']}, owner={d['owner'] or '-'})"
                     )
-                await c.execute(
+                cur = await c.execute(
                     "INSERT INTO task_role_assignments "
                     "(task_id, role, eligible_owners, owner, "
                     "assigned_at, claimed_at) "
                     "VALUES (?, 'executor', '[]', ?, ?, ?)",
                     (task_id, slot, now, now),
+                )
+                new_role_id = cur.lastrowid
+                # Supersede prior active executor row + mirror the
+                # candidate list (audit-2026-05-04 items 7+8).
+                await c.execute(
+                    "UPDATE task_role_assignments SET superseded_by = ? "
+                    "WHERE task_id = ? AND role = 'executor' "
+                    "AND id != ? "
+                    "AND completed_at IS NULL AND superseded_by IS NULL",
+                    (new_role_id, task_id, new_role_id),
+                )
+                await _mirror_assign_targets_to_trajectory(
+                    c, task_id=task_id, role="executor", targets=[slot]
                 )
                 await c.execute(
                     "UPDATE agents SET current_task_id = ? WHERE id = ?",
@@ -1044,18 +1651,19 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         finally:
             await c.close()
 
-        # Read task complexity again for the wake prompt branching.
+        # Read task trajectory again for the wake prompt branching.
         # Cheap second-read is fine; the bus.publish below already
         # closed our connection.
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT complexity FROM tasks WHERE id = ?", (task_id,)
+                "SELECT trajectory FROM tasks WHERE id = ?", (task_id,)
             )
             crow = await cur.fetchone()
-            complexity = (dict(crow)["complexity"] if crow else "standard")
+            wake_stages = _trajectory_stages_from_row(dict(crow) if crow else {})
         finally:
             await c.close()
+        no_audit_configured = not _trajectory_has_audit(wake_stages)
 
         # Emit task_role_assigned (kanban event family). The legacy
         # task_assigned is also emitted for back-compat; the kanban
@@ -1086,12 +1694,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         try:
             from server.agents import maybe_wake_agent
             simple_hint = ""
-            if complexity == "simple":
+            if no_audit_configured:
                 simple_hint = (
-                    " This task is marked SIMPLE — self-audit (run tests / "
-                    "sanity-check the change) before coord_commit_push because "
-                    "the board archives directly on commit, no separate audit "
-                    "pass."
+                    " This task has no audit stage configured — self-audit "
+                    "(run tests / sanity-check the change) before "
+                    "coord_commit_push or coord_complete_execution. The "
+                    "board archives directly on completion; there is no "
+                    "separate review pass."
                 )
             if is_pool:
                 pool_str = ", ".join(deduped)
@@ -1113,8 +1722,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"Coach assigned you task {task_id} as executor "
                     f"(status=execute, owner={slot}). Read spec.md from "
                     f"the task folder, do the work, then call "
-                    f"coord_commit_push(task_id={task_id!r}, ...) when "
-                    f"the work is in.{simple_hint}"
+                    f"coord_commit_push(task_id={task_id!r}, ...) for "
+                    f"code changes or coord_complete_execution("
+                    f"task_id={task_id!r}, ...) for non-code artifacts."
+                    f"{simple_hint}"
                 )
                 await maybe_wake_agent(slot, wake_prompt, bypass_debounce=True)
         except Exception:
@@ -1626,7 +2237,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- task_id: the kanban task this commit is delivering against "
             "(optional but STRONGLY RECOMMENDED). When provided, the "
             "kanban subscriber sees `commit_pushed` with task_id and "
-            "auto-advances the task: standard → audit_syntax, simple → "
+            "auto-routes the task to the next required review, ship, or "
             "archive. Without task_id the commit still works but the "
             "kanban board doesn't move (Coach has to advance manually).\n"
             "Returns 'nothing to commit' as a soft-OK if the working tree "
@@ -1821,6 +2432,142 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             }
         )
         return _ok(f"committed {sha}: {message}{push_note}")
+
+    @tool(
+        "coord_complete_execution",
+        (
+            "Player-only. Mark a non-git execution task complete. Use "
+            "this when the deliverable is a research report, paper, "
+            "marketing draft, decision memo, ops action, or other "
+            "durable artifact where coord_commit_push is the wrong "
+            "completion primitive. Code tasks should still use "
+            "coord_commit_push(task_id=...).\n"
+            "\n"
+            "Validates that you own the active execute-stage task and "
+            "have an uncompleted executor role. The kanban subscriber "
+            "then routes the card to the next required review, ship, or "
+            "archive according to the task workflow.\n"
+            "\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- summary: what you produced / changed (required)\n"
+            "- artifact_path: optional durable path, e.g. knowledge/reports/...\n"
+            "- completion_kind: optional label (research, writing, ops, noop, other)"
+        ),
+        {
+            "task_id": str,
+            "summary": str,
+            "artifact_path": str,
+            "completion_kind": str,
+        },
+    )
+    async def complete_execution(args: dict[str, Any]) -> dict[str, Any]:
+        if caller_is_coach:
+            return _err(
+                "Coach does not execute work. Assign a Player executor."
+            )
+        task_id = (args.get("task_id") or "").strip()
+        summary = (args.get("summary") or "").strip()
+        artifact_path = (args.get("artifact_path") or "").strip()
+        completion_kind = (
+            (args.get("completion_kind") or "other").strip().lower()
+        )
+        if not task_id:
+            return _err("task_id is required")
+        if not summary:
+            return _err("summary is required")
+        if len(summary) > 5000:
+            return _err(f"summary too long ({len(summary)} chars, max 5000)")
+        if len(artifact_path) > 1000:
+            return _err("artifact_path too long (max 1000 chars)")
+        if len(completion_kind) > 50:
+            return _err("completion_kind too long (max 50 chars)")
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT t.status, t.owner, t.artifacts, "
+                "(SELECT id FROM task_role_assignments "
+                " WHERE task_id = t.id AND role = 'executor' "
+                " AND owner = ? AND completed_at IS NULL "
+                " AND superseded_by IS NULL "
+                " ORDER BY assigned_at DESC LIMIT 1) AS role_id "
+                "FROM tasks t WHERE t.id = ? AND t.project_id = ?",
+                (caller_id, task_id, project_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"task {task_id} not found in active project")
+            t = dict(row)
+            if t.get("status") != "execute":
+                return _err(
+                    f"task {task_id} is in stage {t.get('status')}, "
+                    "not execute"
+                )
+            if t.get("owner") != caller_id:
+                return _err(
+                    f"task {task_id} is owned by "
+                    f"{t.get('owner') or 'no one'}, not {caller_id}"
+                )
+            role_id = t.get("role_id")
+            if not role_id:
+                return _err(
+                    f"task {task_id} has no active uncompleted executor "
+                    f"role for {caller_id}"
+                )
+            now = _now_iso()
+            await c.execute(
+                "UPDATE task_role_assignments SET completed_at = ? "
+                "WHERE id = ?",
+                (now, role_id),
+            )
+            if artifact_path:
+                try:
+                    artifacts = json.loads(t.get("artifacts") or "[]")
+                    if not isinstance(artifacts, list):
+                        artifacts = []
+                except Exception:
+                    artifacts = []
+                if artifact_path not in artifacts:
+                    artifacts.append(artifact_path)
+                await c.execute(
+                    "UPDATE tasks SET artifacts = ? "
+                    "WHERE id = ? AND project_id = ?",
+                    (
+                        json.dumps(artifacts, separators=(",", ":")),
+                        task_id, project_id,
+                    ),
+                )
+            await c.commit()
+        finally:
+            await c.close()
+
+        ts = _now_iso()
+        await bus.publish({
+            "ts": ts,
+            "agent_id": caller_id,
+            "type": "task_role_completed",
+            "task_id": task_id,
+            "role": "executor",
+            "owner": caller_id,
+            "artifact_path": artifact_path or None,
+            "to": caller_id,
+        })
+        await bus.publish({
+            "ts": ts,
+            "agent_id": caller_id,
+            "type": "task_execution_completed",
+            "task_id": task_id,
+            "summary": summary,
+            "artifact_path": artifact_path or None,
+            "completion_kind": completion_kind,
+            "to": caller_id,
+        })
+        return _ok(
+            f"completed execution for {task_id}"
+            + (f" → {artifact_path}" if artifact_path else "")
+        )
 
     @tool(
         "coord_write_decision",
@@ -3641,21 +4388,23 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     @tool(
         "coord_write_task_spec",
         (
-            "Write the spec.md for a task. Required before a standard-"
-            "complexity task can move plan→execute (gate enforced in "
-            "coord_assign_task / coord_claim_task). Simple tasks don't "
-            "need a spec — title + description on the row are enough.\n"
+            "Write the spec.md for a task. Required before a task whose "
+            "trajectory includes `plan` can move plan→execute (gate "
+            "enforced in coord_assign_task / coord_claim_task). "
+            "Trajectories without `plan` skip the spec gate.\n"
             "\n"
-            "Permission: Coach can spec any task. A Player can spec a "
-            "task if they (a) have an active planner role assignment, "
-            "(b) are the executor (re-spec during a fail loop), or "
-            "(c) it's a subtask of their current task.\n"
+            "Permission: Coach can spec any task (emergency override). A "
+            "Player can spec a task if they (a) have an active planner "
+            "role assignment, (b) are the executor (re-spec during a "
+            "fail loop), or (c) it's a subtask of their current task. "
+            "By policy Coach should always delegate planning — see the "
+            "lifecycle-policy block for the steer.\n"
             "\n"
             "Body is a full markdown document. Frontmatter is added "
             "automatically (task_id / title / created_by / priority / "
-            "complexity / spec_author / spec_written_at). The body "
-            "should cover Goal, 'Done looks like', Constraints, References. "
-            "Existing spec is overwritten — rolling history lives in events.\n"
+            "spec_author / spec_written_at). The body should cover Goal, "
+            "'Done looks like', Constraints, References. Existing spec "
+            "is overwritten — rolling history lives in events.\n"
             "\n"
             "Params:\n"
             "- task_id: required\n"
@@ -3686,7 +4435,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             # Read task metadata + permission check.
             cur = await c.execute(
                 "SELECT title, owner, created_by, created_at, priority, "
-                "complexity, status, parent_id "
+                "status, parent_id "
                 "FROM tasks WHERE id = ? AND project_id = ?",
                 (task_id, project_id),
             )
@@ -3746,7 +4495,6 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 created_by=t["created_by"],
                 created_at=t["created_at"],
                 priority=t["priority"],
-                complexity=t["complexity"],
             )
         except ValueError as exc:
             return _err(str(exc))
@@ -3808,6 +4556,55 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     # validate target slots; insert task_role_assignments row(s); auto-wake.
     # --------------------------------------------------------------
 
+    # v0.3 audit-2026-05-04 items 7+8: when role rows are created
+    # mid-flight by coord_assign_*, mirror the new candidate list back
+    # into tasks.trajectory.to for the matching stage so the stored
+    # trajectory + Coach prompt + UI marker stay in sync. Best-effort:
+    # an empty/malformed trajectory or a stage absent from the
+    # trajectory leaves the column unchanged (full rewrites are
+    # coord_set_task_trajectory's job).
+    _STAGE_FOR_ROLE = {
+        "planner": "plan",
+        "executor": "execute",
+        "auditor_syntax": "audit_syntax",
+        "auditor_semantics": "audit_semantics",
+        "shipper": "ship",
+    }
+
+    async def _mirror_assign_targets_to_trajectory(
+        c, *, task_id: str, role: str, targets: list[str]
+    ) -> None:
+        target_stage = _STAGE_FOR_ROLE.get(role)
+        if not target_stage:
+            return
+        cur = await c.execute(
+            "SELECT trajectory FROM tasks WHERE id = ?",
+            (task_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return
+        try:
+            traj = json.loads(dict(row).get("trajectory") or "[]")
+        except (TypeError, ValueError):
+            return
+        if not isinstance(traj, list):
+            return
+        changed = False
+        for entry in traj:
+            if (
+                isinstance(entry, dict)
+                and entry.get("stage") == target_stage
+            ):
+                entry["to"] = list(targets)
+                changed = True
+                break
+        if changed:
+            await c.execute(
+                "UPDATE tasks SET trajectory = ? WHERE id = ?",
+                (json.dumps(traj, separators=(",", ":")), task_id),
+            )
+
     async def _assign_role_helper(
         c,
         *,
@@ -3821,50 +4618,86 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
 
         For hard-assign (single target) the row's `owner` is set
         immediately. For pool (multi-target) `owner` stays NULL until
-        a Player claims via coord_claim_task (executor pool only —
-        for planner / auditor / shipper, the first to act on the
-        wake prompt by writing the artifact "wins" implicitly via
-        the role's completed_at column).
+        a Player accepts the current-stage call. Future-stage
+        reservations are stored but not woken until the card actually
+        reaches that stage.
+
+        v0.3 audit-2026-05-04 items 7+8:
+        - Any prior active row for the same (task_id, role) is
+          superseded via `superseded_by = <new_row_id>` so the board
+          UI does not show a stale assignee alongside the new one.
+        - The corresponding stage in `tasks.trajectory` has its `to`
+          list updated to reflect the new candidate list, so the
+          stored trajectory + Coach prompt + UI marker stay in sync
+          with the role rows.
         """
         import json as _json
         is_pool = len(targets) > 1
         now = _now_iso()
         eligible_json = _json.dumps(targets)
         if is_pool:
-            await c.execute(
+            cur = await c.execute(
                 "INSERT INTO task_role_assignments "
                 "(task_id, role, eligible_owners, owner, assigned_at) "
                 "VALUES (?, ?, ?, NULL, ?)",
                 (task_id, role, eligible_json, now),
             )
         else:
-            await c.execute(
+            cur = await c.execute(
                 "INSERT INTO task_role_assignments "
                 "(task_id, role, eligible_owners, owner, "
                 "assigned_at, claimed_at) "
                 "VALUES (?, ?, '[]', ?, ?, ?)",
                 (task_id, role, targets[0], now, now),
             )
+        new_id = cur.lastrowid
+        # Supersede any prior active row for the same (task_id, role)
+        # so the board's "first active matching row" pick stays correct.
+        await c.execute(
+            "UPDATE task_role_assignments SET superseded_by = ? "
+            "WHERE task_id = ? AND role = ? "
+            "AND id != ? "
+            "AND completed_at IS NULL AND superseded_by IS NULL",
+            (new_id, task_id, role, new_id),
+        )
+        # Mirror the new candidate list back into tasks.trajectory.to
+        # for the matching stage (item 8).
+        await _mirror_assign_targets_to_trajectory(
+            c, task_id=task_id, role=role, targets=targets
+        )
         await c.commit()
 
-        # Auto-wake eligible Players. Late import to dodge circular dep.
-        try:
-            from server.agents import maybe_wake_agent
-            for slot in targets:
-                try:
-                    await maybe_wake_agent(
-                        slot, wake_prompt_for_role, bypass_debounce=True
-                    )
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        # Auto-wake only when the role is active for the card's current
+        # stage. Coach may reserve future formal/semantic/ship roles up
+        # front; those Players must not see actionable work until the
+        # task flows into their stage.
+        cur = await c.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        )
+        row = await cur.fetchone()
+        stage = dict(row).get("status") if row else ""
+        woken_now = _role_matches_stage(role, stage)
+        if woken_now:
+            try:
+                from server.agents import maybe_wake_agent
+                for slot in targets:
+                    try:
+                        await maybe_wake_agent(
+                            slot, wake_prompt_for_role, bypass_debounce=True
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
         if is_pool:
+            verb = "called" if woken_now else "reserved"
             return True, (
-                f"posted {task_id} to {role} pool: {', '.join(targets)}"
+                f"{verb} {task_id} {role} pool: {', '.join(targets)}"
             ), targets
-        return True, f"assigned {task_id} {role} → {targets[0]}", targets
+        verb = "assigned" if woken_now else "reserved"
+        return True, f"{verb} {task_id} {role} → {targets[0]}", targets
 
     async def _validate_role_targets(
         targets_raw: str, *, role_label: str
@@ -3902,14 +4735,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         (
             "Coach-only. Delegate writing the spec for a task. Both "
             "single-Player hard-assign and comma-list pool are accepted "
-            "(same shape as coord_assign_task).\n"
-            "\n"
-            "Optional: if Coach is happy writing the spec themselves, "
-            "they SKIP this tool and just call coord_write_task_spec "
-            "directly. Both flows are valid.\n"
-            "\n"
-            "Standard-complexity tasks need a spec to leave the plan "
-            "stage; simple tasks can skip the planner role entirely.\n"
+            "(same shape as coord_assign_task). Tasks whose trajectory "
+            "includes `plan` need a spec before they can move to "
+            "execute; trajectories without `plan` skip the planner role.\n"
             "\n"
             "Params:\n"
             "- task_id: required\n"
@@ -3933,7 +4761,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT status, complexity FROM tasks "
+                "SELECT status FROM tasks "
                 "WHERE id = ? AND project_id = ?",
                 (task_id, project_id),
             )
@@ -3948,6 +4776,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 )
             wake_prompt = (
                 f"Coach asked you to draft the spec for task {task_id}. "
+                f"If this was a pool call, first call "
+                f"coord_accept_role(task_id={task_id!r}, role='planner'); "
                 f"Read coord_list_tasks output for the title/description, "
                 f"then call coord_write_task_spec(task_id={task_id!r}, "
                 f"body=...) with the goal, 'done looks like', constraints, "
@@ -4001,13 +4831,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             return _err("Only Coach assigns auditors.")
         task_id = (args.get("task_id") or "").strip()
         to_raw = (args.get("to") or "").strip()
-        kind = (args.get("kind") or "").strip().lower()
+        kind_input = (args.get("kind") or "").strip().lower()
         if not task_id:
             return _err("task_id is required")
-        role = _resolve_audit_role_kind(kind)
+        role = _resolve_audit_role_kind(kind_input)
         if role is None:
-            return _err("kind must be 'syntax' or 'semantics'")
-        targets, err = await _validate_role_targets(to_raw, role_label=f"{kind} auditor")
+            return _err("kind must be 'formal'/'syntax' or 'semantic'/'semantics'")
+        kind = "syntax" if role == "auditor_syntax" else "semantics"
+        review_label = "formal" if kind == "syntax" else "semantic"
+        targets, err = await _validate_role_targets(to_raw, role_label=f"{review_label} reviewer")
         if err:
             return _err(err)
         if targets is None:
@@ -4027,9 +4859,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             executor = t.get("owner")
             self_review = bool(executor and executor in targets)
             wake_prompt = (
-                f"Coach asked you to audit task {task_id} ({kind}). "
+                f"Coach asked you to perform {review_label} review on task {task_id}. "
+                f"If this was a pool call, first call "
+                f"coord_accept_role(task_id={task_id!r}, role={role!r}); "
                 f"Read the spec at /data/projects/.../tasks/{task_id}/spec.md, "
-                f"the commit history, and (for semantics) any Compass "
+                f"the delivered artifact, and (for semantics) any Compass "
                 f"audit report linked from the kanban card. When done, "
                 f"call coord_submit_audit_report(task_id={task_id!r}, "
                 f"kind={kind!r}, verdict='pass'|'fail', body=...)"
@@ -4078,7 +4912,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     "agent_id": caller_id,
                     "type": "audit_self_review_warning",
                     "task_id": task_id,
-                    "kind": kind,
+                    "kind": review_label,
                     "auditor_id": targets[0] if len(targets) == 1 else None,
                     "executor_id": executor,
                 }
@@ -4130,7 +4964,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 return _err(f"task {task_id} not found")
             wake_prompt = (
                 f"Coach assigned you to ship task {task_id}. Open the PR, "
-                f"run the merge, then call coord_mark_shipped("
+                f"send/publish the deliverable, or confirm there is nothing "
+                f"to merge. If this was a pool call, first call "
+                f"coord_accept_role(task_id={task_id!r}, role='shipper'). "
+                f"Then call coord_mark_shipped("
                 f"task_id={task_id!r}). The kanban will then archive "
                 f"the task."
             )
@@ -4188,14 +5025,16 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "coord_assign_auditor and let them submit."
             )
         task_id = (args.get("task_id") or "").strip()
-        kind = (args.get("kind") or "").strip().lower()
+        kind_input = (args.get("kind") or "").strip().lower()
         body = args.get("body") or ""
         verdict = (args.get("verdict") or "").strip().lower()
         if not task_id:
             return _err("task_id is required")
-        role = _resolve_audit_role_kind(kind)
+        role = _resolve_audit_role_kind(kind_input)
         if role is None:
-            return _err("kind must be 'syntax' or 'semantics'")
+            return _err("kind must be 'formal'/'syntax' or 'semantic'/'semantics'")
+        kind = "syntax" if role == "auditor_syntax" else "semantics"
+        review_label = "formal" if kind == "syntax" else "semantic"
         if verdict not in ("pass", "fail"):
             return _err("verdict must be 'pass' or 'fail'")
         if not body.strip():
@@ -4206,6 +5045,21 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         project_id = await resolve_active_project()
         c = await configured_conn()
         try:
+            cur = await c.execute(
+                "SELECT status FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            task_row = await cur.fetchone()
+            if not task_row:
+                return _err(f"task {task_id} not found")
+            expected_stage = "audit_syntax" if role == "auditor_syntax" else "audit_semantics"
+            actual_stage = dict(task_row).get("status")
+            if actual_stage != expected_stage:
+                return _err(
+                    f"{review_label} review is not active for task {task_id} "
+                    f"(stage={actual_stage}). Future-stage assignments are "
+                    f"not actionable until the card reaches their column."
+                )
             # Find the active auditor assignment for the caller. Must
             # exist, be uncompleted, and not superseded.
             cur = await c.execute(
@@ -4218,7 +5072,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             row = await cur.fetchone()
             if not row:
                 return _err(
-                    f"no active {kind} auditor assignment for {caller_id} "
+                    f"no active {review_label} reviewer assignment for {caller_id} "
                     f"on task {task_id}. Coach must call "
                     f"coord_assign_auditor before you can submit."
                 )
@@ -4346,6 +5200,18 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         c = await configured_conn()
         try:
             cur = await c.execute(
+                "SELECT status FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            task_row = await cur.fetchone()
+            if not task_row:
+                return _err(f"task {task_id} not found")
+            if dict(task_row).get("status") != "ship":
+                return _err(
+                    f"ship role is not active for task {task_id} "
+                    f"(stage={dict(task_row).get('status')})."
+                )
+            cur = await c.execute(
                 "SELECT id FROM task_role_assignments "
                 "WHERE task_id = ? AND role = 'shipper' AND owner = ? "
                 "AND completed_at IS NULL AND superseded_by IS NULL "
@@ -4404,9 +5270,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     @tool(
         "coord_my_assignments",
         (
-            "Player-only. Returns your full plate in four buckets:\n"
+            "Player-only. Returns your current actionable plate in four buckets:\n"
             "  1. Active executor task (the one in agents.current_task_id)\n"
-            "  2. Pending auditor assignments (syntax + semantics)\n"
+            "  2. Pending reviewer assignments (formal + semantic)\n"
             "  3. Pending shipper assignments\n"
             "  4. Eligible-pool tasks you could claim\n"
             "\n"
@@ -4428,7 +5294,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             # Bucket 1: active executor task.
             cur = await c.execute(
                 "SELECT a.current_task_id, t.title, t.status, t.priority, "
-                "t.complexity, t.spec_path "
+                "t.trajectory, t.spec_path "
                 "FROM agents a LEFT JOIN tasks t ON t.id = a.current_task_id "
                 "WHERE a.id = ?",
                 (caller_id,),
@@ -4438,28 +5304,39 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             if arow:
                 ad = dict(arow)
                 if ad.get("current_task_id"):
+                    ad_stages = _trajectory_stages_from_row(ad)
                     executor_task = {
                         "id": ad["current_task_id"],
                         "title": ad.get("title") or "(unknown)",
                         "status": ad.get("status") or "?",
                         "priority": ad.get("priority") or "normal",
-                        "complexity": ad.get("complexity") or "standard",
+                        "trajectory": ad_stages,
                         "has_spec": bool(ad.get("spec_path")),
                     }
 
-            # Bucket 2 + 3: pending auditor + shipper assignments.
+            # Bucket 2 + 3: pending planner / reviewer / shipper
+            # assignments, filtered to the card's current stage so
+            # future-stage reservations do not look actionable early.
             cur = await c.execute(
                 "SELECT r.task_id, r.role, r.assigned_at, t.title, t.priority "
                 "FROM task_role_assignments r "
                 "JOIN tasks t ON t.id = r.task_id "
                 "WHERE r.owner = ? AND r.role IN "
-                "  ('auditor_syntax','auditor_semantics','shipper') "
+                "  ('planner','auditor_syntax','auditor_semantics','shipper') "
                 "AND r.completed_at IS NULL AND r.superseded_by IS NULL "
                 "AND t.project_id = ? "
+                "AND ("
+                "  (r.role = 'planner' AND t.status = 'plan') "
+                "  OR "
+                "  (r.role = 'auditor_syntax' AND t.status = 'audit_syntax') "
+                "  OR (r.role = 'auditor_semantics' AND t.status = 'audit_semantics') "
+                "  OR (r.role = 'shipper' AND t.status = 'ship')"
+                ") "
                 "ORDER BY r.assigned_at",
                 (caller_id, project_id),
             )
-            pending_audits: list[dict[str, Any]] = []
+            pending_plans: list[dict[str, Any]] = []
+            pending_reviews: list[dict[str, Any]] = []
             pending_ships: list[dict[str, Any]] = []
             for r in await cur.fetchall():
                 rd = dict(r)
@@ -4469,18 +5346,20 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     "priority": rd["priority"],
                     "assigned_at": rd["assigned_at"],
                 }
-                if rd["role"] == "shipper":
+                if rd["role"] == "planner":
+                    pending_plans.append(entry)
+                elif rd["role"] == "shipper":
                     pending_ships.append(entry)
                 else:
                     entry["kind"] = _audit_kind_from_role(rd["role"])
-                    pending_audits.append(entry)
+                    pending_reviews.append(entry)
 
             # Bucket 4: eligible-pool tasks. JSON1 json_each scans the
             # eligible_owners array; cheap because we already filter on
             # role + status.
             cur = await c.execute(
                 "SELECT DISTINCT r.task_id, r.role, r.eligible_owners, "
-                "t.title, t.priority, t.complexity "
+                "t.title, t.priority, t.trajectory "
                 "FROM task_role_assignments r "
                 "JOIN tasks t ON t.id = r.task_id, "
                 "json_each(r.eligible_owners) je "
@@ -4488,17 +5367,25 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "AND r.owner IS NULL "
                 "AND r.completed_at IS NULL AND r.superseded_by IS NULL "
                 "AND t.project_id = ? "
+                "AND ("
+                "  (r.role = 'executor' AND t.status = 'plan') "
+                "  OR (r.role = 'planner' AND t.status = 'plan') "
+                "  OR (r.role = 'auditor_syntax' AND t.status = 'audit_syntax') "
+                "  OR (r.role = 'auditor_semantics' AND t.status = 'audit_semantics') "
+                "  OR (r.role = 'shipper' AND t.status = 'ship')"
+                ") "
                 "ORDER BY r.assigned_at",
                 (caller_id, project_id),
             )
             eligible: list[dict[str, Any]] = []
             for r in await cur.fetchall():
                 rd = dict(r)
+                rd_stages = _trajectory_stages_from_row(rd)
                 eligible.append({
                     "task_id": rd["task_id"],
                     "title": rd["title"],
                     "priority": rd["priority"],
-                    "complexity": rd["complexity"],
+                    "trajectory": rd_stages,
                     "role": rd["role"],
                 })
         finally:
@@ -4508,20 +5395,31 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         lines: list[str] = []
         if executor_task:
             spec_marker = "" if executor_task["has_spec"] else " [no spec]"
+            traj_str = ",".join(executor_task["trajectory"]) or "execute"
             lines.append(
                 f"## Executor: {executor_task['id']} "
                 f"\"{executor_task['title']}\" "
                 f"(stage={executor_task['status']}, "
                 f"pri={executor_task['priority']}, "
-                f"complexity={executor_task['complexity']}{spec_marker})"
+                f"trajectory=[{traj_str}]{spec_marker})"
             )
         else:
             lines.append("## Executor: (none — you have no active task)")
 
         lines.append("")
-        lines.append("## Pending audits:")
-        if pending_audits:
-            for e in pending_audits:
+        lines.append("## Pending planner assignments:")
+        if pending_plans:
+            for e in pending_plans:
+                lines.append(
+                    f"  - {e['task_id']} (pri={e['priority']}): {e['title']}"
+                )
+        else:
+            lines.append("  (none)")
+
+        lines.append("")
+        lines.append("## Pending reviews:")
+        if pending_reviews:
+            for e in pending_reviews:
                 lines.append(
                     f"  - {e['task_id']} ({e['kind']}, pri={e['priority']}): "
                     f"{e['title']}"
@@ -4545,15 +5443,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             for e in eligible:
                 role_label = {
                     "executor": "executor",
-                    "auditor_syntax": "syntax auditor",
-                    "auditor_semantics": "semantic auditor",
+                    "auditor_syntax": "formal reviewer",
+                    "auditor_semantics": "semantic reviewer",
                     "shipper": "shipper",
                     "planner": "planner",
                 }.get(e["role"], e["role"])
-                simple = " SIMPLE" if e["complexity"] == "simple" else ""
+                stages = e.get("trajectory") or []
+                traj_str = ",".join(stages) if stages else ""
+                traj_chip = f" [{traj_str}]" if traj_str else ""
                 lines.append(
                     f"  - {e['task_id']} ({role_label}, "
-                    f"pri={e['priority']}{simple}): {e['title']}"
+                    f"pri={e['priority']}{traj_chip}): {e['title']}"
                 )
         else:
             lines.append("  (none)")
@@ -4561,61 +5461,236 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         return _ok("\n".join(lines))
 
     @tool(
-        "coord_set_task_complexity",
+        "coord_set_task_trajectory",
         (
-            "Coach-only. Mark a task simple or standard. Simple tasks "
-            "skip audit + ship — they go plan → execute → archive on "
-            "commit, and the executor self-audits. Use simple for typo "
-            "fixes, log-message tweaks, single-line bug fixes — anything "
-            "well-bounded enough that the executor's diligence is enough "
-            "review. Default at create time is 'standard'.\n"
+            "Coach-only. Mid-flight reroute of a task's trajectory. Use "
+            "this when an unexpected audit reveals more work, or when "
+            "Coach decides a task can skip an audit it originally had. "
+            "Cannot remove a stage the task has already entered.\n"
             "\n"
             "Params:\n"
             "- task_id: required\n"
-            "- complexity: 'simple' or 'standard'"
+            "- trajectory: ordered list of {stage, to} objects (same shape "
+            "as coord_create_task's trajectory param). Replaces the task's "
+            "stored trajectory; supersedes role rows for stages that were "
+            "removed; inserts role rows for stages that are added; updates "
+            "eligible_owners on stages that remain.\n"
         ),
-        {"task_id": str, "complexity": str},
+        {"task_id": str, "trajectory": Any},
     )
-    async def set_task_complexity(args: dict[str, Any]) -> dict[str, Any]:
+    async def set_task_trajectory(args: dict[str, Any]) -> dict[str, Any]:
         if not caller_is_coach:
-            return _err("Only Coach can set task complexity.")
+            return _err("Only Coach can set the task trajectory.")
         task_id = (args.get("task_id") or "").strip()
-        complexity = (args.get("complexity") or "").strip().lower()
         if not task_id:
             return _err("task_id is required")
-        if complexity not in ("simple", "standard"):
-            return _err("complexity must be 'simple' or 'standard'")
+        trajectory, traj_err = _validate_trajectory(args.get("trajectory"))
+        if traj_err:
+            return _err(f"invalid trajectory: {traj_err}")
+        assert trajectory is not None
+
         project_id = await resolve_active_project()
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT owner FROM tasks WHERE id = ? AND project_id = ?",
+                "SELECT owner, status, trajectory FROM tasks "
+                "WHERE id = ? AND project_id = ?",
                 (task_id, project_id),
             )
             row = await cur.fetchone()
             if not row:
                 return _err(f"task {task_id} not found")
-            owner = dict(row).get("owner")
+            t = dict(row)
+            current_status = t.get("status")
+            if current_status == "archive":
+                return _err("archived tasks are read-only")
+
+            new_stages = [s["stage"] for s in trajectory]
+            old_stages = _trajectory_stages_from_row(t)
+            # v0.3 audit-2026-05-04 item 5: enforce "cannot remove an
+            # already-entered stage" by walking the OLD trajectory up
+            # to and including the current stage. The previous check
+            # only looked at current_status — letting a task in
+            # audit_semantics drop an already-passed audit_syntax.
+            if current_status in old_stages:
+                current_idx = old_stages.index(current_status)
+                entered = set(old_stages[: current_idx + 1])
+                removed_entered = entered - set(new_stages)
+                if removed_entered:
+                    return _err(
+                        "cannot remove already-entered stages: "
+                        + ",".join(sorted(removed_entered))
+                        + ". Use coord_advance_task_stage to move "
+                        "forward first, then reroute."
+                    )
+
+            removed = [s for s in old_stages if s not in new_stages]
+            now_iso = _now_iso()
+
+            # Deactivate role rows for removed stages. The schema's
+            # `superseded_by` is a self-FK to a replacement row;
+            # trajectory removal has none, so we use `completed_at =
+            # now()` to drop the row from active filters
+            # (`completed_at IS NULL AND superseded_by IS NULL`).
+            # This avoids the FK violation that `superseded_by = -1`
+            # produced under `PRAGMA foreign_keys = ON`.
+            role_for_stage = {
+                "plan": "planner",
+                "execute": "executor",
+                "audit_syntax": "auditor_syntax",
+                "audit_semantics": "auditor_semantics",
+                "ship": "shipper",
+            }
+            for stage in removed:
+                role = role_for_stage[stage]
+                await c.execute(
+                    "UPDATE task_role_assignments "
+                    "SET completed_at = ? "
+                    "WHERE task_id = ? AND role = ? "
+                    "AND completed_at IS NULL AND superseded_by IS NULL",
+                    (now_iso, task_id, role),
+                )
+
+            # Upsert per-stage role rows for the new trajectory.
+            for entry in trajectory:
+                stage = entry["stage"]
+                to_list: list[str] = entry.get("to") or []
+                role = role_for_stage[stage]
+                eligible_json = json.dumps(to_list, separators=(",", ":"))
+                # Find the active role row (if any). If none, insert fresh.
+                cur = await c.execute(
+                    "SELECT id, owner FROM task_role_assignments "
+                    "WHERE task_id = ? AND role = ? "
+                    "AND completed_at IS NULL AND superseded_by IS NULL "
+                    "ORDER BY assigned_at DESC LIMIT 1",
+                    (task_id, role),
+                )
+                rrow = await cur.fetchone()
+                if rrow is None:
+                    if len(to_list) == 1:
+                        await c.execute(
+                            "INSERT INTO task_role_assignments "
+                            "(task_id, role, eligible_owners, owner, "
+                            "assigned_at, claimed_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (task_id, role, eligible_json, to_list[0],
+                             now_iso, now_iso),
+                        )
+                    else:
+                        await c.execute(
+                            "INSERT INTO task_role_assignments "
+                            "(task_id, role, eligible_owners, owner, "
+                            "assigned_at) "
+                            "VALUES (?, ?, ?, NULL, ?)",
+                            (task_id, role, eligible_json, now_iso),
+                        )
+                else:
+                    # Update eligible_owners on the existing active row;
+                    # don't disturb owner / claimed_at if already set.
+                    await c.execute(
+                        "UPDATE task_role_assignments "
+                        "SET eligible_owners = ? WHERE id = ?",
+                        (eligible_json, rrow[0]),
+                    )
+
+            traj_json = json.dumps(trajectory, separators=(",", ":"))
             await c.execute(
-                "UPDATE tasks SET complexity = ? "
+                "UPDATE tasks SET trajectory = ? "
                 "WHERE id = ? AND project_id = ?",
-                (complexity, task_id, project_id),
+                (traj_json, task_id, project_id),
             )
             await c.commit()
         finally:
             await c.close()
 
-        await bus.publish(
-            {
-                "ts": _now_iso(),
-                "agent_id": caller_id,
-                "type": "task_complexity_set",
-                "task_id": task_id,
-                "complexity": complexity,
-                "to": owner,
-            }
+        await bus.publish({
+            "ts": _now_iso(),
+            "agent_id": caller_id,
+            "type": "task_trajectory_changed",
+            "task_id": task_id,
+            "trajectory": trajectory,
+            "to": t.get("owner"),
+        })
+        return _ok(
+            f"task {task_id} trajectory updated: "
+            f"[{', '.join(s['stage'] for s in trajectory)}]"
         )
-        return _ok(f"task {task_id} → complexity={complexity}")
+
+    @tool(
+        "coord_set_task_workflow",
+        (
+            "Coach-only. Set the workflow tag (and optional tracking_reason) "
+            "on a task. Workflow shapes prompt wording (code / research / "
+            "writing / marketing / ops / generic) but does NOT drive "
+            "routing — use coord_set_task_trajectory for that.\n"
+            "\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- workflow: code | research | writing | marketing | ops | generic\n"
+            "- tracking_reason: optional informational tag"
+        ),
+        {
+            "task_id": str,
+            "workflow": str,
+            "tracking_reason": str,
+        },
+    )
+    async def set_task_workflow(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("Only Coach can set task workflow.")
+        task_id = (args.get("task_id") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+        workflow = (args.get("workflow") or "").strip().lower()
+        if workflow and workflow not in WORKFLOW_TYPES:
+            return _err(
+                f"invalid workflow '{workflow}' "
+                f"(must be one of {sorted(WORKFLOW_TYPES)})"
+            )
+        tracking_reason_raw = args.get("tracking_reason")
+        tracking_reason = (
+            str(tracking_reason_raw).strip()
+            if tracking_reason_raw else ""
+        )
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT owner, status, workflow, tracking_reason "
+                "FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"task {task_id} not found")
+            t = dict(row)
+            if t.get("status") == "archive":
+                return _err("archived tasks are read-only")
+            next_workflow = workflow or (t.get("workflow") or "generic")
+            next_reason = tracking_reason or t.get("tracking_reason")
+            await c.execute(
+                "UPDATE tasks SET workflow = ?, tracking_reason = ? "
+                "WHERE id = ? AND project_id = ?",
+                (next_workflow, next_reason, task_id, project_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+
+        await bus.publish({
+            "ts": _now_iso(),
+            "agent_id": caller_id,
+            "type": "task_workflow_set",
+            "task_id": task_id,
+            "workflow": next_workflow,
+            "tracking_reason": next_reason,
+            "to": t.get("owner"),
+        })
+        return _ok(
+            f"task {task_id} workflow={next_workflow}"
+            + (f", tracking_reason={next_reason}" if next_reason else "")
+        )
 
     @tool(
         "coord_advance_task_stage",
@@ -4670,12 +5745,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"invalid transition: {old_status} → {stage}"
                 )
             now = _now_iso()
+            # Stamp last_stage_change_at + clear stale_alert_at on every
+            # status change (audit-2026-05-04 item 6).
             if stage == "archive":
                 await c.execute(
                     "UPDATE tasks SET status = 'archive', "
-                    "completed_at = ?, archived_at = ? "
+                    "completed_at = ?, archived_at = ?, "
+                    "last_stage_change_at = ?, stale_alert_at = NULL "
                     "WHERE id = ? AND project_id = ?",
-                    (now, now, task_id, project_id),
+                    (now, now, now, task_id, project_id),
                 )
                 if owner:
                     await c.execute(
@@ -4685,9 +5763,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     )
             else:
                 await c.execute(
-                    "UPDATE tasks SET status = ? "
+                    "UPDATE tasks SET status = ?, "
+                    "last_stage_change_at = ?, stale_alert_at = NULL "
                     "WHERE id = ? AND project_id = ?",
-                    (stage, task_id, project_id),
+                    (stage, now, task_id, project_id),
                 )
             await c.commit()
         finally:
@@ -4792,6 +5871,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         list_tasks,
         create_task,
         claim_task,
+        accept_role,
         update_task,
         assign_task,
         # Kanban additions
@@ -4802,7 +5882,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         submit_audit_report,
         mark_shipped,
         my_assignments,
-        set_task_complexity,
+        set_task_trajectory,
+        set_task_workflow,
         advance_task_stage,
         set_task_blocked,
         send_message,
@@ -4811,6 +5892,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         read_memory,
         update_memory,
         commit_push,
+        complete_execution,
         write_decision,
         propose_file_write,
         read_file,
@@ -4867,6 +5949,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_list_tasks",
     "mcp__coord__coord_create_task",
     "mcp__coord__coord_claim_task",
+    "mcp__coord__coord_accept_role",
     "mcp__coord__coord_update_task",
     "mcp__coord__coord_assign_task",
     "mcp__coord__coord_send_message",
@@ -4875,6 +5958,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_read_memory",
     "mcp__coord__coord_update_memory",
     "mcp__coord__coord_commit_push",
+    "mcp__coord__coord_complete_execution",
     "mcp__coord__coord_write_decision",
     "mcp__coord__coord_propose_file_write",
     "mcp__coord__coord_read_file",
@@ -4917,7 +6001,8 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_submit_audit_report",
     "mcp__coord__coord_mark_shipped",
     "mcp__coord__coord_my_assignments",
-    "mcp__coord__coord_set_task_complexity",
+    "mcp__coord__coord_set_task_trajectory",
+    "mcp__coord__coord_set_task_workflow",
     "mcp__coord__coord_advance_task_stage",
     "mcp__coord__coord_set_task_blocked",
 ]

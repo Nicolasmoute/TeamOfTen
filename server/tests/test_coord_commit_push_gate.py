@@ -62,8 +62,13 @@ async def _seed_task(
     try:
         await c.execute(
             "INSERT INTO tasks (id, project_id, title, status, owner, "
-            "created_by, complexity, spec_path) "
-            "VALUES (?, 'misc', 'demo', ?, ?, 'coach', 'standard', 'x')",
+            "created_by, trajectory, spec_path) "
+            "VALUES (?, 'misc', 'demo', ?, ?, 'coach', "
+            "'[{\"stage\":\"plan\",\"to\":[]},"
+            "{\"stage\":\"execute\",\"to\":[]},"
+            "{\"stage\":\"audit_syntax\",\"to\":[]},"
+            "{\"stage\":\"audit_semantics\",\"to\":[]},"
+            "{\"stage\":\"ship\",\"to\":[]}]', 'x')",
             (task_id, status, owner),
         )
         await c.commit()

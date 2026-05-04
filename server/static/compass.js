@@ -231,11 +231,12 @@ function EnableBanner({ onEnable, busy }) {
 //   • <project>/truth/*.{md,txt} — the dedicated truth lane
 //   • <project>/project-objectives.md — the human's authored objectives
 //   • /data/wiki/<project_id>/*.{md,txt} — per-project wiki entries
-// Compass treats all three with truth-corpus authority — they drive
-// truth-derive (Stage 0a, lattice seeding) and truth-check (Q&A
-// contradiction detection). The dashboard surfaces a small read-only
-// summary so the human can see exactly what's fed to the prompts;
-// editing happens via the Files pane.
+// Compass treats all three with corpus authority — they drive
+// intent-derive (Stage 0a, lattice seeding through the intent lens)
+// and truth-check (Q&A contradiction detection against the binding
+// constraint floor). The dashboard surfaces a small read-only summary
+// so the human can see exactly what's fed to the prompts; editing
+// happens via the Files pane.
 
 function TruthReference({ truth, onOpenFiles }) {
   const [expanded, setExpanded] = useState(false);
@@ -791,12 +792,12 @@ function BriefingColumn({ state, onAsk }) {
 
 function AuditsSection({ audits }) {
   // Audits are auto-fired by the watcher (server/compass/audit_watcher.py)
-  // when artifact events land on the bus — `commit_pushed`,
-  // `decision_written`, `knowledge_written`. Coach can also call
-  // `compass_audit` directly via MCP. The dashboard is read-only:
-  // §5.3 "the human reads the log when curious" and §10.5 "human is
-  // never pushed audit results". No submit form here on purpose —
-  // humans don't produce the artifacts being audited.
+  // when a kanban task transitions plan→execute. Compass checks plan-vs-
+  // intent upstream; kanban's own auditor / shipper stages handle execution-
+  // vs-plan downstream. Coach can also call `compass_audit` directly via
+  // MCP. The dashboard is read-only: §5.3 "the human reads the log when
+  // curious" and §10.5 "human is never pushed audit results". No submit
+  // form here — audits are event-driven.
   const [filter, setFilter] = useState(null);
   const counts = useMemo(() => {
     const c = { all: audits.length, aligned: 0, confident_drift: 0, uncertain_drift: 0 };
@@ -810,9 +811,10 @@ function AuditsSection({ audits }) {
         <div class="cmp-audits-about">
           <h3>Work audits</h3>
           <div class="cmp-italic cmp-audits-source">
-            Auto-fired on commit / decision / knowledge events.
-            Coach can also audit on demand via <code>compass_audit</code>.
-            Audits never block work — advisory only.
+            Auto-fired when a kanban task transitions plan → execute.
+            Compass checks the plan aligns with intent; kanban's own
+            auditor stages handle execution. Coach can also audit on
+            demand via <code>compass_audit</code>. Advisory only.
           </div>
         </div>
         <div class="cmp-audits-filter">
@@ -1132,7 +1134,7 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
   }, [authedFetch, state]);
 
   const triggerIngest = useCallback(async () => {
-    // Fast path — runs Stage 0 (truth-derive + reconciliation,
+    // Fast path — runs Stage 0 (intent-derive + reconciliation,
     // idempotent) + Stage 1 (digest answered questions) and stops.
     // Skips passive digest, reviews, question generation, briefing,
     // CLAUDE.md block. Used after the human answers a few queued
@@ -1289,9 +1291,9 @@ export function CompassPane({ slot, authedFetch, onClose, onDropEdge, onPopOut, 
   }, [authedFetch]);
 
   // The dashboard no longer offers a manual audit submit form —
-  // audits are auto-fired by the watcher (commit / decision /
-  // knowledge events) and via the Coach-only `compass_audit` MCP
-  // tool. The `POST /api/compass/audit` endpoint is kept as a debug
+  // audits are auto-fired by the watcher on kanban plan→execute
+  // transitions, and via the Coach-only `compass_audit` MCP tool.
+  // The `POST /api/compass/audit` endpoint is kept as a debug
   // backstop (curl-able) but isn't surfaced in the UI.
 
   // QA flow.

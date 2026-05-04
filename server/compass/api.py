@@ -422,7 +422,7 @@ def build_router(
         lattice to update immediately, without waiting for the next
         scheduler tick or paying the cost of a full Run.
 
-        Stages: 0a (truth-derive, idempotent), 0b (reconciliation,
+        Stages: 0a (intent-derive, idempotent), 0b (reconciliation,
         idempotent), 1 (digest answered questions). Skipped: passive
         digest, region auto-merge, settle/stale/dupe reviews,
         question generation, briefing, CLAUDE.md block.
@@ -946,16 +946,17 @@ def build_router(
     # `<project>/truth/` folder, owned by the harness's existing flow:
     # humans edit via the Files pane, Coach proposes via
     # `coord_propose_file_write(scope='truth', ...)` for human approval. Compass reads
-    # truth via `server.compass.truth.read_truth_facts` on every run
-    # (Stage 0 truth-derive seeds the lattice). The dashboard surfaces
-    # a read-only summary; edits happen elsewhere.
+    # the corpus via `server.compass.truth.read_truth_facts` on every run
+    # (Stage 0a intent-derive seeds the lattice; specs also play a binding-
+    # constraint role in §3.7 truth-check). The dashboard surfaces a
+    # read-only summary; edits happen elsewhere.
 
     @router.get("/truth", dependencies=deps)
     async def list_truth() -> JSONResponse:
-        """Read-only view of the project's truth corpus, as Compass
-        sees it. The dashboard renders this so the human can see what
-        the truth-derive prompt is fed without leaving the Compass
-        pane. Editing truth happens via the Files pane."""
+        """Read-only view of the project's corpus, as Compass sees it.
+        The dashboard renders this so the human can see what the
+        intent-derive prompt is fed without leaving the Compass pane.
+        Editing the corpus happens via the Files pane."""
         from server.compass.truth import read_truth_facts, read_truth_index_to_path  # noqa: PLC0415
 
         project_id = await resolve_active_project()
@@ -1055,8 +1056,8 @@ def build_router(
         project_id = await resolve_active_project()
         await cmp_store.wipe_project(project_id)
         # Clear flags too — the project is now "freshly disabled".
-        # Includes the truth-derive hash so the next run re-derives
-        # from the truth/ folder (truth itself is untouched by reset).
+        # Includes the corpus-derive hash so the next run re-derives
+        # from the truth/ folder (the corpus itself is untouched by reset).
         c = await configured_conn()
         try:
             await c.execute(
