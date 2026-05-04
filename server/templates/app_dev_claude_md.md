@@ -84,55 +84,67 @@ They catch different bug classes. Don't collapse them.
 
 ### Strategic alignment via Compass
 
-Compass is the project's strategic safety net — a per-project
-weighted lattice of goals, constraints, stakeholder preferences, and
-architectural commitments, distilled from `truth/`,
-`project-objectives.md`, and the per-project wiki. It runs alongside
-the team and exposes four Coach-only MCP tools: `compass_ask`,
+Compass is the project's **compass of intent** — a per-project
+weighted lattice that maps what the project is trying to achieve
+(and trying to AVOID), distilled from `truth/`,
+`project-objectives.md`, and the per-project wiki, all read through
+one lens: *"what are we trying to do, what should we NOT do, what's
+implied beyond what's literally specced."* It runs alongside the
+team and exposes four Coach-only MCP tools: `compass_ask`,
 `compass_audit`, `compass_brief`, `compass_status`. Players don't
-query it directly, but their work gets auto-audited.
+query it directly, but each task plan gets auto-audited before
+execution starts.
 
 **What runs automatically (don't trigger these):**
-- Every Player commit, Coach decision, knowledge artifact, and
-  binary output is auto-audited against the lattice as it lands.
-  Verdicts: `aligned` (silent), `confident_drift` (logged),
-  `uncertain_drift` (queues a question for the human).
+- Every kanban task transition `plan → execute` auto-fires a
+  Compass audit of the **plan** (`spec.md`) against the lattice's
+  intent. Compass checks plan-vs-intent upstream; kanban's own
+  auditor / shipper stages handle execution-vs-plan downstream.
+  Single check per plan, not per artifact. Verdicts: `aligned`
+  (silent), `confident_drift` (logged), `uncertain_drift` (queues
+  a question for the human).
 - A daily briefing summarizes lattice state + open questions.
 
 **When Coach should actively query Compass:**
-- **Before scoping ambiguous work.** `compass_ask("which approach
-  fits the stated priorities?")` returns a terse answer citing
-  statement IDs + weights. Cheaper than guessing or pinging the
-  human.
+- **Before writing a plan / scoping ambiguous work.**
+  `compass_ask("which approach fits the project's intent?")`
+  returns a terse answer citing statement IDs + weights. Cheaper
+  than guessing or pinging the human. Especially valuable BEFORE
+  the planner writes spec.md, since the auto-audit will check that
+  plan against the same lattice anyway.
 - **On strategic forks.** Before sending the human a
   structured-choice ping (see "Communicating with the human"),
-  check Compass — the lattice may already encode a preference that
-  resolves the fork without bothering them.
+  check Compass — the lattice may already encode a directional
+  preference that resolves the fork without bothering them.
 - **At session start after a gap.** `compass_brief()` for the
   latest briefing; `compass_status()` for pending questions and
   lattice freshness.
-- **For plans / contracts BEFORE they ship.** The auto-audit
-  watcher catches shipped artifacts; it does NOT catch in-flight
-  plans. Run `compass_audit(<draft contract>)` before locking a
-  phase on non-trivial work — strategic drift caught at the plan
-  stage is much cheaper than at the merge stage.
+- **Ad-hoc audits for unusual work.** The watcher only fires on
+  kanban plan-exits. If you want an audit on something that
+  doesn't flow through the kanban path (a draft brief, a bare
+  decision document, a hypothesis), call `compass_audit(<text>)`
+  directly. For anything moving through kanban, the auto-audit
+  has it covered — don't double-charge the budget.
 
 **What to do with drift verdicts:**
-- `confident_drift` on a recently-merged artifact: investigate.
-  Either the merge was wrong (revert + redo), or the lattice is
-  stale (propose an update). Don't ignore.
+- `confident_drift` on a plan: investigate before the executor's
+  turn fires. Either the plan is pursuing the wrong direction
+  (rewrite the spec), or the lattice is stale (propose an update).
+  Don't let the executor start on a confidently-drifted plan.
 - `uncertain_drift` queues a question — surface it in the next
   human ping ("Compass asked about X, your call"). Unanswered
   Compass questions mean the lattice goes stale and future audits
   drift further.
 
-**Don't:** manually call `compass_audit` on artifacts the watcher
-already covered (commits, decisions, knowledge artifacts, binary
-outputs). Double-charges the budget.
+**Don't:** manually re-audit plans the watcher already covered.
+Each kanban plan-exit fires exactly one audit by construction;
+calling `compass_audit` on the same spec.md just double-charges
+the budget.
 
-Compass is the third axis: code-audit checks "did we do the thing
-right?", semantics-audit checks "does it still mean what it should?",
-Compass checks "is this the thing we should be doing at all?"
+Compass is the upstream axis: kanban's syntax-auditor checks "did
+we build the thing right?", semantics-auditor checks "does it still
+mean what it should?", and Compass checks "is this plan even
+pursuing the right thing?" — *before* execution starts.
 
 ### Contract before implementation
 

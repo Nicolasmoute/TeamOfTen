@@ -1204,6 +1204,22 @@ async def _rebuild_tasks_for_kanban_v3(
         "(trajectory + last_stage_change_at)"
     )
 
+    # Defensive backfill for an in-between state seen on the first
+    # Zeabur deploy: the original v0.2 rebuild (commit 2130c48) only
+    # added `complexity`, then later commits retroactively included
+    # `required_reviews` / `ship_required` in the same rebuild —
+    # but the `tasks_kanban_v1_migrated` marker was already set, so
+    # the additions never ran. Add them here as plain ALTER TABLEs
+    # before the SELECT so the v0.3 rebuild can read them uniformly.
+    await _ensure_columns(
+        db,
+        "tasks",
+        [
+            ("required_reviews", "required_reviews TEXT NOT NULL DEFAULT '[\"formal\",\"semantic\"]'"),
+            ("ship_required", "ship_required INTEGER NOT NULL DEFAULT 1"),
+        ],
+    )
+
     # Read every existing row plus the data we need to derive trajectory
     # in Python. Doing the trajectory build in SQL would be possible via
     # json_group_array + CASE, but the readability cost is high; a one-shot

@@ -6,9 +6,22 @@
 > subscriber, the idle-Player poller) but cannot redefine fields,
 > endpoints, events, or invariants that TOT-specs declares.
 
-**Status:** Shipped (2026-05-04, v0.3 trajectory-driven gating).
+**Status:** Shipped (2026-05-04, v0.3.1 — trajectory-driven gating + audit-2026-05-04 fixes folded in).
 **Target:** TeamOfTen multi-agent harness (Python, Claude Agent SDK, kDrive-backed shared state, single-VPS)
-**Version:** 0.3
+**Version:** 0.3.1
+
+> **v0.3.1 (2026-05-04 audit cycle, 12 items)** — folded in:
+>   - **Initial activation on create.** `coord_create_task` / `POST /api/tasks` set `tasks.status` to the trajectory's first stage (was hard-defaulting to `plan`), hard-set `tasks.owner` when the first stage has a single slot, and emit `task_stage_changed` from `null → first_stage` so the wake chain fires. (§6.5)
+>   - **Spec-write advance.** Subscriber listens for `task_spec_written` and walks `plan → next_stage` once `spec_path` is set. (§9.1)
+>   - **Trajectory reroute schema fix.** `coord_set_task_trajectory` and `POST /api/tasks/{id}/trajectory` now deactivate orphaned role rows via `completed_at = now()` (was `superseded_by = -1`, which violated the self-FK under `PRAGMA foreign_keys = ON` and named columns that didn't exist). (§3.8, §6.1)
+>   - **Already-entered stage guard.** Reroute walks the OLD trajectory up to and including the current stage and rejects removal of any stage in that prefix. (§3.8)
+>   - **Manual transitions stamp `last_stage_change_at`.** Every status-change site (`coord_claim_task`, `coord_assign_task` plan→execute, `coord_update_task`, `coord_advance_task_stage`, the cancel + stage HTTP endpoints) updates `last_stage_change_at` and clears `stale_alert_at` so the stall sweeper sees the move. (§2.3)
+>   - **Assignment supersede + trajectory mirror.** `coord_assign_planner / auditor / shipper / task` insert a fresh role row, supersede any prior active row for the same `(task_id, role)` via `superseded_by`, and mirror the new candidate list back into `tasks.trajectory.to`. The board no longer shows stale assignees beside the new pick. (§6.1)
+>   - **`stage_assignment_needed` rename + back-compat alias.** Subscriber emits `stage_assignment_needed` (covers all stages, not just audit/ship); legacy `audit_assignment_needed` is also published as a back-compat alias for one release. Telegram escalation switched its key extractor and resolution map to the new name. (§8, §14)
+>   - **Audit-fail Telegram surface.** Telegram escalation now keys on `audit_fail_notification` with `escalate=True` instead of raw `audit_report_submitted{verdict='fail'}`, so first-fail noise stays out of the phone and only the second fail of the same kind pings. (§14, §17)
+>   - **Revert wake reads spec/report from row + extracts failed criteria.** `_wake_executor_for_revert` reads `tasks.spec_path` and falls back to `tasks.latest_audit_report_path`; `_extract_failed_criteria()` pulls a `## Failed criteria` (and aliases) section verbatim from the audit report (capped 1500 chars). (§2.3)
+>   - **Per-project Compass correlation.** New `_recent_commit_per_project` cache; `compass_audit_logged` correlates to the project's latest commit, not the global tail. Falls back to global only when the event lacks `project_id`. (§9.1)
+>   - **Tests:** 1064 → 1085 (+21 regressions across `test_kanban_subscriber.py`, `test_kanban_tools.py`, `test_kanban_api.py`, `test_telegram_escalation.py`).
 
 ---
 

@@ -272,6 +272,122 @@ async def test_fresh_db_marks_migrated(fresh_db: str) -> None:
     assert row[0] == "1"
 
 
+_PARTIAL_V2_TASKS_SCHEMA = """
+CREATE TABLE projects (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    repo_url     TEXT,
+    description  TEXT,
+    archived     INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO projects (id, name) VALUES ('misc', 'misc');
+
+CREATE TABLE agents (
+    id              TEXT PRIMARY KEY,
+    kind            TEXT NOT NULL CHECK (kind IN ('coach', 'player')),
+    status          TEXT NOT NULL DEFAULT 'stopped',
+    workspace_path  TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO agents (id, kind, workspace_path) VALUES
+    ('coach', 'coach', '/workspaces/coach'),
+    ('p1', 'player', '/workspaces/p1');
+
+CREATE TABLE team_config (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+INSERT INTO team_config (key, value) VALUES ('tasks_kanban_v1_migrated', '1');
+
+-- Mirrors the kanban v0.2 schema as it shipped in commit 2130c48:
+-- `complexity` was added but `required_reviews` / `ship_required`
+-- were not. A later commit retroactively added them to the v0.2
+-- rebuild, but the v1_migrated marker short-circuits the rebuild
+-- so they never landed on DBs upgraded between those two commits.
+CREATE TABLE tasks (
+    id            TEXT PRIMARY KEY,
+    project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title         TEXT NOT NULL,
+    description   TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'plan'
+                  CHECK (status IN ('plan', 'execute', 'audit_syntax', 'audit_semantics', 'ship', 'archive')),
+    owner         TEXT REFERENCES agents(id),
+    created_by    TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    claimed_at    TEXT,
+    started_at    TEXT,
+    completed_at  TEXT,
+    archived_at   TEXT,
+    cancelled_at  TEXT,
+    parent_id     TEXT,
+    priority      TEXT NOT NULL DEFAULT 'normal'
+                  CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
+    complexity    TEXT NOT NULL DEFAULT 'standard'
+                  CHECK (complexity IN ('simple', 'standard')),
+    blocked       INTEGER NOT NULL DEFAULT 0,
+    blocked_reason TEXT,
+    spec_path     TEXT,
+    spec_written_at TEXT,
+    latest_audit_report_path TEXT,
+    latest_audit_kind TEXT,
+    latest_audit_verdict TEXT,
+    compass_audit_report_path TEXT,
+    compass_audit_verdict TEXT,
+    tags          TEXT NOT NULL DEFAULT '[]',
+    artifacts     TEXT NOT NULL DEFAULT '[]'
+);
+INSERT INTO tasks (id, project_id, title, status, owner, created_by, complexity)
+VALUES
+    ('t-x1', 'misc', 'in-flight execute', 'execute', 'p1', 'coach', 'standard'),
+    ('t-x2', 'misc', 'simple ticket', 'execute', 'p1', 'coach', 'simple');
+"""
+
+
+async def test_v3_handles_partial_v2_schema(fresh_db: str) -> None:
+    """Regression: a DB that ran the original 2130c48 v0.2 rebuild has
+    `complexity` but not `required_reviews` / `ship_required`. The v0.3
+    rebuild used to crash with `no such column: required_reviews`. It
+    must now defensively backfill the missing columns and complete."""
+    import json as _json
+
+    async with aiosqlite.connect(dbmod.DB_PATH) as db:
+        await db.executescript(_PARTIAL_V2_TASKS_SCHEMA)
+        await db.commit()
+
+    await init_db()
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute("PRAGMA table_info(tasks)")
+        cols = {dict(r)["name"] for r in await cur.fetchall()}
+        cur = await c.execute(
+            "SELECT id, status, trajectory FROM tasks ORDER BY id"
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+        cur = await c.execute(
+            "SELECT value FROM team_config "
+            "WHERE key = 'tasks_kanban_v3_migrated'"
+        )
+        marker = await cur.fetchone()
+    finally:
+        await c.close()
+
+    assert "complexity" not in cols
+    assert "required_reviews" not in cols
+    assert "ship_required" not in cols
+    assert "trajectory" in cols
+    assert marker is not None and marker[0] == "1"
+
+    by_id = {r["id"]: r for r in rows}
+    assert by_id["t-x1"]["status"] == "execute"
+    standard_traj = _json.loads(by_id["t-x1"]["trajectory"])
+    assert [s["stage"] for s in standard_traj] == [
+        "execute", "audit_syntax", "audit_semantics", "ship",
+    ]
+    simple_traj = _json.loads(by_id["t-x2"]["trajectory"])
+    assert [s["stage"] for s in simple_traj] == ["execute"]
+
+
 async def test_role_assignments_table_created(fresh_db: str) -> None:
     """Fresh installs get the task_role_assignments table from the
     canonical SCHEMA."""
