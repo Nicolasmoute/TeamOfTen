@@ -6,6 +6,8 @@ A personal orchestration harness for a **team of 11 Claude Code agents — 1 Coa
 
 **Keep the spec in sync.** When you make non-trivial code changes (new feature, behavior change, schema/migration, prompt rewrite, UI subsystem, env var, MCP tool, etc.), reflect them in `Docs/TOT-specs.md` in the same turn. Skip only for genuinely minor tweaks (typos, log-message wording, single-line bug fixes that don't change documented behavior). When in doubt, update the spec — drift is more expensive to repair later than a paragraph is to write now.
 
+**Keep the canonical project CLAUDE.md template current.** When you ship harness functionality that downstream projects need to be aware of (a new MCP tool category, a new lifecycle stage, a renamed concept, a new convention), update [server/templates/app_dev_claude_md.md](server/templates/app_dev_claude_md.md) (and any sibling per-playbook templates) in the same turn. The Coach-driven reconciliation flow at [server/project_claude_md.py:update_claude_md_via_coach](server/project_claude_md.py) propagates the change to existing projects on next activation (and once at boot for the active project), preserving project-specific content. Never edit per-project CLAUDE.md files directly from harness code — the template is the only knob.
+
 ## Team vocabulary
 
 - **Coach** (slot id `coach`) — the coordinator. Receives human goals, decomposes into tasks, assigns work. Never writes code. **Only Coach gives orders.**
@@ -675,9 +677,11 @@ tasks self-audit before `coord_commit_push` and archive directly.
 
 Key files: [server/tools.py](server/tools.py), [server/kanban.py](server/kanban.py),
 [server/idle_poller.py](server/idle_poller.py), [server/static/kanban.js](server/static/kanban.js),
-[server/tasks_claude_md.py](server/tasks_claude_md.py), and
-[server/telegram_escalation.py](server/telegram_escalation.py). Full
-subsystem detail lives in [Docs/kanban-specs.md](Docs/kanban-specs.md).
+and [server/telegram_escalation.py](server/telegram_escalation.py).
+The kanban lifecycle paragraph now lives inside the canonical project
+CLAUDE.md template at [server/templates/app_dev_claude_md.md](server/templates/app_dev_claude_md.md)
+— see the 2026-05-04 "Canonical project CLAUDE.md template + Coach-driven
+reconciliation" entry. Full subsystem detail lives in [Docs/kanban-specs.md](Docs/kanban-specs.md).
 
 **Recent (2026-05-04) — Compass refocused as a compass of intent:**
 
@@ -1592,6 +1596,72 @@ current state. Closed both gaps:
 - **Task ↔ message link** — schema relation so 're: t-42' queries work.
 - **Coach digest tool** — scheduled weekly summary, dropped into
    decisions or knowledge.
+
+**Recent (2026-05-04) — Canonical project CLAUDE.md template + Coach-driven reconciliation:**
+
+The boot-time kanban-block injector that mutated every project's
+CLAUDE.md on every restart is gone. There is no longer any harness
+code path that writes directly into a per-project CLAUDE.md. In its
+place:
+
+- **Single canonical template.** Everything the harness wants
+  downstream projects to know about — kanban lifecycle, Compass
+  usage rules, audit discipline, communication patterns, anti-
+  patterns — lives in [server/templates/app_dev_claude_md.md](server/templates/app_dev_claude_md.md).
+  When harness functionality evolves, the template evolves with it
+  (see the new top-of-file rule in this CLAUDE.md). The kanban
+  paragraph that previously lived in `tasks_claude_md.py` was folded
+  into the template's `### Task lifecycle (kanban)` section.
+- **New projects** are seeded from the canonical template at creation
+  time. [server/paths.py:write_project_claude_md_stub](server/paths.py)
+  now reads via [server/project_claude_md.py:canonical_project_claude_md_template](server/project_claude_md.py)
+  instead of the hardcoded `_PROJECT_CLAUDE_MD_STUB` constant
+  (which was deleted).
+- **Existing projects** get a hidden Coach-identity LLM one-shot on
+  every project activation (in `server/projects_api.py:_run_switch`
+  after the terminal `project_switched` event) AND once at harness
+  boot for the currently-pinned active project (in `server/main.py:lifespan`).
+  The turn reads the canonical template + the project's current
+  CLAUDE.md and writes a reconciled body that reflects the latest
+  harness rules while preserving every line of project-specific
+  content (Stakeholders, Glossary, Team, Decisions, hand-written
+  notes, custom Conventions). Single source of truth, no marker-
+  delimited surgery, no per-subsystem injectors. Lives at
+  [server/project_claude_md.py:update_claude_md_via_coach](server/project_claude_md.py).
+- **Idempotent.** SHA-256 of the canonical template stored in
+  `team_config['claude_md_template_hash_<id>']` (mirrors Compass'
+  `compass_truth_hash_<id>` precedent). Re-activation or a redeploy
+  without template change is a no-op.
+- **Cost-cap aware.** Skipped when `_today_spend()` ≥
+  `TEAM_DAILY_CAP_USD`. Counted in the `turns` ledger under
+  `agent_id="coach"`, `cost_basis="claude_md_update"` so it lands
+  in daily caps + EnvPane cost rollup.
+- **Hidden from chat.** The Coach pane shows only one-line `.sys`
+  rows: `claude_md_update_started` ("Updating CLAUDE.md with latest
+  app specs..."), `claude_md_update_completed` ("CLAUDE.md updated
+  (+N -M lines)"), `claude_md_update_skipped` ("CLAUDE.md already
+  current"), `claude_md_update_failed` (red "CLAUDE.md update
+  failed: {reason}"). The full prompt + response don't surface in
+  the timeline — Compass-style direct
+  `claude_agent_sdk.query()` call via the existing
+  `compass.llm.call` wrapper, no MCP, no resume, one-shot.
+- **Validation failure escalates.** If Coach returns malformed /
+  empty output (under 200 bytes, missing leading heading, etc.),
+  `claude_md_update_failed` AND `human_attention` both fire — the
+  EnvPane attention strip + Telegram bridge raise it. Hash is NOT
+  updated, so the next activation retries (eventual self-heal).
+- **No backup file.** Recovery via the project repo's git history
+  (worktrees commit on shipper-stage) and kDrive's snapshot mirror.
+  No `.claude_md_backup_*.md` artefacts.
+- **Per-project asyncio.Lock** prevents overlap on rapid activations
+  (Compass runner pattern).
+
+The `server/tasks_claude_md.py` module + `server/tests/test_tasks_claude_md.py`
+were deleted; tests moved to [server/tests/test_project_claude_md.py](server/tests/test_project_claude_md.py)
+covering canonical template substitution, fallback when the template
+file is missing, validation, hash gating, lock semantics,
+human_attention escalation on every failure mode, and the role-
+default model resolution.
 
 ## What needs verification (when user is next active)
 

@@ -228,71 +228,15 @@ def bootstrap_status() -> str:
 # **No `## Goal` section** — the project's goals/objectives live in
 # `project-objectives.md` (free-form, kDrive-mirrored, injected into
 # Coach's system prompt every turn — see `recurrence-specs.md` §3.3
-# and §6). The pointer below tells Coach where to look / update so
-# the prompt has a single canonical surface for goal content.
-_PROJECT_CLAUDE_MD_STUB = """# Project: {name}
-
-## Project objectives
-
-The project's goals, success criteria, and scope live in a separate
-file at `/data/projects/{slug}/project-objectives.md` (kDrive-mirrored,
-edited via the EnvPane Objectives section or via Coach's Write tool).
-The harness injects that file into Coach's system prompt every turn,
-so updates land on the next Coach turn — no need to duplicate them
-here. If the file is missing or empty, the next Coach tick will
-prompt the human to define them.
-
-## Repo
-{repo}
-
-## Stakeholders
-<filled in by Coach>
-
-## Team
-<filled in by Coach as roles are assigned via coord_set_player_role —
-record the intent ("p1 = lead developer, p2 = QA") so future you can
-reconstruct why each Player was named what they were named>
-
-## Glossary
-<filled in by Coach>
-
-## Conventions
-<project-specific rules, code style, terminology, do/don't lists>
-
-## truth/
-
-User-validated source-of-truth for this project lives at
-`/data/projects/{slug}/truth/`. Specs, brand guidelines, contracts,
-hard invariants the user has signed off on. **You CANNOT write to
-truth/ directly** — the harness's PreToolUse hook hard-denies any
-`Write` / `Edit` / `MultiEdit` / `NotebookEdit` / `Bash` against this
-tree, regardless of agent. To propose a change, Coach calls
-`coord_propose_file_write(scope='truth', path, content, summary)`
-(Coach-only — Players ask Coach to relay). The user reviews a diff
-and approves/denies in the EnvPane "File-write proposals" section.
-Approved proposals auto-write the file; older pending proposals for
-the same path are auto-superseded by newer ones.
-
-Each project's `truth/` ships seeded with `truth-index.md` —
-explanation only, no expected-files manifest. The user / Coach
-populates that file (and any others) per project: software projects
-might want `specs.md`, brand projects `brand-guidelines.md`, contract
-projects `vendor-agreements.md`. New files: humans use the Files
-pane's "+ new file" button; Coach proposes them via
-`coord_propose_file_write(scope='truth', path, content, summary)`
-and the user approves.
-
-## Updating this CLAUDE.md
-
-This file is **also** read-only for agents (the same PreToolUse hook
-denies direct Write/Edit/Bash on `/data/projects/{slug}/CLAUDE.md`).
-To change it, Coach calls
-`coord_propose_file_write(scope='project_claude_md', path='CLAUDE.md',
-content, summary)` with the FULL new file content; the user reviews
-the diff and approves in the same "File-write proposals" section.
-Players ask Coach to relay. The harness-wide `/data/CLAUDE.md` cannot
-be proposed at all — only the user edits that one directly.
-"""
+# and §6).
+#
+# The body that lands in a freshly-created project's CLAUDE.md is
+# read from `server/templates/app_dev_claude_md.md` via
+# `server.project_claude_md.canonical_project_claude_md_template`.
+# Existing projects pick up template changes through the Coach-driven
+# reconciliation flow at
+# `server.project_claude_md.update_claude_md_via_coach`, which fires
+# on every project activation + once at boot for the active project.
 
 
 def write_project_claude_md_stub(
@@ -321,11 +265,15 @@ def write_project_claude_md_stub(
     pp = project_paths(project_id)
     if pp.claude_md.exists():
         return False
-    repo = (repo_url or "").strip() or "<no repo configured>"
-    body = _PROJECT_CLAUDE_MD_STUB.format(
+    # Lazy import — server.project_claude_md imports server.webdav
+    # which is heavy; paths.py is itself imported very early.
+    from server.project_claude_md import (
+        canonical_project_claude_md_template,
+    )
+    body = canonical_project_claude_md_template(
         name=name,
-        repo=repo,
         slug=project_id,
+        repo_url=repo_url,
     )
     try:
         pp.root.mkdir(parents=True, exist_ok=True)

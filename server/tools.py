@@ -1036,7 +1036,19 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "task_id": task_id,
             }
         )
-        return _ok(f"claimed {task_id}")
+        # v0.3.2: echo the next-step hint into the response so the
+        # claimer doesn't have to guess what to call when they're done.
+        # The kanban subscriber will also wake them via _on_stage_changed
+        # with the same hint shape; this is the immediate confirmation.
+        return _ok(
+            f"claimed {task_id} (you are now the executor in `execute` "
+            f"stage). Read the spec.md from the task folder, do the "
+            f"work, then call coord_commit_push("
+            f"task_id={task_id!r}, message=...) for code or "
+            f"coord_complete_execution(task_id={task_id!r}, "
+            f"summary=...) for non-code. The kanban does NOT advance "
+            f"until you call one of those tools with task_id."
+        )
 
     @tool(
         "coord_accept_role",
@@ -1249,7 +1261,41 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "type": "task_claimed",
                 "task_id": task_id,
             })
-        return _ok(f"accepted {role} on {task_id}")
+        # v0.3.2: echo a role-specific next-step hint so the Player has
+        # the matching completion-tool name in front of them
+        # immediately. Mirrors the kanban subscriber's stage-entry
+        # wake but lands on the synchronous accept response.
+        if role == "executor":
+            next_step = (
+                f"Read the spec, do the work, then call "
+                f"coord_commit_push(task_id={task_id!r}, message=...) "
+                f"for code or coord_complete_execution("
+                f"task_id={task_id!r}, summary=...) for non-code. "
+                f"The kanban does NOT advance until you call one of those."
+            )
+        elif role == "planner":
+            next_step = (
+                f"Draft the spec then call coord_write_task_spec("
+                f"task_id={task_id!r}, body=<spec>). The task auto-"
+                f"advances plan -> execute on success."
+            )
+        elif role in ("auditor_syntax", "auditor_semantics"):
+            kind = "syntax" if role == "auditor_syntax" else "semantics"
+            next_step = (
+                f"Read the spec + the executor's commit/artifact, "
+                f"then call coord_submit_audit_report("
+                f"task_id={task_id!r}, kind={kind!r}, body=<review>, "
+                f"verdict='pass' or 'fail')."
+            )
+        elif role == "shipper":
+            next_step = (
+                f"Merge / publish / hand-off, then call "
+                f"coord_mark_shipped(task_id={task_id!r}, "
+                f"note=<optional>). The task auto-archives."
+            )
+        else:
+            next_step = "call coord_my_assignments() for the next step."
+        return _ok(f"accepted {role} on {task_id}.\n\n{next_step}")
 
     @tool(
         "coord_update_task",
@@ -2271,6 +2317,54 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         # Optional task_id — empty string treated as None.
         task_id_raw = (args.get("task_id") or "").strip()
         task_id_in: str | None = task_id_raw or None
+        auto_bound_task_id: str | None = None
+
+        # v0.3.2 audit-fix (kanban-flow gap 2): if the caller omitted
+        # task_id but has exactly one active executor task in the
+        # current project, auto-bind it. Forgetting `task_id=` was the
+        # #1 cause of "Player did the work but the kanban didn't
+        # advance" reports. The auto-bind is logged in the response so
+        # the Player learns the right shape for next time.
+        if task_id_in is None:
+            try:
+                project_id_for_lookup = await resolve_active_project()
+                c = await configured_conn()
+                try:
+                    # Require a LIVE (uncompleted, unsuperseded)
+                    # executor role row so the downstream validator
+                    # cannot reject what we just bound. Filtering on
+                    # status='execute' alone could pick up a task
+                    # whose executor row got marked complete by a
+                    # prior commit but never advanced (subscriber
+                    # crash / push failure), producing a confusing
+                    # "no active uncompleted executor role" error
+                    # immediately after auto-bind.
+                    cur = await c.execute(
+                        "SELECT t.id FROM tasks t "
+                        "WHERE t.project_id = ? AND t.owner = ? "
+                        "AND t.status = 'execute' "
+                        "AND EXISTS ("
+                        "  SELECT 1 FROM task_role_assignments tra "
+                        "  WHERE tra.task_id = t.id "
+                        "  AND tra.role = 'executor' "
+                        "  AND tra.owner = ? "
+                        "  AND tra.completed_at IS NULL "
+                        "  AND tra.superseded_by IS NULL "
+                        ") "
+                        "ORDER BY t.claimed_at DESC LIMIT 2",
+                        (project_id_for_lookup, caller_id, caller_id),
+                    )
+                    candidates = [dict(r)["id"] for r in await cur.fetchall()]
+                finally:
+                    await c.close()
+            except Exception:
+                candidates = []
+            # Exactly one active executor task → auto-bind. Multiple
+            # is technically not possible (tasks.owner is 1:1) but we
+            # guard anyway.
+            if len(candidates) == 1:
+                task_id_in = candidates[0]
+                auto_bound_task_id = task_id_in
 
         # Bind task_id to the caller's executor role at entry — before
         # we run any git work — so a Player can't pass another Player's
@@ -2429,9 +2523,59 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 # original task_id is preserved on the row above for
                 # the explicit `push=false` mode.
                 "task_id": kanban_task_id,
+                # Marks an auto-bind so the dashboard / event log can
+                # show "we filled this in for you" rather than implying
+                # the Player explicitly passed task_id.
+                "task_id_auto_bound": auto_bound_task_id is not None,
             }
         )
-        return _ok(f"committed {sha}: {message}{push_note}")
+
+        # v0.3.2 audit-fix (kanban-flow gap 2): if the caller committed
+        # without a task_id AND no auto-bind was possible (i.e., they
+        # have no active executor task), emit a Coach-routed warning
+        # event. This catches the case where a Player thought they
+        # were delivering a kanban task but actually committed scratch
+        # work — Coach sees it and can ask. Skipped when push failed
+        # (the push failure itself is the louder signal).
+        if (
+            task_id_in is None
+            and auto_bound_task_id is None
+            and not push_failed
+        ):
+            await bus.publish(
+                {
+                    "ts": _now_iso(),
+                    "agent_id": "system",
+                    "type": "commit_without_task_id_warning",
+                    "committer": caller_id,
+                    "sha": sha,
+                    "message": message[:200],
+                    "to": "coach",
+                }
+            )
+
+        # Build the response. When we auto-bound, tell the Player so
+        # they learn the right shape for next time.
+        msg = f"committed {sha}: {message}{push_note}"
+        if auto_bound_task_id:
+            msg += (
+                f"\n\nNOTE: you didn't pass task_id, so I auto-bound "
+                f"this commit to your active executor task "
+                f"{auto_bound_task_id!r} and the kanban will advance. "
+                f"Pass `task_id={auto_bound_task_id!r}` explicitly next "
+                f"time so the binding is unambiguous."
+            )
+        elif task_id_in is None and not push_failed:
+            msg += (
+                "\n\nNOTE: this commit was NOT bound to any kanban "
+                "task (no active executor task to auto-bind, and no "
+                "task_id passed). If this commit was supposed to "
+                "deliver a kanban task, the kanban will not advance — "
+                "ask Coach to use coord_advance_task_stage or call "
+                "coord_complete_execution(task_id=..., summary=...) "
+                "yourself. Coach has been notified."
+            )
+        return _ok(msg)
 
     @tool(
         "coord_complete_execution",
@@ -4995,9 +5139,22 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     @tool(
         "coord_submit_audit_report",
         (
-            "Player-only. Submit your audit report for a task. Validates "
-            "you have an active auditor assignment (matching kind) for "
-            "this task — you can't audit something you weren't assigned to.\n"
+            "Submit an audit report for a task.\n"
+            "\n"
+            "Normal use (Player-only): you have an active auditor "
+            "assignment matching `kind` and submit your own review.\n"
+            "\n"
+            "Override use (Coach-only, v0.3.4): when an assigned auditor "
+            "Player cannot reach this tool from their runtime (the "
+            "production failure mode that triggered v0.3.4 — Player "
+            "wrote audit_<round>_<kind>.md to disk and stopped because "
+            "coord_* wasn't visible), Coach can submit on their behalf "
+            "by passing `on_behalf_of='<player_slot>'`. The recorded "
+            "auditor is the named Player; the actor in the bus event "
+            "is Coach. Use this ONLY after confirming the Player "
+            "actually wrote the audit (read their audit_*.md from disk "
+            "and copy the body into `body=`); otherwise advance via "
+            "coord_advance_task_stage instead.\n"
             "\n"
             "Writes the markdown report to "
             "/data/projects/<id>/working/tasks/<task_id>/audits/"
@@ -5014,16 +5171,44 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- task_id: required\n"
             "- kind: 'syntax' or 'semantics' (required, must match assignment)\n"
             "- body: full markdown report (required, max 40000 chars)\n"
-            "- verdict: 'pass' or 'fail' (required)"
+            "- verdict: 'pass' or 'fail' (required)\n"
+            "- on_behalf_of: optional Player slot (Coach-only override)"
         ),
-        {"task_id": str, "kind": str, "body": str, "verdict": str},
+        {
+            "task_id": str, "kind": str, "body": str,
+            "verdict": str, "on_behalf_of": str,
+        },
     )
     async def submit_audit_report(args: dict[str, Any]) -> dict[str, Any]:
-        if caller_is_coach:
-            return _err(
-                "Coach doesn't audit — assign a Player auditor with "
-                "coord_assign_auditor and let them submit."
-            )
+        on_behalf_of_raw = (args.get("on_behalf_of") or "").strip().lower()
+        # Resolve the effective auditor identity: when Coach passes
+        # `on_behalf_of`, treat the named Player as the auditor for
+        # role-row lookup + recorded `auditor` field. Otherwise the
+        # caller is the auditor (Player normal path).
+        if on_behalf_of_raw:
+            if not caller_is_coach:
+                return _err(
+                    "on_behalf_of is Coach-only (override path for "
+                    "when an assigned auditor's runtime can't reach "
+                    "this tool)."
+                )
+            if on_behalf_of_raw not in VALID_RECIPIENTS or on_behalf_of_raw in ("coach", "broadcast"):
+                return _err(
+                    f"on_behalf_of must be a Player slot (p1..p10), "
+                    f"not {on_behalf_of_raw!r}"
+                )
+            effective_auditor = on_behalf_of_raw
+        else:
+            if caller_is_coach:
+                return _err(
+                    "Coach doesn't audit directly. Either assign a "
+                    "Player auditor with coord_assign_auditor and let "
+                    "them submit, or override on a stuck Player's "
+                    "behalf via on_behalf_of='<slot>' (only when their "
+                    "runtime can't reach this tool — read their "
+                    "on-disk audit_*.md and copy the body in)."
+                )
+            effective_auditor = caller_id
         task_id = (args.get("task_id") or "").strip()
         kind_input = (args.get("kind") or "").strip().lower()
         body = args.get("body") or ""
@@ -5060,21 +5245,23 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"(stage={actual_stage}). Future-stage assignments are "
                     f"not actionable until the card reaches their column."
                 )
-            # Find the active auditor assignment for the caller. Must
-            # exist, be uncompleted, and not superseded.
+            # Find the active auditor assignment for the effective
+            # auditor (= caller in normal use; = on_behalf_of when
+            # Coach overrides). Must exist, be uncompleted, and not
+            # superseded.
             cur = await c.execute(
                 "SELECT id FROM task_role_assignments "
                 "WHERE task_id = ? AND role = ? AND owner = ? "
                 "AND completed_at IS NULL AND superseded_by IS NULL "
                 "ORDER BY assigned_at DESC LIMIT 1",
-                (task_id, role, caller_id),
+                (task_id, role, effective_auditor),
             )
             row = await cur.fetchone()
             if not row:
                 return _err(
-                    f"no active {review_label} reviewer assignment for {caller_id} "
-                    f"on task {task_id}. Coach must call "
-                    f"coord_assign_auditor before you can submit."
+                    f"no active {review_label} reviewer assignment for "
+                    f"{effective_auditor} on task {task_id}. Coach "
+                    f"must call coord_assign_auditor before submission."
                 )
             assignment_id = dict(row)["id"]
 
@@ -5101,7 +5288,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 kind=kind,
                 round_num=round_num,
                 body=body,
-                auditor=caller_id,
+                auditor=effective_auditor,
                 verdict=verdict,
             )
         except ValueError as exc:
@@ -5139,6 +5326,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         # Emit the kanban-driving event. The auto-advance subscriber
         # (server/kanban.py — landing in a future iteration) listens.
         ts = _now_iso()
+        # Bus events: agent_id is the actor (Coach when override),
+        # auditor_id / owner is the effective auditor (the Player).
+        # That way the timeline shows who actually pressed the button
+        # AND whose audit it is.
+        on_behalf = effective_auditor != caller_id
         await bus.publish(
             {
                 "ts": ts,
@@ -5146,10 +5338,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "type": "task_role_completed",
                 "task_id": task_id,
                 "role": role,
-                "owner": caller_id,
+                "owner": effective_auditor,
                 "artifact_path": rel,
                 "verdict": verdict,
                 "to": executor_owner,
+                "on_behalf_of": effective_auditor if on_behalf else None,
             }
         )
         await bus.publish(
@@ -5162,15 +5355,20 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "verdict": verdict,
                 "report_path": rel,
                 "round": round_num,
-                "auditor_id": caller_id,
+                "auditor_id": effective_auditor,
                 "to": executor_owner,
                 # 'to' = executor — surfaces the event in their pane so
                 # they see fail verdicts immediately. Read from tasks.owner.
+                "on_behalf_of": effective_auditor if on_behalf else None,
             }
+        )
+        suffix = (
+            f" (submitted on behalf of {effective_auditor})"
+            if on_behalf else ""
         )
         return _ok(
             f"submitted {kind} audit (round {round_num}, {verdict}) "
-            f"for {task_id} → {rel}"
+            f"for {task_id} → {rel}{suffix}"
         )
 
     @tool(

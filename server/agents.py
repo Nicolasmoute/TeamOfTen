@@ -2137,12 +2137,28 @@ async def _build_active_task_health_rows(
     return rows
 
 
+_STAGE_TO_ROLE = {
+    "plan": "planner",
+    "execute": "executor",
+    "audit_syntax": "auditor_syntax",
+    "audit_semantics": "auditor_semantics",
+    "ship": "shipper",
+}
+
+
 async def _build_stalled_tasks_rows(
     project_id: str,
 ) -> list[dict[str, Any]]:
     """Tasks that crossed the stall threshold and have not progressed
     since (`stale_alert_at IS NOT NULL AND last_stage_change_at =
-    stale_alert_at`)."""
+    stale_alert_at`).
+
+    v0.3.4 bug-fix: the surfaced 'owner' field is the CURRENT STAGE's
+    assignee — the Player actually responsible for the next move —
+    not `tasks.owner`, which is always the executor. Previously a
+    stuck audit_semantics task would name the executor as the
+    blocker, leading Coach to nudge the wrong Player.
+    """
     rows: list[dict[str, Any]] = []
     try:
         c = await configured_conn()
@@ -2158,6 +2174,26 @@ async def _build_stalled_tasks_rows(
                 (project_id,),
             )
             raw = [dict(r) for r in await cur.fetchall()]
+            # Resolve each task's current-stage assignee in a single
+            # extra round-trip per row (cheap; capped at 10).
+            stage_owner_map: dict[str, str | None] = {}
+            for r in raw:
+                role = _STAGE_TO_ROLE.get(r.get("status") or "")
+                if not role:
+                    stage_owner_map[r["id"]] = None
+                    continue
+                cur = await c.execute(
+                    "SELECT owner FROM task_role_assignments "
+                    "WHERE task_id = ? AND role = ? "
+                    "AND completed_at IS NULL "
+                    "AND superseded_by IS NULL "
+                    "ORDER BY assigned_at DESC LIMIT 1",
+                    (r["id"], role),
+                )
+                rrow = await cur.fetchone()
+                stage_owner_map[r["id"]] = (
+                    dict(rrow).get("owner") if rrow else None
+                )
         finally:
             await c.close()
     except Exception:
@@ -2172,11 +2208,19 @@ async def _build_stalled_tasks_rows(
             age_hours = max(0.0, (now - last).total_seconds() / 3600.0)
         except (TypeError, ValueError):
             age_hours = 0.0
+        stage_owner = stage_owner_map.get(r["id"])
         rows.append({
             "task_id": r["id"],
             "title": (r.get("title") or "").strip()[:80],
             "stage": r.get("status") or "?",
-            "owner": r.get("owner") or "(unassigned)",
+            # The Player actually responsible for the next move at
+            # this stage. Falls back to tasks.owner when no role row
+            # exists (broken state — Coach should fix the trajectory).
+            "owner": stage_owner or r.get("owner") or "(unassigned)",
+            # Keep the executor visible separately so Coach has full
+            # context (e.g., "stuck in audit_semantics owned by p3,
+            # original executor was p8").
+            "task_executor": r.get("owner") or "(unassigned)",
             "age_hours": round(age_hours, 1),
         })
     return rows
@@ -2538,18 +2582,33 @@ async def _build_coach_coordination_block() -> str:
         lines.append("## Stalled tasks")
         lines.append("")
         for row in stalled_rows:
+            blocker = row['owner']
+            executor = row.get('task_executor')
+            # Show the executor in parens when it differs from the
+            # current-stage assignee — e.g. an audit_semantics task
+            # blocked on the auditor while the executor (who finished
+            # their part) waits downstream.
+            who = (
+                f"blocker {blocker} (executor {executor})"
+                if executor and executor != blocker
+                else f"blocker {blocker}"
+            )
             lines.append(
                 f"- {row['task_id']} \"{row['title']}\" — stage "
-                f"{row['stage']}, owner {row['owner']}, stale for "
+                f"{row['stage']}, {who}, stale for "
                 f"{row['age_hours']}h"
             )
         lines.append("")
         lines.append(
-            "If a Player has gone silent, send them a "
-            "coord_send_message nudge or reassign with "
-            "coord_assign_*. If no one is assigned to this stage, fix "
-            "the trajectory with coord_set_task_trajectory or use "
-            "coord_advance_task_stage if you intended a different route."
+            "The 'blocker' is the Player responsible for the next move "
+            "at the current stage (auditor, shipper, etc.) — NOT "
+            "necessarily the original executor. Send them a "
+            "coord_send_message nudge, reassign with coord_assign_*, "
+            "or — if they reported the completion tool is not visible "
+            "in their runtime — submit on their behalf via "
+            "coord_advance_task_stage (after reading the artifact "
+            "they wrote to disk). If no one is assigned to this stage, "
+            "fix the trajectory with coord_set_task_trajectory."
         )
         lines.append("")
 

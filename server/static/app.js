@@ -11304,6 +11304,39 @@ function EventItem({ event }) {
     </div>`;
   }
 
+  if (type === "claude_md_update_started") {
+    const src = event.source ? ` (${event.source})` : "";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · updating CLAUDE.md with latest app specs...${src}</div>
+    </div>`;
+  }
+
+  if (type === "claude_md_update_completed") {
+    const dl = (event.lines_after || 0) - (event.lines_before || 0);
+    const sign = dl > 0 ? `+${dl}` : `${dl}`;
+    const dlText = dl !== 0 ? ` (${sign} lines)` : "";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · CLAUDE.md updated${dlText}</div>
+    </div>`;
+  }
+
+  if (type === "claude_md_update_skipped") {
+    const why = event.reason || "unchanged";
+    const text = why === "unchanged"
+      ? "CLAUDE.md already current"
+      : `CLAUDE.md update skipped: ${why}`;
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ${text}</div>
+    </div>`;
+  }
+
+  if (type === "claude_md_update_failed") {
+    const why = event.reason || "unknown";
+    return html`<div class="event sys" style="color:var(--err,#c44)">
+      <div class="event-meta">${ts} · CLAUDE.md update failed: ${why}</div>
+    </div>`;
+  }
+
   if (type === "session_transfer_requested") {
     const fr = event.from_runtime || "?";
     const to = event.to_runtime || "?";

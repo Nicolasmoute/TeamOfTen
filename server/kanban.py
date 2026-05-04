@@ -749,6 +749,96 @@ async def _emit_audit_fail_notification(
     })
 
 
+_TOOL_NOT_VISIBLE_ESCAPE = (
+    "\n\nIf the named tool is NOT visible in your runtime — i.e. you "
+    "look at your tool list and don't see it — DO NOT just write the "
+    "deliverable to disk and stop. The kanban will never see your "
+    "work. Instead message Coach IMMEDIATELY via "
+    "coord_send_message(to='coach', body='need to deliver task ... "
+    "but the named coord_* tool is not visible to me') so Coach can "
+    "advance the task on your behalf. coord_request_human() is the "
+    "human-facing escalation if Coach is also unreachable."
+)
+
+
+async def _completion_hint_for_role(task_id: str, role: str) -> str:
+    """Per-role wake-prompt instruction line that NAMES the completion
+    tool with the actual `task_id` baked in. The kanban only advances
+    when the assignee calls the matching tool with `task_id` — vague
+    'use the matching completion tool' wording was leaving Players
+    committing without driving the board (see audit-2026-05-04 §gap-1).
+
+    v0.3.4: every hint now ends with the tool-not-visible escape
+    paragraph. Real production trace (2026-05-04) had a Player write
+    audit_<kind>.md to disk and stop because they couldn't see
+    `coord_submit_audit_report` in their runtime — kanban silently
+    stuck for 15+ min, stall sweeper named the wrong Player. The
+    escape tells the Player to message Coach instead of failing
+    quietly."""
+    if role == "planner":
+        return (
+            f"Write the spec by calling "
+            f"coord_write_task_spec(task_id={task_id!r}, body=<spec>). "
+            f"On success the task auto-advances plan -> the next stage "
+            f"in its trajectory.{_TOOL_NOT_VISIBLE_ESCAPE}"
+        )
+    if role == "executor":
+        # Trajectory-aware: when no audit stage follows execute, the
+        # executor must self-audit before signalling done.
+        try:
+            c = await configured_conn()
+            try:
+                cur = await c.execute(
+                    "SELECT trajectory FROM tasks WHERE id = ?",
+                    (task_id,),
+                )
+                row = await cur.fetchone()
+            finally:
+                await c.close()
+        except Exception:
+            row = None
+        stages = _trajectory_stages(dict(row)) if row else []
+        has_audit = any(
+            s in ("audit_syntax", "audit_semantics") for s in stages
+        )
+        self_audit = "" if has_audit else (
+            " Since this trajectory has no audit stage after execute, "
+            "SELF-AUDIT first: run the relevant tests / sanity checks, "
+            "verify the change does what the spec says, THEN call the "
+            "tool below."
+        )
+        return (
+            f"For code changes: "
+            f"coord_commit_push(message=<msg>, task_id={task_id!r}). "
+            f"For non-code deliverables: "
+            f"coord_complete_execution(task_id={task_id!r}, "
+            f"summary=<what you delivered>, artifact_path=<path?>). "
+            f"You MUST pass `task_id={task_id!r}` — without it the "
+            f"kanban does not advance.{self_audit}"
+            f"{_TOOL_NOT_VISIBLE_ESCAPE}"
+        )
+    if role in ("auditor_syntax", "auditor_semantics"):
+        kind = "syntax" if role == "auditor_syntax" else "semantics"
+        return (
+            f"Read the spec + the executor's commit/artifact, then call "
+            f"coord_submit_audit_report(task_id={task_id!r}, "
+            f"kind={kind!r}, body=<your review>, "
+            f"verdict='pass' or 'fail'). Pass advances the stage; fail "
+            f"reverts the task to execute and re-wakes the executor "
+            f"with your report attached.{_TOOL_NOT_VISIBLE_ESCAPE}"
+        )
+    if role == "shipper":
+        return (
+            f"Merge / publish / hand-off the deliverable, then call "
+            f"coord_mark_shipped(task_id={task_id!r}, note=<optional>). "
+            f"The task auto-archives.{_TOOL_NOT_VISIBLE_ESCAPE}"
+        )
+    return (
+        f"Call coord_my_assignments(); it will print the next "
+        f"actionable step + the completion tool to call."
+    )
+
+
 async def _wake_role_or_emit_needed(*, task_id: str, role: str) -> None:
     """Wake the active owner/candidate pool for a just-entered stage.
 
@@ -823,11 +913,13 @@ async def _wake_role_or_emit_needed(*, task_id: str, role: str) -> None:
         return
 
     role_label = _role_label(role)
+    completion_hint = await _completion_hint_for_role(task_id, role)
     if assignment.get("owner"):
         prompt = (
             f"Task {task_id} has entered your active {role_label} stage. "
-            f"Call coord_my_assignments for context, do the role work, "
-            f"then use the matching completion tool."
+            f"Call coord_my_assignments for the spec/context, do the "
+            f"role work, then call the completion tool below — the "
+            f"kanban does NOT advance until you do.\n\n{completion_hint}"
         )
     else:
         prompt = (
@@ -835,7 +927,8 @@ async def _wake_role_or_emit_needed(*, task_id: str, role: str) -> None:
             f"candidate call. If you can take it, call "
             f"coord_accept_role(task_id={task_id!r}, role={role!r}); "
             f"first accepted claim wins. If it is already claimed by the "
-            f"time you answer, there is nothing to do."
+            f"time you answer, there is nothing to do.\n\nOnce you have "
+            f"the role, the next step is:\n{completion_hint}"
         )
 
     try:

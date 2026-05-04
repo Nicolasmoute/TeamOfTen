@@ -106,11 +106,15 @@ def _flag_enabled() -> bool:
 # `HARNESS_KANBAN_STALL_SECONDS` and emits one `task_stage_stale` per
 # threshold-crossing (gated by `tasks.stale_alert_at`).
 def _stall_threshold_seconds() -> int:
-    raw = os.environ.get("HARNESS_KANBAN_STALL_SECONDS", "14400").strip()
+    # v0.3.2 audit-fix (kanban-flow gap 3): default lowered from 4h
+    # to 1h. The 4h default was too long for active sessions — a
+    # Player who silently fails to signal completion shouldn't sit
+    # for half a workday before Coach sees the stall.
+    raw = os.environ.get("HARNESS_KANBAN_STALL_SECONDS", "3600").strip()
     try:
         return max(60, int(raw))
     except ValueError:
-        return 14400
+        return 3600
 
 
 def _stall_re_alert_seconds() -> int:
@@ -284,18 +288,26 @@ async def stall_sweep_once() -> int:
             if not should_alert:
                 continue
 
-            # Pull the active role-row for the current stage to surface
-            # eligible_owners + owner in the event payload.
+            # Pull the active role-row for the CURRENT stage. The
+            # stall belongs to that role's assignee (e.g. the
+            # auditor when status='audit_semantics'), NOT to
+            # tasks.owner, which is always the executor. v0.3.4
+            # bug-fix: previously the event + nudge surfaced
+            # tasks.owner regardless of stage, so Coach saw
+            # "no activity from p8" (executor) when the actual
+            # blocker was p3 (semantic auditor).
             stage = r["status"]
             role = _role_for_stage(stage)
             eligible: list[str] = []
+            stage_owner: str | None = None
             if role:
                 c = await configured_conn()
                 try:
                     cur = await c.execute(
                         "SELECT eligible_owners, owner FROM "
                         "task_role_assignments WHERE task_id = ? "
-                        "AND role = ? AND superseded_by IS NULL "
+                        "AND role = ? AND completed_at IS NULL "
+                        "AND superseded_by IS NULL "
                         "ORDER BY assigned_at DESC LIMIT 1",
                         (r["id"], role),
                     )
@@ -304,12 +316,19 @@ async def stall_sweep_once() -> int:
                     await c.close()
                 if rrow:
                     rd = dict(rrow)
+                    stage_owner = rd.get("owner")
                     try:
                         parsed = json.loads(rd.get("eligible_owners") or "[]")
                         if isinstance(parsed, list):
                             eligible = [str(x) for x in parsed]
                     except Exception:
                         eligible = []
+
+            # The stall's responsible Player is the current stage's
+            # assignee. Fall back to tasks.owner only when no role
+            # row exists for the stage (broken state — Coach should
+            # be the one to fix it, so we still publish to coach).
+            stall_owner = stage_owner or r.get("owner")
 
             await bus.publish({
                 "ts": now_iso,
@@ -318,7 +337,11 @@ async def stall_sweep_once() -> int:
                 "task_id": r["id"],
                 "stage": stage,
                 "age_seconds": age_seconds,
-                "owner": r.get("owner"),
+                "owner": stall_owner,
+                # Keep tasks.owner separately so Coach can still see
+                # "this is the executor's task overall" even when the
+                # blocker is the auditor.
+                "task_executor": r.get("owner"),
                 "eligible_owners": eligible,
                 "to": "coach",
             })
@@ -334,17 +357,24 @@ async def stall_sweep_once() -> int:
                 await c.commit()
             finally:
                 await c.close()
-            # Also nudge the assigned Player (if any) before pinging
-            # Coach via the event — one more wake before escalation.
-            if r.get("owner"):
+            # Nudge the CURRENT stage's assignee (not always the
+            # executor) so the right Player gets the wake. v0.3.4
+            # bug-fix: the previous version always nudged
+            # tasks.owner, so a stuck audit_semantics task woke the
+            # executor instead of the auditor — who then had no
+            # actionable next step.
+            wake_target = stage_owner or r.get("owner")
+            if wake_target:
                 try:
                     from server.agents import maybe_wake_agent
+                    age_min = max(1, age_seconds // 60)
+                    nudge = _stall_nudge_for_stage(
+                        task_id=r["id"],
+                        stage=stage,
+                        age_min=age_min,
+                    )
                     await maybe_wake_agent(
-                        r["owner"],
-                        f"Reminder: task {r['id']} has been waiting in "
-                        f"{stage} for >{threshold // 3600}h. Pick it up "
-                        f"or escalate to Coach.",
-                        bypass_debounce=False,
+                        wake_target, nudge, bypass_debounce=False,
                     )
                 except Exception:
                     pass
@@ -373,6 +403,69 @@ def _role_for_stage(stage: str) -> str | None:
         "audit_semantics": "auditor_semantics",
         "ship": "shipper",
     }.get(stage)
+
+
+def _stall_nudge_for_stage(
+    *, task_id: str, stage: str, age_min: int
+) -> str:
+    """Stage-aware reminder text for the stall sweeper. The previous
+    version hardcoded the executor tools (`coord_commit_push` /
+    `coord_complete_execution`) which made no sense when a Player was
+    stuck in audit_semantics or ship — they'd be told to call the
+    wrong tool. v0.3.4: name the matching completion tool with the
+    `task_id` baked in, plus an explicit tool-not-visible escape."""
+    head = (
+        f"Reminder: task {task_id} has been in {stage} for "
+        f"{age_min} minutes with no progress signal."
+    )
+    blocked = (
+        f" If you're blocked, message Coach via "
+        f"coord_send_message(to='coach', body=...) or, for a hard "
+        f"stop, coord_request_human(subject=..., body=..., "
+        f"urgency='high'). If the named tool below is not visible "
+        f"in your runtime, message Coach IMMEDIATELY — do not write "
+        f"the artifact to disk and stop, the kanban will not see it."
+    )
+    if stage == "plan":
+        body = (
+            f"\n\nDraft the spec then call coord_write_task_spec("
+            f"task_id={task_id!r}, body=<spec>). The task auto-"
+            f"advances on success."
+        )
+    elif stage == "execute":
+        body = (
+            f"\n\nIf you finished the work, call "
+            f"coord_commit_push(task_id={task_id!r}, message=...) "
+            f"for code or coord_complete_execution(task_id={task_id!r}"
+            f", summary=...) for non-code — the kanban won't advance "
+            f"until you do."
+        )
+    elif stage == "audit_syntax":
+        body = (
+            f"\n\nFinish the formal review then call "
+            f"coord_submit_audit_report(task_id={task_id!r}, "
+            f"kind='syntax', body=<review>, "
+            f"verdict='pass' or 'fail')."
+        )
+    elif stage == "audit_semantics":
+        body = (
+            f"\n\nFinish the semantic review then call "
+            f"coord_submit_audit_report(task_id={task_id!r}, "
+            f"kind='semantics', body=<review>, "
+            f"verdict='pass' or 'fail')."
+        )
+    elif stage == "ship":
+        body = (
+            f"\n\nMerge / publish / hand-off, then call "
+            f"coord_mark_shipped(task_id={task_id!r}, "
+            f"note=<optional>)."
+        )
+    else:
+        body = (
+            f"\n\nCall coord_my_assignments() for the next "
+            f"actionable step."
+        )
+    return f"{head}{body}{blocked}"
 
 
 async def _maybe_wake_idle(slot: str) -> bool:

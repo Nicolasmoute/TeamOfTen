@@ -6,9 +6,29 @@
 > subscriber, the idle-Player poller) but cannot redefine fields,
 > endpoints, events, or invariants that TOT-specs declares.
 
-**Status:** Shipped (2026-05-04, v0.3.1 — trajectory-driven gating + audit-2026-05-04 fixes folded in).
+**Status:** Shipped (2026-05-04, v0.3.4 — production-trace fixes for wrong-Player stall attribution + tool-not-visible escape).
 **Target:** TeamOfTen multi-agent harness (Python, Claude Agent SDK, kDrive-backed shared state, single-VPS)
-**Version:** 0.3.1
+**Version:** 0.3.4
+
+> **v0.3.4 (2026-05-04 production trace, 5 bugs)** — folded in on top of v0.3.3. Real failure: Theo (p3) was assigned semantic auditor on a task in `audit_semantics`, did the review, wrote `audit_1_semantics.md` to disk, but reported "the coord task tools are not exposed here" multiple times and never called `coord_submit_audit_report`. The kanban silently sat for 15+ min; the stall sweeper then named the wrong Player (the executor p8) as the blocker; Coach got "no activity from p8" and nudged the wrong person.
+>   - **Stall sweeper attributes blame to the current-stage assignee, not `tasks.owner`.** The sweeper now reads the live `task_role_assignments` row for the task's current stage (e.g. `auditor_semantics` when `status = 'audit_semantics'`) and surfaces THAT row's owner as the stall blocker. `tasks.owner` is kept visible separately as `task_executor` in the event payload + Coach rollup, so context is preserved without misdirecting the nudge. (§10.5, §17 stall handling)
+>   - **Coach `## Stalled tasks` rollup names blocker + executor.** Same fix in `_build_stalled_tasks_rows` ([server/agents.py](server/agents.py)). When the two slots differ the rollup renders `blocker p3 (executor p8)` so Coach sees both at a glance. The trailing instruction now points Coach at the override path for tool-unreachable Players.
+>   - **Stall reminder is stage-aware.** New `_stall_nudge_for_stage()` returns role-specific completion-tool wording: planner→`coord_write_task_spec`, executor→`coord_commit_push`/`coord_complete_execution`, auditor→`coord_submit_audit_report` with the right `kind`, shipper→`coord_mark_shipped`. Previously hardcoded the executor tools regardless of stage, telling auditors to commit code.
+>   - **"Tool not visible" escape paragraph in every wake hint.** `_completion_hint_for_role()` now ends with an explicit instruction: if the named tool is not visible in the Player's runtime, message Coach IMMEDIATELY via `coord_send_message` (or `coord_request_human` for hard escalation) — DO NOT write the deliverable to disk and stop. The stall nudge ships the same escape. This addresses the real failure mode where Players quietly fail to drive the kanban because they can't see the tool.
+>   - **`coord_submit_audit_report` gains `on_behalf_of` Coach override.** Coach can now submit an audit report on behalf of an unreachable Player by passing `on_behalf_of='<slot>'`. Recorded auditor / role-row owner / event `auditor_id` is the Player; bus event `agent_id` is Coach (so the timeline shows who actually pressed the button). Player-callable path unchanged (rejects `on_behalf_of`); Coach without `on_behalf_of` still gets the "Coach doesn't audit" rejection — the override is the only Coach path. Use case: Player wrote the audit to disk, Coach reads it, copies the body, submits with `on_behalf_of=<player_slot>`. Beats `coord_advance_task_stage` because the audit content is preserved + the role row + verdict are recorded properly. (§6.3)
+>   - **Tests:** 1106 → 1115 (+9 regressions: 4 covering `on_behalf_of`, 5 covering stall stage-owner attribution + stage-aware nudge text + tool-not-visible escape).
+
+> **v0.3.3 (2026-05-04 flow-continuity audit-pass)** — folded in on top of v0.3.2:
+>   - **Auto-bind hardened against ghost tasks.** `coord_commit_push`'s auto-bind query now requires a LIVE `task_role_assignments` row (`completed_at IS NULL AND superseded_by IS NULL`), not just `tasks.owner = caller AND status = 'execute'`. Without this guard, a task whose executor row was completed by a prior commit but never advanced (subscriber crash, lost event) would be picked by auto-bind and then immediately rejected by the downstream validator with "no active uncompleted executor role" — a confusing UX directly after silent auto-binding. (§6.5)
+>   - **`coord_claim_task` response echoes the next-step.** The synchronous response was bare (`"claimed t-X"`); the kanban subscriber's stage-change wake re-prompted with the named-tool hint, but that's a separate turn. The immediate response now includes the `coord_commit_push` / `coord_complete_execution` call signature with `task_id` baked in plus the "kanban does NOT advance until you call one of those" reminder.
+>   - **`coord_accept_role` response echoes the role-specific next-step.** Same shape, branched per role: planner → `coord_write_task_spec`, executor → `coord_commit_push` / `coord_complete_execution`, auditor → `coord_submit_audit_report`, shipper → `coord_mark_shipped`. Mirror of the kanban subscriber's stage-entry wake, just landed on the synchronous accept response.
+>   - **Tests:** 1105 → 1106 (+1 regression: `test_commit_push_does_not_auto_bind_when_role_completed`).
+
+> **v0.3.2 (2026-05-04 flow-continuity, 3 gaps)** — folded in:
+>   - **Stage-entry wake names the completion tool.** [server/kanban.py](server/kanban.py)'s `_completion_hint_for_role()` returns role-specific wake instructions that NAME the right tool with `task_id` baked in: planner→`coord_write_task_spec`, executor→`coord_commit_push` / `coord_complete_execution`, auditor→`coord_submit_audit_report`, shipper→`coord_mark_shipped`. Executor hint is trajectory-aware: includes the SELF-AUDIT instruction verbatim when the trajectory has no audit stage after `execute`. Vague "use the matching completion tool" wording was the #1 cause of "Player did the work but the kanban didn't move." (§9.1)
+>   - **`coord_commit_push` auto-binds + warns Coach.** When the caller omits `task_id` but has exactly one active executor task in the project, the tool auto-binds it (kanban advances; response tells the Player so they learn the right shape). When the caller has NO active executor task and commits without `task_id`, the commit succeeds (it might be legitimate scratch work) but a `commit_without_task_id_warning` event is published routed to Coach. The `commit_pushed` event grows a `task_id_auto_bound: bool` field. (§6.5)
+>   - **Stall threshold default lowered to 1h.** `HARNESS_KANBAN_STALL_SECONDS` default dropped from 14400 (4h) to 3600 (1h). The owner-side stall nudge now NAMES the completion tools with `task_id` baked in. (§10.5)
+>   - **Tests:** 1085 → 1105 (+20 regressions).
 
 > **v0.3.1 (2026-05-04 audit cycle, 12 items)** — folded in:
 >   - **Initial activation on create.** `coord_create_task` / `POST /api/tasks` set `tasks.status` to the trajectory's first stage (was hard-defaulting to `plan`), hard-set `tasks.owner` when the first stage has a single slot, and emit `task_stage_changed` from `null → first_stage` so the wake chain fires. (§6.5)
@@ -388,11 +408,11 @@ All new tools are registered in [server/tools.py](server/tools.py)'s `_tools` ma
 | Tool | Params | Purpose |
 |---|---|---|
 | `coord_my_assignments` | (none) | Returns only current actionable work: active executor task, pending planner/reviewer/shipper roles whose stage is active, and current-stage eligible pools. Future reservations are hidden. |
-| `coord_accept_role` | `task_id, role?` | Player answers a current-stage role call. Atomic first-claim wins; losers get a stale/already-accepted error. |
+| `coord_accept_role` | `task_id, role?` | Player answers a current-stage role call. Atomic first-claim wins; losers get a stale/already-accepted error. **Response includes a role-specific next-step hint** (v0.3.3) naming the matching completion tool with `task_id` baked in: planner → `coord_write_task_spec`, executor → `coord_commit_push` / `coord_complete_execution`, auditor → `coord_submit_audit_report`, shipper → `coord_mark_shipped`. Mirror of the kanban subscriber's stage-entry wake — gives the Player the right tool name in the synchronous accept response, not just on the next turn. |
 | `coord_complete_execution` | `task_id, summary, artifact_path?, completion_kind?` | Non-git execution completion for research, writing, marketing, ops, or no-diff artifacts. Marks executor row complete and emits `task_execution_completed`. |
-| `coord_submit_audit_report` | `task_id, kind, body, verdict` | Validates active current-stage reviewer role for caller. Writes the review `.md`, marks the role row complete with verdict, emits `audit_report_submitted`. |
+| `coord_submit_audit_report` | `task_id, kind, body, verdict, on_behalf_of?` | Validates active current-stage reviewer role for caller. Writes the review `.md`, marks the role row complete with verdict, emits `audit_report_submitted`. **`on_behalf_of` is the v0.3.4 Coach-only override** for when an assigned auditor's runtime can't reach this tool: Coach reads the Player's on-disk `audit_*.md`, copies the body in, and submits with `on_behalf_of='<player_slot>'`. The role-row owner / `auditor_id` is the named Player (so the audit history reads correctly); the bus event's `agent_id` is Coach (so the timeline shows who actually pressed the button). Player-callable path unchanged. Coach without `on_behalf_of` is rejected with the standard "Coach doesn't audit" message — the explicit override is the only Coach path. |
 | `coord_mark_shipped` | `task_id, note?` | Validates active current-stage `shipper` role. Marks complete + emits `task_shipped`. |
-| `coord_claim_task` | `task_id` | **Modified.** Executor-only claim path. Validates plan-stage task, standard-task spec gate, and executor-pool `eligible_owners` membership when an executor pool row exists. Atomic UPDATE. Sets `tasks.owner` + `claimed_at = started_at = now()` and claims/inserts the active executor role row. |
+| `coord_claim_task` | `task_id` | **Modified.** Executor-only claim path. Validates plan-stage task, standard-task spec gate, and executor-pool `eligible_owners` membership when an executor pool row exists. Atomic UPDATE. Sets `tasks.owner` + `claimed_at = started_at = now()` and claims/inserts the active executor role row. **Response includes the next-step hint** (v0.3.3) naming `coord_commit_push(task_id=...)` / `coord_complete_execution(task_id=...)` with the actual `task_id` baked in plus the "kanban does NOT advance until you call one of those" reminder. |
 
 ### 6.4 Owner + Coach
 
@@ -405,7 +425,9 @@ All new tools are registered in [server/tools.py](server/tools.py)'s `_tools` ma
 - `coord_create_task` accepts `trajectory` (new in v0.3 — list of `{stage, to}` objects, validated by `_validate_trajectory()`), `workflow`, `tracking_reason` (now optional). The `complexity`, `required_reviews`, and `ship_required` params are **removed**. When `trajectory` is provided, the tool plants the matching `task_role_assignments` rows in the same transaction.
 
   **Initial activation (v0.3).** The new task's `tasks.status` is set to the trajectory's **first stage** (not the schema default `plan`). When the first stage carries a single hard-assignee, `tasks.owner` is hard-set in the same insert. Immediately after `task_created` is published, the tool emits `task_stage_changed` with `from=null` → `to=<first_stage>` so the subscriber's `_on_stage_changed` handler wakes the first-stage assignee. Without this, an execute-only trajectory like `[{"stage":"execute","to":"p2"}]` would sit silently in `plan` behind the spec gate. The default trajectory when omitted is `[{"stage":"execute","to":[]}]` — Coach can follow up with the assign tools, or the idle-poller will pick up the unassigned pool. The tool does **not** write `spec.md`; planner Players or the human do that.
-- `coord_commit_push` accepts optional `task_id`. When provided, it validates that the caller owns that active execute-stage task and has an uncompleted executor role row. On a successful push, or on explicit `push=false` local-only mode, the emitted `commit_pushed` event carries the `task_id` and the executor role row is marked complete. If `git push` was requested and fails, `task_id` is cleared from the event and the executor role remains open so the kanban cannot advance on an unpushed commit. Without `task_id`, behavior is unchanged (Compass auto-audit still fires regardless).
+- `coord_commit_push` accepts optional `task_id`. When provided, it validates that the caller owns that active execute-stage task and has an uncompleted executor role row. On a successful push, or on explicit `push=false` local-only mode, the emitted `commit_pushed` event carries the `task_id` and the executor role row is marked complete. If `git push` was requested and fails, `task_id` is cleared from the event and the executor role remains open so the kanban cannot advance on an unpushed commit.
+
+  **Auto-bind (v0.3.2, hardened in v0.3.3).** When `task_id` is omitted, the tool looks up the caller's active executor tasks in the current project. The lookup requires **both** `tasks.owner = caller` AND a LIVE `task_role_assignments` row (`completed_at IS NULL AND superseded_by IS NULL`) for the executor role — without the role-row guard, a task whose executor row was completed by a prior commit but never advanced (subscriber crash, lost event) would be picked, then the downstream validator would reject with "no active uncompleted executor role" immediately after silent auto-binding. **Exactly one match → auto-bind**: the commit drives the kanban as if `task_id` had been passed, the response tells the Player which task was bound and asks them to pass `task_id=` explicitly next time. **Zero matches** (the caller has no active executor task) → the commit still happens (legitimately useful for scratch work) but a `commit_without_task_id_warning` event is published routed to Coach (`to: 'coach'`) so the gap is visible, and the Player's response includes "Coach has been notified." Multiple matches isn't possible since `tasks.owner` is 1:1. Compass auto-audit fires regardless of binding state. The `commit_pushed` event grows a `task_id_auto_bound: bool` field so the dashboard can distinguish auto-bound from explicit commits. Auto-bind is suppressed when `git push` was requested and failed (the push failure itself is the louder signal; no warning event fires either).
 - `coord_update_task` validates against the new transition map. Legacy aliases (`done` → `archive`, `cancelled` → `archive` + `cancelled_at`) are accepted for one release.
 
 ### 6.6 Removed tools
@@ -455,13 +477,14 @@ All published via the existing `EventBus` ([server/events.py](server/events.py))
 | `task_role_completed` | `{ts, agent_id, type, task_id, role, owner, artifact_path?, verdict?, to: owner}` |
 | `task_execution_completed` | `{ts, agent_id, type, task_id, summary, artifact_path?, completion_kind?, to: executor}` |
 | `task_workflow_set` | `{ts, agent_id, type, task_id, workflow, tracking_reason?, to: owner}` |
-| `audit_report_submitted` | `{ts, agent_id, type, task_id, kind, verdict, report_path, round, auditor_id, to: <executor>}` |
+| `audit_report_submitted` | `{ts, agent_id, type, task_id, kind, verdict, report_path, round, auditor_id, to: <executor>, on_behalf_of?}` — `agent_id` is the actor (the auditor in normal use, Coach when overriding); `auditor_id` is always the effective auditor (the assigned Player). `on_behalf_of` is set to the Player slot when Coach used the v0.3.4 override path; absent / null otherwise. (§6.3) |
 | `audit_self_review_warning` | `{ts, agent_id, type, task_id, kind, auditor_id, executor_id}` |
 | `audit_fail_notification` | `{ts, agent_id: 'system', type, task_id, kind, kind_round, escalate, auditor_id, executor_id, report_path, to: 'coach'}` — fired by the kanban subscriber on every audit fail, in addition to the executor revert. `kind_round` counts fails of this kind only. `escalate=True` when `kind_round >= 2` (Coach should intervene). |
 | `stage_assignment_needed` | `{ts, agent_id: 'system', type, task_id, role, stage, to: 'coach', owner?}` — fired when a stage becomes active and no active role row exists. Renamed from `audit_assignment_needed`; back-compat alias retained for one release. |
 | `task_shipped` | `{ts, agent_id, type, task_id, shipper_id, note?, to: <executor>}` |
-| `task_stage_stale` | `{ts, agent_id: 'system', type, task_id, stage, age_seconds, owner?, eligible_owners, to: 'coach'}` — fired by the stall sweeper when a non-archive task's `last_stage_change_at` exceeds `HARNESS_KANBAN_STALL_SECONDS`. |
+| `task_stage_stale` | `{ts, agent_id: 'system', type, task_id, stage, age_seconds, owner?, task_executor?, eligible_owners, to: 'coach'}` — fired by the stall sweeper when a non-archive task's `last_stage_change_at` exceeds `HARNESS_KANBAN_STALL_SECONDS`. **v0.3.4: `owner` is the current-stage assignee** (the actual blocker — auditor when stuck in `audit_*`, shipper when stuck in `ship`, executor when stuck in `execute`, etc.), NOT `tasks.owner`. The original executor is preserved separately as `task_executor` so Coach has full context without misattribution. (§10.5) |
 | `idle_player_woken` | `{ts, agent_id: <slot>, type, reason, task_id?}` |
+| `commit_without_task_id_warning` | `{ts, agent_id: 'system', type, committer, sha, message, to: 'coach'}` — fired by `coord_commit_push` when the caller commits without `task_id` AND has no active executor task to auto-bind. Surfaces the "Player committed scratch when they should have used a task" failure mode to Coach. (v0.3.2) |
 
 **Removed events**:
 - `task_complexity_set` — column gone, event gone.
@@ -483,7 +506,7 @@ The legacy `task_updated` event keeps firing for back-compat. `/api/events` SQL 
 | `commit_pushed` with `task_id`, stage=execute | Route via `_next_stage(task, "execute")` — walks `tasks.trajectory` to find the next stage. If `execute` is the last entry, archives directly. Stamps `(project_id, sha) → task_id` in the per-project commit cache so a later `compass_audit_logged` can correlate. |
 | `task_execution_completed`, stage=execute | Same route as `commit_pushed`, but for non-git artifacts. |
 | `task_spec_written` (stage=plan, trajectory has `plan`) | Advance `plan → _next_stage(task, "plan")`. Triggered by `coord_write_task_spec` (or the human-side spec endpoint) once `tasks.spec_path` is set and the planner role row is marked completed. Skipped when the task isn't in `plan` (re-spec on an executing task is informational) or when the trajectory has no `plan` stage. |
-| `task_stage_changed` entering a non-terminal stage | The transition itself stamps `last_stage_change_at = now()` + clears `stale_alert_at`. The handler then wakes the current-stage owner/candidates (`task_role_called`) or emits `stage_assignment_needed` to Coach if no active row exists. Future-stage reservations are activated here. The same `from=null → to=<first_stage>` event is emitted by `coord_create_task` / `POST /api/tasks` so creation activates the first stage. |
+| `task_stage_changed` entering a non-terminal stage | The transition itself stamps `last_stage_change_at = now()` + clears `stale_alert_at`. The handler then wakes the current-stage owner/candidates (`task_role_called`) or emits `stage_assignment_needed` to Coach if no active row exists. Future-stage reservations are activated here. The same `from=null → to=<first_stage>` event is emitted by `coord_create_task` / `POST /api/tasks` so creation activates the first stage. **Wake prompt names the completion tool with `task_id` baked in (v0.3.2)** — the executor sees the literal `coord_commit_push(message=..., task_id="t-...")` plus the `coord_complete_execution` alternative, plus the SELF-AUDIT reminder when no audit stage follows execute. Other roles get their role-specific completion tool named the same way. The kanban does NOT advance until the assignee calls the named tool. |
 | `audit_report_submitted{verdict=pass}` | Route via `_next_stage(task, current_stage)`. |
 | `audit_report_submitted{verdict=fail}` | Revert to `execute` (always — independent of trajectory shape). Clear `started_at`. Re-wake executor with the **spec path AND latest audit report path** read fresh from `tasks.spec_path` / `tasks.latest_audit_report_path`. The wake also extracts a `## Failed criteria` (or `## Failed acceptance criteria` / `### Failed criteria`) section verbatim from the audit report when present, capped at 1500 chars. See §2.3 "Audit-fail loop guarantee" for full details. |
 | `task_shipped` | Advance `ship → archive` via `_next_stage(task, "ship")` (always archive since `ship` is canonical-last). |
@@ -552,16 +575,17 @@ Per-task once-per-threshold-crossing semantics: `tasks.stale_alert_at` records w
 
 For each stalled row:
 
-1. Emit `task_stage_stale` event: `{task_id, stage, age_seconds, owner, eligible_owners, to: 'coach'}`.
-2. Update `tasks.stale_alert_at = now()`.
-3. If the stage has an `owner` Player, also call `maybe_wake_agent(owner, ...)` — the original wake might have been ignored or rejected; one more nudge before pinging Coach.
+1. Resolve the **current-stage assignee** by looking up the live `task_role_assignments` row for the role that matches the task's current `status` (e.g. `auditor_semantics` when `status='audit_semantics'`). This Player is the stall blocker. (v0.3.4 fix — previously the sweeper used `tasks.owner` which is always the executor, so a stuck audit_semantics task would surface the executor as the blocker even though the auditor was the actual hold-up.)
+2. Emit `task_stage_stale` event: `{task_id, stage, age_seconds, owner: <stage_assignee>, task_executor: <tasks.owner>, eligible_owners, to: 'coach'}`. The legacy `owner` field is now the stage assignee; the original executor is preserved separately as `task_executor` for full context. Falls back to `tasks.owner` when no live role row exists for the stage (broken state — Coach should fix the trajectory).
+3. Update `tasks.stale_alert_at = now()`.
+4. Nudge the **stage assignee** (not always the executor) with `maybe_wake_agent(stage_assignee, ...)`. The nudge text is now stage-aware (v0.3.4): planner-stuck tasks get `coord_write_task_spec(task_id=..., body=...)`, executors get `coord_commit_push` / `coord_complete_execution`, auditors get `coord_submit_audit_report` with the right `kind`, shippers get `coord_mark_shipped`. Every nudge ends with the **tool-not-visible escape**: "if the named tool is NOT visible in your runtime, message Coach IMMEDIATELY via `coord_send_message`, DO NOT write the deliverable to disk and stop — the kanban will never see your work." This is the explicit fix for the v0.3.4 production trace where a Player wrote `audit_<round>_<kind>.md` to disk and stopped because they couldn't see `coord_submit_audit_report`.
 
 Failure isolation: per-task try/except.
 
 | Env var | Default | Meaning |
 |---|---|---|
 | `HARNESS_KANBAN_STALL_ENABLED` | `true` | Master switch for the sweeper. |
-| `HARNESS_KANBAN_STALL_SECONDS` | `14400` | 4 h. Threshold beyond which a non-blocked, non-archive task is considered stalled. |
+| `HARNESS_KANBAN_STALL_SECONDS` | `3600` | 1 h. Threshold beyond which a non-blocked, non-archive task is considered stalled. (v0.3.2 dropped from 4 h — too long for active sessions; a Player who silently fails to signal completion shouldn't sit half a workday before Coach notices.) |
 | `HARNESS_KANBAN_STALL_RE_ALERT_SECONDS` | `86400` | 24 h. After this much over-threshold, re-alert even though the task hasn't progressed (long-stuck escalation). |
 
 ---
@@ -742,13 +766,13 @@ Drop the columns `complexity`, `required_reviews`, `ship_required`. Idempotent v
 
 ---
 
-## 13 · CLAUDE.md kanban block
+## 13 · Kanban surface in the project CLAUDE.md
 
-[server/tasks_claude_md.py](server/tasks_claude_md.py) — marker-delimited static paragraph injected into every project's `CLAUDE.md` on harness boot. Mirrors the Compass `claude_md.py` pipeline.
+The kanban lifecycle paragraph lives inside the canonical project CLAUDE.md template at [server/templates/app_dev_claude_md.md](server/templates/app_dev_claude_md.md), under the `### Task lifecycle (kanban)` section. There is **no separate kanban-only injector**; the lifecycle surface ships as part of the same template that carries Compass usage rules, audit discipline, communication patterns, and anti-patterns. The whole template is the single source of truth for harness-supplied content in every project's CLAUDE.md.
 
 ### 13.1 The paragraph
 
-Marker convention: `<!-- KANBAN-LIFECYCLE-START -->` / `<!-- KANBAN-LIFECYCLE-END -->`. The source constant in `server/tasks_claude_md.py` is canonical; this spec lists the required behavioral content instead of duplicating the full block:
+Required behavioral content the section must convey:
 
 - every Coach delegation goes through kanban — no admission gate; conversational replies remain conversational;
 - stored stages with product labels: `audit_syntax` = formal review, `audit_semantics` = semantic review;
@@ -759,15 +783,18 @@ Marker convention: `<!-- KANBAN-LIFECYCLE-START -->` / `<!-- KANBAN-LIFECYCLE-EN
 - future-stage reservations are hidden until the card reaches that stage;
 - pass walks the trajectory to the next stage, fail reverts to execute, and Compass remains informational.
 
-### 13.2 inject_kanban_block flow
+### 13.2 Propagation flow
 
-`render_kanban_block()` returns the wrapped paragraph. `inject_kanban_block(project_id)` reads the project's CLAUDE.md, replaces the block between markers if present, otherwise appends it; writes back + kDrive mirror. Idempotent (no-op when content matches). `inject_into_all_projects()` walks every non-archived project on boot.
+The harness never edits a project's `CLAUDE.md` from raw injector code. Two paths:
 
-The block is **not** baked into the static per-project starter template. The project scaffold writes the ordinary `CLAUDE.md` stub first; the kanban injector appends/replaces the marker block during the next harness boot's `inject_into_all_projects()` sweep. Existing projects therefore acquire or refresh the section by boot-time injection, not by template regeneration.
+- **New projects** — `paths.write_project_claude_md_stub` reads the canonical template via `project_claude_md.canonical_project_claude_md_template(...)` and seeds the new project's `CLAUDE.md` first-write-only.
+- **Existing projects** — `project_claude_md.update_claude_md_via_coach(project_id)` runs a hidden Coach-identity LLM one-shot (Compass-style direct `claude_agent_sdk.query()` call) on every project activation and once at harness boot for the currently-pinned project. The turn reads the canonical template + the project's current `CLAUDE.md` and writes a reconciled body that reflects the latest harness rules while preserving every line of project-specific content. SHA-256 hash of the canonical template stored in `team_config['claude_md_template_hash_<id>']` (Compass `compass_truth_hash_<id>` precedent) makes a re-run with no template change a no-op. Per-project `asyncio.Lock` serialises rapid activations. Validation failure (under 200 bytes, no leading heading, etc.) emits `claude_md_update_failed` AND `human_attention` so the EnvPane attention strip + Telegram bridge raise it; hash is NOT updated, so the next activation retries.
 
-### 13.3 Why static + idempotent
+The Coach pane shows only `.sys` rows: `claude_md_update_started` / `_completed (+N -M lines)` / `_skipped (unchanged | cost_capped)` / `_failed (red)`. The full prompt + response don't surface in the timeline.
 
-The content is the same in every project — no per-project tailoring. Updates regenerate via `render_kanban_block()` and re-inject on next boot.
+### 13.3 Why this shape
+
+Every project's `CLAUDE.md` is a curated artefact (project goals, custom rules, hand-written notes). A blunt static replacement on boot — the previous design — could collide with or disturb that content. Routing the update through Coach gives the team's orchestrator the judgement to merge new harness rules with existing project content, and the canonical template is a single knob: when harness functionality evolves, edit `server/templates/app_dev_claude_md.md` once and the next activation propagates the change everywhere.
 
 ### 13.4 Coach lifecycle-policy prompt block
 

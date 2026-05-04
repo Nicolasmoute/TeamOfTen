@@ -491,6 +491,110 @@ async def test_spec_written_stamps_last_stage_change_at(fresh_db: str) -> None:
 
 
 # ------------------------------------------------------------
+# v0.3.2 kanban-flow audit gap 1: stage-entry wake names the tool
+# ------------------------------------------------------------
+
+
+async def test_completion_hint_executor_names_commit_push_with_task_id(
+    fresh_db: str,
+) -> None:
+    """The executor wake hint must name coord_commit_push with the
+    actual task_id baked in, plus coord_complete_execution. Vague
+    'matching completion tool' wording was the #1 cause of Players
+    finishing work but the kanban not moving."""
+    from server.kanban import _completion_hint_for_role
+    await init_db()
+    await _seed(
+        status="execute",
+        trajectory=_STANDARD_TRAJECTORY,
+        owner="p3",
+    )
+    hint = await _completion_hint_for_role(
+        "t-2026-05-03-abc12345", "executor"
+    )
+    assert "coord_commit_push" in hint
+    assert "coord_complete_execution" in hint
+    assert "t-2026-05-03-abc12345" in hint
+    assert "MUST pass" in hint
+
+
+async def test_completion_hint_executor_includes_self_audit_when_no_audit_stage(
+    fresh_db: str,
+) -> None:
+    """Trajectory with no audit stage after execute → hint reminds
+    the executor to self-audit before signalling done."""
+    from server.kanban import _completion_hint_for_role
+    await init_db()
+    await _seed(
+        status="execute",
+        trajectory=_SIMPLE_TRAJECTORY,  # only execute, no audit
+        owner="p3",
+    )
+    hint = await _completion_hint_for_role(
+        "t-2026-05-03-abc12345", "executor"
+    )
+    assert "SELF-AUDIT" in hint
+
+
+async def test_completion_hint_executor_omits_self_audit_when_audit_stage_present(
+    fresh_db: str,
+) -> None:
+    """Trajectory with an audit stage → no self-audit reminder
+    (the configured auditor is the gate)."""
+    from server.kanban import _completion_hint_for_role
+    await init_db()
+    await _seed(
+        status="execute",
+        trajectory=_FORMAL_ONLY_TRAJECTORY,
+        owner="p3",
+    )
+    hint = await _completion_hint_for_role(
+        "t-2026-05-03-abc12345", "executor"
+    )
+    assert "SELF-AUDIT" not in hint
+
+
+async def test_completion_hint_planner_names_write_task_spec(
+    fresh_db: str,
+) -> None:
+    from server.kanban import _completion_hint_for_role
+    await init_db()
+    await _seed(status="plan", owner=None)
+    hint = await _completion_hint_for_role(
+        "t-2026-05-03-abc12345", "planner"
+    )
+    assert "coord_write_task_spec" in hint
+    assert "t-2026-05-03-abc12345" in hint
+
+
+async def test_completion_hint_auditor_names_submit_audit_report(
+    fresh_db: str,
+) -> None:
+    from server.kanban import _completion_hint_for_role
+    await init_db()
+    await _seed(status="audit_syntax", owner="p3")
+    hint = await _completion_hint_for_role(
+        "t-2026-05-03-abc12345", "auditor_syntax"
+    )
+    assert "coord_submit_audit_report" in hint
+    assert "kind='syntax'" in hint or 'kind="syntax"' in hint
+    assert "t-2026-05-03-abc12345" in hint
+
+
+async def test_completion_hint_shipper_names_mark_shipped(
+    fresh_db: str,
+) -> None:
+    from server.kanban import _completion_hint_for_role
+    await init_db()
+    await _seed(status="ship", owner="p3")
+    hint = await _completion_hint_for_role(
+        "t-2026-05-03-abc12345", "shipper"
+    )
+    assert "coord_mark_shipped" in hint
+    assert "t-2026-05-03-abc12345" in hint
+
+
+# ------------------------------------------------------------
 # audit-2026-05-04 item 12: per-project Compass commit correlation
 # ------------------------------------------------------------
 

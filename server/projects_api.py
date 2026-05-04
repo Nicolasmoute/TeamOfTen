@@ -1353,6 +1353,25 @@ async def _run_switch(
                     "actor": actor,
                 }
             )
+            # Fire-and-forget: reconcile the activated project's
+            # CLAUDE.md against the latest canonical template via a
+            # hidden Coach-identity LLM turn. Hash-gated so re-
+            # activation without a template change is a no-op. Lives
+            # outside the switch's success path so a slow LLM doesn't
+            # delay the activation API response.
+            try:
+                from server.project_claude_md import (
+                    update_claude_md_via_coach,
+                )
+                asyncio.create_task(
+                    update_claude_md_via_coach(
+                        to_project, source="activation",
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "project_claude_md: activation update scheduling failed"
+                )
         else:
             # Terminal failure event with which step blew up so the
             # busy modal's "Retry / Cancel and stay" UI (Phase 4) can

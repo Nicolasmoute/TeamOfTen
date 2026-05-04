@@ -1306,10 +1306,14 @@ proposeable>
 ```
 
 The trailing `## truth/` and `## Updating this CLAUDE.md` sections are
-fixed paragraphs (template literal in `_PROJECT_CLAUDE_MD_STUB`) that
+fixed paragraphs in the canonical template at
+`server/templates/app_dev_claude_md.md` (read via
+`server.project_claude_md.canonical_project_claude_md_template`) that
 interpolate the project's slug and explain both proposal scopes.
 Coach in fresh projects reads this on every turn via
-`build_system_prompt_suffix`.
+`build_system_prompt_suffix`. Existing projects pick up template
+changes through the Coach-driven reconciliation flow at
+`server.project_claude_md.update_claude_md_via_coach`.
 
 **No `## Goal` section.** Earlier revisions of this template included
 a `## Goal\n<description>` section pre-filled from the creation-modal

@@ -382,22 +382,25 @@ async def lifespan(app: FastAPI):
         await start_idle_poller()
     except Exception:
         logger.exception("idle player poller failed to start (non-fatal)")
-    # Kanban CLAUDE.md block — inject the static lifecycle paragraph
-    # into every project's CLAUDE.md so Coach + Players see the same
-    # baseline rules every turn. Idempotent; no-op when the block is
-    # already present and matches the canonical text. See
-    # Docs/kanban-specs.md §13.
+    # Project CLAUDE.md reconciliation — fire a hidden Coach-driven
+    # update for the currently-pinned active project so a redeploy
+    # that changes the canonical template at
+    # `server/templates/app_dev_claude_md.md` propagates without
+    # waiting for the human to re-click activate. Hash-gated, so a
+    # boot with no template change is a no-op. Fire-and-forget —
+    # don't block the HTTP listener coming up. Activations also
+    # trigger this path via `server.projects_api._run_switch`.
     try:
-        from server.tasks_claude_md import inject_into_all_projects
-        injected = await inject_into_all_projects()
-        if injected:
-            logger.info(
-                "tasks_claude_md: injected kanban block into %d project(s)",
-                injected,
+        from server.db import resolve_active_project
+        from server.project_claude_md import update_claude_md_via_coach
+        active_pid = await resolve_active_project()
+        if active_pid:
+            asyncio.create_task(
+                update_claude_md_via_coach(active_pid, source="boot")
             )
     except Exception:
         logger.exception(
-            "tasks_claude_md: inject_into_all_projects failed (non-fatal)"
+            "project_claude_md: boot update scheduling failed (non-fatal)"
         )
     bg_tasks = (snapshot_task, project_sync_task, global_sync_task, recurrence_task, stale_task_task, trim_task, att_trim_task, sessions_trim_task, compass_task)
     try:

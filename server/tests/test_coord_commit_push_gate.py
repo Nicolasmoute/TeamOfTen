@@ -345,3 +345,169 @@ async def test_commit_push_explicit_local_only_drives_advance(
     assert len(pushed) == 1
     assert pushed[0].get("push_requested") is False
     assert pushed[0].get("task_id") == "t-2026-05-03-abc12345"
+
+
+# ---------- v0.3.2 kanban-flow audit fixes ----------
+
+
+async def test_commit_push_auto_binds_when_task_id_omitted_and_one_active(
+    fresh_db: str,
+    stub_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the caller omits task_id but has exactly one active executor
+    task, coord_commit_push auto-binds it. The kanban event carries
+    the task_id and the response says we did so."""
+    from server.events import bus
+
+    await init_db()
+    await _seed_task()
+    await _seed_executor_role()
+    _stub_subprocess(monkeypatch)
+
+    captured: list[dict[str, Any]] = []
+    queue = bus.subscribe()
+
+    server = _server_for("p3")
+    result = await _handler(server, "commit_push")({
+        "message": "auto-bind test",
+        # task_id intentionally omitted
+    })
+    text = _ok_text(result)
+    assert "auto-bound" in text.lower() or "auto-bind" in text.lower()
+    assert "t-2026-05-03-abc12345" in text
+
+    while True:
+        try:
+            captured.append(queue.get_nowait())
+        except Exception:
+            break
+    pushed = [e for e in captured if e.get("type") == "commit_pushed"]
+    assert len(pushed) == 1
+    assert pushed[0].get("task_id") == "t-2026-05-03-abc12345"
+    assert pushed[0].get("task_id_auto_bound") is True
+
+
+async def test_commit_push_no_active_task_emits_warning_to_coach(
+    fresh_db: str,
+    stub_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the caller commits without task_id AND has no active
+    executor task, the commit succeeds but a warning event is
+    routed to Coach so the gap is visible."""
+    from server.events import bus
+
+    await init_db()
+    # No seeded task → caller has no active executor task.
+    _stub_subprocess(monkeypatch)
+
+    captured: list[dict[str, Any]] = []
+    queue = bus.subscribe()
+
+    server = _server_for("p3")
+    result = await _handler(server, "commit_push")({
+        "message": "scratch commit",
+    })
+    text = _ok_text(result)
+    assert "NOT bound" in text
+    assert "Coach has been notified" in text
+
+    while True:
+        try:
+            captured.append(queue.get_nowait())
+        except Exception:
+            break
+    warnings = [
+        e for e in captured
+        if e.get("type") == "commit_without_task_id_warning"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].get("committer") == "p3"
+    assert warnings[0].get("to") == "coach"
+    # The companion commit_pushed event has task_id=None.
+    pushed = [e for e in captured if e.get("type") == "commit_pushed"]
+    assert len(pushed) == 1
+    assert pushed[0].get("task_id") is None
+    assert pushed[0].get("task_id_auto_bound") is False
+
+
+async def test_commit_push_does_not_auto_bind_when_role_completed(
+    fresh_db: str,
+    stub_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If a prior commit completed the executor role row but the task
+    is somehow stuck in execute (subscriber crash / push retry), the
+    auto-bind query must NOT pick it up — otherwise the downstream
+    validator rejects with a confusing 'no active uncompleted
+    executor role' error immediately after the auto-bind."""
+    from server.events import bus
+
+    await init_db()
+    await _seed_task()
+    # Role row exists but completed_at is set — there's no LIVE row.
+    await _seed_executor_role(completed_at="2026-05-03T11:00:00Z")
+    _stub_subprocess(monkeypatch)
+
+    captured: list[dict[str, Any]] = []
+    queue = bus.subscribe()
+
+    server = _server_for("p3")
+    result = await _handler(server, "commit_push")({
+        "message": "scratch after stuck task",
+        # task_id omitted; no live executor role to auto-bind to
+    })
+    text = _ok_text(result)
+    # Falls through to the no-active-task path → warning + advisory.
+    assert "NOT bound" in text
+
+    while True:
+        try:
+            captured.append(queue.get_nowait())
+        except Exception:
+            break
+    pushed = [e for e in captured if e.get("type") == "commit_pushed"]
+    assert pushed and pushed[0].get("task_id") is None
+    assert pushed[0].get("task_id_auto_bound") is False
+    warnings = [
+        e for e in captured
+        if e.get("type") == "commit_without_task_id_warning"
+    ]
+    assert len(warnings) == 1
+
+
+async def test_commit_push_explicit_task_id_does_not_emit_warning(
+    fresh_db: str,
+    stub_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sanity: when the caller passes task_id explicitly, no warning fires
+    even though we touch the same publisher path."""
+    from server.events import bus
+
+    await init_db()
+    await _seed_task()
+    await _seed_executor_role()
+    _stub_subprocess(monkeypatch)
+
+    captured: list[dict[str, Any]] = []
+    queue = bus.subscribe()
+
+    server = _server_for("p3")
+    await _handler(server, "commit_push")({
+        "message": "explicit binding",
+        "task_id": "t-2026-05-03-abc12345",
+    })
+    while True:
+        try:
+            captured.append(queue.get_nowait())
+        except Exception:
+            break
+    warnings = [
+        e for e in captured
+        if e.get("type") == "commit_without_task_id_warning"
+    ]
+    assert warnings == []
+    pushed = [e for e in captured if e.get("type") == "commit_pushed"]
+    assert pushed and pushed[0].get("task_id_auto_bound") is False

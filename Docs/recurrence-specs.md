@@ -274,10 +274,11 @@ Coach's tools, not Players'.
 `project-objectives.md` is the **only** place project goals / scope live
 in Coach's system prompt. Specifically:
 
-- The per-project CLAUDE.md template (`server/paths.py`'s
-  `_PROJECT_CLAUDE_MD_STUB`) does NOT include a `## Goal` section. It
-  carries a `## Project objectives` pointer paragraph that names the
-  objectives file and tells Coach where to read / update.
+- The per-project CLAUDE.md template (`server/templates/app_dev_claude_md.md`,
+  read via `server.project_claude_md.canonical_project_claude_md_template`)
+  does NOT include a `## Goal` section. It carries a `## Project objectives`
+  pointer paragraph that names the objectives file and tells Coach where
+  to read / update.
 - The Coach coordination block (`_build_coach_coordination_block` in
   `server/agents.py`) does NOT render a `Goal:` line from
   `projects.description`. It surfaces only the project name and a

@@ -1009,3 +1009,112 @@ async def test_assign_task_pool_mirrors_trajectory_to(fresh_db: str) -> None:
     traj = json.loads(row["trajectory"])
     exec_entry = next(s for s in traj if s["stage"] == "execute")
     assert exec_entry["to"] == ["p2", "p3"]
+
+
+# ---------------------------------------------------------------------
+# v0.3.4 audit-fix: Coach can submit audit on behalf of a Player whose
+# runtime can't reach coord_submit_audit_report
+# ---------------------------------------------------------------------
+
+
+async def test_submit_audit_report_on_behalf_of_records_player_as_auditor(
+    fresh_db: str,
+) -> None:
+    """Coach passing on_behalf_of='p3' submits the audit as if p3 had
+    called the tool. This is the override path for the production
+    failure mode where a Player's runtime doesn't expose coord_*."""
+    await init_db()
+    await _seed_task(status="audit_semantics", owner="p4", spec_path="x")
+    # Coach assigns p3 as the semantic auditor.
+    coach = _server_for("coach")
+    await _handler(coach, "assign_auditor")({
+        "task_id": "t-2026-05-03-abc12345",
+        "to": "p3",
+        "kind": "semantic",
+    })
+    # Coach overrides on p3's behalf.
+    text = _ok_text(await _handler(coach, "submit_audit_report")({
+        "task_id": "t-2026-05-03-abc12345",
+        "kind": "semantic",
+        "body": "p3 wrote this audit to disk; runtime couldn't reach the tool.",
+        "verdict": "pass",
+        "on_behalf_of": "p3",
+    }))
+    assert "on behalf of p3" in text
+    # The recorded auditor on the role row is p3, not coach.
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT owner, verdict, completed_at "
+            "FROM task_role_assignments "
+            "WHERE task_id = 't-2026-05-03-abc12345' "
+            "AND role = 'auditor_semantics' "
+            "AND completed_at IS NOT NULL "
+            "ORDER BY assigned_at DESC LIMIT 1"
+        )
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    assert row["owner"] == "p3"
+    assert row["verdict"] == "pass"
+
+
+async def test_submit_audit_report_on_behalf_of_player_rejected(
+    fresh_db: str,
+) -> None:
+    """Players cannot use on_behalf_of — the override is Coach-only."""
+    await init_db()
+    await _seed_task(status="audit_semantics", owner="p4", spec_path="x")
+    coach = _server_for("coach")
+    await _handler(coach, "assign_auditor")({
+        "task_id": "t-2026-05-03-abc12345",
+        "to": "p3",
+        "kind": "semantic",
+    })
+    p7 = _server_for("p7")
+    err = _err_text(await _handler(p7, "submit_audit_report")({
+        "task_id": "t-2026-05-03-abc12345",
+        "kind": "semantic",
+        "body": "trying to submit for someone else",
+        "verdict": "pass",
+        "on_behalf_of": "p3",
+    }))
+    assert "Coach-only" in err
+
+
+async def test_submit_audit_report_coach_without_on_behalf_of_rejected(
+    fresh_db: str,
+) -> None:
+    """Coach without on_behalf_of still gets the 'Coach doesn't audit'
+    rejection — the explicit override is the only path."""
+    await init_db()
+    await _seed_task(status="audit_semantics", owner="p4", spec_path="x")
+    coach = _server_for("coach")
+    await _handler(coach, "assign_auditor")({
+        "task_id": "t-2026-05-03-abc12345",
+        "to": "p3",
+        "kind": "semantic",
+    })
+    err = _err_text(await _handler(coach, "submit_audit_report")({
+        "task_id": "t-2026-05-03-abc12345",
+        "kind": "semantic",
+        "body": "no override",
+        "verdict": "pass",
+    }))
+    assert "Coach doesn't audit" in err
+
+
+async def test_submit_audit_report_on_behalf_of_invalid_slot_rejected(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed_task(status="audit_semantics", owner="p4", spec_path="x")
+    coach = _server_for("coach")
+    err = _err_text(await _handler(coach, "submit_audit_report")({
+        "task_id": "t-2026-05-03-abc12345",
+        "kind": "semantic",
+        "body": "x",
+        "verdict": "pass",
+        "on_behalf_of": "broadcast",
+    }))
+    assert "must be a Player slot" in err
