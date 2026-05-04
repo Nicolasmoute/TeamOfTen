@@ -34,11 +34,13 @@ lanes — adapt to the project's actual surface:
 
 - **frontend** — UI, rendering, interaction.
 - **backend** — engine, API, server, data layer.
-- **code auditor** — reviews diffs against the contract; verifies
-  protocol / spec / race-condition correctness.
-- **semantics auditor** — verifies the implementation preserves the
-  meaning of the underlying domain model. Independent of the code
-  auditor; they catch different bug classes.
+- **code auditor** (syntax / formal) — reviews diffs against the
+  contract cascade (spec when present, else title+description+wake+
+  commit); verifies protocol / spec / race-condition correctness.
+- **semantics auditor** — judges the deliverable against project
+  context (Compass intent, `truth/`, `project-objectives.md`, wiki),
+  NOT against spec.md. Catches drift that a syntax-only review
+  misses (math errors, brand drift, wrong-domain terminology).
 - **devx / qa** — perf benchmarks, deploy verification, hooks,
   tooling.
 - (overflow lane copies for capacity if a primary Player is busy.)
@@ -72,15 +74,48 @@ post-hoc: run the audit anyway and hot-fix if it surfaces something.
 
 ### Two-axis audit
 
-For non-trivial changes, run two auditors:
+For non-trivial changes, run two auditors. They answer different
+questions and read different sources — conflating them produces
+rubber-stamps or noise.
 
-- **Code auditor** — does the code do what the spec says? Race
-  conditions, memory leaks, fallback loops, freshness bugs.
-- **Semantics auditor** — does the implementation preserve the
-  meaning of the underlying domain model? Data shapes, mathematical
-  invariants, semantic UX deviations from spec wording.
+- **Syntax / formal auditor (contract-bound)** — does the deliverable
+  match what was asked, and is it internally sound? (Race conditions,
+  memory leaks, fallback loops, broken interfaces, drift from the
+  acceptance criteria.) The auditor reads the contract cascade —
+  spec.md when present, else task title+description, else the
+  executor's wake prompt, plus the commit/artifact summary. A missing
+  spec.md does NOT block the audit; the cascade always has at least
+  the title+description Coach provided.
+- **Semantic auditor (context-bound, NOT spec-bound)** — does this
+  deliverable make sense in the world this project lives in? (Math
+  invariants, brand voice, domain terminology, alignment with where
+  the project is heading.) The auditor reads the project's `truth/`,
+  `project-objectives.md`, the per-project wiki, and the Compass
+  block already injected into this CLAUDE.md. The spec is
+  supplementary background only — the audit verdict judges against
+  the world, not against the planner's interpretation. A spec that
+  drifted from project intent is a bug the semantic auditor must
+  catch.
 
-They catch different bug classes. Don't collapse them.
+**Coach must name the focus.** When you assign an auditor, tell them
+**what to check** via the `focus` parameter on `coord_assign_auditor`
+(or in the trajectory entry on `coord_create_task`). Without a
+stated focus the audit is noise.
+
+- Bad: "Run a semantic audit on this commit."
+- Good: `coord_assign_auditor(kind='semantics', to='p7',
+  focus="Verify the rule-3a derivation matches the wiki entry on
+  multiway causal foliation; check that user-facing labels use
+  'foliation' not 'slicing' per the glossary.")`
+- Bad: "Formal review on the lock change."
+- Good: `coord_assign_auditor(kind='syntax', to='p4',
+  focus="Race-condition review on the new lock path in
+  server/foo.py:acquire — particularly the timeout fallback. Ignore
+  unrelated style drift.")`
+
+Semantic audits without a focus are rejected by the tool. Syntax
+audits accept an empty focus (defaults to "match contract +
+soundness") but a sharper focus reduces audit noise.
 
 ### Strategic alignment via Compass
 

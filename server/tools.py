@@ -224,9 +224,10 @@ def _validate_trajectory(
 ) -> tuple[list[dict[str, Any]] | None, str | None]:
     """Validate a trajectory list per Docs/kanban-specs.md §3.2.
 
-    Accepts a Python list of `{stage, to}` dicts OR a JSON-encoded string
-    of the same. On success returns the normalized list (each entry
-    `{stage: str, to: list[str]}`); on failure returns `(None, error)`.
+    Accepts a Python list of `{stage, to, focus?}` dicts OR a
+    JSON-encoded string of the same. On success returns the normalized
+    list (each entry `{stage: str, to: list[str], focus?: str}`); on
+    failure returns `(None, error)`.
 
     Rules:
       - non-empty list
@@ -235,6 +236,12 @@ def _validate_trajectory(
       - stages appear in canonical order
       - `execute` is mandatory
       - `to` is a slot string or list of slot strings
+      - `focus` (optional) must be a string when present; ignored on
+        non-audit stages; REQUIRED on `audit_semantics` entries with a
+        non-empty `to` (semantic audits without a stated focus are
+        noise — see kanban-specs.md §4.6.3). Empty-pool semantic
+        stages are allowed; the focus check then happens at
+        `coord_assign_auditor` time.
     """
     if raw is None:
         return None, "trajectory is required"
@@ -248,7 +255,7 @@ def _validate_trajectory(
             return None, "trajectory JSON could not be parsed"
         return _validate_trajectory(parsed)
     if not isinstance(raw, list):
-        return None, "trajectory must be a list of {stage, to} objects"
+        return None, "trajectory must be a list of {stage, to, focus?} objects"
     if not raw:
         return None, "trajectory cannot be empty"
 
@@ -257,7 +264,7 @@ def _validate_trajectory(
     last_idx = -1
     for entry in raw:
         if not isinstance(entry, dict):
-            return None, "trajectory entries must be {stage, to} objects"
+            return None, "trajectory entries must be {stage, to, focus?} objects"
         stage = str(entry.get("stage", "")).strip().lower()
         if stage not in TRAJECTORY_STAGES:
             return None, (
@@ -278,7 +285,28 @@ def _validate_trajectory(
         slots_or_err = _coerce_player_slots(entry.get("to"))
         if isinstance(slots_or_err, str):
             return None, slots_or_err
-        normalized.append({"stage": stage, "to": slots_or_err})
+        out_entry: dict[str, Any] = {"stage": stage, "to": slots_or_err}
+        focus_raw = entry.get("focus")
+        if focus_raw is not None and not isinstance(focus_raw, str):
+            return None, (
+                f"trajectory entry {stage!r}: 'focus' must be a string"
+            )
+        focus_clean = (focus_raw or "").strip() if isinstance(focus_raw, str) else ""
+        # Reject semantic audit with assignees but no focus. An
+        # empty-pool semantic stage may be planned at create time and
+        # the focus filled in later via coord_assign_auditor.
+        if stage == "audit_semantics" and slots_or_err and not focus_clean:
+            return None, (
+                "audit_semantics requires a 'focus' string when 'to' is "
+                "non-empty — name what to check (e.g. focus='verify the "
+                "math derivation matches the glossary'). Semantic audits "
+                "without a focus are noise (see kanban-specs.md §4.6.3)."
+            )
+        # Persist focus only on audit stages (silently drop on non-audit
+        # so a Coach paste-mistake doesn't pollute the row).
+        if focus_clean and stage in ("audit_syntax", "audit_semantics"):
+            out_entry["focus"] = focus_clean
+        normalized.append(out_entry)
 
     if "execute" not in seen_stages:
         return None, "trajectory must include 'execute'"
@@ -797,24 +825,28 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 to_list: list[str] = entry.get("to") or []
                 role = role_for_stage[stage]
                 eligible_json = json.dumps(to_list, separators=(",", ":"))
+                # Audit-stage focus (kanban-specs §4.6 / §12.1). NULL
+                # for non-audit roles. _validate_trajectory already
+                # enforced the audit_semantics-needs-focus rule above.
+                focus_value: str | None = entry.get("focus") or None
                 if len(to_list) == 1:
                     # Hard-assign.
                     await c.execute(
                         "INSERT INTO task_role_assignments "
                         "(task_id, role, eligible_owners, owner, "
-                        "assigned_at, claimed_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        "assigned_at, claimed_at, focus) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
                         (task_id, role, eligible_json, to_list[0],
-                         now_iso, now_iso),
+                         now_iso, now_iso, focus_value),
                     )
                 else:
                     # Empty list (no candidates yet) or pool (>1).
                     await c.execute(
                         "INSERT INTO task_role_assignments "
                         "(task_id, role, eligible_owners, owner, "
-                        "assigned_at) "
-                        "VALUES (?, ?, ?, NULL, ?)",
-                        (task_id, role, eligible_json, now_iso),
+                        "assigned_at, focus) "
+                        "VALUES (?, ?, ?, NULL, ?, ?)",
+                        (task_id, role, eligible_json, now_iso, focus_value),
                     )
             await c.commit()
         finally:
@@ -4823,7 +4855,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     }
 
     async def _mirror_assign_targets_to_trajectory(
-        c, *, task_id: str, role: str, targets: list[str]
+        c, *, task_id: str, role: str, targets: list[str],
+        focus: str | None = None,
     ) -> None:
         target_stage = _STAGE_FOR_ROLE.get(role)
         if not target_stage:
@@ -4848,6 +4881,19 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 and entry.get("stage") == target_stage
             ):
                 entry["to"] = list(targets)
+                # Audit stages: keep `focus` in sync with the role row.
+                # Only audit_* stages carry focus; on non-audit stages
+                # any prior focus is silently dropped (defensive — the
+                # validator wouldn't have allowed it but legacy rows
+                # might exist).
+                if target_stage in ("audit_syntax", "audit_semantics"):
+                    if focus:
+                        entry["focus"] = focus
+                    # When focus is None, preserve any prior focus on
+                    # the trajectory entry (matches `_assign_role_helper`
+                    # caller semantics — pass focus only when set).
+                else:
+                    entry.pop("focus", None)
                 changed = True
                 break
         if changed:
@@ -4863,6 +4909,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         role: str,
         targets: list[str],
         wake_prompt_for_role: str,
+        focus: str | None = None,
     ) -> tuple[bool, str, list[str]]:
         """Insert a task_role_assignments row for the given role and
         wake eligible Players. Returns (ok, message, woken_slots).
@@ -4881,25 +4928,30 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
           list updated to reflect the new candidate list, so the
           stored trajectory + Coach prompt + UI marker stay in sync
           with the role rows.
+
+        `focus` is the audit-stage focus (kanban-specs §4.6 / §12.1).
+        Caller is responsible for the audit_semantics-needs-focus
+        validation; this helper just persists whatever it's handed.
         """
         import json as _json
         is_pool = len(targets) > 1
         now = _now_iso()
         eligible_json = _json.dumps(targets)
+        focus_value = (focus or None) if isinstance(focus, str) else focus
         if is_pool:
             cur = await c.execute(
                 "INSERT INTO task_role_assignments "
-                "(task_id, role, eligible_owners, owner, assigned_at) "
-                "VALUES (?, ?, ?, NULL, ?)",
-                (task_id, role, eligible_json, now),
+                "(task_id, role, eligible_owners, owner, assigned_at, focus) "
+                "VALUES (?, ?, ?, NULL, ?, ?)",
+                (task_id, role, eligible_json, now, focus_value),
             )
         else:
             cur = await c.execute(
                 "INSERT INTO task_role_assignments "
                 "(task_id, role, eligible_owners, owner, "
-                "assigned_at, claimed_at) "
-                "VALUES (?, ?, '[]', ?, ?, ?)",
-                (task_id, role, targets[0], now, now),
+                "assigned_at, claimed_at, focus) "
+                "VALUES (?, ?, '[]', ?, ?, ?, ?)",
+                (task_id, role, targets[0], now, now, focus_value),
             )
         new_id = cur.lastrowid
         # Capture displaced owners BEFORE the supersede UPDATE so we
@@ -4923,9 +4975,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             (new_id, task_id, role, new_id),
         )
         # Mirror the new candidate list back into tasks.trajectory.to
-        # for the matching stage (item 8).
+        # for the matching stage (item 8). Audit-stage focus is passed
+        # through so a mid-flight `coord_assign_auditor(focus=...)`
+        # also keeps the stored trajectory's matching entry in sync.
         await _mirror_assign_targets_to_trajectory(
-            c, task_id=task_id, role=role, targets=targets
+            c, task_id=task_id, role=role, targets=targets,
+            focus=focus_value,
         )
         await c.commit()
 
@@ -5083,12 +5138,27 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         "coord_assign_auditor",
         (
             "Coach-only. Assign a Player to audit a task. Two kinds:\n"
-            "  - 'syntax':    tests/CI/lint/code review (mechanical correctness)\n"
-            "  - 'semantics': alignment with spec / project goals / lattice\n"
+            "  - 'syntax':    contract-bound (does the deliverable match what was asked + is it sound?).\n"
+            "                 Cascade: spec → title+description → executor wake → commit.\n"
+            "  - 'semantics': context-bound (does it make sense in the project's world?).\n"
+            "                 Reads truth/, project-objectives.md, wiki/, Compass.\n"
+            "                 Spec is supplementary background only.\n"
             "\n"
             "Single-Player or comma-list pool. The auditor reads the "
-            "spec + commit + (semantics only) Compass audit report, then "
-            "calls coord_submit_audit_report(verdict='pass'|'fail').\n"
+            "context, then calls coord_submit_audit_report(verdict='pass'|'fail').\n"
+            "\n"
+            "FOCUS PARAMETER (kanban-specs §4.6.3): name what the auditor "
+            "should check. REQUIRED for kind='semantics' (rejected without). "
+            "Optional for kind='syntax' (defaults to 'match contract + "
+            "soundness'). On re-assign without focus, inherits from the "
+            "prior superseded row.\n"
+            "  - Bad: focus omitted on a semantic audit.\n"
+            "  - Good: focus='Verify the rule-3a derivation matches the wiki "
+            "entry on multiway causal foliation; check brand naming on "
+            "user-facing strings.'\n"
+            "  - Good (syntax): focus='Race-condition review of the new lock "
+            "path in server/foo.py:acquire — particularly the timeout fallback. "
+            "Ignore unrelated style drift.'\n"
             "\n"
             "If you assign the executor as their own auditor, an "
             "audit_self_review_warning event fires (does NOT block — "
@@ -5097,9 +5167,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "Params:\n"
             "- task_id: required\n"
             "- to: 'p4' or 'p4,p5'\n"
-            "- kind: 'syntax' or 'semantics' (required)"
+            "- kind: 'syntax' or 'semantics' (required)\n"
+            "- focus: free-text (REQUIRED for semantics; optional for syntax)"
         ),
-        {"task_id": str, "to": str, "kind": str},
+        {"task_id": str, "to": str, "kind": str, "focus": str},
     )
     async def assign_auditor(args: dict[str, Any]) -> dict[str, Any]:
         if not caller_is_coach:
@@ -5107,6 +5178,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         task_id = (args.get("task_id") or "").strip()
         to_raw = (args.get("to") or "").strip()
         kind_input = (args.get("kind") or "").strip().lower()
+        focus_raw = args.get("focus")
+        focus = focus_raw.strip() if isinstance(focus_raw, str) else ""
         if not task_id:
             return _err("task_id is required")
         role = _resolve_audit_role_kind(kind_input)
@@ -5119,6 +5192,22 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             return _err(err)
         if targets is None:
             return _err("internal: target validation returned None")
+        # Inherit focus from prior superseded row when the caller
+        # omitted it (kanban-specs §4.6.3 — quick reassignment must
+        # not lose Coach's earlier framing).
+        if not focus:
+            from server.kanban import inherit_audit_focus
+            inherited = await inherit_audit_focus(task_id, role)
+            if inherited:
+                focus = inherited
+        # Semantic audits without a focus are noise. Reject loudly.
+        if role == "auditor_semantics" and not focus:
+            return _err(
+                "semantic audits require a focus — name what to check "
+                "(e.g. focus='verify the math derivation matches the "
+                "glossary'). Auditors with no focus rubber-stamp. See "
+                "kanban-specs.md §4.6.3."
+            )
         project_id = await resolve_active_project()
         c = await configured_conn()
         try:
@@ -5133,19 +5222,20 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             t = dict(row)
             executor = t.get("owner")
             self_review = bool(executor and executor in targets)
-            wake_prompt = (
-                f"Coach asked you to perform {review_label} review on task {task_id}. "
-                f"If this was a pool call, first call "
-                f"coord_accept_role(task_id={task_id!r}, role={role!r}); "
-                f"Read the spec at /data/projects/.../tasks/{task_id}/spec.md, "
-                f"the delivered artifact, and (for semantics) any Compass "
-                f"audit report linked from the kanban card. When done, "
-                f"call coord_submit_audit_report(task_id={task_id!r}, "
-                f"kind={kind!r}, verdict='pass'|'fail', body=...)"
+            # Build the auditor wake via the kanban helper so the
+            # initial-assignment wake matches the stage-entry wake
+            # (single source of truth for focus + context layout).
+            from server.kanban import build_auditor_wake_body
+            wake_prompt = await build_auditor_wake_body(
+                task_id=task_id,
+                role=role,
+                focus=focus,
+                is_pool=(len(targets) > 1),
             )
             ok, msg, slots = await _assign_role_helper(
                 c, task_id=task_id, role=role, targets=targets,
                 wake_prompt_for_role=wake_prompt,
+                focus=focus or None,
             )
             if ok:
                 cur = await c.execute(
@@ -5900,9 +5990,16 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 to_list: list[str] = entry.get("to") or []
                 role = role_for_stage[stage]
                 eligible_json = json.dumps(to_list, separators=(",", ":"))
+                # Audit-stage focus from the new entry (when present).
+                # Validator already rejected audit_semantics with
+                # non-empty `to` and no focus. For audit_syntax (focus
+                # optional) and unchanged-focus semantic re-routes,
+                # entry.focus may be absent — preserve the existing
+                # row's focus by passing None into the merge below.
+                new_focus: str | None = entry.get("focus") or None
                 # Find the active role row (if any). If none, insert fresh.
                 cur = await c.execute(
-                    "SELECT id, owner, eligible_owners "
+                    "SELECT id, owner, eligible_owners, focus "
                     "FROM task_role_assignments "
                     "WHERE task_id = ? AND role = ? "
                     "AND completed_at IS NULL AND superseded_by IS NULL "
@@ -5915,18 +6012,18 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                         await c.execute(
                             "INSERT INTO task_role_assignments "
                             "(task_id, role, eligible_owners, owner, "
-                            "assigned_at, claimed_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            "assigned_at, claimed_at, focus) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
                             (task_id, role, eligible_json, to_list[0],
-                             now_iso, now_iso),
+                             now_iso, now_iso, new_focus),
                         )
                     else:
                         await c.execute(
                             "INSERT INTO task_role_assignments "
                             "(task_id, role, eligible_owners, owner, "
-                            "assigned_at) "
-                            "VALUES (?, ?, ?, NULL, ?)",
-                            (task_id, role, eligible_json, now_iso),
+                            "assigned_at, focus) "
+                            "VALUES (?, ?, ?, NULL, ?, ?)",
+                            (task_id, role, eligible_json, now_iso, new_focus),
                         )
                 else:
                     # Diff prior assignees vs new to_list; anyone who's
@@ -5948,11 +6045,20 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                         stand_down_plan.append((role, dropped, list(to_list)))
                     # Update eligible_owners on the existing active row;
                     # don't disturb owner / claimed_at if already set.
-                    await c.execute(
-                        "UPDATE task_role_assignments "
-                        "SET eligible_owners = ? WHERE id = ?",
-                        (eligible_json, rd["id"]),
-                    )
+                    # Preserve existing `focus` when the new entry omits
+                    # it; overwrite when the new entry provides one.
+                    if new_focus is not None:
+                        await c.execute(
+                            "UPDATE task_role_assignments "
+                            "SET eligible_owners = ?, focus = ? WHERE id = ?",
+                            (eligible_json, new_focus, rd["id"]),
+                        )
+                    else:
+                        await c.execute(
+                            "UPDATE task_role_assignments "
+                            "SET eligible_owners = ? WHERE id = ?",
+                            (eligible_json, rd["id"]),
+                        )
 
             traj_json = json.dumps(trajectory, separators=(",", ":"))
             await c.execute(

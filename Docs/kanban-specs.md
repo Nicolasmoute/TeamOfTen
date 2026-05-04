@@ -184,19 +184,22 @@ The trajectory replaces the v0.2 admission gate, the `required_reviews` + `ship_
 
 ### 3.1 Shape
 
-`tasks.trajectory` is a JSON list of `{stage, to}` objects:
+`tasks.trajectory` is a JSON list of `{stage, to, focus?}` objects:
 
 ```json
 [
   {"stage": "plan",            "to": "p5"},
   {"stage": "execute",         "to": "p2"},
   {"stage": "audit_syntax",    "to": ["p4", "p7"]},
+  {"stage": "audit_semantics", "to": "p9",
+   "focus": "Verify the rule-3a derivation matches the wiki entry on multiway causal foliation; check brand naming on user-facing strings."},
   {"stage": "ship",            "to": "p2"}
 ]
 ```
 
 - `stage` ∈ `{plan, execute, audit_syntax, audit_semantics, ship}` (no `archive` — it is implicit/terminal).
 - `to` accepts a single Player slot string (hard-assign) or a list of slot strings (pool; first free wins).
+- `focus` (optional, audit stages only) is a free-text string Coach uses to name **what the auditor should check** (math invariants? brand voice? race conditions? specific acceptance criteria?). REQUIRED for `audit_semantics`; optional for `audit_syntax` (defaults to "match the contract and verify internal soundness"). Ignored on non-audit stages. See §4.6 for the full framing.
 
 ### 3.2 Validation rules
 
@@ -208,8 +211,9 @@ The trajectory replaces the v0.2 admission gate, the `required_reviews` + `ship_
 - Stages appear in canonical order (`plan` < `execute` < `audit_syntax` < `audit_semantics` < `ship`).
 - `execute` is mandatory.
 - Each `to` resolves to a `list[str]` of valid Player slots (`p1`..`p10`).
+- `focus` (optional) must be a string when present; ignored on non-audit stages with no error so a Coach paste-mistake doesn't bounce the whole call. **`audit_semantics` entries with no `focus` AND a non-empty `to` are rejected** at `coord_create_task` / `coord_set_task_trajectory` time — semantic audits without a stated focus are noise. An empty-pool semantic stage (`{"stage":"audit_semantics","to":[]}`) is allowed; the focus enforcement then happens at `coord_assign_auditor` time when Coach actually names the auditor.
 
-The validator returns `(trajectory_json, role_inserts)` so `coord_create_task` can plant the matching `task_role_assignments` rows in the same transaction.
+The validator returns `(trajectory_json, role_inserts)` so `coord_create_task` can plant the matching `task_role_assignments` rows in the same transaction. Each role insert carries the entry's `focus` (when present) into the new `task_role_assignments.focus` column (§12.1).
 
 ### 3.3 Examples
 
@@ -217,8 +221,8 @@ The validator returns `(trajectory_json, role_inserts)` so `coord_create_task` c
 |---|---|
 | Quick mechanical work, "simple" | `[{"stage":"execute","to":["p2","p3"]}]` |
 | Needs a spec but no audit | `[{"stage":"plan","to":"p5"},{"stage":"execute","to":"p2"}]` |
-| Code change with formal review | `[{"stage":"plan","to":"p5"},{"stage":"execute","to":"p2"},{"stage":"audit_syntax","to":"p4"},{"stage":"ship","to":"p2"}]` |
-| Marketing blog post | `[{"stage":"plan","to":"p3"},{"stage":"execute","to":"p5"},{"stage":"audit_semantics","to":"p7"},{"stage":"ship","to":"p4"}]` |
+| Code change with formal review | `[{"stage":"plan","to":"p5"},{"stage":"execute","to":"p2"},{"stage":"audit_syntax","to":"p4","focus":"race conditions in the new lock path"},{"stage":"ship","to":"p2"}]` |
+| Marketing blog post | `[{"stage":"plan","to":"p3"},{"stage":"execute","to":"p5"},{"stage":"audit_semantics","to":"p7","focus":"brand voice + claims accuracy against project-objectives.md"},{"stage":"ship","to":"p4"}]` |
 
 ### 3.4 Spec gate
 
@@ -282,6 +286,57 @@ Planner / reviewer / shipper assignment tools also accept comma-list calls. For 
 ### 4.5 Idle-Player polling
 
 A periodic loop (default 5 min, see [server/idle_poller.py](server/idle_poller.py)) wakes idle Players who have current-stage pool work or current-stage hard-assigned pending roles but are not currently running (e.g. their initial wake landed while they were over-cap; the harness was paused; the Player ignored the wake). Future-stage reservations are deliberately invisible. See §10 for full design.
+
+### 4.6 Audit framing — what auditors actually check
+
+The two auditor stages answer different questions and read different sources. Conflating them produces rubber-stamps or noise.
+
+#### 4.6.1 `auditor_syntax` — contract-bound
+
+Question: **does the deliverable match what was asked, and is it internally sound?** (No bugs, no inconsistencies, the diff does what the contract says.)
+
+The auditor's wake prompt builds a `## Contract` block by cascading whatever rungs exist (priority order, present rungs are concatenated with section headers):
+
+1. **`spec.md`** — the planner's binding contract (when `plan` is in the trajectory and `spec_path` resolves to a readable file).
+2. **Task title + description** — always present (Coach sets them on `coord_create_task`).
+3. **Executor's wake prompt** — what the executor was actually told to do. Pulled from the executor's role row by reverse-walking the most recent `agent_started` for the executor on this task. Best-effort; absent rung means absent block.
+4. **Commit message / artifact summary** — what the executor said they did. Pulled from the latest `commit_pushed` (commit message body) or `task_execution_completed` (`summary` field).
+
+A task always has at least #2 by construction, so syntax audit never has zero context — it just has weaker context when no plan stage ran. This is the explicit fix for the production stall where p8 stopped because `spec.md` was missing on a recovery task that legitimately inherited a sibling's spec: the auditor now audits against title + description + commit when no spec exists, not against nothing.
+
+`focus` is OPTIONAL on syntax audits. Default focus when Coach didn't specify: *"Match the contract above; verify internal soundness (no bugs, no inconsistencies, no broken interfaces)."* Coach can sharpen for high-stakes work, e.g. `focus="race-condition review of the new locking path; ignore unrelated style drift."`
+
+#### 4.6.2 `auditor_semantics` — context-bound (NOT spec-bound)
+
+Question: **does this deliverable make sense in the world this project lives in?** (Math correct? Brand voice intact? Domain terminology right? Aligned with where the project is heading?)
+
+The semantic auditor's wake prompt builds a `## Project context` block from:
+
+1. **Coach's stated focus** (REQUIRED — see §4.6.3 below). The auditor's reading lens.
+2. **Compass** — the lattice of project intent. Wake prompt names the four read tools (`compass_ask`, `compass_audit`, `compass_brief`, `compass_status`) and instructs the auditor to call `compass_ask("does <artifact> align with <focus>?")` as a first-pass sanity check before reading raw sources. **Note**: only Coach can call Compass MCP tools per [compass-specs.md §6](compass-specs.md). The semantic auditor reads the Compass-derived block already injected into every project's `CLAUDE.md`, plus `tasks.compass_audit_report_path` when the auto-audit fired on the executor's commit. Direct `compass_ask` is a Coach-only escalation path — auditor messages Coach to run it on their behalf if the CLAUDE.md block is insufficient.
+3. **Truth corpus** — the auditor reads `<project>/truth/**/*.{md,txt}` + `<project>/project-objectives.md` (binding constraint layer per [compass-specs.md §1.4](compass-specs.md)).
+4. **Wiki** — `/data/wiki/<project_id>/**/*.{md,txt}` (gotchas, glossary, stakeholder preferences, domain rules).
+5. **Compass auto-audit report** — `tasks.compass_audit_report_path` when set (the lattice's already-recorded verdict on this artifact).
+
+`spec.md` is **supplementary** for semantic audits, not binding. The wake prompt names it as "background — what was meant to be built" but the audit verdict must judge against the world (truth/wiki/intent), not against the planner's interpretation. A spec that drifted from project intent is a bug the semantic auditor must catch.
+
+#### 4.6.3 `audit_focus` discipline (Coach must name the check)
+
+Coach must articulate **what the audit is actually checking** when assigning an auditor. Without a stated focus, semantic audits are noise: the auditor either invents one (drifts) or rubber-stamps (false pass). Examples:
+
+- ❌ Bad: "Run a semantic audit on this commit."
+- ✓ Good: `focus="Verify the rule-3a derivation in the new module matches the multiway causal foliation entry in the wiki; check that the user-facing labels use 'foliation' not 'slicing' per the glossary."`
+- ❌ Bad: "Formal review on the lock change."
+- ✓ Good: `focus="Race-condition review on the new lock path in server/foo.py:acquire — particularly the timeout fallback. Ignore unrelated style drift."`
+
+Enforcement:
+
+- `coord_assign_auditor(kind='semantics', focus='')` is **rejected** at the tool with a clear error: *"semantic audits require a focus — name the check (e.g. 'verify math derivation matches glossary'). Auditors with no focus rubber-stamp."*
+- `coord_assign_auditor(kind='syntax', focus='')` is **accepted**; the wake prompt uses the default focus.
+- A trajectory entry for `audit_semantics` with no `focus` AND a non-empty `to` is rejected by `_validate_trajectory` (see §3.2). An empty-pool semantic stage is allowed; the focus enforcement happens at `coord_assign_auditor` time when Coach actually names the auditor.
+- `focus` is stored on the new `task_role_assignments.focus` column (§12.1). When `coord_assign_auditor` re-assigns a role (supersedes the prior row), the new `focus` overrides; if Coach omits `focus` on a syntax re-assign, the prior row's `focus` is inherited so a quick re-assignment doesn't lose Coach's earlier framing.
+
+The wake prompt always renders `## Focus` first so the auditor reads the lens before the sources. Wake-prompt construction is centralised in [server/kanban.py:_build_auditor_wake_body](server/kanban.py) and called from both `coord_assign_auditor` (initial assignment wake) and `_wake_role_or_emit_needed` (stage-entry wake when Coach reserved the role earlier).
 
 ---
 
@@ -400,10 +455,10 @@ All new tools are registered in [server/tools.py](server/tools.py)'s `_tools` ma
 
 | Tool | Params | Purpose |
 |---|---|---|
-| `coord_set_task_trajectory` | `task_id, trajectory` | **New.** Mid-flight reroute. Validates against the OLD trajectory walked up to the current stage — rejects removing any **already-entered** stage (not just the current one). Removed-stage role rows are deactivated by setting `completed_at = now()` (the active-row filter is `completed_at IS NULL AND superseded_by IS NULL`; we don't use `superseded_by = -1` because the column is a self-FK and that violates the constraint under `PRAGMA foreign_keys = ON`). Added-stage rows are inserted. **v0.3.6 stand-down:** any displaced assignees from removed stages OR from in-place `eligible_owners` shrinkage on a remaining stage receive a stop-work wake (`task_role_stand_down` event). Emits `task_trajectory_changed`. |
+| `coord_set_task_trajectory` | `task_id, trajectory` | **New.** Mid-flight reroute. Validates against the OLD trajectory walked up to the current stage — rejects removing any **already-entered** stage (not just the current one). Removed-stage role rows are deactivated by setting `completed_at = now()` (the active-row filter is `completed_at IS NULL AND superseded_by IS NULL`; we don't use `superseded_by = -1` because the column is a self-FK and that violates the constraint under `PRAGMA foreign_keys = ON`). Added-stage rows are inserted with the entry's `focus` (when present) populating `task_role_assignments.focus`. The `audit_semantics`-needs-focus rule (§3.2) applies on edits too: a non-empty-pool semantic stage with no `focus` is rejected before any DB write. **v0.3.6 stand-down:** any displaced assignees from removed stages OR from in-place `eligible_owners` shrinkage on a remaining stage receive a stop-work wake (`task_role_stand_down` event). Emits `task_trajectory_changed`. |
 | `coord_assign_planner` | `task_id, to` | Inserts a fresh `planner` role row, supersedes any prior active row for the same `(task_id, role)` via `superseded_by = <new_row_id>`, and mirrors the new candidate list back into `tasks.trajectory.to` for the matching stage. **v0.3.6:** displaced prior assignee receives a stand-down wake (filtered for same-slot refresh). Hard-assign wakes the owner if the task is still in `plan`; pool-form calls candidates who must `coord_accept_role`. |
 | `coord_assign_task` | `task_id, to` | Inserts a fresh `executor` role row, supersedes any prior active executor row, and mirrors the new candidate list back into `tasks.trajectory.to`. Spec gate enforced when `plan` is in the trajectory and `spec_path` is unset. Stamps `last_stage_change_at` + clears `stale_alert_at` on the plan→execute transition. **v0.3.6:** displaced prior executor receives a stand-down wake (covers both pool-form and hard-assign paths). Auto-wake prompt is trajectory-aware (executors with no audit stage configured get the self-audit reminder verbatim). |
-| `coord_assign_auditor` | `task_id, to, kind` | `kind ∈ {'formal'/'syntax', 'semantic'/'semantics'}`. Same supersede + trajectory-mirror + v0.3.6 stand-down behavior as `coord_assign_planner`. Emits `audit_self_review_warning` if reviewer == executor. Future-stage reservations are not woken until active. |
+| `coord_assign_auditor` | `task_id, to, kind, focus?` | `kind ∈ {'formal'/'syntax', 'semantic'/'semantics'}`. Same supersede + trajectory-mirror + v0.3.6 stand-down behavior as `coord_assign_planner`. **`focus` (free-text)** names what the auditor should check; **REQUIRED for `kind='semantics'`** (rejected with error if empty), optional for `kind='syntax'` (defaults to "match the contract and verify internal soundness"). Stored on the new `task_role_assignments.focus` column and rendered at the top of the auditor's wake prompt as `## Focus` before `## Contract` (syntax) / `## Project context` (semantics). On re-assign without `focus`, inherits from the prior superseded row so Coach doesn't lose framing on a quick reassignment. See §4.6 for the full discipline. Emits `audit_self_review_warning` if reviewer == executor. Future-stage reservations are not woken until active. |
 | `coord_assign_shipper` | `task_id, to` | Same supersede + trajectory-mirror + v0.3.6 stand-down behavior. Future-stage reservations wake only when the task enters `ship`. |
 | `coord_set_task_workflow` | `task_id, workflow?, tracking_reason?` | Sets the workflow / tracking-reason metadata. Routing has moved to trajectory; this tool no longer accepts review/ship knobs. |
 | `coord_advance_task_stage` | `task_id, stage, note?` | Explicit override. Bypasses the trajectory gate. |
@@ -433,7 +488,7 @@ All new tools are registered in [server/tools.py](server/tools.py)'s `_tools` ma
 
 ### 6.5 Modified existing tools
 
-- `coord_create_task` accepts `trajectory` (new in v0.3 — list of `{stage, to}` objects, validated by `_validate_trajectory()`), `workflow`, `tracking_reason` (now optional). The `complexity`, `required_reviews`, and `ship_required` params are **removed**. When `trajectory` is provided, the tool plants the matching `task_role_assignments` rows in the same transaction.
+- `coord_create_task` accepts `trajectory` (new in v0.3 — list of `{stage, to, focus?}` objects, validated by `_validate_trajectory()`), `workflow`, `tracking_reason` (now optional). The `complexity`, `required_reviews`, and `ship_required` params are **removed**. When `trajectory` is provided, the tool plants the matching `task_role_assignments` rows in the same transaction, including each entry's `focus` when present (§4.6, §12.1). A non-empty-pool `audit_semantics` entry without `focus` is rejected at create time (the validator catches it before any DB write).
 
   **Initial activation (v0.3).** The new task's `tasks.status` is set to the trajectory's **first stage** (not the schema default `plan`). When the first stage carries a single hard-assignee, `tasks.owner` is hard-set in the same insert. Immediately after `task_created` is published, the tool emits `task_stage_changed` with `from=null` → `to=<first_stage>` so the subscriber's `_on_stage_changed` handler wakes the first-stage assignee. Without this, an execute-only trajectory like `[{"stage":"execute","to":"p2"}]` would sit silently in `plan` behind the spec gate. The default trajectory when omitted is `[{"stage":"execute","to":[]}]` — Coach can follow up with the assign tools, or the idle-poller will pick up the unassigned pool. The tool does **not** write `spec.md`; planner Players or the human do that.
 - `coord_commit_push` accepts optional `task_id`. When provided, it validates that the caller owns that active execute-stage task and has an uncompleted executor role row. On a successful push, or on explicit `push=false` local-only mode, the emitted `commit_pushed` event carries the `task_id` and the executor role row is marked complete. If `git push` was requested and fails, `task_id` is cleared from the event and the executor role remains open so the kanban cannot advance on an unpushed commit.
@@ -709,7 +764,15 @@ CREATE TABLE task_role_assignments (
   completed_at    TEXT,
   report_path     TEXT,
   verdict         TEXT CHECK(verdict IS NULL OR verdict IN ('pass','fail')),
-  superseded_by   INTEGER REFERENCES task_role_assignments(id)
+  superseded_by   INTEGER REFERENCES task_role_assignments(id),
+  -- Auditor roles only (NULL on planner/executor/shipper rows). Free-text
+  -- focus naming what the auditor should check (math invariants? brand
+  -- voice? race conditions? specific acceptance criteria?). Set by
+  -- coord_assign_auditor / coord_create_task / coord_set_task_trajectory;
+  -- rendered as `## Focus` at the top of the auditor's wake prompt.
+  -- REQUIRED for auditor_semantics rows; defaults applied at wake time
+  -- for auditor_syntax rows when NULL. See §4.6.
+  focus           TEXT
 );
 
 CREATE INDEX idx_role_assignments_task ON task_role_assignments(task_id);
@@ -717,6 +780,8 @@ CREATE INDEX idx_role_assignments_owner ON task_role_assignments(owner);
 CREATE INDEX idx_role_assignments_role ON task_role_assignments(task_id, role);
 CREATE INDEX idx_role_assignments_active ON task_role_assignments(task_id, role, superseded_by, assigned_at);
 ```
+
+The `focus` column is added via `_ensure_columns` in [server/db.py:init_db](server/db.py) — idempotent on re-run, populates existing rows with NULL. CHECK constraints can't be added by ALTER TABLE without a full rebuild, so the "REQUIRED for semantic auditors" rule is enforced at the API layer in `coord_assign_auditor` and `_validate_trajectory` (rejects insert before the row lands).
 
 ### 12.2 New tasks columns
 
@@ -790,10 +855,11 @@ The kanban lifecycle paragraph lives inside the canonical project CLAUDE.md temp
 Required behavioral content the section must convey:
 
 - every Coach delegation goes through kanban — no admission gate; conversational replies remain conversational;
-- stored stages with product labels: `audit_syntax` = formal review, `audit_semantics` = semantic review;
-- Coach defines the trajectory upfront on `coord_create_task` — an ordered list of `{stage, to}` objects;
+- stored stages with product labels: `audit_syntax` = formal review (contract-bound), `audit_semantics` = semantic review (context-bound — Compass + truth/ + wiki/, not spec);
+- Coach defines the trajectory upfront on `coord_create_task` — an ordered list of `{stage, to, focus?}` objects;
 - if `plan` is in the trajectory, the executor cannot start until the planner's `coord_write_task_spec` lands;
 - if no audit stage is in the trajectory after `execute`, the executor self-audits before completion;
+- **semantic audits require a stated `focus`** (what to check) at assignment time — Coach is the one who frames the check. Syntax audits use a contract cascade (spec → title/description → executor wake → commit) so a missing `spec.md` (e.g. on a recovery task that inherits a sibling's spec) doesn't stall the auditor;
 - Players use `coord_accept_role` for current-stage calls, `coord_commit_push` for code, and `coord_complete_execution` for non-git artifacts;
 - future-stage reservations are hidden until the card reaches that stage;
 - pass walks the trajectory to the next stage, fail reverts to execute, and Compass remains informational;
@@ -822,6 +888,7 @@ In addition to the static CLAUDE.md block (which Coach reads alongside Players),
 - create tracked tasks with `workflow`, `tracking_reason`, and review routing;
 - assign/call Players by current stage; future-stage reservations are allowed but inactive;
 - Players complete work with `coord_commit_push`, `coord_complete_execution`, `coord_submit_audit_report`, or `coord_mark_shipped` so the board flows event-by-event;
+- **Audit framing (§4.6).** When assigning an auditor, **name what to check** in the `focus` parameter. Semantic audits without a focus are rejected by the tool — they're noise. Bad: `coord_assign_auditor(kind='semantics', to='p7')`. Good: `coord_assign_auditor(kind='semantics', to='p7', focus="verify the rule-3a derivation matches the wiki entry on multiway causal foliation; check brand naming on user-facing strings.")`. Syntax audits accept an empty `focus` (defaults to "match contract + soundness") but a sharper focus reduces audit noise. Trajectory entries can carry `focus` at create time so the framing is set before the auditor is assigned: `{"stage":"audit_semantics","to":"p9","focus":"..."}`.
 - **v0.3.4** — when the `## Stalled tasks` rollup names a `blocker` who differs from the `executor`, the blocker is the current-stage assignee (auditor / shipper / planner). Coach should nudge THEM, not the executor; if the blocker reports the named `coord_*` tool is not visible in their runtime, Coach reads the artifact they wrote to disk and submits on their behalf via `coord_submit_audit_report(..., on_behalf_of='<slot>')` for audits or `coord_advance_task_stage` for other stages.
 
 ## 14 · Telegram escalation hooks
@@ -848,7 +915,14 @@ Putting Compass on the gate would conflate the two. The kanban v1 keeps them sep
 
 ### 15.2 How the semantic reviewer uses Compass
 
-The auto-wake prompt for the semantic reviewer includes the spec, the delivered artifact/commit, and (when set) the path to `compass_audit_report_path`. The reviewer reads it, factors it into their own verdict, and submits.
+The semantic reviewer's wake prompt is **context-bound, not spec-bound** (see §4.6.2 for the full framing). The wake includes:
+
+- Coach's `## Focus` (the lens — required, see §4.6.3).
+- A `## Project context` block listing the truth corpus paths (`<project>/truth/`, `<project>/project-objectives.md`, `/data/wiki/<project_id>/`), the Compass-derived block already injected into the project's `CLAUDE.md`, and `tasks.compass_audit_report_path` when the auto-audit ran on the executor's commit.
+- The delivered artifact/commit reference.
+- A pointer to the spec as **supplementary background only** ("what was meant to be built — but judge the deliverable against the world, not against the spec; a spec that drifted from intent is a bug the semantic auditor must catch").
+
+Direct `compass_ask` calls are Coach-only per [compass-specs.md §6](compass-specs.md), so the auditor reads the Compass surface that's already in `CLAUDE.md` and in `tasks.compass_audit_report_path`. If those are insufficient for the focus, the auditor messages Coach via `coord_send_message` to run `compass_ask` on their behalf — better than a guessing semantic verdict.
 
 ### 15.3 Drift escalation path
 

@@ -230,6 +230,7 @@ async def test_accept_role_pool_first_claim_wins(fresh_db: str) -> None:
         "task_id": "t-2026-05-03-abc12345",
         "to": "p4,p5",
         "kind": "semantic",
+        "focus": "verify alignment with project intent",
     }))
 
     p4 = _server_for("p4")
@@ -387,6 +388,7 @@ async def test_future_semantic_assignment_not_actionable_early(
         "task_id": "t-2026-05-03-abc12345",
         "to": "p8",
         "kind": "semantic",
+        "focus": "verify alignment with project intent",
     })
     p8 = _server_for("p8")
     text = _ok_text(await _handler(p8, "my_assignments")({}))
@@ -1031,6 +1033,7 @@ async def test_submit_audit_report_on_behalf_of_records_player_as_auditor(
         "task_id": "t-2026-05-03-abc12345",
         "to": "p3",
         "kind": "semantic",
+        "focus": "verify alignment with project intent",
     })
     # Coach overrides on p3's behalf.
     text = _ok_text(await _handler(coach, "submit_audit_report")({
@@ -1070,6 +1073,7 @@ async def test_submit_audit_report_on_behalf_of_player_rejected(
         "task_id": "t-2026-05-03-abc12345",
         "to": "p3",
         "kind": "semantic",
+        "focus": "verify alignment with project intent",
     })
     p7 = _server_for("p7")
     err = _err_text(await _handler(p7, "submit_audit_report")({
@@ -1094,6 +1098,7 @@ async def test_submit_audit_report_coach_without_on_behalf_of_rejected(
         "task_id": "t-2026-05-03-abc12345",
         "to": "p3",
         "kind": "semantic",
+        "focus": "verify alignment with project intent",
     })
     err = _err_text(await _handler(coach, "submit_audit_report")({
         "task_id": "t-2026-05-03-abc12345",

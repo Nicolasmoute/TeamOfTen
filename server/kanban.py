@@ -876,6 +876,369 @@ _TOOL_NOT_VISIBLE_ESCAPE = (
 )
 
 
+_DEFAULT_SYNTAX_FOCUS = (
+    "Match the contract above; verify internal soundness "
+    "(no bugs, no inconsistencies, no broken interfaces)."
+)
+
+
+async def _load_active_role_focus(task_id: str, role: str) -> str | None:
+    """Read the `focus` from the most-recent active task_role_assignments
+    row for `(task_id, role)`. Returns None when no active row exists or
+    the row has no focus. Used by `_wake_role_or_emit_needed` so the
+    stage-entry wake prompt can render Coach's framing."""
+    if role not in ("auditor_syntax", "auditor_semantics"):
+        return None
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT focus FROM task_role_assignments "
+            "WHERE task_id = ? AND role = ? "
+            "AND completed_at IS NULL AND superseded_by IS NULL "
+            "ORDER BY assigned_at DESC LIMIT 1",
+            (task_id, role),
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    if not row:
+        return None
+    val = dict(row).get("focus")
+    return val if isinstance(val, str) and val.strip() else None
+
+
+async def inherit_audit_focus(task_id: str, role: str) -> str | None:
+    """When Coach re-assigns an auditor without re-providing `focus`,
+    inherit from the prior superseded row so a quick reassignment
+    doesn't lose the framing. Walks back through superseded rows
+    (newest first) and returns the first non-empty focus.
+
+    Returns None when no prior audit assignment carried a focus.
+    """
+    if role not in ("auditor_syntax", "auditor_semantics"):
+        return None
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT focus FROM task_role_assignments "
+            "WHERE task_id = ? AND role = ? AND focus IS NOT NULL "
+            "ORDER BY assigned_at DESC LIMIT 1",
+            (task_id, role),
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    if not row:
+        return None
+    val = dict(row).get("focus")
+    return val if isinstance(val, str) and val.strip() else None
+
+
+async def _build_audit_contract_block(task_id: str) -> str:
+    """Build the `## Contract` block for syntax-audit wake prompts
+    (kanban-specs §4.6.1). Cascades whatever rungs exist:
+      1. spec.md (when readable)
+      2. task title + description
+      3. executor's wake prompt (best-effort from event log)
+      4. latest commit_pushed message / task_execution_completed summary
+
+    Each present rung is rendered with a sub-heading. A task always
+    has at least #2, so this never returns empty for a real task.
+    """
+    from pathlib import Path
+
+    parts: list[str] = []
+    spec_path: str | None = None
+    title: str = ""
+    description: str = ""
+    executor_id: str | None = None
+    project_id: str | None = None
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT title, description, spec_path, owner, project_id "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        )
+        row = await cur.fetchone()
+        if row:
+            d = dict(row)
+            title = (d.get("title") or "").strip()
+            description = (d.get("description") or "").strip()
+            spec_path = d.get("spec_path")
+            executor_id = d.get("owner")
+            project_id = d.get("project_id")
+    finally:
+        await c.close()
+
+    # Rung 1: spec.md (when present and readable)
+    if spec_path:
+        try:
+            candidate = Path(spec_path)
+            if not candidate.is_absolute():
+                from server.paths import DATA_ROOT
+                candidate = DATA_ROOT / spec_path
+            if candidate.is_file():
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+                if len(text) > 4000:
+                    text = text[:4000].rstrip() + "\n... (truncated; read full file at " + str(candidate) + ")"
+                parts.append(f"### Spec ({spec_path})\n\n{text}")
+        except Exception:
+            # Spec file unreadable — skip rung, surface the path so
+            # the auditor can find it manually if needed.
+            parts.append(
+                f"### Spec\n\nspec_path={spec_path} (could not be read; "
+                f"check the path on disk)."
+            )
+
+    # Rung 2: task title + description (always present)
+    title_block = f"### Task framing\n\n**Title:** {title}"
+    if description:
+        if len(description) > 1500:
+            description = description[:1500].rstrip() + "..."
+        title_block += f"\n\n**Description:** {description}"
+    parts.append(title_block)
+
+    # Rung 3: executor's most recent wake prompt (best-effort).
+    if executor_id and project_id:
+        try:
+            c = await configured_conn()
+            try:
+                cur = await c.execute(
+                    "SELECT payload FROM events "
+                    "WHERE project_id = ? AND agent_id = ? AND type = 'agent_started' "
+                    "ORDER BY ts DESC LIMIT 5",
+                    (project_id, executor_id),
+                )
+                rows = await cur.fetchall()
+            finally:
+                await c.close()
+            for r in rows:
+                try:
+                    payload = json.loads(dict(r).get("payload") or "{}")
+                except Exception:
+                    continue
+                prompt = payload.get("prompt") or payload.get("entry_prompt") or ""
+                if isinstance(prompt, str) and task_id in prompt:
+                    if len(prompt) > 1500:
+                        prompt = prompt[:1500].rstrip() + "..."
+                    parts.append(
+                        f"### Executor's wake prompt ({executor_id})\n\n{prompt}"
+                    )
+                    break
+        except Exception:
+            logger.exception(
+                "kanban: failed reading executor wake for %s", task_id
+            )
+
+    # Rung 4: latest commit_pushed message / task_execution_completed summary.
+    if project_id:
+        try:
+            c = await configured_conn()
+            try:
+                cur = await c.execute(
+                    "SELECT type, payload FROM events "
+                    "WHERE project_id = ? AND type IN ('commit_pushed', 'task_execution_completed') "
+                    "ORDER BY ts DESC LIMIT 30",
+                    (project_id,),
+                )
+                rows = await cur.fetchall()
+            finally:
+                await c.close()
+            for r in rows:
+                d = dict(r)
+                try:
+                    payload = json.loads(d.get("payload") or "{}")
+                except Exception:
+                    continue
+                if payload.get("task_id") != task_id:
+                    continue
+                if d.get("type") == "commit_pushed":
+                    sha = (payload.get("sha") or "")[:12]
+                    msg = payload.get("message") or ""
+                    if len(msg) > 1000:
+                        msg = msg[:1000].rstrip() + "..."
+                    parts.append(
+                        f"### Executor's commit ({sha})\n\n{msg}"
+                    )
+                else:
+                    summary = payload.get("summary") or ""
+                    artifact = payload.get("artifact_path") or ""
+                    if len(summary) > 1000:
+                        summary = summary[:1000].rstrip() + "..."
+                    body = f"**Summary:** {summary}"
+                    if artifact:
+                        body += f"\n\n**Artifact:** {artifact}"
+                    parts.append(f"### Executor's deliverable\n\n{body}")
+                break
+        except Exception:
+            logger.exception(
+                "kanban: failed reading executor deliverable for %s", task_id
+            )
+
+    return "\n\n".join(parts)
+
+
+def _build_semantic_context_block(task_id: str, project_id: str | None) -> str:
+    """Build the `## Project context` block for semantic-audit wake
+    prompts (kanban-specs §4.6.2). Names the binding sources
+    (truth/, project-objectives.md, wiki/, Compass) the auditor must
+    read instead of treating spec.md as binding."""
+    project_id = project_id or "<active-project>"
+    return (
+        f"### Project context (binding sources for semantic audit)\n\n"
+        f"Read these BEFORE judging the deliverable. The spec is "
+        f"supplementary background — the audit verdict judges against "
+        f"the world (truth + intent + domain), not against the planner's "
+        f"interpretation of it.\n\n"
+        f"- **Truth corpus** — `/data/projects/{project_id}/truth/` "
+        f"(human-vetted binding facts) + "
+        f"`/data/projects/{project_id}/project-objectives.md` "
+        f"(authored objectives).\n"
+        f"- **Wiki** — `/data/wiki/{project_id}/` (gotchas, glossary, "
+        f"stakeholder preferences, domain rules — agent-curated but "
+        f"binding for semantic alignment).\n"
+        f"- **Compass surface** — the Compass-derived block injected "
+        f"into this project's `CLAUDE.md` already lists settled lattice "
+        f"directions; read that section. The Compass auto-audit's most "
+        f"recent verdict on this task's commit is at "
+        f"`tasks.compass_audit_report_path` (when present — link will "
+        f"appear on the kanban card).\n"
+        f"- **Compass MCP tools** are Coach-only. If the CLAUDE.md "
+        f"Compass block + the auto-audit report are insufficient for "
+        f"your focus, message Coach via "
+        f"`coord_send_message(to='coach', body='need compass_ask on "
+        f"<question> for {task_id} semantic audit')` so Coach can run "
+        f"`compass_ask` on your behalf — better than guessing a verdict."
+    )
+
+
+async def build_auditor_wake_body(
+    *,
+    task_id: str,
+    role: str,
+    focus: str | None,
+    is_pool: bool,
+) -> str:
+    """Build the full body of an auditor wake prompt (kanban-specs §4.6).
+
+    Centralised so `coord_assign_auditor` (initial assignment wake) and
+    `_wake_role_or_emit_needed` (stage-entry wake when Coach reserved
+    the role earlier) produce identical wakes. Layout:
+
+        ## Focus
+        <Coach's words, or default-syntax stub>
+
+        ## Contract                                  (syntax only)
+        ### Spec ...                                 (when present)
+        ### Task framing
+        ### Executor's wake prompt                   (when found)
+        ### Executor's commit                        (when found)
+
+        ## Project context                           (semantic only)
+        <truth/wiki/Compass paths + escalation note>
+
+        ## Tool to call when done
+        coord_submit_audit_report(task_id=..., kind=..., verdict=...)
+    """
+    if role == "auditor_syntax":
+        kind = "syntax"
+        review_label = "formal"
+    else:
+        kind = "semantics"
+        review_label = "semantic"
+
+    effective_focus = (focus or "").strip()
+    if not effective_focus:
+        if role == "auditor_syntax":
+            effective_focus = _DEFAULT_SYNTAX_FOCUS
+        else:
+            # Semantic with no focus is a configuration bug — caller
+            # validation should have caught it. Render an explicit
+            # "no focus set, ask Coach" stub so the auditor fails
+            # loudly rather than guessing.
+            effective_focus = (
+                "(no focus set — Coach has not named what to check. "
+                "STOP and message Coach via coord_send_message(to='coach', "
+                f"body='need focus for semantic audit on {task_id}') before "
+                "submitting any verdict.)"
+            )
+
+    sections: list[str] = []
+    sections.append(f"## Focus\n\n{effective_focus}")
+
+    if role == "auditor_syntax":
+        contract = await _build_audit_contract_block(task_id)
+        if contract:
+            sections.append(f"## Contract\n\n{contract}")
+    else:
+        # Resolve project_id for the semantic context block.
+        project_id: str | None = None
+        try:
+            c = await configured_conn()
+            try:
+                cur = await c.execute(
+                    "SELECT project_id FROM tasks WHERE id = ?",
+                    (task_id,),
+                )
+                row = await cur.fetchone()
+            finally:
+                await c.close()
+            if row:
+                project_id = dict(row).get("project_id")
+        except Exception:
+            logger.exception(
+                "kanban: failed reading project_id for semantic wake on %s",
+                task_id,
+            )
+        sections.append(
+            f"## Project context\n\n"
+            f"{_build_semantic_context_block(task_id, project_id)}"
+        )
+        # Spec only as supplementary background for semantic audit.
+        try:
+            c = await configured_conn()
+            try:
+                cur = await c.execute(
+                    "SELECT spec_path FROM tasks WHERE id = ?",
+                    (task_id,),
+                )
+                row = await cur.fetchone()
+            finally:
+                await c.close()
+            if row:
+                sp = dict(row).get("spec_path") or ""
+                if sp:
+                    sections.append(
+                        f"## Spec (supplementary — what was meant to be built)\n\n"
+                        f"`{sp}` — read for context but judge against project "
+                        f"context above; a spec that drifted from intent is a "
+                        f"bug the semantic audit must catch."
+                    )
+        except Exception:
+            pass
+
+    pool_note = ""
+    if is_pool:
+        pool_note = (
+            f"This was a pool call — first call "
+            f"coord_accept_role(task_id={task_id!r}, role={role!r}); first "
+            f"accepted claim wins. Then do the audit and submit."
+        )
+    sections.append(
+        "## Submit the audit\n\n"
+        + (pool_note + "\n\n" if pool_note else "")
+        + f"coord_submit_audit_report(task_id={task_id!r}, "
+        f"kind={kind!r}, verdict='pass'|'fail', body=<your review>)"
+        + _TOOL_NOT_VISIBLE_ESCAPE
+    )
+
+    intro = (
+        f"Coach assigned you the {review_label} review on task {task_id}."
+    )
+    return intro + "\n\n" + "\n\n".join(sections)
+
+
 async def _completion_hint_for_role(task_id: str, role: str) -> str:
     """Per-role wake-prompt instruction line that NAMES the completion
     tool with the actual `task_id` baked in. The kanban only advances
@@ -1028,32 +1391,40 @@ async def _wake_role_or_emit_needed(*, task_id: str, role: str) -> None:
         return
 
     role_label = _role_label(role)
-    completion_hint = await _completion_hint_for_role(task_id, role)
-    if assignment.get("owner"):
-        prompt = (
-            f"Task {task_id} has entered your active {role_label} stage. "
-            f"BEFORE editing, committing, or publishing anything: call "
-            f"coord_my_assignments and confirm task {task_id} appears "
-            f"under your active roles with role={role!r}. If you do NOT "
-            f"see it there, you have been reassigned or the task moved "
-            f"on — STOP and message Coach via coord_send_message(to="
-            f"'coach', body='clarify status of {task_id}'). Do not act "
-            f"on this wake message alone — it can be stale by the time "
-            f"you read it.\n\nIf you ARE the active assignee, do the "
-            f"role work, then call the completion tool below — the "
-            f"kanban does NOT advance until you do.\n\n{completion_hint}"
+    is_pool = not assignment.get("owner")
+    if role in ("auditor_syntax", "auditor_semantics"):
+        # Auditor wakes use the focus + context cascade (kanban-specs §4.6).
+        focus = await _load_active_role_focus(task_id, role)
+        prompt = await build_auditor_wake_body(
+            task_id=task_id, role=role, focus=focus, is_pool=is_pool,
         )
     else:
-        prompt = (
-            f"Task {task_id} has entered {role_label}. You are in the "
-            f"candidate call. If you can take it, call "
-            f"coord_accept_role(task_id={task_id!r}, role={role!r}); "
-            f"first accepted claim wins. If it is already claimed by the "
-            f"time you answer, there is nothing to do — do NOT do the "
-            f"role work without an accepted claim, the kanban will not "
-            f"credit it.\n\nOnce you have the role, the next step is:"
-            f"\n{completion_hint}"
-        )
+        completion_hint = await _completion_hint_for_role(task_id, role)
+        if not is_pool:
+            prompt = (
+                f"Task {task_id} has entered your active {role_label} stage. "
+                f"BEFORE editing, committing, or publishing anything: call "
+                f"coord_my_assignments and confirm task {task_id} appears "
+                f"under your active roles with role={role!r}. If you do NOT "
+                f"see it there, you have been reassigned or the task moved "
+                f"on — STOP and message Coach via coord_send_message(to="
+                f"'coach', body='clarify status of {task_id}'). Do not act "
+                f"on this wake message alone — it can be stale by the time "
+                f"you read it.\n\nIf you ARE the active assignee, do the "
+                f"role work, then call the completion tool below — the "
+                f"kanban does NOT advance until you do.\n\n{completion_hint}"
+            )
+        else:
+            prompt = (
+                f"Task {task_id} has entered {role_label}. You are in the "
+                f"candidate call. If you can take it, call "
+                f"coord_accept_role(task_id={task_id!r}, role={role!r}); "
+                f"first accepted claim wins. If it is already claimed by the "
+                f"time you answer, there is nothing to do — do NOT do the "
+                f"role work without an accepted claim, the kanban will not "
+                f"credit it.\n\nOnce you have the role, the next step is:"
+                f"\n{completion_hint}"
+            )
 
     try:
         from server.agents import maybe_wake_agent
@@ -1204,4 +1575,6 @@ __all__ = [
     "is_running",
     "subscriber_last_event_at",
     "WATCHED_EVENT_TYPES",
+    "build_auditor_wake_body",
+    "inherit_audit_focus",
 ]

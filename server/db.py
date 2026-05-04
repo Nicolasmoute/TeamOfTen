@@ -187,7 +187,13 @@ CREATE TABLE IF NOT EXISTS task_role_assignments (
     -- Self-reference: when a fail verdict creates a fresh auditor row
     -- on the next round, the previous one points forward via this column.
     -- `WHERE superseded_by IS NULL` filters to active rows.
-    superseded_by   INTEGER REFERENCES task_role_assignments(id)
+    superseded_by   INTEGER REFERENCES task_role_assignments(id),
+    -- Auditor roles only (NULL on planner/executor/shipper rows).
+    -- Free-text Coach-set focus naming what the auditor should check
+    -- (math invariants? brand voice? race conditions?). REQUIRED for
+    -- auditor_semantics rows; defaults applied at wake-prompt time
+    -- when NULL on auditor_syntax rows. See kanban-specs.md §4.6.
+    focus           TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_role_assignments_task   ON task_role_assignments(task_id);
@@ -734,6 +740,17 @@ async def init_db() -> None:
             # Idempotent; no-op once team_config['tasks_kanban_v3_migrated']
             # is set.
             await _rebuild_tasks_for_kanban_v3(db)
+            # Auditor-focus column on task_role_assignments (kanban-specs
+            # §4.6 / §12.1). Free-text Coach-set focus naming what an
+            # auditor should check — REQUIRED for auditor_semantics rows
+            # (enforced at the API layer), optional for auditor_syntax
+            # (defaults applied at wake-prompt time when NULL). NULL on
+            # planner / executor / shipper rows.
+            await _ensure_columns(
+                db,
+                "task_role_assignments",
+                [("focus", "focus TEXT")],
+            )
             # Indexes that reference kanban-new columns. Live outside
             # SCHEMA because their columns don't exist on legacy DBs
             # until the migration above runs.
