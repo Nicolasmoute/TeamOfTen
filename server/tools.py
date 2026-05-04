@@ -4544,6 +4544,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "By policy Coach should always delegate planning — see the "
             "lifecycle-policy block for the steer.\n"
             "\n"
+            "Override (Coach-only, v0.3.5): when an assigned planner "
+            "Player cannot reach this tool from their runtime — they "
+            "drafted spec.md to disk and stopped because coord_* "
+            "wasn't visible — Coach can register the spec on their "
+            "behalf by passing `on_behalf_of='<player_slot>'`. The "
+            "recorded spec_author is the named Player and that "
+            "Player's planner role row is marked complete; the bus "
+            "event's actor is Coach. Use this only after confirming "
+            "the Player wrote the body (read their on-disk spec.md "
+            "and copy the body into `body=`).\n"
+            "\n"
             "Body is a full markdown document. Frontmatter is added "
             "automatically (task_id / title / created_by / priority / "
             "spec_author / spec_written_at). The body should cover Goal, "
@@ -4552,19 +4563,43 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "\n"
             "Params:\n"
             "- task_id: required\n"
-            "- body: full markdown body, required (max 40000 chars)"
+            "- body: full markdown body, required (max 40000 chars)\n"
+            "- on_behalf_of: optional Player slot (Coach-only override)"
         ),
-        {"task_id": str, "body": str},
+        {"task_id": str, "body": str, "on_behalf_of": str},
     )
     async def write_task_spec(args: dict[str, Any]) -> dict[str, Any]:
         task_id = (args.get("task_id") or "").strip()
         body = args.get("body") or ""
+        on_behalf_of_raw = (args.get("on_behalf_of") or "").strip().lower()
         if not task_id:
             return _err("task_id is required")
         if not body.strip():
             return _err("body is required (empty specs are not useful)")
         if len(body) > 40_000:
             return _err(f"body too long ({len(body)} chars, max 40000)")
+
+        # v0.3.5 override: Coach can register a spec on a Player's
+        # behalf when the Player's runtime can't reach this tool.
+        # Mirror of `coord_submit_audit_report(on_behalf_of=...)`.
+        if on_behalf_of_raw:
+            if not caller_is_coach:
+                return _err(
+                    "on_behalf_of is Coach-only (override path for "
+                    "when an assigned planner's runtime can't reach "
+                    "this tool). Players write their own specs."
+                )
+            if (
+                on_behalf_of_raw not in VALID_RECIPIENTS
+                or on_behalf_of_raw in ("coach", "broadcast")
+            ):
+                return _err(
+                    f"on_behalf_of must be a Player slot (p1..p10), "
+                    f"not {on_behalf_of_raw!r}"
+                )
+            effective_author: str = on_behalf_of_raw
+        else:
+            effective_author = caller_id
 
         from server.tasks import (
             is_valid_task_id, write_task_spec as _write_spec,
@@ -4592,9 +4627,34 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             #   (a) active planner role for this task
             #   (b) executor (== tasks.owner)
             #   (c) parent is the caller's current task
+            # When Coach uses on_behalf_of, the override path is the
+            # gate (Coach already has full permission); we additionally
+            # verify the named Player has an active planner role on
+            # this task so Coach doesn't accidentally credit a spec to
+            # an unrelated slot.
             allowed = False
             if caller_is_coach:
                 allowed = True
+                if on_behalf_of_raw:
+                    cur = await c.execute(
+                        "SELECT 1 FROM task_role_assignments "
+                        "WHERE task_id = ? AND role = 'planner' "
+                        "AND owner = ? "
+                        "AND completed_at IS NULL "
+                        "AND superseded_by IS NULL LIMIT 1",
+                        (task_id, on_behalf_of_raw),
+                    )
+                    if not await cur.fetchone():
+                        return _err(
+                            f"on_behalf_of='{on_behalf_of_raw}' has no "
+                            f"active planner role on task {task_id}. "
+                            f"Either the Player isn't the assigned "
+                            f"planner, or the role row was superseded "
+                            f"by a reassignment. Use coord_write_task_spec "
+                            f"without on_behalf_of (you'll be recorded "
+                            f"as spec_author) or fix the assignment "
+                            f"first via coord_assign_planner."
+                        )
             elif t["owner"] == caller_id:
                 allowed = True
             else:
@@ -4630,12 +4690,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             await c.close()
 
         try:
+            # Spec frontmatter records `effective_author` (the Player
+            # whose work it is when overriding; the caller otherwise).
             target, rel, written_at = await _write_spec(
                 project_id=project_id,
                 task_id=task_id,
                 title=t["title"],
                 body=body,
-                author=caller_id,
+                author=effective_author,
                 created_by=t["created_by"],
                 created_at=t["created_at"],
                 priority=t["priority"],
@@ -4645,8 +4707,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         except Exception as exc:
             return _err(f"spec write failed: {exc}")
 
-        # Update tasks.spec_path + spec_written_at; mark planner role
-        # complete if there's an active row owned by the caller.
+        # Update tasks.spec_path + spec_written_at; mark the planner
+        # role row complete on `effective_author`'s row (so a Coach
+        # override correctly closes the Player's planner assignment,
+        # not Coach's nonexistent one).
         completed_planner = False
         c = await configured_conn()
         try:
@@ -4659,13 +4723,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "UPDATE task_role_assignments SET completed_at = ? "
                 "WHERE task_id = ? AND role = 'planner' AND owner = ? "
                 "AND completed_at IS NULL AND superseded_by IS NULL",
-                (written_at, task_id, caller_id),
+                (written_at, task_id, effective_author),
             )
             completed_planner = bool(cur.rowcount)
             await c.commit()
         finally:
             await c.close()
 
+        # Bus events: agent_id = the actor (Coach when override),
+        # owner / on_behalf_of = effective_author (the Player whose
+        # spec it is).
+        on_behalf = effective_author != caller_id
         ts = _now_iso()
         await bus.publish(
             {
@@ -4675,6 +4743,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "task_id": task_id,
                 "spec_path": rel,
                 "to": t["owner"],
+                "on_behalf_of": effective_author if on_behalf else None,
             }
         )
         if completed_planner:
@@ -4685,13 +4754,18 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     "type": "task_role_completed",
                     "task_id": task_id,
                     "role": "planner",
-                    "owner": caller_id,
+                    "owner": effective_author,
                     "artifact_path": rel,
                     "to": t["owner"],
+                    "on_behalf_of": effective_author if on_behalf else None,
                 }
             )
+        suffix = (
+            f" (on behalf of {effective_author})" if on_behalf else ""
+        )
         return _ok(
             f"wrote spec for {task_id} ({len(body)} chars) → {rel}"
+            f"{suffix}"
         )
 
     # --------------------------------------------------------------

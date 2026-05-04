@@ -1118,3 +1118,138 @@ async def test_submit_audit_report_on_behalf_of_invalid_slot_rejected(
         "on_behalf_of": "broadcast",
     }))
     assert "must be a Player slot" in err
+
+
+# ---------------------------------------------------------------------
+# v0.3.5 audit-fix: Coach can write the spec on behalf of a Player
+# whose runtime can't reach coord_write_task_spec
+# ---------------------------------------------------------------------
+
+
+async def test_write_task_spec_on_behalf_of_records_player_as_author(
+    fresh_db: str,
+) -> None:
+    """Coach passing on_behalf_of='p3' registers the spec as if p3 had
+    called the tool — production failure mode where a planner Player's
+    runtime didn't expose coord_*."""
+    await init_db()
+    await _seed_task(status="plan", owner=None)
+    coach = _server_for("coach")
+    # Coach assigns p3 as planner first (the override only credits
+    # active assignees).
+    await _handler(coach, "assign_planner")({
+        "task_id": "t-2026-05-03-abc12345",
+        "to": "p3",
+    })
+    text = _ok_text(await _handler(coach, "write_task_spec")({
+        "task_id": "t-2026-05-03-abc12345",
+        "body": "## Goal\np3 wrote this draft to disk; coord_* not visible.\n",
+        "on_behalf_of": "p3",
+    }))
+    assert "on behalf of p3" in text
+    # tasks.spec_path is set + p3's planner role row is closed.
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT spec_path FROM tasks WHERE id = 't-2026-05-03-abc12345'"
+        )
+        spec = dict(await cur.fetchone())
+        cur = await c.execute(
+            "SELECT owner, completed_at FROM task_role_assignments "
+            "WHERE task_id = 't-2026-05-03-abc12345' AND role = 'planner'"
+        )
+        role = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    assert spec["spec_path"] is not None
+    assert role["owner"] == "p3"
+    assert role["completed_at"] is not None
+
+
+async def test_write_task_spec_on_behalf_of_player_rejected(
+    fresh_db: str,
+) -> None:
+    """Players cannot use on_behalf_of — the override is Coach-only."""
+    await init_db()
+    await _seed_task(status="plan", owner=None)
+    p7 = _server_for("p7")
+    err = _err_text(await _handler(p7, "write_task_spec")({
+        "task_id": "t-2026-05-03-abc12345",
+        "body": "trying to spec for someone else",
+        "on_behalf_of": "p3",
+    }))
+    assert "Coach-only" in err
+
+
+async def test_write_task_spec_on_behalf_of_unassigned_player_rejected(
+    fresh_db: str,
+) -> None:
+    """Coach using on_behalf_of must name a Player who actually has an
+    active planner role — otherwise we'd be crediting random slots."""
+    await init_db()
+    await _seed_task(status="plan", owner=None)
+    coach = _server_for("coach")
+    err = _err_text(await _handler(coach, "write_task_spec")({
+        "task_id": "t-2026-05-03-abc12345",
+        "body": "no planner assigned",
+        "on_behalf_of": "p9",
+    }))
+    assert "no active planner role" in err
+
+
+async def test_write_task_spec_on_behalf_of_invalid_slot_rejected(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed_task(status="plan", owner=None)
+    coach = _server_for("coach")
+    err = _err_text(await _handler(coach, "write_task_spec")({
+        "task_id": "t-2026-05-03-abc12345",
+        "body": "x",
+        "on_behalf_of": "broadcast",
+    }))
+    assert "must be a Player slot" in err
+
+
+async def test_write_task_spec_on_behalf_of_emits_event_with_field(
+    fresh_db: str,
+) -> None:
+    """The task_spec_written + task_role_completed events both carry
+    on_behalf_of so timeline + EnvPane can label the override."""
+    from server.events import bus
+
+    await init_db()
+    await _seed_task(status="plan", owner=None)
+    coach = _server_for("coach")
+    await _handler(coach, "assign_planner")({
+        "task_id": "t-2026-05-03-abc12345",
+        "to": "p3",
+    })
+    captured: list[dict] = []
+    queue = bus.subscribe()
+    try:
+        _ok_text(await _handler(coach, "write_task_spec")({
+            "task_id": "t-2026-05-03-abc12345",
+            "body": "## Goal\nfor p3.\n",
+            "on_behalf_of": "p3",
+        }))
+        import asyncio
+        await asyncio.sleep(0.05)
+        while True:
+            try:
+                captured.append(queue.get_nowait())
+            except Exception:
+                break
+    finally:
+        bus.unsubscribe(queue)
+    spec_events = [
+        e for e in captured if e.get("type") == "task_spec_written"
+    ]
+    assert spec_events and spec_events[0].get("on_behalf_of") == "p3"
+    role_events = [
+        e for e in captured
+        if e.get("type") == "task_role_completed"
+        and e.get("role") == "planner"
+    ]
+    assert role_events and role_events[0].get("on_behalf_of") == "p3"
+    assert role_events[0].get("owner") == "p3"

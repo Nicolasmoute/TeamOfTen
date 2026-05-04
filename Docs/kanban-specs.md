@@ -6,9 +6,13 @@
 > subscriber, the idle-Player poller) but cannot redefine fields,
 > endpoints, events, or invariants that TOT-specs declares.
 
-**Status:** Shipped (2026-05-04, v0.3.4 — production-trace fixes for wrong-Player stall attribution + tool-not-visible escape).
+**Status:** Shipped (2026-05-04, v0.3.5 — `coord_write_task_spec(on_behalf_of=...)` Coach override, mirror of v0.3.4 audit override).
 **Target:** TeamOfTen multi-agent harness (Python, Claude Agent SDK, kDrive-backed shared state, single-VPS)
-**Version:** 0.3.4
+**Version:** 0.3.5
+
+> **v0.3.5 (2026-05-04 production trace 2, 1 gap)** — second instance of the same failure mode (Player on Codex runtime can't reach `coord_*`), this time on the planner. Player wrote `spec.md` to disk and reported "I can't call coord_write_task_spec from this runtime"; v0.3.4 only added the override for audit submission.
+>   - **`coord_write_task_spec` gains `on_behalf_of` Coach override.** Mirror of `coord_submit_audit_report(on_behalf_of=...)`: Coach reads the Player's on-disk `spec.md`, copies the body, calls `coord_write_task_spec(task_id=..., body=..., on_behalf_of='<player_slot>')`. The recorded `spec_author` is the named Player; that Player's planner role row is marked complete (so the spec gate releases properly + the kanban auto-advances `plan → execute`); the bus event's `agent_id` is Coach, and `task_spec_written` + `task_role_completed` events both carry `on_behalf_of` for timeline labeling. Verifies the named Player has an active planner role on the task before crediting (rejects with a clear error otherwise — Coach can't accidentally credit unrelated slots). (§6.2)
+>   - **Tests:** 1115 → 1120 (+5 regressions: happy-path, Player rejection, unassigned-Player rejection, invalid-slot rejection, event-payload `on_behalf_of` field).
 
 > **v0.3.4 (2026-05-04 production trace, 5 bugs)** — folded in on top of v0.3.3. Real failure: Theo (p3) was assigned semantic auditor on a task in `audit_semantics`, did the review, wrote `audit_1_semantics.md` to disk, but reported "the coord task tools are not exposed here" multiple times and never called `coord_submit_audit_report`. The kanban silently sat for 15+ min; the stall sweeper then named the wrong Player (the executor p8) as the blocker; Coach got "no activity from p8" and nudged the wrong person.
 >   - **Stall sweeper attributes blame to the current-stage assignee, not `tasks.owner`.** The sweeper now reads the live `task_role_assignments` row for the task's current stage (e.g. `auditor_semantics` when `status = 'audit_semantics'`) and surfaces THAT row's owner as the stall blocker. `tasks.owner` is kept visible separately as `task_executor` in the event payload + Coach rollup, so context is preserved without misdirecting the nudge. (§10.5, §17 stall handling)
@@ -401,7 +405,7 @@ All new tools are registered in [server/tools.py](server/tools.py)'s `_tools` ma
 
 | Tool | Params | Purpose |
 |---|---|---|
-| `coord_write_task_spec` | `task_id, body` | Writes `spec.md`. Permission: Coach, the active planner, the executor, or the owner of the task's parent. Sets `spec_path` + `spec_written_at`; marks the planner role row complete. |
+| `coord_write_task_spec` | `task_id, body, on_behalf_of?` | Writes `spec.md`. Permission: Coach, the active planner, the executor, or the owner of the task's parent. Sets `spec_path` + `spec_written_at`; marks the planner role row complete. **`on_behalf_of` is the v0.3.5 Coach-only override** for when an assigned planner's runtime can't reach this tool: Coach reads the Player's on-disk `spec.md`, copies the body in, submits with `on_behalf_of='<player_slot>'`. Recorded `spec_author` is the named Player; that Player's planner role row is the one marked complete (so the spec gate releases properly); bus event `agent_id` is Coach. Rejects when the named Player has no active planner role on the task — Coach must fix the assignment first via `coord_assign_planner`. Mirror of `coord_submit_audit_report(on_behalf_of=...)`. |
 
 ### 6.3 Player-only — role artifacts + introspection
 
@@ -469,7 +473,7 @@ All published via the existing `EventBus` ([server/events.py](server/events.py))
 | `task_stage_changed` | `{ts, agent_id, type, task_id, from, to, reason: 'commit_pushed'|'audit_pass'|'audit_fail'|'shipped'|'manual', note?, owner}` |
 | `task_trajectory_changed` | `{ts, agent_id, type, task_id, trajectory, to: owner}` |
 | `task_blocked_changed` | `{ts, agent_id, type, task_id, blocked, reason?, to: owner}` |
-| `task_spec_written` | `{ts, agent_id, type, task_id, spec_path, to: owner}` |
+| `task_spec_written` | `{ts, agent_id, type, task_id, spec_path, to: owner, on_behalf_of?}` — `agent_id` is the actor (the planner Player in normal use, Coach when overriding); `on_behalf_of` is the Player slot when Coach used the v0.3.5 override path; absent / null otherwise. (§6.2) |
 | `task_role_assigned` | `{ts, agent_id, type, task_id, role, eligible_owners, owner?, to: owner}` |
 | `task_role_called` | `{ts, agent_id: 'system', type, task_id, role, owner?, eligible_owners, to?}` — fired when a stage becomes active and the reserved owner/candidates are woken. |
 | `task_role_claimed` | `{ts, agent_id, type, task_id, role, owner, to: owner}` — fired by `coord_accept_role` when a Player wins a role call. |
@@ -781,7 +785,9 @@ Required behavioral content the section must convey:
 - if no audit stage is in the trajectory after `execute`, the executor self-audits before completion;
 - Players use `coord_accept_role` for current-stage calls, `coord_commit_push` for code, and `coord_complete_execution` for non-git artifacts;
 - future-stage reservations are hidden until the card reaches that stage;
-- pass walks the trajectory to the next stage, fail reverts to execute, and Compass remains informational.
+- pass walks the trajectory to the next stage, fail reverts to execute, and Compass remains informational;
+- **v0.3.4 — Coach `on_behalf_of` override.** `coord_submit_audit_report(..., on_behalf_of='<slot>')` is the documented Coach-only path for when an assigned auditor's runtime can't reach the tool. Coach reads the Player's on-disk `audit_*.md`, copies the body, submits with `on_behalf_of=<slot>`. Audit body + verdict + role row are recorded properly (better than `coord_advance_task_stage`, which loses the audit content);
+- **v0.3.4 — "tool not visible" Player escape.** If a Player finishes the role work but the named `coord_*` completion tool is **not visible in their runtime**, they MUST NOT just write the deliverable to disk and stop. The kanban will silently sit and the stall sweeper will misattribute the block. Instead they message Coach IMMEDIATELY via `coord_send_message` (with the artifact path), then escalate via `coord_request_human` if Coach is unreachable. Coach picks up the override path via `on_behalf_of` (audits) or `coord_advance_task_stage` (other stages). This is the explicit fix for the production trace where a Player wrote the audit and stopped because their Codex runtime didn't expose `coord_submit_audit_report`.
 
 ### 13.2 Propagation flow
 
@@ -804,7 +810,8 @@ In addition to the static CLAUDE.md block (which Coach reads alongside Players),
 - answer ordinary questions directly instead of creating kanban tasks;
 - create tracked tasks with `workflow`, `tracking_reason`, and review routing;
 - assign/call Players by current stage; future-stage reservations are allowed but inactive;
-- Players complete work with `coord_commit_push`, `coord_complete_execution`, `coord_submit_audit_report`, or `coord_mark_shipped` so the board flows event-by-event.
+- Players complete work with `coord_commit_push`, `coord_complete_execution`, `coord_submit_audit_report`, or `coord_mark_shipped` so the board flows event-by-event;
+- **v0.3.4** — when the `## Stalled tasks` rollup names a `blocker` who differs from the `executor`, the blocker is the current-stage assignee (auditor / shipper / planner). Coach should nudge THEM, not the executor; if the blocker reports the named `coord_*` tool is not visible in their runtime, Coach reads the artifact they wrote to disk and submits on their behalf via `coord_submit_audit_report(..., on_behalf_of='<slot>')` for audits or `coord_advance_task_stage` for other stages.
 
 ## 14 · Telegram escalation hooks
 

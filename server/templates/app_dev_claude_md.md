@@ -183,6 +183,17 @@ Each task produces durable markdown artifacts under
   `coord_set_task_blocked`, `coord_set_task_workflow`.
   `coord_write_task_spec` exists as an EMERGENCY OVERRIDE only —
   when no Player is reachable for the planner role.
+  `coord_submit_audit_report(..., on_behalf_of='<slot>')` is the
+  Coach-only override for when an assigned auditor's runtime can't
+  reach the tool: read the Player's on-disk `audit_*.md`, copy the
+  body into `body=`, submit with `on_behalf_of=<their_slot>`. The
+  audit content + verdict + role row are recorded properly (better
+  than `coord_advance_task_stage`, which loses the audit body).
+  Same shape for planners: `coord_write_task_spec(..., on_behalf_of=
+  '<slot>')` registers a spec a Player drafted to disk but couldn't
+  submit. The named Player must already have an active planner role
+  on the task (otherwise Coach is crediting a random slot — the
+  override rejects).
 - **Players** execute, review, and ship. The relevant tools:
     - `coord_my_assignments` — call this any time you're not sure
       what to do; returns your actionable current-stage plate.
@@ -216,6 +227,43 @@ after `execute`, the executor SELF-AUDITS before
 `coord_commit_push` / `coord_complete_execution`: run the relevant
 tests, sanity-check the output, then commit. The board archives
 (or advances to ship) directly — there is no separate review pass.
+
+#### If the named coord_* tool is NOT visible in your runtime
+
+The kanban only advances when the assignee calls the matching
+`coord_*` completion tool with `task_id`. If you finish the role
+work and the named tool is **not visible in your tool list**, DO
+NOT write the deliverable to disk and stop — the kanban will
+silently sit, the stall sweeper will misattribute the block, and
+Coach won't learn about your work. Instead:
+
+1. Save your deliverable to disk where it belongs (the audit `.md`,
+   the spec, the artifact path) so it's not lost.
+2. Message Coach IMMEDIATELY via
+   `coord_send_message(to='coach', body='finished <role> on
+   t-..., wrote artifact at <path>, but the named coord_* tool is
+   not visible in my runtime — please advance on my behalf')`.
+3. If Coach is also unreachable, escalate via
+   `coord_request_human(subject=..., body=..., urgency='high')`.
+
+Coach has stage-specific override paths — the audit body / spec
+body you wrote to disk gets copied in:
+
+- **Planner stuck on `coord_write_task_spec`:** Coach calls
+  `coord_write_task_spec(task_id=..., body=<your spec.md>,
+  on_behalf_of='<your_slot>')`. The kanban registers the spec
+  properly + advances `plan → execute`.
+- **Auditor stuck on `coord_submit_audit_report`:** Coach calls
+  `coord_submit_audit_report(task_id=..., kind=..., body=<your
+  audit.md>, verdict=..., on_behalf_of='<your_slot>')`. Audit
+  content + verdict + role row are recorded properly.
+- **Other stages (executor / shipper):** Coach calls
+  `coord_advance_task_stage` to force-advance. Note this loses
+  artifact attribution — only use when the override tool above
+  doesn't exist for the stage.
+
+Use the escape the moment you notice the tool is missing, not after
+a 15-minute stall.
 
 ### Contract before implementation
 
