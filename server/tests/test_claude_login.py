@@ -165,6 +165,53 @@ def test_login_cancel_unknown_session_is_noop(fresh_db) -> None:
     assert r.json() == {"ok": True}
 
 
+def test_delete_claude_auth_requires_config_dir(fresh_db, monkeypatch) -> None:
+    """DELETE refuses when CLAUDE_CONFIG_DIR is unset — there's nothing
+    persistable to delete."""
+    from fastapi.testclient import TestClient
+    import server.main as mainmod
+
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    with TestClient(mainmod.app) as c:
+        r = c.delete("/api/auth/claude")
+    assert r.status_code == 400
+    assert "CLAUDE_CONFIG_DIR" in r.json()["detail"]
+
+
+def test_delete_claude_auth_when_no_file_is_idempotent(fresh_db, monkeypatch, tmp_path) -> None:
+    """Hitting DELETE on an unpopulated CLAUDE_CONFIG_DIR returns 200 with
+    deleted=false. Operators retrying should not see an error."""
+    from fastapi.testclient import TestClient
+    import server.main as mainmod
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    with TestClient(mainmod.app) as c:
+        r = c.delete("/api/auth/claude")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["deleted"] is False
+    assert body["credentials_present"] is False
+
+
+def test_delete_claude_auth_removes_file(fresh_db, monkeypatch, tmp_path) -> None:
+    """The happy path: a credentials file exists, DELETE wipes it."""
+    from fastapi.testclient import TestClient
+    import server.main as mainmod
+
+    cred = tmp_path / ".credentials.json"
+    cred.write_text('{"claudeAiOauth": {"accessToken": "x"}}', encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    with TestClient(mainmod.app) as c:
+        r = c.delete("/api/auth/claude")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert body["deleted"] is True
+    assert body["credentials_present"] is False
+    assert not cred.exists()
+
+
 # ----------------------------------------------------- pty smoke tests
 
 # These exercise the real subprocess + pty + os.read path. Linux-only:

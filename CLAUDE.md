@@ -1779,6 +1779,15 @@ stdin; the CLI writes `.credentials.json` to `$CLAUDE_CONFIG_DIR`
   `claude_login_{started,completed,cancelled}` log the actor only —
   the OAuth URL contains a state token and the code is a grant, so
   neither is published to the bus.
+- **Sign-out** — `DELETE /api/auth/claude` wipes
+  `$CLAUDE_CONFIG_DIR/.credentials.json` and drops any in-flight pty
+  login session. Lets the operator switch to a different Anthropic
+  account without first logging out from inside the
+  previously-authenticated CLI. Returns `deleted=false` (not an error)
+  when the file already didn't exist, so retries are safe. UI surfaces
+  a two-step "Sign out / use different account" button next to
+  **Refresh tokens** when authenticated; the second click confirms.
+  Emits `claude_auth_cleared`.
 - **One-session-per-process invariant.** A second `start` drops the
   prior session — nobody runs two parallel logins on the same harness.
 - **Reaper** wired into `lifespan` next to `start_audit_watcher` and

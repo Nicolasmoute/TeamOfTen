@@ -2589,6 +2589,17 @@ $CLAUDE_CONFIG_DIR/.credentials.json
 
 Emits `claude_auth_updated`.
 
+`DELETE /api/auth/claude`
+
+Wipes `$CLAUDE_CONFIG_DIR/.credentials.json` and drops any in-flight pty
+login session (its credential context is tied to the about-to-be-removed
+account). Lets the operator switch to a different Anthropic account
+without first logging out from inside the previously-authenticated CLI.
+Returns `{ok, path, deleted, credentials_present: false}` — `deleted` is
+`false` (not an error) when the file already didn't exist, so retries
+are safe. Requires `CLAUDE_CONFIG_DIR` set; otherwise 400. Emits
+`claude_auth_cleared`.
+
 #### 14.2.1 In-app OAuth login
 
 Drives `claude /login` as a pty subprocess on the server so the

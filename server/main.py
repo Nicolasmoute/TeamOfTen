@@ -1036,6 +1036,61 @@ async def set_claude_auth(
     }
 
 
+@app.delete("/api/auth/claude", dependencies=[Depends(require_token)])
+async def delete_claude_auth(
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    """Wipe the persisted .credentials.json so the next agent spawn (or
+    next /login flow) starts from zero. Lets the operator switch
+    accounts without rotating from inside the previously-authenticated
+    CLI session. We also drop any in-flight pty login session — its
+    credential context is stale once the file is gone.
+    """
+    claude_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if not claude_dir:
+        raise HTTPException(
+            400,
+            detail=(
+                "CLAUDE_CONFIG_DIR is not set, so there is no persisted "
+                "credentials file to delete."
+            ),
+        )
+    cred_file = Path(claude_dir) / ".credentials.json"
+    deleted = False
+    try:
+        cred_file.unlink()
+        deleted = True
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise HTTPException(500, detail=f"could not delete {cred_file}: {e}")
+    # Drop any in-flight pty login session — its credential context is
+    # tied to the old account, no point keeping it warm.
+    from server import claude_login as _cl
+    for sid in list(_cl._sessions):
+        try:
+            _cl._sessions.pop(sid).close()
+        except Exception:
+            logger.exception("error closing login session %s during signout", sid)
+    await bus.publish({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": "system",
+        "type": "claude_auth_cleared",
+        "path": str(cred_file),
+        "actor": actor,
+    })
+    logger.info(
+        "claude auth cleared at %s (deleted=%s, actor=%s)",
+        cred_file, deleted, actor,
+    )
+    return {
+        "ok": True,
+        "path": str(cred_file),
+        "deleted": deleted,
+        "credentials_present": False,
+    }
+
+
 # ------------------------------------------------------------------
 # Claude Code in-app OAuth login. Drives `claude /login` as a pty
 # subprocess inside the container so the operator can complete the

@@ -3713,6 +3713,36 @@ function ClaudeAuthSection({ health, onRefresh }) {
     } catch (_) { /* best-effort */ }
   }, [url]);
 
+  // Hard reset — wipes the persisted .credentials.json so the next
+  // login flow starts from zero (lets you switch to a different
+  // account). Two-step click protects against fat-fingers since this
+  // is destructive.
+  const [confirmSignOut, setConfirmSignOut] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
+  const onSignOut = useCallback(async () => {
+    if (!confirmSignOut) {
+      setConfirmSignOut(true);
+      setTimeout(() => setConfirmSignOut(false), 4000);
+      return;
+    }
+    setSigningOut(true);
+    setError("");
+    try {
+      const res = await authFetch("/api/auth/claude", { method: "DELETE" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data.detail || `HTTP ${res.status}`);
+        return;
+      }
+      setConfirmSignOut(false);
+      try { await onRefresh?.(); } catch (_) {}
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSigningOut(false);
+    }
+  }, [confirmSignOut, onRefresh]);
+
   // If the user closes the drawer or reloads while a login session is
   // mid-flight, fire-and-forget a cancel so the server-side subprocess
   // dies promptly instead of waiting for the 10-min reaper. Capturing
@@ -3792,12 +3822,26 @@ function ClaudeAuthSection({ health, onRefresh }) {
         <code>${auth.config_dir || "/data"}</code> volume — you only
         do this when first setting up or rotating credentials.
       </p>
-      <div style="display: flex; gap: 8px; align-items: center;">
+      <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
         <button
           class="primary"
           onClick=${onStart}
-          disabled=${skipped}
+          disabled=${skipped || signingOut}
         >${present ? "Refresh tokens" : "Sign in to Claude"}</button>
+        ${present
+          ? html`<button
+              onClick=${onSignOut}
+              disabled=${skipped || signingOut}
+              title="Wipe the saved credentials. The CLI will be unauthenticated until you sign in again — useful if you want to switch to a different Anthropic account."
+              style=${confirmSignOut
+                ? "font-size: 11px; color: var(--err); border-color: var(--err);"
+                : "font-size: 11px;"}
+            >${signingOut
+              ? "signing out…"
+              : confirmSignOut
+                ? "click again to confirm"
+                : "Sign out / use different account"}</button>`
+          : null}
         ${error
           ? html`<span style="font-size: 11px; color: var(--err);">${error}</span>`
           : null}
