@@ -2589,6 +2589,24 @@ $CLAUDE_CONFIG_DIR/.credentials.json
 
 Emits `claude_auth_updated`.
 
+#### 14.2.1 In-app OAuth login
+
+Drives `claude /login` as a pty subprocess on the server so the
+operator never has to install the CLI on a separate machine or shell
+into the container. Three-step flow with state held in
+`server/claude_login.py`. POSIX-only — Windows hosts get 501 with a
+pointer to the paste-fallback (§14.2).
+
+| Endpoint | Notes |
+| --- | --- |
+| `POST /api/auth/claude/login/start` | Spawns `claude` in a pty, sends `/login\n`, polls stdout for the OAuth URL (timeout 30s). Drops any prior in-flight session before spawning — one login per process. Returns `{session_id, url}` or 502 on spawn/timeout/early-exit. Requires `CLAUDE_CONFIG_DIR` set; otherwise 400. Emits `claude_login_started` (actor only — the URL is not bus-published). |
+| `POST /api/auth/claude/login/submit` | Body `{session_id, code}`. Writes `code\n` to subprocess stdin, waits up to 30s for a success indicator OR for `.credentials.json` mtime to advance (tie-breaker: CLI may swallow the success line in a TUI redraw). Returns `{ok: true}` and tears down the subprocess. Emits `claude_login_completed`. 400 on unknown/expired session. |
+| `POST /api/auth/claude/login/cancel` | Body `{session_id}`. Best-effort tear-down: `SIGTERM`, wait 2s, `SIGKILL`, close pty fd. No-op when the id is unknown. Emits `claude_login_cancelled`. |
+
+A reaper background task (60s tick, 600s TTL) drops orphaned sessions
+whose subprocess has exited or whose `started_at` exceeds the TTL —
+wired into `lifespan` next to the audit watcher and telegram bridge.
+
 ### 14.3 Agents
 
 | Endpoint | Notes |

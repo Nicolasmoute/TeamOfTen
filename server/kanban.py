@@ -723,6 +723,17 @@ async def _transition(
         rd = dict(row)
         old_status = rd["status"]
         title = rd.get("title")
+        # AUDIT FIX (v0.3.9.1): no-op short-circuit. If old_status ==
+        # new_status the transition is buggy retry / replay; without
+        # this guard the bus.publish would emit a phantom
+        # `task_stage_changed{from: X, to: X}` and (for archive) a
+        # duplicate `task_completed`, double-waking Coach. Bail
+        # silently — caller upstream guards (e.g. _on_task_shipped's
+        # `if t["status"] != "ship": return`) already prevent the
+        # canonical case; this is the defensive backstop. Connection
+        # is closed by the surrounding `finally`.
+        if old_status == new_status:
+            return
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
         # Every transition stamps last_stage_change_at + clears any
@@ -865,21 +876,33 @@ async def _emit_task_completed(
     # Render a compact trajectory marker the prompt can show inline.
     trajectory_marker = _trajectory_marker_from_json(trajectory_str)
 
-    await bus.publish({
-        "ts": ts,
-        "agent_id": "system",
-        "type": "task_completed",
-        "task_id": task_id,
-        "title": title,
-        "trajectory": trajectory_str,
-        "trajectory_marker": trajectory_marker,
-        "from_stage": from_stage,
-        "reason": reason,
-        "executor": executor,
-        "last_stage_owner": last_stage_owner,
-        "owner": owner,
-        "to": "coach",
-    })
+    # AUDIT FIX (v0.3.9.1): isolate publish vs wake. Previously the
+    # bus.publish was outside the wake's try/except — a publish
+    # failure would silently skip the wake too, so Coach got
+    # neither the event nor the prompt. Now each is independently
+    # wrapped: a publish failure still lets the wake fire (Coach
+    # still hears about the completion via the prompt), and a
+    # wake failure doesn't undo the published event.
+    try:
+        await bus.publish({
+            "ts": ts,
+            "agent_id": "system",
+            "type": "task_completed",
+            "task_id": task_id,
+            "title": title,
+            "trajectory": trajectory_str,
+            "trajectory_marker": trajectory_marker,
+            "from_stage": from_stage,
+            "reason": reason,
+            "executor": executor,
+            "last_stage_owner": last_stage_owner,
+            "owner": owner,
+            "to": "coach",
+        })
+    except Exception:
+        logger.exception(
+            "kanban: task_completed publish failed (task_id=%s)", task_id
+        )
 
     # Wake Coach with a summary prompt. The prompt names the task,
     # the path, the executor + last-stage assignee, and asks Coach
@@ -890,19 +913,38 @@ async def _emit_task_completed(
         if last_stage_owner else f"the task wrapped after {from_stage}"
     )
     exec_label = f"executor: {executor}" if executor else "no executor recorded"
+    # AUDIT FIX (v0.3.9.1): the prior wording said the Telegram
+    # bridge would auto-forward Coach's reply "if this turn was
+    # user-triggered." Misleading: this wake IS a system-triggered
+    # turn (the trigger event is `task_completed`, not a
+    # `message_sent{from=human}`), so the bridge's outbound filter
+    # blocks the reply. To reach the user on Telegram, Coach must
+    # explicitly use coord_send_message(to='broadcast') — which the
+    # bridge accumulates and flushes when the OWNING (originating)
+    # turn was user-triggered, OR Coach calls coord_request_human
+    # for unconditional Telegram delivery on important completions.
     body = (
         f"Task {task_id} completed: {title!r}. Trajectory: "
         f"{trajectory_marker or '(unknown)'}. {last_label}; {exec_label}. "
         f"Final reason: {reason}.\n\n"
         f"Send a summary of the outcome to the user. Cover: "
         f"(1) what was delivered, (2) any caveats / known limitations / "
-        f"open questions, (3) whether follow-up tasks are needed. Use "
-        f"coord_send_message(to='broadcast', body=...) if the user is "
-        f"watching the harness UI, or just reply normally — if this "
-        f"turn was user-triggered (web composer or Telegram inbound), "
-        f"the bridge will forward your text to the user's phone "
-        f"automatically. Keep it concise (3-6 sentences) unless the "
-        f"work is complex enough to need more."
+        f"open questions, (3) whether follow-up tasks are needed. Keep "
+        f"it concise (3-6 sentences) unless the work is complex enough "
+        f"to need more.\n\n"
+        f"Channel rules:\n"
+        f"- If the user is watching the harness UI: call "
+        f"coord_send_message(to='broadcast', body=<your summary>). "
+        f"They see it in the chat panel.\n"
+        f"- If the user is on Telegram and wants to be pinged on "
+        f"completion: call coord_request_human(subject='Task "
+        f"{task_id} done', body=<your summary>, urgency='normal'). "
+        f"This unconditionally forwards to Telegram + the EnvPane "
+        f"attention strip — use it for completions the user "
+        f"actually asked for, not routine internal cleanup.\n"
+        f"- Plain text in your reply WITHOUT the tools above stays "
+        f"in your chat panel only — this wake is system-triggered, "
+        f"so the Telegram bridge does NOT auto-forward."
     )
     try:
         from server.agents import maybe_wake_agent

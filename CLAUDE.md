@@ -1752,6 +1752,63 @@ file is missing, validation, hash gating, lock semantics,
 human_attention escalation on every failure mode, and the role-
 default model resolution.
 
+**Recent (2026-05-05) — In-app Claude OAuth login:**
+
+The Claude auth bootstrap used to require shelling into the Zeabur
+container (or installing the CLI on a separate laptop, running
+`claude /login` there, locating `~/.claude/.credentials.json`, and
+pasting its contents into the harness UI). The new flow is one
+button-click: open the Settings drawer → **Claude auth** →
+**Sign in to Claude**. The server spawns its own `claude /login` as a
+pty subprocess inside the container, captures the OAuth URL the CLI
+prints, and surfaces it in the panel. The operator opens the URL on
+their laptop, authorizes on `claude.ai`, and pastes the resulting
+code back into the panel. The server feeds it to the running CLI's
+stdin; the CLI writes `.credentials.json` to `$CLAUDE_CONFIG_DIR`
+(persisted on `/data/claude/` by the Dockerfile) and exits cleanly.
+
+- **Module** [server/claude_login.py](server/claude_login.py) —
+  stdlib only (no new deps). `pty.openpty()` + non-blocking
+  `os.read` for the master fd; `subprocess.Popen` with `start_new_session=True`
+  so `SIGTERM` cleans up the whole group on cancel. ANSI-strip /
+  URL-extract / yes-no-prompt-detect / success-detect helpers are
+  pure functions, exposed for tests.
+- **Endpoints** in [server/main.py](server/main.py):
+  `POST /api/auth/claude/login/{start,submit,cancel}`. All three
+  carry `Depends(require_token)` + `audit_actor`; events
+  `claude_login_{started,completed,cancelled}` log the actor only —
+  the OAuth URL contains a state token and the code is a grant, so
+  neither is published to the bus.
+- **One-session-per-process invariant.** A second `start` drops the
+  prior session — nobody runs two parallel logins on the same harness.
+- **Reaper** wired into `lifespan` next to `start_audit_watcher` and
+  friends; runs every 60s and drops sessions older than 10 min or
+  whose subprocess has already exited. Idempotent
+  `start_login_reaper` / `stop_login_reaper` mirror the
+  audit-watcher pattern.
+- **Submit tie-breaker.** Even if the CLI swallows its success line
+  in a TUI redraw, success is declared if `.credentials.json` mtime
+  advanced past what we recorded at session start.
+- **POSIX-only.** Windows hosts get `501 Not Implemented` with a
+  pointer to the paste-fallback `<details>` (which still works the
+  way it always did, by writing through the existing
+  `POST /api/auth/claude` endpoint).
+- **UI** — [server/static/app.js](server/static/app.js)'s
+  `ClaudeAuthSection` is now a three-phase state machine
+  (`idle` → `awaiting` → `busy`) wrapping the new endpoints. URL is
+  shown in a read-only input with copy + open buttons (uses
+  `navigator.clipboard.writeText` and `window.open` with `noopener,noreferrer`).
+  The legacy paste-the-blob form lives inside a `<details>` labelled
+  *"Stuck? Paste a credentials.json from another machine instead"*.
+- **Tests** in [server/tests/test_claude_login.py](server/tests/test_claude_login.py):
+  12 pure-regex tests (run on every platform), 5 HTTP endpoint
+  smoke tests via `TestClient` (validation + 400/501 paths), 4
+  pty-driven smoke tests guarded by `@pytest.mark.skipif(sys.platform == "win32", ...)`
+  — they substitute a Python one-liner via `_set_command_for_tests`
+  to verify spawn, URL capture, timeout, prior-session-drop, and
+  cancel-kills-subprocess. 16 of 21 pass on Windows; the remaining
+  5 are Linux/CI-only.
+
 ## What needs verification (when user is next active)
 
 Verified as of 2026-04-24: HARNESS_TOKEN auth gate, fine-grained
@@ -1843,8 +1900,9 @@ Confirmed via M-1 spike. `~/.claude.json` holds only local CLI config (numStartu
 
 **Fix:** The Dockerfile sets `CLAUDE_CONFIG_DIR=/data/claude`. Because `/data` is already a Zeabur persistent volume, the CLI writes `.credentials.json` and `.claude.json` into `/data/claude/` which survives redeploys.
 
-- On first deploy (or if you rotate secrets): shell into the container, run `claude`, type `/login`, follow the device-code flow once.
+- On first deploy (or if you rotate secrets): open the harness UI → Settings drawer → **Claude auth** → click **Sign in to Claude**. The button drives `claude /login` as a pty subprocess inside the container ([server/claude_login.py](server/claude_login.py)) and surfaces the OAuth URL right in the panel; complete the dance in your browser, paste the resulting code into the textbox, and the CLI persists `.credentials.json` to `/data/claude/`. No more shell-into-container required for the routine case.
 - After that, every redeploy finds the existing token and you don't re-authenticate.
+- Three backstop paths if the in-app flow misbehaves: (a) the same panel has a `<details>` fallback to paste a `.credentials.json` blob from another machine; (b) shell into the container and run `claude` then `/login` directly; (c) `POST /api/auth/claude` accepts the same paste payload over HTTP. All three end up writing to the same `$CLAUDE_CONFIG_DIR/.credentials.json`.
 - `/api/health` exposes `claude_auth.credentials_present: true/false` so you can confirm persistence without logging in to check.
 
 ### Codex CLI auth: same `/data` strategy via `CODEX_HOME=/data/codex`

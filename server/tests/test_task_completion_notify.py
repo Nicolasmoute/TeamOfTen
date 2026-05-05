@@ -263,6 +263,102 @@ async def test_non_archive_transition_does_not_notify_coach(
     assert completed == []
 
 
+async def test_wake_body_uses_explicit_channel_tools_not_misleading_telegram_clause(
+    fresh_db: str, wake_stub: WakeRecorder,
+) -> None:
+    """AUDIT FIX (v0.3.9.1): the wake body must NOT claim the
+    Telegram bridge auto-forwards Coach's reply. This wake is
+    system-triggered (`task_completed`), so the bridge's outbound
+    user-initiated-turn filter blocks it. Coach must explicitly use
+    `coord_send_message(to='broadcast')` for harness-UI delivery or
+    `coord_request_human` for unconditional Telegram delivery."""
+    await init_db()
+    task_id = "t-2026-05-06-00000016"
+    await _seed_task(task_id=task_id, status="ship")
+    await _transition(
+        task_id=task_id, new_status="archive", reason="shipped",
+        owner="p2", project_id="misc",
+    )
+    coach_wakes = [b for s, b in wake_stub.calls if s == "coach"]
+    assert coach_wakes
+    body = coach_wakes[0]
+    # The misleading clause must be gone.
+    assert "bridge will forward" not in body
+    # Both explicit channel options named.
+    assert "coord_send_message(to='broadcast'" in body
+    assert "coord_request_human" in body
+    # Explicit "this wake is system-triggered" disclaimer.
+    assert "system-triggered" in body
+    assert "does NOT auto-forward" in body
+
+
+async def test_no_op_transition_is_silent(
+    fresh_db: str, wake_stub: WakeRecorder,
+) -> None:
+    """AUDIT FIX (v0.3.9.1): if `_transition` is called with
+    old_status == new_status (replay / double-emit), it must NOT
+    emit a phantom `task_stage_changed{from: X, to: X}` or wake
+    Coach. The defensive guard short-circuits before any side
+    effects."""
+    await init_db()
+    task_id = "t-2026-05-06-00000017"
+    # Task is already archived. A second archive → archive call
+    # must be silent.
+    await _seed_task(task_id=task_id, status="archive", owner="p2")
+    queue = bus.subscribe()
+    try:
+        await _transition(
+            task_id=task_id, new_status="archive", reason="shipped",
+            owner="p2", project_id="misc",
+        )
+        await asyncio.sleep(0.05)
+        events = _drain(queue)
+    finally:
+        bus.unsubscribe(queue)
+
+    # No events of either type should fire.
+    types = [e.get("type") for e in events]
+    assert "task_stage_changed" not in types, events
+    assert "task_completed" not in types, events
+    # And no Coach wake.
+    coach_wakes = [b for s, b in wake_stub.calls if s == "coach"]
+    assert coach_wakes == []
+
+
+async def test_publish_failure_does_not_cancel_coach_wake(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch,
+    wake_stub: WakeRecorder,
+) -> None:
+    """AUDIT FIX (v0.3.9.1): if `bus.publish` raises (e.g. transient
+    DB writer issue), Coach's wake must still fire. Without the
+    isolation, a publish failure would silently skip the wake too,
+    leaving Coach with no signal at all."""
+    await init_db()
+    task_id = "t-2026-05-06-00000018"
+    await _seed_task(task_id=task_id, status="ship")
+
+    # Replace bus.publish with a stub that raises on the
+    # `task_completed` event but lets earlier events through.
+    real_publish = bus.publish
+
+    async def flaky_publish(event: Any) -> None:
+        if event.get("type") == "task_completed":
+            raise RuntimeError("simulated DB writer outage")
+        await real_publish(event)
+
+    monkeypatch.setattr(bus, "publish", flaky_publish)
+
+    await _transition(
+        task_id=task_id, new_status="archive", reason="shipped",
+        owner="p2", project_id="misc",
+    )
+    # The wake must still have fired despite the publish raising.
+    coach_wakes = [b for s, b in wake_stub.calls if s == "coach"]
+    assert coach_wakes, wake_stub.calls
+    body = coach_wakes[0]
+    assert "completed" in body
+
+
 async def test_event_carries_trajectory_marker(
     fresh_db: str, wake_stub: WakeRecorder,
 ) -> None:
