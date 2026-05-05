@@ -212,6 +212,81 @@ def test_delete_claude_auth_removes_file(fresh_db, monkeypatch, tmp_path) -> Non
     assert not cred.exists()
 
 
+def test_delete_claude_auth_drops_in_flight_sessions(fresh_db, monkeypatch, tmp_path) -> None:
+    """Sign-out must invalidate any pty session that's still running —
+    its credential context is tied to the about-to-be-removed account.
+    Otherwise a subsequent submit_code would paste a new account's code
+    into the old account's CLI process."""
+    from fastapi.testclient import TestClient
+    from unittest.mock import MagicMock
+    from datetime import datetime, timezone
+    import server.main as mainmod
+    from server import claude_login
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+
+    # Inject a fake session with a stub Popen + fd. Avoids spawning a
+    # real subprocess while still exercising the cancel_all_sessions
+    # code path end-to-end through the HTTP layer.
+    fake_proc = MagicMock()
+    fake_proc.poll.return_value = None  # alive
+    fake_proc.terminate.return_value = None
+    fake_proc.wait.return_value = 0
+    sess = claude_login.LoginSession(
+        sid="fake-sid",
+        proc=fake_proc,
+        master_fd=-1,  # close() catches OSError on bad fd
+        started_at=datetime.now(timezone.utc),
+    )
+    claude_login._sessions["fake-sid"] = sess
+    try:
+        assert claude_login.session_count() == 1
+        with TestClient(mainmod.app) as c:
+            r = c.delete("/api/auth/claude")
+        assert r.status_code == 200
+        assert claude_login.session_count() == 0
+        # The fake proc should have been terminated.
+        assert fake_proc.terminate.called
+    finally:
+        claude_login._sessions.clear()
+
+
+async def test_cancel_all_sessions_returns_dropped_count() -> None:
+    """Pure unit test for the new public helper."""
+    from unittest.mock import MagicMock
+    from datetime import datetime, timezone
+    from server import claude_login
+
+    for sid in list(claude_login._sessions):
+        claude_login._sessions.pop(sid).close()
+    assert claude_login.session_count() == 0
+
+    for i in range(3):
+        proc = MagicMock()
+        proc.poll.return_value = None
+        proc.terminate.return_value = None
+        proc.wait.return_value = 0
+        sess = claude_login.LoginSession(
+            sid=f"s{i}",
+            proc=proc,
+            master_fd=-1,
+            started_at=datetime.now(timezone.utc),
+        )
+        claude_login._sessions[f"s{i}"] = sess
+
+    dropped = await claude_login.cancel_all_sessions()
+    assert dropped == 3
+    assert claude_login.session_count() == 0
+
+
+async def test_cancel_all_sessions_empty_returns_zero() -> None:
+    from server import claude_login
+    for sid in list(claude_login._sessions):
+        claude_login._sessions.pop(sid).close()
+    dropped = await claude_login.cancel_all_sessions()
+    assert dropped == 0
+
+
 # ----------------------------------------------------- pty smoke tests
 
 # These exercise the real subprocess + pty + os.read path. Linux-only:

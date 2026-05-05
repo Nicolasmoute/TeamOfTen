@@ -434,6 +434,27 @@ async def cancel_login(sid: str) -> dict:
     return {"ok": True}
 
 
+async def cancel_all_sessions() -> int:
+    """Tear down every in-flight session. Returns the count dropped.
+
+    Used by the sign-out endpoint: once .credentials.json is gone, any
+    pty subprocess we spawned earlier holds a stale credential context,
+    so we drop them all rather than letting the next submit_code paste
+    a new account's code into an old account's session.
+    """
+    dropped = 0
+    for sid in list(_sessions):
+        sess = _sessions.pop(sid, None)
+        if sess is None:
+            continue
+        try:
+            sess.close()
+        except Exception:
+            logger.exception("error closing login session %s during cancel_all", sid)
+        dropped += 1
+    return dropped
+
+
 def session_count() -> int:
     return len(_sessions)
 

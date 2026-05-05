@@ -1067,11 +1067,7 @@ async def delete_claude_auth(
     # Drop any in-flight pty login session — its credential context is
     # tied to the old account, no point keeping it warm.
     from server import claude_login as _cl
-    for sid in list(_cl._sessions):
-        try:
-            _cl._sessions.pop(sid).close()
-        except Exception:
-            logger.exception("error closing login session %s during signout", sid)
+    await _cl.cancel_all_sessions()
     await bus.publish({
         "ts": datetime.now(timezone.utc).isoformat(),
         "agent_id": "system",
