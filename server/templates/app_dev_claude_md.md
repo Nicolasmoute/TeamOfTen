@@ -359,6 +359,42 @@ body you wrote to disk gets copied in:
 Use the escape the moment you notice the tool is missing, not after
 a 15-minute stall.
 
+The reconciliation sweep is a safety net, not a replacement for the
+escape. The harness scans every active task's folder on disk every
+~5 min and emits a "spec on disk but unrecorded" / "audit on disk
+but unrecorded" notification to Coach. So if you wrote the artifact
+correctly to its expected path (`spec.md` or
+`audits/audit_<round>_<kind>.md`) and never managed to message
+Coach, Coach will eventually see your work — within ~10 min in the
+typical case. **But message Coach yourself anyway**: the sweep
+runs on a cadence and only catches canonical filenames; the escape
+gives Coach the right context (why you're stuck, whether the work
+is actually finished, what verdict to use, etc.) immediately.
+
+#### Auto-action ladder when a stall persists
+
+The harness has a four-rung auto-action ladder for stalls:
+30 min → nudge the assignee, 1 h → notify Coach, 2 h →
+auto-reassign to another eligible Player, 4 h → auto-archive +
+human escalation. The system always makes some progress; it never
+sits forever waiting for a Player whose session is gone. Two
+implications for you:
+
+- **If you receive an auto-reassign stand-down at the 2 h mark,
+  it's not punitive.** The system inferred your session was lost.
+  Stop work as you would on any reassignment (see below) and
+  message Coach if you have local context worth forwarding.
+- **If your task gets auto-archived at the 4 h mark, the
+  deliverable is lost.** Whatever you wrote to disk is still on
+  the filesystem (un-archived deletions don't happen), but the
+  kanban no longer tracks it. Re-create from your disk artifacts
+  if the work still matters and Coach hasn't already restarted
+  the task.
+
+The ladder is the safety net. Coach's job is to intervene BEFORE
+auto-actions fire — your job, when stalled, is to hit the
+tool-not-visible escape so Coach has time to act.
+
 #### If you receive a "STOP work on task X" message
 
 When Coach reassigns a role mid-flight, the displaced Player gets

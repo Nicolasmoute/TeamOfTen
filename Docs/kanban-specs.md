@@ -6,9 +6,36 @@
 > subscriber, the idle-Player poller) but cannot redefine fields,
 > endpoints, events, or invariants that TOT-specs declares.
 
-**Status:** Shipped (2026-05-04, v0.3.7 — `coord_commit_push` detects misplaced work in shared `.project` checkout; per-slot worktree boundary on executor wakes).
+**Status:** Shipped (2026-05-05, v0.3.8.2 — three audit-pass-2 fixes: rung 3 supersede race, rung 4 role-row cleanup + stand-down, crash_recover stall reset).
 **Target:** TeamOfTen multi-agent harness (Python, Claude Agent SDK, kDrive-backed shared state, single-VPS)
-**Version:** 0.3.7
+**Version:** 0.3.8.2
+
+> **v0.3.8.2 (2026-05-05 second audit pass)** — three more issues caught on a second self-audit of the v0.3.8 ladder + rollup machinery:
+>   - **MEDIUM — rung 3 UPDATE now guards against concurrent supersede.** If Coach reassigns the role between the sweep's main-loop SELECT (which captures `role_row_id`) and rung 3's UPDATE, the row may already be `completed_at IS NOT NULL` or `superseded_by IS NOT NULL`. The UPDATE's WHERE clause now requires the row to still be active; on race-loss (rowcount==0) the function aborts the success path and fires `human_attention` + `task_stall_no_alternative` with `reason='role_row_changed'`. Without this, a winning sweep would silently write `owner` to an inactive row and emit a misleading `task_stall_auto_reassigned` event. (§10.5 rung 3)
+>   - **MEDIUM — rung 4 archive now closes active role rows + stands down the assignee.** Previously the archive UPDATE only touched `tasks` — leaving any active `task_role_assignments` rows orphaned (visible to queries that don't also filter on `tasks.status`). And a Player who happened to be working when rung 4 fired got no signal — they kept editing the worktree on a task the kanban no longer tracked. Rung 4 now: (a) `UPDATE task_role_assignments SET completed_at = ? WHERE task_id = ? AND completed_at IS NULL AND superseded_by IS NULL` so every active row closes; (b) calls `send_role_stand_down(displaced=[stage_owner], new_owners=[])` so the active assignee gets the canonical "STOP work" wake. (§10.5 rung 4)
+>   - **MEDIUM — `crash_recover` now resets the stall ladder for zombie-owned tasks.** Pre-fix: a task at rung 3 with `last_stage_change_at` from 3.5h before a crash, plus reboot delay, would have age >= 4h on the first post-reboot sweep. The next walk would fire rung 4 and archive the task — punishing the new owner for the harness's downtime, not for any actual silence. `crash_recover` now also resets `last_stage_change_at = now`, `stale_alert_at = NULL`, `stall_escalation_level = 0` for any non-archive task whose owner OR active role-row owner is in the zombie-slots set. The post-crash sweep starts at rung 1 again, giving the recovered Player a fresh window. ([server/db.py:crash_recover](../server/db.py))
+>   - **Tests:** 1156 → 1159 (+3 regressions: rung-3 supersede race aborts to no_alt with `reason='role_row_changed'`, rung-4 archive closes all active role rows, rung-4 archive emits stand-down + wakes the displaced assignee).
+>   - **Other audit notes (no fix needed):** `_build_unrecorded_artifacts_rows` queries last 30 events and renders 10 — beyond that capacity findings could be silently dropped, but realistic project load doesn't approach this. Multiple separate DB connections per helper (perf concern, not correctness — sqlite WAL handles fine). Rung 4 archive uses direct UPDATE rather than `_transition` (state machine guarantees archive is reachable from every active stage; the direct UPDATE is fragile if VALID_TRANSITIONS changes — flagged for future hardening if/when the state machine grows).
+
+> **v0.3.8.1 (2026-05-05 audit-fix pass on v0.3.8)** — five issues from the v0.3.8 self-audit, ranked critical → low:
+>   - **CRITICAL — rung 3 success now resets `last_stage_change_at` + zeros `stall_escalation_level`, AND breaks the rung-walk loop.** Without this, a task stalled long enough that `target_level == 4` (env defaults: age >= 4h) would walk rungs 1→2→3→4 in a single sweep — auto-reassigning to a new Player and immediately auto-archiving it. The freshly-reassigned task got archived seconds after handoff, defeating rung 3 entirely. `_fire_rung_3` now returns `True` on the success path; the rung-walk loop checks the return and breaks before rung 4 fires. The reassign-flag SQL also resets the stall window so the new Player gets a fresh ladder starting at rung 1.
+>   - **HIGH — rung 3 alternatives filter now skips Players with `agents.current_task_id` set on a non-archive task.** Previously the filter only checked `is_locked`, then unconditionally overwrote `agents.current_task_id`. A busy Player would be silently yanked off whatever they were doing — same shape as the v0.3.6 raw-git-bypass problem at the auto-reassign layer. New `_has_active_task(slot)` helper joins agents → tasks and returns True only when the held task is non-archive.
+>   - **MEDIUM — Coach `## Unrecorded artifacts` rollup now cross-checks current DB state.** The rollup reads from the events table over 24h, but Coach may have already submitted via `coord_write_task_spec(on_behalf_of=...)` or `coord_submit_audit_report(on_behalf_of=...)` minutes earlier. Without the cross-check, Coach's next turn sees stale findings and re-attempts overrides (which then error). New `_spec_path_already_recorded(task_id)` and `_audit_report_path_already_recorded(task_id, report_path)` helpers ([server/agents.py](../server/agents.py)) drop stale findings.
+>   - **LOW-MEDIUM — rung 2 wake to Coach now uses `bypass_debounce=True`.** Previously dropped silently if Coach's debounce window was active for unrelated traffic. Rung 2 IS the escalation point; the per-rung idempotence (`stall_escalation_level`) means the next sweep wouldn't re-fire it, so a debounced wake = silent failure.
+>   - **LOW — rung 2 nudge text uses the rung-1 threshold minutes, not (age // 60).** The old wording said "didn't move on the 1-min nudge" at age=65min — divided-age math, nonsense. Now reads "didn't move on the {rung1_min}-min nudge" using `_stall_threshold_seconds()`.
+>   - **Tests:** 1152 → 1156 (+4 regressions: rung-3 success doesn't archive same sweep, rung-3 skips busy alternatives, rung-2 wake text uses threshold-min not divided-age, Coach rollup drops stale spec/audit findings after override).
+
+> **v0.3.8 (2026-05-05 flow continuity)** — recurring failure mode where a Player drops the ball (lost session, restarted runtime, missing coord_*) and the kanban sits silently waiting. The legacy single-fire stall + 24h re-alert chain looped back to "wake the same assignee, hope their session is healthy." When the session is gone, the loop is silent. Three additions, designed so the system *always* makes progress:
+>   - **Stall escalation ladder.** New `tasks.stall_escalation_level` column (INTEGER NOT NULL DEFAULT 0). The sweeper in [server/idle_poller.py](../server/idle_poller.py) now walks four rungs per stall, each per-task idempotent via the level column:
+>     - **rung 1 (30 min, env `HARNESS_KANBAN_STALL_SECONDS`):** nudge the current-stage assignee + emit `task_stage_stale` (legacy event preserved for back-compat).
+>     - **rung 2 (1 h, env `HARNESS_KANBAN_ESCALATE_COACH_SECONDS`):** emit `task_stall_persisting` routed to Coach + wake Coach with explicit "intervene before auto-action" framing naming the next deadline.
+>     - **rung 3 (2 h, env `HARNESS_KANBAN_ESCALATE_REASSIGN_SECONDS`):** auto-reassign to another eligible Player from the stage's `eligible_owners` (excluding the stuck owner + locked Players). Updates the role row's `owner` + (for executor) `tasks.owner` + `agents.current_task_id`. Emits `task_stall_auto_reassigned`, fires `task_role_stand_down` for the displaced owner, and re-uses `_wake_role_or_emit_needed` so the new owner gets the canonical role-entry wake. If no alternative is reachable, fires `human_attention` + `task_stall_no_alternative`.
+>     - **rung 4 (4 h, env `HARNESS_KANBAN_ESCALATE_ARCHIVE_SECONDS`):** auto-archive via direct UPDATE + `task_stage_changed{reason=auto_archive_stalled}` + `task_stall_auto_archived` + `human_attention`. Resets `stall_escalation_level = 0` and clears `stale_alert_at` so a re-opened task starts fresh.
+>     The level is reset to 0 on every code path that clears `stale_alert_at` (kanban subscriber `_transition`, `coord_update_task`, `coord_advance_task_stage`, `coord_assign_task`, all human-side stage endpoints — 14 sites). Default times match the user's halved schedule (was 1h / 2h / 4h / 8h in the original proposal). (§10.5, §17 stall handling)
+>   - **Reconciliation sweep.** New `reconciliation_sweep_once()` in [server/idle_poller.py](../server/idle_poller.py) runs as a sibling pass in the existing tick loop (alongside the per-Player wake + stall sweeper). Read-only: walks every non-archive task's folder on disk, diffs against `tasks.spec_path` / `task_role_assignments.report_path`. Emits `task_spec_unrecorded` when `<task_dir>/spec.md` exists but the kanban row has no spec_path; emits `task_audit_unrecorded` when `<task_dir>/audits/audit_<round>_<kind>.md` exists but no auditor role row records that path. Each finding routes to Coach with the `on_behalf_of` Coach-override tool call template baked in, so Coach can submit through normal channels without manually constructing the call. Per-finding TTL dedupe (default 1h, env `HARNESS_KANBAN_RECONCILE_TTL_SECONDS`) so Coach isn't spammed every 5min for the same artifact. Feature flag `HARNESS_KANBAN_RECONCILE_ENABLED` (default true). Catches the recurring p1 / p3 / p8 trace shape directly — Player wrote the work, kanban didn't notice. (§10.6 new)
+>   - **Kanban rollup folded into existing Coach tick.** No new tick — the existing `## Stalled tasks` block in `_build_coach_coordination_block` ([server/agents.py](../server/agents.py)) gets two upgrades: each row now labels its `[escalation: <rung>]` so Coach sees which auto-action is imminent (fresh / nudged / Coach-notified — auto-reassign next / auto-reassigned — auto-archive next / auto-archived); and a new `## Unrecorded artifacts on disk` block lists each reconciliation finding with the path + the suggested `coord_write_task_spec(on_behalf_of=...)` / `coord_submit_audit_report(on_behalf_of=...)` call. New helper `_build_unrecorded_artifacts_rows(project_id)` reads `task_spec_unrecorded` / `task_audit_unrecorded` events from the last 24h. (§17 Coach quality feedback)
+>   - **Tests:** 1137 → 1152 (+15 regressions: 7 in `test_stall_escalation_ladder.py` covering rung 1/2/3 reassign, rung 3 no-alt → human_attention, rung 4 archive + level reset, idempotence, progress-resets-level; 8 in `test_reconciliation_sweep.py` covering spec-unrecorded happy path + dedupe + recorded-path silence, audit-unrecorded happy path + recorded-path silence, malformed filename ignored, archived-task skip, feature flag).
+>   - **Closed v0.3.7 known gap (Coach archive):** rung 4 auto-archive does NOT yet stand-down the current assignee or block subsequent `coord_commit_push` against the archived task. Same applies to Coach-initiated archive via `coord_advance_task_stage`. Still a v0.3.9 candidate.
 
 > **v0.3.7 (2026-05-04 production trace 4, p8 misplaced-work incident)** — p8 wrote their implementation to `/workspaces/.project` (the shared seed checkout used to provision worktrees) instead of `/workspaces/p8/project` (their own per-slot worktree). `coord_commit_push` ran `git status` inside p8's worktree, saw a clean tree, returned `"nothing to commit (working tree clean)"` — opaque soft-OK that left the work stranded on a tree no branch belonged to. Two fixes:
 >   - **Misplaced-work detection in `coord_commit_push`.** When the slot's worktree is clean, the tool now peeks the shared `BASE_REPO_PATH` (`/workspaces/.project`) via `git status --porcelain` (15s timeout, scrubbed env). If the seed checkout is dirty, the tool returns a loud named error: "your worktree at X is clean, but the shared seed checkout at Y has uncommitted changes. The shared checkout is not yours to commit from — per-worktree isolation is mandatory." The error names both paths and gives the fix path (`cd <slot worktree> and re-apply`, or `git -C <base> stash && git -C <slot> stash pop`). When `BASE_REPO_PATH` doesn't exist or has no `.git` (e.g. deploy without seed checkout), the legacy soft-OK behavior is preserved. (§6.4)
@@ -637,35 +664,79 @@ For each (Player slot, sweep tick), skip if any of:
 
 Emits `idle_player_woken` events with `reason ∈ {'pool_task_available', 'pending_role_assignment'}`.
 
-### 10.5 Stall sweeper
+### 10.5 Stall sweeper — escalation ladder (v0.3.8)
 
-Sibling pass in the same tick loop. After the per-Player wake checks, runs a single SQL pass to find tasks that haven't progressed:
+Sibling pass in the same tick loop. After the per-Player wake checks, queries every non-archive, non-blocked task whose `last_stage_change_at` is older than the rung-1 threshold (default 30 min). For each result, walks the four-rung escalation ladder firing each rung the task hasn't yet crossed. Per-rung idempotence is guaranteed by `tasks.stall_escalation_level` (0=fresh, 1=nudged, 2=Coach-notified, 3=auto-reassigned, 4=auto-archived). The level is reset to 0 on every code path that clears `stale_alert_at` (kanban subscriber `_transition`, `coord_update_task`, `coord_advance_task_stage`, `coord_assign_task`, all human-side stage endpoints) — re-stalls start from the bottom.
 
-```sql
-SELECT id, status, last_stage_change_at, owner
-  FROM tasks
- WHERE status NOT IN ('archive')
-   AND blocked = 0
-   AND (julianday('now') - julianday(last_stage_change_at)) * 86400.0
-       > :stall_threshold_seconds
-```
+Resolution of the current-stage assignee, the legacy `task_stage_stale` event, the stage-aware nudge text, and the tool-not-visible escape paragraph are unchanged from v0.3.4 (see rung 1 below). What's new is the ladder structure: when Coach also goes silent, the system auto-reassigns at 2h and auto-archives at 4h instead of looping forever on "wake the same assignee."
 
-Per-task once-per-threshold-crossing semantics: `tasks.stale_alert_at` records when we last alerted; we only re-alert if `last_stage_change_at` advanced since then OR the threshold has been exceeded by ≥ 24 h (long-stuck escalation).
+#### Rung 1 — nudge the current-stage assignee (default 30 min)
+- Resolve the **current-stage assignee** by looking up the live `task_role_assignments` row whose `role` matches the task's `status` (e.g. `auditor_semantics` when `status='audit_semantics'`). This Player is the stall blocker. Falls back to `tasks.owner` only when no live row exists.
+- Emit `task_stage_stale` `{task_id, stage, age_seconds, owner: <stage_assignee>, task_executor: <tasks.owner>, eligible_owners, to: 'coach'}`. (Legacy event preserved for back-compat with existing consumers.)
+- Wake the stage assignee with the stage-aware nudge: planner→`coord_write_task_spec`, executor→`coord_commit_push`/`coord_complete_execution`, auditor→`coord_submit_audit_report` with the right `kind`, shipper→`coord_mark_shipped`. Nudge ends with the **tool-not-visible escape** + (v0.3.6) the **no-raw-shell** paragraph.
+- Stamp `stall_escalation_level = 1` + `stale_alert_at = now()`.
 
-For each stalled row:
+#### Rung 2 — Coach intervention call (default 1 h)
+- Emit `task_stall_persisting` `{task_id, stage, age_seconds, owner, task_executor, next_action: 'auto_reassign', next_action_in_min, to: 'coach'}`.
+- Wake Coach with: "Stall persisting on task X (stage Y, blocker Z). The Player didn't move on the N-min nudge. Auto-reassign fires in ~M min unless you intervene. Options: nudge them again (`coord_send_message`), reassign yourself (`coord_assign_*`), override (`coord_advance_task_stage`), or archive."
+- Stamp `stall_escalation_level = 2`.
 
-1. Resolve the **current-stage assignee** by looking up the live `task_role_assignments` row for the role that matches the task's current `status` (e.g. `auditor_semantics` when `status='audit_semantics'`). This Player is the stall blocker. (v0.3.4 fix — previously the sweeper used `tasks.owner` which is always the executor, so a stuck audit_semantics task would surface the executor as the blocker even though the auditor was the actual hold-up.)
-2. Emit `task_stage_stale` event: `{task_id, stage, age_seconds, owner: <stage_assignee>, task_executor: <tasks.owner>, eligible_owners, to: 'coach'}`. The legacy `owner` field is now the stage assignee; the original executor is preserved separately as `task_executor` for full context. Falls back to `tasks.owner` when no live role row exists for the stage (broken state — Coach should fix the trajectory).
-3. Update `tasks.stale_alert_at = now()`.
-4. Nudge the **stage assignee** (not always the executor) with `maybe_wake_agent(stage_assignee, ...)`. The nudge text is now stage-aware (v0.3.4): planner-stuck tasks get `coord_write_task_spec(task_id=..., body=...)`, executors get `coord_commit_push` / `coord_complete_execution`, auditors get `coord_submit_audit_report` with the right `kind`, shippers get `coord_mark_shipped`. Every nudge ends with the **tool-not-visible escape**: "if the named tool is NOT visible in your runtime, message Coach IMMEDIATELY via `coord_send_message`, DO NOT write the deliverable to disk and stop — the kanban will never see your work." This is the explicit fix for the v0.3.4 production trace where a Player wrote `audit_<round>_<kind>.md` to disk and stopped because they couldn't see `coord_submit_audit_report`.
+#### Rung 3 — auto-reassign (default 2 h)
+- Read the active role row's `eligible_owners`. Filter out the stuck owner + any locked Players. If at least one alternative remains, pick the first and:
+  - UPDATE the role row's `owner` + `claimed_at`.
+  - For executor: also update `tasks.owner` and swap `agents.current_task_id`.
+  - Emit `task_stall_auto_reassigned` `{task_id, stage, role, from_owner, to_owner, to: 'coach'}`.
+  - Call `_wake_role_or_emit_needed(task_id, role)` so the new owner gets the canonical role-entry wake (verify-first gate, named completion tool, etc.).
+  - Call `send_role_stand_down(displaced=[stuck_owner], new_owners=[new_owner])` so the stuck owner gets an explicit "stop work" message.
+- If no alternative is reachable (single eligible Player, all alternatives locked, no role row, etc.):
+  - Emit `task_stall_no_alternative` `{task_id, stage, reason, to: 'coach'}`.
+  - Emit `human_attention` `{subject, body naming the next-archive deadline, urgency: 'high'}`.
+- Stamp `stall_escalation_level = 3`.
 
-Failure isolation: per-task try/except.
+#### Rung 4 — auto-archive (default 4 h)
+- UPDATE `tasks SET status='archive', completed_at=now, archived_at=now, last_stage_change_at=now, stale_alert_at=NULL, stall_escalation_level=0`.
+- Release `agents.current_task_id` for the prior owner.
+- Emit `task_stage_changed{from=<stage>, to='archive', reason='auto_archive_stalled', note}`.
+- Emit `task_stall_auto_archived{task_id, stage_before, age_seconds, to: 'coach'}`.
+- Emit `human_attention{subject, body explaining the rung-by-rung path that led here, urgency: 'high'}`.
+- The `stall_escalation_level = 0` reset means a re-opened task starts the ladder fresh.
+
+Failure isolation: per-task + per-rung try/except. The level is stamped after each successful rung-fire so a crash mid-walk leaves coherent state — the next sweep picks up where it left off.
 
 | Env var | Default | Meaning |
 |---|---|---|
 | `HARNESS_KANBAN_STALL_ENABLED` | `true` | Master switch for the sweeper. |
-| `HARNESS_KANBAN_STALL_SECONDS` | `3600` | 1 h. Threshold beyond which a non-blocked, non-archive task is considered stalled. (v0.3.2 dropped from 4 h — too long for active sessions; a Player who silently fails to signal completion shouldn't sit half a workday before Coach notices.) |
-| `HARNESS_KANBAN_STALL_RE_ALERT_SECONDS` | `86400` | 24 h. After this much over-threshold, re-alert even though the task hasn't progressed (long-stuck escalation). |
+| `HARNESS_KANBAN_STALL_SECONDS` | `1800` | 30 min. Rung 1 — nudge the current-stage assignee. (v0.3.8 halved from 1h.) |
+| `HARNESS_KANBAN_ESCALATE_COACH_SECONDS` | `3600` | 1 h. Rung 2 — `task_stall_persisting` + Coach wake. |
+| `HARNESS_KANBAN_ESCALATE_REASSIGN_SECONDS` | `7200` | 2 h. Rung 3 — auto-reassign or `human_attention`. |
+| `HARNESS_KANBAN_ESCALATE_ARCHIVE_SECONDS` | `14400` | 4 h. Rung 4 — auto-archive + `human_attention`. |
+
+The legacy `HARNESS_KANBAN_STALL_REALERT_SECONDS` is unused in v0.3.8 (the ladder replaces single-fire-with-re-alert).
+
+### 10.6 Reconciliation sweep (v0.3.8)
+
+Sibling pass in the tick loop, after the stall ladder. Read-only — never mutates DB rows. Walks every non-archive task's folder on disk and emits structured events to Coach when an artifact exists but the kanban hasn't recorded it. Catches the recurring "Player did the work but the kanban didn't notice" failure mode that the p1 / p3 / p8 production traces all surfaced.
+
+Two checks per task:
+
+#### Spec unrecorded
+- `<project_paths(project_id).working>/tasks/<task_id>/spec.md` exists AND `tasks.spec_path` IS NULL.
+- Emits `task_spec_unrecorded` `{task_id, project_id, spec_path: <relative>, planner: <active_planner_owner>, to: 'coach'}`.
+- Coach's prompt rollup builds the suggested call `coord_write_task_spec(task_id=..., body=<paste>, on_behalf_of='<planner>')`.
+
+#### Audit unrecorded
+- `<task_dir>/audits/audit_<round>_<kind>.md` exists AND no `task_role_assignments` row for the task has `report_path = <relative_path>`.
+- Emits `task_audit_unrecorded` `{task_id, project_id, kind, round, report_path: <relative>, auditor: <active_auditor_owner>, to: 'coach'}`.
+- Coach's prompt rollup builds the suggested call `coord_submit_audit_report(task_id=..., kind=..., body=<paste>, verdict=..., on_behalf_of='<auditor>')`.
+
+Files that don't match the canonical `audit_<N>_<kind>.md` pattern (drafts, scratch notes, READMEs) are ignored — only `\d+` round + `syntax|semantics` kind triggers a finding.
+
+Per-finding TTL dedupe: `_reconcile_emitted: dict[str, str]` maps `<kind>:<project_id>:<task_id>[:round:audit_kind]` → ISO timestamp. Within `HARNESS_KANBAN_RECONCILE_TTL_SECONDS` (default 1h) of the last emit for a finding key, the sweep skips. Across process restarts the dedupe resets — humans probably want the reminder again after a deploy if the artifact still sits.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `HARNESS_KANBAN_RECONCILE_ENABLED` | `true` | Master switch for the sweep. |
+| `HARNESS_KANBAN_RECONCILE_TTL_SECONDS` | `3600` | 1 h. Per-finding TTL — Coach isn't spammed every 5 min for the same on-disk artifact. |
 
 ---
 
@@ -1028,11 +1099,33 @@ See §10.5. Sibling pass in `idle_poller.py`. Detects `last_stage_change_at` old
 
 ### 18.3 Coach's `## Stalled tasks` rollup
 
-Sibling to `## Active task health` in `_build_coach_coordination_block`. Lists every task where `stale_alert_at IS NOT NULL` AND `last_stage_change_at = stale_alert_at` (i.e., still stalled, not yet progressed).
+Sibling to `## Active task health` in `_build_coach_coordination_block`. Lists every task where `stale_alert_at IS NOT NULL` (i.e. the stall sweeper has fired at least once and the task hasn't progressed since).
 
-Format: `- t-... "<title>" — stage <stage>, owner <slot|pool: N|unassigned>, stale for <hours>h`.
+**v0.3.8 escalation label.** Each row carries `[escalation: <rung>]` so Coach sees which auto-action is imminent: `fresh` (no rung yet) / `nudged` (rung 1 fired) / `Coach-notified — auto-reassign next` (rung 2 fired) / `auto-reassigned — auto-archive next` (rung 3 fired) / `auto-archived` (rung 4 fired, terminal).
 
-Followed by the actionable pointer: "If a Player has gone silent, send them a `coord_send_message` nudge or reassign with `coord_assign_*`. If no one is assigned to this stage, fix the trajectory or use `coord_advance_task_stage` if you intended a different route."
+Format:
+```
+- t-... "<title>" — stage <stage>, blocker <slot> (executor <slot>), stale for <hours>h [escalation: <rung_label>]
+```
+
+Followed by: "If a Player has gone silent, send them a `coord_send_message` nudge or reassign with `coord_assign_*`. If no one is assigned to this stage, fix the trajectory. ESCALATION LADDER (v0.3.8): rung 1 nudge at 30min, rung 2 Coach call at 1h, rung 3 auto-reassign at 2h, rung 4 auto-archive at 4h. Intervene before the next rung fires — auto-actions are the safety net, not the plan."
+
+### 18.3a Coach's `## Unrecorded artifacts on disk` rollup (v0.3.8)
+
+Sibling to `## Stalled tasks`, fed by the reconciliation sweep (§10.6). Built by `_build_unrecorded_artifacts_rows(project_id)` ([server/agents.py](../server/agents.py)) — reads `task_spec_unrecorded` / `task_audit_unrecorded` events from the last 24h, deduped per (task, kind/round). Capped at 10 rows.
+
+Format:
+```
+- t-... (spec | audit_syntax | audit_semantics) — path projects/.../spec.md, owner p5
+
+Suggested calls (Coach picks the right one and pastes the body from disk):
+  - coord_write_task_spec(task_id='t-...', body=<paste from disk>, on_behalf_of='p5')
+  - coord_submit_audit_report(task_id='t-...', kind='semantics', body=<paste from disk>, verdict='pass'|'fail', on_behalf_of='p3')
+```
+
+Followed by: "If the file is junk / superseded, ignore it — the reconciliation finding will re-emit in 1h until the kanban records something or the file is removed."
+
+This block addresses the recurring "Player did the work but the kanban didn't notice" failure mode — Coach sees the artifact path AND the exact override call to make in one place, no construction overhead.
 
 ### 18.4 `GET /api/tasks/flow_health` endpoint
 

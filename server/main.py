@@ -3640,7 +3640,7 @@ async def cancel_task_from_human(task_id: str) -> dict[str, Any]:
         await c.execute(
             "UPDATE tasks SET status = 'archive', "
             "completed_at = ?, archived_at = ?, cancelled_at = ?, "
-            "last_stage_change_at = ?, stale_alert_at = NULL "
+            "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
             "WHERE id = ? AND project_id = ?",
             (now, now, now, now, task_id, project_id),
         )
@@ -3939,7 +3939,7 @@ async def post_task_stage(
             await c.execute(
                 "UPDATE tasks SET status = 'archive', "
                 "completed_at = ?, archived_at = ?, "
-                "last_stage_change_at = ?, stale_alert_at = NULL "
+                "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
                 "WHERE id = ? AND project_id = ?",
                 (now, now, now, task_id, project_id),
             )
@@ -3952,7 +3952,7 @@ async def post_task_stage(
         else:
             await c.execute(
                 "UPDATE tasks SET status = ?, "
-                "last_stage_change_at = ?, stale_alert_at = NULL "
+                "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
                 "WHERE id = ? AND project_id = ?",
                 (req.stage, now, task_id, project_id),
             )

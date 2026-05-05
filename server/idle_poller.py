@@ -103,28 +103,60 @@ def _flag_enabled() -> bool:
 
 # Stall sweeper (Docs/kanban-specs.md §10.5). Sibling pass in this
 # tick loop — detects tasks whose `last_stage_change_at` is older than
-# `HARNESS_KANBAN_STALL_SECONDS` and emits one `task_stage_stale` per
-# threshold-crossing (gated by `tasks.stale_alert_at`).
+# `HARNESS_KANBAN_STALL_SECONDS` and walks the escalation ladder
+# (v0.3.8): rung 1 (nudge assignee) → rung 2 (notify Coach) → rung 3
+# (auto-reassign or human_attention) → rung 4 (auto-archive +
+# human_attention). `tasks.stall_escalation_level` records which rung
+# has been fired so each rung is idempotent across ticks.
 def _stall_threshold_seconds() -> int:
-    # v0.3.2 audit-fix (kanban-flow gap 3): default lowered from 4h
-    # to 1h. The 4h default was too long for active sessions — a
-    # Player who silently fails to signal completion shouldn't sit
-    # for half a workday before Coach sees the stall.
-    raw = os.environ.get("HARNESS_KANBAN_STALL_SECONDS", "3600").strip()
+    """Rung 1 — nudge the current-stage assignee. Default 30min
+    (v0.3.8, halved from 1h). The original 4h default was too long
+    for active sessions; the 1h default still let the kanban sit
+    silently for an hour before Coach saw anything."""
+    raw = os.environ.get("HARNESS_KANBAN_STALL_SECONDS", "1800").strip()
+    try:
+        return max(60, int(raw))
+    except ValueError:
+        return 1800
+
+
+def _escalate_coach_seconds() -> int:
+    """Rung 2 — notify Coach with a 'stall persisting' event so Coach
+    intervenes (reassign / advance / archive) before the auto-action
+    rungs fire. Default 1h."""
+    raw = os.environ.get(
+        "HARNESS_KANBAN_ESCALATE_COACH_SECONDS", "3600"
+    ).strip()
     try:
         return max(60, int(raw))
     except ValueError:
         return 3600
 
 
-def _stall_re_alert_seconds() -> int:
-    """Long-stuck escalation: re-fire if the task has been stalled for
-    this much longer than the threshold without progressing."""
-    raw = os.environ.get("HARNESS_KANBAN_STALL_REALERT_SECONDS", "86400").strip()
+def _escalate_reassign_seconds() -> int:
+    """Rung 3 — auto-reassign to another eligible Player from the
+    trajectory's `to` list, or fire human_attention if no
+    alternative exists. Default 2h."""
+    raw = os.environ.get(
+        "HARNESS_KANBAN_ESCALATE_REASSIGN_SECONDS", "7200"
+    ).strip()
     try:
         return max(60, int(raw))
     except ValueError:
-        return 86400
+        return 7200
+
+
+def _escalate_archive_seconds() -> int:
+    """Rung 4 — auto-archive with note + human_attention. The system
+    always makes some progress; it never sits silently waiting for an
+    assignee who isn't coming back. Default 4h."""
+    raw = os.environ.get(
+        "HARNESS_KANBAN_ESCALATE_ARCHIVE_SECONDS", "14400"
+    ).strip()
+    try:
+        return max(60, int(raw))
+    except ValueError:
+        return 14400
 
 
 def _stall_flag_enabled() -> bool:
@@ -132,6 +164,21 @@ def _stall_flag_enabled() -> bool:
         "HARNESS_KANBAN_STALL_ENABLED", "true"
     ).strip().lower()
     return raw not in ("0", "false", "no", "off")
+
+
+def _stall_target_level(age_seconds: int) -> int:
+    """Compute the target escalation rung for a stalled task at this
+    age. Rung 0 = no action. Walks the ladder thresholds in order.
+    """
+    if age_seconds >= _escalate_archive_seconds():
+        return 4
+    if age_seconds >= _escalate_reassign_seconds():
+        return 3
+    if age_seconds >= _escalate_coach_seconds():
+        return 2
+    if age_seconds >= _stall_threshold_seconds():
+        return 1
+    return 0
 
 
 # ---------------------------------------------------------------- state
@@ -208,9 +255,9 @@ async def _run() -> None:
 
 async def sweep_once() -> int:
     """Run a single sweep. Returns the number of wake-up calls made
-    (player-side; the stall sweeper's emits aren't counted here).
-    Exposed for tests so they can drive the loop deterministically
-    instead of waiting for the asyncio sleep cycle."""
+    (player-side; the stall sweeper's + reconciliation's emits aren't
+    counted here). Exposed for tests so they can drive the loop
+    deterministically instead of waiting for the asyncio sleep cycle."""
     woken = 0
     for slot in PLAYER_SLOTS:
         try:
@@ -227,32 +274,59 @@ async def sweep_once() -> int:
         await stall_sweep_once()
     except Exception:
         logger.exception("idle_poller: stall sweep crashed")
+    # Reconciliation sweep (v0.3.8): catch the "Player did the work
+    # but the kanban didn't notice" failure mode. Read-only — emits
+    # events to Coach but never mutates DB rows itself.
+    try:
+        await reconciliation_sweep_once()
+    except Exception:
+        logger.exception("idle_poller: reconciliation sweep crashed")
     return woken
 
 
 async def stall_sweep_once() -> int:
-    """Find non-archive, non-blocked tasks whose `last_stage_change_at`
-    is older than `HARNESS_KANBAN_STALL_SECONDS`. Emit
-    `task_stage_stale` once per (task, threshold-crossing). Returns
-    the number of tasks alerted.
+    """Walk the v0.3.8 stall-escalation ladder for every non-archive,
+    non-blocked task whose `last_stage_change_at` exceeds the rung-1
+    threshold.
 
-    Per-task once-per-crossing semantics: `tasks.stale_alert_at` is
-    stamped when we alert. We only re-alert if `last_stage_change_at`
-    advanced since then (handled by the kanban subscriber's
-    `_transition`, which clears `stale_alert_at`) OR the threshold has
-    been exceeded by `HARNESS_KANBAN_STALL_REALERT_SECONDS` without
-    progress (long-stuck escalation)."""
+    Ladder (env-overridable):
+      rung 1 — `_stall_threshold_seconds()`        default 30min
+        Nudge the current-stage assignee + emit `task_stage_stale`
+        routed to Coach (legacy event preserved for back-compat).
+      rung 2 — `_escalate_coach_seconds()`         default 1h
+        Emit `task_stall_persisting` and wake Coach with an explicit
+        "intervene before auto-action" message.
+      rung 3 — `_escalate_reassign_seconds()`      default 2h
+        Try auto-reassign to another eligible Player from the
+        stage's `eligible_owners` (excluding the current owner +
+        locked Players). If no alternative exists, fire
+        `human_attention`. Emits `task_stall_auto_reassigned` or
+        `task_stall_no_alternative`.
+      rung 4 — `_escalate_archive_seconds()`       default 4h
+        Auto-archive via `_transition` + fire `human_attention`.
+        Emits `task_stall_auto_archived`.
+
+    Per-rung idempotence: `tasks.stall_escalation_level` records the
+    last fired rung. We walk current_level+1 → target_level firing
+    each in order, stamping the level after each successful action so
+    a crash mid-walk leaves coherent state. The legacy
+    `tasks.stale_alert_at` is also stamped on every rung-fire (used
+    by `_build_stalled_tasks_rows` for the Coach prompt rollup;
+    cleared together with the level when a stage advances).
+
+    Returns the number of tasks where AT LEAST ONE rung fired this
+    sweep (matches the legacy "alerted count" semantics)."""
     if not _stall_flag_enabled():
         return 0
-    threshold = _stall_threshold_seconds()
-    re_alert_after = _stall_re_alert_seconds()
+    rung1_threshold = _stall_threshold_seconds()
 
     c = await configured_conn()
     try:
         cur = await c.execute(
             """
-            SELECT id, status, owner, project_id,
-                   last_stage_change_at, stale_alert_at
+            SELECT id, status, owner, project_id, title,
+                   last_stage_change_at, stale_alert_at,
+                   stall_escalation_level
               FROM tasks
              WHERE status NOT IN ('archive')
                AND blocked = 0
@@ -260,7 +334,7 @@ async def stall_sweep_once() -> int:
                AND (julianday('now') - julianday(last_stage_change_at))
                    * 86400.0 > ?
             """,
-            (threshold,),
+            (rung1_threshold,),
         )
         rows = [dict(r) for r in await cur.fetchall()]
     finally:
@@ -271,40 +345,31 @@ async def stall_sweep_once() -> int:
 
     now_dt = datetime.now(timezone.utc)
     now_iso = now_dt.isoformat()
-    alerted = 0
+    progressed = 0
     for r in rows:
         try:
             last_change = _parse_iso(r.get("last_stage_change_at"))
-            stale_alert = _parse_iso(r.get("stale_alert_at"))
+            if last_change is None:
+                continue
             age_seconds = int((now_dt - last_change).total_seconds())
-            # Suppress re-alert if we already alerted at the current
-            # last_stage_change_at value, unless the long-stuck escalation
-            # window has elapsed since the last alert.
-            should_alert = True
-            if stale_alert is not None:
-                # Already alerted on the current crossing.
-                if age_seconds < threshold + re_alert_after:
-                    should_alert = False
-            if not should_alert:
+            current_level = int(r.get("stall_escalation_level") or 0)
+            target_level = _stall_target_level(age_seconds)
+            if target_level <= current_level:
                 continue
 
-            # Pull the active role-row for the CURRENT stage. The
-            # stall belongs to that role's assignee (e.g. the
-            # auditor when status='audit_semantics'), NOT to
-            # tasks.owner, which is always the executor. v0.3.4
-            # bug-fix: previously the event + nudge surfaced
-            # tasks.owner regardless of stage, so Coach saw
-            # "no activity from p8" (executor) when the actual
-            # blocker was p3 (semantic auditor).
+            # Resolve the active role row for the CURRENT stage so
+            # we ladder-fire against the actual blocker, not always
+            # tasks.owner (v0.3.4 bug-fix preserved).
             stage = r["status"]
             role = _role_for_stage(stage)
             eligible: list[str] = []
             stage_owner: str | None = None
+            role_row_id: int | None = None
             if role:
                 c = await configured_conn()
                 try:
                     cur = await c.execute(
-                        "SELECT eligible_owners, owner FROM "
+                        "SELECT id, eligible_owners, owner FROM "
                         "task_role_assignments WHERE task_id = ? "
                         "AND role = ? AND completed_at IS NULL "
                         "AND superseded_by IS NULL "
@@ -316,6 +381,7 @@ async def stall_sweep_once() -> int:
                     await c.close()
                 if rrow:
                     rd = dict(rrow)
+                    role_row_id = rd.get("id")
                     stage_owner = rd.get("owner")
                     try:
                         parsed = json.loads(rd.get("eligible_owners") or "[]")
@@ -323,67 +389,480 @@ async def stall_sweep_once() -> int:
                             eligible = [str(x) for x in parsed]
                     except Exception:
                         eligible = []
-
-            # The stall's responsible Player is the current stage's
-            # assignee. Fall back to tasks.owner only when no role
-            # row exists for the stage (broken state — Coach should
-            # be the one to fix it, so we still publish to coach).
             stall_owner = stage_owner or r.get("owner")
 
-            await bus.publish({
-                "ts": now_iso,
-                "agent_id": "system",
-                "type": "task_stage_stale",
-                "task_id": r["id"],
-                "stage": stage,
-                "age_seconds": age_seconds,
-                "owner": stall_owner,
-                # Keep tasks.owner separately so Coach can still see
-                # "this is the executor's task overall" even when the
-                # blocker is the auditor.
-                "task_executor": r.get("owner"),
-                "eligible_owners": eligible,
-                "to": "coach",
-            })
-            # Stamp stale_alert_at so we don't re-fire until either the
-            # task progresses (subscriber clears the column) or the
-            # long-stuck escalation window passes.
-            c = await configured_conn()
-            try:
-                await c.execute(
-                    "UPDATE tasks SET stale_alert_at = ? WHERE id = ?",
-                    (now_iso, r["id"]),
+            # Walk every unfired rung up to the target. Each rung
+            # commits its level before the next runs so a crash
+            # leaves coherent state.
+            for rung in range(current_level + 1, target_level + 1):
+                if rung == 1:
+                    await _fire_rung_1(
+                        task=r, stage=stage, age_seconds=age_seconds,
+                        stall_owner=stall_owner, eligible=eligible,
+                        now_iso=now_iso,
+                    )
+                elif rung == 2:
+                    await _fire_rung_2(
+                        task=r, stage=stage, age_seconds=age_seconds,
+                        stall_owner=stall_owner, now_iso=now_iso,
+                    )
+                elif rung == 3:
+                    reassigned = await _fire_rung_3(
+                        task=r, stage=stage, role=role,
+                        role_row_id=role_row_id, eligible=eligible,
+                        stall_owner=stall_owner, now_iso=now_iso,
+                    )
+                    if reassigned:
+                        # AUDIT FIX: rung 3 success resets the
+                        # task's stall window inside _fire_rung_3
+                        # (last_stage_change_at = now,
+                        # stall_escalation_level = 0). Break out so
+                        # rung 4 doesn't fire on the same sweep when
+                        # target_level was 4 — that would archive
+                        # the freshly-reassigned task seconds after
+                        # handoff, defeating the whole rung.
+                        break
+                    # No alternative was reachable — stamp level=3 so
+                    # the next sweep walks rung 4 if still stuck.
+                    await _stamp_escalation_level(
+                        task_id=r["id"], level=rung, now_iso=now_iso,
+                    )
+                    continue
+                elif rung == 4:
+                    await _fire_rung_4(
+                        task=r, stage=stage, age_seconds=age_seconds,
+                        now_iso=now_iso,
+                    )
+                    # Rung 4 archives the task and resets the level
+                    # to 0 itself (so a re-opened task starts fresh).
+                    # Skip the post-stamp — it would overwrite that.
+                    break
+                # Stamp progress after each rung so per-rung
+                # idempotence holds across crashes.
+                await _stamp_escalation_level(
+                    task_id=r["id"], level=rung, now_iso=now_iso,
                 )
-                await c.commit()
-            finally:
-                await c.close()
-            # Nudge the CURRENT stage's assignee (not always the
-            # executor) so the right Player gets the wake. v0.3.4
-            # bug-fix: the previous version always nudged
-            # tasks.owner, so a stuck audit_semantics task woke the
-            # executor instead of the auditor — who then had no
-            # actionable next step.
-            wake_target = stage_owner or r.get("owner")
-            if wake_target:
-                try:
-                    from server.agents import maybe_wake_agent
-                    age_min = max(1, age_seconds // 60)
-                    nudge = _stall_nudge_for_stage(
-                        task_id=r["id"],
-                        stage=stage,
-                        age_min=age_min,
-                    )
-                    await maybe_wake_agent(
-                        wake_target, nudge, bypass_debounce=False,
-                    )
-                except Exception:
-                    pass
-            alerted += 1
+            progressed += 1
         except Exception:
             logger.exception(
-                "idle_poller: stall alert failed for task %s", r.get("id")
+                "idle_poller: stall ladder failed for task %s", r.get("id")
             )
-    return alerted
+    return progressed
+
+
+async def _stamp_escalation_level(
+    *, task_id: str, level: int, now_iso: str,
+) -> None:
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE tasks SET stall_escalation_level = ?, "
+            "stale_alert_at = ? WHERE id = ?",
+            (level, now_iso, task_id),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+
+async def _fire_rung_1(
+    *, task: dict, stage: str, age_seconds: int,
+    stall_owner: str | None, eligible: list[str], now_iso: str,
+) -> None:
+    """Rung 1 — nudge the current-stage assignee + emit
+    `task_stage_stale`. Same as the v0.3.4 behavior, just at 30min
+    instead of 1h."""
+    await bus.publish({
+        "ts": now_iso,
+        "agent_id": "system",
+        "type": "task_stage_stale",
+        "task_id": task["id"],
+        "stage": stage,
+        "age_seconds": age_seconds,
+        "owner": stall_owner,
+        "task_executor": task.get("owner"),
+        "eligible_owners": eligible,
+        "to": "coach",
+    })
+    if stall_owner:
+        try:
+            from server.agents import maybe_wake_agent
+            age_min = max(1, age_seconds // 60)
+            nudge = _stall_nudge_for_stage(
+                task_id=task["id"], stage=stage, age_min=age_min,
+            )
+            await maybe_wake_agent(
+                stall_owner, nudge, bypass_debounce=False,
+            )
+        except Exception:
+            pass
+
+
+async def _fire_rung_2(
+    *, task: dict, stage: str, age_seconds: int,
+    stall_owner: str | None, now_iso: str,
+) -> None:
+    """Rung 2 — Coach intervention call. Different from rung 1's
+    `task_stage_stale` (which can be conflated with first-time
+    stalls): this event names the persistence and the next auto-
+    action so Coach knows the deadline."""
+    age_min = max(1, age_seconds // 60)
+    rung1_min = max(1, _stall_threshold_seconds() // 60)
+    next_reassign_min = max(0, _escalate_reassign_seconds() // 60 - age_min)
+    await bus.publish({
+        "ts": now_iso,
+        "agent_id": "system",
+        "type": "task_stall_persisting",
+        "task_id": task["id"],
+        "stage": stage,
+        "age_seconds": age_seconds,
+        "owner": stall_owner,
+        "task_executor": task.get("owner"),
+        "next_action": "auto_reassign",
+        "next_action_in_min": next_reassign_min,
+        "to": "coach",
+    })
+    try:
+        from server.agents import maybe_wake_agent
+        body = (
+            f"Stall persisting on task {task['id']!r} (stage {stage}, "
+            f"blocker {stall_owner or '(unassigned)'}). The Player "
+            f"didn't move on the {rung1_min}-min nudge. Auto-"
+            f"reassign fires in ~{next_reassign_min} min unless you "
+            f"intervene. Options: nudge them again "
+            f"(coord_send_message), reassign yourself (coord_assign_*), "
+            f"override (coord_advance_task_stage), or archive "
+            f"(coord_advance_task_stage stage='archive')."
+        )
+        # AUDIT FIX: bypass debounce so the escalation reaches Coach
+        # even if Coach's wake debounce window is currently active
+        # (recently woke for unrelated traffic). Rung 2 IS the
+        # escalation point — silently dropping it because Coach was
+        # busy 60s ago defeats the whole rung.
+        await maybe_wake_agent("coach", body, bypass_debounce=True)
+    except Exception:
+        pass
+
+
+async def _fire_rung_3(
+    *, task: dict, stage: str, role: str | None,
+    role_row_id: int | None, eligible: list[str],
+    stall_owner: str | None, now_iso: str,
+) -> bool:
+    """Rung 3 — auto-reassign to an alternative Player from the
+    stage's eligible_owners, excluding the current owner + locked
+    Players + Players already busy on another task. If no
+    alternative is reachable, fire `human_attention` so the human
+    can step in.
+
+    Returns True when the auto-reassign succeeded (caller should
+    `break` out of the rung walk because the task got a fresh
+    window and rung 4 must NOT fire on the same sweep). Returns
+    False when no_alternative fallback fired (caller should stamp
+    level=3 and let rung 4 fire on a later sweep if still stuck).
+
+    Auto-reassign is intentionally narrow: it only swaps `owner` on
+    the existing role row (not a full supersede), and only when
+    `eligible_owners` lists at least one alternative. Coach can
+    rewrite the trajectory or pick a different Player at any rung;
+    this rung is the fallback when Coach also went silent.
+    """
+    if not role or not role_row_id or not stall_owner:
+        await _fire_human_attention_no_alt(
+            task=task, stage=stage, reason="no_role_row", now_iso=now_iso,
+        )
+        return False
+    alternatives: list[str] = []
+    for slot in eligible:
+        if slot == stall_owner:
+            continue
+        try:
+            if await _is_locked(slot):
+                continue
+            # AUDIT FIX: also skip Players who are already on
+            # another task. Without this, the auto-reassign yanks
+            # them off whatever they were doing — same shape as
+            # the v0.3.6 reassignment-without-stand-down problem.
+            if await _has_active_task(slot):
+                continue
+        except Exception:
+            continue
+        alternatives.append(slot)
+    if not alternatives:
+        await _fire_human_attention_no_alt(
+            task=task, stage=stage, reason="no_alternative",
+            now_iso=now_iso,
+        )
+        return False
+    new_owner = alternatives[0]
+    c = await configured_conn()
+    try:
+        # AUDIT-2 FIX: guard the role-row UPDATE against concurrent
+        # supersede. If Coach assigned a new auditor between the
+        # main loop's read and this UPDATE, our `role_row_id` may
+        # already be `completed_at IS NOT NULL` or `superseded_by
+        # IS NOT NULL`. Without the guard we'd write owner to an
+        # inactive row + emit a misleading auto_reassigned event.
+        # On race-loss (rowcount == 0), abort and fire no_alt so
+        # the next sweep can re-evaluate against the fresh state.
+        cur = await c.execute(
+            "UPDATE task_role_assignments "
+            "SET owner = ?, claimed_at = ? "
+            "WHERE id = ? "
+            "AND completed_at IS NULL AND superseded_by IS NULL",
+            (new_owner, now_iso, role_row_id),
+        )
+        if cur.rowcount == 0:
+            await c.commit()
+            await c.close()
+            await _fire_human_attention_no_alt(
+                task=task, stage=stage, reason="role_row_changed",
+                now_iso=now_iso,
+            )
+            return False
+        if role == "executor":
+            await c.execute(
+                "UPDATE tasks SET owner = ? WHERE id = ?",
+                (new_owner, task["id"]),
+            )
+            await c.execute(
+                "UPDATE agents SET current_task_id = NULL "
+                "WHERE id = ? AND current_task_id = ?",
+                (stall_owner, task["id"]),
+            )
+            await c.execute(
+                "UPDATE agents SET current_task_id = ? WHERE id = ?",
+                (task["id"], new_owner),
+            )
+        # AUDIT FIX (v0.3.8.1): reset the stall window so the new
+        # owner gets a fresh ladder. Without this, the next sweep
+        # would see age > rung-4 threshold, fire rung 4, and
+        # archive the task seconds after the handoff.
+        await c.execute(
+            "UPDATE tasks SET last_stage_change_at = ?, "
+            "stale_alert_at = NULL, stall_escalation_level = 0 "
+            "WHERE id = ?",
+            (now_iso, task["id"]),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    await bus.publish({
+        "ts": now_iso,
+        "agent_id": "system",
+        "type": "task_stall_auto_reassigned",
+        "task_id": task["id"],
+        "stage": stage,
+        "role": role,
+        "from_owner": stall_owner,
+        "to_owner": new_owner,
+        "to": "coach",
+    })
+    # Wake the new owner with the same role-entry framing the
+    # subscriber would use on a normal stage entry.
+    try:
+        from server.kanban import _wake_role_or_emit_needed
+        await _wake_role_or_emit_needed(task_id=task["id"], role=role)
+    except Exception:
+        pass
+    # Also stand-down the old owner so they stop work cleanly.
+    try:
+        from server.kanban import send_role_stand_down
+        await send_role_stand_down(
+            task_id=task["id"], role=role,
+            displaced=[stall_owner], new_owners=[new_owner],
+        )
+    except Exception:
+        pass
+    return True
+
+
+async def _has_active_task(slot: str) -> bool:
+    """True when `slot`'s `agents.current_task_id` points at a
+    non-archive task. Used by `_fire_rung_3` to skip Players who'd
+    be yanked off their current work by an auto-reassign."""
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT a.current_task_id, t.status FROM agents a "
+            "LEFT JOIN tasks t ON t.id = a.current_task_id "
+            "WHERE a.id = ?",
+            (slot,),
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    if not row:
+        return False
+    d = dict(row)
+    if not d.get("current_task_id"):
+        return False
+    # If the row joined a task and it's archived, treat as free.
+    status = d.get("status")
+    if status == "archive":
+        return False
+    return True
+
+
+async def _fire_human_attention_no_alt(
+    *, task: dict, stage: str, reason: str, now_iso: str,
+) -> None:
+    """Rung 3 fallback when auto-reassign isn't viable: fire
+    `human_attention` (surfaces in EnvPane + Telegram) so the human
+    can intervene before rung 4 archives the task."""
+    next_archive_min = max(
+        0,
+        (_escalate_archive_seconds() - _escalate_reassign_seconds()) // 60,
+    )
+    await bus.publish({
+        "ts": now_iso,
+        "agent_id": "system",
+        "type": "human_attention",
+        "subject": f"Task {task['id']} stalled, no alternative assignee",
+        "body": (
+            f"Task {task['id']!r} (stage {stage}) is past the "
+            f"auto-reassign window but no alternative Player is "
+            f"available (reason: {reason}). Auto-archive will fire "
+            f"in ~{next_archive_min} min unless you intervene."
+        ),
+        "urgency": "high",
+        "to": "human",
+    })
+    await bus.publish({
+        "ts": now_iso,
+        "agent_id": "system",
+        "type": "task_stall_no_alternative",
+        "task_id": task["id"],
+        "stage": stage,
+        "reason": reason,
+        "to": "coach",
+    })
+
+
+async def _fire_rung_4(
+    *, task: dict, stage: str, age_seconds: int, now_iso: str,
+) -> None:
+    """Rung 4 — auto-archive past the deadline. The system always
+    makes some progress; it never sits silently waiting. Fires
+    `human_attention` so the human knows a task was sacrificed.
+
+    AUDIT-2 FIX: also (a) mark every active role row on the task as
+    completed_at = now (otherwise they're orphaned — visible to
+    queries that look at "any active row" without a status filter),
+    and (b) fire stand-down to the current-stage assignee so a
+    Player who's actively working when rung 4 hits gets an explicit
+    stop-work signal instead of silently working into the void.
+    """
+    age_hours = max(1, age_seconds // 3600)
+    # Pre-read: who is the current-stage assignee (so we can fire
+    # stand-down after commit) and what role rows are about to be
+    # orphaned.
+    role = _role_for_stage(stage)
+    stage_owner: str | None = None
+    if role:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT owner FROM task_role_assignments "
+                "WHERE task_id = ? AND role = ? "
+                "AND completed_at IS NULL AND superseded_by IS NULL "
+                "ORDER BY assigned_at DESC LIMIT 1",
+                (task["id"], role),
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+        if row:
+            stage_owner = dict(row).get("owner")
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE tasks SET status = 'archive', "
+            "completed_at = ?, archived_at = ?, "
+            "last_stage_change_at = ?, "
+            "stale_alert_at = NULL, stall_escalation_level = 0 "
+            "WHERE id = ? AND status != 'archive'",
+            (now_iso, now_iso, now_iso, task["id"]),
+        )
+        # AUDIT-2 FIX: close every active role row so they don't
+        # show up as "still active" in subsequent queries that
+        # don't also filter on tasks.status.
+        await c.execute(
+            "UPDATE task_role_assignments SET completed_at = ? "
+            "WHERE task_id = ? "
+            "AND completed_at IS NULL AND superseded_by IS NULL",
+            (now_iso, task["id"]),
+        )
+        # Release any agent that was holding it.
+        owner = task.get("owner")
+        if owner:
+            await c.execute(
+                "UPDATE agents SET current_task_id = NULL "
+                "WHERE id = ? AND current_task_id = ?",
+                (owner, task["id"]),
+            )
+        await c.commit()
+    finally:
+        await c.close()
+    # AUDIT-2 FIX: stand-down the current-stage assignee with the
+    # canonical "STOP work" wake so a Player who's actively
+    # working at rung-4 fire-time gets an explicit stop signal.
+    if stage_owner and role:
+        try:
+            from server.kanban import send_role_stand_down
+            await send_role_stand_down(
+                task_id=task["id"], role=role,
+                displaced=[stage_owner], new_owners=[],
+            )
+        except Exception:
+            pass
+    await bus.publish({
+        "ts": now_iso,
+        "agent_id": "system",
+        "type": "task_stage_changed",
+        "task_id": task["id"],
+        "from": stage,
+        "to": "archive",
+        "reason": "auto_archive_stalled",
+        "note": f"auto-archived after {age_hours}h with no progress",
+        "owner": task.get("owner"),
+    })
+    await bus.publish({
+        "ts": now_iso,
+        "agent_id": "system",
+        "type": "task_stall_auto_archived",
+        "task_id": task["id"],
+        "stage_before": stage,
+        "age_seconds": age_seconds,
+        "to": "coach",
+    })
+    await bus.publish({
+        "ts": now_iso,
+        "agent_id": "system",
+        "type": "human_attention",
+        "subject": f"Task {task['id']} auto-archived (stalled {age_hours}h)",
+        "body": (
+            f"Task {task['id']!r} ({(task.get('title') or '')[:80]}) "
+            f"was auto-archived after sitting in stage {stage} for "
+            f"{age_hours}h past every nudge + Coach escalation + "
+            f"reassignment attempt. Re-create the task if the work "
+            f"still matters."
+        ),
+        "urgency": "high",
+        "to": "human",
+    })
+
+
+async def _is_locked(slot: str) -> bool:
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT locked FROM agents WHERE id = ?", (slot,)
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    return bool(dict(row).get("locked")) if row else False
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -615,10 +1094,268 @@ async def _has_available_work(slot: str) -> tuple[str, str | None] | None:
     return None
 
 
+# ---------------------------------------------------------------- reconciliation
+#
+# v0.3.8 reconciliation sweep — catches the "Player did the work but
+# the kanban didn't notice" failure mode (the recurring p1/p3/p8
+# trace shape). Read-only: walks each non-archive task's folder on
+# disk, diffs against `tasks.spec_path` / `task_role_assignments.report_path`,
+# emits a structured event to Coach when an artifact is on disk but
+# unrecorded. NEVER mutates DB rows itself — Coach uses the existing
+# `coord_write_task_spec(on_behalf_of=...)` /
+# `coord_submit_audit_report(on_behalf_of=...)` overrides to commit
+# the artifact through normal channels.
+#
+# Per-finding dedupe: in-memory map (sha256 of finding key → last
+# emit ts), TTL = `HARNESS_KANBAN_RECONCILE_TTL_SECONDS` (default 1h).
+# Restarts re-emit, which is the right behavior — humans probably
+# want the reminder again after a deploy if the artifact still sits.
+
+_reconcile_emitted: dict[str, str] = {}  # finding_key → ISO timestamp
+
+
+def _reconcile_flag_enabled() -> bool:
+    raw = os.environ.get(
+        "HARNESS_KANBAN_RECONCILE_ENABLED", "true"
+    ).strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _reconcile_ttl_seconds() -> int:
+    raw = os.environ.get(
+        "HARNESS_KANBAN_RECONCILE_TTL_SECONDS", "3600"
+    ).strip()
+    try:
+        return max(60, int(raw))
+    except ValueError:
+        return 3600
+
+
+def _reconcile_should_emit(key: str, now_dt: datetime) -> bool:
+    """Per-finding TTL dedupe so we don't spam Coach every 5min for
+    the same disk artifact. Returns True + stamps the timestamp when
+    the finding is fresh; False when within TTL."""
+    ttl = _reconcile_ttl_seconds()
+    last = _reconcile_emitted.get(key)
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            if (now_dt - last_dt).total_seconds() < ttl:
+                return False
+        except Exception:
+            pass
+    _reconcile_emitted[key] = now_dt.isoformat()
+    return True
+
+
+async def reconciliation_sweep_once() -> int:
+    """Walk every non-archive task; for each, check disk for spec.md
+    and audits/audit_*.md; emit a structured event to Coach when the
+    artifact exists but the kanban hasn't recorded it. Returns the
+    number of fresh findings emitted this sweep.
+
+    Spec check:
+      `<task_dir>/spec.md` exists AND `tasks.spec_path` IS NULL
+        → emit `task_spec_unrecorded{task_id, spec_path, planner?}`
+
+    Audit check:
+      `<task_dir>/audits/audit_<round>_<kind>.md` exists AND no
+      `task_role_assignments` row for the matching kind has
+      `report_path = <relative_path>`
+        → emit `task_audit_unrecorded{task_id, kind, round,
+          report_path, auditor?}`
+    """
+    if not _reconcile_flag_enabled():
+        return 0
+    from pathlib import Path
+    from server.tasks import (
+        audit_report_filename,
+        audit_report_relative_path,
+        is_valid_task_id,
+        spec_path as _spec_path_helper,
+        spec_relative_path,
+    )
+
+    # Pull every active task. Cap at 200 — a project with more open
+    # tasks than that has bigger problems than reconciliation.
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT id, project_id, status, spec_path "
+            "FROM tasks WHERE status != 'archive' "
+            "ORDER BY last_stage_change_at DESC LIMIT 200"
+        )
+        tasks = [dict(r) for r in await cur.fetchall()]
+    finally:
+        await c.close()
+    if not tasks:
+        return 0
+
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
+    emitted = 0
+    for t in tasks:
+        task_id = t["id"]
+        project_id = t.get("project_id") or "misc"
+        if not is_valid_task_id(task_id):
+            continue
+        try:
+            spec_abs = _spec_path_helper(project_id, task_id)
+        except ValueError:
+            continue
+
+        # ---- spec.md unrecorded ----
+        try:
+            spec_on_disk = spec_abs.is_file()
+        except Exception:
+            spec_on_disk = False
+        if spec_on_disk and not (t.get("spec_path") or ""):
+            key = f"spec:{project_id}:{task_id}"
+            if _reconcile_should_emit(key, now_dt):
+                planner = await _resolve_active_role_owner(
+                    task_id=task_id, role="planner",
+                )
+                await bus.publish({
+                    "ts": now_iso,
+                    "agent_id": "system",
+                    "type": "task_spec_unrecorded",
+                    "task_id": task_id,
+                    "project_id": project_id,
+                    "spec_path": spec_relative_path(project_id, task_id),
+                    "planner": planner,
+                    "to": "coach",
+                })
+                emitted += 1
+
+        # ---- audits/*.md unrecorded ----
+        audits_dir = (
+            spec_abs.parent / "audits"
+            if spec_abs.parent.name == task_id
+            else None
+        )
+        if audits_dir and audits_dir.is_dir():
+            try:
+                audit_files = sorted(audits_dir.glob("audit_*.md"))
+            except Exception:
+                audit_files = []
+            recorded_paths = await _audit_report_paths_for_task(task_id)
+            for af in audit_files:
+                rel = audit_report_relative_path_from_filename(
+                    project_id, task_id, af.name,
+                )
+                if rel is None:
+                    continue
+                if rel in recorded_paths:
+                    continue
+                # Parse round/kind back out for the event body.
+                rk = _parse_audit_filename(af.name)
+                if rk is None:
+                    continue
+                round_num, kind = rk
+                key = f"audit:{project_id}:{task_id}:{round_num}:{kind}"
+                if not _reconcile_should_emit(key, now_dt):
+                    continue
+                role = (
+                    "auditor_syntax" if kind == "syntax"
+                    else "auditor_semantics"
+                )
+                auditor = await _resolve_active_role_owner(
+                    task_id=task_id, role=role,
+                )
+                await bus.publish({
+                    "ts": now_iso,
+                    "agent_id": "system",
+                    "type": "task_audit_unrecorded",
+                    "task_id": task_id,
+                    "project_id": project_id,
+                    "kind": kind,
+                    "round": round_num,
+                    "report_path": rel,
+                    "auditor": auditor,
+                    "to": "coach",
+                })
+                emitted += 1
+    return emitted
+
+
+def _parse_audit_filename(fname: str) -> tuple[int, str] | None:
+    """Parse `audit_<round>_<kind>.md` back into `(round, kind)`.
+    Returns None on malformed input — non-canonical files are
+    ignored rather than triggering a spurious unrecorded finding.
+    """
+    import re as _re
+    m = _re.fullmatch(r"audit_(\d+)_(syntax|semantics)\.md", fname)
+    if not m:
+        return None
+    try:
+        return (int(m.group(1)), m.group(2))
+    except ValueError:
+        return None
+
+
+def audit_report_relative_path_from_filename(
+    project_id: str, task_id: str, filename: str,
+) -> str | None:
+    rk = _parse_audit_filename(filename)
+    if rk is None:
+        return None
+    return (
+        f"projects/{project_id}/working/tasks/{task_id}/"
+        f"audits/{filename}"
+    )
+
+
+async def _audit_report_paths_for_task(task_id: str) -> set[str]:
+    """All `report_path` values recorded on auditor role rows for
+    this task (active or completed). Used to determine which on-disk
+    audits are 'unrecorded'."""
+    out: set[str] = set()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT report_path FROM task_role_assignments "
+            "WHERE task_id = ? AND role IN ('auditor_syntax', "
+            "'auditor_semantics') AND report_path IS NOT NULL",
+            (task_id,),
+        )
+        rows = await cur.fetchall()
+    finally:
+        await c.close()
+    for r in rows:
+        path = dict(r).get("report_path")
+        if isinstance(path, str) and path:
+            out.add(path)
+    return out
+
+
+async def _resolve_active_role_owner(
+    *, task_id: str, role: str,
+) -> str | None:
+    """The current active assignee for a (task, role). Used in
+    reconciliation event payloads so Coach knows which Player wrote
+    the artifact (Coach's `on_behalf_of` argument)."""
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT owner FROM task_role_assignments "
+            "WHERE task_id = ? AND role = ? "
+            "AND completed_at IS NULL AND superseded_by IS NULL "
+            "ORDER BY assigned_at DESC LIMIT 1",
+            (task_id, role),
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    if not row:
+        return None
+    return dict(row).get("owner")
+
+
 __all__ = [
     "start_idle_poller",
     "stop_idle_poller",
     "is_running",
     "sweep_once",
     "PLAYER_SLOTS",
+    "reconciliation_sweep_once",
 ]

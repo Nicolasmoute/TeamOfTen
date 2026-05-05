@@ -8,7 +8,9 @@ from server.db import configured_conn, crash_recover, init_db
 async def test_clean_db_is_a_noop(fresh_db: str) -> None:
     await init_db()
     reset = await crash_recover()
-    assert reset == {"agents_reset": 0, "tasks_reset": 0}
+    assert reset == {
+        "agents_reset": 0, "tasks_reset": 0, "stall_reset": 0,
+    }
 
 
 async def test_resets_working_agents_to_idle(fresh_db: str) -> None:

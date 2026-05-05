@@ -2158,6 +2158,9 @@ async def _build_stalled_tasks_rows(
     not `tasks.owner`, which is always the executor. Previously a
     stuck audit_semantics task would name the executor as the
     blocker, leading Coach to nudge the wrong Player.
+
+    v0.3.8: rows now carry `escalation_level` so the Coach rollup can
+    label which rung of the auto-action ladder each stall is on.
     """
     rows: list[dict[str, Any]] = []
     try:
@@ -2165,11 +2168,10 @@ async def _build_stalled_tasks_rows(
         try:
             cur = await c.execute(
                 "SELECT id, title, status, owner, last_stage_change_at, "
-                "stale_alert_at FROM tasks "
+                "stale_alert_at, stall_escalation_level FROM tasks "
                 "WHERE project_id = ? AND status != 'archive' "
                 "AND stale_alert_at IS NOT NULL "
                 "AND last_stage_change_at IS NOT NULL "
-                "AND last_stage_change_at = stale_alert_at "
                 "ORDER BY last_stage_change_at ASC LIMIT 10",
                 (project_id,),
             )
@@ -2222,8 +2224,171 @@ async def _build_stalled_tasks_rows(
             # original executor was p8").
             "task_executor": r.get("owner") or "(unassigned)",
             "age_hours": round(age_hours, 1),
+            # v0.3.8 escalation rung: 0 fresh, 1 nudged, 2 coach-
+            # notified, 3 auto-reassigned, 4 auto-archived (terminal).
+            "escalation_level": int(
+                r.get("stall_escalation_level") or 0
+            ),
         })
     return rows
+
+
+async def _build_unrecorded_artifacts_rows(
+    project_id: str,
+) -> list[dict[str, Any]]:
+    """Recent reconciliation findings: artifacts on disk that the
+    kanban hasn't recorded. Read from the events log so they survive
+    process restarts (the in-memory dedupe in idle_poller doesn't).
+
+    Each row is one finding (spec OR audit) with the path + the
+    suggested Coach override tool. Window: last 24h, capped at 10
+    rows so the Coach prompt stays bounded.
+
+    AUDIT FIX (v0.3.8): cross-check current DB state before
+    surfacing each finding. The events table keeps fired events
+    around for 24h+, but Coach may have already submitted via
+    `coord_write_task_spec(on_behalf_of=...)` or
+    `coord_submit_audit_report(on_behalf_of=...)` in the meantime.
+    Without this cross-check, Coach sees stale findings and
+    re-attempts the override (which then errors with "already
+    submitted"). For specs: skip when `tasks.spec_path` is set.
+    For audits: skip when any `task_role_assignments` row records
+    the named `report_path`.
+    """
+    rows: list[dict[str, Any]] = []
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT type, payload FROM events "
+                "WHERE type IN ('task_spec_unrecorded', "
+                "'task_audit_unrecorded') "
+                "AND (julianday('now') - julianday(ts)) * 86400.0 < 86400 "
+                "AND project_id = ? "
+                "ORDER BY id DESC LIMIT 30",
+                (project_id,),
+            )
+            raw = await cur.fetchall()
+        finally:
+            await c.close()
+    except Exception:
+        return []
+
+    seen: set[tuple[str, str]] = set()
+    for r in raw:
+        try:
+            d = dict(r)
+            etype = d.get("type") or ""
+            payload = d.get("payload") or "{}"
+            if isinstance(payload, str):
+                import json as _json
+                try:
+                    payload = _json.loads(payload)
+                except Exception:
+                    continue
+            task_id = payload.get("task_id") or ""
+            if not task_id:
+                continue
+            if etype == "task_spec_unrecorded":
+                k = (task_id, "spec")
+                if k in seen:
+                    continue
+                seen.add(k)
+                # Cross-check: if spec_path is now set on the task,
+                # the finding is stale.
+                if await _spec_path_already_recorded(task_id):
+                    continue
+                rows.append({
+                    "kind": "spec",
+                    "task_id": task_id,
+                    "path": payload.get("spec_path") or "",
+                    "owner": payload.get("planner") or "(unassigned)",
+                    "fix": (
+                        f"coord_write_task_spec(task_id={task_id!r}, "
+                        f"body=<paste from disk>, on_behalf_of="
+                        f"{(payload.get('planner') or '<planner>')!r})"
+                    ),
+                })
+            elif etype == "task_audit_unrecorded":
+                kind = payload.get("kind") or "?"
+                round_num = payload.get("round") or 0
+                report_path = payload.get("report_path") or ""
+                k = (task_id, f"audit:{round_num}:{kind}")
+                if k in seen:
+                    continue
+                seen.add(k)
+                # Cross-check: if any role row recorded this exact
+                # report_path, the audit was submitted in the
+                # meantime — drop the stale finding.
+                if await _audit_report_path_already_recorded(
+                    task_id=task_id, report_path=report_path,
+                ):
+                    continue
+                rows.append({
+                    "kind": f"audit_{kind}",
+                    "task_id": task_id,
+                    "path": report_path,
+                    "owner": payload.get("auditor") or "(unassigned)",
+                    "fix": (
+                        f"coord_submit_audit_report(task_id={task_id!r}, "
+                        f"kind={kind!r}, body=<paste from disk>, "
+                        f"verdict='pass'|'fail', on_behalf_of="
+                        f"{(payload.get('auditor') or '<auditor>')!r})"
+                    ),
+                })
+            if len(rows) >= 10:
+                break
+        except Exception:
+            continue
+    return rows
+
+
+async def _spec_path_already_recorded(task_id: str) -> bool:
+    """True when `tasks.spec_path` is set for this task (Coach
+    already submitted the spec via override). Used by
+    `_build_unrecorded_artifacts_rows` to drop stale findings."""
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT spec_path FROM tasks WHERE id = ?",
+                (task_id,),
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        return False
+    if not row:
+        return False
+    p = dict(row).get("spec_path") or ""
+    return bool(p.strip())
+
+
+async def _audit_report_path_already_recorded(
+    *, task_id: str, report_path: str,
+) -> bool:
+    """True when any auditor role row records the exact report_path
+    (Coach already submitted via override). Used by
+    `_build_unrecorded_artifacts_rows` to drop stale findings."""
+    if not report_path:
+        return False
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT 1 FROM task_role_assignments "
+                "WHERE task_id = ? AND report_path = ? "
+                "AND role IN ('auditor_syntax', 'auditor_semantics') "
+                "LIMIT 1",
+                (task_id, report_path),
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        return False
+    return row is not None
 
 
 async def _build_coach_coordination_block() -> str:
@@ -2581,22 +2746,29 @@ async def _build_coach_coordination_block() -> str:
     if stalled_rows:
         lines.append("## Stalled tasks")
         lines.append("")
+        # v0.3.8 escalation labels — Coach sees which auto-action is
+        # imminent and can intervene in time.
+        rung_label = {
+            0: "fresh",
+            1: "nudged",
+            2: "Coach-notified — auto-reassign next",
+            3: "auto-reassigned — auto-archive next",
+            4: "auto-archived",
+        }
         for row in stalled_rows:
             blocker = row['owner']
             executor = row.get('task_executor')
-            # Show the executor in parens when it differs from the
-            # current-stage assignee — e.g. an audit_semantics task
-            # blocked on the auditor while the executor (who finished
-            # their part) waits downstream.
             who = (
                 f"blocker {blocker} (executor {executor})"
                 if executor and executor != blocker
                 else f"blocker {blocker}"
             )
+            level = row.get('escalation_level', 0)
+            label = rung_label.get(level, str(level))
             lines.append(
                 f"- {row['task_id']} \"{row['title']}\" — stage "
                 f"{row['stage']}, {who}, stale for "
-                f"{row['age_hours']}h"
+                f"{row['age_hours']}h [escalation: {label}]"
             )
         lines.append("")
         lines.append(
@@ -2608,7 +2780,40 @@ async def _build_coach_coordination_block() -> str:
             "in their runtime — submit on their behalf via "
             "coord_advance_task_stage (after reading the artifact "
             "they wrote to disk). If no one is assigned to this stage, "
-            "fix the trajectory with coord_set_task_trajectory."
+            "fix the trajectory with coord_set_task_trajectory. "
+            "ESCALATION LADDER (v0.3.8): rung 1 nudge at 30min, "
+            "rung 2 Coach call at 1h, rung 3 auto-reassign at 2h, "
+            "rung 4 auto-archive at 4h. Intervene before the next rung "
+            "fires — auto-actions are the safety net, not the plan."
+        )
+        lines.append("")
+
+    # ---- Unrecorded artifacts (reconciliation findings) -----------
+    artifact_rows = await _build_unrecorded_artifacts_rows(active)
+    if artifact_rows:
+        lines.append("## Unrecorded artifacts on disk")
+        lines.append("")
+        for row in artifact_rows:
+            lines.append(
+                f"- {row['task_id']} ({row['kind']}) — "
+                f"path {row['path']}, owner {row['owner']}"
+            )
+        lines.append("")
+        lines.append(
+            "These artifacts exist on disk but the kanban has no "
+            "record of them — typically a Player wrote the file but "
+            "couldn't reach the matching coord_* tool. Read the file, "
+            "verify it's the real deliverable, and submit on the "
+            "Player's behalf:"
+        )
+        lines.append("")
+        for row in artifact_rows:
+            lines.append(f"  - {row['fix']}")
+        lines.append("")
+        lines.append(
+            "If the file is junk / superseded, ignore it — the "
+            "reconciliation finding will re-emit in 1h until the "
+            "kanban records something or the file is removed."
         )
         lines.append("")
 

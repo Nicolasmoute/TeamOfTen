@@ -517,6 +517,14 @@ async def crash_recover() -> dict[str, int]:
       - task_role_assignments rows whose owner was a zombie agent: clear
         their `started_at` too — the role's spawn-side state mirrors
         tasks.started_at and recovers the same way.
+      - **(v0.3.8.2)** stall ladder state on zombie-owned tasks:
+        `last_stage_change_at = now`, `stall_escalation_level = 0`,
+        `stale_alert_at = NULL`. Without this, a task that was at
+        rung 3 with age 3.5h pre-crash + reboot delay would have
+        age > 4h on the first post-reboot sweep — walking rung 4
+        and auto-archiving the task, punishing the new owner for
+        the harness's downtime. Resetting gives the post-crash
+        Player a fresh ladder window starting at rung 1.
 
     Returns a dict of how many rows were touched for logging. Safe
     to call repeatedly — a no-op on a clean DB.
@@ -535,6 +543,7 @@ async def crash_recover() -> dict[str, int]:
         agents_reset = cur.rowcount
 
         tasks_reset = 0
+        stall_reset = 0
         if zombie_slots:
             placeholders = ",".join("?" for _ in zombie_slots)
             cur = await db.execute(
@@ -549,8 +558,34 @@ async def crash_recover() -> dict[str, int]:
                 f"AND completed_at IS NULL AND superseded_by IS NULL",
                 zombie_slots,
             )
+            # v0.3.8.2 — reset the stall ladder for any active
+            # task tied to a zombie slot (executor OR a current
+            # role assignee). last_stage_change_at moves to NOW
+            # so age starts fresh; the level + stale_alert_at
+            # clear so the post-crash sweep starts at rung 1.
+            from datetime import datetime, timezone
+            now_iso = datetime.now(timezone.utc).isoformat()
+            cur = await db.execute(
+                f"UPDATE tasks SET last_stage_change_at = ?, "
+                f"stale_alert_at = NULL, stall_escalation_level = 0 "
+                f"WHERE status != 'archive' AND ("
+                f"  owner IN ({placeholders}) "
+                f"  OR id IN ("
+                f"    SELECT task_id FROM task_role_assignments "
+                f"    WHERE owner IN ({placeholders}) "
+                f"    AND completed_at IS NULL "
+                f"    AND superseded_by IS NULL"
+                f"  )"
+                f")",
+                (now_iso, *zombie_slots, *zombie_slots),
+            )
+            stall_reset = cur.rowcount
         await db.commit()
-    return {"agents_reset": agents_reset, "tasks_reset": tasks_reset}
+    return {
+        "agents_reset": agents_reset,
+        "tasks_reset": tasks_reset,
+        "stall_reset": stall_reset,
+    }
 
 
 async def _ensure_columns(
@@ -750,6 +785,20 @@ async def init_db() -> None:
                 db,
                 "task_role_assignments",
                 [("focus", "focus TEXT")],
+            )
+            # v0.3.8 stall-escalation ladder. Tracks which rung of the
+            # stall escalation a task is on (0=fresh, 1=nudged at 30m,
+            # 2=coach-notified at 1h, 3=auto-reassigned at 2h,
+            # 4=auto-archived at 4h). Reset to 0 when the task
+            # progresses (subscriber clears stale_alert_at; we mirror
+            # that clear here so a re-stall starts from the bottom).
+            await _ensure_columns(
+                db,
+                "tasks",
+                [(
+                    "stall_escalation_level",
+                    "stall_escalation_level INTEGER NOT NULL DEFAULT 0",
+                )],
             )
             # Indexes that reference kanban-new columns. Live outside
             # SCHEMA because their columns don't exist on legacy DBs

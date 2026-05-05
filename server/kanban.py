@@ -721,7 +721,7 @@ async def _transition(
             await c.execute(
                 "UPDATE tasks SET status = 'archive', "
                 "completed_at = ?, archived_at = ?, "
-                "last_stage_change_at = ?, stale_alert_at = NULL "
+                "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
                 "WHERE id = ? AND project_id = ?",
                 (now, now, now, task_id, project_id),
             )
@@ -734,14 +734,14 @@ async def _transition(
         elif reset_started_at:
             await c.execute(
                 "UPDATE tasks SET status = ?, started_at = NULL, "
-                "last_stage_change_at = ?, stale_alert_at = NULL "
+                "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
                 "WHERE id = ? AND project_id = ?",
                 (new_status, now, task_id, project_id),
             )
         else:
             await c.execute(
                 "UPDATE tasks SET status = ?, "
-                "last_stage_change_at = ?, stale_alert_at = NULL "
+                "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
                 "WHERE id = ? AND project_id = ?",
                 (new_status, now, task_id, project_id),
             )

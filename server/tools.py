@@ -1027,7 +1027,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             cur = await c.execute(
                 "UPDATE tasks SET owner = ?, status = 'execute', "
                 "claimed_at = ?, started_at = ?, "
-                "last_stage_change_at = ?, stale_alert_at = NULL "
+                "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
                 "WHERE id = ? AND status = 'plan' AND project_id = ? "
                 "RETURNING id",
                 (caller_id, now, now, now, task_id, project_id),
@@ -1247,7 +1247,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 cur = await c.execute(
                     "UPDATE tasks SET owner = ?, status = 'execute', "
                     "claimed_at = ?, started_at = ?, "
-                    "last_stage_change_at = ?, stale_alert_at = NULL "
+                    "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
                     "WHERE id = ? AND status = 'plan' AND project_id = ? "
                     "RETURNING id",
                     (caller_id, now, now, now, task_id, project_id),
@@ -1455,7 +1455,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     await c.execute(
                         "UPDATE tasks SET status = 'archive', "
                         "completed_at = ?, archived_at = ?, cancelled_at = ?, "
-                        "last_stage_change_at = ?, stale_alert_at = NULL "
+                        "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
                         "WHERE id = ? AND project_id = ?",
                         (now, now, now, now, task_id, project_id),
                     )
@@ -1463,7 +1463,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     await c.execute(
                         "UPDATE tasks SET status = 'archive', "
                         "completed_at = ?, archived_at = ?, "
-                        "last_stage_change_at = ?, stale_alert_at = NULL "
+                        "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
                         "WHERE id = ? AND project_id = ?",
                         (now, now, now, task_id, project_id),
                     )
@@ -1477,7 +1477,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             else:
                 await c.execute(
                     "UPDATE tasks SET status = ?, "
-                    "last_stage_change_at = ?, stale_alert_at = NULL "
+                    "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
                     "WHERE id = ? AND project_id = ?",
                     (new_status, now, task_id, project_id),
                 )
@@ -1711,7 +1711,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 cur = await c.execute(
                     "UPDATE tasks SET owner = ?, status = 'execute', "
                     "claimed_at = ?, started_at = NULL, "
-                    "last_stage_change_at = ?, stale_alert_at = NULL "
+                    "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
                     "WHERE id = ? AND status = 'plan' "
                     "AND project_id = ? RETURNING id",
                     (slot, now, now, task_id, project_id),
@@ -6333,7 +6333,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 await c.execute(
                     "UPDATE tasks SET status = 'archive', "
                     "completed_at = ?, archived_at = ?, "
-                    "last_stage_change_at = ?, stale_alert_at = NULL "
+                    "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
                     "WHERE id = ? AND project_id = ?",
                     (now, now, now, task_id, project_id),
                 )
@@ -6346,7 +6346,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             else:
                 await c.execute(
                     "UPDATE tasks SET status = ?, "
-                    "last_stage_change_at = ?, stale_alert_at = NULL "
+                    "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
                     "WHERE id = ? AND project_id = ?",
                     (stage, now, task_id, project_id),
                 )
