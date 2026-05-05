@@ -35,6 +35,15 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# Playwright Chromium + system libs. Project-side test suites (e.g.
+# dynamichypergraph) drive a real browser; without the bundle pre-baked
+# every Player redeploy would need a manual `playwright install` and
+# the cache wipe means they'd lose it on the next harness redeploy.
+# `--with-deps` pulls X11/font/audio shared libs Chromium needs to
+# launch headless. Adds ~300 MB to the image.
+RUN pip install --no-cache-dir playwright \
+    && python -m playwright install --with-deps chromium
+
 # Default git identity for agents that commit. Override via env at deploy
 # time if you want per-deployment attribution.
 ARG GIT_USER_NAME="TeamOfTen Harness"
