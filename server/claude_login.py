@@ -61,8 +61,13 @@ ERROR_TAIL_BYTES = 2000
 
 # Strip ANSI escape sequences (CSI + OSC) and bare carriage returns so
 # URL extraction sees clean text. The CLI's TUI redraws can otherwise
-# wrap the URL in colour codes that break the URL regex.
-_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\r")
+# wrap the URL in colour codes that break the URL regex. OSC sequences
+# may end with either BEL (\x07) or ST (\x1b\\); we accept both.
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[a-zA-Z]"          # CSI
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC, BEL or ST terminator
+    r"|\r"                              # bare carriage return
+)
 # Greedy enough to swallow query strings; bounded by whitespace and
 # common terminators that follow a URL in CLI output.
 _URL_RE = re.compile(r"https?://[^\s\x1b\)\]<>]+")
@@ -289,7 +294,7 @@ async def start_login() -> dict:
         _sessions.pop(sid, None)
         raise RuntimeError(f"could not send /login to subprocess: {e}") from e
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     deadline = loop.time() + START_TIMEOUT
     while loop.time() < deadline:
         await asyncio.sleep(POLL_INTERVAL)
@@ -343,7 +348,7 @@ async def submit_code(sid: str, code: str) -> dict:
         raise RuntimeError(f"could not send code to subprocess: {e}") from e
 
     pre_mtime = sess.pre_existing_creds_mtime
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     deadline = loop.time() + SUBMIT_TIMEOUT
     while loop.time() < deadline:
         await asyncio.sleep(POLL_INTERVAL)
@@ -436,7 +441,7 @@ async def start_login_reaper() -> None:
     if is_reaper_running():
         return
     _stopping = False
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     _reaper_task = loop.create_task(_reaper_loop(), name="harness.claude_login.reaper")
     logger.info("claude_login: reaper started (ttl=%.0fs, interval=%.0fs)",
                 SESSION_TTL, REAPER_INTERVAL)

@@ -11,12 +11,8 @@ Three tiers:
 from __future__ import annotations
 
 import asyncio
-import os
 import shutil
-import subprocess
 import sys
-import time
-from pathlib import Path
 
 import pytest
 
@@ -30,9 +26,17 @@ def test_strip_ansi_removes_csi_color_codes() -> None:
     assert claude_login.strip_ansi(raw) == "ERROR: foo"
 
 
-def test_strip_ansi_removes_osc_escapes() -> None:
+def test_strip_ansi_removes_osc_escapes_bel_terminator() -> None:
     raw = "\x1b]0;window title\x07hello"
     assert claude_login.strip_ansi(raw) == "hello"
+
+
+def test_strip_ansi_removes_osc_escapes_st_terminator() -> None:
+    """Some terminals emit OSC sequences ending with ST (\\x1b\\\\)
+    instead of BEL — both must be stripped or the URL regex sees
+    garbage prefix."""
+    raw = "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\!"
+    assert claude_login.strip_ansi(raw) == "link!"
 
 
 def test_strip_ansi_removes_carriage_returns() -> None:
@@ -184,7 +188,7 @@ def _python_path() -> str:
 
 
 @LINUX_ONLY
-def test_start_login_captures_url_from_stand_in(restore_command) -> None:
+async def test_start_login_captures_url_from_stand_in(restore_command) -> None:
     """Spawn a Python one-liner that prints a URL and waits on stdin.
     `start_login` should capture the URL and return a session_id."""
     py = _python_path()
@@ -197,40 +201,31 @@ def test_start_login_captures_url_from_stand_in(restore_command) -> None:
         "time.sleep(5)"
     )
     claude_login._set_command_for_tests([py, "-c", script])
-
-    async def go():
-        return await claude_login.start_login()
-
-    result = asyncio.get_event_loop().run_until_complete(go())
+    result = await claude_login.start_login()
     assert result["url"] == "https://example.com/oauth/authorize?state=xyz"
     assert result["session_id"]
     # Cleanup — the stand-in is still alive.
-    asyncio.get_event_loop().run_until_complete(
-        claude_login.cancel_login(result["session_id"])
-    )
+    await claude_login.cancel_login(result["session_id"])
 
 
 @LINUX_ONLY
-def test_start_login_times_out_when_no_url(restore_command) -> None:
+async def test_start_login_times_out_when_no_url(restore_command) -> None:
     """A subprocess that never prints a URL hits the timeout path."""
     py = _python_path()
     script = "import time; time.sleep(60)"
     claude_login._set_command_for_tests([py, "-c", script])
 
-    # Patch START_TIMEOUT down so the test runs in seconds, not 30s.
     orig_timeout = claude_login.START_TIMEOUT
     claude_login.START_TIMEOUT = 1.5
     try:
-        async def go():
-            return await claude_login.start_login()
         with pytest.raises(RuntimeError, match="timed out"):
-            asyncio.get_event_loop().run_until_complete(go())
+            await claude_login.start_login()
     finally:
         claude_login.START_TIMEOUT = orig_timeout
 
 
 @LINUX_ONLY
-def test_start_login_drops_prior_session(restore_command) -> None:
+async def test_start_login_drops_prior_session(restore_command) -> None:
     """A second `start_login` should kill the first subprocess."""
     py = _python_path()
     script = (
@@ -240,25 +235,17 @@ def test_start_login_drops_prior_session(restore_command) -> None:
         "time.sleep(30)"
     )
     claude_login._set_command_for_tests([py, "-c", script])
-
-    async def go():
-        first = await claude_login.start_login()
-        second = await claude_login.start_login()
-        return first, second
-
-    first, second = asyncio.get_event_loop().run_until_complete(go())
+    first = await claude_login.start_login()
+    second = await claude_login.start_login()
     # Only the second session should remain in the dict.
     assert first["session_id"] != second["session_id"]
     assert second["session_id"] in claude_login._sessions
     assert first["session_id"] not in claude_login._sessions
-    # Cleanup.
-    asyncio.get_event_loop().run_until_complete(
-        claude_login.cancel_login(second["session_id"])
-    )
+    await claude_login.cancel_login(second["session_id"])
 
 
 @LINUX_ONLY
-def test_cancel_login_kills_subprocess(restore_command) -> None:
+async def test_cancel_login_kills_subprocess(restore_command) -> None:
     py = _python_path()
     script = (
         "import sys, time;"
@@ -267,21 +254,15 @@ def test_cancel_login_kills_subprocess(restore_command) -> None:
         "time.sleep(60)"
     )
     claude_login._set_command_for_tests([py, "-c", script])
-
-    async def go():
-        result = await claude_login.start_login()
-        sid = result["session_id"]
-        sess = claude_login._sessions[sid]
-        proc = sess.proc
-        await claude_login.cancel_login(sid)
-        # Give the process a moment to actually die.
-        for _ in range(20):
-            if proc.poll() is not None:
-                break
-            await asyncio.sleep(0.1)
-        return proc.poll()
-
-    exit_code = asyncio.get_event_loop().run_until_complete(go())
-    assert exit_code is not None  # subprocess actually terminated
-    # Session removed.
+    result = await claude_login.start_login()
+    sid = result["session_id"]
+    sess = claude_login._sessions[sid]
+    proc = sess.proc
+    await claude_login.cancel_login(sid)
+    # Give the process a moment to actually die.
+    for _ in range(20):
+        if proc.poll() is not None:
+            break
+        await asyncio.sleep(0.1)
+    assert proc.poll() is not None  # subprocess actually terminated
     assert claude_login.session_count() == 0

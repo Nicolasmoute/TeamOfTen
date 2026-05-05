@@ -3452,7 +3452,7 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
       <!-- Bottom block — wrapped in .rail-bottom so mobile gets a
            reliable single-row layout (flex with no wrap). On desktop
            .rail-bottom takes the remaining vertical space below
-           rail-agents. Hairline `rail-divider` rules separate the
+           rail-agents. Hairline rail-divider rules separate the
            three logical groups instead of fixed-pixel margins. -->
       <div class="rail-bottom">
         <span
@@ -3712,6 +3712,26 @@ function ClaudeAuthSection({ health, onRefresh }) {
       setTimeout(() => setCopied(false), 2000);
     } catch (_) { /* best-effort */ }
   }, [url]);
+
+  // If the user closes the drawer or reloads while a login session is
+  // mid-flight, fire-and-forget a cancel so the server-side subprocess
+  // dies promptly instead of waiting for the 10-min reaper. Capturing
+  // sessionId via ref avoids re-running the cleanup on every state
+  // change — only true unmount triggers it.
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
+  useEffect(() => () => {
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+    try {
+      authFetch("/api/auth/claude/login/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sid }),
+        keepalive: true,
+      }).catch(() => {});
+    } catch (_) { /* best-effort */ }
+  }, []);
 
   const onOpenUrl = useCallback(() => {
     if (!url) return;
