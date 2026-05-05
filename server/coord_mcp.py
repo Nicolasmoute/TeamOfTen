@@ -146,6 +146,14 @@ async def _serve(client: CoordProxyClient) -> int:
     async def _list_tools() -> list[types.Tool]:
         return tool_descriptors
 
+    @server.list_resources()
+    async def _list_resources() -> list[types.Resource]:
+        return []
+
+    @server.list_prompts()
+    async def _list_prompts() -> list[types.Prompt]:
+        return []
+
     @server.call_tool(validate_input=False)
     async def _call_tool(name: str, args: dict[str, Any]) -> types.CallToolResult:
         try:
