@@ -1843,6 +1843,14 @@ Zeabur's default datacenter returns HTTP 403 for `https://claude.ai/install.sh` 
 - Dockerfiles must install Claude CLI via: `npm install -g @anthropic-ai/claude-code`
 - Not via: `curl -fsSL https://claude.ai/install.sh | bash`
 
+### Zeabur Dockerfile changes need a manual "Load from GitHub" click
+
+Zeabur uses **zbpack** to auto-detect builds. Because this repo has `pyproject.toml` at the root, zbpack will silently pick its Python builder and **ignore the repo `Dockerfile`** — even with a `zbpack.json` present. The build log gives it away: `[STEP N]` cosmetic headers and `apt-get install -y git nodejs python3.13` instead of raw `Step N/M : FROM python:3.12-slim` Docker output. Symptom is "I added a package to the Dockerfile and the running container doesn't have it" — confirmed by 2026-05-05 bubblewrap incident where `dpkg -l bubblewrap` returned empty after a clean push to main.
+
+**Fix when you change the Dockerfile:** in the Zeabur dashboard → service → build settings, click **"Load from GitHub"** on the Dockerfile picker. That forces Zeabur to read the actual repo Dockerfile for the next build instead of letting zbpack regenerate one. The click is sticky for that service but does NOT propagate to new services or replicas — every Dockerfile change still requires you to verify the next build log shows raw Docker output, not zbpack's pretty `[STEP N]` headers.
+
+**When asking the user to redeploy after a Dockerfile change:** always include "and click Load from GitHub on the Dockerfile picker in the Zeabur service settings" in the instructions. Otherwise the rebuild silently runs zbpack's auto-generated plan and the Dockerfile change has no effect.
+
 ### Line endings on Windows
 
 `.gitattributes` at repo root forces LF on `*.sh` and `Dockerfile*`. If you add new shell scripts or Dockerfiles, existing rules cover them. If not, the script will fail in Linux containers with `$'\r': command not found`.

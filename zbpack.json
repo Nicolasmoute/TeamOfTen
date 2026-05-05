@@ -1,5 +1,5 @@
 {
-  "build_command": "",
-  "start_command": "",
-  "dockerfile": "./Dockerfile"
+  "dockerfile": {
+    "path": "./Dockerfile"
+  }
 }
