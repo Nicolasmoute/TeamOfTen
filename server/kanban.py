@@ -857,6 +857,32 @@ async def _emit_audit_fail_notification(
     })
 
 
+def _executor_worktree_boundary(role: str, slot: str) -> str:
+    """Per-slot worktree-boundary suffix appended to executor wakes.
+
+    v0.3.7 (production trace 2026-05-04, p8 wrote to /workspaces/.project
+    instead of their own worktree, hit the opaque 'nothing to commit'
+    soft-OK in coord_commit_push, marked the task blocked).
+
+    Names the slot's worktree path explicitly and reminds the executor
+    that the shared seed checkout is off-limits. Empty string for
+    non-executor roles (auditors / shippers don't edit code).
+    """
+    if role != "executor" or not slot:
+        return ""
+    return (
+        f"\n\nWorktree boundary: your edits MUST land in "
+        f"/workspaces/{slot}/project (your own git worktree on branch "
+        f"work/{slot}). Do NOT edit /workspaces/.project — that is the "
+        f"shared seed checkout used to provision worktrees and belongs "
+        f"to no slot. Editing it strands your work on a tree the "
+        f"kanban can't see; coord_commit_push will report 'nothing to "
+        f"commit' from your own worktree because the changes never "
+        f"reached it. If your tooling defaulted to .project, move your "
+        f"changes into /workspaces/{slot}/project before committing."
+    )
+
+
 _TOOL_NOT_VISIBLE_ESCAPE = (
     "\n\nIf the named tool is NOT visible in your runtime — i.e. you "
     "look at your tool list and don't see it — DO NOT just write the "
@@ -1430,7 +1456,8 @@ async def _wake_role_or_emit_needed(*, task_id: str, role: str) -> None:
         from server.agents import maybe_wake_agent
         for slot in targets:
             try:
-                await maybe_wake_agent(slot, prompt, bypass_debounce=True)
+                slot_prompt = prompt + _executor_worktree_boundary(role, slot)
+                await maybe_wake_agent(slot, slot_prompt, bypass_debounce=True)
             except Exception:
                 pass
     except Exception:

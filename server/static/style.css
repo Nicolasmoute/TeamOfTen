@@ -310,7 +310,12 @@ body {
   align-items: center;
   gap: 4px;
 }
-.rail-group.rail-agents { gap: 4px; }
+.rail-group.rail-agents { gap: 2px; }
+/* Tighter vertical footprint for the 11 team slots — the rail was
+   getting crowded once the bottom groups grew. Width stays 32 so the
+   labels and ::before accent stripe geometry are unchanged. */
+.rail-group.rail-agents .slot { height: 26px; }
+.rail-group.rail-agents .slot.open::before { top: 4px; bottom: 4px; }
 /* Desktop: rail-bottom is a transparent flex column that takes the
    remaining vertical space below rail-agents. The existing
    margin-top: auto on rail-files pushes the bottom block down within

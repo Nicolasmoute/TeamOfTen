@@ -2538,6 +2538,48 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
 
         code, status_out, _ = await run(["git", "status", "--porcelain"])
         if not status_out.strip():
+            # v0.3.7: a clean slot worktree is suspicious if there are
+            # uncommitted changes in the shared seed checkout
+            # (/workspaces/.project). That means the Player edited the
+            # wrong tree — work is stranded on a tree that belongs to
+            # no slot. Surface a loud, named error so the Player can
+            # fix it instead of getting an opaque "nothing to commit"
+            # and walking away. (Production trace 2026-05-04: p8 wrote
+            # to .project, hit "nothing to commit" here, marked the
+            # task blocked.)
+            try:
+                from server.workspaces import BASE_REPO_PATH
+                base_repo = BASE_REPO_PATH
+            except Exception:
+                base_repo = None
+            if base_repo and (base_repo / ".git").exists():
+                def _peek_base() -> str:
+                    try:
+                        p = subprocess.run(
+                            ["git", "status", "--porcelain"],
+                            cwd=str(base_repo),
+                            capture_output=True,
+                            text=True,
+                            timeout=15,
+                            env=clean_env,
+                        )
+                        return (p.stdout or "")
+                    except Exception:
+                        return ""
+                base_dirty = (await asyncio.to_thread(_peek_base)).strip()
+                if base_dirty:
+                    return _err(
+                        f"your worktree at {cwd} is clean, but the "
+                        f"shared seed checkout at {base_repo} has "
+                        f"uncommitted changes. The shared checkout is "
+                        f"not yours to commit from — per-worktree "
+                        f"isolation is mandatory. Move your changes "
+                        f"into your worktree (cd {cwd} and re-apply, "
+                        f"or `git -C {base_repo} stash && git -C {cwd} "
+                        f"stash pop` if the patch is small) and retry. "
+                        f"Do NOT `git -C {base_repo} commit` directly "
+                        f"— that bypasses your branch entirely."
+                    )
             return _ok("nothing to commit (working tree clean)")
 
         code, out, err = await run(["git", "commit", "-m", message])

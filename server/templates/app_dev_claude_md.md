@@ -218,6 +218,18 @@ Each task produces durable markdown artifacts under
   `coord_set_task_blocked`, `coord_set_task_workflow`.
   `coord_write_task_spec` exists as an EMERGENCY OVERRIDE only —
   when no Player is reachable for the planner role.
+
+  **Coach does NOT follow assignments with a `coord_send_message`
+  to the assignee.** The kanban subscriber auto-wakes the current-
+  stage assignee with a wake prompt that already names the task,
+  the focus (for audits), the contract or context, and the exact
+  completion tool to call. An extra DM duplicates the wake, burns
+  tokens on both sides, and produces two competing instructions
+  for the Player to reconcile. Use `coord_send_message` only when
+  (a) clarifying something specific AFTER the Player has accepted
+  the role or asked a question, or (b) nudging a stalled blocker
+  surfaced by the stall sweeper. Initial assignment is silent on
+  Coach's side; the kanban does the wake.
   `coord_submit_audit_report(..., on_behalf_of='<slot>')` is the
   Coach-only override for when an assigned auditor's runtime can't
   reach the tool: read the Player's on-disk `audit_*.md`, copy the
@@ -273,6 +285,33 @@ after `execute`, the executor SELF-AUDITS before
 `coord_commit_push` / `coord_complete_execution`: run the relevant
 tests, sanity-check the output, then commit. The board archives
 (or advances to ship) directly — there is no separate review pass.
+
+#### Worktree boundary — edit only your own worktree
+
+Each Player has their own git worktree at
+`/workspaces/<your_slot>/project` on branch `work/<your_slot>`.
+**All your edits MUST land there.** Per-worktree isolation is the
+primary concurrency control — see CLAUDE.md invariant #2.
+
+Do NOT edit `/workspaces/.project`. That path is the **shared seed
+checkout** used to provision per-slot worktrees on container boot;
+it belongs to no slot, has no branch you should be on, and editing
+it strands your work on a tree the kanban can't see. The symptom is
+opaque: when you call `coord_commit_push`, the tool runs `git
+status` inside your own worktree, sees a clean tree, and (in older
+versions) returned `"nothing to commit (working tree clean)"`.
+
+As of v0.3.7, `coord_commit_push` peeks `/workspaces/.project` when
+your worktree is clean and surfaces a loud named error pointing you
+at both paths. If you see that error, move your changes into your
+worktree before retrying:
+- If the changes are small: re-apply them inside
+  `/workspaces/<your_slot>/project`.
+- If the changes are large: `git -C /workspaces/.project stash &&
+  git -C /workspaces/<your_slot>/project stash pop`.
+
+Do NOT `git -C /workspaces/.project commit` directly — that bypasses
+your branch entirely and creates a commit on the wrong tree.
 
 #### If the named coord_* tool is NOT visible in your runtime
 
