@@ -1482,6 +1482,23 @@ tool routing including the empty-clear blunt path and the
 prior-session queued path, and the `TurnContext.transfer_to_runtime`
 schema.
 
+**Recent (2026-05-05) — Claude startup argv limit after transfer:**
+
+Root cause: Claude Agent SDK sends a string `system_prompt` to the
+CLI as `--system-prompt <full text>`. After a Codex→Claude transfer,
+TeamOfTen injects the compact handoff into the next Claude system
+prompt; combined with global/project CLAUDE.md this can exceed
+Linux's per-argument `execve` ceiling and fail before Claude Code
+starts with `CLIConnectionError: Failed to start Claude Code: [Errno
+7] Argument list too long`.
+
+Fix: `ClaudeRuntime` now materializes every non-empty composed system
+prompt to a temporary 0600 markdown file and passes
+`{"type":"file","path":...}` to `ClaudeAgentOptions`, causing the SDK
+to use `--system-prompt-file` instead of an inline argv payload.
+Regression coverage lives in
+[server/tests/test_claude_runtime_prompt_file.py](server/tests/test_claude_runtime_prompt_file.py).
+
 **Recent (2026-05-02, sixth follow-up) — Role-level defaults wired through:**
 
 `_ROLE_MODEL_DEFAULTS` in

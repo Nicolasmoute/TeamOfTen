@@ -19,11 +19,59 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
+from pathlib import Path
 from typing import Any
 
 from server.runtimes.base import TurnContext
 
 logger = logging.getLogger(__name__)
+
+
+def _materialize_system_prompt(system_prompt: str) -> tuple[Any, Path | None]:
+    """Return a Claude SDK system_prompt value plus optional temp path.
+
+    The Python SDK forwards a plain string as `--system-prompt <value>`
+    when spawning `claude`. Large TeamOfTen prompts (CLAUDE.md plus a
+    post-compact handoff) can exceed the OS argv limit before the CLI
+    starts, raising E2BIG / "Argument list too long". A file-backed
+    prompt uses the SDK's `--system-prompt-file` path instead.
+    """
+    if not system_prompt:
+        return "", None
+
+    fd, raw_path = tempfile.mkstemp(
+        prefix="teamoften-claude-system-",
+        suffix=".md",
+    )
+    path = Path(raw_path)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(system_prompt)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return {"type": "file", "path": str(path)}, path
+
+
+def _cleanup_materialized_system_prompt(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("failed to remove temporary Claude system prompt %s", path)
 
 
 class ClaudeRuntime:
@@ -71,6 +119,9 @@ class ClaudeRuntime:
         # instead.
         coord_server = build_coord_server(tc.agent_id)
         mcp_servers = {"coord": coord_server, **(tc.external_mcp_servers or {})}
+        system_prompt_value, system_prompt_file = _materialize_system_prompt(
+            tc.system_prompt
+        )
 
         # can_use_tool callback: intercepts AskUserQuestion and routes
         # per agent role. Coach → human form; Player → Coach inbox.
@@ -79,7 +130,7 @@ class ClaudeRuntime:
         can_use_tool_cb = _build_can_use_tool(tc.agent_id)
 
         options_kwargs: dict[str, Any] = dict(
-            system_prompt=tc.system_prompt,
+            system_prompt=system_prompt_value,
             cwd=tc.workspace_cwd or str(workspace_dir(tc.agent_id)),
             max_turns=MAX_TURNS_PER_SPAWN,
             mcp_servers=mcp_servers,
@@ -145,29 +196,32 @@ class ClaudeRuntime:
                 await _handle_message(agent_id, msg, turn_ctx)
 
         try:
-            await _iterate(options)
-        except Exception as e:
-            # Stale session auto-heal — clear stored id and retry once
-            # without resume. Only when prior_session was set AND the
-            # error came from the SDK subprocess layer (ProcessError).
-            is_process_err = type(e).__name__ == "ProcessError"
-            if tc.prior_session and is_process_err:
-                logger.warning(
-                    "agent %s: resume of session=%s failed, clearing and retrying fresh",
-                    agent_id, tc.prior_session,
-                )
-                await _emit(
-                    agent_id,
-                    "session_resume_failed",
-                    session_id=tc.prior_session,
-                    error=f"{type(e).__name__}: {e}",
-                )
-                await _clear_session_id(agent_id)
-                options_kwargs.pop("resume", None)
-                retry_options = ClaudeAgentOptions(**options_kwargs)
-                await _iterate(retry_options)
-            else:
-                raise
+            try:
+                await _iterate(options)
+            except Exception as e:
+                # Stale session auto-heal — clear stored id and retry once
+                # without resume. Only when prior_session was set AND the
+                # error came from the SDK subprocess layer (ProcessError).
+                is_process_err = type(e).__name__ == "ProcessError"
+                if tc.prior_session and is_process_err:
+                    logger.warning(
+                        "agent %s: resume of session=%s failed, clearing and retrying fresh",
+                        agent_id, tc.prior_session,
+                    )
+                    await _emit(
+                        agent_id,
+                        "session_resume_failed",
+                        session_id=tc.prior_session,
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                    await _clear_session_id(agent_id)
+                    options_kwargs.pop("resume", None)
+                    retry_options = ClaudeAgentOptions(**options_kwargs)
+                    await _iterate(retry_options)
+                else:
+                    raise
+        finally:
+            _cleanup_materialized_system_prompt(system_prompt_file)
 
     async def maybe_auto_compact(self, tc: TurnContext) -> bool:
         """Auto-compact trip-wire — Claude shape.

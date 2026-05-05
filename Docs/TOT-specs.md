@@ -1603,6 +1603,14 @@ cross over. The session-transfer flow runs the compact summary on the
 reads the handoff in its system prompt — same delivery vehicle as a
 plain `/compact`.
 
+ClaudeRuntime materializes the composed system prompt into a temporary
+0600 file and passes it to Claude Code via `--system-prompt-file`.
+This is required because the post-compact handoff plus global/project
+CLAUDE.md can exceed Linux's per-argument `execve` ceiling if sent as a
+literal `--system-prompt` argv value, causing
+`CLIConnectionError: Failed to start Claude Code: [Errno 7] Argument
+list too long` before the CLI starts.
+
 - UI: pane gear popover's runtime selector. Picking `claude` / `codex`
   routes through the transfer endpoint; picking `default` (empty) keeps
   the legacy blunt-clear `PUT /api/agents/{id}/runtime` (no compact).
