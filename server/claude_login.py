@@ -34,7 +34,7 @@ import re
 import secrets as _secrets
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -46,6 +46,9 @@ logger = logging.getLogger(__name__)
 
 # How long to wait for the OAuth URL after sending /login.
 START_TIMEOUT = 30.0
+# Initial settle before sending /login — the TUI needs time to fully
+# render and reach an input-accepting state. 0.5s wasn't enough.
+STARTUP_SETTLE = 1.5
 # How long to wait for confirmation after the user submits the code.
 SUBMIT_TIMEOUT = 30.0
 # Reaper drops sessions older than this — the CLI process gets SIGTERM.
@@ -59,14 +62,25 @@ READ_CHUNK = 4096
 # Tail of buffer to surface in error messages on timeout / early exit.
 ERROR_TAIL_BYTES = 2000
 
-# Strip ANSI escape sequences (CSI + OSC) and bare carriage returns so
-# URL extraction sees clean text. The CLI's TUI redraws can otherwise
-# wrap the URL in colour codes that break the URL regex. OSC sequences
-# may end with either BEL (\x07) or ST (\x1b\\); we accept both.
+# Strip ANSI escape sequences so URL extraction sees clean text. The
+# Claude TUI uses cursor-positioning escapes (e.g. `\x1b[>0q` query,
+# `\x1b[2J` clear) on top of plain colour codes; if we don't catch
+# them, parameter bytes like `>` survive into the buffer and a URL
+# rendered inside a modal stays scrambled. Per ECMA-48:
+#   - CSI: ESC `[`, params 0x30-0x3F (digits + : ; < = > ?),
+#     intermediates 0x20-0x2F (space ! " # $ % & ' ( ) * + , - . /),
+#     final byte 0x40-0x7E (@ A-Z [ \\ ] ^ _ ` a-z { | } ~).
+#   - OSC: ESC `]`, body, BEL or ST (`\x1b\\`) terminator.
+#   - DCS / SOS / PM / APC: ESC `[PX^_]`, body, ST terminator.
+#   - 2-byte escapes: ESC followed by a single 0x40-0x5F byte
+#     (cursor save/restore, NEL, IND, etc.).
+# Plus carriage returns and the BEL char itself when it leaks through.
 _ANSI_RE = re.compile(
-    r"\x1b\[[0-9;?]*[a-zA-Z]"          # CSI
-    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC, BEL or ST terminator
-    r"|\r"                              # bare carriage return
+    r"\x1b\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]"          # CSI
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"                  # OSC
+    r"|\x1b[PX^_][^\x1b]*\x1b\\"                           # DCS, SOS, PM, APC
+    r"|\x1b[\x40-\x5F]"                                    # 2-byte escape
+    r"|[\r\x07]"                                           # CR + BEL
 )
 # Greedy enough to swallow query strings; bounded by whitespace and
 # common terminators that follow a URL in CLI output.
@@ -284,8 +298,11 @@ async def start_login() -> dict:
         )
         _sessions[sid] = sess
 
-    # Brief settle so the CLI prints any banner before we issue /login.
-    await asyncio.sleep(0.5)
+    # Settle long enough for the TUI to fully draw + reach the input
+    # prompt before we send /login. 0.5s was too short — the keystrokes
+    # got dropped during init and the buffer kept showing the welcome
+    # screen until timeout.
+    await asyncio.sleep(STARTUP_SETTLE)
     sess.read_available()
     try:
         sess.write("/login\n")
@@ -296,18 +313,34 @@ async def start_login() -> dict:
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + START_TIMEOUT
+    resent_login = False
     while loop.time() < deadline:
         await asyncio.sleep(POLL_INTERVAL)
         chunk = sess.read_available()
         if chunk and looks_like_yn_prompt(chunk):
+            # CLI asks something like "Refresh login? [Y/n]" or
+            # "Open browser? [Y/n]" — answer 'y' so the URL is printed
+            # (xdg-open fails harmlessly in headless containers and the
+            # CLI falls back to displaying the URL).
             try:
-                sess.write("n\n")
+                sess.write("y\n")
             except OSError:
                 pass
         url = extract_url(sess.buffer)
         if url:
             sess.url = url
             return {"session_id": sid, "url": url}
+        # Some CLI versions need /login resent if the first keystroke
+        # raced startup. After 3s with no URL and an empty-looking
+        # buffer, retry once.
+        if (not resent_login
+                and loop.time() - (deadline - START_TIMEOUT) > 3.0
+                and "login" not in sess.buffer.lower()):
+            try:
+                sess.write("/login\n")
+            except OSError:
+                pass
+            resent_login = True
         if sess.proc.poll() is not None:
             transcript = sess.buffer[-ERROR_TAIL_BYTES:]
             sess.close()
@@ -322,6 +355,8 @@ async def start_login() -> dict:
     _sessions.pop(sid, None)
     raise RuntimeError(
         f"timed out after {START_TIMEOUT:.0f}s waiting for the OAuth URL. "
+        f"The CLI may be rendering the URL inside a TUI modal we can't "
+        f"parse — use the paste-credentials fallback below instead. "
         f"Last output:\n{transcript}"
     )
 

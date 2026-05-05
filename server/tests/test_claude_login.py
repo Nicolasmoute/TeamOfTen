@@ -26,6 +26,21 @@ def test_strip_ansi_removes_csi_color_codes() -> None:
     assert claude_login.strip_ansi(raw) == "ERROR: foo"
 
 
+def test_strip_ansi_removes_csi_with_extended_params() -> None:
+    """The Claude TUI emits things like `\\x1b[>0q` (device query) and
+    `\\x1b[?25l` (hide cursor). The CSI param byte range includes
+    `< = > ?`, not just digits — without that the `>` survived in the
+    buffer and a URL rendered nearby got scrambled."""
+    raw = "\x1b[>0q\x1b[?25lhello\x1b[?25h"
+    assert claude_login.strip_ansi(raw) == "hello"
+
+
+def test_strip_ansi_removes_cursor_positioning() -> None:
+    """CSI with intermediate bytes + final byte (cursor-up etc.)."""
+    raw = "before\x1b[2J\x1b[10;5Hmiddle\x1b[Aend"
+    assert claude_login.strip_ansi(raw) == "beforemiddleend"
+
+
 def test_strip_ansi_removes_osc_escapes_bel_terminator() -> None:
     raw = "\x1b]0;window title\x07hello"
     assert claude_login.strip_ansi(raw) == "hello"
