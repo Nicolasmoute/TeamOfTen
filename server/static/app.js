@@ -3451,14 +3451,17 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
       </div>
       <!-- Bottom block — wrapped in .rail-bottom so mobile gets a
            reliable single-row layout (flex with no wrap). On desktop
-           .rail-bottom takes the remaining vertical space and its
-           flex-column flow restores the prior stacked layout. -->
+           .rail-bottom takes the remaining vertical space below
+           rail-agents. Hairline `rail-divider` rules separate the
+           three logical groups instead of fixed-pixel margins. -->
       <div class="rail-bottom">
         <span
           class=${"ws-dot mobile-ws-dot " + (wsConnected ? "ok" : "")}
           title=${wsConnected ? "websocket connected" : "websocket disconnected"}
         ></span>
-        <div class="rail-group rail-files">
+        <div class="rail-divider" aria-hidden="true"></div>
+        <!-- Tools: open the various global panes. -->
+        <div class="rail-group rail-tools">
           <button
             class=${"gear files-open" + (openSlots.includes("__files") ? " active" : "")}
             title="Open the file explorer pane (global + active project)"
@@ -3498,41 +3501,6 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
           >
             <span class="kanban-icon" aria-hidden="true"><span></span></span>
           </button>
-        </div>
-        <div class="rail-group rail-controls">
-          ${openSlots.length >= 2
-            ? html`<button
-                class="gear layout-preset"
-                title="Spread: one pane per column"
-                onClick=${() => onLayoutPreset && onLayoutPreset("spread")}
-              ><span class="layout-icon layout-icon-spread">
-                <span></span><span></span><span></span>
-              </span></button>
-              <button
-                class="gear layout-preset"
-                title="Pair stack: two panes per column (odd count → first one is solo)"
-                onClick=${() => onLayoutPreset && onLayoutPreset("pairs")}
-              ><span class="layout-icon layout-icon-pairs">
-                <span><i></i><i></i></span><span><i></i><i></i></span><span><i></i><i></i></span>
-              </span></button>`
-            : null}
-          ${workingCount > 0
-            ? html`<button
-                class="gear cancel-all"
-                title=${"Cancel all " + workingCount + " running agent" + (workingCount === 1 ? "" : "s")}
-                onClick=${onCancelAll}
-              >⏹</button>`
-            : null}
-          <button
-            class=${"gear pause-toggle" + (paused ? " active" : "")}
-            title=${(paused
-              ? "Harness is PAUSED — new agent spawns are blocked. Click to resume."
-              : "Pause the harness — stops new agent spawns (in-flight turns keep running)."
-            ) + " Keyboard: ⌘/Ctrl+."}
-            onClick=${onTogglePause}
-          >${paused ? "▶" : "❚❚"}</button>
-        </div>
-        <div class="rail-group rail-env">
           <button
             class=${"gear recurrence-toggle" + (recurrenceOpen ? " active" : "")}
             title=${recurrenceOpen ? "Close recurrence panel" : "Open recurrence panel — Coach tick / repeats / crons"}
@@ -3561,6 +3529,44 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
           >
             <span class="env-icon">▦</span>
           </button>
+        </div>
+        <div class="rail-divider" aria-hidden="true"></div>
+        <!-- Actions: pause/play, layout presets (closer together),
+             cancel-all (when something is running), then settings. -->
+        <div class="rail-group rail-actions">
+          ${workingCount > 0
+            ? html`<button
+                class="gear cancel-all"
+                title=${"Cancel all " + workingCount + " running agent" + (workingCount === 1 ? "" : "s")}
+                onClick=${onCancelAll}
+              >⏹</button>`
+            : null}
+          <button
+            class=${"gear pause-toggle" + (paused ? " active" : "")}
+            title=${(paused
+              ? "Harness is PAUSED — new agent spawns are blocked. Click to resume."
+              : "Pause the harness — stops new agent spawns (in-flight turns keep running)."
+            ) + " Keyboard: ⌘/Ctrl+."}
+            onClick=${onTogglePause}
+          >${paused ? "▶" : "❚❚"}</button>
+          ${openSlots.length >= 2
+            ? html`<span class="rail-layout-presets">
+                <button
+                  class="gear layout-preset"
+                  title="Pair stack: two panes per column (odd count → first one is solo)"
+                  onClick=${() => onLayoutPreset && onLayoutPreset("pairs")}
+                ><span class="layout-icon layout-icon-pairs">
+                  <span><i></i><i></i></span><span><i></i><i></i></span><span><i></i><i></i></span>
+                </span></button>
+                <button
+                  class="gear layout-preset"
+                  title="Spread: one pane per column"
+                  onClick=${() => onLayoutPreset && onLayoutPreset("spread")}
+                ><span class="layout-icon layout-icon-spread">
+                  <span></span><span></span><span></span>
+                </span></button>
+              </span>`
+            : null}
           <button class="gear settings-toggle" title="Settings" onClick=${onOpenSettings}>⚙</button>
         </div>
       </div>
@@ -3601,24 +3607,118 @@ function summarizeHealthCheck(c) {
   return c.ok ? "ok" : "not ready";
 }
 
-// Paste a .credentials.json blob so agents can authenticate to
-// Claude Code without the operator having to shell into the container.
-// Typical flow:
-//   1. On any laptop with `claude` installed: run `claude /login`.
-//   2. Open ~/.claude/.credentials.json (or the platform equivalent).
-//   3. Paste it here, click Save.
-//   4. Agents use the new token on their next turn.
-// Dependent on CLAUDE_CONFIG_DIR being set server-side — without a
-// persistent volume target, the paste would live only in container
-// memory and vanish on redeploy.
+// In-app Claude OAuth login. Drives `claude /login` as a pty
+// subprocess on the server so the operator never has to shell into the
+// container or install the CLI on a separate laptop. Three phases:
+//   - idle     → "Sign in to Claude" button visible
+//   - awaiting → server returned a URL; show it + code-paste textarea
+//   - busy     → POST in flight (start or submit), buttons disabled
+// The legacy paste-the-blob form is kept inside a <details> as a
+// fallback for when pty driving fails (CLI version drift, etc.).
 function ClaudeAuthSection({ health, onRefresh }) {
-  const [blob, setBlob] = useState("");
-  const [status, setStatus] = useState(null); // {type: "ok"|"err", msg}
-  const [saving, setSaving] = useState(false);
   const auth = health?.checks?.claude_auth || {};
   const present = auth.credentials_present === true;
   const skipped = auth.skipped === true;
-  const onSave = useCallback(async () => {
+
+  // Phase machine for the OAuth-driven flow.
+  const [phase, setPhase] = useState("idle"); // idle | awaiting | busy
+  const [sessionId, setSessionId] = useState("");
+  const [url, setUrl] = useState("");
+  const [code, setCode] = useState("");
+  const [error, setError] = useState("");
+  const [copied, setCopied] = useState(false);
+
+  // Legacy paste-the-blob form state (kept inside <details> below).
+  const [blob, setBlob] = useState("");
+  const [status, setStatus] = useState(null); // {type: "ok"|"err", msg}
+  const [saving, setSaving] = useState(false);
+
+  const onStart = useCallback(async () => {
+    setError("");
+    setPhase("busy");
+    try {
+      const res = await authFetch("/api/auth/claude/login/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data.detail || `HTTP ${res.status}`);
+        setPhase("idle");
+        return;
+      }
+      setSessionId(data.session_id || "");
+      setUrl(data.url || "");
+      setCode("");
+      setPhase("awaiting");
+    } catch (e) {
+      setError(String(e));
+      setPhase("idle");
+    }
+  }, []);
+
+  const onSubmit = useCallback(async () => {
+    if (!code.trim()) {
+      setError("Paste the code Anthropic showed you first.");
+      return;
+    }
+    setError("");
+    setPhase("busy");
+    try {
+      const res = await authFetch("/api/auth/claude/login/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, code }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data.detail || `HTTP ${res.status}`);
+        setPhase("awaiting");
+        return;
+      }
+      setSessionId("");
+      setUrl("");
+      setCode("");
+      setPhase("idle");
+      try { await onRefresh?.(); } catch (_) {}
+    } catch (e) {
+      setError(String(e));
+      setPhase("awaiting");
+    }
+  }, [sessionId, code, onRefresh]);
+
+  const onCancel = useCallback(async () => {
+    const sid = sessionId;
+    setSessionId("");
+    setUrl("");
+    setCode("");
+    setError("");
+    setPhase("idle");
+    if (!sid) return;
+    try {
+      await authFetch("/api/auth/claude/login/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sid }),
+      });
+    } catch (_) { /* best-effort */ }
+  }, [sessionId]);
+
+  const onCopyUrl = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (_) { /* best-effort */ }
+  }, [url]);
+
+  const onOpenUrl = useCallback(() => {
+    if (!url) return;
+    window.open(url, "_blank", "noopener,noreferrer");
+  }, [url]);
+
+  const onSavePaste = useCallback(async () => {
     if (!blob.trim()) {
       setStatus({ type: "err", msg: "Paste the credentials JSON first." });
       return;
@@ -3633,10 +3733,7 @@ function ClaudeAuthSection({ health, onRefresh }) {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setStatus({
-          type: "err",
-          msg: data.detail || `HTTP ${res.status}`,
-        });
+        setStatus({ type: "err", msg: data.detail || `HTTP ${res.status}` });
         return;
       }
       setStatus({ type: "ok", msg: "Saved. Agents will use this on next turn." });
@@ -3648,15 +3745,16 @@ function ClaudeAuthSection({ health, onRefresh }) {
       setSaving(false);
     }
   }, [blob, onRefresh]);
+
   return html`<section class="drawer-section">
     <h3>Claude auth</h3>
     ${skipped
       ? html`<p class="muted" style="color: var(--err);">
-          ✗ <code>CLAUDE_CONFIG_DIR</code> is not set — pasted credentials
-          would be lost on redeploy. Set it to a persistent path (e.g.
-          <code>/data/claude</code>) and redeploy first.
+          ✗ <code>CLAUDE_CONFIG_DIR</code> is not set — credentials
+          would be lost on redeploy. Set it to a persistent path
+          (e.g. <code>/data/claude</code>) and redeploy first.
         </p>`
-      : html`<p class="muted" style="margin: 0 0 6px 0;">
+      : html`<p class="muted" style="margin: 0 0 8px 0;">
           <strong style=${present ? "color: var(--ok);" : "color: var(--warn);"}>
             ${present ? "✓ authenticated" : "✗ not yet set"}
           </strong>
@@ -3664,39 +3762,116 @@ function ClaudeAuthSection({ health, onRefresh }) {
             ? html` <span class="muted">(${auth.config_dir})</span>`
             : null}
         </p>`}
-    <p class="muted" style="font-size: 11px; margin: 0 0 8px 0;">
-      On any machine with Claude Code installed, run <code>claude /login</code>,
-      then paste the contents of <code>~/.claude/.credentials.json</code>
-      below. Tokens refresh automatically from there on, and they live
-      on the persistent volume — so you only do this once, not on
-      every redeploy. Do it again only if you rotate credentials.
-    </p>
-    <textarea
-      rows="6"
-      placeholder='{"claudeAiOauth": {"accessToken": "...", "refreshToken": "...", ...}}'
-      value=${blob}
-      onInput=${(e) => setBlob(e.target.value)}
-      disabled=${saving || skipped}
-      style="width: 100%; font-family: ui-monospace, monospace; font-size: 11px; resize: vertical;"
-    ></textarea>
-    <div style="display: flex; gap: 8px; align-items: center; margin-top: 6px;">
-      <button
-        class="primary"
-        onClick=${onSave}
-        disabled=${saving || skipped || !blob.trim()}
-      >${saving ? "saving…" : "Save credentials"}</button>
-      ${status
-        ? html`<span style=${`font-size: 11px; color: var(--${status.type === "ok" ? "ok" : "err"});`}>
-            ${status.msg}
-          </span>`
-        : null}
-    </div>
-    <p class="muted" style="font-size: 11px; margin: 8px 0 0 0;">
-      Alternative: shell into the container and run <code>claude /login</code>
-      directly — the device-code flow lands tokens in the same file.
-      Prefer an API key instead? Set <code>ANTHROPIC_API_KEY</code> in the
-      Secrets store below; not all features work in API-key mode.
-    </p>
+
+    ${phase === "idle" ? html`
+      <p class="muted" style="font-size: 11px; margin: 0 0 8px 0;">
+        Click below to start an OAuth login from this server. You'll
+        get a URL to open in your browser, do the login dance on
+        <code>claude.ai</code>, then paste the code Anthropic shows
+        you back into this panel. Tokens persist on the
+        <code>${auth.config_dir || "/data"}</code> volume — you only
+        do this when first setting up or rotating credentials.
+      </p>
+      <div style="display: flex; gap: 8px; align-items: center;">
+        <button
+          class="primary"
+          onClick=${onStart}
+          disabled=${skipped}
+        >${present ? "Refresh tokens" : "Sign in to Claude"}</button>
+        ${error
+          ? html`<span style="font-size: 11px; color: var(--err);">${error}</span>`
+          : null}
+      </div>
+    ` : null}
+
+    ${phase === "busy" && !url ? html`
+      <p class="muted" style="font-size: 11px;">
+        Starting <code>claude /login</code>… (up to 30s)
+      </p>
+    ` : null}
+
+    ${phase === "awaiting" || (phase === "busy" && url) ? html`
+      <div style="border: 1px solid var(--border); border-radius: 4px; padding: 10px; margin-top: 4px;">
+        <p class="muted" style="font-size: 11px; margin: 0 0 6px 0;">
+          <strong>Step 1.</strong> Open this URL in your browser and
+          authorize:
+        </p>
+        <div style="display: flex; gap: 6px; align-items: stretch; margin-bottom: 6px;">
+          <input
+            readonly
+            value=${url}
+            onClick=${(e) => e.target.select()}
+            style="flex: 1; font-family: ui-monospace, monospace; font-size: 11px; padding: 4px 6px;"
+          />
+          <button
+            onClick=${onCopyUrl}
+            title="Copy URL to clipboard"
+            style="font-size: 11px;"
+          >${copied ? "copied!" : "copy"}</button>
+          <button
+            onClick=${onOpenUrl}
+            title="Open URL in a new tab"
+            style="font-size: 11px;"
+          >open</button>
+        </div>
+        <p class="muted" style="font-size: 11px; margin: 8px 0 4px 0;">
+          <strong>Step 2.</strong> Paste the code Anthropic shows
+          you here:
+        </p>
+        <textarea
+          rows="2"
+          placeholder="paste the code here"
+          value=${code}
+          onInput=${(e) => setCode(e.target.value)}
+          disabled=${phase === "busy"}
+          style="width: 100%; font-family: ui-monospace, monospace; font-size: 11px; resize: vertical;"
+        ></textarea>
+        <div style="display: flex; gap: 8px; align-items: center; margin-top: 6px;">
+          <button
+            class="primary"
+            onClick=${onSubmit}
+            disabled=${phase === "busy" || !code.trim()}
+          >${phase === "busy" ? "submitting…" : "Submit code"}</button>
+          <button onClick=${onCancel} disabled=${phase === "busy"}>Cancel</button>
+          ${error
+            ? html`<span style="font-size: 11px; color: var(--err);">${error}</span>`
+            : null}
+        </div>
+      </div>
+    ` : null}
+
+    <details style="margin-top: 12px;">
+      <summary style="font-size: 11px; cursor: pointer; color: var(--muted);">
+        Stuck? Paste a credentials.json from another machine instead
+      </summary>
+      <div style="margin-top: 8px;">
+        <p class="muted" style="font-size: 11px; margin: 0 0 8px 0;">
+          On any machine with Claude Code installed, run
+          <code>claude /login</code>, then paste the contents of
+          <code>~/.claude/.credentials.json</code> below.
+        </p>
+        <textarea
+          rows="6"
+          placeholder='{"claudeAiOauth": {"accessToken": "...", "refreshToken": "...", ...}}'
+          value=${blob}
+          onInput=${(e) => setBlob(e.target.value)}
+          disabled=${saving || skipped}
+          style="width: 100%; font-family: ui-monospace, monospace; font-size: 11px; resize: vertical;"
+        ></textarea>
+        <div style="display: flex; gap: 8px; align-items: center; margin-top: 6px;">
+          <button
+            class="primary"
+            onClick=${onSavePaste}
+            disabled=${saving || skipped || !blob.trim()}
+          >${saving ? "saving…" : "Save credentials"}</button>
+          ${status
+            ? html`<span style=${`font-size: 11px; color: var(--${status.type === "ok" ? "ok" : "err"});`}>
+                ${status.msg}
+              </span>`
+            : null}
+        </div>
+      </div>
+    </details>
   </section>`;
 }
 

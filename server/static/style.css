@@ -112,49 +112,70 @@ body {
   .rail-group.rail-agents::-webkit-scrollbar { display: none; }
   /* All `!important` here because the mobile @media block sits BEFORE
      the desktop `.rail-bottom` rule in source order, so the cascade
-     would otherwise let desktop values win on mobile screens. */
+     would otherwise let desktop values win on mobile screens.
+     Flex (not grid) so the tools group can absorb whatever width is
+     left after ws-dot + actions, and the 6 tool buttons compress
+     evenly to fit on a single row even on narrow phones (kanban no
+     longer wraps to a 2nd line). */
   .rail-bottom {
-    display: grid !important;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    display: flex !important;
+    flex-direction: row;
     align-items: center !important;
-    justify-items: center !important;
     width: 100% !important;
     flex: 0 0 auto !important;
-    padding: 1px 7px !important;
-    gap: 0 !important;
+    padding: 1px 6px !important;
+    gap: 4px !important;
   }
   .rail-bottom .rail-group { padding: 0; }
-  .rail-bottom .mobile-ws-dot { grid-column: 1; justify-self: center; }
-  .rail-group.rail-files,
-  .rail-group.rail-controls,
-  .rail-group.rail-env {
-    width: 100%;
+  .rail-bottom .mobile-ws-dot { flex: 0 0 auto; }
+  /* Hairline dividers are vertical-rail decoration only — the mobile
+     bottom bar relies on the gap + flex grouping for visual breaks. */
+  .rail-bottom > .rail-divider { display: none; }
+  /* Tools (files/project/compass/kanban/recurrence/env) take all the
+     remaining width; flex children shrink so 6 26px-buttons fit a
+     ~280px-wide gap on a 360px screen without any of them dropping
+     to a second line. justify-content: space-between spreads them
+     evenly within the available space. */
+  .rail-group.rail-tools {
+    display: flex !important;
     flex: 1 1 auto;
-    margin-left: 0;
-    justify-content: center;
+    flex-direction: row !important;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0;
+    min-width: 0;
   }
-  .rail-group.rail-files {
-    grid-column: 2 / span 2;
-    display: grid !important;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    justify-items: center;
+  /* Actions (pause + settings; cancel-all when working) sit at the
+     right end with their natural content width. */
+  .rail-group.rail-actions {
+    display: flex !important;
+    flex: 0 0 auto;
+    flex-direction: row !important;
+    align-items: center;
+    gap: 3px;
   }
-  .rail-group.rail-controls { grid-column: 4; }
-  .rail-group.rail-env {
-    grid-column: 5 / span 2;
-    display: grid !important;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    justify-items: center;
+  .rail-group.rail-actions .rail-layout-presets {
+    display: contents;
   }
-  .rail-group.rail-env .settings-toggle { order: 1; }
-  .rail-group.rail-env .env-toggle { order: 2; }
+  /* Compact gear footprint on mobile. flex-shrink: 1 lets the 6
+     tools buttons squeeze below the 26px nominal width if a 320px
+     phone needs it, instead of one wrapping. */
   .rail-bottom .gear {
     width: 26px;
     height: 24px;
+    flex: 0 1 26px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     font-size: 15px;
+    min-width: 22px;
+  }
+  /* The project-switcher wrapper is a flex child of rail-tools (not
+     the .gear button itself), so propagate the same shrink rule
+     to it explicitly. */
+  .rail-group.rail-tools .project-switcher {
+    flex: 0 1 26px;
+    min-width: 22px;
   }
   .rail-bottom .gear.project-placeholder {
     width: 24px;
@@ -296,14 +317,13 @@ body {
   gap: 4px;
   overflow-y: auto;
 }
-/* Four logical groups in the rail (top → bottom):
+/* Three logical groups in the rail (top → bottom):
      rail-agents   the team (Coach + 10 Players)
-     rail-files    files + project-selector placeholder
-     rail-controls layout presets, cancel-all, pause
-     rail-env      env-pane toggle, settings
-   Agents sit at the top; the bottom block is pushed down by an
-   auto-margin on the first non-agent group, with fixed gaps between
-   the bottom subgroups so they read as separate sections. */
+     rail-tools    files / project / compass / kanban / recurrence / env
+     rail-actions  pause-play, layout presets, cancel-all, settings
+   Agents sit at the top, then a hairline `rail-divider`, then tools,
+   another divider, then actions. The actions group is pinned to the
+   bottom via a `margin-top: auto` on its leading divider. */
 .rail-group {
   display: flex;
   flex-direction: column;
@@ -317,9 +337,8 @@ body {
 .rail-group.rail-agents .slot { height: 26px; }
 .rail-group.rail-agents .slot.open::before { top: 4px; bottom: 4px; }
 /* Desktop: rail-bottom is a transparent flex column that takes the
-   remaining vertical space below rail-agents. The existing
-   margin-top: auto on rail-files pushes the bottom block down within
-   it. Mobile (< 700px) overrides this to flex-row inline. */
+   remaining vertical space below rail-agents. Mobile (< 700px)
+   overrides this to a 6-col grid inline. */
 .rail-bottom {
   display: flex;
   flex-direction: column;
@@ -328,9 +347,41 @@ body {
   width: 100%;
   gap: 4px;
 }
-.rail-group.rail-files { margin-top: auto; }
-.rail-group.rail-controls,
-.rail-group.rail-env { margin-top: 14px; }
+/* Hairline section separator between agents / tools / actions. The
+   second divider (the one after rail-tools, sitting just above
+   rail-actions) gets `margin-top: auto` so the actions group sticks
+   to the bottom of the rail regardless of how tall the rail is. */
+.rail-divider {
+  width: 22px;
+  height: 1px;
+  background: var(--border);
+  flex: 0 0 1px;
+  margin: 2px 0;
+}
+.rail-bottom > .rail-tools ~ .rail-divider { margin-top: auto; }
+/* Pause/play and the two layout-preset buttons live in rail-actions
+   and read as a single bar of controls — pull the gear footprint in
+   so they don't feel like rail-tool icons. */
+.rail-group.rail-actions .gear.pause-toggle {
+  width: 26px;
+  height: 22px;
+  font-size: 14px;
+}
+/* The two layout presets share a wrapper so we can pull their gap
+   tighter without affecting siblings (pause-toggle, settings). On
+   the vertical rail the wrapper is a column with a near-zero gap,
+   which visually fuses the two icons into one cluster. */
+.rail-group.rail-actions .rail-layout-presets {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+}
+.rail-group.rail-actions .gear.layout-preset {
+  width: 24px;
+  height: 20px;
+  padding: 1px 4px;
+}
 @keyframes ws-disconnected-pulse {
   0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(255, 80, 100, 0.5); }
   50%      { opacity: 0.4; box-shadow: 0 0 0 4px rgba(255, 80, 100, 0); }

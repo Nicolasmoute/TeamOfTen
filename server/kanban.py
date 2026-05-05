@@ -701,17 +701,28 @@ async def _transition(
     `reset_started_at=True` on audit-fail reverts so the card flips to
     'assigned, not started' (executor's avatar goes hollow) until the
     auto-wake actually spawns the next turn.
+
+    v0.3.9: when the transition is `<live_stage> → archive` AND the
+    reason is a natural-completion path (the trajectory played out
+    end-to-end via shipper / executor / auditor signals — NOT
+    Coach-forced 'manual', NOT rung-4 'auto_archive_stalled'), also
+    emit a `task_completed` event routed to Coach and wake Coach with
+    a prompt to summarize the outcome to the user.
     """
+    title: str | None = None
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT status FROM tasks WHERE id = ? AND project_id = ?",
+            "SELECT status, title FROM tasks "
+            "WHERE id = ? AND project_id = ?",
             (task_id, project_id),
         )
         row = await cur.fetchone()
         if not row:
             return
-        old_status = dict(row)["status"]
+        rd = dict(row)
+        old_status = rd["status"]
+        title = rd.get("title")
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
         # Every transition stamps last_stage_change_at + clears any
@@ -759,6 +770,176 @@ async def _transition(
         "reason": reason,
         "owner": owner,
     })
+
+    # v0.3.9 trajectory-completion notification. Fires only on
+    # natural completion paths so Coach is told to summarize for the
+    # user. Skipped on Coach-forced manual archives (Coach already
+    # knows + decides what to tell the user) and on rung-4
+    # auto-archive (the human_attention escalation already informs
+    # the user, and Coach summarizing a forced kill is misleading).
+    if new_status == "archive" and reason in _NATURAL_ARCHIVE_REASONS:
+        try:
+            await _emit_task_completed(
+                task_id=task_id,
+                title=title or "",
+                from_stage=old_status,
+                reason=reason,
+                owner=owner,
+                ts=now,
+            )
+        except Exception:
+            logger.exception(
+                "kanban: task_completed notify failed (task_id=%s)", task_id
+            )
+
+
+# Reasons that represent a trajectory playing out end-to-end.
+# `shipped` — shipper called coord_mark_shipped after ship-stage work.
+# `commit_pushed` / `task_execution_completed` — execute was the last
+#   trajectory entry, so the work itself terminates the trajectory.
+# `audit_pass` — audit was the last trajectory entry (rare but valid).
+_NATURAL_ARCHIVE_REASONS: frozenset[str] = frozenset({
+    "shipped",
+    "commit_pushed",
+    "task_execution_completed",
+    "audit_pass",
+})
+
+
+async def _emit_task_completed(
+    *,
+    task_id: str,
+    title: str,
+    from_stage: str,
+    reason: str,
+    owner: str | None,
+    ts: str,
+) -> None:
+    """Publish `task_completed` event + wake Coach with a summary
+    prompt. Coach's reply lands in the chat panel + (if Telegram is
+    configured + this turn was user-triggered) flushes to the user's
+    phone via the existing user-initiated-turn filter.
+    """
+    # Pull the trajectory + executor + last-stage assignee for the
+    # event payload (lets the Coach prompt render the full path).
+    trajectory_str = ""
+    executor: str | None = None
+    last_stage_owner: str | None = None
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT trajectory, owner FROM tasks WHERE id = ?",
+                (task_id,),
+            )
+            r = await cur.fetchone()
+            if r:
+                rd = dict(r)
+                trajectory_str = rd.get("trajectory") or ""
+                executor = rd.get("owner")
+            # Look up who handled the final pre-archive stage so the
+            # summary names them. For shipped → ship's owner; for
+            # commit_pushed → execute's owner; etc.
+            role_for_last = {
+                "ship": "shipper",
+                "audit_syntax": "auditor_syntax",
+                "audit_semantics": "auditor_semantics",
+                "execute": "executor",
+                "plan": "planner",
+            }.get(from_stage)
+            if role_for_last:
+                cur = await c.execute(
+                    "SELECT owner FROM task_role_assignments "
+                    "WHERE task_id = ? AND role = ? "
+                    "ORDER BY assigned_at DESC LIMIT 1",
+                    (task_id, role_for_last),
+                )
+                rr = await cur.fetchone()
+                if rr:
+                    last_stage_owner = dict(rr).get("owner")
+        finally:
+            await c.close()
+    except Exception:
+        pass
+
+    # Render a compact trajectory marker the prompt can show inline.
+    trajectory_marker = _trajectory_marker_from_json(trajectory_str)
+
+    await bus.publish({
+        "ts": ts,
+        "agent_id": "system",
+        "type": "task_completed",
+        "task_id": task_id,
+        "title": title,
+        "trajectory": trajectory_str,
+        "trajectory_marker": trajectory_marker,
+        "from_stage": from_stage,
+        "reason": reason,
+        "executor": executor,
+        "last_stage_owner": last_stage_owner,
+        "owner": owner,
+        "to": "coach",
+    })
+
+    # Wake Coach with a summary prompt. The prompt names the task,
+    # the path, the executor + last-stage assignee, and asks Coach
+    # to send a summary to the user (broadcast / Telegram). Coach
+    # decides the right channel based on who was asking.
+    last_label = (
+        f"the {from_stage} stage was completed by {last_stage_owner}"
+        if last_stage_owner else f"the task wrapped after {from_stage}"
+    )
+    exec_label = f"executor: {executor}" if executor else "no executor recorded"
+    body = (
+        f"Task {task_id} completed: {title!r}. Trajectory: "
+        f"{trajectory_marker or '(unknown)'}. {last_label}; {exec_label}. "
+        f"Final reason: {reason}.\n\n"
+        f"Send a summary of the outcome to the user. Cover: "
+        f"(1) what was delivered, (2) any caveats / known limitations / "
+        f"open questions, (3) whether follow-up tasks are needed. Use "
+        f"coord_send_message(to='broadcast', body=...) if the user is "
+        f"watching the harness UI, or just reply normally — if this "
+        f"turn was user-triggered (web composer or Telegram inbound), "
+        f"the bridge will forward your text to the user's phone "
+        f"automatically. Keep it concise (3-6 sentences) unless the "
+        f"work is complex enough to need more."
+    )
+    try:
+        from server.agents import maybe_wake_agent
+        await maybe_wake_agent("coach", body, bypass_debounce=True)
+    except Exception:
+        logger.exception(
+            "kanban: failed to wake Coach for task_completed %s", task_id
+        )
+
+
+def _trajectory_marker_from_json(traj_json: str) -> str:
+    """`P → E → AY → AS → S` style abbreviation. Returns empty
+    string on parse failure — the prompt then falls back to a
+    generic '(unknown)' label."""
+    if not traj_json:
+        return ""
+    try:
+        parsed = json.loads(traj_json)
+    except Exception:
+        return ""
+    if not isinstance(parsed, list):
+        return ""
+    tokens = {
+        "plan": "P",
+        "execute": "E",
+        "audit_syntax": "AY",
+        "audit_semantics": "AS",
+        "ship": "S",
+    }
+    parts = []
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        stage = entry.get("stage")
+        if stage in tokens:
+            parts.append(tokens[stage])
+    return " → ".join(parts)
 
 
 async def _has_active_role(task_id: str, role: str) -> bool:

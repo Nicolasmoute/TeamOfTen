@@ -278,6 +278,34 @@ latest review report attach to the task and the executor is auto-
 woken with both. Compass auto-audit fires informationally on every
 commit; the assigned Player reviewer is the gate, not Compass.
 
+#### Trajectory completion → Coach summarizes for the user
+
+When a task hits `archive` via a natural-completion path
+(shipper called `coord_mark_shipped`; or executor signalled done
+on a trajectory whose execute is the last stage; or the final audit
+returned pass) the kanban auto-wakes Coach with a summary prompt.
+This is Coach's signal to tell the user what was accomplished.
+
+Coach: when you receive a `task_completed` wake, send a concise
+summary to the user (3–6 sentences for normal work, more if the
+task warrants it). Cover:
+1. **What was delivered** — concrete outcome, not process.
+2. **Caveats / known limitations / open questions** — anything
+   the user should know before relying on the deliverable.
+3. **Follow-up** — whether the work needs another task, a
+   review pass, or a decision from the user.
+
+Channel: if the turn that originated this trajectory was
+user-triggered (web composer or Telegram inbound), reply normally
+and the bridge forwards your text to the user's phone. Otherwise
+use `coord_send_message(to='broadcast', body=...)` so the user
+sees it on the harness UI.
+
+NOT fired for `coord_advance_task_stage(stage='archive')` (Coach
+forced — Coach already knows) or for stall-ladder auto-archives
+(`human_attention` already pings the user). Coach summarizing a
+forced kill would be misleading.
+
 #### Self-audit when the trajectory has no audit stage
 
 If the trajectory has no `audit_syntax` and no `audit_semantics`

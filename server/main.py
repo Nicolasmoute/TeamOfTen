@@ -382,6 +382,17 @@ async def lifespan(app: FastAPI):
         await start_idle_poller()
     except Exception:
         logger.exception("idle player poller failed to start (non-fatal)")
+    # Claude in-app OAuth login reaper — drops orphaned login sessions
+    # (CLI subprocess + pty fd) after SESSION_TTL. Non-POSIX hosts
+    # short-circuit this; the start_login_reaper call is still safe to
+    # make because the underlying loop is just an asyncio.sleep + dict
+    # walk — the actual subprocess work only happens inside
+    # claude_login.start_login(), which the HTTP endpoint guards.
+    from server.claude_login import start_login_reaper, stop_login_reaper
+    try:
+        await start_login_reaper()
+    except Exception:
+        logger.exception("claude_login reaper failed to start (non-fatal)")
     # Project CLAUDE.md reconciliation — fire a hidden Coach-driven
     # update for the currently-pinned active project so a redeploy
     # that changes the canonical template at
@@ -410,6 +421,10 @@ async def lifespan(app: FastAPI):
             await stop_idle_poller()
         except Exception:
             logger.exception("idle player poller shutdown failed")
+        try:
+            await stop_login_reaper()
+        except Exception:
+            logger.exception("claude_login reaper shutdown failed")
         try:
             await stop_kanban_subscriber()
         except Exception:
@@ -1019,6 +1034,93 @@ async def set_claude_auth(
         "path": str(target_file),
         "credentials_present": True,
     }
+
+
+# ------------------------------------------------------------------
+# Claude Code in-app OAuth login. Drives `claude /login` as a pty
+# subprocess inside the container so the operator can complete the
+# OAuth dance from the harness UI without shelling in or running the
+# CLI on a separate laptop. Three-step flow:
+#   1. POST /api/auth/claude/login/start  → returns {session_id, url}
+#   2. (User opens URL in browser, authorizes, copies code)
+#   3. POST /api/auth/claude/login/submit → {ok: true} once the CLI
+#      writes .credentials.json
+# Cancel + reaper handle teardown. POSIX-only; Windows hosts get a
+# 501 + paste-fallback hint. See server/claude_login.py.
+# ------------------------------------------------------------------
+@app.post("/api/auth/claude/login/start", dependencies=[Depends(require_token)])
+async def claude_login_start(
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    from server import claude_login as _cl
+    if sys.platform == "win32":
+        raise HTTPException(
+            501,
+            detail=(
+                "pty-driven login is POSIX-only — this harness is running on "
+                "a Windows host. Use the paste-credentials fallback below."
+            ),
+        )
+    if not os.environ.get("CLAUDE_CONFIG_DIR", "").strip():
+        raise HTTPException(
+            400,
+            detail=(
+                "CLAUDE_CONFIG_DIR is not set, so the CLI's tokens would have "
+                "nowhere durable to land. Set it to a persistent path "
+                "(e.g. /data/claude) and redeploy."
+            ),
+        )
+    try:
+        result = await _cl.start_login()
+    except RuntimeError as e:
+        raise HTTPException(502, detail=str(e))
+    await bus.publish({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": "system",
+        "type": "claude_login_started",
+        "actor": actor,
+    })
+    return result  # {session_id, url}
+
+
+@app.post("/api/auth/claude/login/submit", dependencies=[Depends(require_token)])
+async def claude_login_submit(
+    payload: dict[str, Any] = Body(...),
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    from server import claude_login as _cl
+    sid = str(payload.get("session_id") or "").strip()
+    code = str(payload.get("code") or "").strip()
+    if not sid or not code:
+        raise HTTPException(400, detail="session_id and code are required")
+    try:
+        result = await _cl.submit_code(sid, code)
+    except RuntimeError as e:
+        raise HTTPException(400, detail=str(e))
+    await bus.publish({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": "system",
+        "type": "claude_login_completed",
+        "actor": actor,
+    })
+    return result  # {ok: true}
+
+
+@app.post("/api/auth/claude/login/cancel", dependencies=[Depends(require_token)])
+async def claude_login_cancel(
+    payload: dict[str, Any] = Body(...),
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    from server import claude_login as _cl
+    sid = str(payload.get("session_id") or "").strip()
+    await _cl.cancel_login(sid)
+    await bus.publish({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": "system",
+        "type": "claude_login_cancelled",
+        "actor": actor,
+    })
+    return {"ok": True}
 
 
 @app.get("/api/status", dependencies=[Depends(require_token)])
