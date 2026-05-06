@@ -170,10 +170,14 @@ def _stub_llm(
     candidates_count}."""
     calls: list[dict[str, Any]] = []
 
-    async def _fake(system: str, user: str, *, candidates_count: int):
+    async def _fake(
+        system: str, user: str, *,
+        candidates_count: int, project_id: str | None = None,
+    ):
         calls.append({
             "system": system, "user": user,
             "candidates_count": candidates_count,
+            "project_id": project_id,
         })
         return wd.WatchdogLLMResult(
             text=response_text,
@@ -274,6 +278,46 @@ async def test_tier1_coach_skipped() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tier1_working_chatty_no_tool_use_is_candidate() -> None:
+    """AUDIT-2026-05-06 regression: a working agent that's been
+    emitting `text` events for 20 min without ever calling a tool MUST
+    be flagged. Earlier code did `ref = last_tool_dt or last_event_dt`
+    which let chatty-but-tool-silent agents slip through."""
+    await _set_agent(slot="p1", status="working")
+    # Recent text events (5s ago) but no tool_use ever.
+    recent = _now() - timedelta(seconds=5)
+    older = _now() - timedelta(minutes=15)
+    await _add_event(agent_id="p1", type_="text", ts=older,
+                     payload={"text": "let me think about this"})
+    await _add_event(agent_id="p1", type_="text", ts=recent,
+                     payload={"text": "still thinking"})
+
+    candidates = await wd._tier1_candidates()
+    slots = [c.slot for c in candidates]
+    assert "p1" in slots
+    sig = next(c.signal for c in candidates if c.slot == "p1")
+    assert sig == "working_no_tool_use"
+
+
+@pytest.mark.asyncio
+async def test_tier1_working_old_tool_use_recent_text_is_candidate() -> None:
+    """A working agent whose last tool_use was 15 min ago, even
+    if they emitted `text` 5s ago, IS a candidate. Recent text
+    events do NOT reset the tool_use timer."""
+    await _set_agent(slot="p1", status="working")
+    old_tool = _now() - timedelta(minutes=15)
+    recent_text = _now() - timedelta(seconds=5)
+    await _add_event(agent_id="p1", type_="tool_use", ts=old_tool,
+                     payload={"name": "Read", "input": {}})
+    await _add_event(agent_id="p1", type_="text", ts=recent_text,
+                     payload={"text": "I'll keep going"})
+
+    candidates = await wd._tier1_candidates()
+    slots = [c.slot for c in candidates]
+    assert "p1" in slots
+
+
+@pytest.mark.asyncio
 async def test_tier1_max_candidates_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -371,6 +415,70 @@ async def test_actionable_verdict_emits_watchdog_finding(
     assert f["task_id"] == task_id
     assert "coord_write_task_spec" in f["reason"]
     assert f["to"] == "coach"
+
+
+@pytest.mark.asyncio
+async def test_finding_event_carries_pinned_project_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AUDIT-2026-05-06: project_id is captured at sweep start and
+    stamped explicitly on `watchdog_finding`, so a mid-sweep project
+    switch can't land findings on the wrong project's Coach rollup."""
+    import asyncio as _asyncio
+
+    task_id = "t-2026-01-01-99999991"
+    await _ensure_project("alpha")
+    await _create_task(task_id=task_id, project_id="alpha", status="plan")
+    await _set_agent(slot="p1", status="idle", current_task_id=task_id)
+    old = _now() - timedelta(minutes=20)
+    await _add_event(
+        agent_id="p1", type_="text", ts=old,
+        payload={"text": "wrote the spec"}, project_id="alpha",
+    )
+
+    # Force resolve_active_project to "alpha" at sweep start so we
+    # observe the pinned id even when bus.publish would auto-stamp
+    # something else (the active project in this test fixture is the
+    # default "misc").
+    from server import db as dbmod
+
+    async def _fake_active(*args, **kwargs):
+        return "alpha"
+
+    monkeypatch.setattr(dbmod, "resolve_active_project", _fake_active)
+
+    fired: list[dict[str, Any]] = []
+    q = bus.subscribe()
+
+    async def _drain():
+        while True:
+            try:
+                ev = await q.get()
+                fired.append(ev)
+            except Exception:
+                return
+
+    drain_task = _asyncio.create_task(_drain())
+    calls = _stub_llm(
+        monkeypatch,
+        '{"verdicts":[{"agent_id":"p1","verdict":"finished_not_reported",'
+        '"reason":"declared done in chat"}]}',
+    )
+    await wd.sweep_once()
+    await _asyncio.sleep(0.05)
+    drain_task.cancel()
+    bus.unsubscribe(q)
+
+    # The pinned id reaches `_call_llm` (and thus `_call_haiku` →
+    # `watchdog_llm_call` event in real usage).
+    assert calls and calls[0]["project_id"] == "alpha"
+
+    # The published `watchdog_finding` event carries the explicit
+    # project_id, overriding bus.publish's auto-stamp from the
+    # currently-active project.
+    findings = [e for e in fired if e.get("type") == "watchdog_finding"]
+    assert len(findings) == 1
+    assert findings[0]["project_id"] == "alpha"
 
 
 @pytest.mark.asyncio

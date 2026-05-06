@@ -243,16 +243,27 @@ async def _tier1_candidates() -> list[Candidate]:
 
         # Signal A: working but no tool_use in window. A "working"
         # agent that hasn't called a tool recently is either looping
-        # via plain text or stuck inside a long thought/reasoning
-        # phase — both warrant a closer look.
+        # via plain text, stuck in a long thought, or hung — all
+        # warrant a closer look. Crucially, the absence of `tool_use`
+        # is the signal — recent `text` events do NOT reset the timer
+        # (a 20-min monologue without a single tool call IS the
+        # stall pattern we want to catch). AUDIT-2026-05-06 fix:
+        # earlier code used `ref = last_tool_dt or last_event_dt`,
+        # which let a chatty-but-tool-silent agent slip through.
         if status == "working":
-            ref = last_tool_dt or last_event_dt
-            # No events at all for a working agent → recently spawned;
-            # too early to flag. The session-start grace prevents
-            # "we just spawned p3" → "p3 hasn't called a tool yet".
-            if ref is None:
+            # Skip freshly-spawned agents (no events recorded yet).
+            # `last_event_dt is None` means the agent hasn't even
+            # emitted `agent_started` yet — too early.
+            if last_event_dt is None:
                 continue
-            if (now - ref).total_seconds() >= no_tool_thresh:
+            # Treat "no tool_use ever" as infinite age so the
+            # threshold check fires. A working agent with events but
+            # no tool calls IS suspicious.
+            if last_tool_dt is None:
+                tool_age = float("inf")
+            else:
+                tool_age = (now - last_tool_dt).total_seconds()
+            if tool_age >= no_tool_thresh:
                 candidates.append(Candidate(
                     slot=slot,
                     signal="working_no_tool_use",
@@ -433,10 +444,16 @@ async def _call_haiku(
     user: str,
     *,
     candidates_count: int,
+    project_id: str | None = None,
 ) -> WatchdogLLMResult:
     """Run one Haiku one-shot call. Mirrors compass.llm.call's shape
     but writes the turns ledger row under `agent_id="watchdog"` so
     cost attribution is unambiguous in the EnvPane meter.
+
+    `project_id` is the active project pinned at sweep start; it's
+    threaded into the `watchdog_llm_call` bus event so dashboard
+    counters partition correctly across project switches. None falls
+    back to `bus.publish`'s auto-stamp.
 
     Lazy-imports `claude_agent_sdk` so a hermetic test environment
     without the SDK can still load this module (tests stub
@@ -555,7 +572,7 @@ async def _call_haiku(
 
     # Live UI counter event — mirrors compass_llm_call.
     try:
-        await bus.publish({
+        ev: dict[str, Any] = {
             "ts": _now_iso(),
             "agent_id": "watchdog",
             "type": "watchdog_llm_call",
@@ -566,7 +583,10 @@ async def _call_haiku(
             "output_tokens": output_tokens,
             "candidates": candidates_count,
             "is_error": is_error,
-        })
+        }
+        if project_id:
+            ev["project_id"] = project_id
+        await bus.publish(ev)
     except Exception:
         pass
 
@@ -735,9 +755,19 @@ def _dedup_should_emit(key: str) -> bool:
     return True
 
 
-async def _emit_findings(verdicts: list[dict[str, Any]]) -> int:
+async def _emit_findings(
+    verdicts: list[dict[str, Any]], *, project_id: str | None = None,
+) -> int:
     """For each actionable verdict, dedup + emit `watchdog_finding`.
-    Returns the number of fresh findings emitted this sweep."""
+    Returns the number of fresh findings emitted this sweep.
+
+    `project_id` is captured at sweep start and stamped explicitly on
+    each emitted event so a project switch mid-sweep doesn't land
+    findings on the wrong project's Coach rollup. `bus.publish`
+    auto-stamps from `resolve_active_project()` only when the caller
+    didn't set the field, so providing it here pins the value. None
+    falls back to auto-stamp (no behavior change for legacy callers).
+    """
     emitted = 0
     wake_high = _wake_coach_on_high()
     for v in verdicts:
@@ -761,6 +791,8 @@ async def _emit_findings(verdicts: list[dict[str, Any]]) -> int:
             "hash": key,
             "to": "coach",
         }
+        if project_id:
+            ev_payload["project_id"] = project_id
         try:
             await bus.publish(ev_payload)
         except Exception:
@@ -772,7 +804,7 @@ async def _emit_findings(verdicts: list[dict[str, Any]]) -> int:
 
         if verdict == VERDICT_ERRORING:
             try:
-                await bus.publish({
+                attn: dict[str, Any] = {
                     "ts": _now_iso(),
                     "agent_id": "system",
                     "type": "human_attention",
@@ -783,7 +815,10 @@ async def _emit_findings(verdicts: list[dict[str, Any]]) -> int:
                     "body": v["reason"] or "(no reason captured)",
                     "urgency": "medium",
                     "to": "human",
-                })
+                }
+                if project_id:
+                    attn["project_id"] = project_id
+                await bus.publish(attn)
             except Exception:
                 pass
 
@@ -818,8 +853,13 @@ async def _emit_findings(verdicts: list[dict[str, Any]]) -> int:
 # Indirection so tests can monkeypatch the LLM call cheaply.
 async def _call_llm(
     system: str, user: str, *, candidates_count: int,
+    project_id: str | None = None,
 ) -> WatchdogLLMResult:
-    return await _call_haiku(system, user, candidates_count=candidates_count)
+    return await _call_haiku(
+        system, user,
+        candidates_count=candidates_count,
+        project_id=project_id,
+    )
 
 
 async def _within_cost_cap() -> bool:
@@ -844,9 +884,25 @@ async def _within_cost_cap() -> bool:
 async def sweep_once() -> int:
     """Run one full watchdog cycle. Returns the number of fresh
     findings emitted (deduped). Exposed for tests so they can drive
-    the loop deterministically without waiting on the idle poller."""
+    the loop deterministically without waiting on the idle poller.
+
+    AUDIT-2026-05-06: capture `project_id` at sweep start and pass it
+    through to `_emit_findings` so a mid-sweep project switch can't
+    land findings on the wrong project's Coach rollup. The LLM call
+    event also carries this pinned id.
+    """
     if not _flag_enabled():
         return 0
+
+    # Pin project_id at sweep start. Any switch during the sweep
+    # leaves us emitting against the project the candidates actually
+    # belong to.
+    pinned_project: str | None = None
+    try:
+        from server.db import resolve_active_project  # noqa: PLC0415
+        pinned_project = await resolve_active_project()
+    except Exception:
+        pinned_project = None
 
     candidates: list[Candidate] = []
     try:
@@ -880,6 +936,7 @@ async def sweep_once() -> int:
         result = await _call_llm(
             _SYSTEM_PROMPT, user_prompt,
             candidates_count=len(hydrated),
+            project_id=pinned_project,
         )
     except Exception:
         logger.exception("watchdog: LLM call crashed")
@@ -892,7 +949,7 @@ async def sweep_once() -> int:
         return 0
 
     verdicts = _parse_verdicts_response(result.text, hydrated)
-    return await _emit_findings(verdicts)
+    return await _emit_findings(verdicts, project_id=pinned_project)
 
 
 __all__ = [

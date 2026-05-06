@@ -1279,6 +1279,22 @@ Followed by: "If the file is junk / superseded, ignore it — the reconciliation
 
 This block addresses the recurring "Player did the work but the kanban didn't notice" failure mode — Coach sees the artifact path AND the exact override call to make in one place, no construction overhead.
 
+### 18.3b Coach's `## Soft stalls (watchdog-detected)` rollup (v0.3.9)
+
+Sibling to `## Stalled tasks` and `## Unrecorded artifacts on disk`, fed by the soft-stall watchdog (§10.7). Built by `_build_soft_stalls_rows(project_id)` ([server/agents.py](../server/agents.py)) — reads `watchdog_finding` events from the last 1h scoped to the active project, deduped per `(subject_agent, verdict)` (most recent wins), capped at 10 rows.
+
+Cross-check before surfacing each row: drop the finding when the flagged agent's `current_task_id` no longer points at the named task (Coach already advanced or reassigned it), or when the task's `status = 'archive'` (terminal). This protects Coach from chasing already-resolved problems — the same shape as §18.3a's spec_path / report_path freshness check.
+
+Format:
+```
+- p3 (finished_not_reported) on t-42 — Agent posted "wrote spec.md, ready for review" but never called coord_write_task_spec.
+- p7 (blocked) on t-39 — Audit fail comment is ambiguous; can't decide which fix to apply.
+```
+
+Followed by a verdict-action guide pointing at the right Coach tool: `finished_not_reported` → submit on the agent's behalf via `coord_advance_task_stage` / `coord_write_task_spec` / `coord_submit_audit_report` with `on_behalf_of=...`; `blocked` → clarify via `coord_send_message` or rewrite via `coord_set_task_trajectory`; `erroring` → read recent `tool_results`, retry, or escalate via `coord_request_human`; `looping` → bump quality with `coord_set_player_effort` then `coord_set_player_model`.
+
+Distinct from §18.3 (stalled tasks): the deterministic stall ladder fires on `tasks.last_stage_change_at` thresholds (30min / 1h / 2h / 4h). The watchdog catches the *earlier* soft stalls — the agent declared completion in chat but didn't transition the kanban; the agent looped in plain text without calling a tool — that look fine to SQL but represent real lost time. Both rollups can fire on the same task in different windows; the verdicts are complementary, not redundant.
+
 ### 18.4 `GET /api/tasks/flow_health` endpoint
 
 Returns:
