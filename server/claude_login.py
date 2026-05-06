@@ -136,6 +136,12 @@ def looks_like_success(text: str) -> bool:
 
 # --------------------------------------------------------------- session
 
+# Terminal screen size for the embedded pyte emulator. Wide enough
+# that the OAuth URL fits on one line in any reasonable rendering.
+_TERM_COLS = 200
+_TERM_ROWS = 60
+
+
 @dataclass
 class LoginSession:
     sid: str
@@ -143,26 +149,78 @@ class LoginSession:
     master_fd: int
     started_at: datetime
     url: Optional[str] = None
+    # Raw bytes read from the pty, ANSI-stripped. Kept for error
+    # messages so debugging output reflects exactly what came over
+    # the wire.
     buffer: str = ""
     closed: bool = False
     # Wall-clock when the .credentials.json file existed before we
     # started; used by the submit-tie-breaker to decide whether the
     # CLI just wrote a fresh file or we're seeing a stale one.
     pre_existing_creds_mtime: float = 0.0
+    # Pyte terminal emulator state. The TUI uses cursor-positioning
+    # escapes to redraw — feeding raw bytes through pyte gives us a
+    # screen grid that reflects what's actually visible, instead of
+    # a linear concat of all writes (which scrambles URLs into
+    # `https://clud.com/cai/...`). Lazily constructed in __post_init__
+    # to keep the module importable on Windows.
+    _pyte_screen: object = None
+    _pyte_stream: object = None
+
+    def __post_init__(self) -> None:
+        try:
+            import pyte
+            self._pyte_screen = pyte.Screen(_TERM_COLS, _TERM_ROWS)
+            self._pyte_stream = pyte.ByteStream(self._pyte_screen)
+        except ImportError:
+            # pyte missing — fall back to raw ANSI-stripped buffer for
+            # URL extraction. Older containers without the dep still
+            # work, just with the URL-truncation issue.
+            self._pyte_screen = None
+            self._pyte_stream = None
 
     def read_available(self, max_bytes: int = READ_CHUNK) -> str:
         """Non-blocking drain of the master_fd. Returns the new chunk
         (ANSI-stripped) and appends it to `self.buffer`. Empty string
-        if nothing was available."""
+        if nothing was available. Also feeds raw bytes into the pyte
+        emulator so `rendered_text()` sees an accurate screen state.
+        """
         try:
             data = os.read(self.master_fd, max_bytes)
         except (BlockingIOError, OSError):
             return ""
         if not data:
             return ""
+        if self._pyte_stream is not None:
+            try:
+                self._pyte_stream.feed(data)
+            except Exception:
+                # Don't let a malformed escape sequence kill the
+                # session — we still have the raw buffer fallback.
+                logger.exception("pyte feed failed for %s", self.sid)
         text = strip_ansi(data.decode("utf-8", errors="replace"))
         self.buffer += text
         return text
+
+    def rendered_text(self) -> str:
+        """Return the visible terminal contents as plain text.
+
+        Joins screen rows with newlines, trailing whitespace stripped
+        per row. Returns the empty string when pyte isn't available
+        (caller falls back to `self.buffer` for URL extraction).
+        """
+        if self._pyte_screen is None:
+            return ""
+        try:
+            rows = []
+            for row in self._pyte_screen.display:
+                # Each row is a string of cell characters; pyte pads
+                # short rows to full width with spaces.
+                rows.append(row.rstrip())
+            return "\n".join(rows)
+        except Exception:
+            logger.exception("pyte rendered_text failed for %s", self.sid)
+            return ""
 
     def write(self, data: str) -> None:
         os.write(self.master_fd, data.encode("utf-8"))
@@ -248,10 +306,24 @@ def _spawn_pty_subprocess() -> tuple[subprocess.Popen, int]:
         )
     import fcntl
     import pty
+    import struct
+    import termios
 
     master_fd, slave_fd = pty.openpty()
     flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
     fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    # Tell the TUI the terminal is wide so it doesn't wrap the OAuth
+    # URL across multiple lines. Without this it inherits the default
+    # 80x24, splits the URL, and even with pyte rendering we end up
+    # with a wrapped URL that the regex can't reassemble cleanly.
+    try:
+        winsize = struct.pack("HHHH", _TERM_ROWS, _TERM_COLS, 0, 0)
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+    except OSError:
+        # Some kernels reject TIOCSWINSZ on a freshly-opened pty;
+        # not fatal — pyte still renders, URL just may be wrapped.
+        logger.warning("could not set pty winsize for login subprocess")
 
     env = os.environ.copy()
     # Reduce ANSI noise where the CLI honours these.
@@ -352,7 +424,15 @@ async def start_login() -> dict:
                 sess.write("y\r")
             except OSError:
                 pass
-        url = extract_url(sess.buffer)
+        # Prefer the pyte-rendered screen — the TUI uses cursor
+        # positioning to draw the URL, so the raw byte stream contains
+        # interleaved overwrites that scramble URLs into things like
+        # `https://clud.com/cai/...`. Pyte gives us the actual visible
+        # screen state. Fall back to raw buffer if pyte isn't available.
+        rendered = sess.rendered_text()
+        url = extract_url(rendered) if rendered else None
+        if not url:
+            url = extract_url(sess.buffer)
         if url:
             sess.url = url
             return {"session_id": sid, "url": url}
@@ -374,7 +454,8 @@ async def start_login() -> dict:
                 f"without printing an OAuth URL. Last output:\n{transcript}"
             )
 
-    transcript = sess.buffer[-ERROR_TAIL_BYTES:]
+    rendered = sess.rendered_text()
+    transcript = (rendered or sess.buffer)[-ERROR_TAIL_BYTES:]
     sess.close()
     _sessions.pop(sid, None)
     raise RuntimeError(

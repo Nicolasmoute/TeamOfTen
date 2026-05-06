@@ -315,6 +315,100 @@ def test_credentials_present_directory_not_file_returns_false(monkeypatch, tmp_p
     assert claude_login.credentials_present() is False
 
 
+# ----------------------------------------------------- pyte rendering
+
+# These tests cover the cursor-positioning-overwrite scenario that
+# made `extract_url(buffer)` return scrambled URLs like
+# `https://clud.com/cai/...`. We construct a LoginSession with no
+# subprocess (just a fake proc + master_fd=-1) and feed bytes
+# directly into the pyte stream by calling `read_available()` after
+# stuffing data into our own buffer. Simpler approach: bypass the
+# fd entirely and feed pyte directly.
+
+def _make_fake_session():
+    """Build a LoginSession with a stub subprocess for pyte testing."""
+    from unittest.mock import MagicMock
+    from datetime import datetime, timezone
+    from server import claude_login
+
+    proc = MagicMock()
+    proc.poll.return_value = None
+    proc.terminate.return_value = None
+    proc.wait.return_value = 0
+    return claude_login.LoginSession(
+        sid="pyte-test",
+        proc=proc,
+        master_fd=-1,
+        started_at=datetime.now(timezone.utc),
+    )
+
+
+def test_pyte_renders_simple_text() -> None:
+    """Sanity check — pyte is wired up and turning bytes into a screen."""
+    sess = _make_fake_session()
+    if sess._pyte_stream is None:
+        import pytest
+        pytest.skip("pyte not installed")
+    sess._pyte_stream.feed(b"hello world")
+    rendered = sess.rendered_text()
+    assert "hello world" in rendered
+
+
+def test_pyte_renders_url_after_cursor_positioning() -> None:
+    """The bug we're fixing: TUI writes the URL with cursor jumps.
+    Raw byte concat scrambles it; pyte renders the final screen
+    state correctly. Sequence: write 'https://claude.com/cli', jump
+    cursor back, overwrite some chars (simulating a redraw)."""
+    sess = _make_fake_session()
+    if sess._pyte_stream is None:
+        import pytest
+        pytest.skip("pyte not installed")
+    # Write the URL piecewise with cursor-position resets between
+    # parts — mimics what the Claude TUI does inside its modal.
+    # `\x1b[H` = cursor home; `\x1b[2;1H` = row 2 col 1.
+    sess._pyte_stream.feed(b"\x1b[H\x1b[2J")  # clear screen, cursor home
+    sess._pyte_stream.feed(b"Open this URL:\r\n")
+    sess._pyte_stream.feed(b"https://claude.com/cli/oauth/authorize")
+    sess._pyte_stream.feed(b"?code=true&client_id=9d1c250a-e61b-44d9-8888-abc123\r\n")
+    sess._pyte_stream.feed(b"Then paste the code below.")
+    rendered = sess.rendered_text()
+    from server import claude_login
+    url = claude_login.extract_url(rendered)
+    assert url is not None
+    assert "claude.com/cli/oauth/authorize" in url
+    assert "9d1c250a-e61b-44d9-8888-abc123" in url
+
+
+def test_pyte_recovers_url_from_overwrite_pattern() -> None:
+    """Direct simulation of the bug: write garbage, jump back,
+    overwrite with the real URL. Linear concat would yield garbage
+    + URL interleaved; pyte yields just the final URL on screen."""
+    sess = _make_fake_session()
+    if sess._pyte_stream is None:
+        import pytest
+        pytest.skip("pyte not installed")
+    sess._pyte_stream.feed(b"\x1b[H\x1b[2J")
+    # Garbage at row 1
+    sess._pyte_stream.feed(b"junk1234567890")
+    # Cursor home + clear: redraw with clean URL
+    sess._pyte_stream.feed(b"\x1b[H\x1b[2K")
+    sess._pyte_stream.feed(b"https://claude.com/cli/oauth/authorize?state=xyz")
+    rendered = sess.rendered_text()
+    from server import claude_login
+    url = claude_login.extract_url(rendered)
+    assert url == "https://claude.com/cli/oauth/authorize?state=xyz"
+
+
+def test_pyte_unavailable_falls_back_to_raw_buffer() -> None:
+    """If pyte isn't installed, rendered_text() returns "" and the
+    URL extraction should fall back to the raw buffer (still works
+    for clean URLs, just not for cursor-overwrite scrambles)."""
+    sess = _make_fake_session()
+    sess._pyte_screen = None
+    sess._pyte_stream = None
+    assert sess.rendered_text() == ""
+
+
 # ----------------------------------------------------- pty smoke tests
 
 # These exercise the real subprocess + pty + os.read path. Linux-only:

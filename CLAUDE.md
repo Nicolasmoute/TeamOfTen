@@ -1788,6 +1788,19 @@ stdin; the CLI writes `.credentials.json` to `$CLAUDE_CONFIG_DIR`
   a two-step "Sign out / use different account" button next to
   **Refresh tokens** when authenticated; the second click confirms.
   Emits `claude_auth_cleared`.
+- **Pyte terminal emulation for URL extraction** — initial release used
+  a regex over ANSI-stripped pty output, but the Claude TUI uses
+  cursor-positioning escapes to draw the OAuth URL inside its modal.
+  Linear concat of all writes (with positioning escapes removed) leaves
+  characters out of order, so the URL came back scrambled with letters
+  dropped + truncated mid-id. Fix: feed the raw byte
+  stream into a `pyte.Screen` (200×60 cells) per `LoginSession` and
+  extract URLs from `rendered_text()` instead of the raw buffer. The
+  pty's slave fd also gets a `TIOCSWINSZ` ioctl so the CLI itself
+  doesn't wrap the URL across rows. `pyte>=0.8` added to
+  `pyproject.toml` (pure Python, no compile, ~50 KB). Raw buffer is
+  kept as a fallback when pyte isn't available and for error-message
+  diagnostics.
 - **Auth-failure guard in stale-session auto-heal**
   ([server/runtimes/claude.py](server/runtimes/claude.py)) — sign-out
   was incorrectly resetting agents' `session_id` because the runtime's
