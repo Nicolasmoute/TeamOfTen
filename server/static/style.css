@@ -239,49 +239,28 @@ body {
   }
   .env-resizer { display: none; }
 
-  /* Pane input area on mobile — compact grid layout that survives
-     the conditionally-rendered items at the top (pane-info,
-     attachments, ActiveLoops on Coach).
-       implicit row(s): conditional items, each spans both cols.
-       row N:           [modes (model · plan · effort · ctx)] [run]
-       row N+1:         textarea (spans both cols)
-     `grid-auto-flow: dense` backtracks to fill empty col 2 of the
-     modes row with the input-row (which is later in DOM order).
-     `> *` defaults every direct child to span both columns; only
-     pane-modes and pane-input-row override to single columns. */
+  /* Pane input area on mobile — vertical stack: modes-row (with run
+     button inside) → textarea. Run button is sticky-right inside the
+     scrollable modes row so chip overflow can't push it off-screen. */
   .pane-input {
-    display: grid !important;
-    grid-template-columns: 1fr auto;
-    grid-auto-flow: dense;
-    gap: 4px 6px;
     padding: 6px 8px;
   }
-  .pane-input > * { grid-column: 1 / -1; }
   .pane-input > .pane-modes {
-    grid-column: 1;
-    margin: 0;
+    margin: 0 0 4px;
     flex-wrap: nowrap !important;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     align-items: center;
     gap: 4px;
   }
-  .pane-input > .pane-input-row {
-    grid-column: 2;
-    margin: 0;
-    align-self: center;
-  }
-  .pane-input > .pane-input-wrap {
-    margin-top: 0;
-  }
-  .pane-input-row .hint { display: none; }
-  /* Run button: visually compact (matches text size) but the touch
-     target stays comfortable via min-height. Apple/Material guidance
-     calls for 36-44 px; 32 px is the minimum I'll accept. */
-  .pane-input-row .primary {
-    padding: 6px 14px;
-    font-size: 12px;
+  .pane-input > .pane-input-wrap { margin-top: 0; }
+  .pane-modes-run {
+    position: sticky;
+    right: 0;
     min-height: 32px;
+    padding: 4px 14px !important;
+    font-size: 12px !important;
+    flex: 0 0 auto;
   }
   /* Slash-commands chip — redundant on mobile; user can just type "/"
      in the prompt, the SlashMenu opens the same way. */
@@ -359,13 +338,23 @@ body {
   margin: 2px 0;
 }
 .rail-bottom > .rail-tools ~ .rail-divider { margin-top: auto; }
-/* Pause/play and the two layout-preset buttons live in rail-actions
-   and read as a single bar of controls — pull the gear footprint in
-   so they don't feel like rail-tool icons. */
-.rail-group.rail-actions .gear.pause-toggle {
+/* All buttons in rail-actions (cancel-all, pause, the two layout
+   presets, settings) share a single footprint so the parent's flex
+   `gap: 4px` reads as visually equal spacing between every button.
+   Without this, the gears default to 32×32 while the layout presets
+   were 24×20, making the gaps look uneven on a vertical rail. */
+.rail-group.rail-actions .gear,
+.rail-group.rail-actions .gear.pause-toggle,
+.rail-group.rail-actions .gear.layout-preset,
+.rail-group.rail-actions .gear.cancel-all,
+.rail-group.rail-actions .gear.settings-toggle {
   width: 26px;
   height: 22px;
+  padding: 0;
   font-size: 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 /* The two layout presets share a wrapper for the JSX conditional,
    but visually they should sit in the same column rhythm as their
@@ -374,11 +363,6 @@ body {
    the parent rail-actions group's 4px gap. */
 .rail-group.rail-actions .rail-layout-presets {
   display: contents;
-}
-.rail-group.rail-actions .gear.layout-preset {
-  width: 24px;
-  height: 20px;
-  padding: 1px 4px;
 }
 @keyframes ws-disconnected-pulse {
   0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(255, 80, 100, 0.5); }
@@ -4144,16 +4128,6 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   flex: 1 1 auto;
 }
 
-.pane-input-row {
-  display: flex;
-  align-items: center;
-  margin-top: 6px;
-  gap: 8px;
-}
-.pane-input-row .hint {
-  color: var(--muted);
-  font-size: 11px;
-}
 .primary {
   margin-left: auto;
   padding: 6px 14px;
@@ -4166,6 +4140,21 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   cursor: pointer;
 }
 .primary:disabled { opacity: 0.5; cursor: not-allowed; }
+/* Run button now lives inside .pane-modes (right next to the
+   "/ commands" chip) instead of below the textarea. Tighter padding
+   so it reads as a chip-sized control rather than a footer button,
+   and override the global `.primary { margin-left: auto }` so it
+   sits flush against the slash chip with the row's natural 6px gap.
+   Setting `margin-top: 0` belt-and-braces against the historical
+   chip-row vertical drift. */
+.pane-mode-chip + .pane-modes-run,
+.pane-modes-run {
+  margin-left: 0;
+  padding: 3px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  align-self: center;
+}
 
 /* ---- settings drawer ---- */
 .drawer-backdrop {
@@ -4325,6 +4314,59 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 }
 .drawer-section a { color: var(--accent); }
 .drawer-section a:hover { text-decoration: underline; }
+
+/* Shared button row + styles inside drawer sections — used by the
+   Claude auth pane (Refresh tokens / Sign out / View usage) so the
+   three controls line up at the same height regardless of label
+   length. */
+.drawer-btn-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 0;
+}
+.drawer-btn-row > .drawer-btn { margin-left: 0; }
+.drawer-btn {
+  height: 30px;
+  padding: 0 14px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.drawer-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: var(--muted);
+}
+.drawer-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.drawer-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--bg);
+  font-weight: 600;
+}
+.drawer-btn.primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+  background: var(--accent);
+}
+.drawer-btn.danger { color: var(--err); border-color: var(--err); }
+.drawer-btn.danger:hover:not(:disabled) {
+  background: rgba(229, 89, 89, 0.08);
+}
+.drawer-btn .external-arrow {
+  font-size: 10px;
+  opacity: 0.7;
+}
 .drawer-disabled {
   background: var(--card);
   border: 1px solid var(--border);

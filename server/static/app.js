@@ -3822,25 +3822,32 @@ function ClaudeAuthSection({ health, onRefresh }) {
         <code>${auth.config_dir || "/data"}</code> volume — you only
         do this when first setting up or rotating credentials.
       </p>
-      <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+      <div class="drawer-btn-row">
         <button
-          class="primary"
+          class="drawer-btn primary"
           onClick=${onStart}
           disabled=${skipped || signingOut}
         >${present ? "Refresh tokens" : "Sign in to Claude"}</button>
         ${present
           ? html`<button
+              class=${confirmSignOut ? "drawer-btn danger" : "drawer-btn"}
               onClick=${onSignOut}
               disabled=${skipped || signingOut}
               title="Wipe the saved credentials. The CLI will be unauthenticated until you sign in again — useful if you want to switch to a different Anthropic account."
-              style=${confirmSignOut
-                ? "font-size: 11px; color: var(--err); border-color: var(--err);"
-                : "font-size: 11px;"}
             >${signingOut
-              ? "signing out…"
+              ? "Signing out…"
               : confirmSignOut
-                ? "click again to confirm"
-                : "Sign out / use different account"}</button>`
+                ? "Click again to confirm"
+                : "Sign out"}</button>`
+          : null}
+        ${present
+          ? html`<a
+              class="drawer-btn"
+              href="https://claude.ai/settings/usage"
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Opens claude.ai in a new tab — see your hourly / weekly Max-plan usage and current limits."
+            >View usage<span class="external-arrow">↗</span></a>`
           : null}
         ${error
           ? html`<span style="font-size: 11px; color: var(--err);">${error}</span>`
@@ -11177,6 +11184,14 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
             onClick=${() => setInput("/")}
             title="Slash commands"
           >/ commands</button>
+          <button
+            class="primary pane-modes-run"
+            disabled=${submitting || (!input.trim() && attachments.length === 0)}
+            onClick=${submit}
+            title="Send (⌘/Ctrl+Enter) — ⌘/Ctrl+↑↓ to walk history"
+          >
+            ${submitting ? "running…" : "run"}
+          </button>
         </div>
         <div class="pane-input-wrap">
           <textarea
@@ -11201,16 +11216,6 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
                 onHover=${(i) => setSlashIdx(i)}
               />`
             : null}
-        </div>
-        <div class="pane-input-row">
-          <span class="hint">⌘/Ctrl+Enter to send · ⌘/Ctrl+↑↓ history · / for commands</span>
-          <button
-            class="primary"
-            disabled=${submitting || (!input.trim() && attachments.length === 0)}
-            onClick=${submit}
-          >
-            ${submitting ? "running…" : "run"}
-          </button>
         </div>
       </footer>
     </section>
