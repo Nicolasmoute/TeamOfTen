@@ -100,7 +100,7 @@ async def test_write_task_spec_coach_writes_spec(fresh_db: str) -> None:
         "body": "## Goal\nDo the thing.\n",
     })
     text = _ok_text(result)
-    assert "wrote spec" in text
+    assert "wrote spec" in text.lower()
     # tasks.spec_path is set.
     c = await configured_conn()
     try:
@@ -501,7 +501,7 @@ async def test_complete_execution_non_git_marks_executor_done(
         "artifact_path": "knowledge/reports/demo.md",
         "completion_kind": "research",
     }))
-    assert "completed execution" in text
+    assert "completed execution" in text.lower()
     c = await configured_conn()
     try:
         cur = await c.execute(

@@ -2735,6 +2735,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             and auto_bound_task_id is None
             and not push_failed
         ):
+            warning_body = (
+                f"Player {caller_id} committed sha {sha} "
+                f"({message[:80]!r}) without a task_id and has no "
+                f"active executor task to auto-bind to. If this "
+                f"commit was meant to deliver a kanban task, the "
+                f"kanban won't advance — link it via "
+                f"coord_advance_task_stage or accept it's scratch "
+                f"work and ignore. If this is a recurring pattern, "
+                f"the Player may be working off-board (skipping "
+                f"coord_claim_task)."
+            )
             await bus.publish(
                 {
                     "ts": _now_iso(),
@@ -2743,6 +2754,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     "committer": caller_id,
                     "sha": sha,
                     "message": message[:200],
+                    "body": warning_body,
                     "to": "coach",
                 }
             )
@@ -6483,8 +6495,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "to": t.get("owner"),
         })
         return _ok(
-            f"task {task_id} trajectory updated: "
-            f"[{', '.join(s['stage'] for s in trajectory)}]"
+            f"Task {task_id} trajectory updated: "
+            f"[{', '.join(s['stage'] for s in trajectory)}]. The "
+            f"kanban superseded role rows for removed stages and "
+            f"inserted rows for added stages. Displaced Players "
+            f"(if any) get a stand-down wake; new candidates get "
+            f"role-call wakes if their stage is currently active. "
+            f"Do NOT follow up with coord_send_message; the wakes "
+            f"cover it."
         )
 
     @tool(
@@ -6748,9 +6766,20 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "to": owner,
             }
         )
+        reason_suffix = f" — {reason}" if reason else ""
+        if blocked:
+            return _ok(
+                f"Task {task_id} blocked=true{reason_suffix}. The "
+                f"stall sweeper now ignores this task; no auto-"
+                f"nudges, no auto-reassign, no auto-archive. When "
+                f"the blocker lifts, call coord_set_task_blocked"
+                f"(task_id={task_id!r}, blocked=false) to re-enter "
+                f"the ladder."
+            )
         return _ok(
-            f"task {task_id} blocked={'true' if blocked else 'false'}"
-            + (f" — {reason}" if reason else "")
+            f"Task {task_id} blocked=false{reason_suffix}. Stall "
+            f"sweeper resumes monitoring; the escalation ladder "
+            f"restarts at rung 1."
         )
 
     _tools = [

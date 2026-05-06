@@ -1005,6 +1005,28 @@ async def _emit_assignment_needed(
 ) -> None:
     from datetime import datetime, timezone
     ts = datetime.now(timezone.utc).isoformat()
+    # v0.3.11: include an imperative `body` so Coach's pane row is
+    # actionable instead of a bare event type. The role-specific
+    # tool name is named with the task_id baked in.
+    role_tool = {
+        "planner": f"coord_assign_planner(task_id={task_id!r}, to=<slot>)",
+        "executor": f"coord_assign_task(task_id={task_id!r}, to=<slot>)",
+        "auditor_syntax": (
+            f"coord_assign_auditor(task_id={task_id!r}, "
+            f"kind='syntax', to=<slot>, focus=<...>)"
+        ),
+        "auditor_semantics": (
+            f"coord_assign_auditor(task_id={task_id!r}, "
+            f"kind='semantics', to=<slot>, focus=<...>)"
+        ),
+        "shipper": f"coord_assign_shipper(task_id={task_id!r}, to=<slot>)",
+    }.get(role, f"coord_assign_{role}(task_id={task_id!r}, to=<slot>)")
+    body = (
+        f"Stage assignment needed: task {task_id} is in {stage!r} "
+        f"with no {role}. Assign one via {role_tool}. If you "
+        f"intended to skip this stage, rewrite the trajectory via "
+        f"coord_set_task_trajectory."
+    )
     payload = {
         "ts": ts,
         "agent_id": "system",
@@ -1017,6 +1039,7 @@ async def _emit_assignment_needed(
         # Nudge Coach — the assignment-needed surface is in their pane.
         "to": "coach",
         "owner": to_owner,
+        "body": body,
     }
     await bus.publish(payload)
     # Spec §18 promises a one-release back-compat alias under the
@@ -1063,7 +1086,47 @@ async def _emit_audit_fail_notification(
 ) -> None:
     """Coach-bound notification on every audit fail. See kanban-specs.md
     §8 + §17 for the contract: visibility on every fail, escalation
-    only on the second fail of the same kind."""
+    only on the second fail of the same kind.
+
+    v0.3.11: include an imperative `body` field so the event row in
+    Coach's pane is actionable instead of a bare type. Branches on
+    `escalate` so first-fail noise reads as "expected, watch round 2"
+    while subsequent same-kind fails carry the explicit bump-effort/
+    bump-model ladder.
+    """
+    if escalate:
+        body = (
+            f"Audit failed (ESCALATION): task {task_id} failed "
+            f"kind={kind} round {kind_round}. Same kind has now "
+            f"failed {kind_round} times. The executor "
+            f"({executor_id or '(unknown)'}) was re-woken, but the "
+            f"loop suggests quality is the bottleneck. Inspect their "
+            f"effort/model with coord_get_player_settings"
+            + (
+                f"(player_id={executor_id!r})"
+                if executor_id else "()"
+            )
+            + " and consider bumping: coord_set_player_effort"
+            + (
+                f"({executor_id!r}, 'high'|'max')"
+                if executor_id else "(...)"
+            )
+            + " or coord_set_player_model"
+            + (
+                f"({executor_id!r}, 'latest_opus')"
+                if executor_id else "(...)"
+            )
+            + ". NEVER change runtime — that's a human decision."
+        )
+    else:
+        body = (
+            f"Audit failed: task {task_id} failed kind={kind} "
+            f"round {kind_round}. The executor "
+            f"({executor_id or '(unknown)'}) was auto-re-woken with "
+            f"the report attached. First fail of this kind is "
+            f"expected correction noise; no action needed from you "
+            f"yet. Watch for round 2."
+        )
     from datetime import datetime, timezone
     await bus.publish({
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -1076,6 +1139,7 @@ async def _emit_audit_fail_notification(
         "auditor_id": auditor_id,
         "executor_id": executor_id,
         "report_path": report_path or "",
+        "body": body,
         "to": "coach",
     })
 
