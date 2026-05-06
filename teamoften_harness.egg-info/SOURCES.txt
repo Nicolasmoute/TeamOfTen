@@ -4,6 +4,8 @@ pyproject.toml
 server/__init__.py
 server/agent_env.py
 server/agents.py
+server/attachments_signing.py
+server/claude_login.py
 server/coach_objectives.py
 server/coach_todos.py
 server/context.py
@@ -11,7 +13,9 @@ server/coord_mcp.py
 server/db.py
 server/events.py
 server/files.py
+server/idle_poller.py
 server/interactions.py
+server/kanban.py
 server/knowledge.py
 server/main.py
 server/mcp_config.py
@@ -19,13 +23,16 @@ server/models_catalog.py
 server/outputs.py
 server/paths.py
 server/pricing.py
+server/project_claude_md.py
 server/project_sync.py
 server/projects_api.py
 server/recurrences.py
 server/secrets.py
 server/spawn_tokens.py
 server/sync.py
+server/tasks.py
 server/telegram.py
+server/telegram_escalation.py
 server/tools.py
 server/truth.py
 server/webdav.py
@@ -34,6 +41,7 @@ server/compass/__init__.py
 server/compass/api.py
 server/compass/audit.py
 server/compass/audit_watcher.py
+server/compass/codex_llm.py
 server/compass/config.py
 server/compass/llm.py
 server/compass/mutate.py
@@ -49,6 +57,7 @@ server/compass/pipeline/__init__.py
 server/compass/pipeline/briefing.py
 server/compass/pipeline/claude_md.py
 server/compass/pipeline/digest.py
+server/compass/pipeline/intent_derive.py
 server/compass/pipeline/questions.py
 server/compass/pipeline/reconciliation.py
 server/compass/pipeline/regions.py
@@ -63,6 +72,7 @@ server/static/app.js
 server/static/compass.css
 server/static/compass.js
 server/static/index.html
+server/static/kanban.js
 server/static/markdown.js
 server/static/style.css
 server/static/tools.js

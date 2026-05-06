@@ -122,16 +122,36 @@ async def _read_project_repo_url(project_id: str) -> str:
 async def workspace_dir(slot: str) -> Path:
     """The cwd an agent should run in.
 
-    Pure function of (active_project, slot). The path is
-    `/data/projects/<active>/repo/<slot>`. Does not stat the
-    filesystem — provisioning is expected to have run. If the
-    worktree is missing when an agent wakes, the subprocess will
-    fail at chdir with a clear error and the operator can run the
-    manual provision endpoint.
+    Resolves to `/data/projects/<active>/repo/<slot>` against the
+    active project. Creates the directory if it doesn't exist —
+    `ensure_workspaces` is the canonical provisioner (called at
+    boot, project switch, project create, and repo_url update),
+    but this self-heal keeps an agent's chdir from crashing if the
+    dir somehow went missing (transient FS error, mid-migration
+    deploy). The cwd needs to *exist* for the SDK to chdir;
+    whether it's a git checkout is a separate concern that
+    `coord_commit_push` checks loudly.
+
+    Raises `RuntimeError` when the mkdir itself fails (disk full,
+    permission denied, parent path is a file, etc.) — the calling
+    spawn path needs a real error message in the event log, not a
+    chdir crash to a phantom path.
     """
     from server.db import resolve_active_project
     project_id = await resolve_active_project()
-    return project_paths(project_id).worktree(slot)
+    p = project_paths(project_id).worktree(slot)
+    if not p.exists():
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.exception(
+                "workspace_dir: mkdir failed for %s/%s", project_id, slot,
+            )
+            raise RuntimeError(
+                f"workspace_dir mkdir failed for {project_id}/{slot} "
+                f"at {p}: {type(e).__name__}: {e}"
+            ) from e
+    return p
 
 
 async def project_repo_configured(project_id: str | None = None) -> bool:
@@ -186,19 +206,39 @@ async def get_status(project_id: str | None = None) -> dict[str, Any]:
 async def ensure_workspaces(project_id: str) -> dict[str, Any]:
     """Idempotent provisioner for one project.
 
-    Reads `projects.repo_url`, clones if absent, creates per-slot
-    worktrees if absent. Safe to call any number of times — existing
-    clones aren't re-cloned, existing worktrees aren't recreated.
+    Always creates plain per-slot directories under
+    `/data/projects/<id>/repo/<slot>` so agent cwds exist even when
+    the project has no repo configured (research / chat / doc work
+    doesn't need a git tree). When `projects.repo_url` IS set, layers
+    a bare clone + per-slot git worktrees on top.
+
+    Safe to call any number of times — existing dirs / clones /
+    worktrees aren't recreated.
 
     Returns a status dict; callers in the project-switch flow
     surface the {configured, slots: {<slot>: {ok, ...}}} shape via
     the `provision_workspaces` event step.
     """
     pp = ensure_project_scaffold(project_id)
+
+    # Always-on: plain per-slot dirs. The agent's SDK chdir crashes
+    # with ENOENT before it can print a useful error if the path
+    # doesn't exist; a directory that's not a git checkout is fine
+    # for non-code work, and `coord_commit_push` rejects loudly when
+    # `.git` isn't present.
+    for slot in SLOT_IDS:
+        try:
+            pp.worktree(slot).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            logger.exception(
+                "workspaces: mkdir failed for %s/%s", project_id, slot,
+            )
+
     repo_url = await _read_project_repo_url(project_id)
     if not repo_url:
         logger.info(
-            "workspaces: no repo_url for project '%s'; skipped clone",
+            "workspaces: no repo_url for project '%s'; created plain "
+            "per-slot dirs (no clone)",
             project_id,
         )
         return {
@@ -258,25 +298,82 @@ async def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 120) -> t
     return await asyncio.to_thread(_do)
 
 
+# Per-bare-clone lock so two concurrent `_provision_after_change`
+# tasks targeting the same project (e.g. POST /api/projects
+# immediately followed by PATCH ...{repo_url:...}) don't both pass
+# the "already cloned" check and both run `git clone` to the same
+# path. Lock is keyed by the bare-clone path so different projects
+# don't serialize on each other.
+_clone_locks: dict[str, asyncio.Lock] = {}
+
+
+def _lock_for(bare: Path) -> asyncio.Lock:
+    key = str(bare)
+    lock = _clone_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _clone_locks[key] = lock
+    return lock
+
+
 async def _ensure_base_clone(bare: Path, repo_url_raw: str) -> None:
-    """Idempotent clone of the project repo into its bare-clone path."""
-    if bare.exists() and (bare / ".git").exists():
-        logger.info("base repo already present at %s", bare)
-        return
-    bare.parent.mkdir(parents=True, exist_ok=True)
-    repo = _expand_placeholders(repo_url_raw)
-    # Log the unexpanded form so PATs don't hit the logs.
-    logger.info("cloning %s → %s", repo_url_raw, bare)
-    code, out, err = await _run(
-        ["git", "clone", repo, str(bare)],
-        timeout=300,
-    )
-    if code != 0:
-        msg = (err.strip() or out.strip())
-        raise RuntimeError(
-            f"git clone exited {code}: {_mask_userinfo(msg, repo)}"
+    """Idempotent clone of the project repo into its bare-clone path.
+
+    When the bare clone already exists, verifies its `origin` remote
+    matches the configured URL — when they differ, raises so the
+    caller (`_provision_after_change`) emits an honest `ok=False`
+    event rather than silently ignoring the new URL while reporting
+    success. Operators changing remotes need to wipe
+    `<bare>` on disk and let the next provision re-clone.
+    """
+    expected = _expand_placeholders(repo_url_raw)
+    async with _lock_for(bare):
+        if bare.exists() and (bare / ".git").exists():
+            current = await _read_remote_url(bare)
+            if current and current != expected:
+                # Mask both URLs in the error so a PAT can't leak
+                # into logs / events. We compare the raw expanded
+                # values internally but report the masked forms.
+                raise RuntimeError(
+                    f"bare clone at {bare} has remote "
+                    f"{_mask_userinfo(current, current)} but config "
+                    f"says {_mask_userinfo(expected, expected)}. "
+                    f"Wipe {bare} on disk to let the next provision "
+                    f"re-clone with the new URL."
+                )
+            logger.info("base repo already present at %s", bare)
+            return
+        bare.parent.mkdir(parents=True, exist_ok=True)
+        # Log the unexpanded form so PATs don't hit the logs.
+        logger.info("cloning %s → %s", repo_url_raw, bare)
+        code, out, err = await _run(
+            ["git", "clone", expected, str(bare)],
+            timeout=300,
         )
-    logger.info("clone ok: %s", bare)
+        if code != 0:
+            msg = (err.strip() or out.strip())
+            raise RuntimeError(
+                f"git clone exited {code}: "
+                f"{_mask_userinfo(msg, expected)}"
+            )
+        logger.info("clone ok: %s", bare)
+
+
+async def _read_remote_url(bare: Path) -> str:
+    """`git remote get-url origin` against the bare clone. Returns
+    the URL on success, empty string on any failure (no remote, not
+    a git dir, etc.) — callers use empty string as "couldn't
+    determine, skip the URL-mismatch check"."""
+    try:
+        code, out, _ = await _run(
+            ["git", "-C", str(bare), "remote", "get-url", "origin"],
+            timeout=10,
+        )
+    except Exception:
+        return ""
+    if code != 0:
+        return ""
+    return out.strip()
 
 
 async def _ensure_worktree(

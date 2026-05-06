@@ -2007,6 +2007,64 @@ async def _clear_exchange_log(agent_id: str) -> None:
         pass
 
 
+async def _compose_handoff_suffix(agent_id: str) -> str:
+    """Format the post-compact handoff block for an agent's system prompt.
+
+    Reads `agent_sessions.continuity_note` (a short summary written by
+    `/compact` or by the auto-heal path when a session_id was nulled
+    after a `ProcessError` on resume) and appends the recent exchanges
+    from `agent_sessions.last_exchange_json`. Returns "" when no
+    continuity note is set — caller should not append anything.
+
+    Used both by `run_agent` (normal post-compact handoff) and by the
+    Claude runtime's stale-session auto-heal (synthetic note path) so
+    a freshly-cleared session still carries memory across the boundary.
+    """
+    note = await _get_continuity_note(agent_id)
+    if not note:
+        return ""
+    suffix = (
+        "\n\n## Handoff from your prior session (via /compact)\n\n"
+        + note.strip()
+    )
+    # Append the recent exchanges verbatim — CLI /compact keeps recent
+    # turns intact, and 1 exchange was too thin (tool chains span
+    # multiple turns). The rolling list is maintained by _append_exchange
+    # on every successful non-compact turn, trimmed from the head so the
+    # total stays under the handoff token budget. The full session
+    # transcript lives in the jsonl file; this injected log is just a
+    # warm-start, not the long-term record.
+    recent = await _get_recent_exchanges(agent_id)
+    recent = [
+        e for e in recent
+        if isinstance(e, dict)
+        and isinstance(e.get("prompt"), str)
+        and isinstance(e.get("response"), str)
+        and (e.get("prompt") or e.get("response"))
+    ]
+    if recent:
+        suffix += (
+            f"\n\n### Recent exchanges (verbatim, last "
+            f"{len(recent)} turn{'s' if len(recent) != 1 else ''} "
+            "before compact, oldest first)\n"
+        )
+        for i, e in enumerate(recent, start=1):
+            suffix += (
+                f"\n#### Exchange {i} of {len(recent)}\n\n"
+                "**User asked:**\n\n"
+                + (e["prompt"] or "").strip()
+                + "\n\n**You replied:**\n\n"
+                + (e["response"] or "").strip()
+                + "\n"
+            )
+    suffix += (
+        "\n\n(Your previous conversation history has been cleared "
+        "to free context. The summary + verbatim exchanges above "
+        "are your memory of what came before.)"
+    )
+    return suffix
+
+
 async def _locked_players() -> list[str]:
     """Return sorted list of Player slot ids that have locked=1.
 
@@ -4269,6 +4327,7 @@ async def run_agent(
     compact_mode: bool = False,
     auto_compact: bool = False,
     transfer_to_runtime: str | None = None,
+    wake_source: str | None = None,
 ) -> None:
     """Spawn one SDK query for the given slot and stream its events.
 
@@ -4476,50 +4535,7 @@ async def run_agent(
             for e in errs[:3]:
                 prior_error_suffix += f"- {str(e)[:240]}\n"
 
-    handoff_suffix = ""
-    handoff_text = await _get_continuity_note(agent_id)
-    if handoff_text:
-        handoff_suffix = (
-            "\n\n## Handoff from your prior session (via /compact)\n\n"
-            + handoff_text.strip()
-        )
-        # Append the recent exchanges verbatim — CLI /compact keeps
-        # recent turns intact, and 1 exchange was too thin (tool
-        # chains span multiple turns). The rolling list is maintained
-        # by _append_exchange on every successful non-compact turn,
-        # trimmed from the head so total size stays under
-        # HARNESS_HANDOFF_TOKEN_BUDGET (default 20K tokens — the full
-        # session transcript lives in the jsonl file, so this injected
-        # log is just a warm-start, not the long-term record).
-        recent = await _get_recent_exchanges(agent_id)
-        # Drop empty/malformed entries defensively.
-        recent = [
-            e for e in recent
-            if isinstance(e, dict)
-            and isinstance(e.get("prompt"), str)
-            and isinstance(e.get("response"), str)
-            and (e.get("prompt") or e.get("response"))
-        ]
-        if recent:
-            handoff_suffix += (
-                f"\n\n### Recent exchanges (verbatim, last "
-                f"{len(recent)} turn{'s' if len(recent) != 1 else ''} "
-                "before compact, oldest first)\n"
-            )
-            for i, e in enumerate(recent, start=1):
-                handoff_suffix += (
-                    f"\n#### Exchange {i} of {len(recent)}\n\n"
-                    "**User asked:**\n\n"
-                    + (e["prompt"] or "").strip()
-                    + "\n\n**You replied:**\n\n"
-                    + (e["response"] or "").strip()
-                    + "\n"
-                )
-        handoff_suffix += (
-            "\n\n(Your previous conversation history has been cleared "
-            "to free context. The summary + verbatim exchanges above "
-            "are your memory of what came before.)"
-        )
+    handoff_suffix = await _compose_handoff_suffix(agent_id)
     # Phase 7 audit (PROJECTS_SPEC.md §10): "Roster availability"
     # used to be a standalone Coach-only suffix; the spec folds it
     # into the coordination block as a sub-section. The block now
@@ -4702,12 +4718,57 @@ async def run_agent(
 
     runtime_name = await _resolve_runtime_for(agent_id)
     runtime = get_runtime(runtime_name)
+    # Pre-flight: refuse to spawn when the workspace dir doesn't exist
+    # (and `workspace_dir`'s self-heal mkdir failed — typically a
+    # /data volume mount issue, FS read-only, or a path collision).
+    # Bailing here keeps the SDK from raising CLIConnectionError, which
+    # on retry has historically escalated to a ProcessError on resume
+    # and triggered the stale-session auto-heal — silently nuking the
+    # session_id even though the underlying problem was the workspace.
+    ws_path = await workspace_dir(agent_id)
+    if not ws_path.exists():
+        active_project = await resolve_active_project()
+        err_msg = (
+            f"workspace directory does not exist and could not be "
+            f"created: {ws_path}. Check the volume mount and FS "
+            f"permissions, then call POST /api/projects/{active_project}/"
+            f"repo/provision."
+        )
+        logger.error(
+            "run_agent: workspace_missing for agent=%s cwd=%s",
+            agent_id, ws_path,
+        )
+        await _emit(
+            agent_id,
+            "error",
+            error=err_msg,
+            cwd=str(ws_path),
+            reason="workspace_missing",
+        )
+        await _set_status(agent_id, "error")
+        try:
+            await bus.publish({
+                "ts": _now(),
+                "agent_id": agent_id,
+                "type": "human_attention",
+                "subject": f"{agent_id}: workspace dir missing",
+                "body": err_msg,
+                "urgency": "normal",
+            })
+        except Exception:
+            logger.exception(
+                "workspace_missing escalation failed: agent=%s", agent_id,
+            )
+        _running_tasks.pop(agent_id, None)
+        _last_turn_ended_at[agent_id] = time.monotonic()
+        await _emit(agent_id, "agent_stopped")
+        return
     tc = TurnContext(
         agent_id=agent_id,
         project_id=await resolve_active_project(),
         prompt=prompt,
         system_prompt=system_prompt,
-        workspace_cwd=str(await workspace_dir(agent_id)),
+        workspace_cwd=str(ws_path),
         allowed_tools=list(allowed),
         external_mcp_servers=external_servers,
         model=model,
@@ -4746,6 +4807,7 @@ async def run_agent(
         compact_mode=compact_mode,
         auto_compact=auto_compact,
         runtime=runtime_name,
+        wake_source=wake_source,
     )
     if context_applied_payload is not None:
         await _emit(agent_id, "context_applied", **context_applied_payload)
@@ -5120,6 +5182,7 @@ async def maybe_wake_agent(
     reason: str,
     *,
     bypass_debounce: bool = False,
+    wake_source: str | None = None,
 ) -> bool:
     """Spawn a turn for `agent_id` with `reason` as the prompt, if and
     only if all guards pass:
@@ -5134,6 +5197,15 @@ async def maybe_wake_agent(
     human message) are NOT ping-pongy and should wake the target even
     if they just finished a turn — callers pass bypass_debounce=True
     for those paths.
+
+    `wake_source` tags the origin of an automatic wake — the UI uses
+    it to compact "system-triggered" turn headers (kanban role calls,
+    task-completion summaries, stall ladder rungs, etc.) so the full
+    instructional prompt body doesn't visually clutter the conversation
+    timeline. Conventional values: 'kanban_assignment', 'kanban_pool',
+    'kanban_role', 'kanban_audit_fail', 'kanban_stand_down',
+    'kanban_completion', 'kanban_stall', 'system_recovery'. None for
+    user-originated wakes (UI composer, Telegram inbound, peer chat).
 
     Returns True if a spawn was scheduled, False otherwise. Cost caps
     are checked here AND inside run_agent — the early check avoids a
@@ -5167,7 +5239,7 @@ async def maybe_wake_agent(
         logger.info("auto-wake skipped for %s: cost cap hit", agent_id)
         return False
     logger.info("auto-wake: spawning %s — %s", agent_id, reason[:80])
-    asyncio.create_task(run_agent(agent_id, reason))
+    asyncio.create_task(run_agent(agent_id, reason, wake_source=wake_source))
     return True
 
 

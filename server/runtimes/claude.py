@@ -100,13 +100,16 @@ class ClaudeRuntime:
             MAX_TURNS_PER_SPAWN,
             _build_can_use_tool,
             _clear_session_id,
+            _compose_handoff_suffix,
             _emit,
+            _get_recent_exchanges,
             _handle_message,
             _now,
             _posttool_wiki_index_hook,
             _pretool_continue_hook,
             _pretool_file_guard_hook,
             _pretool_secret_guard_hook,
+            _set_continuity_note,
             _EFFORT_LEVELS,
             workspace_dir,
         )
@@ -237,8 +240,84 @@ class ClaudeRuntime:
                         session_id=tc.prior_session,
                         error=f"{type(e).__name__}: {e}",
                     )
+                    # Salvage memory before nuking session_id. The
+                    # rolling exchange log (last_exchange_json) is
+                    # already populated on every successful non-compact
+                    # turn — it just needs a continuity_note to gate
+                    # the system-prompt handoff injection. Write a
+                    # synthetic note so the immediate retry (and any
+                    # subsequent turn until the note is consumed) has
+                    # the recent exchanges in context, instead of
+                    # starting fully blind.
+                    salvaged = 0
+                    handoff_suffix = ""
+                    try:
+                        recent = await _get_recent_exchanges(agent_id)
+                        salvaged = len([
+                            e for e in recent if isinstance(e, dict)
+                        ])
+                    except Exception:
+                        logger.exception(
+                            "auto-heal: read recent exchanges failed agent=%s",
+                            agent_id,
+                        )
+                    if salvaged > 0:
+                        try:
+                            await _set_continuity_note(
+                                agent_id,
+                                "Your prior session was reset by the "
+                                "harness because resume failed "
+                                "(ProcessError on resume — typically "
+                                "a stale CLI session). The verbatim "
+                                "exchanges below are your only memory "
+                                "of the prior conversation; pick up "
+                                "from there.",
+                            )
+                            handoff_suffix = await _compose_handoff_suffix(
+                                agent_id,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "auto-heal: write synthetic continuity "
+                                "failed agent=%s",
+                                agent_id,
+                            )
+                            handoff_suffix = ""
                     await _clear_session_id(agent_id)
+                    await _emit(
+                        agent_id,
+                        "session_auto_recovered",
+                        salvaged_exchanges=salvaged,
+                    )
                     options_kwargs.pop("resume", None)
+                    retry_system_prompt_file = None
+                    if handoff_suffix:
+                        # Materialize the appended system prompt to a
+                        # fresh temp file. The original system_prompt
+                        # was built BEFORE this turn started (no
+                        # continuity_note then), so the immediate retry
+                        # would otherwise run blind. Rebuilding the
+                        # full system prompt here would require pulling
+                        # all the dispatcher's composition state into
+                        # the runtime; appending the handoff suffix is
+                        # the minimal change that gives the retry
+                        # memory. The post-result handler clears the
+                        # synthetic continuity_note when
+                        # had_handoff_on_entry is True.
+                        _cleanup_materialized_system_prompt(
+                            system_prompt_file
+                        )
+                        new_prompt_text = (tc.system_prompt or "") + handoff_suffix
+                        new_value, retry_system_prompt_file = (
+                            _materialize_system_prompt(new_prompt_text)
+                        )
+                        options_kwargs["system_prompt"] = new_value
+                        # Reassign the outer-scope file handle so the
+                        # finally-block cleanup removes the new temp
+                        # file rather than the (already-deleted) old
+                        # one.
+                        system_prompt_file = retry_system_prompt_file
+                        turn_ctx["had_handoff_on_entry"] = True
                     retry_options = ClaudeAgentOptions(**options_kwargs)
                     await _iterate(retry_options)
                 else:

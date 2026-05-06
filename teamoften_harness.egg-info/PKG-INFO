@@ -20,6 +20,7 @@ Requires-Dist: pypdf>=5.0
 Requires-Dist: python-docx>=1.1
 Requires-Dist: openpyxl>=3.1
 Requires-Dist: python-pptx>=1.0
+Requires-Dist: pyte>=0.8
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0; extra == "dev"
 Requires-Dist: pytest-asyncio>=0.24; extra == "dev"

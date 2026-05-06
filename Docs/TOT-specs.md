@@ -381,12 +381,27 @@ resolves through the active project: it returns
 `project_paths(active).worktree(slot)`. Pure function of `(active,
 slot)`.
 
-Provisioning happens in two places:
+Provisioning happens in four places — all idempotent:
 
-1. **Boot**, once, for the active project — `lifespan` in
+1. **Project creation** (`POST /api/projects`) —
+   `_provision_after_change` fires as a fire-and-forget task
+   right after the row insert + scaffold, so worktrees materialize
+   automatically without the operator hitting "provision now".
+   Plain per-slot dirs always; clone + worktrees only when
+   `repo_url` was provided. Failures surface via the
+   `project_repo_provisioned` bus event with
+   `source="project_created"`.
+2. **Project repo URL update** (`PATCH /api/projects/{id}` with
+   `repo_url` in the body) — same fire-and-forget hook
+   (`source="project_updated"`). Going from URL A → URL B keeps
+   the existing bare clone's remote (the existing `.project` is
+   detected as already-cloned); operators changing remotes need
+   to delete + recreate the project, or wipe
+   `/data/projects/<id>/repo/.project` on the container.
+3. **Boot**, once, for the active project — `lifespan` in
    `server/main.py` calls `ensure_workspaces(active_project_id)`
    after `init_db`.
-2. **Project switch** — `_run_switch` (`server/projects_api.py`)
+4. **Project switch** — `_run_switch` (`server/projects_api.py`)
    inserts a `provision_workspaces` step between `pull_new` and
    `swap_pointer`. A failed provision aborts the switch before the
    pointer swap and emits `project_switched ok=False`.
@@ -3734,20 +3749,28 @@ Layout (matches §4.6):
 ```
 
 `workspace_dir(slot)` (`async`) returns
-`project_paths(active).worktree(slot)` — a pure function of
-`(active_project_id, slot)`. No fallback to a plain dir; the
-worktree is expected to exist before agents wake.
+`project_paths(active).worktree(slot)`. The function `mkdir`s the
+path if it's missing — `ensure_workspaces` is the canonical
+provisioner, but this self-heal keeps an agent's SDK chdir from
+crashing with ENOENT when the directory has somehow gone missing
+(transient FS error, mid-migration deploy). The cwd needs to
+*exist* for the runtime to start; whether it's a git checkout is
+a separate concern that `coord_commit_push` checks.
 
 `ensure_workspaces(project_id)` is the only provisioner:
 
-- Idempotent. Reads `projects.repo_url` for the given project.
-- If `repo_url` is empty, returns `{configured: False}` and creates
-  no worktrees. Agents on that project can still run for non-code
-  work (chat, research, doc writing); `coord_commit_push` rejects
-  loudly.
+- Idempotent.
+- Always creates plain per-slot directories at
+  `/data/projects/<id>/repo/<slot>` so agent cwds exist for
+  non-code work (chat, research, doc writing) regardless of repo
+  configuration.
+- Reads `projects.repo_url` for the given project.
+- If `repo_url` is empty, returns `{configured: False}` and skips
+  the clone + worktree step. `coord_commit_push` rejects loudly
+  on commits because the path isn't a git checkout.
 - If set, clones to `/data/projects/<id>/repo/.project`, then
-  creates per-slot worktrees at `/data/projects/<id>/repo/<slot>`
-  on branch `work/<slot>`.
+  layers per-slot git worktrees on top of the plain dirs at
+  `/data/projects/<id>/repo/<slot>` on branch `work/<slot>`.
 - Branch resolution priority on first creation: local `work/<slot>`
   exists → reuse; remote `origin/work/<slot>` exists → track new
   local from it; neither → fresh from upstream default branch

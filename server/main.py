@@ -466,6 +466,15 @@ async def lifespan(app: FastAPI):
             await stop_audit_watcher()
         except Exception:
             logger.exception("compass audit watcher shutdown failed")
+        # Cancel any in-flight project-provisioning tasks (auto-fired
+        # on POST/PATCH /api/projects). Without this, a clone in
+        # progress at SIGTERM gets abandoned by the GC and leaves a
+        # half-cloned bare directory that the next deploy trips over.
+        try:
+            from server.projects_api import cancel_in_flight_provision_tasks
+            await cancel_in_flight_provision_tasks()
+        except Exception:
+            logger.exception("provision-task cancel failed")
         for t in bg_tasks:
             t.cancel()
         for t in bg_tasks:

@@ -13,6 +13,7 @@ pypdf>=5.0
 python-docx>=1.1
 openpyxl>=3.1
 python-pptx>=1.0
+pyte>=0.8
 
 [:sys_platform == "win32"]
 tzdata

@@ -131,6 +131,116 @@ _active_switch_task: asyncio.Task | None = None
 # the 2026-05-06 workspace refactor — `ensure_workspaces` is now
 # project-aware and never touches global env, so concurrent provisions
 # for different projects don't collide.
+#
+# In-flight fire-and-forget provisioning tasks (auto-fired on
+# project creation + repo_url updates). Tracked here so the lifespan
+# can cancel them on SIGTERM / redeploy — an orphaned task that's
+# mid-`git clone` when the event loop closes leaves a half-cloned
+# bare directory that the next deploy then trips over.
+_provision_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_provision_task(
+    *, project_id: str, source: str, actor: dict,
+) -> asyncio.Task:
+    """Wrap `_provision_after_change` in `asyncio.create_task` with
+    the result registered in `_provision_tasks` so shutdown can
+    cancel it. Mirrors the pattern around `_active_switch_task`.
+    """
+    task = asyncio.create_task(
+        _provision_after_change(
+            project_id=project_id, source=source, actor=actor,
+        )
+    )
+    _provision_tasks.add(task)
+    task.add_done_callback(_provision_tasks.discard)
+    return task
+
+
+async def cancel_in_flight_provision_tasks() -> None:
+    """Called from `lifespan`'s shutdown branch. Cancels every
+    in-flight `_provision_after_change` task and waits for them to
+    settle (with a short timeout) so a clone that's still cloning
+    when the container is told to stop has a chance to either
+    finish or be torn down cooperatively rather than abandoned by
+    the GC.
+    """
+    if not _provision_tasks:
+        return
+    pending = list(_provision_tasks)
+    for t in pending:
+        if not t.done():
+            t.cancel()
+    # Best-effort drain; ignore everything (CancelledError, raised
+    # exceptions, timeouts) — we're shutting down.
+    try:
+        await asyncio.wait(pending, timeout=5.0)
+    except Exception:
+        logger.exception("cancel_in_flight_provision_tasks: drain failed")
+
+
+async def _provision_after_change(
+    *, project_id: str, source: str, actor: dict,
+) -> None:
+    """Fire-and-forget worktree provisioning hook for project lifecycle
+    events (create, repo_url update). Calls `ensure_workspaces` and
+    publishes a `project_repo_provisioned` event with the outcome so
+    failures surface in the EnvPane / logs instead of being swallowed.
+
+    Near-idempotent — `ensure_workspaces` is itself idempotent
+    on the happy path (mkdir(exist_ok=True), early-return on
+    existing bare clone, existing worktrees skipped), but a
+    concurrent provision targeting the same project can produce
+    transient slot-level failures from the second clone hitting a
+    half-created tree. The per-bare-clone lock in
+    `workspaces._ensure_base_clone` serializes the clone phase to
+    avoid that. Safe to call when repo_url is empty (creates plain
+    per-slot dirs only). The `source` string is included in the
+    event payload so subscribers can tell apart auto-fire
+    (create / patch) from operator-triggered (manual provision
+    button or boot/switch).
+    """
+    try:
+        from server.workspaces import ensure_workspaces
+        result = await ensure_workspaces(project_id)
+    except Exception as e:
+        logger.exception(
+            "_provision_after_change(%s) failed for %s",
+            source, project_id,
+        )
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": "system",
+                "type": "project_repo_provisioned",
+                "project_id": project_id,
+                "ok": False,
+                "error": f"{type(e).__name__}: {str(e)[:300]}",
+                "source": source,
+                "actor": actor,
+            }
+        )
+        return
+    clone_error = result.get("error")
+    slot_failures = [
+        {"slot": s, "error": str(info.get("error") or "")[:200]}
+        for s, info in (result.get("slots") or {}).items()
+        if isinstance(info, dict) and not info.get("ok", True)
+    ]
+    ok = clone_error is None and not slot_failures
+    await bus.publish(
+        {
+            "ts": _now_iso(),
+            "agent_id": "system",
+            "type": "project_repo_provisioned",
+            "project_id": project_id,
+            "ok": ok,
+            "error": clone_error,
+            "slot_failures": slot_failures or None,
+            "source": source,
+            "actor": actor,
+        }
+    )
 
 
 async def _any_agent_working(db) -> str | None:
@@ -461,6 +571,18 @@ def build_router(*, require_token, audit_actor):
             # Don't fail the API call — the directories will be created
             # the next time a coord_* tool tries to touch them.
 
+        # Fire-and-forget worktree provisioning. ensure_workspaces is
+        # idempotent and makes plain per-slot dirs even without a
+        # repo_url. When a repo_url IS set, the clone + per-slot
+        # worktrees materialize in the background so the operator
+        # doesn't have to remember to hit "provision now" after
+        # create. Failures surface via the `project_repo_provisioned`
+        # bus event so a failed clone shows up in the EnvPane / logs
+        # without hanging the create response.
+        _spawn_provision_task(
+            project_id=body.slug, source="project_created", actor=actor,
+        )
+
         await bus.publish(
             {
                 "ts": _now_iso(),
@@ -562,6 +684,24 @@ def build_router(*, require_token, audit_actor):
                 "actor": actor,
             }
         )
+        # Fire provisioning in the background when the patch SET a
+        # repo_url to a non-empty value. We skip the hook when the
+        # patch CLEARED the URL — there's no provisioning work to
+        # do, and existing on-disk worktrees stay where they are
+        # (cleanup of orphaned bare clones is out of scope for now;
+        # the operator can delete + recreate the project to fully
+        # tear down). `_ensure_base_clone` now detects URL changes
+        # against the existing remote and surfaces an error event
+        # rather than silently ignoring the new URL — see
+        # workspaces._ensure_base_clone for the check.
+        if body.repo_url is not None:
+            new_repo = (body.repo_url or "").strip()
+            if new_repo:
+                _spawn_provision_task(
+                    project_id=project_id,
+                    source="project_updated",
+                    actor=actor,
+                )
         return {"ok": True, "project_id": project_id, "changed": len(sets)}
 
     @router.delete(
@@ -875,6 +1015,7 @@ def build_router(*, require_token, audit_actor):
                 # not just the slot id with the detail buried in the
                 # HTTP response body.
                 "slot_failures": slot_failures or None,
+                "source": "manual",
                 "actor": actor,
             }
         )

@@ -1896,7 +1896,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 for slot in deduped:
                     try:
                         await maybe_wake_agent(
-                            slot, wake_prompt, bypass_debounce=True
+                            slot, wake_prompt,
+                            bypass_debounce=True,
+                            wake_source="kanban_pool",
                         )
                     except Exception:
                         pass
@@ -1911,7 +1913,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"task_id={task_id!r}, ...) for non-code artifacts."
                     f"{simple_hint}"
                 )
-                await maybe_wake_agent(slot, wake_prompt, bypass_debounce=True)
+                await maybe_wake_agent(
+                    slot, wake_prompt,
+                    bypass_debounce=True,
+                    wake_source="kanban_assignment",
+                )
         except Exception:
             pass
         if is_pool:

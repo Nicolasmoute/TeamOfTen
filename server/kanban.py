@@ -679,7 +679,11 @@ async def send_role_stand_down(
         from server.agents import maybe_wake_agent
         for slot in woken:
             try:
-                await maybe_wake_agent(slot, body, bypass_debounce=True)
+                await maybe_wake_agent(
+                    slot, body,
+                    bypass_debounce=True,
+                    wake_source="kanban_stand_down",
+                )
             except Exception:
                 pass
     except Exception:
@@ -948,7 +952,11 @@ async def _emit_task_completed(
     )
     try:
         from server.agents import maybe_wake_agent
-        await maybe_wake_agent("coach", body, bypass_debounce=True)
+        await maybe_wake_agent(
+            "coach", body,
+            bypass_debounce=True,
+            wake_source="kanban_completion",
+        )
     except Exception:
         logger.exception(
             "kanban: failed to wake Coach for task_completed %s", task_id
@@ -1750,7 +1758,11 @@ async def _wake_role_or_emit_needed(*, task_id: str, role: str) -> None:
         for slot in targets:
             try:
                 slot_prompt = prompt + await _executor_worktree_boundary(role, slot)
-                await maybe_wake_agent(slot, slot_prompt, bypass_debounce=True)
+                await maybe_wake_agent(
+                    slot, slot_prompt,
+                    bypass_debounce=True,
+                    wake_source="kanban_role",
+                )
             except Exception:
                 pass
     except Exception:
@@ -1832,7 +1844,11 @@ async def _wake_executor_for_revert(
             f"non-code artifacts."
             f"{spec_hint}{report_hint}{criteria_hint}"
         )
-        await maybe_wake_agent(owner, wake_prompt, bypass_debounce=True)
+        await maybe_wake_agent(
+            owner, wake_prompt,
+            bypass_debounce=True,
+            wake_source="kanban_audit_fail",
+        )
     except Exception:
         logger.exception(
             "kanban: failed to wake executor %s for revert on %s",
