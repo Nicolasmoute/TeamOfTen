@@ -5239,6 +5239,29 @@ async def maybe_wake_agent(
     if not allowed:
         logger.info("auto-wake skipped for %s: cost cap hit", agent_id)
         return False
+    # Coach-only: every reactive wake also nudges Coach to scan its
+    # todo list. Without this, wakes triggered by a Player message,
+    # human inbound, task-done, or stall escalation pull Coach into
+    # purely reactive mode and the todo list piles up untouched. The
+    # recurrence tick (recurrences._fire_row) calls run_agent directly
+    # and does NOT pass through here, so its prompt — which already
+    # lists "(2) Open coach-todos" — isn't double-nudged.
+    if agent_id == "coach":
+        try:
+            from server.coach_todos import load_open
+            project_id = await resolve_active_project()
+            open_count = len(load_open(project_id))
+            if open_count:
+                reason = (
+                    reason.rstrip()
+                    + f"\n\nAfter handling this, scan your open "
+                    f"coach-todos ({open_count} open) for anything "
+                    f"ready to act on."
+                )
+        except Exception:
+            logger.exception(
+                "coach wake: todo nudge composition failed"
+            )
     logger.info("auto-wake: spawning %s — %s", agent_id, reason[:80])
     asyncio.create_task(run_agent(agent_id, reason, wake_source=wake_source))
     return True

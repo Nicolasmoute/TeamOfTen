@@ -176,6 +176,32 @@ else.
 
 This replaces today's `COACH_TICK_PROMPT`.
 
+### 4.1 Reactive-wake todo nudge
+
+The tick path is one of several routes that spawn a Coach turn. The
+others are reactive — `maybe_wake_agent` ([server/agents.py](../server/agents.py))
+fires on a human message, a Telegram inbound, a peer chat, a
+task-completion notification, or a stall escalation, and passes a
+short prompt scoped to the trigger ("New message from the human:
+…", "Player p3 finished t-7", etc.). Without intervention these
+wakes pull Coach into purely reactive mode: it answers the trigger
+and ends the turn, even when the todo list has open items ready to
+act on.
+
+To close the gap, `maybe_wake_agent` appends a one-line suffix to
+the wake prompt **when both** (a) `agent_id == "coach"` and (b)
+the active project's `coach-todos.md` has at least one open entry:
+
+> After handling this, scan your open coach-todos (N open) for
+> anything ready to act on.
+
+The recurrence tick (`recurrences._fire_row`) calls `run_agent`
+directly and does NOT pass through `maybe_wake_agent`, so its
+prompt — which already lists "(2) Open coach-todos" — is not
+double-nudged. Failures inside the nudge composition (DB hiccup,
+parse error, missing project) are caught and logged; the wake
+proceeds with the original prompt.
+
 ---
 
 ## 5. Cron DSL

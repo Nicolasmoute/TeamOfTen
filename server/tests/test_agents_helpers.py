@@ -503,3 +503,99 @@ async def test_maybe_schedule_auto_continue_delayed_skips_after_clean_turn() -> 
     # The auto_continue_scheduled emit must NOT have fired either.
     types = [t for _, t, _ in captured_emits]
     assert "auto_continue_scheduled" not in types
+
+
+# ---------- maybe_wake_agent: Coach todo nudge --------------------
+
+
+async def _capture_run_agent_prompt(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Stub run_agent to capture the prompt passed by maybe_wake_agent
+    without spawning a real turn. Returns a list that the caller can
+    inspect after invoking maybe_wake_agent."""
+    import server.agents as agents_mod
+
+    captured: list[str] = []
+
+    async def _stub_run(slot, prompt, **kwargs):
+        captured.append(prompt)
+
+    monkeypatch.setattr(agents_mod, "run_agent", _stub_run)
+
+    # Cost cap allow + harness un-paused, no in-flight turn.
+    async def _allow_caps(_slot):
+        return True, None
+
+    monkeypatch.setattr(agents_mod, "_check_cost_caps", _allow_caps)
+    monkeypatch.setattr(agents_mod, "_paused", False)
+    agents_mod._running_tasks.pop("coach", None)
+    agents_mod._last_turn_ended_at.pop("coach", None)
+    return captured
+
+
+async def test_maybe_wake_agent_coach_appends_todo_nudge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    import server.agents as agents_mod
+    import server.coach_todos as todos_mod
+    from server.db import resolve_active_project
+
+    captured = await _capture_run_agent_prompt(monkeypatch)
+
+    project_id = await resolve_active_project()
+    await todos_mod.add_todo(project_id, title="Wire the launch deck")
+    await todos_mod.add_todo(project_id, title="Review p3's audit report")
+
+    await agents_mod.maybe_wake_agent(
+        "coach", "New message from the human: hi"
+    )
+    # Drain the create_task scheduled inside maybe_wake_agent.
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert len(captured) == 1
+    prompt = captured[0]
+    assert prompt.startswith("New message from the human: hi")
+    assert "scan your open coach-todos" in prompt
+    assert "(2 open)" in prompt
+
+
+async def test_maybe_wake_agent_coach_no_nudge_when_no_todos(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    import server.agents as agents_mod
+
+    captured = await _capture_run_agent_prompt(monkeypatch)
+
+    await agents_mod.maybe_wake_agent("coach", "Player p3 finished t-7")
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert captured == ["Player p3 finished t-7"]
+
+
+async def test_maybe_wake_agent_player_never_gets_nudge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    import server.agents as agents_mod
+    import server.coach_todos as todos_mod
+    from server.db import resolve_active_project
+
+    captured = await _capture_run_agent_prompt(monkeypatch)
+    # Even with open Coach todos, a Player wake gets the unmodified prompt.
+    project_id = await resolve_active_project()
+    await todos_mod.add_todo(project_id, title="Coach-only thing")
+    # Player wake bypasses the coach branch even with debounce reset.
+    agents_mod._last_turn_ended_at.pop("p3", None)
+    agents_mod._running_tasks.pop("p3", None)
+
+    await agents_mod.maybe_wake_agent("p3", "you have a new task")
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert captured == ["you have a new task"]
