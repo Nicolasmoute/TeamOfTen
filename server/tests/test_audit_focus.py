@@ -173,6 +173,80 @@ def test_validate_trajectory_audit_syntax_without_focus_ok() -> None:
     assert traj is not None
 
 
+def test_validate_trajectory_persists_coach_review_on_plan() -> None:
+    """`coach_review: true` on the plan entry must be persisted so
+    the kanban subscriber can read it back from `tasks.trajectory`."""
+    traj, err = _validate_trajectory([
+        {"stage": "plan", "to": "p5", "coach_review": True},
+        {"stage": "execute", "to": "p2"},
+    ])
+    assert err is None, err
+    assert traj is not None
+    assert traj[0].get("coach_review") is True
+    # Default-false form is dropped (don't pollute the row).
+    assert "coach_review" not in traj[1]
+
+
+def test_validate_trajectory_drops_coach_review_on_non_plan_stage() -> None:
+    """The flag is plan-stage-only — paste mistakes on execute / audit /
+    ship are silently dropped, same pattern as the focus field."""
+    traj, err = _validate_trajectory([
+        {"stage": "plan", "to": "p5"},
+        {"stage": "execute", "to": "p2", "coach_review": True},
+        {"stage": "ship", "to": "p4", "coach_review": True},
+    ])
+    assert err is None, err
+    assert traj is not None
+    assert "coach_review" not in traj[0]
+    assert "coach_review" not in traj[1]
+    assert "coach_review" not in traj[2]
+
+
+def test_validate_trajectory_coach_review_false_dropped() -> None:
+    """`coach_review: false` is the default — drop it to keep the
+    persisted JSON tight."""
+    traj, err = _validate_trajectory([
+        {"stage": "plan", "to": "p5", "coach_review": False},
+        {"stage": "execute", "to": "p2"},
+    ])
+    assert err is None, err
+    assert traj is not None
+    assert "coach_review" not in traj[0]
+
+
+def test_validate_trajectory_coach_review_string_aliases() -> None:
+    """Accept conventional truthy strings for the flag — a Coach typing
+    `coach_review='true'` shouldn't bounce the whole create call."""
+    for truthy in ("true", "1", "yes", "on", "TRUE"):
+        traj, err = _validate_trajectory([
+            {"stage": "plan", "to": "p5", "coach_review": truthy},
+            {"stage": "execute", "to": "p2"},
+        ])
+        assert err is None, f"{truthy!r}: {err}"
+        assert traj is not None
+        assert traj[0].get("coach_review") is True, truthy
+    for falsy in ("false", "0", "no", "off", ""):
+        traj, err = _validate_trajectory([
+            {"stage": "plan", "to": "p5", "coach_review": falsy},
+            {"stage": "execute", "to": "p2"},
+        ])
+        assert err is None, f"{falsy!r}: {err}"
+        assert traj is not None
+        assert "coach_review" not in traj[0], falsy
+
+
+def test_validate_trajectory_coach_review_invalid_type_rejected() -> None:
+    """Non-bool / non-string / non-numeric values bounce the call so
+    Coach knows the field was misused."""
+    traj, err = _validate_trajectory([
+        {"stage": "plan", "to": "p5", "coach_review": ["true"]},
+        {"stage": "execute", "to": "p2"},
+    ])
+    assert traj is None
+    assert err is not None
+    assert "coach_review" in err
+
+
 # ------------------------------------------------------------ schema
 
 

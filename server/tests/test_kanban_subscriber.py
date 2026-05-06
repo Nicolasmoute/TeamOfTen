@@ -491,6 +491,119 @@ async def test_spec_written_stamps_last_stage_change_at(fresh_db: str) -> None:
 
 
 # ------------------------------------------------------------
+# coach_review pause: plan entry's `coach_review: true` flag
+# withholds the auto-advance until Coach reviews the spec
+# ------------------------------------------------------------
+
+_PLAN_REVIEW_EXECUTE_TRAJECTORY = (
+    '[{"stage":"plan","to":[],"coach_review":true},'
+    '{"stage":"execute","to":[]}]'
+)
+
+
+async def test_spec_written_with_coach_review_does_not_advance(
+    fresh_db: str,
+) -> None:
+    """When the plan entry carries `coach_review: true`, the kanban
+    must NOT auto-advance plan → execute on spec write. The task
+    stays in plan until Coach explicitly advances."""
+    from server.events import bus
+    await init_db()
+    await _seed(
+        status="plan",
+        trajectory=_PLAN_REVIEW_EXECUTE_TRAJECTORY,
+        owner="p3",
+    )
+    # Real flow stamps spec_path on the row before publishing
+    # task_spec_written; mirror that so the body carries the path.
+    spec_rel = "projects/misc/working/tasks/t-2026-05-03-abc12345/spec.md"
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE tasks SET spec_path = ? WHERE id = ?",
+            (spec_rel, "t-2026-05-03-abc12345"),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    queue = bus.subscribe()
+    try:
+        await _on_spec_written({
+            "type": "task_spec_written",
+            "task_id": "t-2026-05-03-abc12345",
+            "spec_path": spec_rel,
+        })
+        # Drain whatever the handler published.
+        events: list[dict] = []
+        while True:
+            try:
+                events.append(queue.get_nowait())
+            except Exception:
+                break
+    finally:
+        bus.unsubscribe(queue)
+    row = await _read_status("t-2026-05-03-abc12345")
+    assert row["status"] == "plan", (
+        "task should stay in plan when coach_review is set"
+    )
+    review_events = [
+        e for e in events if e.get("type") == "spec_review_needed"
+    ]
+    assert len(review_events) == 1
+    rev = review_events[0]
+    assert rev["task_id"] == "t-2026-05-03-abc12345"
+    assert rev["to"] == "coach"
+    assert rev["next_stage"] == "execute"
+    assert "coord_advance_task_stage" in rev["body"]
+    assert "spec.md" in rev["body"]
+
+
+async def test_spec_written_without_coach_review_still_advances(
+    fresh_db: str,
+) -> None:
+    """Defensive: a plain plan entry (no flag) keeps the v0.3 default
+    auto-advance behavior. Reads on the same trajectory shape this
+    time without the coach_review key."""
+    await init_db()
+    await _seed(
+        status="plan",
+        trajectory=_PLAN_EXECUTE_TRAJECTORY,
+        owner="p3",
+    )
+    await _on_spec_written({
+        "type": "task_spec_written",
+        "task_id": "t-2026-05-03-abc12345",
+        "spec_path": "x",
+    })
+    row = await _read_status("t-2026-05-03-abc12345")
+    assert row["status"] == "execute"
+
+
+async def test_spec_written_with_coach_review_false_advances(
+    fresh_db: str,
+) -> None:
+    """`coach_review: false` is the explicit-default form (validator
+    drops it on serialization, but the on-disk JSON might carry it).
+    Behavior must match the missing-key case: auto-advance fires."""
+    await init_db()
+    await _seed(
+        status="plan",
+        trajectory=(
+            '[{"stage":"plan","to":[],"coach_review":false},'
+            '{"stage":"execute","to":[]}]'
+        ),
+        owner="p3",
+    )
+    await _on_spec_written({
+        "type": "task_spec_written",
+        "task_id": "t-2026-05-03-abc12345",
+        "spec_path": "x",
+    })
+    row = await _read_status("t-2026-05-03-abc12345")
+    assert row["status"] == "execute"
+
+
+# ------------------------------------------------------------
 # v0.3.2 kanban-flow audit gap 1: stage-entry wake names the tool
 # ------------------------------------------------------------
 

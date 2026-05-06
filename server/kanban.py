@@ -400,15 +400,22 @@ async def _on_spec_written(ev: dict[str, Any]) -> None:
     transition only fires when the next stage exists in the trajectory.
     The wake of the next-stage assignee is handled by the
     `task_stage_changed` listener (`_on_stage_changed` →
-    `_wake_role_or_emit_needed`)."""
+    `_wake_role_or_emit_needed`).
+
+    Coach-review pause (kanban-specs.md §3.5.1): when the plan entry
+    has `coach_review: true`, the auto-advance is withheld. Coach gets
+    a `spec_review_needed` event + a system-tagged wake with the spec
+    path; they review, then advance manually via
+    `coord_advance_task_stage(stage='execute', assignee=...)`. Without
+    the flag, behavior is unchanged."""
     task_id = (ev.get("task_id") or "").strip()
     if not task_id:
         return
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT status, trajectory, owner, project_id "
-            "FROM tasks WHERE id = ?",
+            "SELECT status, trajectory, owner, project_id, title, "
+            "spec_path FROM tasks WHERE id = ?",
             (task_id,),
         )
         row = await cur.fetchone()
@@ -429,6 +436,19 @@ async def _on_spec_written(ev: dict[str, Any]) -> None:
     # order, but skip plan→archive jumps from corrupted trajectories.
     if next_stage == "archive":
         return
+
+    # Coach-review pause: when the plan entry's `coach_review` flag is
+    # true, withhold the auto-advance + ask Coach to review.
+    if _plan_entry_wants_coach_review(t):
+        await _emit_spec_review_needed(
+            task_id=task_id,
+            title=t.get("title") or "",
+            spec_path=t.get("spec_path") or "",
+            project_id=t.get("project_id") or "",
+            next_stage=next_stage,
+        )
+        return
+
     await _transition(
         task_id=task_id,
         new_status=next_stage,
@@ -436,6 +456,85 @@ async def _on_spec_written(ev: dict[str, Any]) -> None:
         owner=t["owner"],
         project_id=t["project_id"],
     )
+
+
+def _plan_entry_wants_coach_review(task: dict[str, Any]) -> bool:
+    """True when the `plan` entry on the stored trajectory carries the
+    `coach_review: true` flag. Defensive against malformed JSON."""
+    raw = task.get("trajectory")
+    if not raw:
+        return False
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return False
+    if not isinstance(parsed, list):
+        return False
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("stage", "")) == "plan":
+            return bool(entry.get("coach_review"))
+    return False
+
+
+async def _emit_spec_review_needed(
+    *, task_id: str, title: str, spec_path: str, project_id: str,
+    next_stage: str,
+) -> None:
+    """Publish a `spec_review_needed` event routed to Coach + fire a
+    system-tagged wake so Coach gets a compact pane row (not a
+    full-prompt-body turn header) with a link to the spec."""
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).isoformat()
+    title_q = title.strip() or task_id
+    body = (
+        f"Spec for task {task_id} ('{title_q}') is ready for your "
+        f"review. The plan trajectory entry was tagged "
+        f"`coach_review: true`, so the kanban is holding the "
+        f"plan -> {next_stage} transition until you advance manually.\n\n"
+        f"Read the spec at {spec_path or '(spec_path missing)'}, then "
+        f"either:\n"
+        f"  - approve + advance: coord_advance_task_stage("
+        f"task_id={task_id!r}, stage={next_stage!r}, assignee=<slot>)\n"
+        f"  - request changes: coord_send_message(to=<planner>, "
+        f"body='spec needs ...') and the planner re-writes via "
+        f"coord_write_task_spec; this hook re-fires on the next spec "
+        f"write so you'll be re-pinged.\n"
+        f"  - drop the task: coord_advance_task_stage("
+        f"task_id={task_id!r}, stage='archive')."
+    )
+    payload = {
+        "ts": ts,
+        "agent_id": "system",
+        "type": "spec_review_needed",
+        "task_id": task_id,
+        "title": title_q,
+        "spec_path": spec_path,
+        "next_stage": next_stage,
+        "project_id": project_id,
+        "to": "coach",
+        "body": body,
+    }
+    try:
+        await bus.publish(payload)
+    except Exception:
+        logger.exception(
+            "kanban: failed to publish spec_review_needed for %s",
+            task_id,
+        )
+    try:
+        from server.agents import maybe_wake_agent
+        await maybe_wake_agent(
+            "coach", body,
+            bypass_debounce=True,
+            wake_source="kanban_spec_review",
+        )
+    except Exception:
+        logger.exception(
+            "kanban: failed to wake Coach for spec_review_needed %s",
+            task_id,
+        )
 
 
 async def _on_stage_changed(ev: dict[str, Any]) -> None:

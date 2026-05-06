@@ -258,6 +258,12 @@ def _validate_trajectory(
         noise — see kanban-specs.md §4.6.3). Empty-pool semantic
         stages are allowed; the focus check then happens at
         `coord_assign_auditor` time.
+      - `coach_review` (optional) bool on the `plan` entry only; when
+        truthy, the kanban does NOT auto-advance plan → execute on
+        spec write. Instead it emits `spec_review_needed` + a Coach
+        wake; Coach reviews and advances manually via
+        `coord_advance_task_stage(stage='execute', assignee=...)`.
+        Silently dropped on non-plan stages.
     """
     if raw is None:
         return None, "trajectory is required"
@@ -322,6 +328,28 @@ def _validate_trajectory(
         # so a Coach paste-mistake doesn't pollute the row).
         if focus_clean and stage in ("audit_syntax", "audit_semantics"):
             out_entry["focus"] = focus_clean
+        # `coach_review` is plan-stage-only: when truthy, the kanban
+        # withholds the plan→execute auto-advance so Coach can review
+        # the spec before execution begins. Silently drop on other
+        # stages so a paste-mistake doesn't pollute the row.
+        if stage == "plan":
+            cr_raw = entry.get("coach_review")
+            if cr_raw is not None:
+                if isinstance(cr_raw, bool):
+                    cr_value = cr_raw
+                elif isinstance(cr_raw, (int, float)):
+                    cr_value = bool(cr_raw)
+                elif isinstance(cr_raw, str):
+                    cr_value = cr_raw.strip().lower() in (
+                        "1", "true", "yes", "on"
+                    )
+                else:
+                    return None, (
+                        f"trajectory entry 'plan': 'coach_review' must "
+                        f"be a bool"
+                    )
+                if cr_value:
+                    out_entry["coach_review"] = True
         normalized.append(out_entry)
 
     if "execute" not in seen_stages:

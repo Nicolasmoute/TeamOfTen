@@ -11112,6 +11112,7 @@ const _SYSTEM_WAKE_LABELS = {
   kanban_completion: "kanban: task completed",
   kanban_stall: "kanban: stall escalation",
   kanban_idle_poller: "kanban: idle nudge",
+  kanban_spec_review: "kanban: spec ready for review",
   system_recovery: "system: auto-retry",
 };
 

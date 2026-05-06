@@ -6,9 +6,17 @@
 > subscriber, the idle-Player poller) but cannot redefine fields,
 > endpoints, events, or invariants that TOT-specs declares.
 
-**Status:** Shipped (2026-05-06, v0.3.12 — `coord_advance_task_stage` assignee gate: when the target stage's role row has no eligible owner, Coach must pass `assignee` so the new stage has someone to wake; previously the call would succeed and the kanban would echo `stage_assignment_needed` straight back).
+**Status:** Shipped (2026-05-06, v0.3.13 — system-wake compaction + plan-stage `coach_review` flag: wakes spawned by the kanban (role calls, audit-fail re-wakes, completion summaries, stall-ladder rungs, idle-poller nudges, stand-downs, spec-review pings) now carry a `wake_source` tag and render as a single-line compact turn header in the conversation timeline instead of leaking the full instructional prompt body; the trajectory's `plan` entry accepts `coach_review: true` to hold the auto-advance until Coach reviews the spec).
 **Target:** TeamOfTen multi-agent harness (Python, Claude Agent SDK, kDrive-backed shared state, single-VPS)
-**Version:** 0.3.12
+**Version:** 0.3.13
+
+> **v0.3.13 (2026-05-06 system-wake compaction + plan-stage Coach review)** — two related complaints surfaced together: (1) the multi-paragraph instructional bodies the kanban injects as wake prompts (e.g. the `task_completed` Coach summary instruction) were rendering as full prompts in the conversation timeline, blurring the line between "human spoke to Coach" and "system instructed Coach"; (2) Coach often wants to read the spec before the executor runs but had no structured way to express that intent — the free-text "Coach reviews spec before execute" line in the description didn't reach the kanban, so plan → execute auto-advanced silently while Coach and Player each waited on the other.
+>   - **`wake_source` tag on `agent_started` events.** `maybe_wake_agent(..., wake_source: str | None = None)` propagates through `run_agent` into the `agent_started` event payload. Conventional values: `kanban_assignment`, `kanban_pool`, `kanban_role`, `kanban_audit_fail`, `kanban_stand_down`, `kanban_completion`, `kanban_stall`, `kanban_idle_poller`, `kanban_spec_review`, `system_recovery`. Human-originated wakes (UI composer, Telegram inbound, peer `coord_send_message`) stay untagged and keep the existing full-prompt turn header. Tagged at every kanban-internal call site in [server/kanban.py](../server/kanban.py), [server/tools.py](../server/tools.py) (`coord_assign_task` + `_assign_role_helper`), and [server/idle_poller.py](../server/idle_poller.py) (rung 1+2 + the idle nudge); auto-retry in [server/agents.py](../server/agents.py) is `system_recovery`.
+>   - **UI: compact turn header for tagged wakes.** [server/static/app.js](../server/static/app.js) `TurnHeader` now has a third branch alongside `compact_mode`: when `event.wake_source` is set, render the existing `.turn-header.compact` pattern with a `⚙` icon + the human-readable label (e.g. "kanban: task completed", "kanban: audit failed — re-do"). Click-to-expand still reveals the full prompt body for debug; the `.system-wake` class lets future styling tweak the system-tagged variant separately if needed. Old `agent_started` events without the field keep the full one-liner — graceful default.
+>   - **Plan-stage `coach_review` flag.** `_validate_trajectory` now accepts `coach_review: true` on the `plan` entry. When set, the kanban subscriber's `_on_spec_written` skips the auto-advance — it instead emits `spec_review_needed{to: 'coach'}` and fires a `wake_source='kanban_spec_review'` Coach wake whose body links the spec path and names the three resolution paths: approve + advance via `coord_advance_task_stage(stage='execute', assignee=...)` (uses the v0.3.12 assignee gate), request changes via `coord_send_message` to the planner (this hook re-fires on the next spec write), or `coord_advance_task_stage(stage='archive')` to drop the task. Default `false` so existing trajectories keep their auto-advance — opt-in per task. Also accepts truthy strings (`'true'` / `'1'` / `'yes'` / `'on'`) for paste-tolerance; non-bool / non-string / non-numeric values bounce the validator. Silently dropped on non-plan stages (paste-mistake guard, same as `focus`).
+>   - **Coach prompt update.** `_build_coach_coordination_block` ([server/agents.py](../server/agents.py)) gains a "PLAN-STAGE COACH REVIEW" paragraph after the trajectory examples — names the flag, the resulting Coach pane row, and the three resolution paths.
+>   - **Tests:** 1194 → 1207 (+13). +6 in [test_audit_focus.py](../server/tests/test_audit_focus.py) for the validator (true persists, non-plan drops, false drops, string aliases, invalid type rejected). +3 in [test_kanban_subscriber.py](../server/tests/test_kanban_subscriber.py) for `_on_spec_written` (review flag holds the advance + emits the event, no flag still advances, false still advances). +4 informally exercised through the existing wake-stub tests (no new test file needed — the wake_source plumbing is straight-line forward through `run_agent`'s existing payload assembly).
+>   - **Out of scope:** existing peer chat / human composer / Telegram wakes intentionally not tagged; `coord_send_message`'s preview-style wake remains a full turn header because it's a real inter-agent message, not a system instruction.
 
 > **v0.3.12 (2026-05-06 advance-stage assignee gate)** — production trace: Coach called `coord_advance_task_stage(task_id, stage)` to push a task forward. The target stage's role row had no owner / empty `eligible_owners`, so the kanban subscriber's `_on_stage_changed` immediately fired `stage_assignment_needed` back at Coach, asking for an assignment. The advance succeeded, but the task was stuck — Coach had to make a follow-up `coord_assign_<role>` call. Two-step where one would do, and easy to forget the second step.
 >   - **`assignee` parameter.** `coord_advance_task_stage(task_id, stage, assignee?, note?)` — single slot ('p3') for hard-assign or comma-list ('p2,p5') for a pool. Validated via the existing `_validate_role_targets` (rejects locked Players, coach/broadcast, unknown slots).
@@ -288,6 +296,32 @@ The validator returns `(trajectory_json, role_inserts)` so `coord_create_task` c
 ### 3.4 Spec gate
 
 If `plan` is in the trajectory, the executor cannot start until `spec_path IS NOT NULL`. The planner's `coord_write_task_spec` call sets `spec_path`, marks the planner role complete, and triggers `plan → execute`. If `plan` is **not** in the trajectory, no spec is required — Coach signaled "no plan needed" by omitting the stage. `coord_write_task_spec` is callable as a documented emergency override regardless.
+
+### 3.4.1 Coach review gate (`coach_review`, v0.3.13)
+
+The plan trajectory entry accepts an optional `coach_review: true` boolean. When set, the kanban subscriber's `_on_spec_written` does **not** auto-advance plan → execute on spec write. Instead it:
+
+1. Emits `spec_review_needed{task_id, title, spec_path, next_stage, project_id, to: 'coach', body}`.
+2. Wakes Coach with `wake_source='kanban_spec_review'` so the pane row renders compact (single-line "kanban: spec ready for review" header; full body click-to-expand).
+
+Coach's three resolution paths:
+
+- **Approve + advance**: `coord_advance_task_stage(task_id, stage='execute', assignee=<slot>)` — runs through the v0.3.12 assignee gate so the executor row gets planted atomically.
+- **Request changes**: `coord_send_message(to=<planner_slot>, body='spec needs ...')`. The planner re-writes via `coord_write_task_spec`; the hook re-fires on the next spec write so Coach is re-pinged.
+- **Drop the task**: `coord_advance_task_stage(task_id, stage='archive')`.
+
+Without the flag (the default), behavior is unchanged: `_on_spec_written` auto-advances plan → execute the moment the planner role completes. The flag is plan-stage-only; the validator silently drops it from non-plan entries (paste-mistake guard, same as `focus`). String aliases (`'true'` / `'1'` / `'yes'` / `'on'`) are accepted; non-bool / non-string / non-numeric values bounce the validator.
+
+Example trajectory with the gate set:
+
+```json
+[
+  {"stage": "plan", "to": "p5", "coach_review": true},
+  {"stage": "execute", "to": "p2"}
+]
+```
+
+Use it when (a) the spec contract is fuzzy and you want to read it before committing the executor's effort, (b) the executor is new to the area and you want to catch scope-drift in the plan rather than after a wasted execute round, or (c) the work is high-stakes (public-facing, cross-stakeholder, hard to revert).
 
 ### 3.5 Self-audit reminder (trajectory-driven)
 
@@ -1106,6 +1140,10 @@ This matches the rule "expect first fail as normal; act on the second fail of th
 Coach needs to **know** about every fail (visibility) but should **act** only on patterns (signal). The bus notification is the visibility layer; the rollup is the action layer. Without the visibility layer Coach is blind to single fails (which may still warrant a `coord_send_message` nudge or a clarifying question to the executor); without the action filter Coach over-reacts to normal first-correction cycles.
 
 The same ladder is in `MODEL_GUIDANCE` ([server/models_catalog.py](server/models_catalog.py)) — Coach reads it twice (once as policy, once as actionable signal) so the connection between symptom and remedy is unmistakable.
+
+### 17.4 Tick-prompt cross-reference
+
+The `## Active task health` rollup is a **passive** surface (Coach sees it whenever it spawns), so a tick that finds an empty inbox and empty todo list could in principle skip past a degrading task to "drive an objective." To close that gap, the recurrence tick prompt's step (1) explicitly directs Coach to scan `## Active task health` AND `## Stalled tasks` after reading the inbox and before any other priority — see [recurrence-specs.md](recurrence-specs.md) §4. The rollup itself stays unchanged; the tick prompt just promotes "fix what's already broken" above "invent forward motion."
 
 ---
 

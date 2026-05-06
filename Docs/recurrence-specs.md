@@ -122,18 +122,25 @@ with no tick; the operator enables it via `/tick 60` or the pane.
 The tick has **no user-supplied prompt**. The harness assembles a per-fire
 prompt from project state, with priority:
 
-1. **Inbox** — if Coach has unread human messages or unread Player updates,
-   address those.
-2. **Todos** — if `coach-todos.md` has open entries, pick the most relevant
-   (consider deadlines, dependencies) and act on it.
-3. **Objectives** — if no inbox items and no open todos, consult
-   `project-objectives.md` and pick **one concrete action** that
-   materially advances an objective. Coach must take action on every
-   fire when objectives exist; this branch is the whole point of a
-   recurring tick. Action shapes include: assign a Player, send a
-   status update or coordination message, add a new coach-todo for
-   the operator to refine, audit Player work in progress, or just
-   propose a useful next step and execute it.
+1. **Inbox + active problems** — if Coach has unread human messages or
+   unread Player updates, address those. Then scan the
+   `## Active task health` and `## Stalled tasks` rollups (injected
+   into the system prompt by the kanban observer — see
+   [kanban-specs.md](kanban-specs.md) §17, §18) and intervene on
+   anything before the auto-actions fire (auto-reassign at 2h,
+   auto-archive at 4h). The escalation ladder is a safety net, not a
+   plan; Coach should beat it whenever possible.
+2. **Todos** — if no pending problems remain, pick the most relevant
+   open `coach-todos.md` entry (consider deadlines, dependencies) and
+   act on it.
+3. **Objectives** — if no inbox items, no kanban issues, and no open
+   todos, consult `project-objectives.md` and pick **one concrete
+   action** that materially advances an objective. Coach must take
+   action on every fire when objectives exist; this branch is the
+   whole point of a recurring tick. Action shapes include: assign a
+   Player, send a status update or coordination message, add a new
+   coach-todo for the operator to refine, audit Player work in
+   progress, or just propose a useful next step and execute it.
 4. **Empty state — objectives absent or empty** — only when no
    `## Project objectives` section appears in the system prompt
    (file missing, empty, or fully whitespace) does Coach end the
@@ -148,7 +155,11 @@ prompt is short — it just orients Coach to the priority order:
 > Priority order:
 >
 > (1) Inbox first — call coord_read_inbox. Respond to anything pending
-> from the human or your teammates.
+> from the human or your teammates. Then scan "## Active task health"
+> and "## Stalled tasks" if those sections appear in your system
+> prompt above — auto-reassign fires at 2h, auto-archive at 4h.
+> Intervene before the safety net does (nudge the blocker, reassign,
+> or bump effort/model for repeat audit fails).
 > (2) Open coach-todos — if inbox is clear, pick the todo most aligned
 > with current priorities and act on it (assign to a Player, break it
 > into smaller steps, or do the work yourself).

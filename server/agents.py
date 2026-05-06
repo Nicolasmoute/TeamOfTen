@@ -2922,6 +2922,21 @@ async def _build_coach_coordination_block() -> str:
     )
     lines.append("")
     lines.append(
+        "PLAN-STAGE COACH REVIEW: when you want to read the spec "
+        "before the executor runs, set `coach_review: true` on the "
+        "plan entry. The kanban then HOLDS plan -> execute on spec "
+        "write and pings you to review (a `kanban: spec ready for "
+        "review` row in your pane + a `spec_review_needed` event). "
+        "You then advance manually via `coord_advance_task_stage("
+        "task_id=..., stage='execute', assignee=<slot>)`, or send "
+        "the planner a change request via coord_send_message. "
+        "Without the flag, plan -> execute auto-advances on spec "
+        "write — default behavior. Example with review gate: "
+        "[{\"stage\":\"plan\",\"to\":\"p5\",\"coach_review\":true},"
+        "{\"stage\":\"execute\",\"to\":\"p2\"}]"
+    )
+    lines.append("")
+    lines.append(
         "Always delegate planning to a Player (coord_assign_planner "
         "if rerouting mid-flight). coord_write_task_spec exists for "
         "emergency override only — when no Player is reachable for "
