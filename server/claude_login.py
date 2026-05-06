@@ -304,8 +304,16 @@ async def start_login() -> dict:
     # screen until timeout.
     await asyncio.sleep(STARTUP_SETTLE)
     sess.read_available()
+    # Type the command first, let the TUI's slash-command autocomplete
+    # open (~0.3s), THEN send CR. The Claude TUI uses raw-mode input
+    # where Enter is encoded as `\r` (CR), not `\n` (LF) — the latter
+    # was being consumed as a literal character and the command never
+    # executed. Using a separate write for CR also lets the autocomplete
+    # box settle on `/login` as the first match before we commit.
     try:
-        sess.write("/login\n")
+        sess.write("/login")
+        await asyncio.sleep(0.3)
+        sess.write("\r")
     except OSError as e:
         sess.close()
         _sessions.pop(sid, None)
@@ -313,7 +321,8 @@ async def start_login() -> dict:
 
     loop = asyncio.get_running_loop()
     deadline = loop.time() + START_TIMEOUT
-    resent_login = False
+    extra_enter_sent = False
+    extra_enter_at = loop.time() + 2.0
     while loop.time() < deadline:
         await asyncio.sleep(POLL_INTERVAL)
         chunk = sess.read_available()
@@ -321,26 +330,25 @@ async def start_login() -> dict:
             # CLI asks something like "Refresh login? [Y/n]" or
             # "Open browser? [Y/n]" — answer 'y' so the URL is printed
             # (xdg-open fails harmlessly in headless containers and the
-            # CLI falls back to displaying the URL).
+            # CLI falls back to displaying the URL). CR for Enter,
+            # same reason as above.
             try:
-                sess.write("y\n")
+                sess.write("y\r")
             except OSError:
                 pass
         url = extract_url(sess.buffer)
         if url:
             sess.url = url
             return {"session_id": sid, "url": url}
-        # Some CLI versions need /login resent if the first keystroke
-        # raced startup. After 3s with no URL and an empty-looking
-        # buffer, retry once.
-        if (not resent_login
-                and loop.time() - (deadline - START_TIMEOUT) > 3.0
-                and "login" not in sess.buffer.lower()):
+        # If the first CR only confirmed the autocomplete dropdown
+        # without executing, a second CR after a brief delay actually
+        # runs the command. Fires once, ~2s after the initial /login.
+        if not extra_enter_sent and loop.time() >= extra_enter_at:
             try:
-                sess.write("/login\n")
+                sess.write("\r")
             except OSError:
                 pass
-            resent_login = True
+            extra_enter_sent = True
         if sess.proc.poll() is not None:
             transcript = sess.buffer[-ERROR_TAIL_BYTES:]
             sess.close()
@@ -375,8 +383,12 @@ async def submit_code(sid: str, code: str) -> dict:
 
     # Reset the buffer so we only inspect post-submit output.
     sess.buffer = ""
+    # Type the code, brief settle, then CR to submit. Same Enter-is-CR
+    # rationale as the /login send in start_login.
     try:
-        sess.write(code + "\n")
+        sess.write(code)
+        await asyncio.sleep(0.2)
+        sess.write("\r")
     except OSError as e:
         sess.close()
         _sessions.pop(sid, None)
