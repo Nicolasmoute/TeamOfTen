@@ -224,6 +224,22 @@ def _credentials_mtime() -> float:
         return 0.0
 
 
+def credentials_present() -> bool:
+    """True iff $CLAUDE_CONFIG_DIR/.credentials.json exists.
+
+    Public so the Claude runtime can distinguish "auth missing" from
+    "session id stale" when a ProcessError fires — both surface the
+    same exception class, but only the latter should clear session_id.
+    """
+    p = _credentials_path()
+    if p is None:
+        return False
+    try:
+        return p.is_file()
+    except OSError:
+        return False
+
+
 def _spawn_pty_subprocess() -> tuple[subprocess.Popen, int]:
     """Spawn the configured login command in a pty. POSIX-only."""
     if sys.platform == "win32":

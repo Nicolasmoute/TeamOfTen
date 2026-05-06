@@ -287,6 +287,34 @@ async def test_cancel_all_sessions_empty_returns_zero() -> None:
     assert dropped == 0
 
 
+def test_credentials_present_unset_dir_returns_false(monkeypatch) -> None:
+    from server import claude_login
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    assert claude_login.credentials_present() is False
+
+
+def test_credentials_present_missing_file_returns_false(monkeypatch, tmp_path) -> None:
+    from server import claude_login
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    assert claude_login.credentials_present() is False
+
+
+def test_credentials_present_existing_file_returns_true(monkeypatch, tmp_path) -> None:
+    from server import claude_login
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    (tmp_path / ".credentials.json").write_text("{}", encoding="utf-8")
+    assert claude_login.credentials_present() is True
+
+
+def test_credentials_present_directory_not_file_returns_false(monkeypatch, tmp_path) -> None:
+    """A directory at the credentials path doesn't count as creds — a
+    misconfigured CLAUDE_CONFIG_DIR shouldn't masquerade as authed."""
+    from server import claude_login
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    (tmp_path / ".credentials.json").mkdir()
+    assert claude_login.credentials_present() is False
+
+
 # ----------------------------------------------------- pty smoke tests
 
 # These exercise the real subprocess + pty + os.read path. Linux-only:

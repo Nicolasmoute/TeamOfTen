@@ -1788,6 +1788,24 @@ stdin; the CLI writes `.credentials.json` to `$CLAUDE_CONFIG_DIR`
   a two-step "Sign out / use different account" button next to
   **Refresh tokens** when authenticated; the second click confirms.
   Emits `claude_auth_cleared`.
+- **Auth-failure guard in stale-session auto-heal**
+  ([server/runtimes/claude.py](server/runtimes/claude.py)) — sign-out
+  was incorrectly resetting agents' `session_id` because the runtime's
+  stale-session auto-heal treated every `ProcessError` on a resume as
+  "this session is stale, clear it and retry fresh". Auth failures
+  (missing `.credentials.json` after sign-out) surface the same
+  exception class, so the next agent spawn after sign-out would lose
+  its continuity. Fix: before clearing `session_id`, check
+  `claude_login.credentials_present()`. If creds are missing, emit a
+  `session_resume_blocked{reason="credentials_missing"}` event and
+  re-raise so the outer error path runs without touching `session_id`.
+  When the operator signs back in (same or different account), the
+  next spawn either resumes cleanly (same account) or fails normally
+  and triggers the original auto-heal path (different account, server
+  rejects the session_id). Tests in
+  [server/tests/test_claude_login.py](server/tests/test_claude_login.py)
+  cover the four `credentials_present()` truth-table cases (unset
+  env, missing file, present file, directory at the path).
 - **One-session-per-process invariant.** A second `start` drops the
   prior session — nobody runs two parallel logins on the same harness.
 - **Reaper** wired into `lifespan` next to `start_audit_watcher` and

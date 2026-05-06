@@ -202,8 +202,31 @@ class ClaudeRuntime:
                 # Stale session auto-heal — clear stored id and retry once
                 # without resume. Only when prior_session was set AND the
                 # error came from the SDK subprocess layer (ProcessError).
+                #
+                # Guard against auth-failure misclassification: if the
+                # operator just signed out (.credentials.json gone), the
+                # CLI also exits with ProcessError, but the session_id
+                # itself is still valid — clearing it would destroy
+                # continuity that comes back the moment they sign in
+                # again. Bail without touching session_id so the outer
+                # error path emits the failure normally.
                 is_process_err = type(e).__name__ == "ProcessError"
                 if tc.prior_session and is_process_err:
+                    from server.claude_login import credentials_present
+                    if not credentials_present():
+                        logger.warning(
+                            "agent %s: ProcessError with no .credentials.json — "
+                            "treating as auth failure, NOT clearing session=%s",
+                            agent_id, tc.prior_session,
+                        )
+                        await _emit(
+                            agent_id,
+                            "session_resume_blocked",
+                            reason="credentials_missing",
+                            session_id=tc.prior_session,
+                            error=f"{type(e).__name__}: {e}",
+                        )
+                        raise
                     logger.warning(
                         "agent %s: resume of session=%s failed, clearing and retrying fresh",
                         agent_id, tc.prior_session,
