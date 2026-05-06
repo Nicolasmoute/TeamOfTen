@@ -280,8 +280,8 @@ Body is a stdio MCP server that:
   Linux deployment and Windows development hosts.
 - Codex runtime sets the coord MCP subprocess `cwd` and prepends the
   harness root to `PYTHONPATH`, because Codex turns execute inside the
-  agent workspace (`/workspaces/<slot>/project`) while the proxy module
-  lives in the TeamOfTen server package.
+  agent workspace (`/data/projects/<active>/repo/<slot>`) while the
+  proxy module lives in the TeamOfTen server package.
 - Statically declares the coord tool list (names, permissive schemas)
   fetched from the loopback catalog. Handler drift between the proxy
   catalog and the real handlers is caught by contract tests (§J).

@@ -331,8 +331,12 @@ Background switch steps:
    - Calls `push_project_tree(from_project)`.
    - Uses timeout `HARNESS_KDRIVE_CLOSE_TIMEOUT_S`, default 60s.
 3. `pull_new`: pull target project tree from WebDAV.
-4. `swap_pointer`: set `team_config.active_project_id`.
-5. `reload`: emit terminal `project_switched`.
+4. `provision_workspaces`: clone repo + create per-slot worktrees
+   for the new project (idempotent). Pinned to `to_project` for the
+   duration. A failed provision aborts the switch before the
+   pointer swap so `from_project` stays active.
+5. `swap_pointer`: set `team_config.active_project_id`.
+6. `reload`: emit terminal `project_switched`.
 
 Failure semantics:
 
@@ -352,32 +356,55 @@ Switch-preview counts:
 - Whether target exists on disk.
 - In-flight agent id, if any.
 
-### 4.6 Current Project Repo Caveat
+### 4.6 Project Repo Layout
 
-The schema and API include `projects.repo_url` and per-project repo provision.
-However, `server/workspaces.py` still uses the legacy workspace layout:
+Repo URL is per-project: `projects.repo_url` is the single source of
+truth. There is no global `HARNESS_PROJECT_REPO` env or
+`team_config.project_repo` row — both were retired with the
+2026-05-06 workspace refactor (`Docs/workspace-refactor-plan.md`).
 
-```text
-/workspaces/.project
-/workspaces/<slot>/project
-```
-
-It does not yet use the per-project path declared in `server.paths`:
+Worktrees live under each project's own tree, not a global
+`/workspaces/`:
 
 ```text
-/data/projects/<slug>/repo/.project
-/data/projects/<slug>/repo/<slot>
+/data/projects/<id>/repo/.project   # bare-ish seed clone, one per project
+/data/projects/<id>/repo/<slot>     # per-slot worktree on branch work/<slot>
 ```
 
-`POST /api/projects/{id}/repo/provision` temporarily sets
-`HARNESS_PROJECT_REPO` and pins the active project while calling the legacy
-`ensure_workspaces()`. This lets the UI provision a selected project's repo
-URL, but the underlying worktree storage is still global `/workspaces`, not a
-fully isolated per-project repo tree.
+Path resolution helpers in `server/paths.py`:
 
-Implication: project state is project-scoped in the database and file browser,
-but code worktrees are still a hybrid area and can collide across projects if
-the operator switches repos frequently.
+- `project_paths(<id>).bare_clone` → `/data/projects/<id>/repo/.project`
+- `project_paths(<id>).worktree(slot)` → `/data/projects/<id>/repo/<slot>`
+
+`workspace_dir(slot)` (in `server/workspaces.py`) is `async` and
+resolves through the active project: it returns
+`project_paths(active).worktree(slot)`. Pure function of `(active,
+slot)`.
+
+Provisioning happens in two places:
+
+1. **Boot**, once, for the active project — `lifespan` in
+   `server/main.py` calls `ensure_workspaces(active_project_id)`
+   after `init_db`.
+2. **Project switch** — `_run_switch` (`server/projects_api.py`)
+   inserts a `provision_workspaces` step between `pull_new` and
+   `swap_pointer`. A failed provision aborts the switch before the
+   pointer swap and emits `project_switched ok=False`.
+
+The per-slot worktree retains its `work/<slot>` history across
+project switches: switching back to a project re-runs
+`ensure_workspaces`, which sees the existing worktree and is a
+no-op. Branch resolution priority on first creation: local
+`work/<slot>` exists → reuse; remote `origin/work/<slot>` exists →
+track; neither → fresh from upstream default branch (`main`).
+
+Coach gets a per-slot worktree too (used for read-only inspection —
+Read, Grep, Bash). `coord_commit_push` is Player-only at the tool
+level; Coach can't commit even with a worktree.
+
+Manual backstop: `POST /api/projects/{id}/repo/provision` runs
+`ensure_workspaces(<id>)` for any project (active or not). No env
+mutation, no global state — the function is project-aware.
 
 ---
 
@@ -559,10 +586,10 @@ CREATE TABLE agents (
 spawn: `agents.runtime_override` (if set) → role default in
 `team_config` → `'claude'`. See `Docs/CODEX_RUNTIME_SPEC.md` §B.1.
 
-Seed rows:
-
-- `coach`, kind `coach`, workspace `/workspaces/coach`
-- `p1` to `p10`, kind `player`, workspace `/workspaces/pN`
+Seed rows: `coach` (kind `coach`) and `p1`..`p10` (kind `player`).
+The `workspace_path` column is legacy from before the per-project
+repo layout (§4.6) and is not consulted at runtime — agent cwd is
+resolved by `workspace_dir(slot)` against the active project.
 
 Per-(slot, project) identity (`name`, `role`, `brief`) lives in
 `agent_project_roles`; per-(slot, project) session state
@@ -896,8 +923,6 @@ Known keys:
 - `players_default_model_codex`: JSON string, Codex-only Player model default.
 - `coach_default_runtime`: JSON string, role default runtime (`claude`, `codex`, or empty).
 - `players_default_runtime`: JSON string, role default runtime (`claude`, `codex`, or empty).
-- `project_repo`: legacy/global repo URL override.
-- `project_branch`: legacy/global branch override.
 - `telegram_disabled`: `"1"` disables Telegram even if env fallback exists.
 - `observed_context_windows`: stored model context estimates observed at runtime.
 
@@ -1259,7 +1284,6 @@ Actual current caveats:
   memory path is `working/memory/`. That WebDAV path should be reconciled.
 - Outputs module still defaults to global `/data/outputs`, not
   `/data/projects/<slug>/outputs`.
-- Workspaces still use `/workspaces`, not the per-project `repo/` tree.
 
 ### 8.3 Project CLAUDE.md Stub
 
@@ -2850,9 +2874,6 @@ Timeout:
 | `PUT /api/team/models` | Set per-role defaults, split by runtime |
 | `GET /api/team/runtimes` | Per-role default runtimes |
 | `PUT /api/team/runtimes` | Set per-role default runtimes |
-| `GET /api/team/repo` | Legacy/global repo config |
-| `PUT /api/team/repo` | Set legacy/global repo config |
-| `POST /api/team/repo/provision` | Provision legacy/global workspaces |
 | `GET /api/team/telegram` | Telegram status |
 | `PUT /api/team/telegram` | Save Telegram config |
 | `DELETE /api/team/telegram` | Clear/disable Telegram |
@@ -3034,8 +3055,6 @@ Recurrences and runtime:
 - `objectives_updated`
 - `team_tools_updated`
 - `team_models_updated`
-- `team_repo_updated`
-- `team_repo_provisioned`
 
 Projects:
 
@@ -3699,52 +3718,60 @@ Obsidian (kDrive-synced view).
 
 ## 17. Git Workspaces
 
-Configured by (DB is the source of truth; env vars are a legacy
-fallback used only when no DB row is set):
+Per-project, project-scoped. Repo URL lives on each project row at
+`projects.repo_url`; there is no global override (no env var, no
+`team_config.project_repo`).
 
-- `team_config.project_repo` (set via Options → Project repo)
-- `team_config.project_branch`
-
-Legacy env fallback:
+Layout (matches §4.6):
 
 ```text
-HARNESS_PROJECT_REPO
-HARNESS_PROJECT_BRANCH
-```
-
-Current implementation:
-
-```text
-/workspaces/.project
-/workspaces/coach/
-/workspaces/p1/project
-/workspaces/p2/project
+/data/projects/<id>/repo/.project   # bare-ish seed clone (one per project)
+/data/projects/<id>/repo/coach      # Coach's worktree (read-only by convention)
+/data/projects/<id>/repo/p1         # Player worktree, branch work/p1
+/data/projects/<id>/repo/p2
 ...
+/data/projects/<id>/repo/p10
 ```
 
-Startup:
+`workspace_dir(slot)` (`async`) returns
+`project_paths(active).worktree(slot)` — a pure function of
+`(active_project_id, slot)`. No fallback to a plain dir; the
+worktree is expected to exist before agents wake.
 
-- Always creates plain slot dirs.
-- If no repo configured, agents run in plain dirs.
-- If repo configured:
-  - clone to `/workspaces/.project`
-  - create worktree per slot at `/workspaces/<slot>/project`
-  - branch per slot: `work/<slot>`
-  - reuses local branch if present
-  - tracks remote `origin/work/<slot>` if present
-  - otherwise creates new branch off configured branch
+`ensure_workspaces(project_id)` is the only provisioner:
 
-`workspace_dir(slot)`:
+- Idempotent. Reads `projects.repo_url` for the given project.
+- If `repo_url` is empty, returns `{configured: False}` and creates
+  no worktrees. Agents on that project can still run for non-code
+  work (chat, research, doc writing); `coord_commit_push` rejects
+  loudly.
+- If set, clones to `/data/projects/<id>/repo/.project`, then
+  creates per-slot worktrees at `/data/projects/<id>/repo/<slot>`
+  on branch `work/<slot>`.
+- Branch resolution priority on first creation: local `work/<slot>`
+  exists → reuse; remote `origin/work/<slot>` exists → track new
+  local from it; neither → fresh from upstream default branch
+  (`main`).
 
-- Returns worktree if it exists and is git.
-- Otherwise returns plain `/workspaces/<slot>`.
+Provisioning fires at:
 
-`coord_commit_push` requires the returned cwd to contain `.git`.
+- **Boot**, once, for the active project.
+- **Project switch**, as the `provision_workspaces` step in
+  `_run_switch` between `pull_new` and `swap_pointer`. A failed
+  provision aborts the switch before the pointer swap.
+- **Manual** via `POST /api/projects/{id}/repo/provision` (the
+  human-triggered backstop).
 
-Known hybrid:
+`coord_commit_push` requires the active project to have a
+`repo_url` and the per-slot worktree to contain `.git`. It chdirs
+to `workspace_dir(caller_id)` and runs `git add -A`,
+`git commit -m`, `git push origin HEAD`.
 
-- This does not yet honor the fully project-scoped repo layout under
-  `/data/projects/<slug>/repo/`.
+Misplaced-work detector: when the slot's worktree is clean but the
+project's bare seed clone (`project_paths(active).bare_clone`) is
+dirty, `coord_commit_push` returns a loud named error pointing the
+Player at both paths. The seed clone is never the right tree to
+edit — it has no `work/<slot>` branch checked out.
 
 ---
 
@@ -4023,9 +4050,6 @@ implementation):
 | `HARNESS_CODEX_ENABLED` | unset | Codex runtime feature gate. Must be truthy (`true`, `1`, `yes`, `on`) before `PUT /api/agents/{id}/runtime` or the UI runtime controls can select `runtime=codex`. |
 | `HARNESS_DB_PATH` | `/data/harness.db` | SQLite path |
 | `HARNESS_DATA_ROOT` | `/data` | Global/project data root |
-| `HARNESS_PROJECT_REPO` | unset | **Legacy.** Single-project fallback when no project row in the DB has `repo_url`. Removed from `.env.example`; the `projects` table is the source of truth now. |
-| `HARNESS_PROJECT_BRANCH` | `main` | **Legacy.** Paired with `HARNESS_PROJECT_REPO`. |
-| `HARNESS_WORKSPACES_ROOT` | `/workspaces` | Actual workspace root |
 | `HARNESS_WEBDAV_URL` | unset | WebDAV base folder URL |
 | `HARNESS_WEBDAV_USER` | unset | WebDAV username |
 | `HARNESS_WEBDAV_PASSWORD` | unset | WebDAV app password |
@@ -4078,8 +4102,10 @@ add back unless re-wiring the corresponding code path):
 - `HARNESS_KNOWLEDGE_DIR` — never referenced in code.
 - `HARNESS_DECISIONS_DIR` — never referenced in code.
 - `HARNESS_HANDOFFS_DIR` — never referenced in code.
-- `HARNESS_WORKSPACES_DIR` — wrong name; the code reads
-  `HARNESS_WORKSPACES_ROOT` instead.
+- `HARNESS_WORKSPACES_DIR` / `HARNESS_WORKSPACES_ROOT` /
+  `HARNESS_PROJECT_REPO` / `HARNESS_PROJECT_BRANCH` — retired with
+  the 2026-05-06 workspace refactor. Worktrees now live under
+  `/data/projects/<id>/repo/`; repo URL lives on `projects.repo_url`.
 
 Also dropped from `.env.example` (still wired, but defaulted in code
 or in the Dockerfile and not configured per-deploy in practice):
@@ -4087,8 +4113,8 @@ or in the Dockerfile and not configured per-deploy in practice):
 - `CLAUDE_CONFIG_DIR` / `CODEX_HOME` — set in the Dockerfile to
   `/data/claude` and `/data/codex`. Override only if the persistent
   volume mount differs.
-- `HARNESS_DATA_ROOT` (`/data`) and `HARNESS_WORKSPACES_ROOT`
-  (`/workspaces`) — code defaults match the Dockerfile mount points.
+- `HARNESS_DATA_ROOT` (`/data`) — code defaults match the
+  Dockerfile mount points.
 - `HARNESS_DB_PATH`, `HARNESS_OUTPUTS_DIR`, `HARNESS_UPLOADS_DIR`,
   `HARNESS_ATTACHMENTS_DIR` — derived from `HARNESS_DATA_ROOT`.
 - All retention / interval / debounce / batch-size / threshold

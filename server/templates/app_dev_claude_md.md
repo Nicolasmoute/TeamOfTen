@@ -316,30 +316,38 @@ tests, sanity-check the output, then commit. The board archives
 
 #### Worktree boundary — edit only your own worktree
 
-Each Player has their own git worktree at
-`/workspaces/<your_slot>/project` on branch `work/<your_slot>`.
-**All your edits MUST land there.** Per-worktree isolation is the
-primary concurrency control — see CLAUDE.md invariant #2.
+Each Player has their own git worktree under the active project's
+repo tree:
 
-Do NOT edit `/workspaces/.project`. That path is the **shared seed
-checkout** used to provision per-slot worktrees on container boot;
-it belongs to no slot, has no branch you should be on, and editing
-it strands your work on a tree the kanban can't see. The symptom is
+```
+/data/projects/{slug}/repo/<your_slot>     # your worktree, branch work/<your_slot>
+/data/projects/{slug}/repo/.project        # shared seed checkout (DO NOT EDIT)
+```
+
+Your cwd at spawn time is your own worktree. **All your edits MUST
+land there.** Per-worktree isolation is the primary concurrency
+control — see CLAUDE.md invariant #2.
+
+Do NOT edit `/data/projects/{slug}/repo/.project`. That path is the
+shared seed checkout used to provision per-slot worktrees; it
+belongs to no slot, has no branch you should be on, and editing it
+strands your work on a tree the kanban can't see. The symptom is
 opaque: when you call `coord_commit_push`, the tool runs `git
 status` inside your own worktree, sees a clean tree, and (in older
 versions) returned `"nothing to commit (working tree clean)"`.
 
-As of v0.3.7, `coord_commit_push` peeks `/workspaces/.project` when
-your worktree is clean and surfaces a loud named error pointing you
-at both paths. If you see that error, move your changes into your
-worktree before retrying:
+`coord_commit_push` peeks the seed checkout when your worktree is
+clean and surfaces a loud named error pointing you at both paths.
+If you see that error, move your changes into your worktree before
+retrying:
 - If the changes are small: re-apply them inside
-  `/workspaces/<your_slot>/project`.
-- If the changes are large: `git -C /workspaces/.project stash &&
-  git -C /workspaces/<your_slot>/project stash pop`.
+  `/data/projects/{slug}/repo/<your_slot>`.
+- If the changes are large: `git -C /data/projects/{slug}/repo/.project
+  stash && git -C /data/projects/{slug}/repo/<your_slot> stash pop`.
 
-Do NOT `git -C /workspaces/.project commit` directly — that bypasses
-your branch entirely and creates a commit on the wrong tree.
+Do NOT `git -C /data/projects/{slug}/repo/.project commit` directly —
+that bypasses your branch entirely and creates a commit on the wrong
+tree.
 
 #### If the named coord_* tool is NOT visible in your runtime
 

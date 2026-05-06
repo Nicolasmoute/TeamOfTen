@@ -75,18 +75,31 @@ async def _seed_task_and_role() -> None:
 
 @pytest.fixture
 def stub_workspaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
-    """Fake both the slot worktree and the shared .project checkout."""
-    import server.tools as tools_mod
-    import server.workspaces as ws_mod
+    """Fake both the slot worktree and the project's seed checkout.
 
-    slot_cwd = tmp_path / "p3" / "project"
+    Pins paths under tmp_path by monkey-patching `server.paths.DATA_ROOT`
+    so `project_paths('misc').worktree('p3')` and `.bare_clone` resolve
+    inside tmp_path. `workspace_dir` is async post-refactor; we replace
+    it with an async stub that returns the slot worktree directly.
+    """
+    import server.paths as paths_mod
+    import server.tools as tools_mod
+
+    monkeypatch.setattr(paths_mod, "DATA_ROOT", tmp_path)
+
+    slot_cwd = tmp_path / "projects" / "misc" / "repo" / "p3"
     (slot_cwd / ".git").mkdir(parents=True)
-    base_cwd = tmp_path / ".project"
+    base_cwd = tmp_path / "projects" / "misc" / "repo" / ".project"
     (base_cwd / ".git").mkdir(parents=True)
 
-    monkeypatch.setattr(tools_mod, "project_configured", lambda: True)
-    monkeypatch.setattr(tools_mod, "workspace_dir", lambda slot: slot_cwd)
-    monkeypatch.setattr(ws_mod, "BASE_REPO_PATH", base_cwd)
+    async def _configured() -> bool:
+        return True
+
+    async def _workspace_dir(_slot: str) -> Path:
+        return slot_cwd
+
+    monkeypatch.setattr(tools_mod, "project_repo_configured", _configured)
+    monkeypatch.setattr(tools_mod, "workspace_dir", _workspace_dir)
     return {"slot": slot_cwd, "base": base_cwd}
 
 
@@ -212,18 +225,26 @@ async def test_clean_slot_no_base_repo_falls_back_to_soft_ok(
     fresh_db: str, tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When BASE_REPO_PATH points to a directory without a .git dir
-    (e.g. a deploy without the seed checkout), the clean-tree case
-    falls back to the legacy soft-OK rather than crashing."""
+    """When the project's seed checkout has no `.git` (e.g. an
+    unprovisioned project), the clean-tree case falls back to the
+    legacy soft-OK rather than crashing."""
+    import server.paths as paths_mod
     import server.tools as tools_mod
-    import server.workspaces as ws_mod
-    slot_cwd = tmp_path / "p3" / "project"
+
+    monkeypatch.setattr(paths_mod, "DATA_ROOT", tmp_path)
+    slot_cwd = tmp_path / "projects" / "misc" / "repo" / "p3"
     (slot_cwd / ".git").mkdir(parents=True)
-    base_cwd = tmp_path / ".project"  # no .git inside
-    base_cwd.mkdir()
-    monkeypatch.setattr(tools_mod, "project_configured", lambda: True)
-    monkeypatch.setattr(tools_mod, "workspace_dir", lambda slot: slot_cwd)
-    monkeypatch.setattr(ws_mod, "BASE_REPO_PATH", base_cwd)
+    base_cwd = tmp_path / "projects" / "misc" / "repo" / ".project"
+    base_cwd.mkdir(parents=True)  # no .git inside
+
+    async def _configured() -> bool:
+        return True
+
+    async def _workspace_dir(_slot: str) -> Path:
+        return slot_cwd
+
+    monkeypatch.setattr(tools_mod, "project_repo_configured", _configured)
+    monkeypatch.setattr(tools_mod, "workspace_dir", _workspace_dir)
 
     def _fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
         if cmd[:2] == ["git", "status"]:
@@ -290,8 +311,10 @@ async def test_executor_wake_includes_worktree_boundary(
     p8_wakes = [body for slot, body in captured if slot == "p8"]
     assert p8_wakes, captured
     body = p8_wakes[0]
-    assert "/workspaces/p8/project" in body
-    assert "/workspaces/.project" in body
+    # Per-project paths under the active project (misc by default).
+    body_norm = body.replace("\\", "/")
+    assert "/projects/misc/repo/p8" in body_norm
+    assert "/projects/misc/repo/.project" in body_norm
     assert "Worktree boundary" in body
     assert "do NOT edit" in body.lower() or "do not edit" in body.lower()
 
@@ -346,12 +369,17 @@ async def test_non_executor_wake_omits_worktree_boundary(
     assert "Worktree boundary" not in body
 
 
-def test_executor_worktree_boundary_helper_returns_empty_for_non_executor() -> None:
+@pytest.mark.usefixtures("fresh_db")
+async def test_executor_worktree_boundary_helper_returns_empty_for_non_executor() -> None:
     from server.kanban import _executor_worktree_boundary
-    assert _executor_worktree_boundary("auditor_syntax", "p3") == ""
-    assert _executor_worktree_boundary("planner", "p3") == ""
-    assert _executor_worktree_boundary("shipper", "p3") == ""
-    assert _executor_worktree_boundary("executor", "") == ""
-    out = _executor_worktree_boundary("executor", "p7")
-    assert "/workspaces/p7/project" in out
-    assert "/workspaces/.project" in out
+    await init_db()
+    assert await _executor_worktree_boundary("auditor_syntax", "p3") == ""
+    assert await _executor_worktree_boundary("planner", "p3") == ""
+    assert await _executor_worktree_boundary("shipper", "p3") == ""
+    assert await _executor_worktree_boundary("executor", "") == ""
+    out = await _executor_worktree_boundary("executor", "p7")
+    # Per-project path, resolved against the active project (misc by
+    # default in init_db). Names both the slot worktree and the seed
+    # checkout so the executor can navigate either way.
+    assert "/projects/misc/repo/p7" in out.replace("\\", "/")
+    assert "/projects/misc/repo/.project" in out.replace("\\", "/")

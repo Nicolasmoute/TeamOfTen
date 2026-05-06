@@ -1144,29 +1144,35 @@ async def _emit_audit_fail_notification(
     })
 
 
-def _executor_worktree_boundary(role: str, slot: str) -> str:
+async def _executor_worktree_boundary(role: str, slot: str) -> str:
     """Per-slot worktree-boundary suffix appended to executor wakes.
 
-    v0.3.7 (production trace 2026-05-04, p8 wrote to /workspaces/.project
+    v0.3.7 (production trace 2026-05-04, p8 wrote to the seed checkout
     instead of their own worktree, hit the opaque 'nothing to commit'
     soft-OK in coord_commit_push, marked the task blocked).
 
-    Names the slot's worktree path explicitly and reminds the executor
-    that the shared seed checkout is off-limits. Empty string for
-    non-executor roles (auditors / shippers don't edit code).
+    Names the slot's worktree path explicitly (resolved against the
+    active project) and reminds the executor that the shared seed
+    checkout is off-limits. Empty string for non-executor roles
+    (auditors / shippers don't edit code).
     """
     if role != "executor" or not slot:
         return ""
+    from server.db import resolve_active_project
+    from server.paths import project_paths
+    pp = project_paths(await resolve_active_project())
+    worktree = pp.worktree(slot)
+    seed = pp.bare_clone
     return (
-        f"\n\nWorktree boundary: your edits MUST land in "
-        f"/workspaces/{slot}/project (your own git worktree on branch "
-        f"work/{slot}). Do NOT edit /workspaces/.project — that is the "
-        f"shared seed checkout used to provision worktrees and belongs "
-        f"to no slot. Editing it strands your work on a tree the "
-        f"kanban can't see; coord_commit_push will report 'nothing to "
-        f"commit' from your own worktree because the changes never "
-        f"reached it. If your tooling defaulted to .project, move your "
-        f"changes into /workspaces/{slot}/project before committing."
+        f"\n\nWorktree boundary: your edits MUST land in {worktree} "
+        f"(your own git worktree on branch work/{slot}). Do NOT edit "
+        f"{seed} — that is the shared seed checkout used to provision "
+        f"worktrees and belongs to no slot. Editing it strands your "
+        f"work on a tree the kanban can't see; coord_commit_push will "
+        f"report 'nothing to commit' from your own worktree because "
+        f"the changes never reached it. If your tooling defaulted to "
+        f"the seed checkout, move your changes into {worktree} before "
+        f"committing."
     )
 
 
@@ -1743,7 +1749,7 @@ async def _wake_role_or_emit_needed(*, task_id: str, role: str) -> None:
         from server.agents import maybe_wake_agent
         for slot in targets:
             try:
-                slot_prompt = prompt + _executor_worktree_boundary(role, slot)
+                slot_prompt = prompt + await _executor_worktree_boundary(role, slot)
                 await maybe_wake_agent(slot, slot_prompt, bypass_debounce=True)
             except Exception:
                 pass

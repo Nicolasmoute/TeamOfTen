@@ -2020,7 +2020,7 @@ class CodexRuntime:
         try:
             client = await get_client(
                 tc.agent_id,
-                cwd=str(workspace_dir(tc.agent_id)),
+                cwd=str(await workspace_dir(tc.agent_id)),
                 env_overrides=env_overrides,
             )
         except ImportError as exc:

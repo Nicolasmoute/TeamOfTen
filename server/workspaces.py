@@ -1,17 +1,21 @@
-"""Per-slot git worktrees.
+"""Per-project, per-slot git worktrees.
 
-When HARNESS_PROJECT_REPO is set, on startup we clone it once into
-/workspaces/.project (the bare-ish base) and create a git worktree at
-/workspaces/<slot>/project for each slot on branch work/<slot>. Each
-agent's cwd is then its own worktree — file edits and commits are
-isolated per Player by construction, no merging while in flight.
+Layout (canonical — see Docs/TOT-specs.md §4.6 + §17):
 
-When HARNESS_PROJECT_REPO is NOT set, no clone happens and agent cwd
-stays at the plain dir /workspaces/<slot>/. The harness still works
-end-to-end; agents just don't have a project to operate on.
+    /data/projects/<id>/repo/.project   # bare-ish seed clone, one per project
+    /data/projects/<id>/repo/<slot>     # per-slot worktree on branch work/<slot>
 
-Idempotent: ensure_workspaces() is safe to call any number of times —
-existing clones aren't re-cloned, existing worktrees aren't recreated.
+`workspace_dir(slot)` is async and resolves through the active
+project — pure function of (active_project_id, slot). No fallback
+to a plain dir; provisioning is expected to have run before any
+agent uses the path.
+
+`ensure_workspaces(project_id)` is the only provisioner. Reads
+`projects.repo_url` for the given project; clones if absent;
+creates per-slot worktrees if absent. Idempotent. Called at boot
+for the active project, on every project switch (as the
+`provision_workspaces` step in `_run_switch`), and via the manual
+backstop `POST /api/projects/{id}/repo/provision`.
 """
 
 from __future__ import annotations
@@ -23,6 +27,9 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
+
+from server.paths import ensure_project_scaffold, project_paths
 
 logger = logging.getLogger("harness.workspaces")
 if not logger.handlers:
@@ -32,70 +39,7 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-WORKSPACES_ROOT = Path(os.environ.get("HARNESS_WORKSPACES_ROOT", "/workspaces"))
-BASE_REPO_PATH = WORKSPACES_ROOT / ".project"
-
 SLOT_IDS: list[str] = ["coach"] + [f"p{i}" for i in range(1, 11)]
-
-# Project repo + branch are resolved DB-first, env-fallback. The DB
-# value (set via Options → Project repo) persists across redeploys;
-# the env var (HARNESS_PROJECT_REPO / HARNESS_PROJECT_BRANCH) is the
-# initial bootstrap path. Both are read once per process; changing
-# the DB value requires a redeploy to take effect (existing worktrees
-# keep their old `git remote`).
-_CACHED_REPO: str | None = None
-_CACHED_BRANCH: str | None = None
-
-
-def _read_team_config_sync(key: str) -> str:
-    """Synchronous team_config read — used at process startup before
-    the asyncio loop is guaranteed up. Returns "" on any error /
-    missing row so env fallback kicks in."""
-    try:
-        import json
-        import sqlite3
-        from server.db import DB_PATH
-        conn = sqlite3.connect(DB_PATH, timeout=2.0)
-        try:
-            cur = conn.execute(
-                "SELECT value FROM team_config WHERE key = ?", (key,)
-            )
-            row = cur.fetchone()
-        finally:
-            conn.close()
-    except Exception:
-        return ""
-    if not row:
-        return ""
-    raw = (row[0] or "").strip()
-    if raw.startswith('"') and raw.endswith('"'):
-        try:
-            v = json.loads(raw)
-            if isinstance(v, str):
-                return v
-        except Exception:
-            pass
-    return raw
-
-
-def _project_repo() -> str:
-    global _CACHED_REPO
-    if _CACHED_REPO is not None:
-        return _CACHED_REPO
-    db_val = _read_team_config_sync("project_repo")
-    env_val = os.environ.get("HARNESS_PROJECT_REPO", "").strip()
-    _CACHED_REPO = db_val or env_val or ""
-    return _CACHED_REPO
-
-
-def _project_branch() -> str:
-    global _CACHED_BRANCH
-    if _CACHED_BRANCH is not None:
-        return _CACHED_BRANCH
-    db_val = _read_team_config_sync("project_branch")
-    env_val = os.environ.get("HARNESS_PROJECT_BRANCH", "").strip()
-    _CACHED_BRANCH = db_val or env_val or "main"
-    return _CACHED_BRANCH
 
 
 _ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -139,8 +83,7 @@ def _expand_placeholders(value: str) -> str:
 
 def _mask_userinfo(text: str, *expanded_urls: str) -> str:
     """Scrub the userinfo portion of any expanded URL from `text` so
-    raw tokens don't leak into logs / API error responses. Called on
-    every string we surface after a git invocation."""
+    raw tokens don't leak into logs / API error responses."""
     out = text
     for url in expanded_urls:
         if not url:
@@ -154,120 +97,143 @@ def _mask_userinfo(text: str, *expanded_urls: str) -> str:
     return out
 
 
-def project_configured() -> bool:
-    return bool(_project_repo())
+async def _read_project_repo_url(project_id: str) -> str:
+    """Load `projects.repo_url` for the given project id. Returns ""
+    on missing project or empty URL — callers treat both as "no repo
+    configured" and skip cloning."""
+    from server.db import configured_conn
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT repo_url FROM projects WHERE id = ?", (project_id,)
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    if not row:
+        return ""
+    try:
+        v = row[0]
+    except Exception:
+        v = None
+    return (v or "").strip()
 
 
-def refresh_repo_cache() -> None:
-    """Clear the in-process repo/branch cache so the next
-    project_configured() / _project_repo() / _project_branch() call
-    re-reads from DB. Called by PUT /api/team/repo after a save so
-    downstream code reflects the new value (the clone itself still
-    needs a container restart — see set_team_repo docstring)."""
-    global _CACHED_REPO, _CACHED_BRANCH
-    _CACHED_REPO = None
-    _CACHED_BRANCH = None
-
-
-def workspace_dir(slot: str) -> Path:
+async def workspace_dir(slot: str) -> Path:
     """The cwd an agent should run in.
 
-    Prefers the per-slot git worktree when it exists on disk; falls back
-    to the plain /workspaces/<slot>/ directory otherwise. The filesystem
-    check (not just the config flag) prevents the "repo configured but
-    never provisioned" footgun: if the DB says a repo is set but
-    ensure_workspaces() hasn't run yet (or is still running), the agent
-    still gets a real cwd and unrelated tasks (chat, research, doc
-    writing, coord_* tools) keep working. Only code-touching work
-    (`coord_commit_push`, Bash in the repo) would then fail loudly —
-    and those are the tasks that genuinely need a worktree.
+    Pure function of (active_project, slot). The path is
+    `/data/projects/<active>/repo/<slot>`. Does not stat the
+    filesystem — provisioning is expected to have run. If the
+    worktree is missing when an agent wakes, the subprocess will
+    fail at chdir with a clear error and the operator can run the
+    manual provision endpoint.
     """
-    base = WORKSPACES_ROOT / slot
-    if project_configured():
-        worktree = base / "project"
-        if (worktree / ".git").exists():
-            return worktree
-    return base
+    from server.db import resolve_active_project
+    project_id = await resolve_active_project()
+    return project_paths(project_id).worktree(slot)
 
 
-def get_status() -> dict[str, object]:
-    """Snapshot of workspace state for /api/status. Cheap — just stats.
+async def project_repo_configured(project_id: str | None = None) -> bool:
+    """True iff the given project has a non-empty repo_url. Defaults
+    to the active project when no id is passed."""
+    if project_id is None:
+        from server.db import resolve_active_project
+        project_id = await resolve_active_project()
+    return bool(await _read_project_repo_url(project_id))
 
-    The repo URL is masked before returning — the raw value can carry
-    a PAT (from `${GITHUB_TOKEN}` placeholder expansion) and must
-    never leave the harness server. Boot logs use the unexpanded
-    placeholder form so production logs don't leak either."""
-    if not project_configured():
-        return {"configured": False, "reason": "no project repo set (Options → Project repo or HARNESS_PROJECT_REPO)"}
-    slot_state = {}
+
+async def get_status(project_id: str | None = None) -> dict[str, Any]:
+    """Snapshot of workspace state for /api/status + /api/health.
+
+    The repo URL is masked before returning — the raw value can
+    carry a PAT (from `${GITHUB_TOKEN}` placeholder expansion) and
+    must never leave the harness server.
+    """
+    if project_id is None:
+        from server.db import resolve_active_project
+        project_id = await resolve_active_project()
+    pp = project_paths(project_id)
+    repo_url = await _read_project_repo_url(project_id)
+    if not repo_url:
+        return {
+            "configured": False,
+            "project_id": project_id,
+            "reason": (
+                f"project '{project_id}' has no repo_url "
+                "(set via Options → Projects → edit)"
+            ),
+        }
+    slot_state: dict[str, dict[str, Any]] = {}
     for s in SLOT_IDS:
-        # Report the *intended* worktree path even when the fallback
-        # kicks in, so the UI can spot "repo configured but worktree
-        # missing" (fallback_active=True) and prompt for provisioning.
-        worktree = WORKSPACES_ROOT / s / "project"
-        actual = workspace_dir(s)
+        worktree = pp.worktree(s)
         slot_state[s] = {
             "path": str(worktree),
             "exists": worktree.exists(),
             "is_git": (worktree / ".git").exists(),
-            "fallback_active": actual != worktree,
         }
-    # Local import to avoid a circular: main.py imports this module.
     from server.main import _mask_repo_url
     return {
         "configured": True,
-        "repo_masked": _mask_repo_url(_project_repo()),
-        "branch": _project_branch(),
-        "base_cloned": BASE_REPO_PATH.exists(),
+        "project_id": project_id,
+        "repo_masked": _mask_repo_url(repo_url),
+        "bare_cloned": (pp.bare_clone / ".git").exists()
+                       or pp.bare_clone.exists(),
         "slots": slot_state,
     }
 
 
-async def ensure_workspaces() -> dict[str, object]:
-    """Idempotent setup. Called once at startup. Returns status dict.
+async def ensure_workspaces(project_id: str) -> dict[str, Any]:
+    """Idempotent provisioner for one project.
 
-    Even when no project repo is configured we still need a real cwd
-    for each slot — the Claude Agent SDK passes cwd to subprocess,
-    which ENOENTs before it can even print a useful error when the
-    path is missing. So mkdir the plain dirs unconditionally.
+    Reads `projects.repo_url`, clones if absent, creates per-slot
+    worktrees if absent. Safe to call any number of times — existing
+    clones aren't re-cloned, existing worktrees aren't recreated.
+
+    Returns a status dict; callers in the project-switch flow
+    surface the {configured, slots: {<slot>: {ok, ...}}} shape via
+    the `provision_workspaces` event step.
     """
-    for slot in SLOT_IDS:
-        try:
-            (WORKSPACES_ROOT / slot).mkdir(parents=True, exist_ok=True)
-        except Exception:
-            logger.exception("workspaces: mkdir failed for %s", slot)
-
-    if not project_configured():
+    pp = ensure_project_scaffold(project_id)
+    repo_url = await _read_project_repo_url(project_id)
+    if not repo_url:
         logger.info(
-            "workspaces: no project repo set; created plain /workspaces/<slot>/ dirs"
+            "workspaces: no repo_url for project '%s'; skipped clone",
+            project_id,
         )
-        return {"configured": False}
+        return {
+            "configured": False,
+            "project_id": project_id,
+            "reason": "projects.repo_url is empty",
+        }
 
-    # Mask before storing in the status dict — `_project_repo()` is the
-    # unexpanded `${VAR}` form by convention, so masking is a no-op for
-    # well-formed deploys. Belt-and-braces against a developer who
-    # pastes a literal PAT rather than using the placeholder pattern.
     from server.main import _mask_repo_url
-    status: dict[str, object] = {
+    status: dict[str, Any] = {
         "configured": True,
-        "repo_masked": _mask_repo_url(_project_repo()),
-        "branch": _project_branch(),
+        "project_id": project_id,
+        "repo_masked": _mask_repo_url(repo_url),
         "slots": {},
     }
 
     try:
-        await _ensure_base_clone()
+        await _ensure_base_clone(pp.bare_clone, repo_url)
     except Exception as e:
-        logger.exception("base clone failed")
+        logger.exception("base clone failed for project %s", project_id)
         status["error"] = f"clone failed: {e}"
         return status
 
-    slot_results: dict[str, object] = {}
+    slot_results: dict[str, Any] = {}
     for slot in SLOT_IDS:
         try:
-            slot_results[slot] = await _ensure_worktree(slot)
+            slot_results[slot] = await _ensure_worktree(
+                bare=pp.bare_clone,
+                worktree=pp.worktree(slot),
+                slot=slot,
+            )
         except Exception as e:
-            logger.exception("worktree for %s failed", slot)
+            logger.exception(
+                "worktree for %s failed (project %s)", slot, project_id
+            )
             slot_results[slot] = {"ok": False, "error": str(e)}
     status["slots"] = slot_results
     return status
@@ -292,18 +258,17 @@ async def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 120) -> t
     return await asyncio.to_thread(_do)
 
 
-async def _ensure_base_clone() -> None:
-    if BASE_REPO_PATH.exists() and (BASE_REPO_PATH / ".git").exists():
-        logger.info("base repo already present at %s", BASE_REPO_PATH)
+async def _ensure_base_clone(bare: Path, repo_url_raw: str) -> None:
+    """Idempotent clone of the project repo into its bare-clone path."""
+    if bare.exists() and (bare / ".git").exists():
+        logger.info("base repo already present at %s", bare)
         return
-    BASE_REPO_PATH.parent.mkdir(parents=True, exist_ok=True)
-    repo_raw = _project_repo()
-    repo = _expand_placeholders(repo_raw)
-    branch = _expand_placeholders(_project_branch())
+    bare.parent.mkdir(parents=True, exist_ok=True)
+    repo = _expand_placeholders(repo_url_raw)
     # Log the unexpanded form so PATs don't hit the logs.
-    logger.info("cloning %s (branch %s) → %s", repo_raw, branch, BASE_REPO_PATH)
+    logger.info("cloning %s → %s", repo_url_raw, bare)
     code, out, err = await _run(
-        ["git", "clone", "--branch", branch, repo, str(BASE_REPO_PATH)],
+        ["git", "clone", repo, str(bare)],
         timeout=300,
     )
     if code != 0:
@@ -311,42 +276,43 @@ async def _ensure_base_clone() -> None:
         raise RuntimeError(
             f"git clone exited {code}: {_mask_userinfo(msg, repo)}"
         )
-    logger.info("clone ok")
+    logger.info("clone ok: %s", bare)
 
 
-async def _ensure_worktree(slot: str) -> dict[str, object]:
-    worktree_path = WORKSPACES_ROOT / slot / "project"
+async def _ensure_worktree(
+    *, bare: Path, worktree: Path, slot: str,
+) -> dict[str, Any]:
     branch_name = f"work/{slot}"
 
-    if (worktree_path / ".git").exists():
+    if (worktree / ".git").exists():
         return {
             "ok": True,
-            "path": str(worktree_path),
+            "path": str(worktree),
             "branch": branch_name,
             "status": "already-present",
         }
 
-    if worktree_path.exists():
-        contents = [p for p in worktree_path.iterdir()] if worktree_path.is_dir() else []
+    if worktree.exists():
+        contents = [p for p in worktree.iterdir()] if worktree.is_dir() else []
         if contents:
             return {
                 "ok": False,
-                "error": f"path {worktree_path} exists and is non-empty",
+                "error": f"path {worktree} exists and is non-empty",
             }
 
-    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    worktree.parent.mkdir(parents=True, exist_ok=True)
 
     # Branch resolution priority:
-    #   1. Local branch already exists → reuse it (post-redeploy where the
-    #      base repo wasn't wiped).
-    #   2. Remote branch origin/<branch> exists → create a local tracking
-    #      branch from it. Critical: a fresh clone has the remote ref but
-    #      no local branch yet; without this step we'd lose committed agent
-    #      work after a base-repo wipe + re-clone.
-    #   3. Neither → create a brand-new branch off PROJECT_BRANCH.
+    #   1. Local branch already exists → reuse it (post-redeploy where
+    #      the bare clone wasn't wiped).
+    #   2. Remote branch origin/<branch> exists → create a local
+    #      tracking branch from it. Critical: a fresh clone has the
+    #      remote ref but no local branch yet; without this step we'd
+    #      lose committed agent work after a base-repo wipe + re-clone.
+    #   3. Neither → create a brand-new branch off the upstream default.
     code, out, _ = await _run(
         ["git", "branch", "--list", branch_name],
-        cwd=BASE_REPO_PATH,
+        cwd=bare,
     )
     local_exists = bool(out.strip())
 
@@ -354,31 +320,36 @@ async def _ensure_worktree(slot: str) -> dict[str, object]:
     if not local_exists:
         code, out, _ = await _run(
             ["git", "branch", "-r", "--list", f"origin/{branch_name}"],
-            cwd=BASE_REPO_PATH,
+            cwd=bare,
         )
         remote_exists = bool(out.strip())
 
     if local_exists:
-        cmd = ["git", "worktree", "add", str(worktree_path), branch_name]
+        cmd = ["git", "worktree", "add", str(worktree), branch_name]
         source = "local-branch"
     elif remote_exists:
         cmd = [
             "git", "worktree", "add",
-            str(worktree_path),
+            str(worktree),
             "-b", branch_name,
             f"origin/{branch_name}",
         ]
         source = "origin-tracking"
     else:
+        # Fresh worktree off the bare clone's HEAD (whatever the
+        # upstream default branch is — typically `main`). We do NOT
+        # hardcode `main` here; the `git worktree add -b` form takes
+        # the start point as the next argument and `HEAD` works
+        # regardless of branch name.
         cmd = [
             "git", "worktree", "add",
             "-b", branch_name,
-            str(worktree_path),
-            _project_branch(),
+            str(worktree),
+            "HEAD",
         ]
         source = "new-from-base"
 
-    code, _, err = await _run(cmd, cwd=BASE_REPO_PATH)
+    code, _, err = await _run(cmd, cwd=bare)
     if code != 0:
         return {
             "ok": False,
@@ -387,7 +358,7 @@ async def _ensure_worktree(slot: str) -> dict[str, object]:
 
     return {
         "ok": True,
-        "path": str(worktree_path),
+        "path": str(worktree),
         "branch": branch_name,
         "source": source,
         "status": "created",

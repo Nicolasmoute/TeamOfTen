@@ -257,8 +257,15 @@ def stub_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     import server.tools as tools_mod
     cwd = tmp_path / "p2" / "project"
     (cwd / ".git").mkdir(parents=True)
-    monkeypatch.setattr(tools_mod, "project_configured", lambda: True)
-    monkeypatch.setattr(tools_mod, "workspace_dir", lambda slot: cwd)
+
+    async def _configured() -> bool:
+        return True
+
+    async def _workspace_dir(_slot: str) -> Path:
+        return cwd
+
+    monkeypatch.setattr(tools_mod, "project_repo_configured", _configured)
+    monkeypatch.setattr(tools_mod, "workspace_dir", _workspace_dir)
     return cwd
 
 

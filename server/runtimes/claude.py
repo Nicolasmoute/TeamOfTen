@@ -131,7 +131,7 @@ class ClaudeRuntime:
 
         options_kwargs: dict[str, Any] = dict(
             system_prompt=system_prompt_value,
-            cwd=tc.workspace_cwd or str(workspace_dir(tc.agent_id)),
+            cwd=tc.workspace_cwd or str(await workspace_dir(tc.agent_id)),
             max_turns=MAX_TURNS_PER_SPAWN,
             mcp_servers=mcp_servers,
             allowed_tools=tc.allowed_tools,

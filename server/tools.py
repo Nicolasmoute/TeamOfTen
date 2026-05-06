@@ -17,7 +17,7 @@ from server import outputs as outmod
 from server.db import configured_conn, resolve_active_project
 from server.events import bus
 from server.webdav import webdav
-from server.workspaces import project_configured, workspace_dir
+from server.workspaces import project_repo_configured, workspace_dir
 
 
 def _now_iso() -> str:
@@ -2438,9 +2438,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "archive. Without task_id the commit still works but the "
             "kanban board doesn't move (Coach has to advance manually).\n"
             "Returns 'nothing to commit' as a soft-OK if the working tree "
-            "is clean. Requires HARNESS_PROJECT_REPO to be configured; "
-            "push also needs pushable credentials (typically a PAT "
-            "embedded in the project repo URL)."
+            "is clean. Requires the active project to have a repo URL "
+            "configured; push also needs pushable credentials (typically "
+            "a PAT embedded in the project repo URL)."
         ),
         {"message": str, "push": str, "task_id": str},
     )
@@ -2450,10 +2450,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "Coach delegates; only Players commit code. If you want "
                 "Coach to trigger a commit, message a Player with the task."
             )
-        if not project_configured():
+        if not await project_repo_configured():
             return _err(
-                "HARNESS_PROJECT_REPO is not set; no git worktree to "
-                "commit into. Ask the operator to configure it and redeploy."
+                "the active project has no repo_url configured; no git "
+                "worktree to commit into. Ask the operator to set the "
+                "repo URL via Options → Projects."
             )
 
         message = (args.get("message") or "").strip()
@@ -2571,7 +2572,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"completed by a prior commit."
                 )
 
-        cwd = workspace_dir(caller_id)
+        cwd = await workspace_dir(caller_id)
         if not (cwd / ".git").exists():
             return _err(
                 f"worktree at {cwd} is not a git checkout — something "
@@ -2608,17 +2609,19 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         code, status_out, _ = await run(["git", "status", "--porcelain"])
         if not status_out.strip():
             # v0.3.7: a clean slot worktree is suspicious if there are
-            # uncommitted changes in the shared seed checkout
-            # (/workspaces/.project). That means the Player edited the
-            # wrong tree — work is stranded on a tree that belongs to
-            # no slot. Surface a loud, named error so the Player can
-            # fix it instead of getting an opaque "nothing to commit"
-            # and walking away. (Production trace 2026-05-04: p8 wrote
-            # to .project, hit "nothing to commit" here, marked the
-            # task blocked.)
+            # uncommitted changes in the project's shared seed checkout
+            # (/data/projects/<id>/repo/.project). That means the
+            # Player edited the wrong tree — work is stranded on a tree
+            # that belongs to no slot. Surface a loud, named error so
+            # the Player can fix it instead of getting an opaque
+            # "nothing to commit" and walking away. (Production trace
+            # 2026-05-04: p8 wrote to .project, hit "nothing to commit"
+            # here, marked the task blocked.)
             try:
-                from server.workspaces import BASE_REPO_PATH
-                base_repo = BASE_REPO_PATH
+                from server.paths import project_paths
+                base_repo = project_paths(
+                    await resolve_active_project()
+                ).bare_clone
             except Exception:
                 base_repo = None
             if base_repo and (base_repo / ".git").exists():

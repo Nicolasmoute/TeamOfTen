@@ -14,7 +14,7 @@ Coverage:
   - explicit local-only mode (push='false'): treated as success for
     auto-advance purposes (documented escape hatch)
 
-The test patches `project_configured` + `workspace_dir` and stubs
+The test patches `project_repo_configured` + `workspace_dir` and stubs
 `subprocess.run` so the validation logic and the publisher's
 post-push decision can be exercised without a real git checkout.
 """
@@ -99,15 +99,21 @@ async def _seed_executor_role(
 @pytest.fixture
 def stub_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Create a fake git checkout under the per-slot workspace and stub
-    `project_configured` + `workspace_dir` so coord_commit_push proceeds
-    past its repo-config / .git checks."""
+    `project_repo_configured` + `workspace_dir` so coord_commit_push
+    proceeds past its repo-config / .git checks."""
     import server.tools as tools_mod
 
     cwd = tmp_path / "p3" / "project"
     (cwd / ".git").mkdir(parents=True)
 
-    monkeypatch.setattr(tools_mod, "project_configured", lambda: True)
-    monkeypatch.setattr(tools_mod, "workspace_dir", lambda slot: cwd)
+    async def _configured() -> bool:
+        return True
+
+    async def _workspace_dir(_slot: str) -> Path:
+        return cwd
+
+    monkeypatch.setattr(tools_mod, "project_repo_configured", _configured)
+    monkeypatch.setattr(tools_mod, "workspace_dir", _workspace_dir)
     return cwd
 
 

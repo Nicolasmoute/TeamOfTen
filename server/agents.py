@@ -3457,8 +3457,9 @@ def _system_prompt_for(agent_id: str) -> str:
         f"  - ./uploads/: human-uploaded reference material — PDFs, specs, "
         f"screenshots. Read-only, auto-synced from kDrive every ~60s. When "
         f"Coach or the human refers to 'the doc I uploaded', look here first.\n"
-        f"  - ./project/: your git worktree (if HARNESS_PROJECT_REPO is set). "
-        f"This is where you edit code; use coord_commit_push to ship.\n"
+        f"  - your cwd is your per-slot git worktree (if the active project "
+        f"has a repo configured). All edits MUST land in this cwd; use "
+        f"coord_commit_push to ship.\n"
         f"  - ./attachments/: pasted images from the UI (symlink to a shared "
         f"store).\n"
         f"Team-wide paths (outside your workspace):\n"
@@ -4706,7 +4707,7 @@ async def run_agent(
         project_id=await resolve_active_project(),
         prompt=prompt,
         system_prompt=system_prompt,
-        workspace_cwd=str(workspace_dir(agent_id)),
+        workspace_cwd=str(await workspace_dir(agent_id)),
         allowed_tools=list(allowed),
         external_mcp_servers=external_servers,
         model=model,
@@ -4799,9 +4800,13 @@ async def run_agent(
             # the event only carries a summary so the UI doesn't drown
             # in stack frames, but operators can correlate via the
             # timestamp.
+            try:
+                _err_cwd = str(await workspace_dir(agent_id))
+            except Exception:
+                _err_cwd = "<workspace_dir failed>"
             logger.exception(
                 "run_agent failed: agent=%s cwd=%s",
-                agent_id, str(workspace_dir(agent_id)),
+                agent_id, _err_cwd,
             )
             # Friendlier message when a ProcessError was caused by the
             # model invoking a tool we didn't allow: the CLI exits 1
@@ -4823,7 +4828,7 @@ async def run_agent(
                 agent_id,
                 "error",
                 error=err_msg,
-                cwd=str(workspace_dir(agent_id)),
+                cwd=_err_cwd,
             )
             await _set_status(agent_id, "error")
             # Auto-retry: bump the consecutive-error counter and

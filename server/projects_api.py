@@ -127,12 +127,10 @@ _switch_in_progress: bool = False
 # Reference to the in-flight switch task so the lifespan can cancel
 # it on shutdown (Phase 3 audit fix #2 — task was previously orphaned).
 _active_switch_task: asyncio.Task | None = None
-# Provision env mutation lock — `provision_project_repo` mutates
-# `os.environ["HARNESS_PROJECT_REPO"]` to feed the legacy single-
-# project ensure_workspaces. Two concurrent provisions corrupt the
-# env (Phase 3 audit fix #9). This lock serializes the env-mutation
-# critical section per process.
-_provision_lock = asyncio.Lock()
+# `_provision_lock` (legacy env-mutation serializer) was removed with
+# the 2026-05-06 workspace refactor — `ensure_workspaces` is now
+# project-aware and never touches global env, so concurrent provisions
+# for different projects don't collide.
 
 
 async def _any_agent_working(db) -> str | None:
@@ -846,51 +844,41 @@ def build_router(*, require_token, audit_actor):
             raise HTTPException(
                 400, detail=f"project '{project_id}' has no repo_url configured"
             )
-        # Lazy import to avoid pulling workspaces (and its claude_agent_sdk
-        # dependency) at module import time.
+        # ensure_workspaces is now project-aware — it reads
+        # `projects.repo_url` directly, so we just pass project_id.
+        # No env mutation, no global lock, no contextvar pin needed.
         from server.workspaces import ensure_workspaces
-
-        # ensure_workspaces is the legacy single-project provisioner; the
-        # active-project flow already routes through workspace_dir via
-        # project_paths. Force the env override momentarily so the legacy
-        # function targets THIS project even when it isn't active. Phase 5+
-        # rework should plumb project_id through workspaces directly.
-        import os as _os
-
-        # Phase 3 audit fix #9: serialize env-mutation across
-        # concurrent provision calls. Without the lock two provisions
-        # for different projects could interleave: A sets env to A,
-        # B sets to B, A reads `prev` (now B's value), restores B
-        # into env, B finishes and restores `None`. The env is then
-        # silently corrupted.
-        async with _provision_lock:
-            prev = _os.environ.get("HARNESS_PROJECT_REPO")
-            _os.environ["HARNESS_PROJECT_REPO"] = repo
-            try:
-                with pin_active_project(project_id):
-                    # ensure_workspaces is async — call it directly. Do
-                    # NOT wrap in asyncio.to_thread: that runs the
-                    # callable in a worker thread, where calling an
-                    # `async def` returns a coroutine instead of its
-                    # result. The thread hands the unawaited coroutine
-                    # back to us, and FastAPI then 500s with
-                    # PydanticSerializationError on the response.
-                    result = await ensure_workspaces()
-            finally:
-                if prev is None:
-                    _os.environ.pop("HARNESS_PROJECT_REPO", None)
-                else:
-                    _os.environ["HARNESS_PROJECT_REPO"] = prev
+        result = await ensure_workspaces(project_id)
+        # The function returns a dict with `error: <str>` when the
+        # initial clone failed, OR per-slot worktree errors under
+        # `slots: {<slot>: {ok: False, error: ...}}`. Surface both
+        # in the response + event so an operator hitting the
+        # provision button sees the failure instead of a green
+        # "ok" hiding a buried error string.
+        clone_error = result.get("error")
+        slot_failures = [
+            {"slot": s, "error": str(info.get("error") or "")[:200]}
+            for s, info in (result.get("slots") or {}).items()
+            if isinstance(info, dict) and not info.get("ok", True)
+        ]
+        ok = clone_error is None and not slot_failures
         await bus.publish(
             {
                 "ts": _now_iso(),
                 "agent_id": "system",
                 "type": "project_repo_provisioned",
                 "project_id": project_id,
+                "ok": ok,
+                "error": clone_error,
+                # List of {slot, error} dicts so subscribers (Telegram,
+                # audit log replay, dashboards) get the actual reason —
+                # not just the slot id with the detail buried in the
+                # HTTP response body.
+                "slot_failures": slot_failures or None,
                 "actor": actor,
             }
         )
-        return {"ok": True, "project_id": project_id, "result": result}
+        return {"ok": ok, "project_id": project_id, "result": result}
 
     # ---- Coach todos + project objectives (recurrence-specs.md §9) ----
 
@@ -1305,6 +1293,82 @@ async def _run_switch(
                 }
                 await _emit_step(
                     job_id=job_id, step="pull_new", status="failed",
+                    from_project=from_project, to_project=to_project,
+                    detail=failure_detail,
+                )
+
+        if failed_step is None:
+            # Step 2.5 — provision per-slot worktrees for the new
+            # project. Pinned for the duration so any tool call /
+            # bus publish that begins mid-provisioning sees the
+            # to_project (matches the swap_pointer step's TOCTOU
+            # discipline). A failed provision aborts the switch
+            # before the pointer swap so the from_project remains
+            # active and the user can retry once they've fixed the
+            # repo URL / connectivity / disk.
+            try:
+                await _emit_step(
+                    job_id=job_id, step="provision_workspaces", status="running",
+                    from_project=from_project, to_project=to_project,
+                )
+                from server.workspaces import ensure_workspaces
+                with pin_active_project(to_project):
+                    provision_result = await ensure_workspaces(to_project)
+                # Two failure modes need the abort: (a) the bare clone
+                # itself failed (`error` set) and (b) the clone
+                # succeeded but ≥1 per-slot worktree creation failed
+                # (`slots[<slot>].ok == False`). Either leaves the user
+                # with a broken switch — partial worktrees mean the
+                # next agent spawn on the failed slots will chdir to a
+                # non-existent path. Better to keep the user on
+                # from_project and let them retry once the underlying
+                # cause is fixed.
+                clone_error = provision_result.get("error")
+                slot_failures = [
+                    {"slot": s, "error": str(info.get("error") or "")[:200]}
+                    for s, info in (provision_result.get("slots") or {}).items()
+                    if isinstance(info, dict) and not info.get("ok", True)
+                ]
+                if clone_error:
+                    failed_step = "provision_workspaces"
+                    failure_detail = {
+                        "error": str(clone_error)[:300],
+                    }
+                    await _emit_step(
+                        job_id=job_id, step="provision_workspaces",
+                        status="failed",
+                        from_project=from_project, to_project=to_project,
+                        detail=failure_detail,
+                    )
+                elif slot_failures:
+                    failed_step = "provision_workspaces"
+                    failed_slots = ", ".join(f["slot"] for f in slot_failures)
+                    failure_detail = {
+                        "error": f"per-slot worktree failure(s): {failed_slots}",
+                        "slot_failures": slot_failures,
+                    }
+                    await _emit_step(
+                        job_id=job_id, step="provision_workspaces",
+                        status="failed",
+                        from_project=from_project, to_project=to_project,
+                        detail=failure_detail,
+                    )
+                else:
+                    await _emit_step(
+                        job_id=job_id, step="provision_workspaces", status="ok",
+                        from_project=from_project, to_project=to_project,
+                        detail={
+                            "configured": bool(provision_result.get("configured")),
+                            "slots": provision_result.get("slots") or {},
+                        },
+                    )
+            except Exception as e:
+                failed_step = "provision_workspaces"
+                failure_detail = {
+                    "error": f"{type(e).__name__}: {str(e)[:300]}"
+                }
+                await _emit_step(
+                    job_id=job_id, step="provision_workspaces", status="failed",
                     from_project=from_project, to_project=to_project,
                     detail=failure_detail,
                 )

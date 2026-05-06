@@ -3269,6 +3269,7 @@ const SWITCH_STEP_LABELS = {
   started: "Starting switch",
   push_current: "Pushing current project to kDrive",
   pull_new: "Pulling new project from kDrive",
+  provision_workspaces: "Provisioning per-slot worktrees",
   swap_pointer: "Switching active project pointer",
   reload: "Loading new project context",
 };
@@ -3300,6 +3301,19 @@ function ProjectSwitchBusyModal({ busy, onDismiss, onRetry }) {
       if (c.project && typeof c.project === "object" && "pushed" in c.project) {
         return ` (${c.project.pushed || 0} pushed)${liveSuffix}`;
       }
+    }
+    // provision_workspaces: {configured: bool, slots: {<slot>: {ok, status}}}
+    if (step === "provision_workspaces" && detail.slots) {
+      const slots = Object.values(detail.slots || {});
+      const created = slots.filter((s) => s && s.status === "created").length;
+      const already = slots.filter((s) => s && s.status === "already-present").length;
+      const failed = slots.filter((s) => s && !s.ok).length;
+      if (detail.configured === false) return " (no repo configured)";
+      const parts = [];
+      if (created) parts.push(`${created} new`);
+      if (already) parts.push(`${already} ready`);
+      if (failed) parts.push(`${failed} failed`);
+      return parts.length ? ` (${parts.join(", ")})` : liveSuffix;
     }
     if (detail.error) return ` — ${String(detail.error).slice(0, 100)}`;
     return liveSuffix;
@@ -4788,184 +4802,6 @@ function ProjectsSection() {
 }
 
 
-// worktrees keep their old `git remote`, so changing the URL
-// mid-session doesn't affect in-flight Players.
-function TeamRepoSection() {
-  const [data, setData] = useState(null);
-  const [loaded, setLoaded] = useState(false);
-  const [repoDraft, setRepoDraft] = useState("");
-  const [branchDraft, setBranchDraft] = useState("");
-  const [allowSecrets, setAllowSecrets] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [provisioning, setProvisioning] = useState(false);
-  const [msg, setMsg] = useState(null);
-
-  const reload = useCallback(async () => {
-    try {
-      const res = await authFetch("/api/team/repo");
-      if (res.ok) {
-        const d = await res.json();
-        setData(d);
-        // Repo URL is write-only — the GET endpoint never returns the
-        // raw value (could carry a PAT). Leave the textbox empty so
-        // the user knows to re-paste if they want to change it.
-        setRepoDraft("");
-        setBranchDraft(d.branch && d.branch !== "main" ? d.branch : "");
-      }
-    } catch (e) {
-      console.error("repo load failed", e);
-    } finally {
-      setLoaded(true);
-    }
-  }, []);
-  useEffect(() => { reload(); }, [reload]);
-
-  const save = useCallback(async () => {
-    setSaving(true);
-    setMsg(null);
-    try {
-      const res = await authFetch("/api/team/repo", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          repo: repoDraft,
-          branch: branchDraft,
-          allow_secrets: allowSecrets,
-        }),
-      });
-      if (res.ok) {
-        const d = await res.json();
-        setMsg({
-          kind: "ok",
-          text: "saved · click 'provision now' to apply" +
-            ((d.secret_warnings || []).length
-              ? "  (kept raw secret despite warning: " + d.secret_warnings.join(", ") + ")"
-              : ""),
-        });
-        setAllowSecrets(false);
-        await reload();
-      } else {
-        let detail;
-        try {
-          const d = await res.json();
-          detail = typeof d.detail === "string" ? d.detail : JSON.stringify(d.detail);
-        } catch (_) {
-          detail = "HTTP " + res.status;
-        }
-        setMsg({ kind: "err", text: detail });
-      }
-    } catch (e) {
-      setMsg({ kind: "err", text: String(e) });
-    } finally {
-      setSaving(false);
-    }
-  }, [repoDraft, branchDraft, allowSecrets, reload]);
-
-  // Clone + worktree-add live so the saved repo takes effect without
-  // a container restart. Idempotent — existing .git worktrees are
-  // untouched. Can take 10–60s for a fresh first clone; button stays
-  // disabled while the request is in-flight.
-  const provision = useCallback(async () => {
-    setProvisioning(true);
-    setMsg(null);
-    try {
-      const res = await authFetch("/api/team/repo/provision", {
-        method: "POST",
-      });
-      if (res.ok) {
-        const d = await res.json().catch(() => ({}));
-        const st = d.status || {};
-        if (st.configured === false) {
-          setMsg({ kind: "err", text: "No repo set. Save a URL first, then provision." });
-        } else if (st.error) {
-          setMsg({ kind: "err", text: "clone failed: " + st.error });
-        } else {
-          const slots = st.slots || {};
-          const created = Object.values(slots).filter((s) => s && s.status === "created").length;
-          const already = Object.values(slots).filter((s) => s && s.status === "already-present").length;
-          const failed = Object.values(slots).filter((s) => s && !s.ok).length;
-          setMsg({
-            kind: failed ? "err" : "ok",
-            text: `provisioned · ${created} new worktree${created === 1 ? "" : "s"}, ${already} already present${failed ? `, ${failed} failed` : ""}`,
-          });
-        }
-      } else {
-        let detail;
-        try {
-          const d = await res.json();
-          detail = typeof d.detail === "string" ? d.detail : JSON.stringify(d.detail);
-        } catch (_) {
-          detail = "HTTP " + res.status;
-        }
-        setMsg({ kind: "err", text: detail });
-      }
-    } catch (e) {
-      setMsg({ kind: "err", text: String(e) });
-    } finally {
-      setProvisioning(false);
-    }
-  }, []);
-
-  return html`<section class="drawer-section">
-    <h3>Project repo</h3>
-    <p class="muted" style="margin: 0 0 6px 0; font-size: 12px;">
-      The GitHub (or any git) URL the team clones into per-Player
-      worktrees. Use a <code>\${VAR}</code> placeholder for your
-      PAT so the token stays in the Zeabur env, not in the DB —
-      e.g. <code>https://\${GITHUB_TOKEN}@github.com/you/repo.git</code>.
-      After saving, hit <em>provision now</em> to clone + create
-      worktrees live (no restart needed).
-    </p>
-    ${loaded && data
-      ? html`<div style="font-size: 11px; color: var(--muted); margin-bottom: 6px;">
-          <div>current: ${data.repo_masked || "(unset)"} <span class="muted">· source: ${data.repo_source}</span></div>
-          <div>branch: ${data.branch} <span class="muted">· source: ${data.branch_source}</span></div>
-          ${data.env_repo_set && data.repo_source === "db"
-            ? html`<div style="color: var(--warn);">⚠ HARNESS_PROJECT_REPO env is also set — DB value wins</div>`
-            : null}
-        </div>`
-      : null}
-    <input
-      placeholder="https://\${GITHUB_TOKEN}@github.com/you/repo.git"
-      value=${repoDraft}
-      onInput=${(e) => setRepoDraft(e.target.value)}
-      style="width: 100%; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 4px 8px; font-size: 12px; font-family: ui-monospace, monospace; margin-bottom: 4px;"
-    />
-    <input
-      placeholder="branch (default: main)"
-      value=${branchDraft}
-      onInput=${(e) => setBranchDraft(e.target.value)}
-      style="width: 100%; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 4px 8px; font-size: 12px; margin-bottom: 4px;"
-    />
-    <div style="display: flex; gap: 10px; align-items: center;">
-      <label style="font-size: 11px; color: var(--muted);">
-        <input
-          type="checkbox"
-          checked=${allowSecrets}
-          onChange=${(e) => setAllowSecrets(e.target.checked)}
-        />
-        save even if raw secret detected
-      </label>
-      <button
-        class="primary"
-        disabled=${saving || provisioning}
-        onClick=${save}
-      >${saving ? "saving…" : "save"}</button>
-      <button
-        type="button"
-        disabled=${saving || provisioning || !(data && data.configured)}
-        onClick=${provision}
-        title="Clone + create worktrees now, without a restart. Idempotent."
-      >${provisioning ? "provisioning…" : "provision now"}</button>
-    </div>
-    ${msg
-      ? html`<div style=${"font-size: 11px; margin: 6px 0 0; padding: 4px 8px; border-radius: 3px; " + (msg.kind === "ok"
-            ? "color: var(--ok); border: 1px solid var(--ok); background: rgba(63,185,80,0.08);"
-            : "color: var(--err); border: 1px solid var(--err); background: rgba(248,81,73,0.08); white-space: pre-wrap;")}>${msg.text}</div>`
-      : null}
-  </section>`;
-}
-
 // Telegram bridge configuration. Token + chat-id whitelist live in the
 // encrypted secrets store (Fernet via HARNESS_SECRETS_KEY). Save here
 // triggers a live bridge reload — no redeploy needed. The token is
@@ -6148,8 +5984,6 @@ function SettingsDrawer({ onClose, serverStatus }) {
           <${TeamModelsSection} />
 
           <${TeamRuntimesSection} />
-
-          <${TeamRepoSection} />
 
           <${TeamTelegramSection} />
 

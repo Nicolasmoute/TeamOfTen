@@ -56,12 +56,15 @@ deployed Zeabur instance — see "What needs verification" below.
    - Hourly `VACUUM INTO` snapshot to `/harness/snapshots/<ts>.db`
 - **M4 (1/2/3)** ✓ Per-Player git worktrees:
    - `git` installed in container with default identity
-   - On boot, if `HARNESS_PROJECT_REPO` is set, clone to `/workspaces/.project`
-     and create worktree `/workspaces/<slot>/project` on branch `work/<slot>`
+   - Project-scoped layout (post 2026-05-06 refactor — see entry below):
+     bare clone at `/data/projects/<id>/repo/.project`, per-slot
+     worktree at `/data/projects/<id>/repo/<slot>` on branch
+     `work/<slot>`. Repo URL lives on `projects.repo_url` per project.
    - Branch resolution preserves `origin/work/<slot>` history if it exists
    - `coord_commit_push` MCP tool (Player-only; rejects Coach) wraps
-     `git add -A && commit && push origin HEAD` and emits a `commit_pushed`
-     event. Push expects creds via PAT-in-URL on `HARNESS_PROJECT_REPO`.
+     `git add -A && commit && push origin HEAD` and emits a
+     `commit_pushed` event. Push expects creds via PAT-in-URL on
+     the per-project `repo_url`.
 - **M5 step 1** ✓ session_id captured on `ResultMessage` and persisted to
    `agents.session_id`. Green ● indicator in pane header when present;
    `DELETE /api/agents/<slot>/session` clears it (button next to the dot).
@@ -239,14 +242,11 @@ Security hardening:
   `GET /api/mcp/servers` returns them.
 - **Repo URL masking** ✓ `_mask_repo_url` hides userinfo in UI.
 
-Workspace resilience:
-- **`workspace_dir(slot)`** ✓ stat-checks `<slot>/project/.git`
-  before returning it. Missing worktree → falls back to plain
-  `/workspaces/<slot>/`. Closes the "repo configured but never
-  provisioned → CLIConnectionError on every spawn" footgun; only
-  code-touching turns and `coord_commit_push` fail loudly now.
-- **`POST /api/team/repo/provision`** ✓ runs `ensure_workspaces()`
-  live with a cache refresh; idempotent across existing worktrees.
+Workspace resilience (the 2026-05-06 refactor below superseded
+the per-slot legacy form of these notes — see "Recent (2026-05-06)
+— Workspace refactor" below):
+- **`POST /api/projects/{id}/repo/provision`** ✓ runs
+  `ensure_workspaces(project_id)` live; idempotent.
 
 Context / compaction:
 - **agents.continuity_note** + **agents.last_exchange_json**
@@ -1848,6 +1848,76 @@ stdin; the CLI writes `.credentials.json` to `$CLAUDE_CONFIG_DIR`
   to verify spawn, URL capture, timeout, prior-session-drop, and
   cancel-kills-subprocess. 16 of 21 pass on Windows; the remaining
   5 are Linux/CI-only.
+
+**Recent (2026-05-06) — Workspace refactor (one scheme, no drift):**
+
+Two production failure modes on 2026-05-06 forced the cleanup:
+Sofia (p8) found stale unrelated commits in her per-slot worktree
+when starting a task, and Coach had previously invented an ad-hoc
+`/data/projects/dynamichypergraph/repo/shared/` worktree to work
+around the staleness. Three path schemes coexisted (legacy
+`/workspaces/<slot>/project`, the multi-project
+`/data/projects/<id>/repo/<slot>` defined in `paths.py` but unused
+for git, and Coach's improvisation). Collapsed to one.
+
+- **Canonical scheme**: `/data/projects/<id>/repo/.project` (bare-ish
+  seed clone) + `/data/projects/<id>/repo/<slot>` (per-slot worktree
+  on `work/<slot>`). Pure function of `(active_project, slot)`. Repo
+  URL lives on `projects.repo_url`. No global override.
+- **`workspace_dir(slot)` is now `async`** and resolves through
+  `resolve_active_project()` + `project_paths(...).worktree(slot)`.
+  No fallback to a plain dir — provisioning is expected to have run.
+- **`ensure_workspaces(project_id)`** rewritten — takes the project
+  id explicitly, reads `projects.repo_url`, clones if absent, creates
+  per-slot worktrees if absent. Idempotent. No env mutation, no
+  module-level cache.
+- **Provisioning lifecycle** — boot calls `ensure_workspaces(active)`
+  once; `_run_switch` ([server/projects_api.py](server/projects_api.py))
+  inserts a new `provision_workspaces` step between `pull_new` and
+  `swap_pointer`. The step hard-aborts the switch on either a clone
+  failure OR ≥1 per-slot worktree failure, leaving the user on the
+  pre-switch project. `POST /api/projects/{id}/repo/provision` is the
+  manual backstop and now correctly returns `ok=False` + emits a bus
+  event with structured `slot_failures: [{slot, error}, ...]` so
+  Telegram / audit-log subscribers see the actual reason.
+- **Deleted**: `WORKSPACES_ROOT`, `BASE_REPO_PATH`, the global
+  `HARNESS_PROJECT_REPO` / `HARNESS_PROJECT_BRANCH` /
+  `HARNESS_WORKSPACES_ROOT` env vars, `team_config.project_repo` /
+  `project_branch` rows (dead, no migration needed — new code
+  doesn't read them), the three `/api/team/repo*` HTTP endpoints +
+  `TeamRepoSection` UI component, the `_provision_lock` env-mutation
+  serializer, the legacy `/workspaces/<slot>/` tree creation in the
+  Dockerfile.
+- **Migration alarm** at boot: when the active project has no
+  `repo_url` but legacy `team_config.project_repo` or
+  `HARNESS_PROJECT_REPO` is set, lifespan logs a warning pointing at
+  Options → Projects → edit so the operator sees why provisioning
+  silently no-oped.
+- **Coach has a worktree too** (read-only by convention).
+  `coord_commit_push` is Player-only at the tool level so Coach
+  can't commit even if their cwd looks writable. The
+  `paths.py` doc comment claiming "Coach has no worktree" was
+  aspirational and not the lived behavior — refactor preserved
+  current behavior, only the comment was misleading.
+- **Misplaced-work detector** in `coord_commit_push` now resolves
+  the seed-clone path via `project_paths(active).bare_clone` instead
+  of the deleted `BASE_REPO_PATH` constant. Same loud-error UX.
+- **Kanban executor wake suffix** (`_executor_worktree_boundary`)
+  now async + project-aware — it surfaces the actual per-project
+  paths to the executor instead of the dead `/workspaces/...` paths.
+- **UI** ([server/static/app.js](server/static/app.js)) — switch
+  modal renders the new step with a slot-count summary
+  (`(N new, M ready, K failed)`); `TeamRepoSection` deleted (per-
+  project repo URL editing already lives in the Projects section
+  of the Options drawer).
+- **Pre-deploy salvage required.** `/workspaces/<slot>/project` and
+  `/data/projects/dynamichypergraph/repo/shared/` get orphaned by
+  this refactor; anything unpushed in either must be salvaged on the
+  live container before the new image lands.
+- **Spec mirror**: `Docs/TOT-specs.md` §4.6 + §17 rewritten;
+  `Docs/workspace-refactor-plan.md` is the design doc.
+
+Suite at 1281/1281.
 
 ## What needs verification (when user is next active)
 

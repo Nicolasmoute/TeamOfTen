@@ -487,10 +487,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_recurrence_one_tick
 # identity rows (name/role/brief) live in agent_project_roles; the
 # seed only writes id/kind/workspace_path. The misc-project Coach
 # identity is seeded in init_db after the projects row exists.
+#
+# `workspace_path` is vestigial post the 2026-05-06 workspace
+# refactor — agent cwd is now resolved at spawn time via
+# `workspace_dir(slot)` against the active project. The column is
+# NOT NULL so we seed empty strings rather than misleading legacy
+# `/workspaces/...` paths. Drop the column the next time anything
+# else in this table needs migrating.
 SEED_AGENTS: list[tuple[str, str, str]] = [
-    ("coach", "coach", "/workspaces/coach"),
+    ("coach", "coach", ""),
 ] + [
-    (f"p{i}", "player", f"/workspaces/p{i}")
+    (f"p{i}", "player", "")
     for i in range(1, 11)
 ]
 

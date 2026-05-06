@@ -45,19 +45,19 @@ async def main() -> None:
     await run_test("1-minimal")
 
     # 2. Add cwd. Rules out filesystem issues.
-    await run_test("2-cwd", cwd="/workspaces/p1")
+    await run_test("2-cwd", cwd="/data/projects/misc/repo/p1")
 
     # 3. Add system_prompt. Rules out long-prompt argv limits.
     await run_test(
         "3-system-prompt",
-        cwd="/workspaces/p1",
+        cwd="/data/projects/misc/repo/p1",
         system_prompt="You are a helpful assistant.",
     )
 
     # 4. Add max_turns.
     await run_test(
         "4-max-turns",
-        cwd="/workspaces/p1",
+        cwd="/data/projects/misc/repo/p1",
         system_prompt="You are a helpful assistant.",
         max_turns=1,
     )
@@ -65,7 +65,7 @@ async def main() -> None:
     # 5. Add allowed_tools (the harness production list).
     await run_test(
         "5-allowed-tools",
-        cwd="/workspaces/p1",
+        cwd="/data/projects/misc/repo/p1",
         system_prompt="You are a helpful assistant.",
         max_turns=1,
         allowed_tools=["Read", "Grep", "Glob"],
@@ -82,7 +82,7 @@ async def main() -> None:
         mcp = create_sdk_mcp_server(name="diag", version="0.1.0", tools=[ping])
         await run_test(
             "6-mcp-server",
-            cwd="/workspaces/p1",
+            cwd="/data/projects/misc/repo/p1",
             system_prompt="You are a helpful assistant.",
             max_turns=1,
             allowed_tools=["Read", "mcp__diag__ping"],

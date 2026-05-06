@@ -53,21 +53,6 @@ RUN git config --global user.name "${GIT_USER_NAME}" \
     && git config --global init.defaultBranch main \
     && git config --global --add safe.directory '*'
 
-# Workspaces — one per slot (Coach + p1..p10) plus a default.
-# In M2a these are plain dirs; per-slot git worktrees come in M4+.
-# Each workspace also symlinks `attachments/` to /data/attachments so an
-# agent whose cwd is /workspaces/<slot>/ can Read pasted images via a
-# workspace-local path, regardless of whether the SDK's Read tool
-# restricts paths to the cwd subtree. The symlink target doesn't need
-# to exist at build time — the /data volume mounts + ATTACHMENTS_DIR is
-# created in lifespan. (We deliberately do NOT `mkdir /data` in the
-# image, see memory/zeabur_volumes.md for why.)
-RUN mkdir -p /workspaces/default /workspaces/coach \
-    && for i in 1 2 3 4 5 6 7 8 9 10; do mkdir -p "/workspaces/p${i}"; done \
-    && for slot in default coach p1 p2 p3 p4 p5 p6 p7 p8 p9 p10; do \
-         ln -s /data/attachments "/workspaces/${slot}/attachments"; \
-       done
-
 # Persistent data dir for SQLite — on Zeabur, mount a volume at /data
 # (matches the DB_PATH default in server/db.py). We deliberately do NOT
 # pre-create /data in the image: Zeabur's bind-mount over an already-
@@ -94,8 +79,9 @@ RUN pip install ".[dev]"
 EXPOSE 8000
 
 # Healthcheck. Hits /api/health every 30s; two misses in a row mark
-# the container unhealthy (90 s boot grace so init_db + workspaces
-# have time). Endpoint is public (doesn't require HARNESS_TOKEN),
+# the container unhealthy (90 s boot grace so init_db + active-project
+# worktree provisioning have time). Endpoint is public (doesn't
+# require HARNESS_TOKEN),
 # curl is already installed above. --fail makes non-2xx exit 22, so
 # /api/health returning 503 (any required subsystem red) correctly
 # marks the container unhealthy without us parsing the body.

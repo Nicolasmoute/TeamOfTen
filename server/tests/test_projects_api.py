@@ -249,8 +249,11 @@ async def test_run_switch_emits_full_step_sequence(
     # important thing is the sequence is monotonic.
     step_names = [s for s, _ in steps]
     assert step_names == [
-        "started", "push_current", "push_current",
-        "pull_new", "pull_new", "swap_pointer", "reload",
+        "started",
+        "push_current", "push_current",
+        "pull_new", "pull_new",
+        "provision_workspaces", "provision_workspaces",
+        "swap_pointer", "reload",
     ]
     # Final event closes the subscriber.
     final = [e for e in captured if e["type"] == "project_switched"]

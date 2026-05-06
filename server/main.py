@@ -297,11 +297,36 @@ async def lifespan(app: FastAPI):
             Path(claude_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
         except Exception:
             logger.exception("failed to mkdir CLAUDE_CONFIG_DIR=%s", claude_dir)
-    # Project-repo clone + per-slot worktrees (no-op if HARNESS_PROJECT_REPO
-    # unset). Logged but errors don't abort startup — agents can still run
-    # in plain dirs if worktree setup fails.
-    workspaces_status = await ensure_workspaces()
+    # Project-repo clone + per-slot worktrees for the active project.
+    # No-op if the active project has no repo_url. Logged but errors
+    # don't abort startup — agents can still run for non-code work
+    # (chat, research, doc writing) when provisioning fails.
+    from server.db import resolve_active_project
+    active_project_id = await resolve_active_project()
+    workspaces_status = await ensure_workspaces(active_project_id)
     logger.info("workspaces: %r", workspaces_status)
+    # Migration alarm — flag deploys that still carry the legacy
+    # global repo settings but haven't populated the active project's
+    # `projects.repo_url`. Provisioning silently no-ops in that case
+    # (the new code only reads the per-project column), so an
+    # operator who hasn't migrated would see "agents work but
+    # coord_commit_push fails" with no obvious cause. One-shot warning
+    # at boot — shows up in Zeabur logs.
+    if not workspaces_status.get("configured"):
+        try:
+            legacy_repo = (await _read_team_config_str("project_repo")).strip()
+            legacy_env_repo = os.environ.get("HARNESS_PROJECT_REPO", "").strip()
+            if legacy_repo or legacy_env_repo:
+                logger.warning(
+                    "workspaces: active project '%s' has no repo_url but "
+                    "legacy %s is set. Copy the URL into the project row "
+                    "(Options → Projects → edit) so worktrees provision.",
+                    active_project_id,
+                    "team_config.project_repo" if legacy_repo
+                    else "HARNESS_PROJECT_REPO env",
+                )
+        except Exception:
+            logger.exception("workspaces: legacy-config check failed")
     # Restore observed-context-window map from team_config so we don't
     # relearn from turn 1 on every redeploy.
     from server.agents import _load_observed_windows
@@ -904,8 +929,10 @@ async def health_detail() -> JSONResponse:
         secrets_info["reason"] = key_status.get("reason")
     checks["secrets"] = secrets_info
 
-    # 7. Workspaces — only check if HARNESS_PROJECT_REPO set
-    ws_status = get_workspaces_status()
+    # 7. Workspaces — checks the active project's per-slot worktrees.
+    # Skipped (and reported ok) when the active project has no repo_url
+    # (intended state for content-only projects).
+    ws_status = await get_workspaces_status()
     if ws_status.get("configured"):
         slot_states = ws_status.get("slots") or {}
         all_git = bool(slot_states) and all(
@@ -1203,7 +1230,7 @@ async def status() -> dict[str, object]:
             "reason": webdav.reason,
             "url": webdav.url,
         },
-        "workspaces": get_workspaces_status(),
+        "workspaces": await get_workspaces_status(),
     }
 
 
@@ -2448,23 +2475,17 @@ async def test_mcp_server(name: str) -> dict[str, object]:
 
 
 # ------------------------------------------------------------------
-# Project repo (HARNESS_PROJECT_REPO replacement, DB-backed)
+# Repo URL helpers
 # ------------------------------------------------------------------
-
-
-class TeamRepoWrite(BaseModel):
-    repo: str = Field(
-        "",
-        description="Project repo URL. Include PAT via ${VAR} placeholder for auth. Empty clears.",
-    )
-    branch: str = Field(
-        "",
-        description="Branch to base per-Player worktrees on. Empty = 'main'.",
-    )
-    allow_secrets: bool = Field(
-        default=False,
-        description="Override the raw-token warning and save anyway.",
-    )
+#
+# Repo URL is per-project: `projects.repo_url`. Editing happens via
+# the existing per-project endpoints in `server/projects_api.py`
+# (`PATCH /api/projects/{id}` + `POST /api/projects/{id}/repo/provision`).
+# The legacy global `/api/team/repo*` endpoints were retired with the
+# 2026-05-06 workspace refactor — see `Docs/workspace-refactor-plan.md`.
+#
+# `_mask_repo_url` survives because `workspaces.get_status` and the
+# MCP-config redaction (line 2000) both still use it.
 
 
 def _mask_repo_url(url: str) -> str:
@@ -2482,115 +2503,6 @@ def _mask_repo_url(url: str) -> str:
     if userinfo.startswith("${") and userinfo.endswith("}"):
         return f"{scheme}{userinfo}@{rest}"
     return f"{scheme}***@{rest}"
-
-
-@app.get("/api/team/repo", dependencies=[Depends(require_token)])
-async def get_team_repo() -> dict[str, object]:
-    """Return the currently-active repo/branch + their source
-    (db vs env vs unset), so the UI can show where the setting lives."""
-    db_repo = await _read_team_config_str("project_repo")
-    db_branch = await _read_team_config_str("project_branch")
-    env_repo = os.environ.get("HARNESS_PROJECT_REPO", "").strip()
-    env_branch = os.environ.get("HARNESS_PROJECT_BRANCH", "").strip()
-    if db_repo:
-        active_repo, repo_source = db_repo, "db"
-    elif env_repo:
-        active_repo, repo_source = env_repo, "env"
-    else:
-        active_repo, repo_source = "", "unset"
-    if db_branch:
-        active_branch, branch_source = db_branch, "db"
-    elif env_branch:
-        active_branch, branch_source = env_branch, "env"
-    else:
-        active_branch, branch_source = "main", "default"
-    # Never return the raw repo URL — if a deploy bypasses the
-    # `${VAR}` placeholder convention and saves a literal PAT-bearing
-    # URL, the raw value would leak to anyone holding the bearer
-    # token (or any XSS that grabs it). Editing requires the user to
-    # re-paste the URL via PUT (write-only credential pattern,
-    # standard for password fields).
-    return {
-        "repo_masked": _mask_repo_url(active_repo),
-        "repo_source": repo_source,
-        "configured": bool(active_repo),
-        "branch": active_branch,
-        "branch_source": branch_source,
-        "env_repo_set": bool(env_repo),
-    }
-
-
-@app.put("/api/team/repo", dependencies=[Depends(require_token)])
-async def set_team_repo(
-    req: TeamRepoWrite,
-    actor: dict = Depends(audit_actor),
-) -> dict[str, object]:
-    """Save repo + branch to team_config. Takes effect on the NEXT
-    container restart — existing clones + worktrees stay pointing at
-    the old remote. Secret-scan rejects raw tokens unless
-    allow_secrets=true."""
-    from server.mcp_config import detect_secrets
-    repo = (req.repo or "").strip()
-    branch = (req.branch or "").strip()
-    warnings = detect_secrets(repo) if repo else []
-    if warnings and not req.allow_secrets:
-        raise HTTPException(
-            400,
-            detail={
-                "secret_warnings": warnings,
-                "hint": "Replace raw tokens with ${VAR} placeholders (the "
-                "placeholder expands at clone time from the Zeabur env). "
-                "Re-submit with allow_secrets=true to override.",
-            },
-        )
-    await _write_team_config_str("project_repo", repo)
-    await _write_team_config_str("project_branch", branch)
-    # Invalidate the in-process cache so project_configured() reflects
-    # the new value on the next call. The clone / worktree setup still
-    # requires a restart — refresh just keeps the DB and cache in sync.
-    from server.workspaces import refresh_repo_cache
-    refresh_repo_cache()
-    await bus.publish(
-        {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "agent_id": "system",
-            "type": "team_repo_updated",
-            "repo_masked": _mask_repo_url(repo),
-            "branch": branch or "main",
-            "actor": actor,
-        }
-    )
-    return {"ok": True, "secret_warnings": warnings}
-
-
-@app.post("/api/team/repo/provision", dependencies=[Depends(require_token)])
-async def provision_team_repo(
-    actor: dict = Depends(audit_actor),
-) -> dict[str, object]:
-    """Run `ensure_workspaces()` live so a repo URL saved via the UI
-    takes effect without a container restart. Idempotent — existing
-    `.git` worktrees are left alone; only missing ones get cloned /
-    added. Can take tens of seconds for a large first clone.
-    """
-    from server.workspaces import ensure_workspaces, refresh_repo_cache
-    # Drop any stale cache first so the call reads the latest DB value.
-    refresh_repo_cache()
-    try:
-        status = await ensure_workspaces()
-    except Exception as e:
-        logger.exception("ensure_workspaces failed from /provision")
-        raise HTTPException(500, detail=f"provision failed: {e}") from e
-    await bus.publish(
-        {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "agent_id": "system",
-            "type": "team_repo_provisioned",
-            "configured": bool(status.get("configured")),
-            "error": status.get("error"),
-            "actor": actor,
-        }
-    )
-    return {"ok": "error" not in status, "status": status}
 
 
 # Telegram bridge configuration. Token + chat-id whitelist live in the
