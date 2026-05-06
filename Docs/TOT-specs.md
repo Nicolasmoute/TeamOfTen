@@ -203,6 +203,17 @@ Important deployment decisions:
   shipping them costs almost nothing and removes one common
   failure mode. Project repos that bring their own pytest still win
   via venv activation; the system pytest is a fallback.
+- The image bakes in Playwright Chromium (`pip install playwright &&
+  python -m playwright install --with-deps chromium`) AND the
+  `@playwright/mcp` npm package (alongside Claude Code and Codex). A
+  project that opts in via the Options drawer → MCP servers gets
+  `browser_navigate` / `browser_click` / `browser_snapshot` /
+  `browser_take_screenshot` / etc. as MCP tools, so any agent can
+  drive a real headless browser to test pages. The Python
+  `playwright` library remains available via Bash for project test
+  suites that script their own browser flows. Adds ~400 MB to the
+  image. See `mcp-servers.example.json` for the canonical stanza
+  and recommended `allowed_tools` list.
 
 ---
 

@@ -2449,6 +2449,119 @@ async def _audit_report_path_already_recorded(
     return row is not None
 
 
+async def _build_soft_stalls_rows(
+    project_id: str,
+) -> list[dict[str, Any]]:
+    """Recent watchdog findings (Docs/kanban-specs.md §10.7) — soft
+    stalls flagged by the Haiku-tiered watchdog: agents that declared
+    completion in chat without advancing the kanban, agents looping
+    or erroring, etc.
+
+    Read from the events log so findings survive process restarts
+    (the in-memory dedup map in kanban_watchdog doesn't). Window:
+    last 1h, capped at 10 rows so the Coach prompt stays bounded.
+    Deduped per `(subject_agent, verdict)` so the most recent finding
+    per agent wins on rapid re-fires.
+
+    Stale findings (already resolved): if the flagged agent is no
+    longer holding the named task — `tasks.status` advanced past the
+    stage they were stuck in, or the task got reassigned — the
+    finding is dropped before surfacing. Better to under-surface than
+    to send Coach chasing already-fixed problems.
+    """
+    rows: list[dict[str, Any]] = []
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT type, payload, ts FROM events "
+                "WHERE type = 'watchdog_finding' "
+                "AND (julianday('now') - julianday(ts)) * 86400.0 < 3600 "
+                "AND project_id = ? "
+                "ORDER BY id DESC LIMIT 30",
+                (project_id,),
+            )
+            raw = await cur.fetchall()
+        finally:
+            await c.close()
+    except Exception:
+        return []
+
+    seen: set[tuple[str, str]] = set()
+    for r in raw:
+        try:
+            d = dict(r)
+            payload = d.get("payload") or "{}"
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    continue
+            slot = (payload.get("subject_agent") or "").strip()
+            verdict = (payload.get("verdict") or "").strip()
+            if not slot or not verdict:
+                continue
+            k = (slot, verdict)
+            if k in seen:
+                continue
+            seen.add(k)
+
+            task_id = (payload.get("task_id") or "").strip() or None
+            # Cross-check: drop the finding if the task already moved
+            # off the stage where the agent was stuck. Same-shape
+            # protection as `_build_unrecorded_artifacts_rows`.
+            if task_id and await _watchdog_finding_already_resolved(
+                slot=slot, task_id=task_id,
+            ):
+                continue
+
+            rows.append({
+                "agent": slot,
+                "verdict": verdict,
+                "reason": (payload.get("reason") or "").strip()[:200],
+                "task_id": task_id,
+                "signal": payload.get("signal") or "",
+                "ts": d.get("ts"),
+            })
+            if len(rows) >= 10:
+                break
+        except Exception:
+            continue
+    return rows
+
+
+async def _watchdog_finding_already_resolved(
+    *, slot: str, task_id: str,
+) -> bool:
+    """True when the watchdog finding is stale: either the agent is
+    no longer holding the task (`current_task_id != task_id`), or the
+    task was archived in the meantime. Coach will see a churn-y rollup
+    if we surface findings that are already history."""
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT current_task_id FROM agents WHERE id = ?",
+                (slot,),
+            )
+            agent_row = await cur.fetchone()
+            cur = await c.execute(
+                "SELECT status FROM tasks WHERE id = ?",
+                (task_id,),
+            )
+            task_row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        return False
+    if task_row and (dict(task_row).get("status") == "archive"):
+        return True
+    if agent_row:
+        if dict(agent_row).get("current_task_id") != task_id:
+            return True
+    return False
+
+
 async def _build_coach_coordination_block() -> str:
     """Phase 7 (PROJECTS_SPEC.md §10): Coach-only per-turn coordination
     block. Built fresh on every Coach turn from `projects`,
@@ -2843,6 +2956,38 @@ async def _build_coach_coordination_block() -> str:
             "rung 2 Coach call at 1h, rung 3 auto-reassign at 2h, "
             "rung 4 auto-archive at 4h. Intervene before the next rung "
             "fires — auto-actions are the safety net, not the plan."
+        )
+        lines.append("")
+
+    # ---- Soft stalls (watchdog findings, §10.7) -------------------
+    soft_stall_rows = await _build_soft_stalls_rows(active)
+    if soft_stall_rows:
+        lines.append("## Soft stalls (watchdog-detected)")
+        lines.append("")
+        for row in soft_stall_rows:
+            tail = f" on {row['task_id']}" if row.get("task_id") else ""
+            reason = row.get("reason") or "(no reason captured)"
+            lines.append(
+                f"- {row['agent']} ({row['verdict']}){tail} — {reason}"
+            )
+        lines.append("")
+        lines.append(
+            "These are SOFT stalls: a Haiku watchdog read each agent's "
+            "last few messages and flagged a stuck-shape pattern that "
+            "the deterministic stall ladder can't see yet. Verdict "
+            "guide: `finished_not_reported` = Player declared done in "
+            "chat but didn't call the matching coord_* tool — read the "
+            "artifact and submit on their behalf via "
+            "coord_advance_task_stage / coord_write_task_spec / "
+            "coord_submit_audit_report (with on_behalf_of=...). "
+            "`blocked` = clarify via coord_send_message or unblock by "
+            "rewriting the trajectory. `erroring` = read the recent "
+            "tool_results, retry via coord_send_message, or escalate "
+            "to the human via coord_request_human. `looping` = the "
+            "Player is wasting tokens; bump effort with "
+            "coord_set_player_effort, or model tier with "
+            "coord_set_player_model. Findings auto-clear in 1h or "
+            "when the agent's current_task_id changes."
         )
         lines.append("")
 

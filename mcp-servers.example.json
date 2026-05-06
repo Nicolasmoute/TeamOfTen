@@ -27,6 +27,13 @@
         "SLACK_BOT_TOKEN": "${SLACK_BOT_TOKEN}",
         "SLACK_TEAM_ID": "${SLACK_TEAM_ID}"
       }
+    },
+
+    "_comment_playwright": "Browser automation. The @playwright/mcp package and Chromium are pre-baked in the Dockerfile, so spawn is fast and offline. --isolated gives each session a fresh ephemeral profile (no cookie/cache leakage between turns). Drop --isolated if agents need persistent login state across turns.",
+    "playwright": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest", "--isolated"]
     }
   },
 
@@ -54,6 +61,28 @@
       "slack_list_channels",
       "slack_get_channel_history",
       "slack_post_message"
+    ],
+
+    "playwright": [
+      "browser_navigate",
+      "browser_navigate_back",
+      "browser_click",
+      "browser_type",
+      "browser_press_key",
+      "browser_hover",
+      "browser_select_option",
+      "browser_snapshot",
+      "browser_take_screenshot",
+      "browser_evaluate",
+      "browser_console_messages",
+      "browser_network_requests",
+      "browser_wait_for",
+      "browser_resize",
+      "browser_close",
+      "browser_tab_list",
+      "browser_tab_new",
+      "browser_tab_select",
+      "browser_tab_close"
     ]
   }
 }

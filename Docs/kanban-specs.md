@@ -802,6 +802,90 @@ Per-finding TTL dedupe: `_reconcile_emitted: dict[str, str]` maps `<kind>:<proje
 | `HARNESS_KANBAN_RECONCILE_ENABLED` | `true` | Master switch for the sweep. |
 | `HARNESS_KANBAN_RECONCILE_TTL_SECONDS` | `3600` | 1 h. Per-finding TTL — Coach isn't spammed every 5 min for the same on-disk artifact. |
 
+### 10.7 Soft-stall watchdog (Haiku-tiered)
+
+[server/kanban_watchdog.py](server/kanban_watchdog.py). Sibling pass in the idle poller's tick loop, fires after the reconciliation sweep.
+
+The §10.5 stall ladder operates on `tasks.last_stage_change_at` — it catches tasks where nothing has progressed for at least 30 min. The §10.6 reconciliation sweep catches the "artifact on disk but kanban didn't notice" pattern. Neither catches the *soft* stalls that show up earlier and look fine to a SQL query:
+
+- Agent says *"I've finished, here's the summary"* in chat but never calls the kanban completion tool. Their `current_task_id` is still set; the task hasn't progressed. Looks idle to SQL but is actually a forgotten transition.
+- Agent looped for ten messages without producing a useful tool_use — they're confused, not blocked.
+- A turn errored mid-tool and the agent acknowledged the error but didn't retry, didn't escalate, didn't reach out to Coach.
+
+Coach can't catch these without spending an Opus turn reading the timeline of every agent. The watchdog spends a Haiku call instead.
+
+#### Three tiers
+
+**Tier 1 (free, deterministic SQL).** Filter the 11 agents down to a handful of *candidates* whose recent activity matches a stall-shape signature. Most ticks return zero candidates and the watchdog short-circuits before any LLM call. Two signals:
+
+- `agents.status = 'working'` AND no `tool_use` event in the last `HARNESS_WATCHDOG_NO_TOOL_USE_SECONDS` (default 600s = 10 min). Captures the "looping but talking" case.
+- `agents.status = 'idle'` AND `current_task_id IS NOT NULL` AND the task is non-archive AND the agent's most recent event is older than `HARNESS_WATCHDOG_IDLE_WITH_TASK_SECONDS` (default 600s). Captures the "finished but forgot to advance" case.
+
+Coach is excluded — Coach has its own recurrence machinery and the watchdog explicitly routes findings *to* Coach. Locked Players are also skipped.
+
+**Tier 2 (cheap, one bundled Haiku call).** When ≥1 candidate exists, the watchdog reads each candidate's last `HARNESS_WATCHDOG_RECENT_EVENTS` (default 10) events from the `events` table + their current task state (id, title, stage, last_stage_change_at), bundles everything into ONE structured prompt, and asks Haiku 4.5 (`latest_haiku`) to classify each candidate. The prompt requests strict JSON of shape:
+
+```json
+{
+  "verdicts": [
+    {
+      "agent_id": "p3",
+      "verdict": "finished_not_reported",
+      "reason": "Agent posted 'wrote spec.md, ready for review' but never called coord_write_task_spec — task t-42 still in plan stage."
+    },
+    {"agent_id": "p7", "verdict": "progressing", "reason": "Tool calls in flight; ignore."}
+  ]
+}
+```
+
+Verdict enum:
+- `progressing` — actually fine; SQL false positive.
+- `finished_not_reported` — agent declared the work done but didn't transition the task. Coach should read the artifact + submit on the agent's behalf.
+- `blocked` — agent said it can't proceed. Coach should unblock or reassign.
+- `erroring` — turn errored without recovery. Likely needs Coach intervention or `human_attention`.
+- `looping` — repeated similar actions without progress. Quality / model-tier signal.
+- `idle_ok` — genuinely idle, nothing to do.
+
+Verdicts that are unparseable / unknown / missing default to `idle_ok` (drop). Bundled in one call: at 5 candidates × ~200 tokens of recent-event context each ≈ 2 k input + 500 output ≈ ~$0.005 per fire. Most ticks fire zero candidates so steady-state cost is a few cents per day.
+
+**Tier 3 (routing).** For each verdict that isn't `progressing` / `idle_ok`:
+
+- Emit `watchdog_finding` `{agent_id, verdict, reason, task_id, hash, to: 'coach'}` on the bus. The event lands in the events table where Coach's per-tick rollup builder reads it.
+- Dedup by SHA-256 over `(agent_id, verdict, last_event_ids[:10])`. Same observation can't fire twice within `HARNESS_WATCHDOG_DEDUP_TTL_SECONDS` (default 3600s = 1h). Restarts reset the in-memory dedup map (mirrors the §10.6 reconciliation pattern).
+- For `erroring` verdicts only: also fire `human_attention` so the EnvPane attention strip + Telegram bridge surface the failure immediately (rare, real fault).
+
+The watchdog never wakes the agent directly. The user-facing rationale: an agent that's stuck *because they don't know what to do next* (missed assignment, ambiguous spec, dead-end audit feedback) won't make progress on a wake — Coach has to make the call to nudge / reassign / clarify. The watchdog never wakes Coach out-of-band either by default; findings enrich the regular per-tick rollup so the next scheduled Coach turn sees them. Toggling `HARNESS_WATCHDOG_WAKE_COACH_ON_HIGH=true` enables out-of-band Coach wakes for `erroring` + `blocked` verdicts (off by default — extra Opus turns add up).
+
+#### Coach prompt rollup
+
+[server/agents.py](server/agents.py)'s `_build_coach_coordination_block` reads the last 1h of `watchdog_finding` events for the active project (capped 10 rows, deduped per agent), and renders `## Soft stalls (watchdog-detected)` after `## Unrecorded artifacts on disk`. Format:
+
+```
+- p3 (finished_not_reported) on t-42 — Agent posted "wrote spec.md, ready for review" but never called coord_write_task_spec.
+- p7 (blocked) on t-39 — Agent reports the audit fail comment is ambiguous; can't decide which fix to apply.
+```
+
+Followed by a one-line action hint pointing at the relevant Coach tools (`coord_send_message` to clarify, `coord_advance_task_stage` for finished-but-forgot, `coord_assign_*` for reassignment, `coord_set_player_effort` / `coord_set_player_model` for repeated `looping`).
+
+#### Cost discipline
+
+- **Cost cap gate.** Skipped entirely when `_today_spend()` ≥ `HARNESS_TEAM_DAILY_CAP`. Same fail-closed behavior as the Compass audit watcher.
+- **Turns ledger.** Each Haiku call records one row under `agent_id="watchdog"`, `runtime="claude"`, `cost_basis="watchdog:tick"` so spend rolls up alongside Coach + Compass + Players in `_today_spend()` and the EnvPane cost meter. The hard cap thus applies transitively.
+- **Bus event.** A `watchdog_llm_call{agent_id="watchdog", model, cost_usd, duration_ms, candidates: N, findings: M, is_error}` event mirrors `compass_llm_call` for live UI counters.
+- **Master kill-switch.** `HARNESS_WATCHDOG_ENABLED=false` disables the sweep entirely; idle poller still runs its other passes.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `HARNESS_WATCHDOG_ENABLED` | `true` | Master switch for the watchdog sweep. |
+| `HARNESS_WATCHDOG_NO_TOOL_USE_SECONDS` | `600` | 10 min. Tier 1: working agent with no `tool_use` in this window is a candidate. |
+| `HARNESS_WATCHDOG_IDLE_WITH_TASK_SECONDS` | `600` | 10 min. Tier 1: idle agent with `current_task_id` set + no recent events is a candidate. |
+| `HARNESS_WATCHDOG_RECENT_EVENTS` | `10` | Tier 2: how many last events to bundle per candidate into the Haiku prompt. |
+| `HARNESS_WATCHDOG_DEDUP_TTL_SECONDS` | `3600` | 1 h. Per-finding-hash TTL — same observation can't re-fire within this window. |
+| `HARNESS_WATCHDOG_MAX_CANDIDATES` | `5` | Defensive cap — if tier 1 returns more than this, only the N oldest are inspected. |
+| `HARNESS_WATCHDOG_WAKE_COACH_ON_HIGH` | `false` | When true, `erroring` / `blocked` verdicts wake Coach out-of-band instead of waiting for the next tick. |
+
+Failure isolation: tier 2 LLM error → log + drop (no findings emitted that tick). Tier 1 SQL error → log + skip. Per-candidate exceptions in result parsing don't block sibling candidates.
+
 ---
 
 ## 11 · UI surface

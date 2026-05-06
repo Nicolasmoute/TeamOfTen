@@ -281,6 +281,17 @@ async def sweep_once() -> int:
         await reconciliation_sweep_once()
     except Exception:
         logger.exception("idle_poller: reconciliation sweep crashed")
+    # Soft-stall watchdog (v0.3.9): tier 1 SQL filter + bundled Haiku
+    # call to catch agents stuck in ways the deterministic ladder
+    # misses (declared done but didn't advance the kanban; looping;
+    # erroring without recovery). Cost-capped + dedup-gated; most
+    # ticks short-circuit at tier 1 with zero candidates.
+    # See Docs/kanban-specs.md §10.7.
+    try:
+        from server.kanban_watchdog import sweep_once as _watchdog_sweep
+        await _watchdog_sweep()
+    except Exception:
+        logger.exception("idle_poller: watchdog sweep crashed")
     return woken
 
 

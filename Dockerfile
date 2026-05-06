@@ -29,16 +29,23 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates git ripgrep bubblewrap \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g @anthropic-ai/claude-code @openai/codex \
+    && npm install -g @anthropic-ai/claude-code @openai/codex @playwright/mcp \
     && bwrap --version > /dev/null \
     && codex app-server --help > /dev/null \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Playwright Chromium + system libs. Project-side test suites (e.g.
-# dynamichypergraph) drive a real browser; without the bundle pre-baked
-# every Player redeploy would need a manual `playwright install` and
-# the cache wipe means they'd lose it on the next harness redeploy.
+# Playwright Chromium + system libs. Two consumers:
+#   1. Project-side test suites that drive a real browser via the
+#      Python `playwright` library through Bash.
+#   2. The `@playwright/mcp` server (installed above via npm) which
+#      exposes browser_navigate / browser_click / browser_snapshot /
+#      browser_take_screenshot / etc. as MCP tools to every agent
+#      whose project enables it via the Options drawer.
+# Both share the same browser cache (~/.cache/ms-playwright). Without
+# the bundle pre-baked every redeploy would need a manual
+# `playwright install` and the cache wipe means agents would lose it
+# on the next harness redeploy.
 # `--with-deps` pulls X11/font/audio shared libs Chromium needs to
 # launch headless. Adds ~300 MB to the image.
 RUN pip install --no-cache-dir playwright \

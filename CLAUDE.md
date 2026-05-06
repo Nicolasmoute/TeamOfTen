@@ -1978,6 +1978,90 @@ produces a fully-rendered handoff suffix).
 
 Suite at 1297/1297.
 
+**Recent (2026-05-06, follow-up) — Playwright MCP wired up:**
+
+The Dockerfile already baked in Python `playwright` + Chromium for
+project test suites that drive a real browser via `Bash`, but agents
+had no first-class browser tools — they had to script everything.
+Closed the gap by adding the **`@playwright/mcp`** npm package to
+the Dockerfile's `npm install -g` line (alongside `@anthropic-ai/claude-code`
+and `@openai/codex`) and adding a `playwright` server stanza to
+[mcp-servers.example.json](mcp-servers.example.json) with a
+recommended `allowed_tools` list (`browser_navigate`, `browser_click`,
+`browser_type`, `browser_snapshot`, `browser_take_screenshot`,
+`browser_evaluate`, `browser_console_messages`,
+`browser_network_requests`, tab controls, etc.).
+
+The MCP server is OFF by default — projects that need it enable it
+via Options → MCP servers (paste the stanza). `--isolated` flag
+gives each session a fresh ephemeral profile so cookie/cache state
+doesn't leak across turns; drop the flag if persistent login state
+is needed. Both consumers (the Python lib via Bash and the MCP
+server via npm) share the same `~/.cache/ms-playwright` browser
+cache so Chromium is downloaded exactly once at image build time.
+Spec mirror: `Docs/TOT-specs.md` §3 deployment bullet list.
+
+**Recent (2026-05-06, follow-up) — Soft-stall watchdog (Haiku-tiered):**
+
+The §10.5 stall ladder operates on `tasks.last_stage_change_at`
+(catches hard stalls at 30 min); §10.6 reconciliation catches
+"artifact on disk but kanban didn't notice." Neither catches the
+*soft* stalls that look fine to SQL — agent declared "I've finished"
+in chat but never called `coord_write_task_spec` /
+`coord_commit_push`, agent looping for ten messages without producing
+useful tool_use, agent acknowledged an error but never retried or
+escalated. Coach can't catch these on its own without spending an
+Opus turn reading every agent's timeline. The new
+[server/kanban_watchdog.py](server/kanban_watchdog.py) spends a
+bundled Haiku 4.5 call per tick instead.
+
+- **Three tiers.** Tier 1: free SQL filter (`agents.status='working'`
+  with no `tool_use` event in 10 min, OR `status='idle'` with
+  `current_task_id` set + no recent activity for 10 min) reduces 11
+  Players to a handful of candidates; most ticks return zero and the
+  watchdog short-circuits before any LLM call. Tier 2: bundle the
+  candidates' last 10 events + task state into ONE structured prompt;
+  Haiku classifies each into `progressing` / `finished_not_reported` /
+  `blocked` / `erroring` / `looping` / `idle_ok`. Tier 3: actionable
+  verdicts emit `watchdog_finding` events that Coach's per-tick
+  rollup reads.
+- **Routes to Coach, not the agent.** The agent often genuinely
+  doesn't know why it's stuck — Coach owns task lifecycle and can
+  decide whether to clarify, reassign, advance on the agent's behalf,
+  or escalate. The watchdog never wakes the agent directly. Coach
+  gets findings via the new `## Soft stalls (watchdog-detected)`
+  section in `_build_coach_coordination_block`
+  ([server/agents.py:_build_soft_stalls_rows](server/agents.py)) so
+  the next scheduled tick sees them — no extra Opus turns spawned.
+  `HARNESS_WATCHDOG_WAKE_COACH_ON_HIGH=true` enables out-of-band
+  Coach wakes for `erroring` + `blocked` (off by default — extra
+  Opus turns add up). `erroring` ALWAYS also fires `human_attention`
+  so the EnvPane attention strip + Telegram bridge surface the
+  failure immediately (rare, real fault).
+- **Dedup + cost gates.** SHA-256 over `(agent, verdict, last 10
+  event_ids)` — same observation can't fire twice within
+  `HARNESS_WATCHDOG_DEDUP_TTL_SECONDS` (default 1h). Pre-fire cost
+  gate against `HARNESS_TEAM_DAILY_CAP` (fail-closed). One row in
+  `turns` per call under `agent_id="watchdog"`,
+  `cost_basis="watchdog:tick"` so spend rolls into the team daily
+  cap and EnvPane meter. Bus event `watchdog_llm_call` mirrors
+  `compass_llm_call` for live UI counters.
+- **Stale-finding cross-check.** When Coach's rollup builder pulls
+  `watchdog_finding` events from the last hour, it drops any whose
+  named task is no longer the agent's `current_task_id` (Coach
+  already advanced the task) or whose task is archived. Same shape
+  as the §10.6 reconciliation cross-check.
+- **Wired into the idle poller's tick loop** (after the
+  reconciliation sweep) so it runs at the same 5-min cadence; no
+  new lifecycle task. Master kill-switch `HARNESS_WATCHDOG_ENABLED`.
+- **Cost ballpark.** Haiku 4.5 ≈ $1/$5 per Mtok. ~5 candidates × ~200
+  tokens recent-event context = ~2k input + 500 output ≈ $0.005 per
+  fire. Most ticks fire zero candidates — steady-state cost is cents
+  per day.
+
+Spec mirror: [Docs/kanban-specs.md](Docs/kanban-specs.md) §10.7.
+Tests: [server/tests/test_kanban_watchdog.py](server/tests/test_kanban_watchdog.py).
+
 ## What needs verification (when user is next active)
 
 Verified as of 2026-04-24: HARNESS_TOKEN auth gate, fine-grained
