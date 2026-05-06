@@ -6594,13 +6594,25 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "(plan → execute → audit_syntax → audit_semantics → ship → "
             "archive, plus revert audit_*→execute and execute→archive).\n"
             "\n"
+            "ASSIGNEE GATE: if the target stage's role row has no "
+            "owner and no eligible_owners, you MUST pass `assignee` so "
+            "the new stage has someone to wake. Single slot ('p3') for "
+            "hard-assign or comma-list ('p2,p5') for a pool. If the "
+            "active role row already has an owner or non-empty "
+            "eligible_owners, `assignee` is optional — omit to keep the "
+            "existing assignee, or pass to mid-flight reassign in one "
+            "call. Archive has no role to fill, so `assignee` is "
+            "rejected on stage='archive'.\n"
+            "\n"
             "Params:\n"
             "- task_id: required\n"
             "- stage: target stage (kanban value)\n"
+            "- assignee: optional Player slot or comma-list pool "
+            "(required when target stage has no eligible owners)\n"
             "- note: optional reason; rendered on the timeline + carried "
             "in the task_stage_changed event"
         ),
-        {"task_id": str, "stage": str, "note": str},
+        {"task_id": str, "stage": str, "assignee": str, "note": str},
     )
     async def advance_task_stage(args: dict[str, Any]) -> dict[str, Any]:
         if not caller_is_coach:
@@ -6608,6 +6620,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         task_id = (args.get("task_id") or "").strip()
         stage = (args.get("stage") or "").strip().lower()
         note = (args.get("note") or "").strip()
+        assignee_raw = (args.get("assignee") or "").strip()
         if not task_id:
             return _err("task_id is required")
         if stage not in ALL_KANBAN_STAGES:
@@ -6615,6 +6628,28 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"invalid stage '{stage}' (must be one of "
                 f"{sorted(ALL_KANBAN_STAGES)})"
             )
+
+        # Resolve the role for the target stage. Archive has no role.
+        from server.kanban import _role_for_stage
+        target_role = _role_for_stage(stage)
+
+        # Pre-validate `assignee` (when provided).
+        targets: list[str] | None = None
+        if assignee_raw:
+            if stage == "archive" or target_role is None:
+                return _err(
+                    "archive stage takes no assignee; drop the "
+                    "`assignee` parameter."
+                )
+            validated, terr = await _validate_role_targets(
+                assignee_raw, role_label=target_role
+            )
+            if terr:
+                return _err(terr)
+            if validated is None:
+                return _err("internal: assignee validation returned None")
+            targets = validated
+
         project_id = await resolve_active_project()
         c = await configured_conn()
         try:
@@ -6633,6 +6668,114 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 return _err(
                     f"invalid transition: {old_status} → {stage}"
                 )
+
+            # Assignee gate: when the target stage isn't archive, the
+            # role row must end up with at least one eligible Player so
+            # the kanban subscriber's stage-entry wake has someone to
+            # call. Either Coach passed `assignee` (we plant it) or the
+            # existing active row already has owner / non-empty
+            # eligible_owners.
+            planted_targets: list[str] | None = None
+            if stage != "archive" and target_role:
+                if targets:
+                    # Build a generic wake prompt. NB: at this point
+                    # `tasks.status` is still `old_status`, so
+                    # `_assign_role_helper`'s `_role_matches_stage`
+                    # check returns False and the helper does NOT
+                    # wake. The subscriber's `_on_stage_changed`
+                    # (fired by the `task_stage_changed` event we
+                    # publish below) finds the planted row and wakes
+                    # the assignee — single wake.
+                    role_label = _role_token_for_stage(stage)
+                    is_pool = len(targets) > 1
+                    if is_pool:
+                        wake_prompt = (
+                            f"Coach advanced task {task_id} to "
+                            f"{stage!r} and posted the {target_role} "
+                            f"role to a pool of {', '.join(targets)}. "
+                            f"First to call coord_accept_role(task_id="
+                            f"{task_id!r}, role={target_role!r}) wins."
+                        )
+                    else:
+                        wake_prompt = (
+                            f"Coach advanced task {task_id} to "
+                            f"{stage!r} and assigned you as "
+                            f"{target_role}. Read coord_my_assignments "
+                            f"for the role context, do the work, then "
+                            f"call the matching completion tool "
+                            f"(coord_assign_{role_label}'s response "
+                            f"explains which one)."
+                        )
+                    ok, _msg, _slots = await _assign_role_helper(
+                        c, task_id=task_id, role=target_role,
+                        targets=targets,
+                        wake_prompt_for_role=wake_prompt,
+                    )
+                    if not ok:
+                        return _err(
+                            f"assignee planting failed for "
+                            f"{target_role}; task not advanced."
+                        )
+                    planted_targets = targets
+                else:
+                    # No assignee provided — the existing active role
+                    # row must already have owner / non-empty
+                    # eligible_owners. Without one, the wake fires
+                    # `stage_assignment_needed` back at Coach — at
+                    # which point the advance is moot. Reject loudly
+                    # so Coach plants the assignee atomically with
+                    # the advance.
+                    cur = await c.execute(
+                        "SELECT owner, eligible_owners FROM "
+                        "task_role_assignments "
+                        "WHERE task_id = ? AND role = ? "
+                        "AND completed_at IS NULL "
+                        "AND superseded_by IS NULL "
+                        "ORDER BY assigned_at DESC LIMIT 1",
+                        (task_id, target_role),
+                    )
+                    rrow = await cur.fetchone()
+                    has_assignee = False
+                    if rrow:
+                        rd = dict(rrow)
+                        if rd.get("owner"):
+                            has_assignee = True
+                        else:
+                            try:
+                                lst = json.loads(
+                                    rd.get("eligible_owners") or "[]"
+                                )
+                                if isinstance(lst, list) and lst:
+                                    has_assignee = True
+                            except Exception:
+                                has_assignee = False
+                    if not has_assignee:
+                        role_token = _role_token_for_stage(stage)
+                        if stage in ("audit_syntax", "audit_semantics"):
+                            kind = (
+                                "syntax" if stage == "audit_syntax"
+                                else "semantics"
+                            )
+                            tool_template = (
+                                f"coord_assign_auditor(task_id="
+                                f"{task_id!r}, kind={kind!r}, "
+                                f"to=<slot>, focus=<...>)"
+                            )
+                        else:
+                            tool_template = (
+                                f"coord_assign_{role_token}("
+                                f"task_id={task_id!r}, to=<slot>)"
+                            )
+                        return _err(
+                            f"target stage {stage!r} has no eligible "
+                            f"{target_role}. Pass `assignee='pN'` "
+                            f"(single slot) or `assignee='pN,pM'` "
+                            f"(pool) to plant the role atomically "
+                            f"with the advance, or call "
+                            f"{tool_template} first and retry "
+                            f"without `assignee`."
+                        )
+
             now = _now_iso()
             # Stamp last_stage_change_at + clear stale_alert_at on every
             # status change (audit-2026-05-04 item 6).
@@ -6687,12 +6830,26 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"user notified, call coord_request_human or "
                 f"coord_send_message yourself."
             )
-        return _ok(
-            f"{head} The kanban auto-wakes the new-stage assignee. "
-            f"Note: this bypassed the normal role-completion gate, "
-            f"so the previous stage's role row stays open unless "
-            f"you intended to skip it entirely."
-        )
+        if planted_targets:
+            assignee_clause = (
+                f"{planted_targets[0]} (hard-assign)"
+                if len(planted_targets) == 1
+                else f"pool [{', '.join(planted_targets)}]"
+            )
+            tail = (
+                f" Planted {target_role} role → {assignee_clause}; "
+                f"the kanban auto-wakes them with the role context. "
+                f"Do NOT follow up with coord_send_message; the wake "
+                f"covers it."
+            )
+        else:
+            tail = (
+                f" The kanban auto-wakes the new-stage assignee. "
+                f"Note: this bypassed the normal role-completion "
+                f"gate, so the previous stage's role row stays open "
+                f"unless you intended to skip it entirely."
+            )
+        return _ok(head + tail)
 
     @tool(
         "coord_set_task_blocked",

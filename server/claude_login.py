@@ -114,14 +114,25 @@ def strip_ansi(text: str) -> str:
 
 
 def extract_url(text: str) -> Optional[str]:
-    """Return the first https?:// URL in `text`, or None.
+    """Return the longest https?:// URL in `text`, or None.
 
-    Strips trailing punctuation that the regex may have swept up.
+    Returning the longest match (rather than the first) handles two
+    bug shapes seen in the wild:
+
+      - The TUI prints multiple URLs (a documentation link + the OAuth
+        URL); the OAuth one is what we want and is always longer.
+      - Pyte rendering occasionally surfaces a partial URL on one row
+        and the full URL on another (e.g. the CLI's "Open this URL"
+        prompt + the URL itself wrapped to the next row). The full
+        version wins.
+
+    Trailing URL punctuation that the regex swept up is stripped.
     """
-    m = _URL_RE.search(text)
-    if not m:
+    matches = _URL_RE.findall(text)
+    if not matches:
         return None
-    url = m.group(0).rstrip(_URL_TRAILING_TRIM)
+    matches.sort(key=len, reverse=True)
+    url = matches[0].rstrip(_URL_TRAILING_TRIM)
     return url or None
 
 
@@ -136,9 +147,13 @@ def looks_like_success(text: str) -> bool:
 
 # --------------------------------------------------------------- session
 
-# Terminal screen size for the embedded pyte emulator. Wide enough
-# that the OAuth URL fits on one line in any reasonable rendering.
-_TERM_COLS = 200
+# Terminal screen size for the embedded pyte emulator. Very wide so
+# the OAuth URL fits on a single row even when scopes etc. push the
+# total length well past 200 chars (Anthropic's auth URL has been
+# observed at 250+). Pyte handles arbitrary widths cheaply, and we
+# also TIOCSWINSZ the slave fd to match so the CLI doesn't wrap the
+# URL itself before pyte ever sees it.
+_TERM_COLS = 500
 _TERM_ROWS = 60
 
 

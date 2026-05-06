@@ -84,6 +84,35 @@ def test_extract_url_returns_none_when_absent() -> None:
     assert claude_login.extract_url("nothing to see here") is None
 
 
+def test_extract_url_picks_longest_when_multiple() -> None:
+    """The TUI sometimes prints both a docs link and the OAuth URL.
+    The OAuth URL is always the longer of the two — that's what the
+    user actually needs."""
+    text = (
+        "Help: https://docs.anthropic.com/cli\n"
+        "Open: https://claude.com/cli/oauth/authorize?code=true&client_id=abc&scope=org%3Aclaude-cli"
+    )
+    url = claude_login.extract_url(text)
+    assert url is not None
+    assert "scope=org%3Aclaude-cli" in url
+    assert "docs.anthropic" not in url
+
+
+def test_extract_url_preserves_url_encoded_chars() -> None:
+    """Percent-encoded chars in query values (RFC 3986) must be kept
+    intact — `%3A` / `%2F` decode back to `:` / `/` in the inner URL.
+    A naive cleanup that decodes them would break the OAuth call."""
+    text = (
+        "Open: https://claude.com/cli/oauth/authorize?"
+        "redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"
+        "&scope=org%3Acreate_api_key"
+    )
+    url = claude_login.extract_url(text)
+    assert url is not None
+    assert "%3A%2F%2F" in url  # nested URL still percent-encoded
+    assert "scope=org%3Acreate_api_key" in url
+
+
 def test_looks_like_yn_prompt_brackets() -> None:
     assert claude_login.looks_like_yn_prompt("Open browser? [Y/n]")
     assert claude_login.looks_like_yn_prompt("Continue? [y/N]")

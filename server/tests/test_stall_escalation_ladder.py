@@ -626,9 +626,12 @@ async def test_stage_progression_resets_escalation_level(
         coach["_handlers"].get("coord_advance_task_stage")
         or coach["_handlers"].get("advance_task_stage")
     )
+    # The seeded task has no shipper role row planted; supply
+    # `assignee` so the advance plants it atomically.
     result = await handler({
         "task_id": "t-2026-05-06-stallesc",
         "stage": "ship",
+        "assignee": "p3",
     })
     assert not result.get("isError"), result
 

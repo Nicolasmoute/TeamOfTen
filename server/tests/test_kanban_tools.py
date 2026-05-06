@@ -844,13 +844,180 @@ async def test_advance_task_stage_stamps_last_stage_change_at(
         owner="p3",
     )
     server = _server_for("coach")
+    # The new stage has no auditor planted; supply assignee atomically
+    # with the advance.
     result = await _handler(server, "advance_task_stage")({
         "task_id": "t-2026-05-03-abc12345",
         "stage": "audit_syntax",
+        "assignee": "p4",
     })
     assert not result.get("isError"), f"unexpected error: {result}"
     stamp = await _read_stage_change_at("t-2026-05-03-abc12345")
     assert stamp is not None
+
+
+async def test_advance_task_stage_rejects_when_target_stage_has_no_assignee(
+    fresh_db: str,
+) -> None:
+    """Coach advancing to a stage whose role row has no owner /
+    eligible_owners must be rejected with a pointer at `assignee`.
+    This closes the loop where Coach advanced into a stage and the
+    kanban then echoed `stage_assignment_needed` straight back."""
+    await init_db()
+    await _seed_task(
+        status="execute",
+        trajectory='[{"stage":"execute","to":[]},'
+                   '{"stage":"audit_syntax","to":[]}]',
+        owner="p3",
+    )
+    server = _server_for("coach")
+    result = await _handler(server, "advance_task_stage")({
+        "task_id": "t-2026-05-03-abc12345",
+        "stage": "audit_syntax",
+    })
+    err = _err_text(result)
+    assert "no eligible auditor_syntax" in err
+    assert "assignee=" in err
+    assert "coord_assign_auditor" in err
+    # Status must be unchanged.
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT status FROM tasks WHERE id = 't-2026-05-03-abc12345'"
+        )
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    assert row["status"] == "execute"
+
+
+async def test_advance_task_stage_plants_role_row_atomically(
+    fresh_db: str,
+) -> None:
+    """Passing `assignee` must plant a fresh task_role_assignments
+    row for the target stage's role and update tasks.status in one
+    call. Verifies the new row is active (no superseded_by, no
+    completed_at) and matches the slot."""
+    await init_db()
+    await _seed_task(
+        status="execute",
+        trajectory='[{"stage":"execute","to":[]},'
+                   '{"stage":"audit_syntax","to":[]}]',
+        owner="p3",
+    )
+    server = _server_for("coach")
+    result = await _handler(server, "advance_task_stage")({
+        "task_id": "t-2026-05-03-abc12345",
+        "stage": "audit_syntax",
+        "assignee": "p4",
+    })
+    text = _ok_text(result)
+    assert "Planted auditor_syntax role" in text
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT status FROM tasks WHERE id = 't-2026-05-03-abc12345'"
+        )
+        task_row = dict(await cur.fetchone())
+        cur = await c.execute(
+            "SELECT role, owner, eligible_owners "
+            "FROM task_role_assignments "
+            "WHERE task_id = 't-2026-05-03-abc12345' "
+            "AND completed_at IS NULL AND superseded_by IS NULL"
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+    finally:
+        await c.close()
+    assert task_row["status"] == "audit_syntax"
+    auditor_rows = [r for r in rows if r["role"] == "auditor_syntax"]
+    assert len(auditor_rows) == 1
+    assert auditor_rows[0]["owner"] == "p4"
+
+
+async def test_advance_task_stage_pool_assignee_accepted(
+    fresh_db: str,
+) -> None:
+    """`assignee='p4,p5'` lands as a pool row (owner NULL,
+    eligible_owners=['p4','p5'])."""
+    await init_db()
+    await _seed_task(
+        status="execute",
+        trajectory='[{"stage":"execute","to":[]},'
+                   '{"stage":"audit_syntax","to":[]}]',
+        owner="p3",
+    )
+    server = _server_for("coach")
+    result = await _handler(server, "advance_task_stage")({
+        "task_id": "t-2026-05-03-abc12345",
+        "stage": "audit_syntax",
+        "assignee": "p4,p5",
+    })
+    text = _ok_text(result)
+    assert "pool [p4, p5]" in text
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT owner, eligible_owners FROM task_role_assignments "
+            "WHERE task_id = 't-2026-05-03-abc12345' "
+            "AND role = 'auditor_syntax' "
+            "AND completed_at IS NULL AND superseded_by IS NULL"
+        )
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    assert row["owner"] is None
+    assert json.loads(row["eligible_owners"]) == ["p4", "p5"]
+
+
+async def test_advance_task_stage_archive_rejects_assignee(
+    fresh_db: str,
+) -> None:
+    """Archive has no role to fill; passing `assignee` is a programmer
+    error. Reject loudly rather than silently dropping the value."""
+    await init_db()
+    await _seed_task(status="execute", owner="p3")
+    server = _server_for("coach")
+    result = await _handler(server, "advance_task_stage")({
+        "task_id": "t-2026-05-03-abc12345",
+        "stage": "archive",
+        "assignee": "p4",
+    })
+    err = _err_text(result)
+    assert "archive stage takes no assignee" in err
+
+
+async def test_advance_task_stage_existing_assignee_no_assignee_needed(
+    fresh_db: str,
+) -> None:
+    """When the target stage's role row already has an owner, the
+    advance proceeds without `assignee` — Coach reserved it earlier."""
+    await init_db()
+    await _seed_task(
+        status="execute",
+        trajectory='[{"stage":"execute","to":[]},'
+                   '{"stage":"audit_syntax","to":[]}]',
+        owner="p3",
+    )
+    # Pre-plant the auditor_syntax row.
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO task_role_assignments "
+            "(task_id, role, eligible_owners, owner, "
+            "assigned_at, claimed_at) "
+            "VALUES ('t-2026-05-03-abc12345', 'auditor_syntax', "
+            "'[]', 'p4', "
+            "'2026-05-06T00:00:00Z', '2026-05-06T00:00:00Z')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    server = _server_for("coach")
+    result = await _handler(server, "advance_task_stage")({
+        "task_id": "t-2026-05-03-abc12345",
+        "stage": "audit_syntax",
+    })
+    assert not result.get("isError"), result
 
 
 async def test_claim_task_stamps_last_stage_change_at(
