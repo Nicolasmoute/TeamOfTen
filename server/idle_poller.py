@@ -989,10 +989,21 @@ async def _maybe_wake_idle(slot: str) -> bool:
 
     try:
         from server.agents import maybe_wake_agent
+        # v0.3.10: imperative wake. The previous "There MAY be tasks
+        # waiting" wording let Players treat the wake as a
+        # housekeeping prompt — they'd call coord_my_assignments,
+        # see "Pending planner: t-...", and stop without actually
+        # writing the spec (production trace 2026-05-06). The wake
+        # is now imperative + the response from coord_my_assignments
+        # carries an explicit Next-action footer naming the
+        # completion tool with the task_id baked in.
         wake_text = (
-            "There may be tasks waiting for you. Call coord_my_assignments "
-            "to see your current actionable plate (active executor task, "
-            "pending reviews, pending ship, eligible pools)."
+            "You have actionable work. Call coord_my_assignments "
+            "and read the '## Next action:' footer at the bottom — "
+            "it names the exact completion tool to call with the "
+            "task_id baked in. Then DO that work; the kanban does "
+            "not advance until you call the named tool. Do NOT "
+            "treat the response as a status report."
         )
         did_wake = await maybe_wake_agent(
             slot, wake_text, bypass_debounce=False

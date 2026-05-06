@@ -29,6 +29,22 @@ def _new_task_id() -> str:
     return f"t-{today}-{uuid.uuid4().hex[:8]}"
 
 
+def _role_token_for_stage(stage: str) -> str:
+    """Map a kanban stage to the assign-tool's role token. Used by
+    response strings that point Coach at the right
+    `coord_assign_<role>` follow-up (v0.3.11).
+    `audit_syntax`/`audit_semantics` collapse to `auditor` because
+    `coord_assign_auditor` takes the kind as a param, not in the
+    tool name."""
+    return {
+        "plan": "planner",
+        "execute": "task",
+        "audit_syntax": "auditor",
+        "audit_semantics": "auditor",
+        "ship": "shipper",
+    }.get(stage, "task")
+
+
 # Kanban-shaped task state machine (Docs/kanban-specs.md §2). Reject
 # transitions not listed here. The legacy enum values (open/claimed/
 # in_progress/blocked/done/cancelled) are accepted as input aliases
@@ -903,13 +919,40 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "owner": initial_owner,
             }
         )
-        return _ok(
+        head = (
             f"Created task {task_id}"
             + (f" (subtask of {parent_id})" if parent_id else " (top-level)")
             + f", priority={priority}, "
             + f"workflow={workflow}, "
             + f"trajectory=[{', '.join(s['stage'] for s in trajectory)}]"
         )
+        # v0.3.11 — surface what happens next so Coach doesn't double-
+        # fire coord_send_message and so they know completion will
+        # round-trip via task_completed.
+        if first_stage_to:
+            tail = (
+                f". The kanban auto-wakes the first-stage assignee "
+                f"({initial_status} → "
+                + (
+                    f"{first_stage_to[0]}"
+                    if len(first_stage_to) == 1
+                    else f"pool {first_stage_to}"
+                )
+                + f"). Do NOT follow up with coord_send_message; "
+                f"the wake includes the role context. You'll be "
+                f"re-notified at trajectory completion via a "
+                f"`task_completed` wake to summarize for the user."
+            )
+        else:
+            tail = (
+                f". WARNING: the first stage ({initial_status}) has "
+                f"no eligible owners. The idle poller won't pick "
+                f"this up automatically — assign someone via "
+                f"coord_assign_{_role_token_for_stage(initial_status)} "
+                f"(or rewrite the trajectory) or this task sits "
+                f"silently."
+            )
+        return _ok(head + tail)
 
     @tool(
         "coord_claim_task",
@@ -1540,7 +1583,20 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             except Exception:
                 pass
         suffix = f" — {note}" if note else ""
-        return _ok(f"updated {task_id}: {old_status} → {new_status}{suffix}")
+        head = f"Updated {task_id}: {old_status} → {new_status}{suffix}."
+        if new_status == "archive":
+            return _ok(
+                f"{head} Task is closed (manual). NO auto-summary "
+                f"fires — Coach forced the archive, you decide what "
+                f"to tell the user. If you want the user notified, "
+                f"call coord_send_message or coord_request_human "
+                f"yourself."
+            )
+        return _ok(
+            f"{head} The kanban auto-wakes the new-stage assignee "
+            f"if one is configured. Do NOT follow up with "
+            f"coord_send_message; the wake covers it."
+        )
 
     @tool(
         "coord_assign_task",
@@ -1860,9 +1916,22 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             pass
         if is_pool:
             return _ok(
-                f"posted {task_id} to executor pool: {', '.join(deduped)}"
+                f"Posted {task_id} to executor pool: "
+                f"{', '.join(deduped)}. The kanban auto-wakes all "
+                f"eligible Players with the task spec; first to call "
+                f"coord_claim_task wins. Do NOT follow up with "
+                f"coord_send_message — the wake already includes "
+                f"the role context."
             )
-        return _ok(f"assigned {task_id} → {deduped[0]}")
+        return _ok(
+            f"Assigned {task_id} → {deduped[0]} as executor "
+            f"(status now 'execute'). The kanban auto-wakes "
+            f"{deduped[0]} with the spec + completion-tool hint. "
+            f"Do NOT follow up with coord_send_message — the wake "
+            f"already includes everything they need. Watch for "
+            f"`task_completed` or `task_stage_stale` in your "
+            f"next-turn rollup."
+        )
 
     @tool(
         "coord_send_message",
@@ -2678,26 +2747,45 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 }
             )
 
-        # Build the response. When we auto-bound, tell the Player so
-        # they learn the right shape for next time.
-        msg = f"committed {sha}: {message}{push_note}"
+        # Build the response. v0.3.11 — every branch ends with a
+        # "what's next" line so the executor knows whether they're
+        # done or whether the commit didn't land on the kanban.
+        msg = f"Committed {sha}: {message}{push_note}."
+        if push_failed:
+            msg += (
+                f"\n\nPush FAILED — task NOT advanced. Fix the push "
+                f"(creds, branch, conflicts) and retry "
+                f"coord_commit_push. The executor role row is still "
+                f"active, so the kanban still expects you to deliver."
+            )
+            return _ok(msg)
         if auto_bound_task_id:
             msg += (
-                f"\n\nNOTE: you didn't pass task_id, so I auto-bound "
-                f"this commit to your active executor task "
-                f"{auto_bound_task_id!r} and the kanban will advance. "
-                f"Pass `task_id={auto_bound_task_id!r}` explicitly next "
+                f"\n\nAuto-bound to task {auto_bound_task_id!r} "
+                f"(you didn't pass task_id). Your executor role is "
+                f"now complete. The kanban auto-advances execute → "
+                f"the next stage in the trajectory; you're done with "
+                f"this task unless the audit fails (you'll be re-"
+                f"woken with the report). Pass "
+                f"`task_id={auto_bound_task_id!r}` explicitly next "
                 f"time so the binding is unambiguous."
             )
-        elif task_id_in is None and not push_failed:
+        elif task_id_in is None:
             msg += (
-                "\n\nNOTE: this commit was NOT bound to any kanban "
-                "task (no active executor task to auto-bind, and no "
-                "task_id passed). If this commit was supposed to "
-                "deliver a kanban task, the kanban will not advance — "
-                "ask Coach to use coord_advance_task_stage or call "
-                "coord_complete_execution(task_id=..., summary=...) "
-                "yourself. Coach has been notified."
+                "\n\nNOT bound to any kanban task (no active executor "
+                "task, no task_id passed). If this commit was "
+                "supposed to deliver a kanban task, the kanban will "
+                "not advance — Coach has been notified. If it's "
+                "scratch work, you can ignore."
+            )
+        else:
+            # task_id_in was set + push succeeded.
+            msg += (
+                f"\n\nLinked to task {task_id_in!r}. Your executor "
+                f"role is now complete. The kanban auto-advances "
+                f"execute → the next stage in the trajectory; you're "
+                f"done with this task unless the audit fails (you'll "
+                f"be re-woken with the report)."
             )
         return _ok(msg)
 
@@ -2832,9 +2920,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "completion_kind": completion_kind,
             "to": caller_id,
         })
+        artifact_suffix = (
+            f" → {artifact_path}" if artifact_path else ""
+        )
         return _ok(
-            f"completed execution for {task_id}"
-            + (f" → {artifact_path}" if artifact_path else "")
+            f"Completed execution for {task_id}{artifact_suffix}. "
+            f"Your executor role is now complete. The kanban auto-"
+            f"advances execute → the next stage in the trajectory. "
+            f"You're done with this task unless the audit fails "
+            f"(you'll be re-woken with the report)."
         )
 
     @tool(
@@ -4884,12 +4978,20 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     "on_behalf_of": effective_author if on_behalf else None,
                 }
             )
-        suffix = (
-            f" (on behalf of {effective_author})" if on_behalf else ""
-        )
+        if on_behalf:
+            return _ok(
+                f"Wrote spec for {task_id} ({len(body)} chars) → "
+                f"{rel} (on behalf of {effective_author}). "
+                f"{effective_author}'s planner role is now complete. "
+                f"The kanban auto-advances plan → the next stage in "
+                f"the trajectory and wakes the next-stage assignee."
+            )
         return _ok(
-            f"wrote spec for {task_id} ({len(body)} chars) → {rel}"
-            f"{suffix}"
+            f"Wrote spec for {task_id} ({len(body)} chars) → {rel}. "
+            f"Your planner role is now complete. The kanban auto-"
+            f"advances plan → the next stage in the trajectory and "
+            f"wakes the next-stage assignee. You're done with this "
+            f"task unless reassigned to another role."
         )
 
     # --------------------------------------------------------------
@@ -5080,13 +5182,41 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             except Exception:
                 pass
 
+        # v0.3.11 — every branch ends with imperative "what's next"
+        # so Coach doesn't read the response as a status report and
+        # double-fire coord_send_message.
         if is_pool:
-            verb = "called" if woken_now else "reserved"
-            return True, (
-                f"{verb} {task_id} {role} pool: {', '.join(targets)}"
-            ), targets
-        verb = "assigned" if woken_now else "reserved"
-        return True, f"{verb} {task_id} {role} → {targets[0]}", targets
+            if woken_now:
+                msg = (
+                    f"Called {task_id} {role} pool: "
+                    f"{', '.join(targets)}. All are auto-woken; "
+                    f"first to call coord_accept_role wins. Do NOT "
+                    f"follow up with coord_send_message; the wake "
+                    f"covers it."
+                )
+            else:
+                msg = (
+                    f"Reserved {task_id} {role} pool: "
+                    f"{', '.join(targets)}. The wake will fire when "
+                    f"the task reaches the {role} stage. You can "
+                    f"safely move on; nothing to do until then."
+                )
+            return True, msg, targets
+        if woken_now:
+            msg = (
+                f"Assigned {task_id} {role} → {targets[0]}. The "
+                f"kanban auto-wakes {targets[0]} with the task "
+                f"context + completion-tool hint. Do NOT follow up "
+                f"with coord_send_message; the wake covers it."
+            )
+        else:
+            msg = (
+                f"Reserved {task_id} {role} → {targets[0]}. The "
+                f"wake will fire when the task reaches the {role} "
+                f"stage (after upstream stages complete). You can "
+                f"safely move on; nothing to do until then."
+            )
+        return True, msg, targets
 
     async def _validate_role_targets(
         targets_raw: str, *, role_label: str
@@ -5642,13 +5772,37 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "on_behalf_of": effective_auditor if on_behalf else None,
             }
         )
-        suffix = (
+        on_behalf_suffix = (
             f" (submitted on behalf of {effective_auditor})"
             if on_behalf else ""
         )
+        head = (
+            f"Submitted {kind} audit (round {round_num}, {verdict}) "
+            f"for {task_id} → {rel}{on_behalf_suffix}."
+        )
+        if verdict == "pass":
+            who_done = (
+                f"{effective_auditor}'s reviewer role"
+                if on_behalf else "Your reviewer role"
+            )
+            return _ok(
+                f"{head} {who_done} is now complete. The kanban "
+                f"auto-advances to the next stage in the trajectory "
+                f"(semantic review, ship, or archive depending on "
+                f"what's configured). "
+                + (
+                    "You're done with this task unless reassigned."
+                    if not on_behalf else
+                    "The trajectory continues automatically."
+                )
+            )
+        # verdict == fail
         return _ok(
-            f"submitted {kind} audit (round {round_num}, {verdict}) "
-            f"for {task_id} → {rel}{suffix}"
+            f"{head} The kanban reverts the task to execute and "
+            f"re-wakes the executor with your report attached + the "
+            f"spec. Watch for `task_stage_changed` on this task. If "
+            f"the executor doesn't move within the stall threshold "
+            f"(~30 min), Coach will be nudged."
         )
 
     @tool(
@@ -5743,7 +5897,115 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "to": executor_owner,
             }
         )
-        return _ok(f"marked {task_id} shipped" + (f" — {note}" if note else ""))
+        note_suffix = f" — {note}" if note else ""
+        return _ok(
+            f"Marked {task_id} shipped{note_suffix}. Your shipper "
+            f"role is complete. The kanban auto-archives the task "
+            f"and wakes Coach with a 'summarize the outcome to the "
+            f"user' prompt. You're done."
+        )
+
+    def _next_action_for_plate(
+        *,
+        executor_task: dict[str, Any] | None,
+        pending_reviews: list[dict[str, Any]],
+        pending_plans: list[dict[str, Any]],
+        pending_ships: list[dict[str, Any]],
+        eligible: list[dict[str, Any]],
+    ) -> str | None:
+        """Pick the highest-priority actionable item and return the
+        imperative call line to surface in `coord_my_assignments`'
+        Next-action footer.
+
+        Priority order (matches kanban-flow expectations):
+          1. Active executor task — if the spec gate is open, write
+             code/artifacts then call coord_commit_push /
+             coord_complete_execution; if the spec gate is closed
+             (no spec on a `plan`-stage task), say so explicitly.
+          2. Pending reviewer assignment — call
+             coord_submit_audit_report.
+          3. Pending shipper assignment — call coord_mark_shipped.
+          4. Pending planner assignment — call coord_write_task_spec.
+          5. Eligible-pool task — call coord_accept_role to claim.
+
+        Returns None when nothing actionable exists (caller renders
+        a "your plate is empty" line).
+        """
+        if executor_task:
+            tid = executor_task["id"]
+            stage = executor_task.get("status") or ""
+            has_spec = executor_task.get("has_spec", False)
+            traj = executor_task.get("trajectory") or []
+            if stage == "plan" and "plan" in traj and not has_spec:
+                # Spec gate is closed — the planner hasn't written
+                # the spec yet. The Player can't do executor work
+                # until the spec lands. Surface the wait state.
+                return (
+                    f"  Wait — task {tid} has 'plan' in its trajectory "
+                    f"and no spec.md yet. The executor can't start "
+                    f"until the planner calls coord_write_task_spec. "
+                    f"If you ARE the planner, write the spec; "
+                    f"otherwise message Coach if the planner has "
+                    f"gone silent."
+                )
+            has_audit = any(
+                s in ("audit_syntax", "audit_semantics") for s in traj
+            )
+            self_audit = "" if has_audit else (
+                " This trajectory has no audit stage after execute, "
+                "so SELF-AUDIT first (run tests / sanity-check) "
+                "before calling the tool."
+            )
+            return (
+                f"  Do the executor work for task {tid}, then call "
+                f"coord_commit_push(task_id={tid!r}, message=...) "
+                f"for code or coord_complete_execution(task_id={tid!r}, "
+                f"summary=...) for non-code.{self_audit}"
+            )
+        if pending_reviews:
+            e = pending_reviews[0]
+            tid = e["task_id"]
+            kind = e.get("kind") or "syntax"
+            return (
+                f"  Read the spec + the executor's commit/artifact "
+                f"for task {tid}, then call "
+                f"coord_submit_audit_report(task_id={tid!r}, "
+                f"kind={kind!r}, body=<your review>, "
+                f"verdict='pass' or 'fail'). The kanban does NOT "
+                f"advance until you do."
+            )
+        if pending_ships:
+            e = pending_ships[0]
+            tid = e["task_id"]
+            return (
+                f"  Merge / publish / hand-off task {tid}, then "
+                f"call coord_mark_shipped(task_id={tid!r}, "
+                f"note=<optional>). The task auto-archives."
+            )
+        if pending_plans:
+            e = pending_plans[0]
+            tid = e["task_id"]
+            return (
+                f"  Draft the spec for task {tid}, then call "
+                f"coord_write_task_spec(task_id={tid!r}, "
+                f"body=<spec>). On success the task auto-advances "
+                f"plan -> the next stage in its trajectory. "
+                f"DO NOT just describe the task back to Coach — "
+                f"writing the spec IS the planner's role."
+            )
+        if eligible:
+            e = eligible[0]
+            tid = e["task_id"]
+            role = e.get("role") or ""
+            return (
+                f"  You are eligible for task {tid} (role={role}). "
+                f"If you can take it, call "
+                f"coord_accept_role(task_id={tid!r}, role={role!r}); "
+                f"first accepted claim wins. Do NOT do the role "
+                f"work without an accepted claim — the kanban will "
+                f"not credit it."
+            )
+        return None
 
     @tool(
         "coord_my_assignments",
@@ -5979,6 +6241,33 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 )
         else:
             lines.append("  (none)")
+
+        # v0.3.10 — explicit next-action footer. The buckets above
+        # are descriptive; without this footer Players read the
+        # response as a status report, see "Pending planner
+        # assignment" with the task id, conclude "okay, here's
+        # what's pending," and stop the turn (production trace
+        # 2026-05-06: planner sat on a task for hours after this
+        # exact pattern). The footer names the next imperative
+        # action with the task_id baked in, mirroring the kanban
+        # subscriber's stage-entry wake hint.
+        next_action = _next_action_for_plate(
+            executor_task=executor_task,
+            pending_reviews=pending_reviews,
+            pending_plans=pending_plans,
+            pending_ships=pending_ships,
+            eligible=eligible,
+        )
+        lines.append("")
+        lines.append("## Next action:")
+        if next_action:
+            lines.append(next_action)
+        else:
+            lines.append(
+                "  Your plate is empty. Wait for a task assignment, "
+                "or check the inbox for messages from Coach. The "
+                "idle poller will wake you when pool work appears."
+            )
 
         return _ok("\n".join(lines))
 
@@ -6367,9 +6656,24 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "owner": owner,
             }
         )
+        suffix_note = f" — {note}" if note else ""
+        head = (
+            f"Advanced {task_id}: {old_status} → {stage} (manual)"
+            f"{suffix_note}."
+        )
+        if stage == "archive":
+            return _ok(
+                f"{head} Task is closed. NO auto-summary fires for "
+                f"manual archives (you decided to kill it, so you "
+                f"decide what to tell the user). If you want the "
+                f"user notified, call coord_request_human or "
+                f"coord_send_message yourself."
+            )
         return _ok(
-            f"advanced {task_id}: {old_status} → {stage}"
-            + (f" — {note}" if note else "")
+            f"{head} The kanban auto-wakes the new-stage assignee. "
+            f"Note: this bypassed the normal role-completion gate, "
+            f"so the previous stage's role row stays open unless "
+            f"you intended to skip it entirely."
         )
 
     @tool(

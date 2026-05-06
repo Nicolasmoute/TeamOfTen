@@ -367,15 +367,13 @@ body {
   height: 22px;
   font-size: 14px;
 }
-/* The two layout presets share a wrapper so we can pull their gap
-   tighter without affecting siblings (pause-toggle, settings). On
-   the vertical rail the wrapper is a column with a near-zero gap,
-   which visually fuses the two icons into one cluster. */
+/* The two layout presets share a wrapper for the JSX conditional,
+   but visually they should sit in the same column rhythm as their
+   siblings (cancel-all, pause-toggle, settings). `display: contents`
+   makes the wrapper layout-transparent so both inner buttons inherit
+   the parent rail-actions group's 4px gap. */
 .rail-group.rail-actions .rail-layout-presets {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 1px;
+  display: contents;
 }
 .rail-group.rail-actions .gear.layout-preset {
   width: 24px;
