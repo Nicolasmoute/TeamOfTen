@@ -3211,6 +3211,14 @@ Errors and asks ignore the tiering and stay loud regardless: `.event.error`
 red, `.event.tool_result.error` red, plus AskUserQuestion / plan-mode
 / file-write-proposal / human_attention escalations.
 
+`human_attention` events specifically render as a full body card
+(`.event.human_attention`) — subject in the meta line plus the entire
+markdown-rendered body inline, urgency-colored left border (warn for
+`normal`, err for `blocker`). The body is not a sys row because it is
+the same text the Telegram bridge forwards to the user's phone, and
+needs to be readable in chat too instead of buried in the
+`coord_request_human` tool_use JSON.
+
 Routing logic for `message_sent` lives in [server/static/app.js](../server/static/app.js)'s
 event renderer — it adds `.human-thread` or `.peer-thread` based on
 `from`/`to` ids before the CSS tiering takes over. The `comm-tool`

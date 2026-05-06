@@ -10193,12 +10193,40 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
   const streamLen =
     (streaming?.text?.length || 0) + (streaming?.thinking?.length || 0);
   const isStreaming = streamLen > 0;
+  // Synchronous snap on event-count / stream changes.
   useEffect(() => {
     if (!bodyRef.current) return;
     if (isStreaming || stickToBottomRef.current) {
       bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
     }
   }, [allEvents.length, streamLen, isStreaming]);
+  // Async-render catch-up. Markdown/highlight.js/mermaid/images render
+  // after the React commit, so the body's scrollHeight grows *after*
+  // the scrollTop snap above ran. A ResizeObserver on the timeline
+  // re-snaps every time the content grows, as long as the user is
+  // still at-or-near the bottom (or actively streaming). Without
+  // this, long agent responses with code blocks consistently leave
+  // the viewport ~half a screen above the latest content.
+  useEffect(() => {
+    if (!bodyRef.current || typeof ResizeObserver === "undefined") return;
+    const el = bodyRef.current;
+    let lastHeight = el.scrollHeight;
+    const ro = new ResizeObserver(() => {
+      const h = el.scrollHeight;
+      if (h === lastHeight) return;
+      lastHeight = h;
+      if (isStreaming || stickToBottomRef.current) {
+        el.scrollTop = h;
+      }
+    });
+    ro.observe(el);
+    // Also observe the inner content wrapper if present — body itself
+    // is fixed-height (overflow: auto), so its own ResizeObserver
+    // entries fire on viewport resizes, not content growth. The first
+    // child is the events list wrapper.
+    if (el.firstElementChild) ro.observe(el.firstElementChild);
+    return () => ro.disconnect();
+  }, [isStreaming]);
 
   // Filter allEvents by searchQuery for body render. No-op when the
   // query is empty; otherwise a case-insensitive substring match
@@ -11724,8 +11752,25 @@ function EventItem({ event }) {
   }
 
   if (type === "human_attention") {
-    return html`<div class="event sys">
-      <div class="event-meta">${ts} · ⚠ human attention: ${event.subject || ""}</div>
+    // Prominent card (not a sys row): coord_request_human is also
+    // forwarded to Telegram, so the body the user got pinged with on
+    // their phone needs to be readable in chat too — not buried in
+    // the tool_use JSON above. Urgency drives the left-border color.
+    const urgency = event.urgency === "blocker" ? "blocker" : "normal";
+    const subj = event.subject || "";
+    const body = event.body || "";
+    const cls = "event human_attention urgency-" + urgency;
+    const who = event.agent_id || "?";
+    return html`<div class=${cls}>
+      <div class="event-meta">
+        ${ts}  <span class="ha-label">${urgency} attention</span>${who} → human${subj ? "  ·  " + subj : ""}
+      </div>
+      ${body
+        ? html`<div
+            class="event-body markdown"
+            dangerouslySetInnerHTML=${{ __html: renderMarkdown(body) }}
+          />`
+        : null}
     </div>`;
   }
 
