@@ -11098,6 +11098,23 @@ function RuntimeChip({ runtime, compact = false }) {
   />`;
 }
 
+// Map system wake_source values (server/agents.py:maybe_wake_agent) to
+// the short label rendered on the compact turn header. Anything not
+// listed here falls back to the generic "system wake" — but if you
+// add a new wake_source to the backend, add it here too so the UI
+// reads as something specific.
+const _SYSTEM_WAKE_LABELS = {
+  kanban_assignment: "kanban: task assignment",
+  kanban_pool: "kanban: pool call",
+  kanban_role: "kanban: stage entry",
+  kanban_audit_fail: "kanban: audit failed — re-do",
+  kanban_stand_down: "kanban: role stand-down",
+  kanban_completion: "kanban: task completed",
+  kanban_stall: "kanban: stall escalation",
+  kanban_idle_poller: "kanban: idle nudge",
+  system_recovery: "system: auto-retry",
+};
+
 function TurnHeader({ event, ts }) {
   const [open, setOpen] = useState(false);
   const prompt = event.prompt || "";
@@ -11123,6 +11140,30 @@ function TurnHeader({ event, ts }) {
         title=${open ? "collapse" : "show compact instruction"}
       >
         <span class="turn-header-arrow" title="compact turn">⤵</span>
+        <span class="turn-header-ts">${ts}</span>
+        <${RuntimeChip} runtime=${event.runtime} />
+        <span class="turn-header-compact-badge">${label}</span>
+        <span class="turn-header-chev">${open ? "▾" : "▸"}</span>
+      </div>
+      ${open && prompt
+        ? html`<div class="turn-header-full">${prompt}</div>`
+        : null}
+    </div>`;
+  }
+  // System-triggered wakes (kanban role calls, completion summaries,
+  // stall ladder, recovery retries) carry a `wake_source` tag. Render
+  // them in compact form so the multi-paragraph instructional body
+  // stops cluttering the human-facing conversation; click to expand
+  // still reveals the full prompt for debug.
+  if (event.wake_source) {
+    const label = _SYSTEM_WAKE_LABELS[event.wake_source] || "system wake";
+    return html`<div class=${"event agent_started turn-header compact system-wake" + (open ? " open" : "")}>
+      <div
+        class="turn-header-row"
+        onClick=${() => setOpen((v) => !v)}
+        title=${open ? "collapse" : "show wake prompt"}
+      >
+        <span class="turn-header-arrow" title="system wake">⚙</span>
         <span class="turn-header-ts">${ts}</span>
         <${RuntimeChip} runtime=${event.runtime} />
         <span class="turn-header-compact-badge">${label}</span>

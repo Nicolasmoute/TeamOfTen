@@ -5196,7 +5196,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 for slot in targets:
                     try:
                         await maybe_wake_agent(
-                            slot, wake_prompt_for_role, bypass_debounce=True
+                            slot, wake_prompt_for_role,
+                            bypass_debounce=True,
+                            wake_source="kanban_role",
                         )
                     except Exception:
                         pass

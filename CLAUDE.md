@@ -1919,6 +1919,65 @@ for git, and Coach's improvisation). Collapsed to one.
 
 Suite at 1281/1281.
 
+**Recent (2026-05-06, follow-up) — Memory salvage on stale-session auto-heal:**
+
+Coach lost its conversational continuity after a cascade of
+`CLIConnectionError: Working directory does not exist:
+/data/projects/dynamichypergraph/repo/coach` errors. The dir was
+missing because `workspace_dir`'s self-heal mkdir failed silently
+(the sandboxed cwd was on a path that hadn't been provisioned yet).
+After a few retries the SDK eventually surfaced a `ProcessError` on
+resume, which tripped the existing stale-session auto-heal in
+[server/runtimes/claude.py](server/runtimes/claude.py): clear
+`session_id`, retry once with no `resume`. The retry started a
+fresh Claude session with no memory of prior turns — Coach's
+"I have minimal context for retry" message.
+
+Two changes close the gap:
+
+- **Pre-flight in `run_agent`** ([server/agents.py](server/agents.py))
+  — after `workspace_dir(agent_id)` returns a path, check `exists()`.
+  If not present, emit `error{reason="workspace_missing"}` plus a
+  `human_attention` and return BEFORE flipping status to working or
+  emitting `agent_started`. The runtime is never invoked, so the
+  cascade that historically escalated to ProcessError → auto-heal is
+  cut at the root. The error message points the operator at
+  `POST /api/projects/<id>/repo/provision`.
+- **Synthetic `continuity_note` in the auto-heal path** ([server/runtimes/claude.py](server/runtimes/claude.py))
+  — before nuking `session_id`, read `agent_sessions.last_exchange_json`
+  (the rolling per-turn log already populated on every successful
+  non-compact turn). If non-empty, write a synthetic continuity_note
+  ("Your prior session was reset by the harness because resume
+  failed (ProcessError on resume — typically a stale CLI session).
+  The verbatim exchanges below are your only memory of the prior
+  conversation; pick up from there.") and recompose the system
+  prompt with the handoff suffix appended for the immediate retry.
+  `turn_ctx["had_handoff_on_entry"] = True` so the post-result
+  handler clears the synthetic note on first non-error turn (same
+  lifecycle as a normal `/compact`-written note). The retry now
+  runs WITH memory of recent turns instead of starting blind. New
+  bus event `session_auto_recovered{salvaged_exchanges: int}` lands
+  in the timeline so the operator can see the boundary.
+
+The mechanism reuses existing machinery: `last_exchange_json` was
+already populated; `_compose_handoff_suffix` extracted from
+`run_agent`'s inline post-compact path so both call sites share one
+implementation; the system-prompt re-materialization swaps the temp
+file (file-backed prompts since the 2026-05-05 argv-limit fix). No
+new SDK calls, no LLM round-trip — the salvage is pure data
+plumbing.
+
+Tests: [server/tests/test_session_auto_recover.py](server/tests/test_session_auto_recover.py)
+covers `_compose_handoff_suffix` (returns "" without note,
+includes recent exchanges verbatim, drops malformed entries,
+singular vs plural), the workspace pre-flight (`run_agent` emits
+the error + human_attention + skips runtime when the cwd is
+missing; happy path proceeds normally), and the integration
+invariant (synthetic continuity_note + intact `last_exchange_json`
+produces a fully-rendered handoff suffix).
+
+Suite at 1297/1297.
+
 ## What needs verification (when user is next active)
 
 Verified as of 2026-04-24: HARNESS_TOKEN auth gate, fine-grained

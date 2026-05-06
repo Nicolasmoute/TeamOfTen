@@ -5168,6 +5168,7 @@ async def _schedule_post_error_retry(agent_id: str) -> None:
                 "coord_request_human to escalate. Otherwise, carry on "
                 "where you left off.",
                 bypass_debounce=True,
+                wake_source="system_recovery",
             )
         except Exception:
             logger.exception("delayed retry failed for %s", agent_id)

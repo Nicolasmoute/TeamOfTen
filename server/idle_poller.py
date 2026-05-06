@@ -492,7 +492,9 @@ async def _fire_rung_1(
                 task_id=task["id"], stage=stage, age_min=age_min,
             )
             await maybe_wake_agent(
-                stall_owner, nudge, bypass_debounce=False,
+                stall_owner, nudge,
+                bypass_debounce=False,
+                wake_source="kanban_stall",
             )
         except Exception:
             pass
@@ -539,7 +541,11 @@ async def _fire_rung_2(
         # (recently woke for unrelated traffic). Rung 2 IS the
         # escalation point — silently dropping it because Coach was
         # busy 60s ago defeats the whole rung.
-        await maybe_wake_agent("coach", body, bypass_debounce=True)
+        await maybe_wake_agent(
+            "coach", body,
+            bypass_debounce=True,
+            wake_source="kanban_stall",
+        )
     except Exception:
         pass
 
@@ -1006,7 +1012,9 @@ async def _maybe_wake_idle(slot: str) -> bool:
             "treat the response as a status report."
         )
         did_wake = await maybe_wake_agent(
-            slot, wake_text, bypass_debounce=False
+            slot, wake_text,
+            bypass_debounce=False,
+            wake_source="kanban_idle_poller",
         )
     except Exception:
         logger.exception("idle_poller: maybe_wake_agent failed for %s", slot)
