@@ -1,4 +1,4 @@
-"""Per-project Compass directory resolver.
+﻿"""Per-project Compass directory resolver.
 
 Two paths matter:
   - **Local** under `<project>/working/compass/` — same lane as
@@ -66,7 +66,7 @@ class CompassPaths:
     # the structured `audits.jsonl` index. The .md is the human-
     # readable surface (Files pane, kDrive on phone, attachable to
     # Coach decisions); the jsonl drives the dashboard. See
-    # Docs/kanban-specs.md §5.3.
+    # Docs/kanban-specs-v2.md §5.3.
     audit_reports_dir: Path
 
     def audit_report_for(self, audit_id: str) -> Path:

@@ -1,6 +1,6 @@
-"""Task lifecycle helpers — spec.md + audit-report .md writers.
+﻿"""Task lifecycle helpers — spec.md + audit-report .md writers.
 
-The kanban lifecycle (Docs/kanban-specs.md) produces durable markdown
+The kanban lifecycle (Docs/kanban-specs-v2.md) produces durable markdown
 artifacts under each task's folder:
 
     /data/projects/<project_id>/working/tasks/<task_id>/

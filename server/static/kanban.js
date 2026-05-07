@@ -998,8 +998,25 @@ export function KanbanPane({
     await refresh();
   };
 
+  // v2 §7.1: stage transitions and role assignment are one atomic
+  // action via `coord_approve_stage` (HTTP: POST /approve_stage).
+  // Role→stage mapping is fixed: planner→plan, executor→execute,
+  // auditor_syntax→audit_syntax, auditor_semantics→audit_semantics,
+  // shipper→ship.
+  const ROLE_TO_STAGE = {
+    planner: "plan",
+    executor: "execute",
+    auditor_syntax: "audit_syntax",
+    auditor_semantics: "audit_semantics",
+    shipper: "ship",
+  };
   const onAssign = async (task, role, to) => {
-    await apiPost(authedFetch, `/${encodeURIComponent(task.id)}/assign`, { role, to });
+    const next_stage = ROLE_TO_STAGE[role] || role;
+    await apiPost(
+      authedFetch,
+      `/${encodeURIComponent(task.id)}/approve_stage`,
+      { next_stage, assignee: to, note: "approved via UI" },
+    );
     setHistoryByTask((prev) => {
       const next = { ...prev };
       delete next[task.id];

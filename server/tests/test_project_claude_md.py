@@ -155,17 +155,23 @@ def test_canonical_template_default_repo_placeholder() -> None:
 
 
 def test_canonical_template_includes_kanban_lifecycle_section() -> None:
-    """After folding the kanban paragraph into the canonical template,
-    every freshly-rendered body should carry the kanban surface so
-    Coach + Players see the lifecycle every turn."""
+    """v2 §17 — every freshly-rendered body should carry the v2
+    lifecycle paragraph so Coach + Players see the explicit-review
+    model every turn."""
     body = canonical_project_claude_md_template(name="Misc", slug="misc")
     assert "Task lifecycle (kanban)" in body
-    assert "plan -> execute -> audit_syntax" in body
-    # Strict role boundaries section.
-    assert "Coach** plans" in body
-    assert "Players** execute, review, and ship" in body
-    # Self-audit fallback when no audit stage in trajectory.
-    assert "Self-audit when the trajectory has no audit stage" in body
+    # v2 stage order in the template's prose (wrap-tolerant).
+    flat = " ".join(body.split())
+    assert "plan → execute → audit_syntax" in flat
+    # v2 explicit-review-gate model + new tools.
+    assert "coord_approve_stage" in body
+    assert "coord_archive_task" in body
+    assert "message_to_coach" in body
+    # The for-Players / for-Coach block headings.
+    assert "**For Players:**" in body
+    assert "**For Coach:**" in body
+    # Pools-are-FYI-only language (the load-bearing v2 distinction).
+    assert "pools are FYI only" in body
 
 
 def test_canonical_template_missing_falls_back(

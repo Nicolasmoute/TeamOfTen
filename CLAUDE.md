@@ -158,8 +158,12 @@ deployed Zeabur instance — see "What needs verification" below.
    on boot via `crash_recover()`.
 - **Sticky turn headers** ✓ each `agent_started` is a `position:
    sticky` one-line bar in the pane body.
-- **Token streaming** ✓ opt-in via `HARNESS_STREAM_TOKENS=true`
-   (off by default — some CLI builds crash on the underlying flag).
+- **Token streaming** ✓ on by default; agent answers render
+   character-by-character as the SDK emits `text_delta` /
+   `thinking_delta` events. Disable via
+   `HARNESS_STREAM_TOKENS=false` if your CLI build is one of the
+   rare ones that crashes on the underlying
+   `include_partial_messages` flag.
 - **Compact system renderers** ✓ 15+ event types rendered as
    single-line `.sys` rows instead of JSON blobs.
 - **Input mode chips + slash commands** ✓ `/plan /model /effort
@@ -681,7 +685,7 @@ and [server/telegram_escalation.py](server/telegram_escalation.py).
 The kanban lifecycle paragraph now lives inside the canonical project
 CLAUDE.md template at [server/templates/app_dev_claude_md.md](server/templates/app_dev_claude_md.md)
 — see the 2026-05-04 "Canonical project CLAUDE.md template + Coach-driven
-reconciliation" entry. Full subsystem detail lives in [Docs/kanban-specs.md](Docs/kanban-specs.md).
+reconciliation" entry. Full subsystem detail lives in [Docs/kanban-specs-v1-archived.md](Docs/kanban-specs-v1-archived.md) (this Recent entry describes v1 behavior; the canonical spec is now [Docs/kanban-specs-v2.md](Docs/kanban-specs-v2.md)).
 
 **Recent (2026-05-04) — Compass refocused as a compass of intent:**
 
@@ -793,7 +797,7 @@ pipeline). New `.kanban-flow-health` footer polls
 `/api/tasks/flow_health` every 30s + on subscriber events; turns red
 when subscriber is down or stalled count > 0.
 
-Spec mirror: [Docs/kanban-specs.md](Docs/kanban-specs.md) bumped to
+Spec mirror: [Docs/kanban-specs-v1-archived.md](Docs/kanban-specs-v1-archived.md) bumped to
 v0.3 (new §3 Trajectory, §17 Coach quality feedback, §18 Flow
 continuity & observability). Suite at 1064/1064.
 
@@ -2039,7 +2043,7 @@ Two related fixes shipped together:
   inputs) and the HTTP path (round-trip, secret round-trip,
   raw-token rejection + override, `${VAR}` acceptance, invalid
   JSON, non-dict, unknown-server 404, mixed-field PATCH,
-  empty-PATCH 400). Suite at 1316/1316.
+  empty-PATCH 400).
 
 **Recent (2026-05-06, follow-up) — Soft-stall watchdog (Haiku-tiered):**
 
@@ -2099,8 +2103,59 @@ bundled Haiku 4.5 call per tick instead.
   fire. Most ticks fire zero candidates — steady-state cost is cents
   per day.
 
-Spec mirror: [Docs/kanban-specs.md](Docs/kanban-specs.md) §10.7.
+Spec mirror: [Docs/kanban-specs-v1-archived.md](Docs/kanban-specs-v1-archived.md) §10.7.
 Tests: [server/tests/test_kanban_watchdog.py](server/tests/test_kanban_watchdog.py).
+
+**Recent (2026-05-07) — Kanban v2 (shape-(2) routing) supersedes v1:**
+
+A radical redesign of the kanban subsystem started today. v1's
+auto-routing model (subscriber auto-advances on commit/audit/spec,
+auto-wakes the next assignee, FAILs auto-revert) produced four
+production failure modes during the 2026-05-06/07 session: stale
+wakes (Player wakes on a since-reassigned task), silent audit reverts
+(executor loops with auditor without Coach noticing), missed
+deviations (scope drift only surfaces at audit time), and stuck pools
+(first-claim-wins picks the wrong Player). **Shape (2)** reshapes the
+system so every team event flows through Coach: the kanban records
+and surfaces, but does not route. Coach explicitly authorizes each
+stage transition via the new `coord_approve_stage` tool. Pools become
+advisory; Coach picks one named Player per stage. Audit FAIL no
+longer auto-reverts — surfaces to Coach via a new per-project event
+log. Compass `aligned` verdicts also surface (so Coach sees WHY the
+lattice signed off). Pattern-detection counters (Player health,
+audit aggregator, push-time deviation flag, recent-patterns block)
+surface drift proactively rather than after manual observation.
+
+The canonical spec is now [Docs/kanban-specs-v2.md](Docs/kanban-specs-v2.md).
+v1 is archived at [Docs/kanban-specs-v1-archived.md](Docs/kanban-specs-v1-archived.md)
+for historical reference; **v1 is no longer authoritative**. The
+2026-05-03/04/05 entries above point at the archive — those describe
+v1 behavior at the time the entries were written, not current
+direction.
+
+**Cutover model: clean, not gradual.** v2 is being finalized as a
+complete spec FIRST. Code is then updated to reflect v2 in one pass.
+The current container still runs v1 behavior until the implementation
+PR ships — v2 describes the target, not the deployed system. This
+PR is docs-only: rename `kanban-specs.md` → `kanban-specs-v1-archived.md`
+with a deprecation banner, create `kanban-specs-v2.md`, repoint
+forward-pointer cross-references in TOT-specs / recurrence-specs /
+compass-specs to v2. No `server/` changes, no test changes.
+
+The implementation PR (subsequent, after v2 is finalized through
+review with Coach + the user) will update `server/kanban.py`,
+`server/tools.py`, `server/idle_poller.py`, the MCP tool registry
+(add `coord_approve_stage` / `coord_archive_task` /
+`coord_assign_executor` / `coord_request_plan_review`; remove
+`coord_claim_task` / `coord_accept_role` / `coord_advance_task_stage`),
+the schema (new `project_events` and `player_health_counters`
+tables, new `tasks.auto_advance` column), the UI (event log surface,
+Player health section, audit aggregator card), the project CLAUDE.md
+template (rewritten kanban paragraph), and the Compass audit watcher
+(R7 wiring — every verdict to event log, including `aligned`).
+Validation criteria: ≥80% deviations noticed at push-time vs
+audit-time, ≥50% reduction in Coach context-reconstruction turns,
+flat or decreased human pings on routine items.
 
 ## What needs verification (when user is next active)
 

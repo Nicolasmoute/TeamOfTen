@@ -159,10 +159,11 @@ class ClaudeRuntime:
                 ],
             },
         )
-        # Partial-message streaming — opt-in env. Some CLI builds crash
-        # exit=1 on the underlying flag; flip HARNESS_STREAM_TOKENS=true
-        # only after verifying your CLI handles it.
-        if os.environ.get("HARNESS_STREAM_TOKENS", "").lower() in ("1", "true", "yes"):
+        # Partial-message streaming — on by default. Set
+        # HARNESS_STREAM_TOKENS=false (or 0/no/off) to disable if your
+        # CLI build is one of the rare ones that crashes exit=1 on the
+        # underlying flag.
+        if os.environ.get("HARNESS_STREAM_TOKENS", "true").lower() not in ("0", "false", "no", "off"):
             options_kwargs["include_partial_messages"] = True
 
         # Env scrub — overwrite sensitive harness env vars to empty

@@ -1,50 +1,42 @@
-"""Kanban auto-advance subscriber (Docs/kanban-specs.md §9).
+﻿"""Kanban v2 record-only subscriber (Docs/kanban-specs-v2.md §9).
 
-A small bus subscriber wired in `main.py:lifespan` next to the
-audit-watcher / telegram bridge. Watches the event bus for the
-events that should drive a stage transition and applies the
-transition atomically + emits `task_stage_changed`. The MCP tools
-never call into this module directly — Coach + Players just emit
-events through their normal tool flow, and this subscriber does
-the bookkeeping.
+In v1 this module auto-advanced stages on commit/audit/spec events
+and auto-reverted on audit FAIL. v2 inverts that: every transition
+is an explicit Coach call to `coord_approve_stage` (or
+`coord_archive_task`). The subscriber's job is now narrower:
 
-Triggers (mirroring §9 of the spec):
+  1. Mirror every v2-mappable bus event into `project_events` via
+     `server.project_events.maybe_write_from_bus(ev)`. This is the
+     unified context surface Coach reads on its tick (§9).
 
-  1. `commit_pushed` with `task_id` → executor's commit signals
-     end-of-execute. The next stage is read from the task's
-     trajectory column via `_next_stage(stages, "execute")` —
-     archives directly when the trajectory has no stage after
-     execute.
+  2. Maintain in-process correlation caches the rest of the harness
+     reads at runtime — specifically the most-recent commit-per-
+     project map used by the Compass audit watcher to attach a
+     verdict to the right task.
 
-  2. `audit_report_submitted{kind=syntax, verdict=pass}` →
-     audit_syntax → audit_semantics.
+  3. On `audit_report_submitted{verdict='fail'}`, emit the
+     Coach-bound `audit_fail_notification` and insert a
+     `deviations_log{noticed_at='audit'}` row so Coach sees the
+     fail on the next tick (§22.1) — but the task does NOT
+     auto-revert. Coach reads the report, decides, and calls
+     `coord_approve_stage(next_stage='execute', assignee=<slot>,
+     note=<composed prompt>)` if rework is the right call.
 
-  3. `audit_report_submitted{kind=syntax, verdict=fail}` →
-     audit_syntax → execute. The executor is auto-woken with the
-     spec + the latest audit report attached.
+  4. `compass_audit_logged` writes the `compass_audit_report_path`
+     + `compass_audit_verdict` columns on the correlated task.
 
-  4. `audit_report_submitted{kind=semantics, verdict=pass}` →
-     audit_semantics → ship.
+The subscriber NEVER transitions stages, NEVER calls
+`maybe_wake_agent`, NEVER inserts task_role_assignments rows.
+Those are MCP-tool concerns now (`coord_approve_stage`,
+`coord_archive_task`, `coord_role_complete`).
 
-  5. `audit_report_submitted{kind=semantics, verdict=fail}` →
-     audit_semantics → execute.
-
-  6. `task_shipped` (shipper called coord_mark_shipped) →
-     ship → archive.
-
-  7. `compass_audit_logged` is informational. The subscriber writes
-     the `compass_audit_report_path` + `compass_audit_verdict`
-     columns onto the task whose latest commit was being audited
-     (correlated by `commit_pushed` → audit chain), but does NOT
-     change the task's stage. The Player auditor is the gate.
-
-Failure isolation: per-event `try/except` so a single bad event
+Failure isolation: per-event try/except so a single bad event
 doesn't kill the subscriber. Feature flag
 `HARNESS_KANBAN_AUTO_ADVANCE` (default true) can disable the whole
-subscriber on cost-constrained deploys — events still emit, the
-subscriber just doesn't react. Lifecycle owned by the module
-(`start_kanban_subscriber` / `stop_kanban_subscriber` / `is_running`)
-mirrors the audit-watcher pattern.
+subscriber on cost-constrained deploys — Phase-1 mirroring still
+runs (it's the bus subscription itself). Lifecycle owned by the
+module (`start_kanban_subscriber` / `stop_kanban_subscriber` /
+`is_running`) mirrors the audit-watcher pattern.
 """
 
 from __future__ import annotations
@@ -68,13 +60,13 @@ if not logger.handlers:
 
 
 WATCHED_EVENT_TYPES: frozenset[str] = frozenset({
+    # v2 cares about commit_pushed (commit cache + warning), audit
+    # results (fail notification + deviations_log), and Compass
+    # verdicts (correlation columns). Everything else just gets
+    # mirrored to project_events via maybe_write_from_bus.
     "commit_pushed",
-    "task_execution_completed",
     "audit_report_submitted",
-    "task_shipped",
     "compass_audit_logged",
-    "task_stage_changed",
-    "task_spec_written",
 })
 
 
@@ -202,32 +194,36 @@ async def _run(queue: asyncio.Queue[dict[str, Any]]) -> None:
 
 async def _handle_event(ev: dict[str, Any]) -> None:
     etype = ev.get("type") or ""
+    # Phase 1 (kanban v2): every bus event also gets mirrored to the
+    # per-project event log when its type is v2-mappable. Independent
+    # of the v1 dispatch below — this just records, it doesn't drive
+    # transitions. Failure-isolated inside the helper, so a DB hiccup
+    # never breaks the v1 dispatch.
+    try:
+        from server.project_events import maybe_write_from_bus
+        await maybe_write_from_bus(ev)
+    except Exception:
+        logger.exception(
+            "kanban: project_events mirror failed on event %r", etype
+        )
     if etype not in WATCHED_EVENT_TYPES:
         return
     if etype == "commit_pushed":
         await _on_commit_pushed(ev)
-    elif etype == "task_execution_completed":
-        await _on_task_execution_completed(ev)
     elif etype == "audit_report_submitted":
         await _on_audit_submitted(ev)
-    elif etype == "task_shipped":
-        await _on_task_shipped(ev)
     elif etype == "compass_audit_logged":
         await _on_compass_audit_logged(ev)
-    elif etype == "task_stage_changed":
-        await _on_stage_changed(ev)
-    elif etype == "task_spec_written":
-        await _on_spec_written(ev)
 
 
 # ---------------------------------------------------------------- handlers
 
 
 async def _on_commit_pushed(ev: dict[str, Any]) -> None:
-    """Auto-route after code execution completes.
-
-    The current workflow route can skip formal review, skip semantic
-    review, or archive simple self-audit tasks directly.
+    """v2 record-only handler. Updates the in-process commit cache so
+    the Compass audit watcher can correlate a verdict to the right
+    task. NEVER advances the stage — Coach calls coord_approve_stage
+    after reading the commit in the event log.
     """
     task_id = (ev.get("task_id") or "").strip()
     sha = (ev.get("sha") or "").strip()
@@ -242,68 +238,30 @@ async def _on_commit_pushed(ev: dict[str, Any]) -> None:
         # correlation heuristic (audit-2026-05-04 item 12).
         if project_id:
             _recent_commit_per_project[project_id] = (sha, task_id)
-    await _advance_after_execute_completion(task_id, reason="commit_pushed")
-
-
-async def _on_task_execution_completed(ev: dict[str, Any]) -> None:
-    """Auto-route after non-git execution completion."""
-    task_id = (ev.get("task_id") or "").strip()
-    if not task_id:
-        return
-    await _advance_after_execute_completion(
-        task_id, reason="task_execution_completed"
-    )
-
-
-async def _advance_after_execute_completion(
-    task_id: str, *, reason: str
-) -> None:
-    c = await configured_conn()
-    try:
-        cur = await c.execute(
-            "SELECT status, trajectory, owner, project_id "
-            "FROM tasks WHERE id = ?",
-            (task_id,),
-        )
-        row = await cur.fetchone()
-    finally:
-        await c.close()
-    if not row:
-        return
-    t = dict(row)
-    if t["status"] != "execute":
-        return
-    stages = _trajectory_stages(t)
-    next_stage = _next_stage(stages, "execute")
-    await _transition(
-        task_id=task_id,
-        new_status=next_stage,
-        reason=reason,
-        owner=t["owner"],
-        project_id=t["project_id"],
-    )
 
 
 async def _on_audit_submitted(ev: dict[str, Any]) -> None:
-    """Pass → next stage; fail → revert to execute. Auto-wake the
-    next assignee or executor.
+    """v2 record-only handler. On verdict='fail' emits the Coach-bound
+    `audit_fail_notification` (kind_round + escalate flag computed from
+    fail history) and inserts a `deviations_log{noticed_at='audit'}`
+    row so Coach sees the FAIL on the next tick and the §22.1
+    instrumentation has the data point. NEVER reverts the stage.
 
-    On every fail also publishes an `audit_fail_notification` event
-    routed to Coach. Coach treats the first fail of any kind as
-    expected correction noise; the `escalate=True` flag fires on the
-    second fail of the same kind, signalling Coach to consider an
-    effort/model bump on the executor (see kanban-specs.md §17)."""
+    Pass-verdict events get NO subscriber action — the project_events
+    mirror in maybe_write_from_bus already records them. Coach reads
+    the row and calls `coord_approve_stage` to advance.
+    """
     task_id = (ev.get("task_id") or "").strip()
     kind = (ev.get("kind") or "").strip().lower()
     verdict = (ev.get("verdict") or "").strip().lower()
-    if not task_id or kind not in ("syntax", "semantics") or verdict not in ("pass", "fail"):
+    if not task_id or kind not in ("syntax", "semantics") or verdict != "fail":
         return
 
+    # Read the executor + project for the notification + deviations row.
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT status, owner, project_id, trajectory "
-            "FROM tasks WHERE id = ?",
+            "SELECT owner, project_id FROM tasks WHERE id = ?",
             (task_id,),
         )
         row = await cur.fetchone()
@@ -312,250 +270,55 @@ async def _on_audit_submitted(ev: dict[str, Any]) -> None:
     if not row:
         return
     t = dict(row)
+    executor = t.get("owner")
+    project_id = t.get("project_id") or ""
 
-    expected_stage = f"audit_{kind}"
-    if t["status"] != expected_stage:
-        # The task moved to a different stage (force-advance, cancel,
-        # etc.) since the audit was assigned — drop the transition.
-        return
-    stages = _trajectory_stages(t)
-
-    if verdict == "pass":
-        new_status = _next_stage(stages, expected_stage)
-        await _transition(
-            task_id=task_id,
-            new_status=new_status,
-            reason="audit_pass",
-            owner=t["owner"],
-            project_id=t["project_id"],
-        )
-    else:
-        # Fail → revert to execute. Reset started_at so the card
-        # flips to "assigned, not started" again until the executor's
-        # auto-wake actually fires.
-        await _transition(
-            task_id=task_id,
-            new_status="execute",
-            reason="audit_fail",
-            owner=t["owner"],
-            project_id=t["project_id"],
-            reset_started_at=True,
-        )
-        # Count prior fails of the same kind to compute kind_round +
-        # escalate flag for the Coach-bound notification.
-        kind_round, escalate = await _count_fails_for_kind(
-            task_id=task_id, kind=kind,
-        )
-        await _emit_audit_fail_notification(
-            task_id=task_id,
-            kind=kind,
-            kind_round=kind_round,
-            escalate=escalate,
-            auditor_id=ev.get("auditor_id"),
-            executor_id=t["owner"],
-            report_path=ev.get("report_path") or "",
-        )
-        # Re-wake the executor with the spec + latest report.
-        await _wake_executor_for_revert(
-            task_id=task_id, owner=t["owner"], kind=kind,
-            report_path=(ev.get("report_path") or ""),
-            round_num=int(ev.get("round") or 1),
-        )
-
-
-async def _on_task_shipped(ev: dict[str, Any]) -> None:
-    """ship → archive."""
-    task_id = (ev.get("task_id") or "").strip()
-    if not task_id:
-        return
-    c = await configured_conn()
-    try:
-        cur = await c.execute(
-            "SELECT status, owner, project_id FROM tasks WHERE id = ?",
-            (task_id,),
-        )
-        row = await cur.fetchone()
-    finally:
-        await c.close()
-    if not row:
-        return
-    t = dict(row)
-    if t["status"] != "ship":
-        return
-    await _transition(
+    # Coach-bound notification — same payload shape as v1; Coach reads
+    # this in the project_events log on the next tick.
+    kind_round, escalate = await _count_fails_for_kind(
+        task_id=task_id, kind=kind,
+    )
+    await _emit_audit_fail_notification(
         task_id=task_id,
-        new_status="archive",
-        reason="shipped",
-        owner=t["owner"],
-        project_id=t["project_id"],
+        kind=kind,
+        kind_round=kind_round,
+        escalate=escalate,
+        auditor_id=ev.get("auditor_id"),
+        executor_id=executor,
+        report_path=ev.get("report_path") or "",
     )
 
-
-async def _on_spec_written(ev: dict[str, Any]) -> None:
-    """`coord_write_task_spec` (or human-side spec write) wrote the
-    spec.md, completing the planner role. If the task is in `plan` and
-    the trajectory has a stage after `plan`, advance to it.
-
-    Spec gate (kanban-specs.md §3.5): the planner-completion → next-stage
-    transition only fires when the next stage exists in the trajectory.
-    The wake of the next-stage assignee is handled by the
-    `task_stage_changed` listener (`_on_stage_changed` →
-    `_wake_role_or_emit_needed`).
-
-    Coach-review pause (kanban-specs.md §3.5.1): when the plan entry
-    has `coach_review: true`, the auto-advance is withheld. Coach gets
-    a `spec_review_needed` event + a system-tagged wake with the spec
-    path; they review, then advance manually via
-    `coord_advance_task_stage(stage='execute', assignee=...)`. Without
-    the flag, behavior is unchanged."""
-    task_id = (ev.get("task_id") or "").strip()
-    if not task_id:
-        return
-    c = await configured_conn()
-    try:
-        cur = await c.execute(
-            "SELECT status, trajectory, owner, project_id, title, "
-            "spec_path FROM tasks WHERE id = ?",
-            (task_id,),
-        )
-        row = await cur.fetchone()
-    finally:
-        await c.close()
-    if not row:
-        return
-    t = dict(row)
-    if t["status"] != "plan":
-        # Spec was rewritten on a downstream stage (e.g. mid-execute);
-        # nothing to advance.
-        return
-    stages = _trajectory_stages(t)
-    if "plan" not in stages:
-        return
-    next_stage = _next_stage(stages, "plan")
-    # Defensive: validator guarantees execute follows plan in canonical
-    # order, but skip plan→archive jumps from corrupted trajectories.
-    if next_stage == "archive":
-        return
-
-    # Coach-review pause: when the plan entry's `coach_review` flag is
-    # true, withhold the auto-advance + ask Coach to review.
-    if _plan_entry_wants_coach_review(t):
-        await _emit_spec_review_needed(
-            task_id=task_id,
-            title=t.get("title") or "",
-            spec_path=t.get("spec_path") or "",
-            project_id=t.get("project_id") or "",
-            next_stage=next_stage,
-        )
-        return
-
-    await _transition(
-        task_id=task_id,
-        new_status=next_stage,
-        reason="spec_written",
-        owner=t["owner"],
-        project_id=t["project_id"],
-    )
-
-
-def _plan_entry_wants_coach_review(task: dict[str, Any]) -> bool:
-    """True when the `plan` entry on the stored trajectory carries the
-    `coach_review: true` flag. Defensive against malformed JSON."""
-    raw = task.get("trajectory")
-    if not raw:
-        return False
-    try:
-        parsed = json.loads(raw)
-    except Exception:
-        return False
-    if not isinstance(parsed, list):
-        return False
-    for entry in parsed:
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("stage", "")) == "plan":
-            return bool(entry.get("coach_review"))
-    return False
-
-
-async def _emit_spec_review_needed(
-    *, task_id: str, title: str, spec_path: str, project_id: str,
-    next_stage: str,
-) -> None:
-    """Publish a `spec_review_needed` event routed to Coach + fire a
-    system-tagged wake so Coach gets a compact pane row (not a
-    full-prompt-body turn header) with a link to the spec."""
-    from datetime import datetime, timezone
-    ts = datetime.now(timezone.utc).isoformat()
-    title_q = title.strip() or task_id
-    body = (
-        f"Spec for task {task_id} ('{title_q}') is ready for your "
-        f"review. The plan trajectory entry was tagged "
-        f"`coach_review: true`, so the kanban is holding the "
-        f"plan -> {next_stage} transition until you advance manually.\n\n"
-        f"Read the spec at {spec_path or '(spec_path missing)'}, then "
-        f"either:\n"
-        f"  - approve + advance: coord_advance_task_stage("
-        f"task_id={task_id!r}, stage={next_stage!r}, assignee=<slot>)\n"
-        f"  - request changes: coord_send_message(to=<planner>, "
-        f"body='spec needs ...') and the planner re-writes via "
-        f"coord_write_task_spec; this hook re-fires on the next spec "
-        f"write so you'll be re-pinged.\n"
-        f"  - drop the task: coord_advance_task_stage("
-        f"task_id={task_id!r}, stage='archive')."
-    )
-    payload = {
-        "ts": ts,
-        "agent_id": "system",
-        "type": "spec_review_needed",
-        "task_id": task_id,
-        "title": title_q,
-        "spec_path": spec_path,
-        "next_stage": next_stage,
-        "project_id": project_id,
-        "to": "coach",
-        "body": body,
-    }
-    try:
-        await bus.publish(payload)
-    except Exception:
-        logger.exception(
-            "kanban: failed to publish spec_review_needed for %s",
-            task_id,
-        )
-    try:
-        from server.agents import maybe_wake_agent
-        await maybe_wake_agent(
-            "coach", body,
-            bypass_debounce=True,
-            wake_source="kanban_spec_review",
-        )
-    except Exception:
-        logger.exception(
-            "kanban: failed to wake Coach for spec_review_needed %s",
-            task_id,
-        )
-
-
-async def _on_stage_changed(ev: dict[str, Any]) -> None:
-    """Stage-entry activation: wake the current-stage owner/candidates.
-
-    This is the piece that makes the board flow. Coach can reserve later
-    roles up front, but Players are only called once the card actually
-    reaches their stage.
-    """
-    task_id = (ev.get("task_id") or "").strip()
-    new_stage = (ev.get("to") or "").strip()
-    reason = (ev.get("reason") or "").strip()
-    if not task_id or new_stage in ("", "archive"):
-        return
-    if new_stage == "execute" and reason == "audit_fail":
-        # _on_audit_submitted sends a richer wake with report context.
-        return
-    role = _role_for_stage(new_stage)
-    if not role:
-        return
-    await _wake_role_or_emit_needed(task_id=task_id, role=role)
+    # Deviations log instrumentation (§22.1). The audit's body summary
+    # would be richer but we don't read the report file here — Coach
+    # gets the path via the audit_fail_notification + project_events
+    # row. The description records the kind / round / report pointer.
+    if executor and project_id:
+        try:
+            from datetime import datetime, timezone
+            description = (
+                f"audit FAIL kind={kind} round={kind_round} "
+                f"report={ev.get('report_path') or '(no path)'}"
+            )
+            c = await configured_conn()
+            try:
+                await c.execute(
+                    "INSERT INTO deviations_log "
+                    "(project_id, ts, task_id, executor, "
+                    " noticed_at, description) "
+                    "VALUES (?, ?, ?, ?, 'audit', ?)",
+                    (
+                        project_id,
+                        datetime.now(timezone.utc).isoformat(),
+                        task_id, executor, description,
+                    ),
+                )
+                await c.commit()
+            finally:
+                await c.close()
+        except Exception:
+            logger.exception(
+                "kanban: deviations_log insert failed for task=%s", task_id
+            )
 
 
 async def _on_compass_audit_logged(ev: dict[str, Any]) -> None:
@@ -790,307 +553,6 @@ async def send_role_stand_down(
     return woken
 
 
-async def _transition(
-    *,
-    task_id: str,
-    new_status: str,
-    reason: str,
-    owner: str | None,
-    project_id: str,
-    reset_started_at: bool = False,
-) -> None:
-    """Apply a stage change atomically + emit task_stage_changed.
-
-    `reset_started_at=True` on audit-fail reverts so the card flips to
-    'assigned, not started' (executor's avatar goes hollow) until the
-    auto-wake actually spawns the next turn.
-
-    v0.3.9: when the transition is `<live_stage> → archive` AND the
-    reason is a natural-completion path (the trajectory played out
-    end-to-end via shipper / executor / auditor signals — NOT
-    Coach-forced 'manual', NOT rung-4 'auto_archive_stalled'), also
-    emit a `task_completed` event routed to Coach and wake Coach with
-    a prompt to summarize the outcome to the user.
-    """
-    title: str | None = None
-    c = await configured_conn()
-    try:
-        cur = await c.execute(
-            "SELECT status, title FROM tasks "
-            "WHERE id = ? AND project_id = ?",
-            (task_id, project_id),
-        )
-        row = await cur.fetchone()
-        if not row:
-            return
-        rd = dict(row)
-        old_status = rd["status"]
-        title = rd.get("title")
-        # AUDIT FIX (v0.3.9.1): no-op short-circuit. If old_status ==
-        # new_status the transition is buggy retry / replay; without
-        # this guard the bus.publish would emit a phantom
-        # `task_stage_changed{from: X, to: X}` and (for archive) a
-        # duplicate `task_completed`, double-waking Coach. Bail
-        # silently — caller upstream guards (e.g. _on_task_shipped's
-        # `if t["status"] != "ship": return`) already prevent the
-        # canonical case; this is the defensive backstop. Connection
-        # is closed by the surrounding `finally`.
-        if old_status == new_status:
-            return
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc).isoformat()
-        # Every transition stamps last_stage_change_at + clears any
-        # stale_alert_at (the task is moving again, so the stall
-        # sweeper should re-arm rather than suppress next alert).
-        if new_status == "archive":
-            await c.execute(
-                "UPDATE tasks SET status = 'archive', "
-                "completed_at = ?, archived_at = ?, "
-                "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
-                "WHERE id = ? AND project_id = ?",
-                (now, now, now, task_id, project_id),
-            )
-            if owner:
-                await c.execute(
-                    "UPDATE agents SET current_task_id = NULL "
-                    "WHERE id = ? AND current_task_id = ?",
-                    (owner, task_id),
-                )
-        elif reset_started_at:
-            await c.execute(
-                "UPDATE tasks SET status = ?, started_at = NULL, "
-                "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
-                "WHERE id = ? AND project_id = ?",
-                (new_status, now, task_id, project_id),
-            )
-        else:
-            await c.execute(
-                "UPDATE tasks SET status = ?, "
-                "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
-                "WHERE id = ? AND project_id = ?",
-                (new_status, now, task_id, project_id),
-            )
-        await c.commit()
-    finally:
-        await c.close()
-
-    await bus.publish({
-        "ts": now,
-        "agent_id": "system",
-        "type": "task_stage_changed",
-        "task_id": task_id,
-        "from": old_status,
-        "to": new_status,
-        "reason": reason,
-        "owner": owner,
-    })
-
-    # v0.3.9 trajectory-completion notification. Fires only on
-    # natural completion paths so Coach is told to summarize for the
-    # user. Skipped on Coach-forced manual archives (Coach already
-    # knows + decides what to tell the user) and on rung-4
-    # auto-archive (the human_attention escalation already informs
-    # the user, and Coach summarizing a forced kill is misleading).
-    if new_status == "archive" and reason in _NATURAL_ARCHIVE_REASONS:
-        try:
-            await _emit_task_completed(
-                task_id=task_id,
-                title=title or "",
-                from_stage=old_status,
-                reason=reason,
-                owner=owner,
-                ts=now,
-            )
-        except Exception:
-            logger.exception(
-                "kanban: task_completed notify failed (task_id=%s)", task_id
-            )
-
-
-# Reasons that represent a trajectory playing out end-to-end.
-# `shipped` — shipper called coord_mark_shipped after ship-stage work.
-# `commit_pushed` / `task_execution_completed` — execute was the last
-#   trajectory entry, so the work itself terminates the trajectory.
-# `audit_pass` — audit was the last trajectory entry (rare but valid).
-_NATURAL_ARCHIVE_REASONS: frozenset[str] = frozenset({
-    "shipped",
-    "commit_pushed",
-    "task_execution_completed",
-    "audit_pass",
-})
-
-
-async def _emit_task_completed(
-    *,
-    task_id: str,
-    title: str,
-    from_stage: str,
-    reason: str,
-    owner: str | None,
-    ts: str,
-) -> None:
-    """Publish `task_completed` event + wake Coach with a summary
-    prompt. Coach's reply lands in the chat panel + (if Telegram is
-    configured + this turn was user-triggered) flushes to the user's
-    phone via the existing user-initiated-turn filter.
-    """
-    # Pull the trajectory + executor + last-stage assignee for the
-    # event payload (lets the Coach prompt render the full path).
-    trajectory_str = ""
-    executor: str | None = None
-    last_stage_owner: str | None = None
-    try:
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT trajectory, owner FROM tasks WHERE id = ?",
-                (task_id,),
-            )
-            r = await cur.fetchone()
-            if r:
-                rd = dict(r)
-                trajectory_str = rd.get("trajectory") or ""
-                executor = rd.get("owner")
-            # Look up who handled the final pre-archive stage so the
-            # summary names them. For shipped → ship's owner; for
-            # commit_pushed → execute's owner; etc.
-            role_for_last = {
-                "ship": "shipper",
-                "audit_syntax": "auditor_syntax",
-                "audit_semantics": "auditor_semantics",
-                "execute": "executor",
-                "plan": "planner",
-            }.get(from_stage)
-            if role_for_last:
-                cur = await c.execute(
-                    "SELECT owner FROM task_role_assignments "
-                    "WHERE task_id = ? AND role = ? "
-                    "ORDER BY assigned_at DESC LIMIT 1",
-                    (task_id, role_for_last),
-                )
-                rr = await cur.fetchone()
-                if rr:
-                    last_stage_owner = dict(rr).get("owner")
-        finally:
-            await c.close()
-    except Exception:
-        pass
-
-    # Render a compact trajectory marker the prompt can show inline.
-    trajectory_marker = _trajectory_marker_from_json(trajectory_str)
-
-    # AUDIT FIX (v0.3.9.1): isolate publish vs wake. Previously the
-    # bus.publish was outside the wake's try/except — a publish
-    # failure would silently skip the wake too, so Coach got
-    # neither the event nor the prompt. Now each is independently
-    # wrapped: a publish failure still lets the wake fire (Coach
-    # still hears about the completion via the prompt), and a
-    # wake failure doesn't undo the published event.
-    try:
-        await bus.publish({
-            "ts": ts,
-            "agent_id": "system",
-            "type": "task_completed",
-            "task_id": task_id,
-            "title": title,
-            "trajectory": trajectory_str,
-            "trajectory_marker": trajectory_marker,
-            "from_stage": from_stage,
-            "reason": reason,
-            "executor": executor,
-            "last_stage_owner": last_stage_owner,
-            "owner": owner,
-            "to": "coach",
-        })
-    except Exception:
-        logger.exception(
-            "kanban: task_completed publish failed (task_id=%s)", task_id
-        )
-
-    # Wake Coach with a summary prompt. The prompt names the task,
-    # the path, the executor + last-stage assignee, and asks Coach
-    # to send a summary to the user (broadcast / Telegram). Coach
-    # decides the right channel based on who was asking.
-    last_label = (
-        f"the {from_stage} stage was completed by {last_stage_owner}"
-        if last_stage_owner else f"the task wrapped after {from_stage}"
-    )
-    exec_label = f"executor: {executor}" if executor else "no executor recorded"
-    # AUDIT FIX (v0.3.9.1): the prior wording said the Telegram
-    # bridge would auto-forward Coach's reply "if this turn was
-    # user-triggered." Misleading: this wake IS a system-triggered
-    # turn (the trigger event is `task_completed`, not a
-    # `message_sent{from=human}`), so the bridge's outbound filter
-    # blocks the reply. To reach the user on Telegram, Coach must
-    # explicitly use coord_send_message(to='broadcast') — which the
-    # bridge accumulates and flushes when the OWNING (originating)
-    # turn was user-triggered, OR Coach calls coord_request_human
-    # for unconditional Telegram delivery on important completions.
-    body = (
-        f"Task {task_id} completed: {title!r}. Trajectory: "
-        f"{trajectory_marker or '(unknown)'}. {last_label}; {exec_label}. "
-        f"Final reason: {reason}.\n\n"
-        f"Send a summary of the outcome to the user. Cover: "
-        f"(1) what was delivered, (2) any caveats / known limitations / "
-        f"open questions, (3) whether follow-up tasks are needed. Keep "
-        f"it concise (3-6 sentences) unless the work is complex enough "
-        f"to need more.\n\n"
-        f"Channel rules:\n"
-        f"- If the user is watching the harness UI: call "
-        f"coord_send_message(to='broadcast', body=<your summary>). "
-        f"They see it in the chat panel.\n"
-        f"- If the user is on Telegram and wants to be pinged on "
-        f"completion: call coord_request_human(subject='Task "
-        f"{task_id} done', body=<your summary>, urgency='normal'). "
-        f"This unconditionally forwards to Telegram + the EnvPane "
-        f"attention strip — use it for completions the user "
-        f"actually asked for, not routine internal cleanup.\n"
-        f"- Plain text in your reply WITHOUT the tools above stays "
-        f"in your chat panel only — this wake is system-triggered, "
-        f"so the Telegram bridge does NOT auto-forward."
-    )
-    try:
-        from server.agents import maybe_wake_agent
-        await maybe_wake_agent(
-            "coach", body,
-            bypass_debounce=True,
-            wake_source="kanban_completion",
-        )
-    except Exception:
-        logger.exception(
-            "kanban: failed to wake Coach for task_completed %s", task_id
-        )
-
-
-def _trajectory_marker_from_json(traj_json: str) -> str:
-    """`P → E → AY → AS → S` style abbreviation. Returns empty
-    string on parse failure — the prompt then falls back to a
-    generic '(unknown)' label."""
-    if not traj_json:
-        return ""
-    try:
-        parsed = json.loads(traj_json)
-    except Exception:
-        return ""
-    if not isinstance(parsed, list):
-        return ""
-    tokens = {
-        "plan": "P",
-        "execute": "E",
-        "audit_syntax": "AY",
-        "audit_semantics": "AS",
-        "ship": "S",
-    }
-    parts = []
-    for entry in parsed:
-        if not isinstance(entry, dict):
-            continue
-        stage = entry.get("stage")
-        if stage in tokens:
-            parts.append(tokens[stage])
-    return " → ".join(parts)
-
-
 async def _has_active_role(task_id: str, role: str) -> bool:
     c = await configured_conn()
     try:
@@ -1110,52 +572,41 @@ async def _has_active_role(task_id: str, role: str) -> bool:
 async def _emit_assignment_needed(
     *, task_id: str, role: str, stage: str, to_owner: str | None
 ) -> None:
+    """v2: a defensive surface that fires when something tried to wake
+    a role but no active row exists at the target stage.
+
+    Per spec §18, the `stage_assignment_needed` event of v0.3 is gone:
+    `coord_approve_stage` plants the role row + assignee atomically, so
+    the "assignment gap" failure mode shouldn't happen in normal flow.
+    The path is still reachable defensively (e.g. a trajectory rewrite
+    that inserted a stage Coach hasn't yet approved into; the rung-3
+    auto-reassign branch failing to match a role row). When it does,
+    surface as a `human_attention` event — a real fault someone needs
+    to see — rather than the removed v0.3 type.
+    """
     from datetime import datetime, timezone
     ts = datetime.now(timezone.utc).isoformat()
-    # v0.3.11: include an imperative `body` so Coach's pane row is
-    # actionable instead of a bare event type. The role-specific
-    # tool name is named with the task_id baked in.
-    role_tool = {
-        "planner": f"coord_assign_planner(task_id={task_id!r}, to=<slot>)",
-        "executor": f"coord_assign_task(task_id={task_id!r}, to=<slot>)",
-        "auditor_syntax": (
-            f"coord_assign_auditor(task_id={task_id!r}, "
-            f"kind='syntax', to=<slot>, focus=<...>)"
-        ),
-        "auditor_semantics": (
-            f"coord_assign_auditor(task_id={task_id!r}, "
-            f"kind='semantics', to=<slot>, focus=<...>)"
-        ),
-        "shipper": f"coord_assign_shipper(task_id={task_id!r}, to=<slot>)",
-    }.get(role, f"coord_assign_{role}(task_id={task_id!r}, to=<slot>)")
     body = (
-        f"Stage assignment needed: task {task_id} is in {stage!r} "
-        f"with no {role}. Assign one via {role_tool}. If you "
-        f"intended to skip this stage, rewrite the trajectory via "
-        f"coord_set_task_trajectory."
+        f"Task {task_id} is in stage {stage!r} with no {role} role row. "
+        f"The harness tried to wake the role but found nothing planted. "
+        f"Coach should call coord_approve_stage(task_id={task_id!r}, "
+        f"next_stage={stage!r}, assignee=<slot>, note=<brief>) to plant, "
+        f"OR rewrite the trajectory via coord_set_task_trajectory if "
+        f"the stage was inserted by mistake. owner={to_owner!r}."
     )
     payload = {
         "ts": ts,
         "agent_id": "system",
-        # v0.3 rename: was `audit_assignment_needed` (audit-only);
-        # now covers plan / execute / audit / ship gaps.
-        "type": "stage_assignment_needed",
+        "type": "human_attention",
+        "subject": f"kanban: {role} role missing on task {task_id}",
+        "body": body,
         "task_id": task_id,
         "role": role,
         "stage": stage,
-        # Nudge Coach — the assignment-needed surface is in their pane.
-        "to": "coach",
-        "owner": to_owner,
-        "body": body,
+        "urgency": "medium",
+        "to": "human",
     }
     await bus.publish(payload)
-    # Spec §18 promises a one-release back-compat alias under the
-    # legacy name. Subscribers that filtered on the old name still
-    # work; new code listens for `stage_assignment_needed`.
-    if role in ("auditor_syntax", "auditor_semantics", "shipper"):
-        alias = dict(payload)
-        alias["type"] = "audit_assignment_needed"
-        await bus.publish(alias)
 
 
 async def _count_fails_for_kind(
@@ -1191,7 +642,7 @@ async def _emit_audit_fail_notification(
     executor_id: str | None,
     report_path: str,
 ) -> None:
-    """Coach-bound notification on every audit fail. See kanban-specs.md
+    """Coach-bound notification on every audit fail. See kanban-specs-v2.md
     §8 + §17 for the contract: visibility on every fail, escalation
     only on the second fail of the same kind.
 
@@ -1546,11 +997,12 @@ async def build_auditor_wake_body(
     focus: str | None,
     is_pool: bool,
 ) -> str:
-    """Build the full body of an auditor wake prompt (kanban-specs §4.6).
+    """Build the full body of an auditor wake prompt (kanban-specs-v2.md §5.4).
 
-    Centralised so `coord_assign_auditor` (initial assignment wake) and
-    `_wake_role_or_emit_needed` (stage-entry wake when Coach reserved
-    the role earlier) produce identical wakes. Layout:
+    Centralised so the v2 `coord_approve_stage` path (initial assignment
+    wake when Coach approves into audit_*) and `_wake_role_or_emit_needed`
+    (stage-entry wake when Coach reserved the role earlier) produce
+    identical wakes. Layout:
 
         ## Focus
         <Coach's words, or default-syntax stub>
@@ -1647,9 +1099,11 @@ async def build_auditor_wake_body(
     pool_note = ""
     if is_pool:
         pool_note = (
-            f"This was a pool call — first call "
-            f"coord_accept_role(task_id={task_id!r}, role={role!r}); first "
-            f"accepted claim wins. Then do the audit and submit."
+            f"This wake landed via a legacy pool entry. In v2 pools "
+            f"are FYI only — wait for Coach to assign explicitly via "
+            f"coord_approve_stage. If Coach already named you in a "
+            f"recent note, proceed with the audit; otherwise message "
+            f"Coach to confirm."
         )
     sections.append(
         "## Submit the audit\n\n"
@@ -1681,10 +1135,12 @@ async def _completion_hint_for_role(task_id: str, role: str) -> str:
     quietly."""
     if role == "planner":
         return (
-            f"Write the spec by calling "
-            f"coord_write_task_spec(task_id={task_id!r}, body=<spec>). "
-            f"On success the task auto-advances plan -> the next stage "
-            f"in its trajectory.{_TOOL_NOT_VISIBLE_ESCAPE}"
+            f"Write the spec by calling coord_write_task_spec("
+            f"task_id={task_id!r}, body=<spec>, "
+            f"message_to_coach=<your response>). Your turn ends "
+            f"there — Coach reviews on the next tick and approves "
+            f"the next stage via coord_approve_stage. The kanban "
+            f"does NOT auto-advance in v2.{_TOOL_NOT_VISIBLE_ESCAPE}"
         )
     if role == "executor":
         # Trajectory-aware: when no audit stage follows execute, the
@@ -1712,14 +1168,13 @@ async def _completion_hint_for_role(task_id: str, role: str) -> str:
             "tool below."
         )
         return (
-            f"For code changes: "
-            f"coord_commit_push(message=<msg>, task_id={task_id!r}). "
-            f"For non-code deliverables: "
-            f"coord_complete_execution(task_id={task_id!r}, "
-            f"summary=<what you delivered>, artifact_path=<path?>). "
-            f"You MUST pass `task_id={task_id!r}` — without it the "
-            f"kanban does not advance.{self_audit}"
-            f"{_TOOL_NOT_VISIBLE_ESCAPE}"
+            f"For code changes: coord_commit_push(message=<msg>, "
+            f"task_id={task_id!r}, message_to_coach=<your response>). "
+            f"For non-code deliverables: coord_role_complete("
+            f"task_id={task_id!r}, message_to_coach=<your response>, "
+            f"artifact_path=<path?>). Pass `task_id={task_id!r}` so "
+            f"the event log routes correctly.{self_audit} Coach "
+            f"reviews on the next tick.{_TOOL_NOT_VISIBLE_ESCAPE}"
         )
     if role in ("auditor_syntax", "auditor_semantics"):
         kind = "syntax" if role == "auditor_syntax" else "semantics"
@@ -1727,15 +1182,18 @@ async def _completion_hint_for_role(task_id: str, role: str) -> str:
             f"Read the spec + the executor's commit/artifact, then call "
             f"coord_submit_audit_report(task_id={task_id!r}, "
             f"kind={kind!r}, body=<your review>, "
-            f"verdict='pass' or 'fail'). Pass advances the stage; fail "
-            f"reverts the task to execute and re-wakes the executor "
-            f"with your report attached.{_TOOL_NOT_VISIBLE_ESCAPE}"
+            f"verdict='pass' or 'fail', "
+            f"message_to_coach=<your response>). The verdict is "
+            f"recorded; Coach reviews and decides. FAIL does NOT "
+            f"auto-revert in v2 — wait for Coach's wake.{_TOOL_NOT_VISIBLE_ESCAPE}"
         )
     if role == "shipper":
         return (
             f"Merge / publish / hand-off the deliverable, then call "
-            f"coord_mark_shipped(task_id={task_id!r}, note=<optional>). "
-            f"The task auto-archives.{_TOOL_NOT_VISIBLE_ESCAPE}"
+            f"coord_role_complete(task_id={task_id!r}, "
+            f"message_to_coach='shipped at <ref>'). Coach reviews "
+            f"and archives with a user-facing summary via "
+            f"coord_archive_task.{_TOOL_NOT_VISIBLE_ESCAPE}"
         )
     return (
         f"Call coord_my_assignments(); it will print the next "
@@ -1842,13 +1300,15 @@ async def _wake_role_or_emit_needed(*, task_id: str, role: str) -> None:
             )
         else:
             prompt = (
-                f"Task {task_id} has entered {role_label}. You are in the "
-                f"candidate call. If you can take it, call "
-                f"coord_accept_role(task_id={task_id!r}, role={role!r}); "
-                f"first accepted claim wins. If it is already claimed by the "
-                f"time you answer, there is nothing to do — do NOT do the "
-                f"role work without an accepted claim, the kanban will not "
-                f"credit it.\n\nOnce you have the role, the next step is:"
+                f"Task {task_id} has entered {role_label}. You appear in "
+                f"its FYI pool list. In v2 pools do NOT auto-resolve — "
+                f"Coach picks the assignee explicitly via "
+                f"coord_approve_stage. Wait for Coach's wake naming "
+                f"you; do NOT start the role work without it (the "
+                f"kanban won't credit unauthorized work). If Coach has "
+                f"gone silent, message Coach to ask which Player should "
+                f"take it.\n\nIf you ARE woken with an explicit "
+                f"assignment later, the next step will be:"
                 f"\n{completion_hint}"
             )
 
@@ -1878,81 +1338,6 @@ async def _wake_role_or_emit_needed(*, task_id: str, role: str) -> None:
         "eligible_owners": targets if not assignment.get("owner") else [],
         "to": assignment.get("owner"),
     })
-
-
-async def _wake_executor_for_revert(
-    *, task_id: str, owner: str | None, kind: str,
-    report_path: str, round_num: int,
-) -> None:
-    """Re-wake the executor with the spec + the latest audit report
-    attached. Late import to avoid the kanban↔agents circular dep.
-
-    v0.3 audit-2026-05-04 item 11: read tasks.spec_path from the row
-    (was previously implicit "your spec.md") and fall back to the
-    `latest_audit_report_path` denorm column when the event payload
-    didn't carry the report path. Failed acceptance criteria, when
-    extractable from the audit report, are appended verbatim — saves
-    the executor from re-reading the whole report when only one
-    criterion failed.
-    """
-    if not owner:
-        return
-    spec_path: str | None = None
-    fallback_report: str | None = None
-    try:
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT spec_path, latest_audit_report_path "
-                "FROM tasks WHERE id = ?",
-                (task_id,),
-            )
-            row = await cur.fetchone()
-            if row:
-                d = dict(row)
-                spec_path = d.get("spec_path")
-                fallback_report = d.get("latest_audit_report_path")
-        finally:
-            await c.close()
-    except Exception:
-        # Best-effort enrichment — fall back to the bare wake on read failure.
-        logger.exception(
-            "kanban: failed to enrich revert wake for %s", task_id
-        )
-    effective_report = report_path or (fallback_report or "")
-    failed_criteria = _extract_failed_criteria(effective_report)
-    try:
-        from server.agents import maybe_wake_agent
-        spec_hint = (
-            f"\nSpec: {spec_path}" if spec_path else ""
-        )
-        report_hint = (
-            f"\nLatest audit report: {effective_report}"
-            if effective_report else ""
-        )
-        criteria_hint = (
-            f"\n\nFailed acceptance criteria:\n{failed_criteria}"
-            if failed_criteria else ""
-        )
-        wake_prompt = (
-            f"Audit failed for {task_id} ({kind}, round {round_num}). "
-            f"Read the spec and the latest audit report, fix what the "
-            f"reviewer flagged, then deliver again with "
-            f"coord_commit_push(task_id={task_id!r}, ...) for code or "
-            f"coord_complete_execution(task_id={task_id!r}, ...) for "
-            f"non-code artifacts."
-            f"{spec_hint}{report_hint}{criteria_hint}"
-        )
-        await maybe_wake_agent(
-            owner, wake_prompt,
-            bypass_debounce=True,
-            wake_source="kanban_audit_fail",
-        )
-    except Exception:
-        logger.exception(
-            "kanban: failed to wake executor %s for revert on %s",
-            owner, task_id,
-        )
 
 
 def _extract_failed_criteria(report_path: str) -> str:

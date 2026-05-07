@@ -273,58 +273,77 @@ def test_assignments_404_for_unknown_task(client: TestClient) -> None:
     assert r.status_code == 404
 
 
-# ----------------------------------------------------------------- /stage
+# ----------------------------------------------------------------- /approve_stage (v2)
 
-def test_stage_post_advances(client: TestClient) -> None:
+def test_approve_stage_post_plants_role_and_transitions(
+    client: TestClient,
+) -> None:
+    """v2 single transition tool: stages and assigns atomically."""
     import asyncio
     task_id = "t-2026-05-03-aaaaaaaa"
     asyncio.run(_seed(task_id=task_id, status="plan", spec_path="x"))
-
-    async def add_executor() -> None:
-        c = await configured_conn()
-        try:
-            await c.execute(
-                "INSERT INTO task_role_assignments "
-                "(task_id, role, eligible_owners, owner, assigned_at) "
-                "VALUES (?, 'executor', '[]', 'p3', '2026-05-03T10:00:00Z')",
-                (task_id,),
-            )
-            await c.commit()
-        finally:
-            await c.close()
-
-    asyncio.run(add_executor())
     r = client.post(
-        f"/api/tasks/{task_id}/stage",
-        json={"stage": "execute", "note": "kicking off"},
+        f"/api/tasks/{task_id}/approve_stage",
+        json={"next_stage": "execute", "assignee": "p3", "note": "kicking off"},
     )
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
     body = r.json()
     assert body["from"] == "plan"
     assert body["to"] == "execute"
+    assert body["assignee"] == "p3"
+
+    async def read_state() -> dict:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT status, owner FROM tasks WHERE id = ?",
+                (task_id,),
+            )
+            return dict(await cur.fetchone())
+        finally:
+            await c.close()
+
+    state = asyncio.run(read_state())
+    assert state["status"] == "execute"
+    assert state["owner"] == "p3"
 
 
-def test_stage_post_invalid_transition_rejected_without_force(
+def test_approve_stage_post_invalid_transition_rejected(
     client: TestClient,
 ) -> None:
     import asyncio
     asyncio.run(_seed(task_id="t-2026-05-03-aaaaaaaa", status="plan"))
     r = client.post(
-        "/api/tasks/t-2026-05-03-aaaaaaaa/stage",
-        json={"stage": "ship"},  # plan → ship is illegal
+        "/api/tasks/t-2026-05-03-aaaaaaaa/approve_stage",
+        json={"next_stage": "ship", "assignee": "p3"},
     )
     assert r.status_code == 400
     assert "invalid transition" in r.json()["detail"]
 
 
-def test_stage_post_force_bypasses_state_machine(client: TestClient) -> None:
+def test_approve_stage_post_archive_rejects_assignee(
+    client: TestClient,
+) -> None:
+    import asyncio
+    asyncio.run(_seed(task_id="t-2026-05-03-aaaaaaaa", status="execute", owner="p3"))
+    r = client.post(
+        "/api/tasks/t-2026-05-03-aaaaaaaa/approve_stage",
+        json={"next_stage": "archive", "assignee": "p3"},
+    )
+    assert r.status_code == 400
+
+
+def test_approve_stage_post_requires_assignee_for_non_archive(
+    client: TestClient,
+) -> None:
     import asyncio
     asyncio.run(_seed(task_id="t-2026-05-03-aaaaaaaa", status="plan"))
     r = client.post(
-        "/api/tasks/t-2026-05-03-aaaaaaaa/stage",
-        json={"stage": "ship", "force": True},
+        "/api/tasks/t-2026-05-03-aaaaaaaa/approve_stage",
+        json={"next_stage": "execute"},
     )
-    assert r.status_code == 200
+    assert r.status_code == 400
+    assert "assignee" in r.json()["detail"].lower()
 
 
 # ----------------------------------------------------------------- /workflow / /blocked
@@ -400,117 +419,127 @@ def test_spec_post_invalid_task_id_rejected(client: TestClient) -> None:
     assert r.status_code in (400, 404)
 
 
-# ----------------------------------------------------------------- /assign
+# /api/tasks/{id}/assign was folded into /api/tasks/{id}/approve_stage
+# in v2 — see tests above. Coverage of the supersede + plant pattern is
+# now in test_coord_approve_stage.py (the MCP-tool side); the HTTP path
+# uses the same helpers, so we just smoke-test the endpoint shape.
 
-def test_assign_post_single_player_creates_role_row(client: TestClient) -> None:
-    import asyncio
-    asyncio.run(_seed(task_id="t-2026-05-03-aaaaaaaa", status="audit_syntax", owner="p3"))
+
+def test_approve_stage_post_404_for_unknown_task(client: TestClient) -> None:
     r = client.post(
-        "/api/tasks/t-2026-05-03-aaaaaaaa/assign",
-        json={"role": "auditor_syntax", "to": "p4"},
+        "/api/tasks/t-2026-05-03-99999999/approve_stage",
+        json={"next_stage": "execute", "assignee": "p3"},
     )
-    assert r.status_code == 200
-    body = r.json()
-    assert body["to"] == ["p4"]
+    assert r.status_code == 404
 
 
-def test_assign_post_pool_form_creates_eligible_owners(
+def test_approve_stage_post_invalid_assignee_rejected(
     client: TestClient,
 ) -> None:
     import asyncio
     asyncio.run(_seed(task_id="t-2026-05-03-aaaaaaaa", status="plan"))
     r = client.post(
-        "/api/tasks/t-2026-05-03-aaaaaaaa/assign",
-        json={"role": "executor", "to": ["p3", "p4", "p5"]},
+        "/api/tasks/t-2026-05-03-aaaaaaaa/approve_stage",
+        json={"next_stage": "execute", "assignee": "coach"},
+    )
+    assert r.status_code == 400
+
+
+# ---------------------------------------------------- /flag_deviation (v2 §22.1)
+
+def test_flag_deviation_inserts_human_row(client: TestClient) -> None:
+    import asyncio
+    asyncio.run(_seed(
+        task_id="t-2026-05-03-aaaaaaaa",
+        status="execute",
+        owner="p3",
+    ))
+    r = client.post(
+        "/api/tasks/t-2026-05-03-aaaaaaaa/flag_deviation",
+        json={"description": "scope drift: p3 added an unrelated refactor"},
     )
     assert r.status_code == 200
     body = r.json()
-    assert sorted(body["to"]) == ["p3", "p4", "p5"]
+    assert body["task_id"] == "t-2026-05-03-aaaaaaaa"
+    assert body["executor"] == "p3"
 
-    async def check() -> dict:
+    async def read() -> dict:
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT eligible_owners, owner FROM task_role_assignments "
-                "WHERE task_id = ? AND role = 'executor'",
+                "SELECT executor, noticed_at, description "
+                "FROM deviations_log WHERE task_id = ?",
                 ("t-2026-05-03-aaaaaaaa",),
             )
             return dict(await cur.fetchone())
         finally:
             await c.close()
 
-    row = asyncio.run(check())
-    assert sorted(json.loads(row["eligible_owners"])) == ["p3", "p4", "p5"]
-    assert row["owner"] is None  # pool: no claim yet
+    row = asyncio.run(read())
+    assert row["noticed_at"] == "human"
+    assert row["executor"] == "p3"
+    assert "scope drift" in row["description"]
 
 
-def test_assign_post_invalid_slot_rejected(client: TestClient) -> None:
-    import asyncio
-    asyncio.run(_seed(task_id="t-2026-05-03-aaaaaaaa"))
+def test_flag_deviation_404_for_unknown_task(client: TestClient) -> None:
     r = client.post(
-        "/api/tasks/t-2026-05-03-aaaaaaaa/assign",
-        json={"role": "executor", "to": "coach"},
-    )
-    assert r.status_code == 400
-
-
-def test_assign_post_supersedes_failed_audit_round(client: TestClient) -> None:
-    import asyncio
-    task_id = "t-2026-05-03-1234abcd"
-    asyncio.run(_seed(task_id=task_id, status="audit_syntax", owner="p3"))
-
-    async def add_failed_round() -> int:
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "INSERT INTO task_role_assignments "
-                "(task_id, role, eligible_owners, owner, assigned_at, "
-                "completed_at, verdict, report_path) "
-                "VALUES (?, 'auditor_syntax', '[]', 'p4', "
-                "'2026-05-02T10:00:00Z', '2026-05-02T11:00:00Z', "
-                "'fail', 'audits/audit_1_syntax.md')",
-                (task_id,),
-            )
-            await c.commit()
-            return int(cur.lastrowid)
-        finally:
-            await c.close()
-
-    old_id = asyncio.run(add_failed_round())
-    r = client.post(
-        f"/api/tasks/{task_id}/assign",
-        json={"role": "auditor_syntax", "to": "p5"},
-    )
-    assert r.status_code == 200
-
-    async def read_superseded() -> tuple[int | None, int]:
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT superseded_by FROM task_role_assignments WHERE id = ?",
-                (old_id,),
-            )
-            old_row = dict(await cur.fetchone())
-            cur = await c.execute(
-                "SELECT MAX(id) AS id FROM task_role_assignments "
-                "WHERE task_id = ? AND role = 'auditor_syntax'",
-                (task_id,),
-            )
-            new_row = dict(await cur.fetchone())
-            return old_row["superseded_by"], new_row["id"]
-        finally:
-            await c.close()
-
-    superseded_by, new_id = asyncio.run(read_superseded())
-    assert superseded_by == new_id
-
-
-def test_assign_post_404_for_unknown_task(client: TestClient) -> None:
-    r = client.post(
-        "/api/tasks/t-2026-05-03-99999999/assign",
-        json={"role": "executor", "to": "p3"},
+        "/api/tasks/t-2026-05-03-99999999/flag_deviation",
+        json={"description": "x"},
     )
     assert r.status_code == 404
+
+
+def test_flag_deviation_requires_description(client: TestClient) -> None:
+    import asyncio
+    asyncio.run(_seed(task_id="t-2026-05-03-aaaaaaaa", status="execute", owner="p3"))
+    r = client.post(
+        "/api/tasks/t-2026-05-03-aaaaaaaa/flag_deviation",
+        json={"description": ""},
+    )
+    # Pydantic min_length=1 → 422 validation failure.
+    assert r.status_code == 422
+
+
+# ----------------------------------------------------- /api/projects/{id}/event_log
+
+def test_event_log_returns_unread_rows_by_default(client: TestClient) -> None:
+    """The migration's synthetic kanban_v2_cutover row lands as UNREAD,
+    so a fresh DB returns it on the default include_read=false query."""
+    r = client.get("/api/projects/misc/event_log")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["include_read"] is False
+    types = [e["type"] for e in body["events"]]
+    assert "kanban_v2_cutover" in types
+
+
+def test_event_log_filter_by_type(client: TestClient) -> None:
+    r = client.get("/api/projects/misc/event_log?type=nonexistent_type")
+    assert r.status_code == 200
+    assert r.json()["events"] == []
+
+
+def test_event_log_filter_by_actor(client: TestClient) -> None:
+    r = client.get("/api/projects/misc/event_log?actor=system")
+    assert r.status_code == 200
+    body = r.json()
+    actors = {e["actor"] for e in body["events"]}
+    # All returned rows should be 'system'.
+    assert actors <= {"system"} or not actors
+
+
+def test_event_log_limit_capped(client: TestClient) -> None:
+    r = client.get("/api/projects/misc/event_log?limit=500")
+    assert r.status_code == 200
+    body = r.json()
+    # Server caps at 200.
+    assert body["limit"] == 200
+
+
+def test_event_log_unknown_project_returns_empty(client: TestClient) -> None:
+    r = client.get("/api/projects/no-such/event_log")
+    assert r.status_code == 200
+    assert r.json()["events"] == []
 
 
 # --------------------------------------------------------------- create
@@ -583,8 +612,10 @@ def test_create_task_with_plan_starts_in_plan(client: TestClient) -> None:
 
 
 def test_create_task_pool_first_stage_leaves_owner_null(client: TestClient) -> None:
-    """A pool-form first stage (multiple candidates) must NOT set
-    tasks.owner — claim happens via coord_accept_role."""
+    """v2 §7.1: a pool-form first stage (multiple candidates or empty)
+    plants NO role row at create time — Coach picks the assignee
+    later via coord_approve_stage. tasks.owner stays NULL until
+    assignment."""
     r = client.post(
         "/api/tasks",
         json={
@@ -605,20 +636,20 @@ def test_create_task_pool_first_stage_leaves_owner_null(client: TestClient) -> N
             )
             task_row = dict(await cur.fetchone())
             cur = await c.execute(
-                "SELECT eligible_owners, owner FROM task_role_assignments "
-                "WHERE task_id = ? AND role = 'executor'",
+                "SELECT COUNT(*) AS n FROM task_role_assignments "
+                "WHERE task_id = ?",
                 (task_id,),
             )
-            role_row = dict(await cur.fetchone())
-            return task_row, role_row
+            role_count = int(dict(await cur.fetchone())["n"])
+            return task_row, role_count
         finally:
             await c.close()
 
-    task_row, role_row = asyncio.run(read())
+    task_row, role_count = asyncio.run(read())
     assert task_row["status"] == "execute"
     assert task_row["owner"] is None
-    assert role_row["owner"] is None
-    assert json.loads(role_row["eligible_owners"]) == ["p2", "p3"]
+    # v2: pool/empty first stage plants no row.
+    assert role_count == 0
 
 
 def test_create_task_default_trajectory_starts_in_execute(client: TestClient) -> None:
@@ -714,7 +745,7 @@ def test_post_trajectory_rejects_removing_already_entered(
         '[{"stage":"plan","to":[]},'
         '{"stage":"execute","to":[]},'
         '{"stage":"audit_syntax","to":[]},'
-        '{"stage":"audit_semantics","to":[]},'
+        '{"stage":"audit_semantics","to":[],"focus":"check semantics"},'
         '{"stage":"ship","to":[]}]'
     )
     asyncio.run(_seed(
@@ -730,7 +761,7 @@ def test_post_trajectory_rejects_removing_already_entered(
             "trajectory": [
                 {"stage": "plan", "to": []},
                 {"stage": "execute", "to": []},
-                {"stage": "audit_semantics", "to": []},
+                {"stage": "audit_semantics", "to": [], "focus": "check"},
                 {"stage": "ship", "to": []},
             ],
         },

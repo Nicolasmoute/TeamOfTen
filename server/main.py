@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
@@ -616,18 +616,7 @@ class CreateTaskRequest(BaseModel):
     trajectory: list[dict[str, Any]] | None = None
 
 
-# ------- kanban-specific request models (Docs/kanban-specs.md §7) -------
-
-
-class TaskStageRequest(BaseModel):
-    """POST /api/tasks/{id}/stage. Human override of the kanban
-    transition. `force=True` bypasses the role-completion gate (Coach
-    is asleep / over-cap, human just wants the task to move)."""
-    stage: str = Field(
-        pattern=r"^(plan|execute|audit_syntax|audit_semantics|ship|archive)$"
-    )
-    note: str = Field(default="", max_length=500)
-    force: bool = False
+# ------- kanban-specific request models (Docs/kanban-specs-v2.md §8) -------
 
 
 class TaskTrajectoryRequest(BaseModel):
@@ -656,13 +645,27 @@ class TaskSpecRequest(BaseModel):
     body: str = Field(min_length=1, max_length=40_000)
 
 
-class TaskAssignRequest(BaseModel):
-    """POST /api/tasks/{id}/assign. Human-side role assignment. `to`
-    accepts a single slot or a list (pool form)."""
-    role: str = Field(
-        pattern=r"^(planner|executor|auditor_syntax|auditor_semantics|shipper)$"
+# Kanban v2 (Docs/kanban-specs-v2.md §8)
+
+
+class TaskApproveStageRequest(BaseModel):
+    """POST /api/tasks/{id}/approve_stage. Human-side equivalent of
+    `coord_approve_stage` — single transition tool that authorizes the
+    next stage, names the assignee, and provides the wake prompt."""
+    next_stage: str = Field(
+        pattern=r"^(plan|execute|audit_syntax|audit_semantics|ship|archive)$"
     )
-    to: str | list[str]
+    # Required for any non-archive next_stage; rejected on archive.
+    assignee: str | None = Field(default=None, max_length=10)
+    note: str = Field(default="", max_length=4000)
+
+
+class TaskFlagDeviationRequest(BaseModel):
+    """POST /api/tasks/{id}/flag_deviation. Human-side row insertion
+    into deviations_log with noticed_at='human' (Docs/kanban-specs-v2
+    §22.1). Lets the human flag drift the kanban didn't catch via
+    Coach's approve_stage note or the audit FAIL path."""
+    description: str = Field(min_length=1, max_length=2000)
 
 
 # ------------------------------------------------------------------
@@ -1716,6 +1719,18 @@ async def get_team_tools() -> dict[str, object]:
         "tools": await _read_team_extra_tools(),
         "available": sorted(_EXTRA_TOOL_WHITELIST),
     }
+
+
+@app.get("/api/team/player_health", dependencies=[Depends(require_token)])
+async def get_team_player_health() -> dict[str, object]:
+    """v2 §15.3 — counters for the EnvPlayerHealthSection. Last 30
+    days, active project. Empty `rows` when every Player's counters
+    are zero so the UI hides the section."""
+    from server.agents import compute_player_health_counters
+    from server.db import resolve_active_project
+    project_id = await resolve_active_project()
+    rows = await compute_player_health_counters(project_id)
+    return {"project_id": project_id, "rows": rows}
 
 
 # Per-role defaults + allowlists are owned by `server.models_catalog`
@@ -3345,7 +3360,7 @@ async def set_agent_locked(
     """Set the per-agent lock flag.
 
     When locked:
-      - Coach cannot coord_assign_task a task to this agent
+      - Coach cannot coord_approve_stage onto this agent
       - Coach cannot coord_send_message this agent directly
       - coord_read_inbox skips messages whose sender is 'coach' (direct
         or broadcast)
@@ -3722,29 +3737,25 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
                 initial_status, initial_owner, now_iso,
             ),
         )
-        # Plant role rows for each stage in the trajectory.
-        for entry in trajectory:
-            stage = entry["stage"]
-            to_list: list[str] = entry.get("to") or []
-            role = role_for_stage[stage]
-            eligible_json = json.dumps(to_list, separators=(",", ":"))
-            if len(to_list) == 1:
-                await c.execute(
-                    "INSERT INTO task_role_assignments "
-                    "(task_id, role, eligible_owners, owner, "
-                    "assigned_at, claimed_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (task_id, role, eligible_json, to_list[0],
-                     now_iso, now_iso),
-                )
-            else:
-                await c.execute(
-                    "INSERT INTO task_role_assignments "
-                    "(task_id, role, eligible_owners, owner, "
-                    "assigned_at) "
-                    "VALUES (?, ?, ?, NULL, ?)",
-                    (task_id, role, eligible_json, now_iso),
-                )
+        # v2 §7.1: plant a role row ONLY for the first trajectory entry
+        # AND only when its `to` is a single named slot (Coach pre-picked
+        # via the trajectory). Subsequent stages' `to` lists are FYI
+        # only — Coach drives them later via coord_approve_stage. Pool
+        # / empty entries don't auto-plant; Coach picks at approval
+        # time.
+        first_entry = trajectory[0]
+        first_to: list[str] = first_entry.get("to") or []
+        if len(first_to) == 1:
+            first_role = role_for_stage[first_entry["stage"]]
+            eligible_json = json.dumps(first_to, separators=(",", ":"))
+            await c.execute(
+                "INSERT INTO task_role_assignments "
+                "(task_id, role, eligible_owners, owner, "
+                "assigned_at, claimed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (task_id, first_role, eligible_json, first_to[0],
+                 now_iso, now_iso),
+            )
         await c.commit()
     finally:
         await c.close()
@@ -3787,11 +3798,14 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
 
 @app.post("/api/tasks/{task_id}/cancel", dependencies=[Depends(require_token)])
 async def cancel_task_from_human(task_id: str) -> dict[str, Any]:
-    """Cancel a task from the UI. Updates the task row + clears the
-    owner's current_task_id so the agent is free to claim the next one.
+    """Human cancellation (Docs/kanban-specs-v2.md §8). Equivalent of
+    `coord_archive_task` from the human side — sets `cancelled_at` so
+    the archive view can distinguish cancellation from delivery, marks
+    every active role row complete, and emits `task_stage_changed` +
+    `task_archived`.
 
-    Noop (but returns 200) if the task is already done or cancelled —
-    the UI may race against an in-flight update."""
+    Idempotent: returns 200 with `already=archive` if the task is
+    already in archive."""
     project_id = await resolve_active_project()
     c = await configured_conn()
     try:
@@ -3809,10 +3823,17 @@ async def cancel_task_from_human(task_id: str) -> dict[str, Any]:
             return {"ok": True, "task_id": task_id, "already": "archive"}
         old_status = task["status"]
         now = datetime.now(timezone.utc).isoformat()
+        # Mark every active role row complete on archive — no roles
+        # persist into archive (v2 §7.1 carryover).
+        await c.execute(
+            "UPDATE task_role_assignments SET completed_at = ? "
+            "WHERE task_id = ? "
+            "AND completed_at IS NULL AND superseded_by IS NULL",
+            (now, task_id),
+        )
         # Cancellation lands in archive with cancelled_at + archived_at +
         # completed_at populated. The archive view's "show cancelled"
-        # toggle filters on cancelled_at. Stamp last_stage_change_at +
-        # clear stale_alert_at (audit-2026-05-04 item 6).
+        # toggle filters on cancelled_at.
         await c.execute(
             "UPDATE tasks SET status = 'archive', "
             "completed_at = ?, archived_at = ?, cancelled_at = ?, "
@@ -3830,37 +3851,33 @@ async def cancel_task_from_human(task_id: str) -> dict[str, Any]:
     finally:
         await c.close()
 
-    # Emit the kanban-shaped event AND the legacy event for back-compat.
-    await bus.publish(
-        {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "agent_id": "human",
-            "type": "task_stage_changed",
-            "task_id": task_id,
-            "from": old_status,
-            "to": "archive",
-            "reason": "manual",
-            "note": "cancelled by human",
-            "owner": task["owner"],
-        }
-    )
-    await bus.publish(
-        {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "agent_id": "human",
-            "type": "task_updated",
-            "task_id": task_id,
-            "old_status": old_status,
-            "new_status": "archive",
-            "note": "cancelled by human",
-            "owner": task["owner"],
-        }
-    )
+    ts = datetime.now(timezone.utc).isoformat()
+    await bus.publish({
+        "ts": ts,
+        "agent_id": "human",
+        "type": "task_stage_changed",
+        "task_id": task_id,
+        "from": old_status,
+        "to": "archive",
+        "reason": "cancelled",
+        "note": "cancelled by human",
+        "owner": task["owner"],
+    })
+    await bus.publish({
+        "ts": ts,
+        "agent_id": "human",
+        "type": "task_archived",
+        "task_id": task_id,
+        "summary": "Cancelled by human via UI.",
+        "body": "Cancelled by human via UI.",
+        "cancelled": True,
+        "owner": task["owner"],
+    })
     return {"ok": True, "task_id": task_id, "old_status": old_status}
 
 
 # ------------------------------------------------------------------
-# Kanban-shaped views + human overrides (Docs/kanban-specs.md §7)
+# Kanban-shaped views + human overrides (Docs/kanban-specs-v2.md §7)
 # ------------------------------------------------------------------
 
 
@@ -4053,24 +4070,82 @@ async def get_task_assignments(task_id: str) -> dict[str, Any]:
 # through the same validator as Coach's MCP-tool override.
 from server.tools import (  # noqa: E402
     ALL_KANBAN_STAGES,
-    _check_kanban_role_gate,
     _valid_transition,
     _validate_trajectory,
 )
 
 
 @app.post(
-    "/api/tasks/{task_id}/stage", dependencies=[Depends(require_token)]
+    "/api/tasks/{task_id}/approve_stage",
+    dependencies=[Depends(require_token)],
 )
-async def post_task_stage(
-    task_id: str, req: TaskStageRequest
+async def post_task_approve_stage(
+    task_id: str, req: TaskApproveStageRequest
 ) -> dict[str, Any]:
-    """Human-side stage override. Validates against the state machine
-    unless `force=True`."""
-    if req.stage not in ALL_KANBAN_STAGES:
-        raise HTTPException(400, detail=f"invalid stage: {req.stage}")
+    """Human-side equivalent of `coord_approve_stage` (Docs/kanban-specs-v2.md
+    §8). Single transition tool: authorizes the next stage, names the
+    assignee, plants the role row, supersedes any prior active row for
+    the target role with stand-down wakes, and emits
+    `task_stage_changed` + `task_role_assigned`. Replaces the v1
+    `/api/tasks/{id}/stage` and `/api/tasks/{id}/assign` endpoints.
+    """
+    next_stage = req.next_stage
+    if next_stage not in ALL_KANBAN_STAGES:
+        raise HTTPException(400, detail=f"invalid stage: {next_stage}")
+
+    assignee_raw = (req.assignee or "").strip().lower()
+    if next_stage == "archive":
+        if assignee_raw:
+            raise HTTPException(
+                400,
+                detail=(
+                    "next_stage='archive' takes no assignee — drop "
+                    "`assignee` (or call POST /api/tasks/{id}/cancel "
+                    "for the user-facing wrap-up)."
+                ),
+            )
+        assignee: str | None = None
+    else:
+        if not assignee_raw:
+            raise HTTPException(
+                400,
+                detail=(
+                    f"next_stage='{next_stage}' requires an assignee "
+                    f"(single Player slot)."
+                ),
+            )
+        if "," in assignee_raw or "[" in assignee_raw:
+            raise HTTPException(
+                400,
+                detail="v2 takes a single assignee slot — pools are FYI only.",
+            )
+        from server.tools import VALID_RECIPIENTS  # noqa: WPS433
+        if (
+            assignee_raw not in VALID_RECIPIENTS
+            or assignee_raw in ("coach", "broadcast")
+        ):
+            raise HTTPException(
+                400,
+                detail=f"assignee must be a Player slot (p1..p10), not {assignee_raw!r}",
+            )
+        assignee = assignee_raw
+
+    from server.kanban import (
+        _role_for_stage as _kanban_role_for_stage,
+        collect_superseded_role_owners,
+        send_role_stand_down,
+    )
+    target_role = (
+        _kanban_role_for_stage(next_stage) if next_stage != "archive" else None
+    )
+
     project_id = await resolve_active_project()
     c = await configured_conn()
+    displaced_target: list[str] = []
+    displaced_source: list[str] = []
+    old_status: str | None = None
+    old_owner: str | None = None
+    new_role_id: int | None = None
     try:
         cur = await c.execute(
             "SELECT status, owner FROM tasks "
@@ -4078,76 +4153,209 @@ async def post_task_stage(
             (task_id, project_id),
         )
         row = await cur.fetchone()
-        if row is None:
+        if not row:
             raise HTTPException(404, detail=f"task {task_id} not found")
         t = dict(row)
         old_status = t["status"]
-        if not req.force and not _valid_transition(old_status, req.stage):
+        old_owner = t.get("owner")
+        if old_status == "archive":
             raise HTTPException(
                 400,
-                detail=(
-                    f"invalid transition: {old_status} → {req.stage} "
-                    f"(pass force=true to bypass the gate)"
-                ),
+                detail=f"task {task_id} is already archived; archived tasks are read-only.",
             )
-        # Role-completion gate (Docs/kanban-specs.md §2.3). Skipped on
-        # `force=true` (the documented escape hatch). Cancellation has
-        # its own endpoint (POST /api/tasks/{id}/cancel) so the stage
-        # endpoint's archive moves are always treated as delivery.
-        if not req.force:
-            gate_err = await _check_kanban_role_gate(
-                c,
-                project_id,
-                task_id,
-                old_status,
-                req.stage,
-                was_cancellation=False,
+        if not _valid_transition(old_status, next_stage):
+            raise HTTPException(
+                400,
+                detail=f"invalid transition: {old_status} → {next_stage}",
             )
-            if gate_err is not None:
-                raise HTTPException(
-                    400,
-                    detail=f"{gate_err} (pass force=true to bypass)",
-                )
+
         now = datetime.now(timezone.utc).isoformat()
-        # Stamp last_stage_change_at + clear stale_alert_at on every
-        # status change (audit-2026-05-04 item 6).
-        if req.stage == "archive":
+        if next_stage == "archive":
+            await c.execute(
+                "UPDATE task_role_assignments SET completed_at = ? "
+                "WHERE task_id = ? "
+                "AND completed_at IS NULL AND superseded_by IS NULL",
+                (now, task_id),
+            )
             await c.execute(
                 "UPDATE tasks SET status = 'archive', "
                 "completed_at = ?, archived_at = ?, "
-                "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
+                "last_stage_change_at = ?, stale_alert_at = NULL, "
+                "stall_escalation_level = 0 "
                 "WHERE id = ? AND project_id = ?",
                 (now, now, now, task_id, project_id),
             )
-            if t["owner"]:
+            if old_owner:
                 await c.execute(
                     "UPDATE agents SET current_task_id = NULL "
                     "WHERE id = ? AND current_task_id = ?",
-                    (t["owner"], task_id),
+                    (old_owner, task_id),
                 )
         else:
-            await c.execute(
-                "UPDATE tasks SET status = ?, "
-                "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
-                "WHERE id = ? AND project_id = ?",
-                (req.stage, now, task_id, project_id),
+            source_role = _kanban_role_for_stage(old_status)
+            if source_role:
+                displaced_source = await collect_superseded_role_owners(
+                    c, task_id=task_id, role=source_role, new_row_id=None,
+                )
+                if displaced_source:
+                    await c.execute(
+                        "UPDATE task_role_assignments "
+                        "SET completed_at = ? "
+                        "WHERE task_id = ? AND role = ? "
+                        "AND completed_at IS NULL "
+                        "AND superseded_by IS NULL",
+                        (now, task_id, source_role),
+                    )
+            pre_displaced = await collect_superseded_role_owners(
+                c, task_id=task_id, role=target_role, new_row_id=None,
             )
+            insert_cur = await c.execute(
+                "INSERT INTO task_role_assignments "
+                "(task_id, role, eligible_owners, owner, "
+                "assigned_at, claimed_at) "
+                "VALUES (?, ?, '[]', ?, ?, ?)",
+                (task_id, target_role, assignee, now, now),
+            )
+            new_role_id = insert_cur.lastrowid
+            await c.execute(
+                "UPDATE task_role_assignments "
+                "SET superseded_by = ? "
+                "WHERE task_id = ? AND role = ? AND id != ? "
+                "AND completed_at IS NULL AND superseded_by IS NULL",
+                (new_role_id, task_id, target_role, new_role_id),
+            )
+            displaced_target = [s for s in pre_displaced if s != assignee]
+            tasks_owner: str | None = old_owner
+            if next_stage == "execute":
+                tasks_owner = assignee
+            await c.execute(
+                "UPDATE tasks SET status = ?, owner = ?, "
+                "last_stage_change_at = ?, stale_alert_at = NULL, "
+                "stall_escalation_level = 0 "
+                "WHERE id = ? AND project_id = ?",
+                (next_stage, tasks_owner, now, task_id, project_id),
+            )
+            if next_stage == "execute":
+                await c.execute(
+                    "UPDATE agents SET current_task_id = ? "
+                    "WHERE id = ? AND current_task_id IS NULL",
+                    (task_id, assignee),
+                )
         await c.commit()
     finally:
         await c.close()
 
+    ts = datetime.now(timezone.utc).isoformat()
     await bus.publish({
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": ts,
         "agent_id": "human",
         "type": "task_stage_changed",
         "task_id": task_id,
         "from": old_status,
-        "to": req.stage,
-        "reason": "manual",
+        "to": next_stage,
+        "reason": "approve_stage_human",
+        "assignee": assignee,
         "note": req.note or None,
-        "owner": t["owner"],
+        "owner": assignee if next_stage == "execute" else None,
     })
-    return {"ok": True, "task_id": task_id, "from": old_status, "to": req.stage}
+    if next_stage != "archive" and target_role and assignee:
+        await bus.publish({
+            "ts": ts,
+            "agent_id": "human",
+            "type": "task_role_assigned",
+            "task_id": task_id,
+            "role": target_role,
+            "owner": assignee,
+            "to": assignee,
+            "note": req.note or None,
+        })
+
+    if displaced_source:
+        try:
+            await send_role_stand_down(
+                task_id=task_id,
+                role=_kanban_role_for_stage(old_status) or "",
+                displaced=displaced_source,
+                new_owners=[],
+            )
+        except Exception:
+            pass
+    if displaced_target and target_role:
+        try:
+            await send_role_stand_down(
+                task_id=task_id,
+                role=target_role,
+                displaced=displaced_target,
+                new_owners=[assignee] if assignee else [],
+            )
+        except Exception:
+            pass
+
+    if next_stage != "archive" and assignee:
+        from server.agents import maybe_wake_agent
+        wake_body = req.note or (
+            f"Human approved task {task_id} → stage "
+            f"{next_stage!r} ({target_role}). Read coord_my_assignments "
+            f"for the role context, do the work, then call the matching "
+            f"completion tool."
+        )
+        try:
+            await maybe_wake_agent(
+                assignee, wake_body,
+                bypass_debounce=True,
+                wake_source="kanban_approval_human",
+            )
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "from": old_status,
+        "to": next_stage,
+        "assignee": assignee,
+    }
+
+
+@app.post(
+    "/api/tasks/{task_id}/flag_deviation",
+    dependencies=[Depends(require_token)],
+)
+async def post_task_flag_deviation(
+    task_id: str, req: TaskFlagDeviationRequest
+) -> dict[str, Any]:
+    """Human-side deviation flag (Docs/kanban-specs-v2.md §22.1). Inserts
+    a `deviations_log` row with `noticed_at='human'` so the validation
+    instrumentation captures human-noticed drift alongside the audit-FAIL
+    + Coach-flagged paths."""
+    project_id = await resolve_active_project()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT owner FROM tasks WHERE id = ? AND project_id = ?",
+            (task_id, project_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(404, detail=f"task {task_id} not found")
+        executor = dict(row).get("owner") or "unknown"
+        ts = datetime.now(timezone.utc).isoformat()
+        cur = await c.execute(
+            "INSERT INTO deviations_log "
+            "(project_id, ts, task_id, executor, noticed_at, description) "
+            "VALUES (?, ?, ?, ?, 'human', ?)",
+            (project_id, ts, task_id, executor, req.description),
+        )
+        new_id = cur.lastrowid
+        await c.commit()
+    finally:
+        await c.close()
+    return {
+        "ok": True,
+        "deviation_id": new_id,
+        "task_id": task_id,
+        "executor": executor,
+    }
 
 
 # NOTE: POST /api/tasks/{id}/complexity was removed in v0.3 — routing
@@ -4523,129 +4731,89 @@ async def post_task_spec(
     return {"ok": True, "task_id": task_id, "spec_path": rel}
 
 
-@app.post(
-    "/api/tasks/{task_id}/assign", dependencies=[Depends(require_token)]
-)
-async def post_task_assign(
-    task_id: str, req: TaskAssignRequest
-) -> dict[str, Any]:
-    """Human-side role assignment — useful when Coach is asleep or
-    over-cap. Inserts a task_role_assignments row. `to` accepts a
-    single slot or a list (pool form). Same auto-wake behavior as
-    the Coach MCP tools."""
-    import json
-    from server.tools import VALID_RECIPIENTS  # noqa: WPS433
-    targets_raw = req.to
-    if isinstance(targets_raw, str):
-        targets = [targets_raw.strip().lower()] if targets_raw.strip() else []
-    else:
-        targets = [str(s).strip().lower() for s in targets_raw if str(s).strip()]
-    if not targets:
-        raise HTTPException(400, detail="'to' is empty")
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for slot in targets:
-        if slot in seen:
-            continue
-        seen.add(slot)
-        if slot in ("coach", "broadcast"):
-            raise HTTPException(
-                400, detail=f"can only assign Players (p1..p10), not {slot!r}"
-            )
-        if slot not in VALID_RECIPIENTS:
-            raise HTTPException(400, detail=f"invalid slot: {slot}")
-        deduped.append(slot)
+# POST /api/tasks/{id}/assign was removed in v2 — folded into
+# /api/tasks/{id}/approve_stage which now does the role-row plant
+# atomically with the stage transition. See Docs/kanban-specs-v2.md §8.
 
-    project_id = await resolve_active_project()
+
+# ------------------------------------------------------------------
+# Per-project event log (Docs/kanban-specs-v2.md §8 + §9.5)
+# ------------------------------------------------------------------
+
+
+@app.get(
+    "/api/projects/{project_id}/event_log",
+    dependencies=[Depends(require_token)],
+)
+async def get_project_event_log(
+    project_id: str,
+    actor: str | None = None,
+    type: str | None = None,
+    task_id: str | None = None,
+    since: str | None = None,
+    limit: int = 50,
+    include_read: bool = False,
+) -> dict[str, Any]:
+    """Paginated read of the per-project event log (Docs/kanban-specs-v2.md
+    §8 / §9.5). Coach's tick consumes the unread tail via its own
+    prompt-build path; humans browse via this endpoint.
+
+    Filters:
+      - actor: 'coach' / 'p1'..'p10' / 'compass' / 'system' / 'human'
+      - type: any project_events.type value
+      - task_id: filter to a single task
+      - since: ISO timestamp; rows with ts > since (exclusive)
+      - limit: default 50, max 200
+      - include_read: default false (only unread rows shown)
+
+    Does NOT stamp `read_by_coach_at` — that column is Coach-tick-
+    specific and is only stamped by the Coach prompt-build path.
+    """
+    if limit < 1:
+        limit = 1
+    if limit > 200:
+        limit = 200
+    where_parts: list[str] = ["project_id = ?"]
+    params: list[Any] = [project_id]
+    if actor:
+        where_parts.append("actor = ?")
+        params.append(actor.strip())
+    if type:
+        where_parts.append("type = ?")
+        params.append(type.strip())
+    if task_id:
+        where_parts.append("task_id = ?")
+        params.append(task_id.strip())
+    if since:
+        where_parts.append("ts > ?")
+        params.append(since.strip())
+    if not include_read:
+        where_parts.append("read_by_coach_at IS NULL")
+    where = " AND ".join(where_parts)
+    sql = (
+        f"SELECT id, project_id, ts, actor, type, task_id, "
+        f"payload_json, payload_pointer, read_by_coach_at "
+        f"FROM project_events WHERE {where} "
+        f"ORDER BY ts ASC, id ASC LIMIT ?"
+    )
+    params.append(limit)
     c = await configured_conn()
     try:
-        cur = await c.execute(
-            "SELECT status FROM tasks WHERE id = ? AND project_id = ?",
-            (task_id, project_id),
-        )
-        task_row = await cur.fetchone()
-        if task_row is None:
-            raise HTTPException(404, detail=f"task {task_id} not found")
-        task_status = dict(task_row).get("status")
-        if task_status == "archive":
-            raise HTTPException(
-                400, detail="archived tasks are read-only"
-            )
-        now = datetime.now(timezone.utc).isoformat()
-        if len(deduped) > 1:
-            insert_cur = await c.execute(
-                "INSERT INTO task_role_assignments "
-                "(task_id, role, eligible_owners, owner, assigned_at) "
-                "VALUES (?, ?, ?, NULL, ?)",
-                (task_id, req.role, json.dumps(deduped), now),
-            )
-        else:
-            insert_cur = await c.execute(
-                "INSERT INTO task_role_assignments "
-                "(task_id, role, eligible_owners, owner, "
-                "assigned_at, claimed_at) "
-                "VALUES (?, ?, '[]', ?, ?, ?)",
-                (task_id, req.role, deduped[0], now, now),
-            )
-        new_assignment_id = insert_cur.lastrowid
-        if (
-            req.role in ("auditor_syntax", "auditor_semantics")
-            and new_assignment_id
-        ):
-            await c.execute(
-                "UPDATE task_role_assignments SET superseded_by = ? "
-                "WHERE task_id = ? AND role = ? AND id <> ? "
-                "AND verdict = 'fail' AND completed_at IS NOT NULL "
-                "AND superseded_by IS NULL",
-                (new_assignment_id, task_id, req.role, new_assignment_id),
-            )
-        await c.commit()
+        cur = await c.execute(sql, params)
+        rows = [dict(r) for r in await cur.fetchall()]
     finally:
         await c.close()
-
-    await bus.publish({
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "agent_id": "human",
-        "type": "task_role_assigned",
-        "task_id": task_id,
-        "role": req.role,
-        "eligible_owners": deduped,
-        "owner": (None if len(deduped) > 1 else deduped[0]),
-        "to": (deduped[0] if len(deduped) == 1 else None),
-    })
-
-    # Auto-wake eligible Players (best-effort).
-    role_stage = {
-        "planner": "plan",
-        "executor": "plan",
-        "auditor_syntax": "audit_syntax",
-        "auditor_semantics": "audit_semantics",
-        "shipper": "ship",
-    }.get(req.role)
-    if role_stage == task_status:
+    # Parse payload_json so the API consumer doesn't have to.
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        body = r.get("payload_json") or "{}"
         try:
-            from server.agents import maybe_wake_agent
-            if len(deduped) > 1:
-                wake_text = (
-                    f"Human called you as a candidate for {req.role} "
-                    f"on task {task_id}. Call coord_accept_role("
-                    f"task_id={task_id!r}, role={req.role!r}) if you "
-                    f"can take it; first accepted claim wins."
-                )
-            else:
-                wake_text = (
-                    f"Human assigned you the {req.role} role on task {task_id}. "
-                    f"Call coord_my_assignments to see context."
-                )
-            for slot in deduped:
-                try:
-                    await maybe_wake_agent(slot, wake_text, bypass_debounce=True)
-                except Exception:
-                    pass
+            r["payload"] = json.loads(body)
         except Exception:
-            pass
-
-    return {"ok": True, "task_id": task_id, "role": req.role, "to": deduped}
+            r["payload"] = {}
+        r.pop("payload_json", None)
+        out.append(r)
+    return {"events": out, "limit": limit, "include_read": include_read}
 
 
 # ------------------------------------------------------------------

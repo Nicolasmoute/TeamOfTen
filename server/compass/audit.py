@@ -1,4 +1,4 @@
-"""Audit subsystem (spec §5).
+﻿"""Audit subsystem (spec §5).
 
 Coach calls `compass_audit(artifact)` whenever a worker produces a
 meaningful unit of work. Compass returns a verdict and writes it to
@@ -17,7 +17,7 @@ the most recent N audits for region drift. If many recent audits in
 the same region drifted, queue a meta-question — the lattice may be
 wrong, not the work.
 
-**Audit reports as .md files** (Docs/kanban-specs.md §5.3): every
+**Audit reports as .md files** (Docs/kanban-specs-v2.md §5.3): every
 audit also writes a standalone markdown report to
 `<compass_root>/audit_reports/<audit_id>.md`, mirrored to kDrive at
 the same relative path. The .md is the human-readable surface

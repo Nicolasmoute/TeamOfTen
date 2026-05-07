@@ -124,12 +124,15 @@ prompt from project state, with priority:
 
 1. **Inbox + active problems** — if Coach has unread human messages or
    unread Player updates, address those. Then scan the
-   `## Active task health` and `## Stalled tasks` rollups (injected
-   into the system prompt by the kanban observer — see
-   [kanban-specs.md](kanban-specs.md) §17, §18) and intervene on
-   anything before the auto-actions fire (auto-reassign at 2h,
-   auto-archive at 4h). The escalation ladder is a safety net, not a
-   plan; Coach should beat it whenever possible.
+   `## Active task health` and `## Stalled tasks` rollups (along with
+   the `## Player health`, `## Audit history`, `## Recent patterns`,
+   and `## Recent events` blocks injected into the system prompt by
+   the kanban observer — see [kanban-specs-v2.md](kanban-specs-v2.md)
+   §11, §14) and intervene on anything before the auto-actions fire
+   (auto-reassign at 2h, auto-archive at 4h). The escalation ladder
+   is a safety net, not a plan; Coach should beat it whenever
+   possible. Stage transitions themselves require Coach to call
+   `coord_approve_stage` — the kanban records, Coach routes.
 2. **Todos** — for each open `coach-todos.md` entry, find the smallest
    movable next step and take it. External blockers (pending user
    verdict, prod soak, Player unavailable, env issues outside scope)

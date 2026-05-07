@@ -24,15 +24,18 @@ Dependent specs (subordinate to this document):
   `project-objectives.md`).
 - `Docs/compass-specs.md` — Compass autonomous strategy engine
   (lattice, regions, truth corpus, audits, briefings).
-- `Docs/kanban-specs.md` — Kanban-shaped task lifecycle. Every Coach
-  delegation is a tracked task; routing is driven by an explicit
-  `trajectory` Coach defines on `coord_create_task` (ordered list of
-  `{stage, to}` dicts). Stages: plan → execute → audit_syntax →
-  audit_semantics → ship → archive. Strict role separation (Coach
-  plans by delegation; Players execute, review, ship). Stall sweeper
-  surfaces tasks with no progress under Coach's `## Stalled tasks`
-  block; `GET /api/tasks/flow_health` exposes per-stage counts +
-  subscriber liveness for human inspection.
+- `Docs/kanban-specs-v2.md` — Kanban-shaped task lifecycle (shape (2)
+  routing through Coach). Every Coach delegation is a tracked task;
+  the kanban records and surfaces but does not auto-route. Coach
+  reviews every stage transition via `coord_approve_stage` unless the
+  task is created with `auto_advance: true` (mechanical fast-path).
+  Trajectory Coach defines on `coord_create_task` is the planned
+  contract; pools are advisory (Coach assigns one named Player).
+  Stages: plan → execute → audit_syntax → audit_semantics → ship →
+  archive. A new per-project event log feeds Coach's tick context;
+  pattern-detection counters (Player health, audit aggregator,
+  push-time deviation flag, recent-patterns block) surface drift
+  proactively. v1 archive at `Docs/kanban-specs-v1-archived.md`.
 
 These docs are subordinate: when a dependent disagrees with this one,
 TOT-specs.md wins. Dependents may go deeper on their own subject but
@@ -4110,7 +4113,7 @@ implementation):
 | `HARNESS_STALE_TASK_CHECK_INTERVAL_SECONDS` | `60` | Watchdog loop cadence |
 | `HARNESS_AUTO_COMPACT_THRESHOLD` | `0.7` | Context fraction for auto-compact |
 | `HARNESS_HANDOFF_TOKEN_BUDGET` | `20000` | Recent exchange budget |
-| `HARNESS_STREAM_TOKENS` | unset | Enable token delta streaming |
+| `HARNESS_STREAM_TOKENS` | `true` | Token delta streaming. Set to `false`/`0`/`no`/`off` to disable (only needed for the rare CLI build that crashes on the underlying flag). |
 | `HARNESS_INTERACTION_TIMEOUT_SECONDS` | `1800` | Question/plan timeout |
 | `HARNESS_MCP_CONFIG` | unset | **Legacy.** Path to a static MCP server JSON file. Removed from `.env.example`; the `mcp_servers` table (Options drawer → MCP servers) is the source of truth. DB entries override file entries when both exist. |
 | `HARNESS_SECRETS_KEY` | unset | Fernet master key |

@@ -6847,6 +6847,7 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, active
           onDismissAll=${onDismissAllAttention}
         />
         <${EnvOverridesSection} agents=${agents} />
+        <${EnvPlayerHealthSection} conversations=${conversations} activeProjectId=${activeProjectId} />
         <${EnvKDriveStatusSection} conversations=${conversations} />
         ${openSlots.includes("__kanban")
           ? null
@@ -6967,6 +6968,78 @@ function saveDismissedAttention(ids) {
     // disabled localStorage — silent no-op.
   }
 }
+
+// v2 §15.3 — Player health counters surfaced for the human alongside
+// Coach's prompt-block view. Hidden when every Player's three
+// counters are zero. Refreshes on a project switch, on the events
+// that move the counters (audit fail, deviation flag, commit), and
+// on a 5-minute timer fallback. Calls `/api/team/player_health`.
+function EnvPlayerHealthSection({ conversations, activeProjectId }) {
+  const [rows, setRows] = useState([]);
+  const refresh = useCallback(async () => {
+    try {
+      const res = await authFetch("/api/team/player_health");
+      if (!res.ok) return;
+      const data = await res.json();
+      setRows(Array.isArray(data?.rows) ? data.rows : []);
+    } catch (_) {
+      // Failure-isolated; UI hides on empty rows.
+    }
+  }, []);
+  useEffect(() => { refresh(); }, [refresh, activeProjectId]);
+  useEffect(() => {
+    if (!conversations) return;
+    const triggers = new Set([
+      "audit_report_submitted", "audit_fail_notification",
+      "commit_pushed", "deviation_flagged", "task_archived",
+    ]);
+    let dirty = false;
+    Object.values(conversations || {}).forEach((evts) => {
+      (evts || []).slice(-3).forEach((e) => {
+        if (triggers.has(e?.type)) dirty = true;
+      });
+    });
+    if (dirty) refresh();
+  }, [conversations, refresh]);
+  useEffect(() => {
+    const id = setInterval(refresh, 5 * 60 * 1000);
+    return () => clearInterval(id);
+  }, [refresh]);
+
+  if (!rows.length) return null;
+  return html`
+    <section class="env-section env-player-health">
+      <h3>Player health (last 30d)</h3>
+      <table class="env-player-health-table">
+        <thead>
+          <tr>
+            <th>Slot</th>
+            <th title="Audit FAIL rounds against this Player as executor">Dev</th>
+            <th title="Commits pushed before audit completed for the round">Push&lt;A</th>
+            <th title="Deviations flagged at push or audit time">Off-spec</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.map(
+            (r) => html`
+              <tr key=${r.slot}>
+                <td>${r.slot}</td>
+                <td>${r.deviations}</td>
+                <td>${r.push_before_audit}</td>
+                <td>${r.off_spec_completions}</td>
+              </tr>
+            `
+          )}
+        </tbody>
+      </table>
+      <p class="env-hint">
+        From 2 deviations on a Player, treat quality as the bottleneck:
+        bump effort first, then model tier. Never change runtime.
+      </p>
+    </section>
+  `;
+}
+
 
 // Source of truth for `open`, `onDismiss`, `onDismissAll` lives in
 // App scope so the env-toggle dot + auto-pop-open work without the
@@ -10348,7 +10421,8 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
       case "/tools": {
         const coach = [
           "Read · Grep · Glob · ToolSearch",
-          "coord_list_tasks · coord_create_task · coord_assign_task · coord_update_task",
+          "coord_list_tasks · coord_create_task · coord_update_task",
+          "coord_approve_stage · coord_archive_task · coord_request_plan_review",
           "coord_send_message · coord_read_inbox",
           "coord_list_memory · coord_read_memory · coord_update_memory",
           "coord_write_decision · coord_write_context",
@@ -10357,7 +10431,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
         ];
         const player = [
           "Read · Grep · Glob · ToolSearch · Write · Edit · Bash",
-          "coord_list_tasks · coord_create_task · coord_claim_task · coord_update_task",
+          "coord_list_tasks · coord_role_complete · coord_update_task",
           "coord_send_message · coord_read_inbox",
           "coord_list_memory · coord_read_memory · coord_update_memory",
           "coord_write_knowledge · coord_read_knowledge · coord_list_knowledge",

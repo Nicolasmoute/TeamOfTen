@@ -503,6 +503,34 @@ async def trim_events_once() -> int:
             "events trim: deleted %d rows older than %s (retention=%dd)",
             deleted, cutoff_iso, EVENTS_RETENTION_DAYS,
         )
+    # v2 §9.4: sibling pass for project_events. Same cutoff math; same
+    # safety guarantees. Ignored when the v2 retention env is set to 0.
+    raw_v2 = os.environ.get(
+        "HARNESS_PROJECT_EVENTS_RETENTION_DAYS",
+        str(EVENTS_RETENTION_DAYS),
+    )
+    try:
+        v2_retention = int(raw_v2)
+    except ValueError:
+        v2_retention = EVENTS_RETENTION_DAYS
+    if v2_retention > 0:
+        cutoff_v2 = datetime.now(timezone.utc) - timedelta(days=v2_retention)
+        cutoff_v2_iso = cutoff_v2.isoformat()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "DELETE FROM project_events WHERE ts < ?", (cutoff_v2_iso,)
+            )
+            v2_deleted = cur.rowcount
+            await c.commit()
+        finally:
+            await c.close()
+        if v2_deleted:
+            logger.info(
+                "project_events trim: deleted %d rows older than %s "
+                "(retention=%dd)",
+                v2_deleted, cutoff_v2_iso, v2_retention,
+            )
     return deleted
 
 

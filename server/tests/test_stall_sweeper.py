@@ -176,16 +176,19 @@ async def test_stall_nudge_for_audit_semantics_names_submit_audit_report(
     assert "coord_commit_push" not in nudge
 
 
-async def test_stall_nudge_for_ship_names_mark_shipped(
+async def test_stall_nudge_for_ship_names_role_complete(
     fresh_db: str,
 ) -> None:
+    """v2: ship-stage stall nudge points at coord_role_complete (the
+    v2 collapsed completion tool); v1's coord_mark_shipped is gone."""
     from server.idle_poller import _stall_nudge_for_stage
     nudge = _stall_nudge_for_stage(
         task_id="t-2026-05-04-aaaaaaaa",
         stage="ship",
         age_min=5,
     )
-    assert "coord_mark_shipped" in nudge
+    assert "coord_role_complete" in nudge
+    assert "coord_mark_shipped" not in nudge
     assert "coord_commit_push" not in nudge
 
 

@@ -172,28 +172,27 @@ async def test_working_status_not_woken(
 
 # ---------------------------------------------------------------- happy path
 
-async def test_eligible_pool_task_wakes_player(
+async def test_v2_pool_task_does_not_wake(
     fresh_db: str, wake_stub: WakeRecorder
 ) -> None:
+    """v2 §10.1: pools are FYI only; the idle poller never wakes
+    Players based on pool eligibility. Hard-assigned rows still drive
+    re-wakes (covered by test_hard_assigned_pending_role_wakes_player)."""
     await init_db()
     await _seed_pool_task(
         task_id="t-2026-05-03-aaaaaaaa", eligible=["p3", "p4"]
     )
     woken = await sweep_once()
-    # Both p3 and p4 are eligible + free → both get woken.
-    assert woken == 2
-    slots = sorted(c[0] for c in wake_stub.calls)
-    assert slots == ["p3", "p4"]
-    # Wake prompt mentions coord_my_assignments.
-    for _slot, prompt in wake_stub.calls:
-        assert "coord_my_assignments" in prompt
+    assert woken == 0
+    assert wake_stub.calls == []
 
 
 async def test_debounced_wake_does_not_stamp_or_emit(
     fresh_db: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If maybe_wake_agent declines the wake, the poller must not stamp
-    last_idle_wake_at or count the slot as woken."""
+    last_idle_wake_at or count the slot as woken. Uses a hard-assigned
+    auditor row (the v2 surviving wake path)."""
     calls: list[str] = []
 
     async def fake_wake(slot: str, prompt: str, **kwargs: Any) -> bool:
@@ -202,8 +201,8 @@ async def test_debounced_wake_does_not_stamp_or_emit(
 
     monkeypatch.setattr(agents_mod, "maybe_wake_agent", fake_wake)
     await init_db()
-    await _seed_pool_task(
-        task_id="t-2026-05-03-aaaabbbb", eligible=["p3"]
+    await _seed_hard_assign(
+        task_id="t-2026-05-03-aaaabbbb", role="auditor_syntax", owner="p3",
     )
 
     woken = await sweep_once()
@@ -239,8 +238,10 @@ async def test_hard_assigned_pending_role_wakes_player(
 async def test_grace_period_skips_freshly_assigned(
     fresh_db: str, wake_stub: WakeRecorder
 ) -> None:
-    """A pool task assigned moments ago should be skipped — give the
-    initial assign-time wake a head start."""
+    """v2: pools are FYI only, so a freshly pool-assigned slot
+    likewise doesn't fire a poller wake. The slot may still see a
+    stall-ladder rung 3 alternative-pick after Coach has been silent
+    for ≥1h, but that path is in test_stall_escalation_ladder.py."""
     from datetime import datetime, timezone
     await init_db()
     just_now = datetime.now(timezone.utc).isoformat()
@@ -260,12 +261,15 @@ async def test_per_player_debounce(
     fresh_db: str, wake_stub: WakeRecorder, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A Player who was just woken by the poller shouldn't be re-woken
-    on the next sweep within the debounce window."""
+    on the next sweep within the debounce window. Uses a hard-assigned
+    role (the v2 surviving wake path)."""
     from datetime import datetime, timezone
     monkeypatch.setenv("HARNESS_IDLE_POLL_DEBOUNCE_SECONDS", "1800")
     await init_db()
-    await _seed_pool_task(
-        task_id="t-2026-05-03-dddddddd", eligible=["p3"]
+    await _seed_hard_assign(
+        task_id="t-2026-05-03-dddddddd",
+        role="auditor_syntax",
+        owner="p3",
     )
     # Pre-stamp last_idle_wake_at to "just now".
     just_now = datetime.now(timezone.utc).isoformat()
@@ -285,12 +289,13 @@ async def test_per_player_debounce(
 async def test_debounce_window_zero_means_always_wake(
     fresh_db: str, wake_stub: WakeRecorder, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Setting the debounce window to 0 disables the debounce check."""
+    """Setting the debounce window to 0 disables the debounce check.
+    Uses a hard-assigned shipper row (v2 surviving wake path)."""
     from datetime import datetime, timezone
     monkeypatch.setenv("HARNESS_IDLE_POLL_DEBOUNCE_SECONDS", "0")
     await init_db()
-    await _seed_pool_task(
-        task_id="t-2026-05-03-eeeeeeee", eligible=["p3"]
+    await _seed_hard_assign(
+        task_id="t-2026-05-03-eeeeeeee", role="shipper", owner="p3",
     )
     just_now = datetime.now(timezone.utc).isoformat()
     c = await configured_conn()
@@ -321,13 +326,16 @@ def test_feature_flag_default_enabled(monkeypatch) -> None:
 
 # ---------------------------------------------------------------- _has_available_work
 
-async def test_has_available_work_returns_pool_reason(fresh_db: str) -> None:
+async def test_has_available_work_pool_returns_none(fresh_db: str) -> None:
+    """v2 §10.1: pools are FYI only — _has_available_work skips the
+    pool branch entirely and returns None when only a pool-eligible
+    row exists for the slot."""
     await init_db()
     await _seed_pool_task(
         task_id="t-2026-05-03-ffffffff", eligible=["p3"]
     )
     out = await _has_available_work("p3")
-    assert out == ("pool_task_available", "t-2026-05-03-ffffffff")
+    assert out is None
 
 
 async def test_has_available_work_returns_pending_role_reason(

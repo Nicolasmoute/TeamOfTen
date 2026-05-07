@@ -1,8 +1,8 @@
-"""Compass audit watcher — auto-fires `compass_audit` on kanban plan exits.
+﻿"""Compass audit watcher — auto-fires `compass_audit` on kanban plan exits.
 
 Compass is a COMPASS OF INTENT — its job is to check that a task's
 PLAN aligns with the project's intent (the lattice + corpus). The
-kanban v0.3 lifecycle (Docs/kanban-specs.md) already runs syntactic +
+kanban v0.3 lifecycle (Docs/kanban-specs-v2.md) already runs syntactic +
 semantic Player audits and shipper review on every stage transition;
 those check that EXECUTION aligns with the plan. Compass sits one
 layer up: the upstream check that the plan even pursues the right

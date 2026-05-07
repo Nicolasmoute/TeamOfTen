@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import json
@@ -986,6 +986,20 @@ async def _handle_message(
                 entry_prompt = (turn_ctx.get("entry_prompt") or "").strip()
                 if response_text and entry_prompt:
                     await _append_exchange(agent_id, entry_prompt, response_text)
+                # Kanban v2 (§9.3): stamp `read_by_coach_at` on every
+                # project_events row Coach's prompt surfaced this turn.
+                # Failed-turn ids stay unread (we never reach this
+                # branch) and roll forward to the next tick.
+                surfaced_ids = turn_ctx.get("surfaced_event_ids") or []
+                if surfaced_ids:
+                    try:
+                        await _stamp_events_read_by_coach(
+                            list(surfaced_ids)
+                        )
+                    except Exception:
+                        logger.exception(
+                            "stamp_events_read_by_coach call failed"
+                        )
         usage = _extract_usage(msg)
         if turn_ctx is not None:
             # Self-adapting window estimate: if this turn read more
@@ -2452,7 +2466,7 @@ async def _audit_report_path_already_recorded(
 async def _build_soft_stalls_rows(
     project_id: str,
 ) -> list[dict[str, Any]]:
-    """Recent watchdog findings (Docs/kanban-specs.md §10.7) — soft
+    """Recent watchdog findings (Docs/kanban-specs-v2.md §10.7) — soft
     stalls flagged by the Haiku-tiered watchdog: agents that declared
     completion in chat without advancing the kanban, agents looping
     or erroring, etc.
@@ -2562,7 +2576,606 @@ async def _watchdog_finding_already_resolved(
     return False
 
 
-async def _build_coach_coordination_block() -> str:
+# ----------------------------------------------------------------------
+# Kanban v2 prompt blocks (Docs/kanban-specs-v2.md §11.1, §11.2, §11.3,
+# §9.3). Each builder returns a markdown string (or "" when there's
+# nothing to render). They're called from `_build_coach_coordination_block`
+# in the §14 order.
+# ----------------------------------------------------------------------
+
+
+async def compute_player_health_counters(
+    project_id: str,
+) -> list[dict[str, Any]]:
+    """Player health counters (§11.1, §15.3). Last 30 days. Returns a
+    list of {slot, deviations, push_before_audit, off_spec_completions}
+    rows, one per Player with at least one non-zero counter. Empty list
+    when every Player's three counters are zero. Shared between the
+    Coach prompt block and the `/api/team/player_health` endpoint."""
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT t.owner AS slot, COUNT(*) AS n "
+                "FROM task_role_assignments r "
+                "JOIN tasks t ON t.id = r.task_id "
+                "WHERE t.project_id = ? "
+                "AND r.role IN ('auditor_syntax', 'auditor_semantics') "
+                "AND r.verdict = 'fail' "
+                "AND r.completed_at >= datetime('now', '-30 days') "
+                "AND t.owner IS NOT NULL "
+                "GROUP BY t.owner",
+                (project_id,),
+            )
+            deviations = {
+                dict(r)["slot"]: int(dict(r)["n"]) for r in await cur.fetchall()
+            }
+            cur = await c.execute(
+                "SELECT executor AS slot, COUNT(*) AS n "
+                "FROM deviations_log "
+                "WHERE project_id = ? "
+                "AND noticed_at IN ('push', 'audit') "
+                "AND ts >= datetime('now', '-30 days') "
+                "GROUP BY executor",
+                (project_id,),
+            )
+            off_spec = {
+                dict(r)["slot"]: int(dict(r)["n"]) for r in await cur.fetchall()
+            }
+            cur = await c.execute(
+                """
+                SELECT e.agent_id AS slot, COUNT(*) AS n
+                FROM events e
+                WHERE e.type = 'commit_pushed'
+                  AND e.project_id = ?
+                  AND e.ts >= datetime('now', '-30 days')
+                  AND json_extract(e.payload, '$.task_id') IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM task_role_assignments r2
+                      WHERE r2.task_id = json_extract(e.payload, '$.task_id')
+                      AND r2.role IN ('auditor_syntax', 'auditor_semantics')
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_role_assignments r3
+                      WHERE r3.task_id = json_extract(e.payload, '$.task_id')
+                      AND r3.role IN ('auditor_syntax', 'auditor_semantics')
+                      AND r3.verdict = 'pass'
+                      AND r3.completed_at >= e.ts
+                  )
+                GROUP BY e.agent_id
+                """,
+                (project_id,),
+            )
+            push_before = {
+                dict(r)["slot"]: int(dict(r)["n"]) for r in await cur.fetchall()
+            }
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("player_health: query failed")
+        return []
+    out: list[dict[str, Any]] = []
+    for slot in sorted(set(deviations) | set(push_before) | set(off_spec)):
+        d = int(deviations.get(slot, 0))
+        p = int(push_before.get(slot, 0))
+        o = int(off_spec.get(slot, 0))
+        if d == 0 and p == 0 and o == 0:
+            continue
+        out.append({
+            "slot": slot,
+            "deviations": d,
+            "push_before_audit": p,
+            "off_spec_completions": o,
+        })
+    return out
+
+
+async def _build_player_health_block(project_id: str) -> str:
+    """Player health counters (§11.1). Computed at prompt-build from
+    existing tables — no separate counter table. Last 30 days, active
+    project. Returns "" when every Player's three counters are zero
+    so the prompt stays quiet on a healthy team.
+    """
+    try:
+        c = await configured_conn()
+        try:
+            # deviations: distinct audit FAIL rounds per executor
+            cur = await c.execute(
+                "SELECT t.owner AS slot, COUNT(*) AS n "
+                "FROM task_role_assignments r "
+                "JOIN tasks t ON t.id = r.task_id "
+                "WHERE t.project_id = ? "
+                "AND r.role IN ('auditor_syntax', 'auditor_semantics') "
+                "AND r.verdict = 'fail' "
+                "AND r.completed_at >= datetime('now', '-30 days') "
+                "AND t.owner IS NOT NULL "
+                "GROUP BY t.owner",
+                (project_id,),
+            )
+            deviations = {dict(r)["slot"]: int(dict(r)["n"]) for r in await cur.fetchall()}
+
+            # off_spec_completion_count: deviations_log rows with
+            # noticed_at IN ('push', 'audit') for this Player as
+            # executor.
+            cur = await c.execute(
+                "SELECT executor AS slot, COUNT(*) AS n "
+                "FROM deviations_log "
+                "WHERE project_id = ? "
+                "AND noticed_at IN ('push', 'audit') "
+                "AND ts >= datetime('now', '-30 days') "
+                "GROUP BY executor",
+                (project_id,),
+            )
+            off_spec = {dict(r)["slot"]: int(dict(r)["n"]) for r in await cur.fetchall()}
+
+            # push_before_audit_count: commit_pushed events from this
+            # slot where the task had any auditor role row planted but
+            # no audit_report_submitted{verdict='pass'} for the current
+            # execute round at commit time. Approximated via the events
+            # table — the precise read would require timeline cross-
+            # referencing per commit, which is expensive at prompt-build.
+            # The approximation: count `commit_pushed` events whose
+            # task has ANY auditor role row planted, filtered by ts.
+            cur = await c.execute(
+                """
+                SELECT e.agent_id AS slot, COUNT(*) AS n
+                FROM events e
+                WHERE e.type = 'commit_pushed'
+                  AND e.project_id = ?
+                  AND e.ts >= datetime('now', '-30 days')
+                  AND json_extract(e.payload, '$.task_id') IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM task_role_assignments r2
+                      WHERE r2.task_id = json_extract(e.payload, '$.task_id')
+                      AND r2.role IN ('auditor_syntax', 'auditor_semantics')
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_role_assignments r3
+                      WHERE r3.task_id = json_extract(e.payload, '$.task_id')
+                      AND r3.role IN ('auditor_syntax', 'auditor_semantics')
+                      AND r3.verdict = 'pass'
+                      AND r3.completed_at >= e.ts
+                  )
+                GROUP BY e.agent_id
+                """,
+                (project_id,),
+            )
+            push_before = {dict(r)["slot"]: int(dict(r)["n"]) for r in await cur.fetchall()}
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("player_health: query failed")
+        return ""
+
+    slots = sorted(set(deviations) | set(push_before) | set(off_spec))
+    if not slots:
+        return ""
+    rows: list[tuple[str, int, int, int]] = []
+    for slot in slots:
+        d = int(deviations.get(slot, 0))
+        p = int(push_before.get(slot, 0))
+        o = int(off_spec.get(slot, 0))
+        if d == 0 and p == 0 and o == 0:
+            continue
+        rows.append((slot, d, p, o))
+    if not rows:
+        return ""
+    out: list[str] = []
+    out.append("## Player health (last 30 days, active project)")
+    out.append("")
+    out.append("| Slot | Deviations | Pushes-before-audit | Off-spec completions |")
+    out.append("|------|------------|---------------------|----------------------|")
+    for slot, d, p, o in rows:
+        out.append(f"| {slot:<4} | {d:<10} | {p:<19} | {o:<20} |")
+    out.append("")
+    out.append(
+        "Counters surface for proactive effort/model bumps. From "
+        "deviations >= 2 on a Player, treat quality as the bottleneck: "
+        "bump effort first via coord_set_player_effort, then model tier "
+        "via coord_set_player_model. NEVER change runtime."
+    )
+    out.append("")
+    return "\n".join(out)
+
+
+async def _build_audit_aggregator_rows(project_id: str) -> str:
+    """Audit aggregator (§11.2). For every active task with audit
+    history, render a compact audit-trajectory block. Capped at 8
+    active tasks. Returns "" when no active task has audit history.
+    """
+    try:
+        c = await configured_conn()
+        try:
+            # Find up to 8 active tasks that have at least one auditor
+            # role row.
+            cur = await c.execute(
+                """
+                SELECT t.id, t.title, t.owner
+                FROM tasks t
+                WHERE t.project_id = ?
+                  AND t.status != 'archive'
+                  AND EXISTS (
+                      SELECT 1 FROM task_role_assignments r
+                      WHERE r.task_id = t.id
+                      AND r.role IN ('auditor_syntax', 'auditor_semantics')
+                  )
+                ORDER BY t.created_at DESC
+                LIMIT 8
+                """,
+                (project_id,),
+            )
+            tasks = [dict(r) for r in await cur.fetchall()]
+            if not tasks:
+                return ""
+            task_ids = [t["id"] for t in tasks]
+            placeholders = ",".join("?" * len(task_ids))
+            cur = await c.execute(
+                f"SELECT task_id, role, owner, verdict, report_path, "
+                f"completed_at, assigned_at "
+                f"FROM task_role_assignments "
+                f"WHERE task_id IN ({placeholders}) "
+                f"AND role IN ('auditor_syntax', 'auditor_semantics') "
+                f"ORDER BY task_id, role, assigned_at",
+                task_ids,
+            )
+            rows_by_task: dict[str, list[dict[str, Any]]] = {tid: [] for tid in task_ids}
+            for r in await cur.fetchall():
+                d = dict(r)
+                rows_by_task[d["task_id"]].append(d)
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("audit_aggregator: query failed")
+        return ""
+
+    out: list[str] = []
+    out.append("## Audit history (active tasks)")
+    out.append("")
+    rendered_any = False
+    for t in tasks:
+        rows = rows_by_task.get(t["id"], [])
+        if not rows:
+            continue
+        rendered_any = True
+        out.append(
+            f"- {t['id']} \"{(t.get('title') or '').strip()[:60]}\" "
+            f"(executor {t.get('owner') or '—'}):"
+        )
+        round_counter: dict[str, int] = {"auditor_syntax": 0, "auditor_semantics": 0}
+        for r in rows:
+            role = r.get("role") or "?"
+            kind = "syntax" if role == "auditor_syntax" else "semantic"
+            round_counter[role] = round_counter.get(role, 0) + 1
+            verdict = (r.get("verdict") or "pending").upper()
+            owner = r.get("owner") or "—"
+            summary = _read_audit_summary(r.get("report_path") or "")
+            summary_clause = f' — "{summary}"' if summary else ""
+            if r.get("completed_at"):
+                out.append(
+                    f"  - {kind} round {round_counter[role]}: "
+                    f"{verdict}{summary_clause}"
+                )
+            else:
+                out.append(
+                    f"  - {kind} round {round_counter[role]}: "
+                    f"pending (auditor {owner})"
+                )
+    out.append("")
+    return "\n".join(out) if rendered_any else ""
+
+
+def _read_audit_summary(report_path: str) -> str:
+    """Best-effort read of the `## Summary` (or first heading body) from
+    an audit report markdown file. Returns up to 160 chars with no
+    newlines, or "" on any failure."""
+    if not report_path:
+        return ""
+    try:
+        from pathlib import Path
+        from server.paths import DATA_ROOT
+        p = Path(report_path)
+        if not p.is_absolute():
+            p = DATA_ROOT / report_path
+        if not p.is_file():
+            return ""
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    needle = "## Summary"
+    idx = text.find(needle)
+    if idx < 0:
+        # No `## Summary` heading — pick the first non-empty paragraph
+        # after the frontmatter as a fallback.
+        if text.startswith("---\n"):
+            close = text.find("\n---\n", 4)
+            if close > 0:
+                text = text[close + 5 :]
+        text = text.lstrip()
+    else:
+        text = text[idx + len(needle) :].lstrip()
+    body = text.split("\n\n", 1)[0]
+    body = " ".join(line.strip() for line in body.splitlines() if line.strip())
+    if not body:
+        return ""
+    return body[:160] + ("…" if len(body) > 160 else "")
+
+
+async def _build_recent_patterns_block(project_id: str) -> str:
+    """Recent patterns (§11.3). Last `HARNESS_RECENT_PATTERNS_WINDOW_HOURS`
+    (default 24h). Bounded at 5 lines. Returns "" when there's nothing
+    to flag.
+    """
+    try:
+        hours = int(os.environ.get("HARNESS_RECENT_PATTERNS_WINDOW_HOURS", "24"))
+    except (TypeError, ValueError):
+        hours = 24
+    if hours < 1:
+        hours = 1
+    cutoff = f"-{hours} hours"
+    findings: list[str] = []
+    try:
+        c = await configured_conn()
+        try:
+            # Repeat audit fails: same task, same kind, ≥ 2 rounds.
+            cur = await c.execute(
+                """
+                SELECT t.id AS task_id, t.title, r.role, COUNT(*) AS n
+                FROM task_role_assignments r
+                JOIN tasks t ON t.id = r.task_id
+                WHERE t.project_id = ?
+                  AND r.role IN ('auditor_syntax', 'auditor_semantics')
+                  AND r.verdict = 'fail'
+                  AND r.completed_at >= datetime('now', ?)
+                GROUP BY t.id, r.role
+                HAVING n >= 2
+                ORDER BY n DESC
+                LIMIT 3
+                """,
+                (project_id, cutoff),
+            )
+            for r in await cur.fetchall():
+                d = dict(r)
+                kind = "syntax" if d["role"] == "auditor_syntax" else "semantic"
+                title = (d.get("title") or "").strip()[:50]
+                findings.append(
+                    f"- {d['task_id']} \"{title}\" — {d['n']} {kind} fails; "
+                    f"escalate via effort bump or re-spec."
+                )
+
+            # Players with deviations >= 3 in the window (any executor
+            # who took >= 3 audit FAILs across all their tasks).
+            cur = await c.execute(
+                """
+                SELECT t.owner AS slot, COUNT(*) AS n
+                FROM task_role_assignments r
+                JOIN tasks t ON t.id = r.task_id
+                WHERE t.project_id = ?
+                  AND r.role IN ('auditor_syntax', 'auditor_semantics')
+                  AND r.verdict = 'fail'
+                  AND r.completed_at >= datetime('now', ?)
+                  AND t.owner IS NOT NULL
+                GROUP BY t.owner
+                HAVING n >= 3
+                ORDER BY n DESC
+                LIMIT 3
+                """,
+                (project_id, cutoff),
+            )
+            for r in await cur.fetchall():
+                d = dict(r)
+                findings.append(
+                    f"- {d['slot']} has {d['n']} audit fails in the window; "
+                    f"consider effort bump."
+                )
+
+            # commit_without_task_id_warning from same Player.
+            cur = await c.execute(
+                """
+                SELECT json_extract(payload, '$.committer') AS slot,
+                       COUNT(*) AS n
+                FROM events
+                WHERE type = 'commit_without_task_id_warning'
+                  AND project_id = ?
+                  AND ts >= datetime('now', ?)
+                GROUP BY json_extract(payload, '$.committer')
+                HAVING n >= 2
+                ORDER BY n DESC
+                LIMIT 2
+                """,
+                (project_id, cutoff),
+            )
+            for r in await cur.fetchall():
+                d = dict(r)
+                slot = d.get("slot") or "(unknown)"
+                findings.append(
+                    f"- {slot} pushed without a task_id {d['n']} times in "
+                    f"the window; clarify their workflow."
+                )
+
+            # Compass confident_drift in the same region.
+            cur = await c.execute(
+                """
+                SELECT json_extract(payload, '$.region') AS region,
+                       COUNT(*) AS n
+                FROM events
+                WHERE type = 'compass_audit_logged'
+                  AND project_id = ?
+                  AND json_extract(payload, '$.verdict') = 'confident_drift'
+                  AND ts >= datetime('now', ?)
+                GROUP BY json_extract(payload, '$.region')
+                HAVING n >= 2
+                ORDER BY n DESC
+                LIMIT 2
+                """,
+                (project_id, cutoff),
+            )
+            for r in await cur.fetchall():
+                d = dict(r)
+                region = d.get("region") or "(unknown)"
+                findings.append(
+                    f"- {d['n']} confident_drift verdicts in the {region!r} "
+                    f"region; the lattice may be wrong about it."
+                )
+
+            # Multiple deviations_log rows for same executor across
+            # distinct tasks.
+            cur = await c.execute(
+                """
+                SELECT executor AS slot, COUNT(DISTINCT task_id) AS n
+                FROM deviations_log
+                WHERE project_id = ?
+                  AND ts >= datetime('now', ?)
+                GROUP BY executor
+                HAVING n >= 2
+                ORDER BY n DESC
+                LIMIT 2
+                """,
+                (project_id, cutoff),
+            )
+            for r in await cur.fetchall():
+                d = dict(r)
+                findings.append(
+                    f"- {d['slot']} flagged for deviations on {d['n']} "
+                    f"distinct tasks; pattern, not one-off."
+                )
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("recent_patterns: query failed")
+        return ""
+
+    if not findings:
+        return ""
+    findings = findings[:5]
+    out: list[str] = []
+    out.append(f"## Recent patterns (last {hours}h)")
+    out.append("")
+    out.extend(findings)
+    out.append("")
+    return "\n".join(out)
+
+
+def _render_event_log_line(row: dict[str, Any]) -> str:
+    """Compact one-line summary for a project_events row. Hard-cap at
+    240 chars per §9.3."""
+    actor = row.get("actor") or "?"
+    etype = row.get("type") or "?"
+    task_id = row.get("task_id") or ""
+    pointer = row.get("payload_pointer") or ""
+    ts = row.get("ts") or ""
+    # ts → HH:MM short-form; defensive against unparseable.
+    short_ts = ts
+    if "T" in ts:
+        short_ts = ts.split("T", 1)[1][:5]
+    head = f"[{short_ts}] {actor} {etype}"
+    if task_id:
+        head += f" ({task_id})"
+    if pointer:
+        head += f": {pointer}"
+    if len(head) > 240:
+        head = head[:237] + "..."
+    return head
+
+
+async def _build_recent_events_block(
+    project_id: str,
+    surfaced_event_ids: list[int],
+) -> str:
+    """Recent events (§9.3). Reads the unread tail of `project_events`
+    for the active project, capped at `HARNESS_PROJECT_EVENTS_PER_TICK`
+    (default 50). Renders one line per row plus an overflow footer when
+    the unread count exceeded the cap.
+
+    Mutates `surfaced_event_ids` in place — appending the ids of every
+    row surfaced. The post-turn handler stamps `read_by_coach_at` on
+    these ids once Coach's ResultMessage lands successfully. If the
+    turn fails (no ResultMessage), the ids stay unread and roll forward
+    to the next tick.
+    """
+    try:
+        cap = int(os.environ.get("HARNESS_PROJECT_EVENTS_PER_TICK", "50"))
+    except (TypeError, ValueError):
+        cap = 50
+    if cap < 1:
+        cap = 1
+    rows: list[dict[str, Any]] = []
+    older_count = 0
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id, ts, actor, type, task_id, payload_pointer "
+                "FROM project_events "
+                "WHERE project_id = ? AND read_by_coach_at IS NULL "
+                "ORDER BY ts ASC, id ASC LIMIT ?",
+                (project_id, cap),
+            )
+            rows = [dict(r) for r in await cur.fetchall()]
+            if len(rows) >= cap:
+                # There may be more older-than-the-cap unread rows;
+                # count them for the footer.
+                cur = await c.execute(
+                    "SELECT COUNT(*) AS n FROM project_events "
+                    "WHERE project_id = ? AND read_by_coach_at IS NULL",
+                    (project_id,),
+                )
+                total = int(dict(await cur.fetchone())["n"])
+                older_count = max(0, total - len(rows))
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("recent_events: query failed")
+        return ""
+
+    if not rows:
+        return ""
+    surfaced_event_ids.extend(int(r["id"]) for r in rows)
+    out: list[str] = []
+    out.append("## Recent events")
+    out.append("")
+    for r in rows:
+        out.append(_render_event_log_line(r))
+    if older_count:
+        out.append("")
+        out.append(
+            f"*+ {older_count} older unread event"
+            + ("s" if older_count != 1 else "")
+            + " — query `/api/projects/{id}/event_log` to browse.*"
+        )
+    out.append("")
+    return "\n".join(out)
+
+
+async def _stamp_events_read_by_coach(event_ids: list[int]) -> None:
+    """Post-turn handler: stamps `read_by_coach_at = now()` on every
+    project_events row in `event_ids`. Called from `run_agent`'s
+    ResultMessage success path when the turn was Coach's and the surfaced
+    ids list is non-empty."""
+    if not event_ids:
+        return
+    placeholders = ",".join("?" * len(event_ids))
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                f"UPDATE project_events SET read_by_coach_at = ? "
+                f"WHERE id IN ({placeholders}) "
+                f"AND read_by_coach_at IS NULL",
+                [now, *event_ids],
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception(
+            "stamp_events_read_by_coach: failed for %d ids", len(event_ids)
+        )
+
+
+async def _build_coach_coordination_block(
+    surfaced_event_ids: list[int] | None = None,
+) -> str:
     """Phase 7 (PROJECTS_SPEC.md §10): Coach-only per-turn coordination
     block. Built fresh on every Coach turn from `projects`,
     `agent_project_roles`, `agents.locked`, `tasks`, `messages`, and
@@ -2732,6 +3345,26 @@ async def _build_coach_coordination_block() -> str:
     )
     lines.append("")
 
+    # v2 §14 position 1: `## Roster availability`. Emitted only when at
+    # least one Player is locked — keeps the prompt quiet on the common
+    # all-available case. Rendered ahead of `## Team composition` so
+    # Coach reads availability before scanning the roster.
+    locked_pre: list[str] = [
+        prow["id"] for prow in player_rows if bool(prow.get("locked"))
+    ]
+    if locked_pre:
+        lines.append("## Roster availability")
+        lines.append("")
+        lines.append(
+            "The human has LOCKED the following Player(s): "
+            + ", ".join(locked_pre)
+            + ". Do NOT assign tasks to them, do NOT direct-message "
+            "them, and remember broadcasts also skip them. Work "
+            "around this constraint — pick other Players or tell "
+            "the human if no suitable unlocked Player remains."
+        )
+        lines.append("")
+
     lines.append("## Team composition (this project)")
     lines.append("")
     lines.append("- coach   — you")
@@ -2788,12 +3421,12 @@ async def _build_coach_coordination_block() -> str:
         )
     lines.append("")
 
-    # Phase 7 audit: "Roster availability" prose folded in as a
-    # sub-section per spec §10. Inline LOCKED tags carry the fact;
-    # this carries the explicit "do NOT assign / do NOT message /
-    # broadcasts skip them" rule so Coach plans around it instead
-    # of hitting the tool-layer rejection.
-    if locked_named:
+    # The top-level `## Roster availability` block already handled the
+    # locked-Player notice ahead of this section per spec §14 position
+    # 1. The legacy in-section block is gone — single source of truth.
+    if False:
+        # Dead branch retained briefly to minimise diff surface for the
+        # surrounding f-string formatting; will be removed in a follow-up.
         lines.append("### Roster availability (right now)")
         lines.append("")
         lines.append(
@@ -2887,6 +3520,12 @@ async def _build_coach_coordination_block() -> str:
     lines.append(f"Last decision: {last_decision_line}")
     lines.append("")
 
+    # ---- Player health (§11.1, position 3 in v2 §14 ordering) -----
+    player_health_block = await _build_player_health_block(active)
+    if player_health_block:
+        lines.append(player_health_block.rstrip())
+        lines.append("")
+
     # ---- Active task health (kind_fail_count >= 2) -----------------
     health_rows = await _build_active_task_health_rows(active)
     if health_rows:
@@ -2910,6 +3549,12 @@ async def _build_coach_coordination_block() -> str:
             "coord_set_player_model. NEVER change runtime — that's a "
             "human decision."
         )
+        lines.append("")
+
+    # ---- Audit history (§11.2, position 5 in v2 §14 ordering) -----
+    audit_history_block = await _build_audit_aggregator_rows(active)
+    if audit_history_block:
+        lines.append(audit_history_block.rstrip())
         lines.append("")
 
     # ---- Stalled tasks (stage_change >= threshold, no progress) ----
@@ -2946,12 +3591,15 @@ async def _build_coach_coordination_block() -> str:
             "The 'blocker' is the Player responsible for the next move "
             "at the current stage (auditor, shipper, etc.) — NOT "
             "necessarily the original executor. Send them a "
-            "coord_send_message nudge, reassign with coord_assign_*, "
-            "or — if they reported the completion tool is not visible "
-            "in their runtime — submit on their behalf via "
-            "coord_advance_task_stage (after reading the artifact "
-            "they wrote to disk). If no one is assigned to this stage, "
-            "fix the trajectory with coord_set_task_trajectory. "
+            "coord_send_message nudge, reassign with "
+            "coord_approve_stage, or — if they reported the completion "
+            "tool is not visible in their runtime — submit on their "
+            "behalf via coord_write_task_spec(..., on_behalf_of=<slot>) "
+            "or coord_submit_audit_report(..., on_behalf_of=<slot>) "
+            "(after reading the artifact they wrote to disk), then "
+            "advance via coord_approve_stage. If no one is assigned to "
+            "this stage, fix the trajectory with "
+            "coord_set_task_trajectory. "
             "ESCALATION LADDER (v0.3.8): rung 1 nudge at 30min, "
             "rung 2 Coach call at 1h, rung 3 auto-reassign at 2h, "
             "rung 4 auto-archive at 4h. Intervene before the next rung "
@@ -2978,7 +3626,7 @@ async def _build_coach_coordination_block() -> str:
             "guide: `finished_not_reported` = Player declared done in "
             "chat but didn't call the matching coord_* tool — read the "
             "artifact and submit on their behalf via "
-            "coord_advance_task_stage / coord_write_task_spec / "
+            "coord_approve_stage / coord_write_task_spec / "
             "coord_submit_audit_report (with on_behalf_of=...). "
             "`blocked` = clarify via coord_send_message or unblock by "
             "rewriting the trajectory. `erroring` = read the recent "
@@ -3020,113 +3668,156 @@ async def _build_coach_coordination_block() -> str:
         )
         lines.append("")
 
-    # ---- Lifecycle policy (v0.3 — trajectory-driven) ---------------
-    lines.append("## Task lifecycle policy")
+    # ---- Recent patterns (§11.3, position 9 in v2 §14 ordering) ----
+    recent_patterns_block = await _build_recent_patterns_block(active)
+    if recent_patterns_block:
+        lines.append(recent_patterns_block.rstrip())
+        lines.append("")
+
+    # ---- Recent events (§9.3, position 10 in v2 §14 ordering) ------
+    # Mutates the surfaced_event_ids list passed in. The post-turn
+    # handler in run_agent stamps read_by_coach_at on those rows
+    # only when the turn lands a successful ResultMessage.
+    if surfaced_event_ids is not None:
+        recent_events_block = await _build_recent_events_block(
+            active, surfaced_event_ids,
+        )
+        if recent_events_block:
+            lines.append(recent_events_block.rstrip())
+            lines.append("")
+
+    # ---- Trajectory examples (position 11 in v2 §14 ordering) -----
+    lines.append("## Trajectory examples")
     lines.append("")
     lines.append(
-        "You coordinate; you do NOT execute. Anything you delegate to "
-        "a Player goes through the kanban as a tracked task. "
-        "Conversational replies remain conversational — but if you're "
-        "handing work to a Player, create the task."
+        "Define the trajectory upfront. Pass `trajectory=[...]` to "
+        "coord_create_task — an ordered list of {stage, to, focus?} "
+        "dicts. `to` is a single named Player slot OR a candidate list "
+        "(advisory only — pools are FYI; you still assign one named "
+        "slot via coord_approve_stage at each transition). Examples:"
     )
     lines.append("")
     lines.append(
-        "Stages: plan -> execute -> audit_syntax -> audit_semantics "
-        "-> ship -> archive."
-    )
-    lines.append("")
-    lines.append(
-        "DEFINE THE TRAJECTORY UPFRONT. Pass `trajectory=[...]` to "
-        "coord_create_task — an ordered list of {stage, to} dicts. "
-        "`to` accepts a single Player slot or a list (pool; first "
-        "free picks up). Examples:"
-    )
-    lines.append("")
-    lines.append(
-        "  - Quick mechanical work: "
-        "[{\"stage\":\"execute\",\"to\":[\"p2\",\"p3\"]}]"
+        "  - Quick mechanical: "
+        "[{\"stage\":\"execute\",\"to\":\"p2\"}]"
     )
     lines.append(
-        "  - Needs a spec but no audit: "
+        "  - Plan + execute: "
         "[{\"stage\":\"plan\",\"to\":\"p5\"},"
         "{\"stage\":\"execute\",\"to\":\"p2\"}]"
     )
     lines.append(
-        "  - Code change with formal review: "
+        "  - Code change + formal review: "
         "[{\"stage\":\"plan\",\"to\":\"p5\"},"
         "{\"stage\":\"execute\",\"to\":\"p2\"},"
         "{\"stage\":\"audit_syntax\",\"to\":\"p4\"},"
         "{\"stage\":\"ship\",\"to\":\"p2\"}]"
     )
     lines.append(
-        "  - Marketing blog post: "
+        "  - Marketing post + semantic review: "
         "[{\"stage\":\"plan\",\"to\":\"p3\"},"
         "{\"stage\":\"execute\",\"to\":\"p5\"},"
-        "{\"stage\":\"audit_semantics\",\"to\":\"p7\"},"
+        "{\"stage\":\"audit_semantics\",\"to\":\"p7\","
+        "\"focus\":\"check brand voice + claims\"},"
         "{\"stage\":\"ship\",\"to\":\"p4\"}]"
     )
     lines.append("")
+
+    # ---- Lifecycle policy (v2 — Docs/kanban-specs-v2.md §14.1) -----
+    lines.append("## Lifecycle policy")
+    lines.append("")
     lines.append(
-        "PLAN-STAGE COACH REVIEW: when you want to read the spec "
-        "before the executor runs, set `coach_review: true` on the "
-        "plan entry. The kanban then HOLDS plan -> execute on spec "
-        "write and pings you to review (a `kanban: spec ready for "
-        "review` row in your pane + a `spec_review_needed` event). "
-        "You then advance manually via `coord_advance_task_stage("
-        "task_id=..., stage='execute', assignee=<slot>)`, or send "
-        "the planner a change request via coord_send_message. "
-        "Without the flag, plan -> execute auto-advances on spec "
-        "write — default behavior. Example with review gate: "
-        "[{\"stage\":\"plan\",\"to\":\"p5\",\"coach_review\":true},"
-        "{\"stage\":\"execute\",\"to\":\"p2\"}]"
+        "**Continuous reasoning.** You are the team's reasoning layer. "
+        "Read every entry in `## Recent events` before composing the "
+        "next move. The kanban records, you route."
     )
     lines.append("")
     lines.append(
-        "Always delegate planning to a Player (coord_assign_planner "
-        "if rerouting mid-flight). coord_write_task_spec exists for "
-        "emergency override only — when no Player is reachable for "
-        "the planner role."
+        "**Single transition tool.** Every stage transition is "
+        "`coord_approve_stage(task_id, next_stage, assignee, note?)`. "
+        "There is no auto-advance and no implicit assignment. Pick the "
+        "assignee deliberately from the trajectory pool (or override). "
+        "The note becomes the assignee's wake prompt verbatim — write "
+        "it like a brief."
     )
     lines.append("")
     lines.append(
-        "Mid-flight reroute: coord_set_task_trajectory rewrites the "
-        "route; coord_assign_planner / auditor / shipper / task swap "
-        "candidates within one stage; coord_advance_task_stage is "
-        "the explicit Coach override that bypasses the role-completion "
-        "gate."
+        "**Audit-FAIL handling.** Read the report + the executor's "
+        "prior commit, decide (re-spec / bump effort / clarify the "
+        "audit / abandon), then call "
+        "`coord_approve_stage(next_stage='execute', assignee=<slot>, "
+        "note=<composed prompt>)`. The executor wakes ONLY with your "
+        "prompt, not the audit alone. Audit FAIL never auto-reverts in "
+        "v2 — it surfaces in `## Recent events` and waits for you."
     )
     lines.append("")
     lines.append(
-        "When a Player is unsure what to do, they can call "
-        "coord_my_assignments. The idle poller also auto-wakes them "
-        "every ~5 min if current-stage pool work is waiting — and a "
-        "stall sweeper surfaces tasks with no progress in the past "
-        "few hours under '## Stalled tasks' above."
+        "**Pool discipline.** Pools are FYI only. There is no claim "
+        "path. You explicitly assign one named slot via "
+        "coord_approve_stage. The trajectory's `to` list is a hint "
+        "about who could do the work."
     )
     lines.append("")
     lines.append(
-        "DO NOT follow `coord_create_task` / `coord_assign_*` with a "
-        "`coord_send_message` to the assignee. The kanban subscriber "
-        "auto-wakes the current-stage assignee with a wake prompt "
-        "that already names the task, the focus (for audits), the "
-        "contract or context, and the exact completion tool to call. "
-        "An extra DM duplicates the wake, burns tokens on both sides, "
-        "and creates two competing instructions for the Player to "
-        "reconcile. Use `coord_send_message` only when (a) you need "
-        "to clarify something specific to the Player AFTER they've "
-        "already accepted the role or surfaced a question, or (b) "
-        "the stall sweeper has flagged the task and you're nudging a "
-        "blocker. Initial assignment is silent on Coach's side — "
-        "the kanban does the wake."
+        "**Coherent assignment.** Player sessions stay live across "
+        "review-wait windows; accumulated context is real value. When "
+        "picking an executor for follow-up work on the same area / "
+        "module / domain, prefer the Player who already has context. "
+        "Random rotation through the pool wastes accumulated continuity."
     )
     lines.append("")
     lines.append(
-        "QUALITY FEEDBACK: from the 2nd fail of the same audit kind, "
-        "inspect the executor's current effort/model. Bump effort "
-        "first (coord_set_player_effort 'high'/'max'), then model "
-        "tier (coord_set_player_model 'latest_opus'). NEVER change "
-        "runtime — that's a human decision. Read current settings "
-        "via coord_get_player_settings before bumping."
+        "**Pattern-action ladder.** When `## Player health` shows "
+        "`deviations >= 2` OR `## Recent patterns` flags repeat issues, "
+        "bump effort first via coord_set_player_effort, then model "
+        "tier via coord_set_player_model, never runtime (human "
+        "decision). Read coord_get_player_settings before bumping so "
+        "you don't re-set what's already correct."
+    )
+    lines.append("")
+    lines.append(
+        "**Plan-mode.** Default to Coach-reviews-plan-first via "
+        "`coord_request_plan_review(task_id, slot)` for non-trivial "
+        "work. The Player produces an ExitPlanMode artifact; on "
+        "submission a `pending_plan{route='coach'}` event surfaces it "
+        "to you for review before tools are touched. Approve (Player "
+        "proceeds with the plan) or rewrite (call coord_approve_stage "
+        "with a Coach-composed note instead). Trivial mechanical tasks "
+        "can skip plan-mode but you still review the commit."
+    )
+    lines.append("")
+    lines.append(
+        "**Archival.** `coord_archive_task(task_id, summary)` is your "
+        "deliberate user-facing wrap-up. No auto-archive in v2 — every "
+        "task ends with a Coach-written summary. The summary lands in "
+        "your pane and is forwarded to Telegram if the originating "
+        "turn was user-triggered."
+    )
+    lines.append("")
+    lines.append(
+        "**Compass verdicts.** Every Compass verdict (including "
+        "`aligned`) appears in `## Recent events`. Read WHY the lattice "
+        "signed off, not just THAT it did. A repeated `aligned` chain "
+        "on questionable work means the lattice may be drifting."
+    )
+    lines.append("")
+    lines.append(
+        "**Deviation tagging.** When you notice scope drift, off-spec "
+        "work, or unexpected changes in the artifact you're reviewing, "
+        "prefix your `coord_approve_stage` `note` with a structured "
+        "`[deviation: <one-line reason>]` tag. This both communicates "
+        "to the next Player and feeds the validation instrumentation "
+        "in §22 — your push-time deviation-noticing rate vs audit-time "
+        "is one of the key signals for whether v2 is delivering its "
+        "promise."
+    )
+    lines.append("")
+    lines.append(
+        "**Trajectory is FYI.** You can change it any time via "
+        "coord_set_task_trajectory, including inserting stages mid-"
+        "flight (e.g. add `audit_semantics` after seeing the commit "
+        "and deciding semantic review is now warranted). Cannot remove "
+        "stages already entered."
     )
     lines.append("")
     from server.paths import global_paths
@@ -3473,32 +4164,54 @@ def _system_prompt_for(agent_id: str) -> str:
             "lifecycle policy block for examples.\n"
             "  - coord_set_task_trajectory(task_id, trajectory): "
             "rewrite the route mid-flight. Cannot remove a stage the "
-            "task has already entered.\n"
-            "  - coord_assign_planner(task_id, to): delegate spec "
-            "writing to a Player (or pool 'p1,p2'). Use this rather "
-            "than writing the spec yourself.\n"
-            "  - coord_write_task_spec(task_id, body): EMERGENCY "
-            "OVERRIDE — only when no Player is reachable for the "
-            "planner role. Default path is coord_assign_planner.\n"
-            "  - coord_assign_task(task_id, to): assign the EXECUTOR. "
-            "`to` accepts a single Player (hard-assign) OR a comma-list "
-            "(post to a pool, first-claim wins).\n"
-            "  - coord_assign_auditor(task_id, to, kind): assign an "
-            "auditor (kind='syntax' or 'semantics'). Same single/list "
-            "shape. Players audit; you don't. Tool warns if you assign "
-            "the executor as their own auditor (weak self-review).\n"
-            "  - coord_assign_shipper(task_id, to): assign a Player to "
-            "merge after both audits pass. They call coord_mark_shipped "
-            "when the merge lands; task archives.\n"
-            "  - coord_advance_task_stage(task_id, stage, note?): "
-            "manually move a task across the kanban gate. Use when an "
-            "audit/ship assignment is stuck.\n"
+            "task has already entered. Trajectory is FYI only — the "
+            "actual path is decided one transition at a time via "
+            "coord_approve_stage.\n"
+            "  - coord_approve_stage(task_id, next_stage, assignee, "
+            "note?): THE single stage-transition tool. Authorizes the "
+            "next stage move, names the assignee, supplies the wake "
+            "prompt. There is no auto-advance and no implicit "
+            "assignment in v2 — every transition is a Coach decision. "
+            "`assignee` is required for any non-archive next_stage; "
+            "pools are FYI only, pick one slot. Use this for: "
+            "plan→execute, execute→audit_*, audit_*→execute (re-do), "
+            "audit_*→ship (override a FAIL), execute→ship (skip "
+            "audits), and any-stage→archive (cancellation, with "
+            "assignee=null). When you've noticed a deviation in the "
+            "artifact you're reviewing, prefix `note` with a "
+            "structured `[deviation: <one-line reason>]` tag — feeds "
+            "the §22 push-time validation instrumentation.\n"
+            "  - coord_archive_task(task_id, summary): deliberate "
+            "archive with a user-facing summary. Use this when a "
+            "task wraps via natural completion (delivered) or "
+            "explicit cancellation. The summary is your hand-written "
+            "wrap-up — it lands in your pane and is forwarded to "
+            "Telegram if the originating turn was user-triggered.\n"
+            "  - coord_request_plan_review(task_id, slot): wake a "
+            "Player with plan-mode enabled so they produce an "
+            "ExitPlanMode artifact before touching tools. The plan "
+            "lands as `pending_plan{route='coach'}` for you to review; "
+            "you then approve or rewrite the plan and dispatch via "
+            "coord_approve_stage.\n"
+            "  - coord_write_task_spec(task_id, body, on_behalf_of?, "
+            "message_to_coach?): EMERGENCY OVERRIDE only — when a "
+            "planner Player can't reach the tool in their runtime, "
+            "Coach pastes the body and passes `on_behalf_of=<their "
+            "slot>`. Default path: assign a planner via "
+            "coord_approve_stage(stage='plan', assignee=<slot>) and "
+            "let them write the spec.\n"
+            "  - coord_submit_audit_report(task_id, kind, body, "
+            "verdict, on_behalf_of?, message_to_coach?): same "
+            "Coach-override path for an auditor Player who can't "
+            "reach the tool — Coach pastes the body + verdict.\n"
             "  - coord_set_task_blocked(task_id, blocked, reason?): "
             "toggle the orthogonal BLOCKED flag (e.g. waiting on "
             "stakeholder).\n"
-            "  - coord_update_task(task_id, status, note?): cancel a "
-            "task (status='archive' with cancellation behavior). For "
-            "stage transitions, prefer coord_advance_task_stage.\n"
+            "  - coord_update_task(task_id, status='archive', note?): "
+            "DEPRECATED for stage transitions — use coord_approve_stage. "
+            "Tolerated only for fast cancellation (status='archive') "
+            "without a user-facing summary. Prefer coord_archive_task "
+            "with a summary; the user reads it.\n"
             "  - coord_send_message(to, body, subject?, priority?): message a Player "
             "or 'broadcast' to the whole team\n"
             "  - coord_read_inbox(): read messages addressed to you or the team\n"
@@ -3596,7 +4309,18 @@ def _system_prompt_for(agent_id: str) -> str:
             "Rules:\n"
             "  - You never write code; you delegate.\n"
             "  - Only you can create top-level tasks — Players can only subtask.\n"
-            "  - You are the sole source of assignments; Players claim them.\n"
+            "  - You are the sole source of assignments. Pools are FYI "
+            "only in v2; Players never claim. You explicitly assign one "
+            "named slot per stage via coord_approve_stage.\n"
+            "  - The kanban records and surfaces; it does NOT route. "
+            "Read every entry in `## Recent events` before composing the "
+            "next move.\n"
+            "  - Audit FAIL never auto-reverts. The verdict surfaces in "
+            "`## Recent events`; you read it, decide, then call "
+            "coord_approve_stage(next_stage='execute', assignee=<slot>, "
+            "note=<composed prompt>).\n"
+            "  - No auto-archive. Every task ends with a Coach-written "
+            "summary via coord_archive_task.\n"
             "  - Start every turn by reading your inbox for new human goals.\n"
             "  - Be terse.\n"
             "\n"
@@ -3608,39 +4332,55 @@ def _system_prompt_for(agent_id: str) -> str:
         f"Tasks flow through stages: plan -> execute -> audit_syntax -> "
         f"audit_semantics -> ship -> archive. Your role per task is one of: "
         f"executor (default), formal/semantic reviewer, shipper, planner. "
-        f"Call coord_my_assignments at the start of any turn where you're "
-        f"not sure what to do - it returns your current actionable plate "
-        f"(active executor task / pending reviews / pending ship / eligible "
-        f"current-stage pools you could claim).\n\n"
-        f"Always pass task_id to coord_commit_push, coord_submit_audit_report, "
-        f"and coord_mark_shipped so the kanban auto-advances. Without "
-        f"task_id the work still happens but the board doesn't move.\n\n"
+        f"You take work only when Coach explicitly assigns you via "
+        f"coord_approve_stage. Don't claim from pools — pools are FYI "
+        f"only in v2. Call coord_my_assignments at the start of any turn "
+        f"where you're not sure what to do — it returns your current "
+        f"actionable plate.\n\n"
+        f"When you finish your role's work, call the matching completion "
+        f"tool with `task_id` and `message_to_coach` (your response: what "
+        f"you noticed, any caveats, what the next person should know). "
+        f"Your turn ends after that — Coach reviews on the next tick "
+        f"and decides whether to advance, request rework, or archive. "
+        f"The kanban does NOT auto-advance and audit FAIL does NOT "
+        f"auto-revert.\n\n"
         f"Coordination tools:\n"
         f"  - coord_my_assignments(): your current actionable plate. Call first when "
         f"unsure.\n"
         f"  - coord_list_tasks(status?, owner?): the whole team board (kanban "
         f"stage names: plan / execute / audit_syntax / audit_semantics / "
         f"ship / archive)\n"
-        f"  - coord_claim_task(task_id): claim a plan-stage task you're in "
-        f"the eligible pool for (one at a time). Standard tasks need a "
-        f"spec.md before you can claim - Coach will write one.\n"
-        f"  - coord_commit_push(task_id, message): commit + push your work "
-        f"in your worktree. ALWAYS pass task_id so the kanban moves.\n"
-        f"  - coord_submit_audit_report(task_id, kind, body, verdict): when "
-        f"you're the assigned auditor (kind='syntax' or 'semantics'), "
-        f"submit pass/fail with a markdown body. Kanban auto-advances on "
-        f"pass; reverts to execute on fail (with your report attached).\n"
-        f"  - coord_mark_shipped(task_id, note?): when you're the assigned "
-        f"shipper and the merge is in, call this; task archives.\n"
-        f"  - coord_write_task_spec(task_id, body): when Coach assigned "
-        f"you the planner role, draft the spec.md so the executor can "
-        f"start. Goal / done-looks-like / constraints / references.\n"
+        f"  - coord_commit_push(task_id, message, push?, message_to_coach?): "
+        f"commit + push your work in your worktree. Pass `task_id` so "
+        f"the event log routes correctly; pass `message_to_coach` with "
+        f"your response (e.g. 'committed at <sha>; tests pass'). Marks "
+        f"your executor role complete; Coach reviews and approves the "
+        f"next stage.\n"
+        f"  - coord_submit_audit_report(task_id, kind, body, verdict, "
+        f"message_to_coach?): when Coach assigned you as auditor "
+        f"(kind='syntax' or 'semantics'), submit pass/fail with a "
+        f"markdown body. The verdict is recorded; Coach reads + decides. "
+        f"FAIL does NOT auto-revert — wait for Coach's wake; do NOT "
+        f"start fixing things based on a FAIL you saw.\n"
+        f"  - coord_role_complete(task_id, message_to_coach, "
+        f"artifact_path?): generic completion for non-git executors "
+        f"(wrote a file via Write / coord_save_output / "
+        f"coord_write_knowledge) and shippers (merged / published / "
+        f"sent via Bash or external CLIs). Pass `artifact_path` when "
+        f"there's a file deliverable; the harness verifies it exists. "
+        f"This is the catch-all completion tool — use it when no "
+        f"role-specific tool above fits.\n"
+        f"  - coord_write_task_spec(task_id, body, message_to_coach?): "
+        f"when Coach assigned you the planner role, draft the spec.md "
+        f"so the executor can start. Goal / done-looks-like / "
+        f"constraints / references.\n"
         f"  - coord_set_task_blocked(task_id, blocked, reason?): on a task "
         f"you own, mark blocked when you're stuck waiting on something "
         f"external (stakeholder, API outage). Stays in current stage.\n"
-        f"  - coord_update_task(task_id, status, note?): rarely needed for "
-        f"Players - most stage transitions auto-advance via the tools "
-        f"above. Use this only when you genuinely need to manually move.\n"
+        f"  - coord_update_task: not for Players in v2. Stage "
+        f"transitions are Coach's job (coord_approve_stage); your role "
+        f"is to do the work and signal completion via the tools above. "
+        f"Mention coord_update_task only if Coach explicitly directs you.\n"
         f"  - coord_create_task(title, ...): create SUBTASKS of tasks you own\n"
         f"      (you cannot create top-level tasks - that's Coach's job)\n"
         f"  - coord_send_message(to, body, ...): message Coach or a peer for info\n"
@@ -4737,9 +5477,15 @@ async def run_agent(
     # `coord_set_player_role` update, a new task, or a fresh decision
     # all show up immediately on Coach's next turn.
     coordination_block = ""
+    # Populated by `_build_recent_events_block` when Coach's prompt
+    # surfaces unread project_events rows; stamped post-ResultMessage
+    # by the success path so a failed turn rolls them forward.
+    surfaced_event_ids: list[int] = []
     if agent_id == "coach":
         try:
-            body = await _build_coach_coordination_block()
+            body = await _build_coach_coordination_block(
+                surfaced_event_ids=surfaced_event_ids,
+            )
         except Exception:
             logger.exception("coach coordination block build failed")
             body = ""
@@ -4866,6 +5612,11 @@ async def run_agent(
         # _insert_turn_row. cost_basis defaults inside that function;
         # CodexRuntime sets it explicitly when auth is plan_included.
         "runtime": _runtime_name,
+        # Kanban v2 (§9.3): Coach's prompt surfaces unread project_events
+        # rows for this tick. The post-ResultMessage success path stamps
+        # `read_by_coach_at` on these ids; a failed turn leaves them
+        # unread so they roll forward to the next tick.
+        "surfaced_event_ids": list(surfaced_event_ids),
     }
 
     # Hand the runtime a TurnContext with everything it needs for one
@@ -5344,6 +6095,7 @@ async def maybe_wake_agent(
     *,
     bypass_debounce: bool = False,
     wake_source: str | None = None,
+    plan_mode: bool | None = None,
 ) -> bool:
     """Spawn a turn for `agent_id` with `reason` as the prompt, if and
     only if all guards pass:
@@ -5423,7 +6175,9 @@ async def maybe_wake_agent(
                 "coach wake: todo nudge composition failed"
             )
     logger.info("auto-wake: spawning %s — %s", agent_id, reason[:80])
-    asyncio.create_task(run_agent(agent_id, reason, wake_source=wake_source))
+    asyncio.create_task(run_agent(
+        agent_id, reason, wake_source=wake_source, plan_mode=plan_mode,
+    ))
     return True
 
 

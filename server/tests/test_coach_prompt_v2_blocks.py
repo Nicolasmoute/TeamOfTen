@@ -1,0 +1,442 @@
+"""Audit tests for the v2 Coach prompt blocks (Docs/kanban-specs-v2.md
+§9.3, §11.1, §11.2, §11.3, §14.1).
+
+Each builder returns markdown when there's something to render, "" when
+the team is healthy / no relevant data exists. Coverage:
+  - _build_player_health_block (counters, empty-state)
+  - _build_audit_aggregator_rows (with summary read, empty-state)
+  - _build_recent_patterns_block (repeat audit fails, deviations spike,
+    empty-state)
+  - _build_recent_events_block (cap, overflow footer, surfaced_event_ids
+    population, empty-state)
+  - _stamp_events_read_by_coach (idempotent, only stamps unread rows)
+  - _build_coach_coordination_block surfaces the §14.1 lifecycle policy
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from server.agents import (
+    _build_audit_aggregator_rows,
+    _build_coach_coordination_block,
+    _build_player_health_block,
+    _build_recent_events_block,
+    _build_recent_patterns_block,
+    _stamp_events_read_by_coach,
+)
+from server.db import configured_conn, init_db
+
+
+async def _seed_task(
+    *,
+    task_id: str,
+    title: str = "demo",
+    status: str = "execute",
+    owner: str | None = "p2",
+    project: str = "misc",
+) -> None:
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO tasks (id, project_id, title, status, owner, "
+            "created_by, trajectory) "
+            "VALUES (?, ?, ?, ?, ?, 'coach', '[]')",
+            (task_id, project, title, status, owner),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+
+async def _seed_role_row(
+    *,
+    task_id: str,
+    role: str = "auditor_syntax",
+    owner: str | None = "p4",
+    verdict: str | None = None,
+    completed_at: str | None = None,
+    report_path: str | None = None,
+) -> None:
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO task_role_assignments "
+            "(task_id, role, eligible_owners, owner, "
+            " assigned_at, claimed_at, completed_at, verdict, report_path) "
+            "VALUES (?, ?, '[]', ?, "
+            "strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
+            "strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?, ?, ?)",
+            (task_id, role, owner, completed_at, verdict, report_path),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+
+async def _seed_deviation(
+    *,
+    task_id: str,
+    executor: str = "p2",
+    noticed_at: str = "audit",
+    project: str = "misc",
+) -> None:
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO deviations_log "
+            "(project_id, task_id, executor, noticed_at, description) "
+            "VALUES (?, ?, ?, ?, 'demo')",
+            (project, task_id, executor, noticed_at),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+
+async def _seed_project_event(
+    *,
+    actor: str = "p2",
+    type: str = "commit_pushed",
+    task_id: str | None = None,
+    project: str = "misc",
+    payload_pointer: str | None = None,
+    read_by_coach_at: str | None = None,
+) -> int:
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "INSERT INTO project_events "
+            "(project_id, actor, type, task_id, payload_json, "
+            " payload_pointer, read_by_coach_at) "
+            "VALUES (?, ?, ?, ?, '{}', ?, ?)",
+            (project, actor, type, task_id, payload_pointer, read_by_coach_at),
+        )
+        await c.commit()
+        return int(cur.lastrowid)
+    finally:
+        await c.close()
+
+
+# ---------------------------------------------------------------------
+# _build_player_health_block (§11.1)
+# ---------------------------------------------------------------------
+
+async def test_player_health_empty_returns_empty_string(fresh_db: str) -> None:
+    await init_db()
+    out = await _build_player_health_block("misc")
+    assert out == ""
+
+
+async def test_player_health_renders_deviations(fresh_db: str) -> None:
+    await init_db()
+    await _seed_task(task_id="t-2026-05-07-aaaa1111", owner="p2")
+    # Two FAIL rounds for p2.
+    await _seed_role_row(
+        task_id="t-2026-05-07-aaaa1111", role="auditor_syntax",
+        owner="p4", verdict="fail",
+        completed_at="2026-05-07T01:00:00Z",
+    )
+    await _seed_role_row(
+        task_id="t-2026-05-07-aaaa1111", role="auditor_syntax",
+        owner="p4", verdict="fail",
+        completed_at="2026-05-07T02:00:00Z",
+    )
+    out = await _build_player_health_block("misc")
+    assert "## Player health" in out
+    assert "p2" in out
+    # Two failing audit rounds for the same task = 2.
+    assert "| 2 " in out or "| 2  " in out
+
+
+async def test_player_health_renders_off_spec_completions(fresh_db: str) -> None:
+    await init_db()
+    await _seed_task(task_id="t-2026-05-07-bbbb2222", owner="p3")
+    await _seed_deviation(
+        task_id="t-2026-05-07-bbbb2222",
+        executor="p3",
+        noticed_at="audit",
+    )
+    out = await _build_player_health_block("misc")
+    assert "## Player health" in out
+    assert "p3" in out
+
+
+async def test_player_health_skips_zero_rows(fresh_db: str) -> None:
+    """A Player whose three counters are all zero should not appear in
+    the table — keeps the prompt quiet on a healthy team."""
+    await init_db()
+    await _seed_task(task_id="t-2026-05-07-cccc3333", owner="p2")
+    await _seed_role_row(
+        task_id="t-2026-05-07-cccc3333", role="auditor_syntax",
+        owner="p4", verdict="fail",
+        completed_at="2026-05-07T01:00:00Z",
+    )
+    out = await _build_player_health_block("misc")
+    assert "p2" in out
+    # Only p2 has a non-zero counter — no other slot listed.
+    for slot in ("p1", "p3", "p5", "p7", "p9"):
+        assert f"| {slot} " not in out
+
+
+# ---------------------------------------------------------------------
+# _build_audit_aggregator_rows (§11.2)
+# ---------------------------------------------------------------------
+
+async def test_audit_aggregator_empty_when_no_audit_history(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed_task(task_id="t-2026-05-07-dddd4444", status="execute")
+    out = await _build_audit_aggregator_rows("misc")
+    assert out == ""
+
+
+async def test_audit_aggregator_renders_per_round(fresh_db: str) -> None:
+    await init_db()
+    await _seed_task(
+        task_id="t-2026-05-07-dddd4444",
+        status="audit_semantics",
+        owner="p2",
+    )
+    await _seed_role_row(
+        task_id="t-2026-05-07-dddd4444", role="auditor_syntax",
+        owner="p4", verdict="fail",
+        completed_at="2026-05-07T01:00:00Z",
+    )
+    await _seed_role_row(
+        task_id="t-2026-05-07-dddd4444", role="auditor_syntax",
+        owner="p4", verdict="pass",
+        completed_at="2026-05-07T02:00:00Z",
+    )
+    await _seed_role_row(
+        task_id="t-2026-05-07-dddd4444", role="auditor_semantics",
+        owner="p7",  # active, no verdict yet
+    )
+    out = await _build_audit_aggregator_rows("misc")
+    assert "## Audit history" in out
+    assert "t-2026-05-07-dddd4444" in out
+    assert "syntax round 1" in out and "FAIL" in out
+    assert "syntax round 2" in out and "PASS" in out
+    assert "semantic round 1" in out and "pending" in out
+
+
+# ---------------------------------------------------------------------
+# _build_recent_patterns_block (§11.3)
+# ---------------------------------------------------------------------
+
+async def test_recent_patterns_empty_returns_empty(fresh_db: str) -> None:
+    await init_db()
+    out = await _build_recent_patterns_block("misc")
+    assert out == ""
+
+
+async def test_recent_patterns_flags_repeat_audit_fails(fresh_db: str) -> None:
+    await init_db()
+    await _seed_task(task_id="t-2026-05-07-eeee5555", owner="p2")
+    # Two same-kind FAILs in the window.
+    for i in range(2):
+        await _seed_role_row(
+            task_id="t-2026-05-07-eeee5555",
+            role="auditor_syntax",
+            owner="p4",
+            verdict="fail",
+            # Use SQLite default (now()) by setting completed_at to
+            # the format SQLite produces for `datetime('now')`.
+            completed_at=None,
+        )
+    # Manually stamp `completed_at` to "now" for both rows so the
+    # window filter picks them up.
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE task_role_assignments SET completed_at = "
+            "strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            "WHERE task_id = ? AND role = 'auditor_syntax'",
+            ("t-2026-05-07-eeee5555",),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    out = await _build_recent_patterns_block("misc")
+    assert "## Recent patterns" in out
+    assert "t-2026-05-07-eeee5555" in out
+    assert "syntax fail" in out
+
+
+# ---------------------------------------------------------------------
+# _build_recent_events_block (§9.3) + surfaced_event_ids
+# ---------------------------------------------------------------------
+
+async def test_recent_events_empty_returns_empty(
+    fresh_db: str, monkeypatch
+) -> None:
+    """Even on a fresh DB the migration inserts a kanban_v2_cutover row,
+    so we override that to get a true empty state."""
+    await init_db()
+    # Mark every project_events row as read so the unread-tail returns nothing.
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE project_events SET read_by_coach_at = "
+            "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    surfaced: list[int] = []
+    out = await _build_recent_events_block("misc", surfaced)
+    assert out == ""
+    assert surfaced == []
+
+
+async def test_recent_events_returns_unread_and_populates_ids(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    # Mark migration cutover row as read so we see only fresh rows.
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE project_events SET read_by_coach_at = "
+            "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    e1 = await _seed_project_event(
+        actor="p2", type="commit_pushed",
+        task_id="t-2026-05-07-aaaa1111",
+        payload_pointer="abc1234",
+    )
+    e2 = await _seed_project_event(
+        actor="compass", type="compass_audit",
+        task_id="t-2026-05-07-aaaa1111",
+        payload_pointer="aligned",
+    )
+    surfaced: list[int] = []
+    out = await _build_recent_events_block("misc", surfaced)
+    assert "## Recent events" in out
+    assert "p2 commit_pushed" in out
+    assert "compass compass_audit" in out
+    assert sorted(surfaced) == sorted([e1, e2])
+
+
+async def test_recent_events_overflow_footer(
+    fresh_db: str, monkeypatch
+) -> None:
+    await init_db()
+    monkeypatch.setenv("HARNESS_PROJECT_EVENTS_PER_TICK", "3")
+    # Mark migration cutover row read first.
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE project_events SET read_by_coach_at = "
+            "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    for i in range(5):
+        await _seed_project_event(
+            actor="system",
+            type="task_stage_changed",
+            task_id=f"t-2026-05-07-{i:08x}",
+        )
+    surfaced: list[int] = []
+    out = await _build_recent_events_block("misc", surfaced)
+    assert "## Recent events" in out
+    # Cap of 3 → 2 older unread.
+    assert "+ 2 older unread events" in out
+    assert len(surfaced) == 3
+
+
+# ---------------------------------------------------------------------
+# _stamp_events_read_by_coach
+# ---------------------------------------------------------------------
+
+async def test_stamp_events_idempotent(fresh_db: str) -> None:
+    await init_db()
+    eid = await _seed_project_event(
+        actor="p2", type="commit_pushed",
+    )
+    await _stamp_events_read_by_coach([eid])
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT read_by_coach_at FROM project_events WHERE id = ?",
+            (eid,),
+        )
+        first = dict(await cur.fetchone())["read_by_coach_at"]
+    finally:
+        await c.close()
+    assert first is not None
+    # Re-call should NOT update the column (only stamps unread rows).
+    await _stamp_events_read_by_coach([eid])
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT read_by_coach_at FROM project_events WHERE id = ?",
+            (eid,),
+        )
+        second = dict(await cur.fetchone())["read_by_coach_at"]
+    finally:
+        await c.close()
+    assert second == first  # unchanged on second stamp
+
+
+async def test_stamp_events_empty_list_noop(fresh_db: str) -> None:
+    await init_db()
+    # Should not throw.
+    await _stamp_events_read_by_coach([])
+
+
+# ---------------------------------------------------------------------
+# _build_coach_coordination_block — §14.1 lifecycle policy
+# ---------------------------------------------------------------------
+
+async def test_coordination_block_includes_v2_lifecycle_policy(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    surfaced: list[int] = []
+    body = await _build_coach_coordination_block(surfaced_event_ids=surfaced)
+    # Section header
+    assert "## Lifecycle policy" in body
+    # v2-specific phrases that should appear
+    assert "coord_approve_stage" in body
+    assert "Pools are FYI only" in body
+    assert "[deviation:" in body
+    assert "coord_archive_task" in body
+    assert "coord_request_plan_review" in body
+    # Migration cutover event surfaces by default
+    assert "## Recent events" in body
+    assert len(surfaced) >= 1
+
+
+async def test_coordination_block_section_ordering(fresh_db: str) -> None:
+    """The §14 ordering matters — Player health (3) before Active task
+    health (4); Audit history (5) before Stalled tasks (6); Recent
+    patterns (9) before Recent events (10); Trajectory examples (11)
+    before Lifecycle policy (12)."""
+    await init_db()
+    surfaced: list[int] = []
+    body = await _build_coach_coordination_block(surfaced_event_ids=surfaced)
+    # Always-present headers in v2 ordering.
+    headers_in_order = [
+        "## Coordinating:",
+        "## Team composition",
+        "## Current state",
+        "## Recent events",  # cutover event always present
+        "## Trajectory examples",
+        "## Lifecycle policy",
+    ]
+    last_pos = -1
+    for h in headers_in_order:
+        pos = body.find(h)
+        assert pos != -1, f"missing header: {h}"
+        assert pos > last_pos, (
+            f"header {h!r} appears at {pos}, before previous (at {last_pos})"
+        )
+        last_pos = pos

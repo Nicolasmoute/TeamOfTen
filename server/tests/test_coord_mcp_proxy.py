@@ -74,7 +74,7 @@ def test_coord_handlers_include_required_set() -> None:
         "coord_send_message",
         "coord_read_inbox",
         "coord_create_task",
-        "coord_assign_task",
+        "coord_approve_stage",
         "coord_update_memory",
         "coord_request_human",
     }
@@ -109,7 +109,7 @@ async def test_coord_mcp_stdio_subprocess_lists_and_calls_tool() -> None:
                     "tools": [
                         "coord_list_team",
                         "coord_send_message",
-                        "coord_assign_task",
+                        "coord_approve_stage",
                     ]
                 },
             )
@@ -133,7 +133,7 @@ async def test_coord_mcp_stdio_subprocess_lists_and_calls_tool() -> None:
                         {"detail": "caller_id mismatch (token bound to 'coach')"},
                     )
                     return
-                if self.path == "/api/_coord/coord_assign_task":
+                if self.path == "/api/_coord/coord_approve_stage":
                     self._send_json(
                         200,
                         {
@@ -187,7 +187,7 @@ async def test_coord_mcp_stdio_subprocess_lists_and_calls_tool() -> None:
                 assert [t.name for t in listed.tools] == [
                     "coord_list_team",
                     "coord_send_message",
-                    "coord_assign_task",
+                    "coord_approve_stage",
                 ]
 
                 result = await session.call_tool("coord_list_team", {"verbose": True})
@@ -205,7 +205,7 @@ async def test_coord_mcp_stdio_subprocess_lists_and_calls_tool() -> None:
                 assert "caller_id mismatch" in http_error.content[0].text
 
                 tool_error = await session.call_tool(
-                    "coord_assign_task",
+                    "coord_approve_stage",
                     {"task_id": "t-1", "to": "p1"},
                 )
                 assert tool_error.isError is True
@@ -229,7 +229,7 @@ async def test_coord_mcp_stdio_subprocess_lists_and_calls_tool() -> None:
                 },
             },
             {
-                "path": "/api/_coord/coord_assign_task",
+                "path": "/api/_coord/coord_approve_stage",
                 "authorization": f"Bearer {token}",
                 "payload": {
                     "caller_id": "coach",

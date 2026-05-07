@@ -1,4 +1,4 @@
-"""Idle-Player polling (Docs/kanban-specs.md §10).
+﻿"""Idle-Player polling (Docs/kanban-specs-v2.md §10).
 
 Background loop that wakes Players who could be doing pool / pending
 work but aren't. Sibling of the audit-watcher and kanban subscriber;
@@ -101,7 +101,30 @@ def _flag_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
-# Stall sweeper (Docs/kanban-specs.md §10.5). Sibling pass in this
+def _board_silence_seconds() -> int:
+    """Board safety ring (§10.4) trigger threshold. Default 30 min."""
+    raw = os.environ.get("HARNESS_KANBAN_BOARD_SILENCE_SECONDS", "1800").strip()
+    try:
+        return max(60, int(raw))
+    except ValueError:
+        return 1800
+
+
+def _board_silence_realert_seconds() -> int:
+    """Board safety ring re-alert cooldown. Default 1h."""
+    raw = os.environ.get("HARNESS_KANBAN_BOARD_SILENCE_REALERT_SECONDS", "3600").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 3600
+
+
+def _board_safety_flag_enabled() -> bool:
+    raw = os.environ.get("HARNESS_KANBAN_BOARD_SAFETY_ENABLED", "true").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+# Stall sweeper (Docs/kanban-specs-v2.md §10.5). Sibling pass in this
 # tick loop — detects tasks whose `last_stage_change_at` is older than
 # `HARNESS_KANBAN_STALL_SECONDS` and walks the escalation ladder
 # (v0.3.8): rung 1 (nudge assignee) → rung 2 (notify Coach) → rung 3
@@ -281,12 +304,19 @@ async def sweep_once() -> int:
         await reconciliation_sweep_once()
     except Exception:
         logger.exception("idle_poller: reconciliation sweep crashed")
+    # Board safety ring (v2 §10.4): catch "Coach went to sleep on the
+    # entire kanban" — no task_stage_changed event in N minutes despite
+    # active tasks on the board.
+    try:
+        await board_safety_ring_once()
+    except Exception:
+        logger.exception("idle_poller: board safety ring crashed")
     # Soft-stall watchdog (v0.3.9): tier 1 SQL filter + bundled Haiku
     # call to catch agents stuck in ways the deterministic ladder
     # misses (declared done but didn't advance the kanban; looping;
     # erroring without recovery). Cost-capped + dedup-gated; most
     # ticks short-circuit at tier 1 with zero candidates.
-    # See Docs/kanban-specs.md §10.7.
+    # See Docs/kanban-specs-v2.md §10.7.
     try:
         from server.kanban_watchdog import sweep_once as _watchdog_sweep
         await _watchdog_sweep()
@@ -543,9 +573,10 @@ async def _fire_rung_2(
             f"didn't move on the {rung1_min}-min nudge. Auto-"
             f"reassign fires in ~{next_reassign_min} min unless you "
             f"intervene. Options: nudge them again "
-            f"(coord_send_message), reassign yourself (coord_assign_*), "
-            f"override (coord_advance_task_stage), or archive "
-            f"(coord_advance_task_stage stage='archive')."
+            f"(coord_send_message), reassign via "
+            f"coord_approve_stage(next_stage={stage!r}, "
+            f"assignee=<other-slot>, note=<brief>), or archive via "
+            f"coord_archive_task(task_id={task['id']!r}, summary=...)."
         )
         # AUDIT FIX: bypass debounce so the escalation reaches Coach
         # even if Coach's wake debounce window is currently active
@@ -925,36 +956,41 @@ def _stall_nudge_for_stage(
     if stage == "plan":
         body = (
             f"\n\nDraft the spec then call coord_write_task_spec("
-            f"task_id={task_id!r}, body=<spec>). The task auto-"
-            f"advances on success."
+            f"task_id={task_id!r}, body=<spec>, "
+            f"message_to_coach=<your response>). Coach reviews "
+            f"on the next tick."
         )
     elif stage == "execute":
         body = (
             f"\n\nIf you finished the work, call "
-            f"coord_commit_push(task_id={task_id!r}, message=...) "
-            f"for code or coord_complete_execution(task_id={task_id!r}"
-            f", summary=...) for non-code — the kanban won't advance "
-            f"until you do."
+            f"coord_commit_push(task_id={task_id!r}, message=..., "
+            f"message_to_coach=<your response>) for code or "
+            f"coord_role_complete(task_id={task_id!r}, "
+            f"message_to_coach=..., artifact_path=<path?>) for "
+            f"non-code — Coach reviews and approves the next stage."
         )
     elif stage == "audit_syntax":
         body = (
             f"\n\nFinish the formal review then call "
             f"coord_submit_audit_report(task_id={task_id!r}, "
             f"kind='syntax', body=<review>, "
-            f"verdict='pass' or 'fail')."
+            f"verdict='pass' or 'fail', "
+            f"message_to_coach=<your response>)."
         )
     elif stage == "audit_semantics":
         body = (
             f"\n\nFinish the semantic review then call "
             f"coord_submit_audit_report(task_id={task_id!r}, "
             f"kind='semantics', body=<review>, "
-            f"verdict='pass' or 'fail')."
+            f"verdict='pass' or 'fail', "
+            f"message_to_coach=<your response>)."
         )
     elif stage == "ship":
         body = (
             f"\n\nMerge / publish / hand-off, then call "
-            f"coord_mark_shipped(task_id={task_id!r}, "
-            f"note=<optional>)."
+            f"coord_role_complete(task_id={task_id!r}, "
+            f"message_to_coach='shipped at <ref>'). Coach archives "
+            f"with a user-facing summary."
         )
     else:
         body = (
@@ -1058,47 +1094,16 @@ async def _has_available_work(slot: str) -> tuple[str, str | None] | None:
     """Return `(reason, task_id)` if `slot` has something they could
     work on, else None.
 
-    Two paths:
-      - eligible-pool task whose `assigned_at` is older than the
-        grace window
-      - hard-assigned (owner=slot) role row that's still uncompleted
-        — this catches the case where the original assign-time wake
-        was rejected (cost cap, paused) and Coach hasn't followed up
+    v2 (Docs/kanban-specs-v2.md §10.1): pools are FYI only. There is
+    no claim path; Coach assigns named slots via `coord_approve_stage`.
+    The only legitimate idle-wake reason is a HARD-assigned role row
+    whose stage just became active and whose original assign-time
+    wake was rejected (cost cap, paused). Coach assigns again, fine —
+    but the safety net catches the missed-wake edge case so a Player
+    doesn't sit idle on a real assignment.
     """
-    grace = _grace_seconds()
     c = await configured_conn()
     try:
-        # Pool eligibility: scan task_role_assignments for rows where
-        # eligible_owners contains the slot AND owner IS NULL AND
-        # assigned_at is older than the grace window. JSON1 json_each
-        # gives us the array unrolling.
-        cur = await c.execute(
-            """
-            SELECT r.task_id
-              FROM task_role_assignments r
-              JOIN tasks t ON t.id = r.task_id,
-                   json_each(r.eligible_owners) je
-             WHERE je.value = ?
-               AND r.owner IS NULL
-               AND r.completed_at IS NULL
-               AND r.superseded_by IS NULL
-               AND (
-                    (r.role = 'executor' AND t.status = 'plan')
-                 OR (r.role = 'planner' AND t.status = 'plan')
-                 OR (r.role = 'auditor_syntax' AND t.status = 'audit_syntax')
-                 OR (r.role = 'auditor_semantics' AND t.status = 'audit_semantics')
-                 OR (r.role = 'shipper' AND t.status = 'ship')
-               )
-               AND (julianday('now') - julianday(r.assigned_at)) * 86400.0 > ?
-             ORDER BY r.assigned_at
-             LIMIT 1
-            """,
-            (slot, grace),
-        )
-        row = await cur.fetchone()
-        if row:
-            return ("pool_task_available", dict(row)["task_id"])
-
         # Hard-assigned but not started: there's an active role row
         # owned by `slot` that hasn't completed. The first assign-time
         # wake might have missed; we re-fire here.
@@ -1381,6 +1386,145 @@ async def _resolve_active_role_owner(
     return dict(row).get("owner")
 
 
+async def board_safety_ring_once(project_id: str | None = None) -> int:
+    """Board safety ring (§10.4). Detects board-wide stagnation: no
+    `task_stage_changed` event written for the project in
+    `HARNESS_KANBAN_BOARD_SILENCE_SECONDS` AND ≥1 non-archive task on
+    the board. Emits `kanban_board_stalled` + wakes Coach with
+    `bypass_debounce=True`. Stamps `team_config['kanban_board_silence_alerted_at']`
+    so it doesn't re-fire every tick — re-armed once a fresh
+    `task_stage_changed` event lands or after the realert cooldown.
+    Returns 1 if a fresh alert was emitted this sweep, 0 otherwise.
+    """
+    if not _board_safety_flag_enabled():
+        return 0
+    if project_id is None:
+        from server.db import resolve_active_project
+        try:
+            project_id = await resolve_active_project()
+        except Exception:
+            return 0
+    if not project_id:
+        return 0
+
+    silence_threshold = _board_silence_seconds()
+    realert_cooldown = _board_silence_realert_seconds()
+    now_dt = datetime.now(timezone.utc)
+    now_iso = now_dt.isoformat()
+    alert_key = f"kanban_board_silence_alerted_at:{project_id}"
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT COUNT(*) AS n, "
+            "       MAX(last_stage_change_at) AS last_change, "
+            "       MAX(created_at) AS last_created "
+            "FROM tasks WHERE project_id = ? AND status != 'archive'",
+            (project_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return 0
+        rd = dict(row)
+        active_count = int(rd["n"] or 0)
+        if active_count == 0:
+            return 0
+        task_last_change = rd.get("last_change")
+        task_last_created = rd.get("last_created")
+
+        cur = await c.execute(
+            "SELECT ts FROM project_events "
+            "WHERE project_id = ? AND type = 'task_stage_changed' "
+            "ORDER BY ts DESC LIMIT 1",
+            (project_id,),
+        )
+        row = await cur.fetchone()
+        event_last_change = dict(row)["ts"] if row else None
+
+        # Pick the freshest of the three references — project_events
+        # is the canonical signal but tasks.last_stage_change_at /
+        # created_at are reliable fallbacks for boards where the v2
+        # event log has barely started being written.
+        candidates = [
+            ts for ts in (event_last_change, task_last_change, task_last_created)
+            if ts
+        ]
+        last_change_ts = max(candidates) if candidates else None
+
+        last_dt: datetime | None = None
+        if last_change_ts:
+            try:
+                last_dt = datetime.fromisoformat(
+                    last_change_ts.replace("Z", "+00:00")
+                )
+            except Exception:
+                last_dt = None
+
+        if last_dt is not None:
+            age_seconds = int((now_dt - last_dt).total_seconds())
+        else:
+            # No reference timestamp at all — treat as stale.
+            age_seconds = silence_threshold + 1
+
+        if age_seconds < silence_threshold:
+            # Board moved recently — re-arm by clearing any prior stamp.
+            await c.execute(
+                "DELETE FROM team_config WHERE key = ?", (alert_key,)
+            )
+            await c.commit()
+            return 0
+
+        cur = await c.execute(
+            "SELECT value FROM team_config WHERE key = ?", (alert_key,)
+        )
+        row = await cur.fetchone()
+        prior_alert_iso = dict(row)["value"] if row else None
+        if prior_alert_iso:
+            try:
+                prior_dt = datetime.fromisoformat(prior_alert_iso.replace("Z", "+00:00"))
+                if (now_dt - prior_dt).total_seconds() < realert_cooldown:
+                    return 0
+            except Exception:
+                pass
+
+        await c.execute(
+            "INSERT OR REPLACE INTO team_config (key, value) VALUES (?, ?)",
+            (alert_key, now_iso),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    age_min = max(1, age_seconds // 60)
+    await bus.publish({
+        "ts": now_iso,
+        "agent_id": "system",
+        "type": "kanban_board_stalled",
+        "project_id": project_id,
+        "last_stage_change_at": last_change_ts,
+        "age_seconds": age_seconds,
+        "active_task_count": active_count,
+        "to": "coach",
+    })
+
+    try:
+        from server.agents import maybe_wake_agent
+        body = (
+            f"The kanban hasn't moved in {age_min} min — review the "
+            f"board. Active tasks: {active_count}. Query "
+            f"`/api/tasks/flow_health` for the state, then advance, "
+            f"reassign, or archive as needed."
+        )
+        await maybe_wake_agent(
+            "coach", body,
+            bypass_debounce=True,
+            wake_source="kanban_board_safety",
+        )
+    except Exception:
+        logger.exception("board_safety_ring: coach wake failed")
+    return 1
+
+
 __all__ = [
     "start_idle_poller",
     "stop_idle_poller",
@@ -1388,4 +1532,5 @@ __all__ = [
     "sweep_once",
     "PLAYER_SLOTS",
     "reconciliation_sweep_once",
+    "board_safety_ring_once",
 ]

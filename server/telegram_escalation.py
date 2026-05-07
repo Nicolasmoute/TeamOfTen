@@ -127,18 +127,20 @@ def _key_for_pending(ev: dict[str, Any]) -> tuple[str, str] | None:
     None when the event isn't one we escalate (or is a route='coach'
     pending_question/plan that Coach handles itself).
 
-    Kanban escalations (Docs/kanban-specs.md §14, v0.3 §17/§18):
+    Kanban escalations (Docs/kanban-specs-v2.md §18):
       - audit_fail_notification → "audit_fail" / task_id
-        (the v0.3 Coach-routed notification — replaced the prior
-        audit_report_submitted{verdict='fail'} listener per items
-        9+10. Escalates only on the second fail of the same kind
+        (Escalates only on the second fail of the same kind
         via the `escalate` flag set by the kanban subscriber.)
-      - stage_assignment_needed → "stage_assignment_needed" /
-        f"{task_id}:{role}" (renamed from audit_assignment_needed
-        in v0.3 to cover plan/execute gaps too. Cancelled by
-        task_role_assigned for the matching role.)
       - audit_self_review_warning → "audit_self_review" / f"{task_id}:{kind}"
         (informational, no resolution)
+      - kanban_board_stalled → "board_stalled" / project_id
+        (v2 §10.4 board-safety-ring fire — Coach went to sleep on
+        the entire kanban. No matching resolution event; fires
+        immediately and stays standalone.)
+
+    `stage_assignment_needed` (v0.3) was removed in v2 — `coord_approve_stage`
+    plants the role row and assignee atomically, so the "assignment
+    gap" failure mode no longer exists.
     """
     etype = ev.get("type") or ""
     if etype == "pending_question" and ev.get("route") == "human":
@@ -163,11 +165,13 @@ def _key_for_pending(ev: dict[str, Any]) -> tuple[str, str] | None:
         tid = ev.get("task_id")
         if tid:
             return ("audit_fail", str(tid))
-    elif etype == "stage_assignment_needed":
-        tid = ev.get("task_id")
-        role = ev.get("role")
-        if tid and role:
-            return ("stage_assignment_needed", f"{tid}:{role}")
+    elif etype == "kanban_board_stalled":
+        # v2 §10.4: board safety ring fired. No matching resolution
+        # event — fires once per ring detection and forwards
+        # immediately. Re-arm cooldown is owned by the ring itself.
+        pid = ev.get("project_id")
+        if pid:
+            return ("board_stalled", str(pid))
     elif etype == "audit_self_review_warning":
         tid = ev.get("task_id")
         kind = ev.get("kind")
@@ -196,13 +200,6 @@ def _key_for_resolution(ev: dict[str, Any]) -> tuple[str, str] | None:
         pid = ev.get("proposal_id")
         if pid is not None:
             return ("proposal", str(pid))
-    elif etype == "task_role_assigned":
-        # Cancels a matching stage_assignment_needed timer when Coach
-        # finally fills the role (v0.3 rename of audit_assignment_needed).
-        tid = ev.get("task_id")
-        role = ev.get("role")
-        if tid and role:
-            return ("stage_assignment_needed", f"{tid}:{role}")
     return None
 
 
@@ -444,27 +441,31 @@ async def _format_audit_fail_msg(ev: dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
-async def _format_stage_assignment_needed_msg(ev: dict[str, Any]) -> str:
-    """Compose the Telegram body for a stage that's stuck waiting on
-    a Coach role assignment. Implies Coach is asleep / over-cap or
-    forgot — the human can step in and assign via the UI.
-
-    v0.3: covers all stages (plan/execute/audit/ship), not just audit/ship."""
-    tid = ev.get("task_id") or "?"
-    role = ev.get("role") or "?"
+async def _format_board_stalled_msg(ev: dict[str, Any]) -> str:
+    """Compose the Telegram body for a board safety ring fire (v2
+    §10.4). The whole kanban hasn't moved in N minutes despite ≥1
+    active task — Coach went to sleep on review-gate decisions."""
+    project_id = ev.get("project_id") or "?"
+    age_seconds = int(ev.get("age_seconds") or 0)
+    age_min = max(1, age_seconds // 60)
+    active = ev.get("active_task_count")
+    last_change = _short_iso(ev.get("last_stage_change_at"))
     when = _short_iso(ev.get("ts"))
 
     lines: list[str] = []
-    lines.append(f"[needs] Assignment needed: {tid} - {role}")
-    lines.extend(await _task_context_lines(tid, ev))
+    lines.append(f"[stall] Kanban board stalled: {project_id}")
+    if active is not None:
+        lines.append(f"Active tasks: {active}")
+    lines.append(f"No task_stage_changed event in {age_min} min.")
+    if last_change:
+        lines.append(f"Last stage change: {last_change}")
     if when:
         lines.append(f"flagged at {when}")
-    lines.append(
-        "The task is sitting in this stage with no assigned Player. "
-        "Coach hasn't followed up."
-    )
     lines.append("")
-    lines.append("Open the kanban to assign one (or nudge Coach).")
+    lines.append(
+        "Coach hasn't advanced the board. Open the kanban to "
+        "approve, reassign, or archive (or nudge Coach)."
+    )
     return "\n".join(lines).strip()
 
 
@@ -503,8 +504,8 @@ async def _format_message(kind: str, ev: dict[str, Any]) -> str:
         return await _format_proposal_msg(ev)
     if kind == "audit_fail":
         return await _format_audit_fail_msg(ev)
-    if kind == "stage_assignment_needed":
-        return await _format_stage_assignment_needed_msg(ev)
+    if kind == "board_stalled":
+        return await _format_board_stalled_msg(ev)
     if kind == "audit_self_review":
         return await _format_audit_self_review_msg(ev)
     return ""

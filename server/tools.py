@@ -127,6 +127,55 @@ def _valid_transition(old: str, new: str) -> bool:
     return new in VALID_TRANSITIONS.get(old, set())
 
 
+# v2 §22.1 push-time deviation tag matcher. Coach is taught (lifecycle
+# policy block, agents.py) to prefix the `coord_approve_stage` `note`
+# with `[deviation: <one-line reason>]` when noticing scope drift /
+# off-spec work / unexpected changes in the artifact under review. This
+# helper extracts the description so a `deviations_log{noticed_at='push'}`
+# row can be inserted by the approve_stage code path.
+#
+# Matching:
+#   1. Structured tag `[deviation: <reason>]` — preferred form. The
+#      bracketed reason is captured verbatim (trimmed). Substring
+#      match (case-insensitive) on `[deviation:` so the tag can appear
+#      anywhere in the note, with any leading whitespace.
+#   2. Fallback bare phrases (any of `deviation`, `off-spec`,
+#      `scope drift`, `unexpected change`, case-insensitive). These
+#      catch organic Coach prose so we don't lose the signal when the
+#      tag is forgotten — at the cost of occasional false positives
+#      (e.g. "no deviation here"). Acceptable per spec §22.1: the
+#      validation criterion is qualitative across many tasks.
+#
+# Returns the extracted description, or None when no marker is present.
+def _extract_deviation_description(note: str) -> str | None:
+    if not note:
+        return None
+    text = note.strip()
+    if not text:
+        return None
+    lower = text.lower()
+    # Structured tag: find the first `[deviation:` (case-insensitive)
+    # and the matching `]`. Capture the body between.
+    tag_idx = lower.find("[deviation:")
+    if tag_idx >= 0:
+        body_start = tag_idx + len("[deviation:")
+        # Find the closing `]` from body_start onwards.
+        end = text.find("]", body_start)
+        if end > body_start:
+            body = text[body_start:end].strip()
+            if body:
+                return body
+        # Tag opens but has no closing `]` — still treat as flagged so
+        # the row gets inserted with a placeholder description.
+        tail = text[body_start:].strip()
+        return tail or "deviation flagged in note"
+    # Bare-phrase fallback.
+    bare_phrases = ("deviation", "off-spec", "scope drift", "unexpected change")
+    if any(p in lower for p in bare_phrases):
+        return "deviation flagged in note"
+    return None
+
+
 def _parse_boolish(raw: Any, *, default: bool) -> bool:
     if raw is None or raw == "":
         return default
@@ -253,17 +302,15 @@ def _validate_trajectory(
       - `execute` is mandatory
       - `to` is a slot string or list of slot strings
       - `focus` (optional) must be a string when present; ignored on
-        non-audit stages; REQUIRED on `audit_semantics` entries with a
-        non-empty `to` (semantic audits without a stated focus are
-        noise — see kanban-specs.md §4.6.3). Empty-pool semantic
-        stages are allowed; the focus check then happens at
-        `coord_assign_auditor` time.
-      - `coach_review` (optional) bool on the `plan` entry only; when
-        truthy, the kanban does NOT auto-advance plan → execute on
-        spec write. Instead it emits `spec_review_needed` + a Coach
-        wake; Coach reviews and advances manually via
-        `coord_advance_task_stage(stage='execute', assignee=...)`.
-        Silently dropped on non-plan stages.
+        non-audit stages; REQUIRED on every `audit_semantics` entry
+        regardless of `to` (v2 §5.4 — semantic audits without a
+        stated focus are noise; under v2 pools-are-FYI the empty-pool
+        case is the normal case, so the focus must be authored at
+        trajectory time).
+      - The v1.3.13 `coach_review` plan-stage flag is removed in v2.
+        Coach reviews every stage transition by default — there is no
+        per-stage opt-in. The flag is silently dropped if present in
+        legacy trajectories so old persisted rows still validate.
     """
     if raw is None:
         return None, "trajectory is required"
@@ -314,42 +361,24 @@ def _validate_trajectory(
                 f"trajectory entry {stage!r}: 'focus' must be a string"
             )
         focus_clean = (focus_raw or "").strip() if isinstance(focus_raw, str) else ""
-        # Reject semantic audit with assignees but no focus. An
-        # empty-pool semantic stage may be planned at create time and
-        # the focus filled in later via coord_assign_auditor.
-        if stage == "audit_semantics" and slots_or_err and not focus_clean:
+        # v2 §5.4: every audit_semantics entry must carry a focus, even
+        # when `to` is empty (pools are FYI only in v2; the focus is
+        # authored upfront so the trajectory documents what will be
+        # checked). Semantic audits without a focus are noise.
+        if stage == "audit_semantics" and not focus_clean:
             return None, (
-                "audit_semantics requires a 'focus' string when 'to' is "
-                "non-empty — name what to check (e.g. focus='verify the "
-                "math derivation matches the glossary'). Semantic audits "
-                "without a focus are noise (see kanban-specs.md §4.6.3)."
+                "audit_semantics requires a 'focus' string — name what "
+                "to check (e.g. focus='verify the math derivation "
+                "matches the glossary'). Semantic audits without a "
+                "focus are noise (see kanban-specs-v2.md §5.4)."
             )
         # Persist focus only on audit stages (silently drop on non-audit
         # so a Coach paste-mistake doesn't pollute the row).
         if focus_clean and stage in ("audit_syntax", "audit_semantics"):
             out_entry["focus"] = focus_clean
-        # `coach_review` is plan-stage-only: when truthy, the kanban
-        # withholds the plan→execute auto-advance so Coach can review
-        # the spec before execution begins. Silently drop on other
-        # stages so a paste-mistake doesn't pollute the row.
-        if stage == "plan":
-            cr_raw = entry.get("coach_review")
-            if cr_raw is not None:
-                if isinstance(cr_raw, bool):
-                    cr_value = cr_raw
-                elif isinstance(cr_raw, (int, float)):
-                    cr_value = bool(cr_raw)
-                elif isinstance(cr_raw, str):
-                    cr_value = cr_raw.strip().lower() in (
-                        "1", "true", "yes", "on"
-                    )
-                else:
-                    return None, (
-                        f"trajectory entry 'plan': 'coach_review' must "
-                        f"be a bool"
-                    )
-                if cr_value:
-                    out_entry["coach_review"] = True
+        # The v1.3.13 `coach_review` plan-stage flag is removed in v2
+        # (§4.1). Silently drop if present in legacy / paste-mistake
+        # trajectories so old persisted rows still validate.
         normalized.append(out_entry)
 
     if "execute" not in seen_stages:
@@ -426,10 +455,11 @@ async def _check_kanban_role_gate(
         # Spec gate: trajectory has `plan` → spec required.
         if "plan" in stages and not spec_path:
             return (
-                f"task {task_id} has no spec — write one with "
-                f"coord_write_task_spec (or delegate via "
-                f"coord_assign_planner) before moving plan → execute. "
-                f"Use coord_advance_task_stage to force."
+                f"task {task_id} has no spec. The planner must call "
+                f"coord_write_task_spec; Coach can override with "
+                f"coord_write_task_spec(..., on_behalf_of=<slot>) when "
+                f"the planner can't reach the tool. Then advance via "
+                f"coord_approve_stage."
             )
         cur = await c.execute(
             "SELECT 1 FROM task_role_assignments "
@@ -440,64 +470,70 @@ async def _check_kanban_role_gate(
         )
         if not await cur.fetchone():
             return (
-                f"task {task_id} has no claimed executor; assign via "
-                f"coord_assign_task or have a Player call "
-                f"coord_claim_task before moving plan → execute. Use "
-                f"coord_advance_task_stage to force."
+                f"task {task_id} has no executor assigned. Coach must "
+                f"call coord_approve_stage(next_stage='execute', "
+                f"assignee=<slot>, note=<brief>) to plant the role row "
+                f"and advance the stage in one atomic step. Pools are "
+                f"FYI only in v2; pick a named slot."
             )
         return None
 
     if old == "execute" and new in ("audit_syntax", "audit_semantics", "ship", "archive"):
         return (
-            f"manual execute → {new} is not allowed. The kanban "
-            f"subscriber routes the task when the executor calls "
-            f"coord_commit_push(task_id={task_id!r}) for code work or "
-            f"coord_complete_execution(task_id={task_id!r}, ...) for "
-            f"non-code artifacts. Use "
-            f"coord_advance_task_stage to force, or pass "
-            f"status='cancelled' if the intent is cancellation."
+            f"task {task_id} stage transitions are Coach-only in v2. "
+            f"The executor signals completion via "
+            f"coord_commit_push(task_id={task_id!r}) for code or "
+            f"coord_role_complete(task_id={task_id!r}, ...) for "
+            f"non-code; Coach then approves the next stage via "
+            f"coord_approve_stage. Pass status='archive' here only "
+            f"as the cancellation backstop (no user-facing summary; "
+            f"prefer coord_archive_task for normal archives)."
         )
 
     if old == "audit_syntax" and new in ("audit_semantics", "ship", "archive"):
         if not await _has_passing_auditor(c, task_id, "auditor_syntax"):
             return (
-                f"leaving formal review requires the active formal "
-                f"reviewer to submit verdict='pass' via "
-                f"coord_submit_audit_report. Use "
-                f"coord_advance_task_stage to force."
+                f"leaving formal review requires verdict='pass' from "
+                f"the active formal reviewer (via "
+                f"coord_submit_audit_report). Use coord_approve_stage "
+                f"to advance once the verdict lands; if the verdict "
+                f"is 'fail' and Coach wants to override the audit, "
+                f"call coord_approve_stage with the explicit "
+                f"next_stage."
             )
         if new != expected_next:
             return (
                 f"task {task_id} trajectory expects {expected_next!r} "
                 f"after formal-review pass. Update via "
-                f"coord_set_task_trajectory or use "
-                f"coord_advance_task_stage to force."
+                f"coord_set_task_trajectory, then coord_approve_stage."
             )
         return None
 
     if old == "audit_semantics" and new in ("ship", "archive"):
         if not await _has_passing_auditor(c, task_id, "auditor_semantics"):
             return (
-                f"leaving semantic review requires the active semantic "
-                f"reviewer to submit verdict='pass' via "
-                f"coord_submit_audit_report. Use "
-                f"coord_advance_task_stage to force."
+                f"leaving semantic review requires verdict='pass' "
+                f"from the active semantic reviewer (via "
+                f"coord_submit_audit_report). Use coord_approve_stage "
+                f"to advance once the verdict lands; Coach can override "
+                f"a FAIL via an explicit coord_approve_stage call."
             )
         if new != expected_next:
             return (
                 f"task {task_id} trajectory expects {expected_next!r} "
                 f"after semantic-review pass. Update via "
-                f"coord_set_task_trajectory or use "
-                f"coord_advance_task_stage to force."
+                f"coord_set_task_trajectory, then coord_approve_stage."
             )
         return None
 
     if old == "ship" and new == "archive":
         if not await _has_completed_shipper(c, task_id):
             return (
-                f"ship → archive requires the assigned shipper to call "
-                f"coord_mark_shipped(task_id={task_id!r}). Use "
-                f"coord_advance_task_stage to force."
+                f"ship → archive requires the shipper to call "
+                f"coord_role_complete(task_id={task_id!r}, "
+                f"message_to_coach=...). Coach then archives with a "
+                f"user-facing summary via "
+                f"coord_archive_task(task_id={task_id!r}, summary=...)."
             )
         return None
 
@@ -853,10 +889,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                  trajectory_json, initial_status, initial_owner,
                  now_iso, caller_id),
             )
-            # Plant one task_role_assignments row per trajectory stage.
-            # Hard-assigns (single slot) get owner+claimed_at set; pool
-            # rows leave owner NULL and rely on coord_accept_role / the
-            # idle poller's pool path.
+            # v2 (Docs/kanban-specs-v2.md §7.1): first-stage-only
+            # planting. The role row is created ONLY when the
+            # trajectory's first entry has a single named slot in
+            # `to` (semantically: "Coach picked via the trajectory
+            # itself"). Pool / empty `to` doesn't auto-plant —
+            # subsequent stages NEVER auto-plant. Coach plants role
+            # rows for later stages by calling coord_approve_stage.
             role_for_stage = {
                 "plan": "planner",
                 "execute": "executor",
@@ -864,34 +903,22 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "audit_semantics": "auditor_semantics",
                 "ship": "shipper",
             }
-            for entry in trajectory:
-                stage = entry["stage"]
-                to_list: list[str] = entry.get("to") or []
-                role = role_for_stage[stage]
-                eligible_json = json.dumps(to_list, separators=(",", ":"))
-                # Audit-stage focus (kanban-specs §4.6 / §12.1). NULL
-                # for non-audit roles. _validate_trajectory already
-                # enforced the audit_semantics-needs-focus rule above.
-                focus_value: str | None = entry.get("focus") or None
-                if len(to_list) == 1:
-                    # Hard-assign.
-                    await c.execute(
-                        "INSERT INTO task_role_assignments "
-                        "(task_id, role, eligible_owners, owner, "
-                        "assigned_at, claimed_at, focus) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (task_id, role, eligible_json, to_list[0],
-                         now_iso, now_iso, focus_value),
-                    )
-                else:
-                    # Empty list (no candidates yet) or pool (>1).
-                    await c.execute(
-                        "INSERT INTO task_role_assignments "
-                        "(task_id, role, eligible_owners, owner, "
-                        "assigned_at, focus) "
-                        "VALUES (?, ?, ?, NULL, ?, ?)",
-                        (task_id, role, eligible_json, now_iso, focus_value),
-                    )
+            first_entry = trajectory[0]
+            first_to: list[str] = first_entry.get("to") or []
+            planted_first_stage = False
+            if len(first_to) == 1:
+                first_role = role_for_stage[first_entry["stage"]]
+                first_focus: str | None = first_entry.get("focus") or None
+                eligible_json = json.dumps(first_to, separators=(",", ":"))
+                await c.execute(
+                    "INSERT INTO task_role_assignments "
+                    "(task_id, role, eligible_owners, owner, "
+                    "assigned_at, claimed_at, focus) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (task_id, first_role, eligible_json, first_to[0],
+                     now_iso, now_iso, first_focus),
+                )
+                planted_first_stage = True
             # When the first stage is `execute` with a single hard-
             # assigned owner, propagate to agents.current_task_id so
             # `coord_my_assignments` Bucket 1 surfaces the task. Without
@@ -928,25 +955,37 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "trajectory": trajectory,
             }
         )
-        # v0.3 audit fix (item 2): emit task_stage_changed for the
-        # initial stage so the kanban subscriber's _on_stage_changed
-        # handler wakes the first-stage assignee. Without this, a task
-        # with hard-assigned `to` slots in the trajectory sits silently
-        # — the executor never knows they own work, and the idle poller
-        # only nudges pool calls (not single-owner reservations until
-        # the stage is "current").
-        await bus.publish(
-            {
-                "ts": ts,
-                "agent_id": "system",
-                "type": "task_stage_changed",
-                "task_id": task_id,
-                "from": None,
-                "to": initial_status,
-                "reason": "task_created",
-                "owner": initial_owner,
-            }
-        )
+        # v2 (Docs/kanban-specs-v2.md §7.1): emit task_stage_changed +
+        # task_role_assigned ONLY when the first-stage role row was
+        # actually planted (single-name `to`). Pool / empty first-stage
+        # entries don't produce these events — Coach drives the first
+        # transition via coord_approve_stage when ready.
+        if planted_first_stage and initial_owner:
+            await bus.publish(
+                {
+                    "ts": ts,
+                    "agent_id": "system",
+                    "type": "task_stage_changed",
+                    "task_id": task_id,
+                    "from": None,
+                    "to": initial_status,
+                    "reason": "task_created",
+                    "owner": initial_owner,
+                    "assignee": initial_owner,
+                }
+            )
+            first_role = role_for_stage[trajectory[0]["stage"]]
+            await bus.publish(
+                {
+                    "ts": ts,
+                    "agent_id": caller_id,
+                    "type": "task_role_assigned",
+                    "task_id": task_id,
+                    "role": first_role,
+                    "owner": initial_owner,
+                    "to": initial_owner,
+                }
+            )
         head = (
             f"Created task {task_id}"
             + (f" (subtask of {parent_id})" if parent_id else " (top-level)")
@@ -954,485 +993,74 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             + f"workflow={workflow}, "
             + f"trajectory=[{', '.join(s['stage'] for s in trajectory)}]"
         )
-        # v0.3.11 — surface what happens next so Coach doesn't double-
-        # fire coord_send_message and so they know completion will
-        # round-trip via task_completed.
-        if first_stage_to:
+        if planted_first_stage and initial_owner:
             tail = (
-                f". The kanban auto-wakes the first-stage assignee "
-                f"({initial_status} → "
-                + (
-                    f"{first_stage_to[0]}"
-                    if len(first_stage_to) == 1
-                    else f"pool {first_stage_to}"
-                )
-                + f"). Do NOT follow up with coord_send_message; "
-                f"the wake includes the role context. You'll be "
-                f"re-notified at trajectory completion via a "
-                f"`task_completed` wake to summarize for the user."
+                f". Planted {role_for_stage[trajectory[0]['stage']]} "
+                f"role → {initial_owner} (first-stage single-name auto-"
+                f"plant per v2 §7.1). The harness wakes them with the "
+                f"role context. Subsequent stages' `to` lists are FYI "
+                f"only — you advance each stage explicitly via "
+                f"coord_approve_stage(task_id, next_stage, assignee, "
+                f"note?) when the previous stage's deliverable lands."
             )
+            # Wake the planted first-stage assignee directly. v1 used
+            # the subscriber's _on_stage_changed handler; v2 has no
+            # auto-advance so the wake fires from here.
+            from server.agents import maybe_wake_agent
+            wake_body = (
+                f"Coach created task {task_id} ({title!r}) and assigned "
+                f"you as {role_for_stage[trajectory[0]['stage']]} for "
+                f"the {initial_status} stage. Read coord_my_assignments "
+                f"for the role context, do the work, then call the "
+                f"matching completion tool (coord_commit_push for code, "
+                f"coord_write_task_spec for planners, "
+                f"coord_role_complete for non-git executors / "
+                f"shippers). Coach reviews after you complete and "
+                f"approves the next stage."
+            )
+            try:
+                await maybe_wake_agent(
+                    initial_owner, wake_body,
+                    bypass_debounce=True,
+                    wake_source="kanban_create",
+                )
+            except Exception:
+                pass
         else:
             tail = (
-                f". WARNING: the first stage ({initial_status}) has "
-                f"no eligible owners. The idle poller won't pick "
-                f"this up automatically — assign someone via "
-                f"coord_assign_{_role_token_for_stage(initial_status)} "
-                f"(or rewrite the trajectory) or this task sits "
-                f"silently."
+                f". No role row planted (first-stage `to` is "
+                f"empty or a pool — pools are FYI only in v2). Drive "
+                f"the first transition via "
+                f"coord_approve_stage(task_id={task_id!r}, "
+                f"next_stage={initial_status!r}, assignee=<slot>, "
+                f"note=<brief>) when you're ready. Until then the task "
+                f"sits silently."
             )
         return _ok(head + tail)
 
     @tool(
-        "coord_claim_task",
-        (
-            "Claim a plan-stage task — sets you as its executor and moves "
-            "it from `plan` → `execute`. Only Players can claim (Coach "
-            "delegates, never executes). Fails if:\n"
-            "  - task is not status=plan\n"
-            "  - you're Coach\n"
-            "  - you already own another task (finish or cancel it first)\n"
-            "  - the task has an executor pool (eligible_owners) and you're "
-            "    not in it\n"
-            "  - the trajectory has a `plan` stage and no spec.md exists "
-            "    yet (the planner must call coord_write_task_spec first)\n"
-            "Self-claim is one atomic step: claimed_at + started_at are "
-            "both set to now() because claim IS starting from the Player's "
-            "perspective."
-        ),
-        {"task_id": str},
-    )
-    async def claim_task(args: dict[str, Any]) -> dict[str, Any]:
-        task_id = (args.get("task_id") or "").strip()
-        if not task_id:
-            return _err("task_id is required")
-        if caller_is_coach:
-            return _err(
-                "Coach delegates; only Players claim tasks. Use "
-                "coord_assign_task(task_id, to) to push-assign this "
-                "to a specific Player, or coord_send_message to nudge "
-                "one to claim it themselves."
-            )
-
-        c = await configured_conn()
-        try:
-            # One-task-at-a-time for Players — enforces focus and keeps
-            # current_task_id well-defined for subtask nesting.
-            cur = await c.execute(
-                "SELECT current_task_id FROM agents WHERE id = ?",
-                (caller_id,),
-            )
-            row = await cur.fetchone()
-            if row and dict(row)["current_task_id"]:
-                return _err(
-                    f"you already own task {dict(row)['current_task_id']}; "
-                    f"complete or cancel it first."
-                )
-
-            project_id = await resolve_active_project()
-            # Pre-checks: task exists in plan stage, has a spec (when the
-            # trajectory has a `plan` stage), and (if posted to a pool)
-            # the caller is eligible.
-            cur = await c.execute(
-                "SELECT status, owner, trajectory, spec_path "
-                "FROM tasks WHERE id = ? AND project_id = ?",
-                (task_id, project_id),
-            )
-            existing = await cur.fetchone()
-            if not existing:
-                return _err(f"task {task_id} not found")
-            ed = dict(existing)
-            if ed["status"] != "plan":
-                return _err(
-                    f"task {task_id} is not claimable "
-                    f"(status={ed['status']}, owner={ed['owner'] or '-'}). "
-                    f"Only plan-stage tasks can be claimed."
-                )
-            stages = _trajectory_stages_from_row(ed)
-            if "plan" in stages and not ed.get("spec_path"):
-                return _err(
-                    f"task {task_id} has no spec — write it (planner) "
-                    f"with coord_write_task_spec before this can move "
-                    f"to execute. (Trajectories without `plan` skip "
-                    f"this gate.)"
-                )
-
-            # Pool eligibility: if there's an active executor role row
-            # with non-empty eligible_owners, the caller must be in the
-            # list. If no active executor row exists yet (back-compat
-            # path: Coach pushed via legacy coord_assign_task that didn't
-            # write a row), allow the claim — production migrations
-            # don't require pre-existing role rows.
-            import json as _json
-            cur = await c.execute(
-                "SELECT id, eligible_owners, owner FROM task_role_assignments "
-                "WHERE task_id = ? AND role = 'executor' "
-                "AND completed_at IS NULL AND superseded_by IS NULL "
-                "ORDER BY assigned_at DESC LIMIT 1",
-                (task_id,),
-            )
-            role_row = await cur.fetchone()
-            if role_row:
-                rd = dict(role_row)
-                if rd.get("owner") and rd["owner"] != caller_id:
-                    return _err(
-                        f"task {task_id} already has executor "
-                        f"{rd['owner']} on the role-assignment row."
-                    )
-                eligible = []
-                try:
-                    eligible = _json.loads(rd.get("eligible_owners") or "[]")
-                except Exception:
-                    eligible = []
-                if eligible and caller_id not in eligible:
-                    return _err(
-                        f"task {task_id} is posted to executors "
-                        f"{eligible}; {caller_id} is not in the pool."
-                    )
-
-            # Atomic claim — race-safe via status='plan' guard. Both
-            # claimed_at AND started_at are set to now (self-claim IS
-            # starting; no separate "assigned but not picked up" window).
-            # Stamp last_stage_change_at + clear stale_alert_at so the
-            # stall sweeper sees the move (audit-2026-05-04 item 6).
-            now = _now_iso()
-            cur = await c.execute(
-                "UPDATE tasks SET owner = ?, status = 'execute', "
-                "claimed_at = ?, started_at = ?, "
-                "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
-                "WHERE id = ? AND status = 'plan' AND project_id = ? "
-                "RETURNING id",
-                (caller_id, now, now, now, task_id, project_id),
-            )
-            updated = await cur.fetchone()
-            if not updated:
-                # Race-loss path — someone else claimed between our pre-check
-                # and the UPDATE. Re-read to give a precise error.
-                cur = await c.execute(
-                    "SELECT status, owner FROM tasks "
-                    "WHERE id = ? AND project_id = ?",
-                    (task_id, project_id),
-                )
-                current = await cur.fetchone()
-                if not current:
-                    return _err(f"task {task_id} not found")
-                d = dict(current)
-                return _err(
-                    f"task {task_id} race-lost during claim "
-                    f"(status={d['status']}, owner={d['owner'] or '-'})"
-                )
-
-            # Update or insert the executor role-assignment row. If
-            # there's a posted-pool row, claim it; otherwise insert a
-            # fresh hard-assign row so the audit trail is complete.
-            if role_row:
-                await c.execute(
-                    "UPDATE task_role_assignments "
-                    "SET owner = ?, claimed_at = ?, started_at = ? "
-                    "WHERE id = ?",
-                    (caller_id, now, now, dict(role_row)["id"]),
-                )
-            else:
-                await c.execute(
-                    "INSERT INTO task_role_assignments "
-                    "(task_id, role, eligible_owners, owner, "
-                    "assigned_at, claimed_at, started_at) "
-                    "VALUES (?, 'executor', '[]', ?, ?, ?, ?)",
-                    (task_id, caller_id, now, now, now),
-                )
-
-            await c.execute(
-                "UPDATE agents SET current_task_id = ? WHERE id = ?",
-                (task_id, caller_id),
-            )
-            await c.commit()
-        finally:
-            await c.close()
-
-        await bus.publish(
-            {
-                "ts": _now_iso(),
-                "agent_id": caller_id,
-                "type": "task_claimed",
-                "task_id": task_id,
-            }
-        )
-        # v0.3.2: echo the next-step hint into the response so the
-        # claimer doesn't have to guess what to call when they're done.
-        # The kanban subscriber will also wake them via _on_stage_changed
-        # with the same hint shape; this is the immediate confirmation.
-        return _ok(
-            f"claimed {task_id} (you are now the executor in `execute` "
-            f"stage). Read the spec.md from the task folder, do the "
-            f"work, then call coord_commit_push("
-            f"task_id={task_id!r}, message=...) for code or "
-            f"coord_complete_execution(task_id={task_id!r}, "
-            f"summary=...) for non-code. The kanban does NOT advance "
-            f"until you call one of those tools with task_id."
-        )
-
-    @tool(
-        "coord_accept_role",
-        (
-            "Player-only. Answer a kanban role call. Coach may post a "
-            "current-stage role to several candidates; the first eligible "
-            "Player to call this tool wins atomically. Future-stage "
-            "reservations are not actionable until the card reaches that "
-            "stage.\n"
-            "\n"
-            "Params:\n"
-            "- task_id: required\n"
-            "- role: optional role or alias. Valid roles: planner, "
-            "executor, auditor_syntax/formal, auditor_semantics/semantic, "
-            "shipper. If omitted, the tool infers the only current-stage "
-            "pool row you are eligible for."
-        ),
-        {"task_id": str, "role": str},
-    )
-    async def accept_role(args: dict[str, Any]) -> dict[str, Any]:
-        if caller_is_coach:
-            return _err("Coach assigns roles; only Players answer role calls.")
-        task_id = (args.get("task_id") or "").strip()
-        role_raw = (args.get("role") or "").strip()
-        if not task_id:
-            return _err("task_id is required")
-
-        role = _normalize_role_alias(role_raw) if role_raw else None
-        if role_raw and role is None:
-            return _err(
-                "role must be planner, executor, formal/syntax, "
-                "semantic/semantics, or shipper"
-            )
-
-        project_id = await resolve_active_project()
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT current_task_id FROM agents WHERE id = ?",
-                (caller_id,),
-            )
-            agent_row = await cur.fetchone()
-            if not agent_row:
-                return _err(f"caller '{caller_id}' not in agents table")
-            current_task = dict(agent_row).get("current_task_id")
-
-            cur = await c.execute(
-                "SELECT id, status, owner, trajectory, spec_path "
-                "FROM tasks WHERE id = ? AND project_id = ?",
-                (task_id, project_id),
-            )
-            task_row = await cur.fetchone()
-            if not task_row:
-                return _err(f"task {task_id} not found")
-            task = dict(task_row)
-            stage = task.get("status")
-            if stage == "archive":
-                return _err(f"task {task_id} is archived")
-            task_stages = _trajectory_stages_from_row(task)
-
-            if role is None:
-                cur = await c.execute(
-                    "SELECT id, role, eligible_owners FROM task_role_assignments "
-                    "WHERE task_id = ? AND owner IS NULL "
-                    "AND completed_at IS NULL AND superseded_by IS NULL "
-                    "ORDER BY assigned_at",
-                    (task_id,),
-                )
-                candidates = []
-                for rr in await cur.fetchall():
-                    rd = dict(rr)
-                    if not _role_matches_stage(rd["role"], stage):
-                        continue
-                    try:
-                        eligible = json.loads(rd.get("eligible_owners") or "[]")
-                    except Exception:
-                        eligible = []
-                    if caller_id in eligible:
-                        candidates.append(rd)
-                if not candidates:
-                    return _err(
-                        f"no current-stage role call for {caller_id} "
-                        f"on task {task_id}"
-                    )
-                if len(candidates) > 1:
-                    roles = ", ".join(sorted({c["role"] for c in candidates}))
-                    return _err(
-                        f"multiple role calls are available ({roles}); "
-                        f"pass role explicitly."
-                    )
-                role = candidates[0]["role"]
-
-            if not _role_matches_stage(role, stage):
-                return _err(
-                    f"role {role} is not active while task {task_id} "
-                    f"is in stage {stage}. Future-stage reservations are "
-                    f"not actionable yet."
-                )
-            if role == "executor" and current_task:
-                return _err(
-                    f"you already own task {current_task}; complete or "
-                    f"cancel it before accepting another executor role."
-                )
-            if (
-                role == "executor"
-                and "plan" in task_stages
-                and not task.get("spec_path")
-            ):
-                return _err(
-                    f"task {task_id} has no spec — the planner must call "
-                    f"coord_write_task_spec before this can move to execute."
-                )
-
-            cur = await c.execute(
-                "SELECT id, eligible_owners, owner FROM task_role_assignments "
-                "WHERE task_id = ? AND role = ? "
-                "AND completed_at IS NULL AND superseded_by IS NULL "
-                "ORDER BY assigned_at DESC LIMIT 1",
-                (task_id, role),
-            )
-            role_row = await cur.fetchone()
-            if not role_row:
-                return _err(
-                    f"no active {role} role row exists for task {task_id}"
-                )
-            rd = dict(role_row)
-            if rd.get("owner"):
-                return _err(
-                    f"task {task_id} {role} was already accepted by "
-                    f"{rd['owner']}"
-                )
-            try:
-                eligible = json.loads(rd.get("eligible_owners") or "[]")
-            except Exception:
-                eligible = []
-            if caller_id not in eligible:
-                return _err(
-                    f"{caller_id} is not in the candidate call for "
-                    f"task {task_id} {role}"
-                )
-
-            now = _now_iso()
-            if role == "executor":
-                await c.execute("BEGIN")
-                # Stamp last_stage_change_at on plan→execute transition
-                # (audit-2026-05-04 item 6).
-                cur = await c.execute(
-                    "UPDATE tasks SET owner = ?, status = 'execute', "
-                    "claimed_at = ?, started_at = ?, "
-                    "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
-                    "WHERE id = ? AND status = 'plan' AND project_id = ? "
-                    "RETURNING id",
-                    (caller_id, now, now, now, task_id, project_id),
-                )
-                if not await cur.fetchone():
-                    await c.rollback()
-                    return _err(
-                        f"task {task_id} could not be claimed; it may "
-                        f"have moved out of plan."
-                    )
-                cur = await c.execute(
-                    "UPDATE task_role_assignments "
-                    "SET owner = ?, claimed_at = ?, started_at = ? "
-                    "WHERE id = ? AND owner IS NULL "
-                    "AND completed_at IS NULL AND superseded_by IS NULL "
-                    "RETURNING id",
-                    (caller_id, now, now, rd["id"]),
-                )
-                if not await cur.fetchone():
-                    await c.rollback()
-                    return _err(
-                        f"task {task_id} executor role was already accepted"
-                    )
-                await c.execute(
-                    "UPDATE agents SET current_task_id = ? WHERE id = ?",
-                    (task_id, caller_id),
-                )
-                await c.commit()
-            else:
-                cur = await c.execute(
-                    "UPDATE task_role_assignments "
-                    "SET owner = ?, claimed_at = ?, started_at = ? "
-                    "WHERE id = ? AND owner IS NULL "
-                    "AND completed_at IS NULL AND superseded_by IS NULL "
-                    "RETURNING id",
-                    (caller_id, now, now, rd["id"]),
-                )
-                if not await cur.fetchone():
-                    return _err(
-                        f"task {task_id} {role} was already accepted"
-                    )
-                await c.commit()
-        finally:
-            await c.close()
-
-        ts = _now_iso()
-        await bus.publish({
-            "ts": ts,
-            "agent_id": caller_id,
-            "type": "task_role_claimed",
-            "task_id": task_id,
-            "role": role,
-            "owner": caller_id,
-            "to": caller_id,
-        })
-        if role == "executor":
-            await bus.publish({
-                "ts": ts,
-                "agent_id": caller_id,
-                "type": "task_claimed",
-                "task_id": task_id,
-            })
-        # v0.3.2: echo a role-specific next-step hint so the Player has
-        # the matching completion-tool name in front of them
-        # immediately. Mirrors the kanban subscriber's stage-entry
-        # wake but lands on the synchronous accept response.
-        if role == "executor":
-            next_step = (
-                f"Read the spec, do the work, then call "
-                f"coord_commit_push(task_id={task_id!r}, message=...) "
-                f"for code or coord_complete_execution("
-                f"task_id={task_id!r}, summary=...) for non-code. "
-                f"The kanban does NOT advance until you call one of those."
-            )
-        elif role == "planner":
-            next_step = (
-                f"Draft the spec then call coord_write_task_spec("
-                f"task_id={task_id!r}, body=<spec>). The task auto-"
-                f"advances plan -> execute on success."
-            )
-        elif role in ("auditor_syntax", "auditor_semantics"):
-            kind = "syntax" if role == "auditor_syntax" else "semantics"
-            next_step = (
-                f"Read the spec + the executor's commit/artifact, "
-                f"then call coord_submit_audit_report("
-                f"task_id={task_id!r}, kind={kind!r}, body=<review>, "
-                f"verdict='pass' or 'fail')."
-            )
-        elif role == "shipper":
-            next_step = (
-                f"Merge / publish / hand-off, then call "
-                f"coord_mark_shipped(task_id={task_id!r}, "
-                f"note=<optional>). The task auto-archives."
-            )
-        else:
-            next_step = "call coord_my_assignments() for the next step."
-        return _ok(f"accepted {role} on {task_id}.\n\n{next_step}")
-
-    @tool(
         "coord_update_task",
         (
-            "Update a task's kanban stage. Valid transitions:\n"
+            "DEPRECATED for stage transitions in kanban v2. The "
+            "single transition tool is coord_approve_stage(task_id, "
+            "next_stage, assignee, note?); this tool is tolerated only "
+            "as the fast-cancellation backstop (status='archive' "
+            "without a user-facing summary). Prefer "
+            "coord_archive_task(task_id, summary) so the user sees a "
+            "deliberate wrap-up.\n"
+            "\n"
+            "Valid transitions still gated by the v2 state machine:\n"
             "  plan → execute, archive\n"
-            "  execute → audit_syntax, archive\n"
-            "  audit_syntax → audit_semantics, execute\n"
-            "  audit_semantics → ship, execute\n"
+            "  execute → audit_syntax, audit_semantics, ship, archive\n"
+            "  audit_syntax → audit_semantics, ship, archive, execute\n"
+            "  audit_semantics → ship, archive, execute\n"
             "  ship → archive\n"
             "  archive: terminal\n"
             "\n"
-            "For most transitions you should NOT call this tool directly — "
-            "the kanban subscriber auto-advances on the right events "
-            "(coord_commit_push, coord_submit_audit_report, "
-            "coord_mark_shipped). Use this for cancellation (any stage → "
-            "archive with note) or other manual one-off moves.\n"
+            "Most call sites should use coord_approve_stage instead. "
+            "v2 does NOT auto-advance on commit/audit/ship; the role-"
+            "completion gate here will reject manual transitions Coach "
+            "should have driven via coord_approve_stage.\n"
             "\n"
             "Legacy aliases accepted for one release: 'open'→'plan', "
             "'claimed'/'in_progress'/'blocked'→'execute', 'done'→'archive', "
@@ -1626,346 +1254,6 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             f"coord_send_message; the wake covers it."
         )
 
-    @tool(
-        "coord_assign_task",
-        (
-            "Coach-only. Assign a plan-stage task as the EXECUTOR.\n"
-            "Params:\n"
-            "- task_id: the task to assign (required)\n"
-            "- to: either a single Player slot id (e.g. 'p3') for hard-assign, "
-            "OR a comma-separated list (e.g. 'p1,p2,p3') to post the task to "
-            "an executor pool — the first eligible Player to call "
-            "coord_claim_task wins via atomic UPDATE.\n"
-            "\n"
-            "Hard-assign: task moves plan→execute immediately, owner is set, "
-            "the assignee is auto-woken. Pool: task stays in `plan` with the "
-            "eligible_owners list set on a task_role_assignments row; all "
-            "eligible Players are auto-woken with an 'available task' prompt.\n"
-            "\n"
-            "Tasks whose trajectory includes `plan` must have a spec.md "
-            "before they can move to execute (the planner writes one via "
-            "coord_write_task_spec). Trajectories without `plan` skip the "
-            "spec gate.\n"
-            "\n"
-            "Fails if: you're a Player (Players report, don't assign), the "
-            "task isn't status=plan, the target isn't a valid Player slot, "
-            "the spec gate trips for a standard task, or (hard-assign) the "
-            "Player already owns another task."
-        ),
-        {"task_id": str, "to": str},
-    )
-    async def assign_task(args: dict[str, Any]) -> dict[str, Any]:
-        if not caller_is_coach:
-            return _err(
-                "Only Coach can push-assign tasks. Players report and claim "
-                "plan-stage tasks themselves via coord_claim_task."
-            )
-        task_id = (args.get("task_id") or "").strip()
-        to_raw = (args.get("to") or "").strip()
-        if not task_id:
-            return _err("task_id is required")
-        if not to_raw:
-            return _err("'to' is required (Player slot id, or comma-list for pool)")
-
-        # Parse `to`: comma → pool; otherwise single hard-assign.
-        if "," in to_raw:
-            pool = [p.strip().lower() for p in to_raw.split(",") if p.strip()]
-        else:
-            pool = [to_raw.lower()]
-        if not pool:
-            return _err("'to' resolved to an empty list of Players")
-        for slot in pool:
-            if slot in ("coach", "broadcast"):
-                return _err(
-                    f"can only assign to Players (p1..p10), not {slot!r}"
-                )
-            if slot not in VALID_RECIPIENTS:
-                return _err(f"invalid target '{slot}' — must be p1..p10")
-        # Dedupe + locked check.
-        seen: set[str] = set()
-        deduped: list[str] = []
-        for slot in pool:
-            if slot in seen:
-                continue
-            seen.add(slot)
-            if await _is_locked(slot):
-                return _err(
-                    f"Player {slot} is locked (human marked them off-limits "
-                    f"for Coach orchestration). Pick unlocked Players."
-                )
-            deduped.append(slot)
-        is_pool = len(deduped) > 1
-
-        c = await configured_conn()
-        try:
-            project_id = await resolve_active_project()
-            # Read the task: must be in plan, must have spec if standard.
-            cur = await c.execute(
-                "SELECT status, owner, trajectory, spec_path "
-                "FROM tasks WHERE id = ? AND project_id = ?",
-                (task_id, project_id),
-            )
-            existing = await cur.fetchone()
-            if not existing:
-                return _err(f"task {task_id} not found")
-            ed = dict(existing)
-            if ed["status"] != "plan":
-                return _err(
-                    f"task {task_id} is not in plan stage "
-                    f"(status={ed['status']}, owner={ed['owner'] or '-'}). "
-                    f"Use coord_advance_task_stage to force a transition, "
-                    f"or send a message if you want to nudge an in-flight task."
-                )
-            ed_stages = _trajectory_stages_from_row(ed)
-            if "plan" in ed_stages and not ed.get("spec_path"):
-                return _err(
-                    f"task {task_id} has no spec — the planner must call "
-                    f"coord_write_task_spec before assigning the "
-                    f"executor. (Trajectories without `plan` skip this "
-                    f"gate.)"
-                )
-
-            now = _now_iso()
-            import json as _json
-
-            # Pre-read the slots that own the about-to-be-superseded
-            # active executor row(s), so we can wake them with a
-            # stand-down message after commit (v0.3.6: production p1
-            # incident — Coach reassigned, p1 didn't see it, kept
-            # working and pushed raw git past the kanban).
-            from server.kanban import collect_superseded_role_owners
-            displaced_executor: list[str] = []
-
-            if is_pool:
-                # Pool form: leave tasks.owner NULL, status stays `plan`,
-                # but record the eligible_owners on a fresh executor
-                # role-assignment row. The first eligible Player to
-                # call coord_claim_task wins.
-                eligible_json = _json.dumps(deduped)
-                # Don't preemptively reject if some pool members are
-                # busy — the auto-wake will still fire for everyone in
-                # the list and busy Players will simply ignore it. The
-                # idle poller picks up posted-pool work later for any
-                # Player that becomes free.
-                cur = await c.execute(
-                    "INSERT INTO task_role_assignments "
-                    "(task_id, role, eligible_owners, owner, assigned_at) "
-                    "VALUES (?, 'executor', ?, NULL, ?)",
-                    (task_id, eligible_json, now),
-                )
-                new_role_id = cur.lastrowid
-                # Capture displaced owners BEFORE the supersede UPDATE
-                # rewrites their rows out of the "active" set.
-                displaced_executor = await collect_superseded_role_owners(
-                    c, task_id=task_id, role="executor", new_row_id=new_role_id,
-                )
-                # Supersede any prior active executor row + mirror the
-                # candidate list into tasks.trajectory.to (audit
-                # 2026-05-04 items 7 + 8).
-                await c.execute(
-                    "UPDATE task_role_assignments SET superseded_by = ? "
-                    "WHERE task_id = ? AND role = 'executor' "
-                    "AND id != ? "
-                    "AND completed_at IS NULL AND superseded_by IS NULL",
-                    (new_role_id, task_id, new_role_id),
-                )
-                await _mirror_assign_targets_to_trajectory(
-                    c, task_id=task_id, role="executor", targets=deduped
-                )
-                await c.commit()
-            else:
-                # Hard-assign: single Player.
-                slot = deduped[0]
-                # Target Player must exist and be free.
-                cur = await c.execute(
-                    "SELECT current_task_id FROM agents WHERE id = ?", (slot,)
-                )
-                row = await cur.fetchone()
-                if not row:
-                    return _err(f"Player '{slot}' not found")
-                busy_with = dict(row)["current_task_id"]
-                if busy_with:
-                    return _err(
-                        f"Player {slot} already owns task {busy_with}; cancel "
-                        f"or complete it before reassigning."
-                    )
-                # Atomic transition plan → execute. status='plan' guard
-                # is race-safe. Stamp last_stage_change_at + clear
-                # stale_alert_at (audit-2026-05-04 item 6).
-                cur = await c.execute(
-                    "UPDATE tasks SET owner = ?, status = 'execute', "
-                    "claimed_at = ?, started_at = NULL, "
-                    "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
-                    "WHERE id = ? AND status = 'plan' "
-                    "AND project_id = ? RETURNING id",
-                    (slot, now, now, task_id, project_id),
-                )
-                updated = await cur.fetchone()
-                if not updated:
-                    cur = await c.execute(
-                        "SELECT status, owner FROM tasks "
-                        "WHERE id = ? AND project_id = ?",
-                        (task_id, project_id),
-                    )
-                    current = await cur.fetchone()
-                    if not current:
-                        return _err(f"task {task_id} not found")
-                    d = dict(current)
-                    return _err(
-                        f"task {task_id} race-lost during assign "
-                        f"(status={d['status']}, owner={d['owner'] or '-'})"
-                    )
-                cur = await c.execute(
-                    "INSERT INTO task_role_assignments "
-                    "(task_id, role, eligible_owners, owner, "
-                    "assigned_at, claimed_at) "
-                    "VALUES (?, 'executor', '[]', ?, ?, ?)",
-                    (task_id, slot, now, now),
-                )
-                new_role_id = cur.lastrowid
-                # Capture displaced owners BEFORE the supersede UPDATE.
-                displaced_executor = await collect_superseded_role_owners(
-                    c, task_id=task_id, role="executor", new_row_id=new_role_id,
-                )
-                # Supersede prior active executor row + mirror the
-                # candidate list (audit-2026-05-04 items 7+8).
-                await c.execute(
-                    "UPDATE task_role_assignments SET superseded_by = ? "
-                    "WHERE task_id = ? AND role = 'executor' "
-                    "AND id != ? "
-                    "AND completed_at IS NULL AND superseded_by IS NULL",
-                    (new_role_id, task_id, new_role_id),
-                )
-                await _mirror_assign_targets_to_trajectory(
-                    c, task_id=task_id, role="executor", targets=[slot]
-                )
-                await c.execute(
-                    "UPDATE agents SET current_task_id = ? WHERE id = ?",
-                    (task_id, slot),
-                )
-                await c.commit()
-        finally:
-            await c.close()
-
-        # Read task trajectory again for the wake prompt branching.
-        # Cheap second-read is fine; the bus.publish below already
-        # closed our connection.
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT trajectory FROM tasks WHERE id = ?", (task_id,)
-            )
-            crow = await cur.fetchone()
-            wake_stages = _trajectory_stages_from_row(dict(crow) if crow else {})
-        finally:
-            await c.close()
-        no_audit_configured = not _trajectory_has_audit(wake_stages)
-
-        # Stand-down wake to any executor displaced by this assignment
-        # (v0.3.6). Same-slot refresh is filtered inside the helper.
-        # Sent BEFORE the new-target wake so the timeline reads as
-        # "old owner stops, new owner starts" rather than the reverse.
-        if displaced_executor:
-            try:
-                from server.kanban import send_role_stand_down
-                await send_role_stand_down(
-                    task_id=task_id,
-                    role="executor",
-                    displaced=displaced_executor,
-                    new_owners=deduped,
-                )
-            except Exception:
-                pass
-
-        # Emit task_role_assigned (kanban event family). The legacy
-        # task_assigned is also emitted for back-compat; the kanban
-        # subscriber listens for both.
-        await bus.publish(
-            {
-                "ts": _now_iso(),
-                "agent_id": caller_id,
-                "type": "task_role_assigned",
-                "task_id": task_id,
-                "role": "executor",
-                "eligible_owners": deduped,
-                "owner": (None if is_pool else deduped[0]),
-                "to": (deduped[0] if not is_pool else None),
-            }
-        )
-        if not is_pool:
-            await bus.publish(
-                {
-                    "ts": _now_iso(),
-                    "agent_id": caller_id,
-                    "type": "task_assigned",
-                    "task_id": task_id,
-                    "to": deduped[0],
-                }
-            )
-        # Auto-wake. Late import to avoid the tools↔agents circular dep.
-        try:
-            from server.agents import maybe_wake_agent
-            simple_hint = ""
-            if no_audit_configured:
-                simple_hint = (
-                    " This task has no audit stage configured — self-audit "
-                    "(run tests / sanity-check the change) before "
-                    "coord_commit_push or coord_complete_execution. The "
-                    "board archives directly on completion; there is no "
-                    "separate review pass."
-                )
-            if is_pool:
-                pool_str = ", ".join(deduped)
-                wake_prompt = (
-                    f"Coach posted task {task_id} to a pool of {pool_str}. "
-                    f"Read the spec + decide if you want to take it; first "
-                    f"to call coord_claim_task wins.{simple_hint}"
-                )
-                for slot in deduped:
-                    try:
-                        await maybe_wake_agent(
-                            slot, wake_prompt,
-                            bypass_debounce=True,
-                            wake_source="kanban_pool",
-                        )
-                    except Exception:
-                        pass
-            else:
-                slot = deduped[0]
-                wake_prompt = (
-                    f"Coach assigned you task {task_id} as executor "
-                    f"(status=execute, owner={slot}). Read spec.md from "
-                    f"the task folder, do the work, then call "
-                    f"coord_commit_push(task_id={task_id!r}, ...) for "
-                    f"code changes or coord_complete_execution("
-                    f"task_id={task_id!r}, ...) for non-code artifacts."
-                    f"{simple_hint}"
-                )
-                await maybe_wake_agent(
-                    slot, wake_prompt,
-                    bypass_debounce=True,
-                    wake_source="kanban_assignment",
-                )
-        except Exception:
-            pass
-        if is_pool:
-            return _ok(
-                f"Posted {task_id} to executor pool: "
-                f"{', '.join(deduped)}. The kanban auto-wakes all "
-                f"eligible Players with the task spec; first to call "
-                f"coord_claim_task wins. Do NOT follow up with "
-                f"coord_send_message — the wake already includes "
-                f"the role context."
-            )
-        return _ok(
-            f"Assigned {task_id} → {deduped[0]} as executor "
-            f"(status now 'execute'). The kanban auto-wakes "
-            f"{deduped[0]} with the spec + completion-tool hint. "
-            f"Do NOT follow up with coord_send_message — the wake "
-            f"already includes everything they need. Watch for "
-            f"`task_completed` or `task_stage_stale` in your "
-            f"next-turn rollup."
-        )
 
     @tool(
         "coord_send_message",
@@ -2474,9 +1762,16 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "Returns 'nothing to commit' as a soft-OK if the working tree "
             "is clean. Requires the active project to have a repo URL "
             "configured; push also needs pushable credentials (typically "
-            "a PAT embedded in the project repo URL)."
+            "a PAT embedded in the project repo URL).\n"
+            "- message_to_coach: optional one-line note Coach reads on "
+            "the next tick. Use this to flag what you noticed, any "
+            "caveats, what the next person should know. Carried verbatim "
+            "in the `commit_pushed` event payload."
         ),
-        {"message": str, "push": str, "task_id": str},
+        {
+            "message": str, "push": str, "task_id": str,
+            "message_to_coach": str,
+        },
     )
     async def commit_push(args: dict[str, Any]) -> dict[str, Any]:
         if caller_is_coach:
@@ -2496,6 +1791,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             return _err("message is required")
         if len(message) > 2000:
             return _err(f"message too long ({len(message)} chars, max 2000)")
+
+        message_to_coach = (args.get("message_to_coach") or "").strip()
+        if len(message_to_coach) > 2000:
+            return _err(
+                f"message_to_coach too long ({len(message_to_coach)} chars, "
+                f"max 2000)"
+            )
 
         push_raw = str(args.get("push") or "true").strip().lower()
         do_push = push_raw not in ("false", "0", "no", "off")
@@ -2757,6 +2059,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 # show "we filled this in for you" rather than implying
                 # the Player explicitly passed task_id.
                 "task_id_auto_bound": auto_bound_task_id is not None,
+                "message_to_coach": message_to_coach or None,
             }
         )
 
@@ -2776,12 +2079,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"Player {caller_id} committed sha {sha} "
                 f"({message[:80]!r}) without a task_id and has no "
                 f"active executor task to auto-bind to. If this "
-                f"commit was meant to deliver a kanban task, the "
-                f"kanban won't advance — link it via "
-                f"coord_advance_task_stage or accept it's scratch "
-                f"work and ignore. If this is a recurring pattern, "
-                f"the Player may be working off-board (skipping "
-                f"coord_claim_task)."
+                f"commit was meant to deliver a kanban task, link it "
+                f"by approving the stage with the right context "
+                f"(coord_approve_stage with a note referencing the "
+                f"commit), or accept it's scratch work and ignore. "
+                f"If this is a recurring pattern, the Player may be "
+                f"working off-board — Coach should call "
+                f"coord_approve_stage(execute, <slot>) so the kanban "
+                f"sees the work."
             )
             await bus.publish(
                 {
@@ -2837,148 +2142,6 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"be re-woken with the report)."
             )
         return _ok(msg)
-
-    @tool(
-        "coord_complete_execution",
-        (
-            "Player-only. Mark a non-git execution task complete. Use "
-            "this when the deliverable is a research report, paper, "
-            "marketing draft, decision memo, ops action, or other "
-            "durable artifact where coord_commit_push is the wrong "
-            "completion primitive. Code tasks should still use "
-            "coord_commit_push(task_id=...).\n"
-            "\n"
-            "Validates that you own the active execute-stage task and "
-            "have an uncompleted executor role. The kanban subscriber "
-            "then routes the card to the next required review, ship, or "
-            "archive according to the task workflow.\n"
-            "\n"
-            "Params:\n"
-            "- task_id: required\n"
-            "- summary: what you produced / changed (required)\n"
-            "- artifact_path: optional durable path, e.g. knowledge/reports/...\n"
-            "- completion_kind: optional label (research, writing, ops, noop, other)"
-        ),
-        {
-            "task_id": str,
-            "summary": str,
-            "artifact_path": str,
-            "completion_kind": str,
-        },
-    )
-    async def complete_execution(args: dict[str, Any]) -> dict[str, Any]:
-        if caller_is_coach:
-            return _err(
-                "Coach does not execute work. Assign a Player executor."
-            )
-        task_id = (args.get("task_id") or "").strip()
-        summary = (args.get("summary") or "").strip()
-        artifact_path = (args.get("artifact_path") or "").strip()
-        completion_kind = (
-            (args.get("completion_kind") or "other").strip().lower()
-        )
-        if not task_id:
-            return _err("task_id is required")
-        if not summary:
-            return _err("summary is required")
-        if len(summary) > 5000:
-            return _err(f"summary too long ({len(summary)} chars, max 5000)")
-        if len(artifact_path) > 1000:
-            return _err("artifact_path too long (max 1000 chars)")
-        if len(completion_kind) > 50:
-            return _err("completion_kind too long (max 50 chars)")
-
-        project_id = await resolve_active_project()
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT t.status, t.owner, t.artifacts, "
-                "(SELECT id FROM task_role_assignments "
-                " WHERE task_id = t.id AND role = 'executor' "
-                " AND owner = ? AND completed_at IS NULL "
-                " AND superseded_by IS NULL "
-                " ORDER BY assigned_at DESC LIMIT 1) AS role_id "
-                "FROM tasks t WHERE t.id = ? AND t.project_id = ?",
-                (caller_id, task_id, project_id),
-            )
-            row = await cur.fetchone()
-            if not row:
-                return _err(f"task {task_id} not found in active project")
-            t = dict(row)
-            if t.get("status") != "execute":
-                return _err(
-                    f"task {task_id} is in stage {t.get('status')}, "
-                    "not execute"
-                )
-            if t.get("owner") != caller_id:
-                return _err(
-                    f"task {task_id} is owned by "
-                    f"{t.get('owner') or 'no one'}, not {caller_id}"
-                )
-            role_id = t.get("role_id")
-            if not role_id:
-                return _err(
-                    f"task {task_id} has no active uncompleted executor "
-                    f"role for {caller_id}"
-                )
-            now = _now_iso()
-            await c.execute(
-                "UPDATE task_role_assignments SET completed_at = ? "
-                "WHERE id = ?",
-                (now, role_id),
-            )
-            if artifact_path:
-                try:
-                    artifacts = json.loads(t.get("artifacts") or "[]")
-                    if not isinstance(artifacts, list):
-                        artifacts = []
-                except Exception:
-                    artifacts = []
-                if artifact_path not in artifacts:
-                    artifacts.append(artifact_path)
-                await c.execute(
-                    "UPDATE tasks SET artifacts = ? "
-                    "WHERE id = ? AND project_id = ?",
-                    (
-                        json.dumps(artifacts, separators=(",", ":")),
-                        task_id, project_id,
-                    ),
-                )
-            await c.commit()
-        finally:
-            await c.close()
-
-        ts = _now_iso()
-        await bus.publish({
-            "ts": ts,
-            "agent_id": caller_id,
-            "type": "task_role_completed",
-            "task_id": task_id,
-            "role": "executor",
-            "owner": caller_id,
-            "artifact_path": artifact_path or None,
-            "to": caller_id,
-        })
-        await bus.publish({
-            "ts": ts,
-            "agent_id": caller_id,
-            "type": "task_execution_completed",
-            "task_id": task_id,
-            "summary": summary,
-            "artifact_path": artifact_path or None,
-            "completion_kind": completion_kind,
-            "to": caller_id,
-        })
-        artifact_suffix = (
-            f" → {artifact_path}" if artifact_path else ""
-        )
-        return _ok(
-            f"Completed execution for {task_id}{artifact_suffix}. "
-            f"Your executor role is now complete. The kanban auto-"
-            f"advances execute → the next stage in the trajectory. "
-            f"You're done with this task unless the audit fails "
-            f"(you'll be re-woken with the report)."
-        )
 
     @tool(
         "coord_write_decision",
@@ -4831,20 +3994,34 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "Params:\n"
             "- task_id: required\n"
             "- body: full markdown body, required (max 40000 chars)\n"
-            "- on_behalf_of: optional Player slot (Coach-only override)"
+            "- on_behalf_of: optional Player slot (Coach-only override)\n"
+            "- message_to_coach: optional one-line note Coach reads on "
+            "the next tick. Use this to flag what you noticed while "
+            "drafting, open questions, anything the executor should be "
+            "aware of beyond the spec body. Carried verbatim in the "
+            "`task_spec_written` event payload."
         ),
-        {"task_id": str, "body": str, "on_behalf_of": str},
+        {
+            "task_id": str, "body": str, "on_behalf_of": str,
+            "message_to_coach": str,
+        },
     )
     async def write_task_spec(args: dict[str, Any]) -> dict[str, Any]:
         task_id = (args.get("task_id") or "").strip()
         body = args.get("body") or ""
         on_behalf_of_raw = (args.get("on_behalf_of") or "").strip().lower()
+        message_to_coach = (args.get("message_to_coach") or "").strip()
         if not task_id:
             return _err("task_id is required")
         if not body.strip():
             return _err("body is required (empty specs are not useful)")
         if len(body) > 40_000:
             return _err(f"body too long ({len(body)} chars, max 40000)")
+        if len(message_to_coach) > 2000:
+            return _err(
+                f"message_to_coach too long ({len(message_to_coach)} chars, "
+                f"max 2000)"
+            )
 
         # v0.3.5 override: Coach can register a spec on a Player's
         # behalf when the Player's runtime can't reach this tool.
@@ -4920,7 +4097,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                             f"by a reassignment. Use coord_write_task_spec "
                             f"without on_behalf_of (you'll be recorded "
                             f"as spec_author) or fix the assignment "
-                            f"first via coord_assign_planner."
+                            f"first via coord_approve_stage(stage='plan', "
+                            f"assignee=<slot>)."
                         )
             elif t["owner"] == caller_id:
                 allowed = True
@@ -5011,6 +4189,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "spec_path": rel,
                 "to": t["owner"],
                 "on_behalf_of": effective_author if on_behalf else None,
+                "message_to_coach": message_to_coach or None,
             }
         )
         if completed_planner:
@@ -5301,303 +4480,6 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         return deduped, None
 
     @tool(
-        "coord_assign_planner",
-        (
-            "Coach-only. Delegate writing the spec for a task. Both "
-            "single-Player hard-assign and comma-list pool are accepted "
-            "(same shape as coord_assign_task). Tasks whose trajectory "
-            "includes `plan` need a spec before they can move to "
-            "execute; trajectories without `plan` skip the planner role.\n"
-            "\n"
-            "Params:\n"
-            "- task_id: required\n"
-            "- to: 'p3' or 'p1,p2,p3' (planner pool)"
-        ),
-        {"task_id": str, "to": str},
-    )
-    async def assign_planner(args: dict[str, Any]) -> dict[str, Any]:
-        if not caller_is_coach:
-            return _err("Only Coach assigns planners.")
-        task_id = (args.get("task_id") or "").strip()
-        to_raw = (args.get("to") or "").strip()
-        if not task_id:
-            return _err("task_id is required")
-        targets, err = await _validate_role_targets(to_raw, role_label="planner")
-        if err:
-            return _err(err)
-        if targets is None:
-            return _err("internal: target validation returned None")
-        project_id = await resolve_active_project()
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT status FROM tasks "
-                "WHERE id = ? AND project_id = ?",
-                (task_id, project_id),
-            )
-            row = await cur.fetchone()
-            if not row:
-                return _err(f"task {task_id} not found")
-            t = dict(row)
-            if t["status"] != "plan":
-                return _err(
-                    f"planner only makes sense in `plan` stage; "
-                    f"task is currently {t['status']}."
-                )
-            wake_prompt = (
-                f"Coach asked you to draft the spec for task {task_id}. "
-                f"If this was a pool call, first call "
-                f"coord_accept_role(task_id={task_id!r}, role='planner'); "
-                f"Read coord_list_tasks output for the title/description, "
-                f"then call coord_write_task_spec(task_id={task_id!r}, "
-                f"body=...) with the goal, 'done looks like', constraints, "
-                f"and references."
-            )
-            ok, msg, slots = await _assign_role_helper(
-                c, task_id=task_id, role="planner", targets=targets,
-                wake_prompt_for_role=wake_prompt,
-            )
-        finally:
-            await c.close()
-
-        await bus.publish(
-            {
-                "ts": _now_iso(),
-                "agent_id": caller_id,
-                "type": "task_role_assigned",
-                "task_id": task_id,
-                "role": "planner",
-                "eligible_owners": targets,
-                "owner": (None if len(targets) > 1 else targets[0]),
-                "to": (targets[0] if len(targets) == 1 else None),
-            }
-        )
-        return _ok(msg)
-
-    @tool(
-        "coord_assign_auditor",
-        (
-            "Coach-only. Assign a Player to audit a task. Two kinds:\n"
-            "  - 'syntax':    contract-bound (does the deliverable match what was asked + is it sound?).\n"
-            "                 Cascade: spec → title+description → executor wake → commit.\n"
-            "  - 'semantics': context-bound (does it make sense in the project's world?).\n"
-            "                 Reads truth/, project-objectives.md, wiki/, Compass.\n"
-            "                 Spec is supplementary background only.\n"
-            "\n"
-            "Single-Player or comma-list pool. The auditor reads the "
-            "context, then calls coord_submit_audit_report(verdict='pass'|'fail').\n"
-            "\n"
-            "FOCUS PARAMETER (kanban-specs §4.6.3): name what the auditor "
-            "should check. REQUIRED for kind='semantics' (rejected without). "
-            "Optional for kind='syntax' (defaults to 'match contract + "
-            "soundness'). On re-assign without focus, inherits from the "
-            "prior superseded row.\n"
-            "  - Bad: focus omitted on a semantic audit.\n"
-            "  - Good: focus='Verify the rule-3a derivation matches the wiki "
-            "entry on multiway causal foliation; check brand naming on "
-            "user-facing strings.'\n"
-            "  - Good (syntax): focus='Race-condition review of the new lock "
-            "path in server/foo.py:acquire — particularly the timeout fallback. "
-            "Ignore unrelated style drift.'\n"
-            "\n"
-            "If you assign the executor as their own auditor, an "
-            "audit_self_review_warning event fires (does NOT block — "
-            "useful when the team is small).\n"
-            "\n"
-            "Params:\n"
-            "- task_id: required\n"
-            "- to: 'p4' or 'p4,p5'\n"
-            "- kind: 'syntax' or 'semantics' (required)\n"
-            "- focus: free-text (REQUIRED for semantics; optional for syntax)"
-        ),
-        {"task_id": str, "to": str, "kind": str, "focus": str},
-    )
-    async def assign_auditor(args: dict[str, Any]) -> dict[str, Any]:
-        if not caller_is_coach:
-            return _err("Only Coach assigns auditors.")
-        task_id = (args.get("task_id") or "").strip()
-        to_raw = (args.get("to") or "").strip()
-        kind_input = (args.get("kind") or "").strip().lower()
-        focus_raw = args.get("focus")
-        focus = focus_raw.strip() if isinstance(focus_raw, str) else ""
-        if not task_id:
-            return _err("task_id is required")
-        role = _resolve_audit_role_kind(kind_input)
-        if role is None:
-            return _err("kind must be 'formal'/'syntax' or 'semantic'/'semantics'")
-        kind = "syntax" if role == "auditor_syntax" else "semantics"
-        review_label = "formal" if kind == "syntax" else "semantic"
-        targets, err = await _validate_role_targets(to_raw, role_label=f"{review_label} reviewer")
-        if err:
-            return _err(err)
-        if targets is None:
-            return _err("internal: target validation returned None")
-        # Inherit focus from prior superseded row when the caller
-        # omitted it (kanban-specs §4.6.3 — quick reassignment must
-        # not lose Coach's earlier framing).
-        if not focus:
-            from server.kanban import inherit_audit_focus
-            inherited = await inherit_audit_focus(task_id, role)
-            if inherited:
-                focus = inherited
-        # Semantic audits without a focus are noise. Reject loudly.
-        if role == "auditor_semantics" and not focus:
-            return _err(
-                "semantic audits require a focus — name what to check "
-                "(e.g. focus='verify the math derivation matches the "
-                "glossary'). Auditors with no focus rubber-stamp. See "
-                "kanban-specs.md §4.6.3."
-            )
-        project_id = await resolve_active_project()
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT status, owner FROM tasks "
-                "WHERE id = ? AND project_id = ?",
-                (task_id, project_id),
-            )
-            row = await cur.fetchone()
-            if not row:
-                return _err(f"task {task_id} not found")
-            t = dict(row)
-            executor = t.get("owner")
-            self_review = bool(executor and executor in targets)
-            # Build the auditor wake via the kanban helper so the
-            # initial-assignment wake matches the stage-entry wake
-            # (single source of truth for focus + context layout).
-            from server.kanban import build_auditor_wake_body
-            wake_prompt = await build_auditor_wake_body(
-                task_id=task_id,
-                role=role,
-                focus=focus,
-                is_pool=(len(targets) > 1),
-            )
-            ok, msg, slots = await _assign_role_helper(
-                c, task_id=task_id, role=role, targets=targets,
-                wake_prompt_for_role=wake_prompt,
-                focus=focus or None,
-            )
-            if ok:
-                cur = await c.execute(
-                    "SELECT id FROM task_role_assignments "
-                    "WHERE task_id = ? AND role = ? "
-                    "ORDER BY assigned_at DESC, id DESC LIMIT 1",
-                    (task_id, role),
-                )
-                new_row = await cur.fetchone()
-                if new_row:
-                    new_id = dict(new_row)["id"]
-                    await c.execute(
-                        "UPDATE task_role_assignments SET superseded_by = ? "
-                        "WHERE task_id = ? AND role = ? AND id <> ? "
-                        "AND verdict = 'fail' AND completed_at IS NOT NULL "
-                        "AND superseded_by IS NULL",
-                        (new_id, task_id, role, new_id),
-                    )
-                    await c.commit()
-        finally:
-            await c.close()
-
-        await bus.publish(
-            {
-                "ts": _now_iso(),
-                "agent_id": caller_id,
-                "type": "task_role_assigned",
-                "task_id": task_id,
-                "role": role,
-                "eligible_owners": targets,
-                "owner": (None if len(targets) > 1 else targets[0]),
-                "to": (targets[0] if len(targets) == 1 else None),
-            }
-        )
-        if self_review:
-            await bus.publish(
-                {
-                    "ts": _now_iso(),
-                    "agent_id": caller_id,
-                    "type": "audit_self_review_warning",
-                    "task_id": task_id,
-                    "kind": review_label,
-                    "auditor_id": targets[0] if len(targets) == 1 else None,
-                    "executor_id": executor,
-                }
-            )
-        return _ok(msg)
-
-    @tool(
-        "coord_assign_shipper",
-        (
-            "Coach-only. Assign a Player to handle the merge for a task "
-            "(after both audits pass). Single Player or pool.\n"
-            "\n"
-            "The shipper opens the PR / runs the merge / calls "
-            "coord_mark_shipped(task_id) when the work is in main. "
-            "Coach doesn't merge — that's Player work.\n"
-            "\n"
-            "Often the shipper is the executor (they know the change "
-            "best); pick someone different if you want a second pair "
-            "of eyes on the merge.\n"
-            "\n"
-            "Params:\n"
-            "- task_id: required\n"
-            "- to: 'p3' or 'p3,p4'"
-        ),
-        {"task_id": str, "to": str},
-    )
-    async def assign_shipper(args: dict[str, Any]) -> dict[str, Any]:
-        if not caller_is_coach:
-            return _err("Only Coach assigns shippers.")
-        task_id = (args.get("task_id") or "").strip()
-        to_raw = (args.get("to") or "").strip()
-        if not task_id:
-            return _err("task_id is required")
-        targets, err = await _validate_role_targets(to_raw, role_label="shipper")
-        if err:
-            return _err(err)
-        if targets is None:
-            return _err("internal: target validation returned None")
-        project_id = await resolve_active_project()
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT status FROM tasks "
-                "WHERE id = ? AND project_id = ?",
-                (task_id, project_id),
-            )
-            row = await cur.fetchone()
-            if not row:
-                return _err(f"task {task_id} not found")
-            wake_prompt = (
-                f"Coach assigned you to ship task {task_id}. Open the PR, "
-                f"send/publish the deliverable, or confirm there is nothing "
-                f"to merge. If this was a pool call, first call "
-                f"coord_accept_role(task_id={task_id!r}, role='shipper'). "
-                f"Then call coord_mark_shipped("
-                f"task_id={task_id!r}). The kanban will then archive "
-                f"the task."
-            )
-            ok, msg, slots = await _assign_role_helper(
-                c, task_id=task_id, role="shipper", targets=targets,
-                wake_prompt_for_role=wake_prompt,
-            )
-        finally:
-            await c.close()
-
-        await bus.publish(
-            {
-                "ts": _now_iso(),
-                "agent_id": caller_id,
-                "type": "task_role_assigned",
-                "task_id": task_id,
-                "role": "shipper",
-                "eligible_owners": targets,
-                "owner": (None if len(targets) > 1 else targets[0]),
-                "to": (targets[0] if len(targets) == 1 else None),
-            }
-        )
-        return _ok(msg)
-
-    @tool(
         "coord_submit_audit_report",
         (
             "Submit an audit report for a task.\n"
@@ -5615,7 +4497,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "is Coach. Use this ONLY after confirming the Player "
             "actually wrote the audit (read their audit_*.md from disk "
             "and copy the body into `body=`); otherwise advance via "
-            "coord_advance_task_stage instead.\n"
+            "coord_approve_stage instead.\n"
             "\n"
             "Writes the markdown report to "
             "/data/projects/<id>/working/tasks/<task_id>/audits/"
@@ -5633,11 +4515,18 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- kind: 'syntax' or 'semantics' (required, must match assignment)\n"
             "- body: full markdown report (required, max 40000 chars)\n"
             "- verdict: 'pass' or 'fail' (required)\n"
-            "- on_behalf_of: optional Player slot (Coach-only override)"
+            "- on_behalf_of: optional Player slot (Coach-only override)\n"
+            "- message_to_coach: optional one-line note Coach reads on "
+            "the next tick. Distinct from the audit body itself — use "
+            "this to flag something Coach should know that doesn't "
+            "belong in the report (e.g. recurring pattern, suggestion "
+            "for re-execution framing). Carried verbatim in the "
+            "`audit_report_submitted` event payload."
         ),
         {
             "task_id": str, "kind": str, "body": str,
             "verdict": str, "on_behalf_of": str,
+            "message_to_coach": str,
         },
     )
     async def submit_audit_report(args: dict[str, Any]) -> dict[str, Any]:
@@ -5663,9 +4552,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             if caller_is_coach:
                 return _err(
                     "Coach doesn't audit directly. Either assign a "
-                    "Player auditor with coord_assign_auditor and let "
-                    "them submit, or override on a stuck Player's "
-                    "behalf via on_behalf_of='<slot>' (only when their "
+                    "Player auditor via coord_approve_stage(stage='audit_*', "
+                    "assignee=<slot>, note=...) and let them submit, or "
+                    "override on a stuck Player's behalf via "
+                    "on_behalf_of='<slot>' (only when their "
                     "runtime can't reach this tool — read their "
                     "on-disk audit_*.md and copy the body in)."
                 )
@@ -5687,6 +4577,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             return _err("body is required")
         if len(body) > 40_000:
             return _err(f"body too long ({len(body)} chars, max 40000)")
+        message_to_coach = (args.get("message_to_coach") or "").strip()
+        if len(message_to_coach) > 2000:
+            return _err(
+                f"message_to_coach too long ({len(message_to_coach)} chars, "
+                f"max 2000)"
+            )
 
         project_id = await resolve_active_project()
         c = await configured_conn()
@@ -5722,7 +4618,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 return _err(
                     f"no active {review_label} reviewer assignment for "
                     f"{effective_auditor} on task {task_id}. Coach "
-                    f"must call coord_assign_auditor before submission."
+                    f"must call coord_approve_stage(stage='{review_label.replace(' ', '_')}', "
+                    f"assignee=<slot>) before submission."
                 )
             assignment_id = dict(row)["id"]
 
@@ -5821,6 +4718,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 # 'to' = executor — surfaces the event in their pane so
                 # they see fail verdicts immediately. Read from tasks.owner.
                 "on_behalf_of": effective_auditor if on_behalf else None,
+                "message_to_coach": message_to_coach or None,
             }
         )
         on_behalf_suffix = (
@@ -5849,111 +4747,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             )
         # verdict == fail
         return _ok(
-            f"{head} The kanban reverts the task to execute and "
-            f"re-wakes the executor with your report attached + the "
-            f"spec. Watch for `task_stage_changed` on this task. If "
-            f"the executor doesn't move within the stall threshold "
-            f"(~30 min), Coach will be nudged."
-        )
-
-    @tool(
-        "coord_mark_shipped",
-        (
-            "Player-only. Call after merging the task's PR / pushing the "
-            "release. Validates you have an active shipper assignment for "
-            "this task. Triggers the kanban subscriber to move the task "
-            "from `ship` → `archive`.\n"
-            "\n"
-            "Params:\n"
-            "- task_id: required\n"
-            "- note: optional one-line note (e.g. merge SHA / PR URL)"
-        ),
-        {"task_id": str, "note": str},
-    )
-    async def mark_shipped(args: dict[str, Any]) -> dict[str, Any]:
-        if caller_is_coach:
-            return _err("Coach doesn't ship — assign a shipper Player.")
-        task_id = (args.get("task_id") or "").strip()
-        note = (args.get("note") or "").strip()
-        if not task_id:
-            return _err("task_id is required")
-
-        project_id = await resolve_active_project()
-        executor_owner = None
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT status FROM tasks WHERE id = ? AND project_id = ?",
-                (task_id, project_id),
-            )
-            task_row = await cur.fetchone()
-            if not task_row:
-                return _err(f"task {task_id} not found")
-            if dict(task_row).get("status") != "ship":
-                return _err(
-                    f"ship role is not active for task {task_id} "
-                    f"(stage={dict(task_row).get('status')})."
-                )
-            cur = await c.execute(
-                "SELECT id FROM task_role_assignments "
-                "WHERE task_id = ? AND role = 'shipper' AND owner = ? "
-                "AND completed_at IS NULL AND superseded_by IS NULL "
-                "ORDER BY assigned_at DESC LIMIT 1",
-                (task_id, caller_id),
-            )
-            row = await cur.fetchone()
-            if not row:
-                return _err(
-                    f"no active shipper assignment for {caller_id} on "
-                    f"task {task_id}. Coach must call coord_assign_shipper."
-                )
-            assignment_id = dict(row)["id"]
-            cur = await c.execute(
-                "SELECT owner FROM tasks WHERE id = ? AND project_id = ?",
-                (task_id, project_id),
-            )
-            task_row = await cur.fetchone()
-            if task_row:
-                executor_owner = dict(task_row).get("owner")
-            now = _now_iso()
-            await c.execute(
-                "UPDATE task_role_assignments SET completed_at = ? "
-                "WHERE id = ?",
-                (now, assignment_id),
-            )
-            await c.commit()
-        finally:
-            await c.close()
-
-        ts = _now_iso()
-        await bus.publish(
-            {
-                "ts": ts,
-                "agent_id": caller_id,
-                "type": "task_role_completed",
-                "task_id": task_id,
-                "role": "shipper",
-                "owner": caller_id,
-                "to": executor_owner,
-            }
-        )
-        await bus.publish(
-            {
-                "ts": ts,
-                "agent_id": caller_id,
-                "type": "task_shipped",
-                "task_id": task_id,
-                "shipper_id": caller_id,
-                "note": note or None,
-                "to": executor_owner,
-            }
-        )
-        note_suffix = f" — {note}" if note else ""
-        return _ok(
-            f"Marked {task_id} shipped{note_suffix}. Your shipper "
-            f"role is complete. The kanban auto-archives the task "
-            f"and wakes Coach with a 'summarize the outcome to the "
-            f"user' prompt. You're done."
+            f"{head} The verdict is recorded and surfaces to Coach "
+            f"via the event log; Coach decides whether to re-execute, "
+            f"abandon, or override the audit. v2 does NOT auto-revert "
+            f"on FAIL — do not start fixing things based on this "
+            f"verdict. Wait for Coach's wake."
         )
 
     def _next_action_for_plate(
@@ -5970,14 +4768,16 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
 
         Priority order (matches kanban-flow expectations):
           1. Active executor task — if the spec gate is open, write
-             code/artifacts then call coord_commit_push /
-             coord_complete_execution; if the spec gate is closed
-             (no spec on a `plan`-stage task), say so explicitly.
+             code/artifacts then call coord_commit_push (code) or
+             coord_role_complete (non-code); if the spec gate is
+             closed (no spec on a `plan`-stage task), say so explicitly.
           2. Pending reviewer assignment — call
              coord_submit_audit_report.
-          3. Pending shipper assignment — call coord_mark_shipped.
+          3. Pending shipper assignment — call coord_role_complete.
           4. Pending planner assignment — call coord_write_task_spec.
-          5. Eligible-pool task — call coord_accept_role to claim.
+          5. Eligible-pool entry (FYI in v2) — wait; pools never
+             auto-resolve to a Player claim. Coach picks via
+             coord_approve_stage.
 
         Returns None when nothing actionable exists (caller renders
         a "your plate is empty" line).
@@ -6009,9 +4809,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             )
             return (
                 f"  Do the executor work for task {tid}, then call "
-                f"coord_commit_push(task_id={tid!r}, message=...) "
-                f"for code or coord_complete_execution(task_id={tid!r}, "
-                f"summary=...) for non-code.{self_audit}"
+                f"coord_commit_push(task_id={tid!r}, message=..., "
+                f"message_to_coach=<your response>) for code OR "
+                f"coord_role_complete(task_id={tid!r}, "
+                f"message_to_coach=..., artifact_path=<path?>) for "
+                f"non-code deliverables.{self_audit} Coach reviews "
+                f"on the next tick and approves the next stage."
             )
         if pending_reviews:
             e = pending_reviews[0]
@@ -6022,16 +4825,19 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"for task {tid}, then call "
                 f"coord_submit_audit_report(task_id={tid!r}, "
                 f"kind={kind!r}, body=<your review>, "
-                f"verdict='pass' or 'fail'). The kanban does NOT "
-                f"advance until you do."
+                f"verdict='pass' or 'fail', message_to_coach=...). "
+                f"Coach reviews the verdict and decides the next "
+                f"move; FAIL does NOT auto-revert in v2."
             )
         if pending_ships:
             e = pending_ships[0]
             tid = e["task_id"]
             return (
                 f"  Merge / publish / hand-off task {tid}, then "
-                f"call coord_mark_shipped(task_id={tid!r}, "
-                f"note=<optional>). The task auto-archives."
+                f"call coord_role_complete(task_id={tid!r}, "
+                f"message_to_coach='shipped at <ref>'). Coach "
+                f"reviews and archives via coord_archive_task with "
+                f"a user-facing summary."
             )
         if pending_plans:
             e = pending_plans[0]
@@ -6039,8 +4845,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             return (
                 f"  Draft the spec for task {tid}, then call "
                 f"coord_write_task_spec(task_id={tid!r}, "
-                f"body=<spec>). On success the task auto-advances "
-                f"plan -> the next stage in its trajectory. "
+                f"body=<spec>, message_to_coach=<your response>). "
+                f"Coach reviews the spec and approves execute. "
                 f"DO NOT just describe the task back to Coach — "
                 f"writing the spec IS the planner's role."
             )
@@ -6049,12 +4855,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             tid = e["task_id"]
             role = e.get("role") or ""
             return (
-                f"  You are eligible for task {tid} (role={role}). "
-                f"If you can take it, call "
-                f"coord_accept_role(task_id={tid!r}, role={role!r}); "
-                f"first accepted claim wins. Do NOT do the role "
-                f"work without an accepted claim — the kanban will "
-                f"not credit it."
+                f"  Task {tid} lists you in its FYI pool for role "
+                f"{role!r}. In v2 pools don't auto-resolve — Coach "
+                f"picks the assignee explicitly. Wait for Coach's "
+                f"coord_approve_stage wake. Do NOT start the role "
+                f"work without it."
             )
         return None
 
@@ -6382,8 +5187,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     return _err(
                         "cannot remove already-entered stages: "
                         + ",".join(sorted(removed_entered))
-                        + ". Use coord_advance_task_stage to move "
-                        "forward first, then reroute."
+                        + ". Use coord_approve_stage to move forward "
+                        "first, then reroute."
                     )
 
             removed = [s for s in old_stages if s not in new_stages]
@@ -6620,74 +5425,510 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             + (f", tracking_reason={next_reason}" if next_reason else "")
         )
 
+    # ------------------------------------------------------------------
+    # Kanban v2 (Docs/kanban-specs-v2.md §7.1) — single transition tool
+    # plus deliberate-archive, role-complete, and plan-review-request.
+    # ------------------------------------------------------------------
+
     @tool(
-        "coord_advance_task_stage",
+        "coord_approve_stage",
         (
-            "Coach-only. Manually move a task to a new kanban stage, "
-            "bypassing the role-completion gate. Use when an audit or "
-            "ship assignment is stuck and you need to push the task "
-            "through (e.g. an auditor went silent and you've decided "
-            "the work is good enough to advance).\n"
+            "Coach-only. Single transition tool for kanban v2. Coach "
+            "explicitly authorizes the next stage transition, names the "
+            "assignee, and provides the wake prompt. Replaces v1's "
+            "coord_advance_task_stage and the four coord_assign_* tools "
+            "in one shape — every stage move is a Coach decision.\n"
             "\n"
-            "Validates the transition against the state machine "
-            "(plan → execute → audit_syntax → audit_semantics → ship → "
-            "archive, plus revert audit_*→execute and execute→archive).\n"
+            "Validates the transition against the state machine (plan → "
+            "execute → audit_syntax → audit_semantics → ship → archive, "
+            "plus revert audit_*→execute and execute→archive).\n"
             "\n"
-            "ASSIGNEE GATE: if the target stage's role row has no "
-            "owner and no eligible_owners, you MUST pass `assignee` so "
-            "the new stage has someone to wake. Single slot ('p3') for "
-            "hard-assign or comma-list ('p2,p5') for a pool. If the "
-            "active role row already has an owner or non-empty "
-            "eligible_owners, `assignee` is optional — omit to keep the "
-            "existing assignee, or pass to mid-flight reassign in one "
-            "call. Archive has no role to fill, so `assignee` is "
-            "rejected on stage='archive'.\n"
+            "ASSIGNEE: required for any non-archive next_stage; pass a "
+            "single Player slot ('p3') — v2 has no pool path. For "
+            "next_stage='archive' the assignee is rejected (archive has "
+            "no role; use coord_archive_task for the user-facing summary "
+            "path).\n"
+            "\n"
+            "NOTE: optional brief that becomes the assignee's wake "
+            "prompt verbatim. Use this to frame the work — what to "
+            "look at, what changed, what you want them to do. When "
+            "Coach has noticed a deviation, prefix the note with a "
+            "structured `[deviation: <one-line reason>]` tag — the "
+            "instrumentation in §22 of the kanban v2 spec uses this to "
+            "measure whether deviations are caught at push time vs "
+            "audit time.\n"
+            "\n"
+            "Atomically: stamps `last_stage_change_at`; deactivates any "
+            "prior active role row at the target stage (with stand-down "
+            "wake to displaced Player); deactivates the source-stage "
+            "role row if Coach is overriding without source completion "
+            "(also stand-down); plants a fresh role row owned by the "
+            "named assignee; emits `task_stage_changed` + "
+            "`task_role_assigned`; fires the wake.\n"
             "\n"
             "Params:\n"
             "- task_id: required\n"
-            "- stage: target stage (kanban value)\n"
-            "- assignee: optional Player slot or comma-list pool "
-            "(required when target stage has no eligible owners)\n"
-            "- note: optional reason; rendered on the timeline + carried "
-            "in the task_stage_changed event"
+            "- next_stage: target stage (kanban value)\n"
+            "- assignee: single Player slot (required when next_stage "
+            "is not 'archive')\n"
+            "- note: optional wake prompt; carried on `task_stage_changed`"
         ),
-        {"task_id": str, "stage": str, "assignee": str, "note": str},
+        {
+            "task_id": str, "next_stage": str,
+            "assignee": str, "note": str,
+        },
     )
-    async def advance_task_stage(args: dict[str, Any]) -> dict[str, Any]:
+    async def approve_stage(args: dict[str, Any]) -> dict[str, Any]:
         if not caller_is_coach:
-            return _err("Only Coach can force a stage transition.")
+            return _err(
+                "coord_approve_stage is Coach-only. Players don't drive "
+                "stage transitions; complete your role's tool and Coach "
+                "will review."
+            )
         task_id = (args.get("task_id") or "").strip()
-        stage = (args.get("stage") or "").strip().lower()
+        next_stage = (args.get("next_stage") or "").strip().lower()
+        assignee_raw = (args.get("assignee") or "").strip().lower()
         note = (args.get("note") or "").strip()
-        assignee_raw = (args.get("assignee") or "").strip()
         if not task_id:
             return _err("task_id is required")
-        if stage not in ALL_KANBAN_STAGES:
+        if next_stage not in ALL_KANBAN_STAGES:
             return _err(
-                f"invalid stage '{stage}' (must be one of "
+                f"invalid next_stage '{next_stage}' (must be one of "
                 f"{sorted(ALL_KANBAN_STAGES)})"
             )
-
-        # Resolve the role for the target stage. Archive has no role.
-        from server.kanban import _role_for_stage
-        target_role = _role_for_stage(stage)
-
-        # Pre-validate `assignee` (when provided).
-        targets: list[str] | None = None
-        if assignee_raw:
-            if stage == "archive" or target_role is None:
+        if next_stage == "archive":
+            if assignee_raw:
                 return _err(
-                    "archive stage takes no assignee; drop the "
-                    "`assignee` parameter."
+                    "next_stage='archive' takes no assignee — archive "
+                    "has no role. Drop `assignee` (or call "
+                    "coord_archive_task(task_id, summary) for the "
+                    "user-facing wrap-up path)."
                 )
-            validated, terr = await _validate_role_targets(
-                assignee_raw, role_label=target_role
+            assignee: str | None = None
+        else:
+            if not assignee_raw:
+                return _err(
+                    f"next_stage='{next_stage}' requires an assignee "
+                    f"(single Player slot). Pools are FYI only in v2; "
+                    f"pick a named Player from the trajectory's `to` "
+                    f"hint or another available slot."
+                )
+            if "," in assignee_raw or "[" in assignee_raw:
+                return _err(
+                    "v2 takes a single assignee slot per transition — "
+                    "pools are FYI only. Pick one Player explicitly."
+                )
+            if (
+                assignee_raw not in VALID_RECIPIENTS
+                or assignee_raw in ("coach", "broadcast")
+            ):
+                return _err(
+                    f"assignee must be a Player slot (p1..p10), "
+                    f"not {assignee_raw!r}"
+                )
+            if await _is_locked(assignee_raw):
+                return _err(
+                    f"Player {assignee_raw} is locked; pick an "
+                    f"unlocked Player."
+                )
+            assignee = assignee_raw
+
+        from server.kanban import (
+            _role_for_stage as _kanban_role_for_stage,
+            collect_superseded_role_owners,
+            send_role_stand_down,
+        )
+        target_role = (
+            _kanban_role_for_stage(next_stage) if next_stage != "archive" else None
+        )
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        displaced_target: list[str] = []
+        displaced_source: list[str] = []
+        old_status: str | None = None
+        try:
+            cur = await c.execute(
+                "SELECT status, owner FROM tasks "
+                "WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
             )
-            if terr:
-                return _err(terr)
-            if validated is None:
-                return _err("internal: assignee validation returned None")
-            targets = validated
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"task {task_id} not found")
+            t = dict(row)
+            old_status = t["status"]
+            old_owner = t.get("owner")
+            if old_status == "archive":
+                return _err(
+                    f"task {task_id} is already archived; archived "
+                    f"tasks are read-only."
+                )
+            # v2 §7.1 same-stage allowance. When a task was created with
+            # a pool/empty first-stage `to`, the harness sets
+            # tasks.status to that first stage but plants no role row;
+            # Coach's first approve_stage call has next_stage == current
+            # status. _valid_transition rejects same-stage by default, so
+            # we special-case: allow same-stage IFF no active role row
+            # exists at the target stage. If a row already exists, this
+            # is a normal supersede attempt — reject to keep the API
+            # explicit (the caller should approve into the next stage,
+            # not re-plant the same one).
+            is_same_stage_plant = False
+            if (
+                old_status == next_stage
+                and next_stage != "archive"
+                and target_role is not None
+            ):
+                cur = await c.execute(
+                    "SELECT 1 FROM task_role_assignments "
+                    "WHERE task_id = ? AND role = ? "
+                    "AND completed_at IS NULL AND superseded_by IS NULL "
+                    "LIMIT 1",
+                    (task_id, target_role),
+                )
+                if await cur.fetchone():
+                    return _err(
+                        f"task {task_id} is already in {next_stage!r} "
+                        f"with an active {target_role} role. Same-stage "
+                        f"approve_stage is only valid as the first plant "
+                        f"when the task was created with a pool/empty "
+                        f"first-stage `to`. Approve into the next stage "
+                        f"instead, or call coord_set_task_trajectory if "
+                        f"you need to reroute."
+                    )
+                is_same_stage_plant = True
+            if not is_same_stage_plant and not _valid_transition(
+                old_status, next_stage
+            ):
+                return _err(
+                    f"invalid transition: {old_status} → {next_stage}"
+                )
+
+            now = _now_iso()
+            new_role_id: int | None = None
+            if next_stage == "archive":
+                # Mark every active role row complete on archive — no
+                # roles persist into archive. Capture nothing for stand-
+                # down (archive isn't a reassignment). The user-facing
+                # summary path is coord_archive_task; this branch is the
+                # "skip the wrap-up" cancellation route.
+                await c.execute(
+                    "UPDATE task_role_assignments "
+                    "SET completed_at = ? "
+                    "WHERE task_id = ? "
+                    "AND completed_at IS NULL AND superseded_by IS NULL",
+                    (now, task_id),
+                )
+                await c.execute(
+                    "UPDATE tasks SET status = 'archive', "
+                    "completed_at = ?, archived_at = ?, "
+                    "last_stage_change_at = ?, stale_alert_at = NULL, "
+                    "stall_escalation_level = 0 "
+                    "WHERE id = ? AND project_id = ?",
+                    (now, now, now, task_id, project_id),
+                )
+                if old_owner:
+                    await c.execute(
+                        "UPDATE agents SET current_task_id = NULL "
+                        "WHERE id = ? AND current_task_id = ?",
+                        (old_owner, task_id),
+                    )
+            else:
+                # Source-stage role row: deactivate when Coach is
+                # overriding without source completion (still active).
+                # The displaced slot gets a stand-down wake post-commit
+                # so they know to stop work.
+                source_role = _kanban_role_for_stage(old_status)
+                if source_role:
+                    displaced_source = await collect_superseded_role_owners(
+                        c, task_id=task_id, role=source_role,
+                        new_row_id=None,
+                    )
+                    if displaced_source:
+                        await c.execute(
+                            "UPDATE task_role_assignments "
+                            "SET completed_at = ? "
+                            "WHERE task_id = ? AND role = ? "
+                            "AND completed_at IS NULL "
+                            "AND superseded_by IS NULL",
+                            (now, task_id, source_role),
+                        )
+                # Target-stage role row supersede + plant. Capture
+                # displaced BEFORE INSERT so we can wake them after.
+                pre_displaced = await collect_superseded_role_owners(
+                    c, task_id=task_id, role=target_role, new_row_id=None,
+                )
+                # Plant the new hard-assign row.
+                cur = await c.execute(
+                    "INSERT INTO task_role_assignments "
+                    "(task_id, role, eligible_owners, owner, "
+                    "assigned_at, claimed_at) "
+                    "VALUES (?, ?, '[]', ?, ?, ?)",
+                    (task_id, target_role, assignee, now, now),
+                )
+                new_role_id = cur.lastrowid
+                # Supersede prior active rows for the same (task,role).
+                await c.execute(
+                    "UPDATE task_role_assignments "
+                    "SET superseded_by = ? "
+                    "WHERE task_id = ? AND role = ? AND id != ? "
+                    "AND completed_at IS NULL AND superseded_by IS NULL",
+                    (new_role_id, task_id, target_role, new_role_id),
+                )
+                displaced_target = [
+                    s for s in pre_displaced if s != assignee
+                ]
+                # Update tasks.status + owner.
+                tasks_owner: str | None = old_owner
+                if next_stage == "execute":
+                    tasks_owner = assignee
+                elif old_status == "execute" and next_stage != "execute":
+                    # Leaving execute — keep tasks.owner so the executor's
+                    # current_task_id mapping isn't disturbed (the executor
+                    # may still need to reopen the task on a later
+                    # re-execute approval). The owner column is sticky
+                    # from execute through subsequent stages until archive.
+                    tasks_owner = old_owner
+                await c.execute(
+                    "UPDATE tasks SET status = ?, owner = ?, "
+                    "last_stage_change_at = ?, stale_alert_at = NULL, "
+                    "stall_escalation_level = 0 "
+                    "WHERE id = ? AND project_id = ?",
+                    (next_stage, tasks_owner, now, task_id, project_id),
+                )
+                # Propagate current_task_id when entering execute with
+                # a hard-assigned executor (mirror coord_create_task).
+                if next_stage == "execute":
+                    await c.execute(
+                        "UPDATE agents SET current_task_id = ? "
+                        "WHERE id = ? AND current_task_id IS NULL",
+                        (task_id, assignee),
+                    )
+            await c.commit()
+        finally:
+            await c.close()
+
+        # v2 §22.1 push-time deviation instrumentation. When Coach
+        # approves a stage with a deviation tag/phrase in the note AND
+        # the source stage is `execute` (Coach is reviewing executor
+        # work), insert a `deviations_log{noticed_at='push'}` row. The
+        # source executor is the slot whose work Coach noticed the
+        # drift in — read from tasks.owner BEFORE this transition (the
+        # executor role row is sticky through subsequent stages, but
+        # `old_owner` was captured before the column was overwritten).
+        # Failure-isolated: a DB hiccup never blocks the approval.
+        deviation_description: str | None = None
+        if (
+            old_status == "execute"
+            and note
+            and old_owner
+            and next_stage != "archive"  # archive path emits its own signal
+        ):
+            try:
+                deviation_description = _extract_deviation_description(note)
+                if deviation_description:
+                    cdev = await configured_conn()
+                    try:
+                        await cdev.execute(
+                            "INSERT INTO deviations_log "
+                            "(project_id, ts, task_id, executor, "
+                            " noticed_at, description) "
+                            "VALUES (?, ?, ?, ?, 'push', ?)",
+                            (
+                                project_id, _now_iso(),
+                                task_id, old_owner,
+                                deviation_description,
+                            ),
+                        )
+                        await cdev.commit()
+                    finally:
+                        await cdev.close()
+            except Exception:
+                # Failure-isolated instrumentation — never block the
+                # approval. Bare except matches the surrounding pattern.
+                pass
+
+        ts = _now_iso()
+        # Emit the stage-change event — only when the stage actually
+        # changed. Same-stage plants (v2 §7.1 first-plant after pool/
+        # empty creation) emit `task_role_assigned` only, since the
+        # board didn't move.
+        if not is_same_stage_plant:
+            await bus.publish({
+                "ts": ts,
+                "agent_id": caller_id,
+                "type": "task_stage_changed",
+                "task_id": task_id,
+                "from": old_status,
+                "to": next_stage,
+                "reason": "coord_approve_stage",
+                "assignee": assignee,
+                "note": note or None,
+                "owner": assignee if next_stage == "execute" else None,
+            })
+        # Emit the role-assignment event when a role was planted.
+        if next_stage != "archive" and target_role and assignee:
+            await bus.publish({
+                "ts": ts,
+                "agent_id": caller_id,
+                "type": "task_role_assigned",
+                "task_id": task_id,
+                "role": target_role,
+                "owner": assignee,
+                "to": assignee,
+                "note": note or None,
+            })
+
+        # v2 §5.3 self-review warning: when Coach assigns the same
+        # Player to an auditor role that's also the task's executor,
+        # surface the pattern. Informational — Coach can choose this
+        # deliberately (small team, specialist scarcity); the Telegram
+        # bridge formats the warning so the human sees it.
+        if (
+            target_role in ("auditor_syntax", "auditor_semantics")
+            and assignee
+            and old_owner
+            and assignee == old_owner
+        ):
+            kind = (
+                "syntax" if target_role == "auditor_syntax" else "semantics"
+            )
+            await bus.publish({
+                "ts": ts,
+                "agent_id": caller_id,
+                "type": "audit_self_review_warning",
+                "task_id": task_id,
+                "kind": kind,
+                "auditor_id": assignee,
+                "executor_id": old_owner,
+                "to": "coach",
+            })
+
+        # Stand-down wakes. Source-stage displacement is the more
+        # disruptive one (Player was actively working) so it goes
+        # first. Same-slot refresh (assignee was already the active
+        # role owner) is filtered by send_role_stand_down.
+        if displaced_source:
+            try:
+                await send_role_stand_down(
+                    task_id=task_id,
+                    role=_kanban_role_for_stage(old_status) or "",
+                    displaced=displaced_source,
+                    new_owners=[],
+                )
+            except Exception:
+                pass
+        if displaced_target and target_role:
+            try:
+                await send_role_stand_down(
+                    task_id=task_id,
+                    role=target_role,
+                    displaced=displaced_target,
+                    new_owners=[assignee] if assignee else [],
+                )
+            except Exception:
+                pass
+
+        # Wake the new assignee with `note` as the prompt body. Coach's
+        # note is the verbatim brief — the lifecycle policy teaches
+        # Coach to write it like a hand-off, not a status comment.
+        if next_stage != "archive" and assignee:
+            from server.agents import maybe_wake_agent
+            wake_body = note or (
+                f"Coach approved your move on task {task_id} to stage "
+                f"{next_stage!r} as {target_role}. Read coord_my_assignments "
+                f"for the role context, do the work, then call the "
+                f"matching completion tool (coord_commit_push for code, "
+                f"coord_submit_audit_report for audits, "
+                f"coord_role_complete for non-git executors / shippers, "
+                f"coord_write_task_spec for planners)."
+            )
+            try:
+                await maybe_wake_agent(
+                    assignee, wake_body,
+                    bypass_debounce=True,
+                    wake_source="kanban_approval",
+                )
+            except Exception:
+                pass
+
+        suffix_note = f" — {note[:120]}" if note else ""
+        if next_stage == "archive":
+            return _ok(
+                f"Approved {task_id}: {old_status} → archive (no "
+                f"summary){suffix_note}. NO user-facing summary fires "
+                f"for this path. If the task ends with a deliverable "
+                f"or decision the user needs to know, call "
+                f"coord_archive_task(task_id, summary) instead so the "
+                f"summary lands in chat + Telegram."
+            )
+        if is_same_stage_plant:
+            return _ok(
+                f"Planted {assignee} as {target_role} on {task_id} "
+                f"(stage {next_stage!r}, first plant after pool/empty "
+                f"create){suffix_note}. Role row planted, wake fired. "
+                f"Do NOT follow up with coord_send_message; the wake "
+                f"covers it."
+            )
+        return _ok(
+            f"Approved {task_id}: {old_status} → {next_stage} "
+            f"({target_role} → {assignee}){suffix_note}. "
+            f"Planted {assignee}'s role row, woke them with your "
+            f"note as the brief. Do NOT follow up with "
+            f"coord_send_message; the wake covers it."
+        )
+
+    @tool(
+        "coord_archive_task",
+        (
+            "Coach-only. Deliberately archive a task with a user-facing "
+            "summary. Replaces v1's auto-archive on trajectory completion "
+            "— v2 has no auto-archive; every task ends with a Coach-"
+            "written wrap-up.\n"
+            "\n"
+            "Use this when:\n"
+            "- a shipper completed and you want to publish the result\n"
+            "- a research / writing / ops task delivered and you want "
+            "to summarise the outcome\n"
+            "- you're cancelling a task and want the user to know why\n"
+            "\n"
+            "The summary is your deliberate user-facing artifact: write "
+            "it like the user just asked 'what happened with that task?' "
+            "It lands as a `.sys` row in your pane and is forwarded to "
+            "Telegram (when the originating turn was user-triggered, "
+            "matching the existing user-triggered-turn filter).\n"
+            "\n"
+            "Effects: marks every active role row complete; transitions "
+            "the task to archive; stamps `archived_at` and "
+            "`completed_at`; emits `task_archived{summary, ...}`.\n"
+            "\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- summary: user-facing wrap-up (required, max 5000 chars)"
+        ),
+        {"task_id": str, "summary": str},
+    )
+    async def archive_task(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err(
+                "coord_archive_task is Coach-only. Players don't archive "
+                "tasks — Coach reviews and decides on the wrap-up."
+            )
+        task_id = (args.get("task_id") or "").strip()
+        summary = (args.get("summary") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+        if not summary:
+            return _err(
+                "summary is required — this is the user-facing wrap-up. "
+                "If you really want to close without a summary, use "
+                "coord_approve_stage(next_stage='archive') instead."
+            )
+        if len(summary) > 5000:
+            return _err(
+                f"summary too long ({len(summary)} chars, max 5000)"
+            )
 
         project_id = await resolve_active_project()
         c = await configured_conn()
@@ -6702,193 +5943,380 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 return _err(f"task {task_id} not found")
             t = dict(row)
             old_status = t["status"]
-            owner = t.get("owner")
-            if not _valid_transition(old_status, stage):
+            old_owner = t.get("owner")
+            if old_status == "archive":
                 return _err(
-                    f"invalid transition: {old_status} → {stage}"
+                    f"task {task_id} is already archived; archived "
+                    f"tasks are read-only."
                 )
-
-            # Assignee gate: when the target stage isn't archive, the
-            # role row must end up with at least one eligible Player so
-            # the kanban subscriber's stage-entry wake has someone to
-            # call. Either Coach passed `assignee` (we plant it) or the
-            # existing active row already has owner / non-empty
-            # eligible_owners.
-            planted_targets: list[str] | None = None
-            if stage != "archive" and target_role:
-                if targets:
-                    # Build a generic wake prompt. NB: at this point
-                    # `tasks.status` is still `old_status`, so
-                    # `_assign_role_helper`'s `_role_matches_stage`
-                    # check returns False and the helper does NOT
-                    # wake. The subscriber's `_on_stage_changed`
-                    # (fired by the `task_stage_changed` event we
-                    # publish below) finds the planted row and wakes
-                    # the assignee — single wake.
-                    role_label = _role_token_for_stage(stage)
-                    is_pool = len(targets) > 1
-                    if is_pool:
-                        wake_prompt = (
-                            f"Coach advanced task {task_id} to "
-                            f"{stage!r} and posted the {target_role} "
-                            f"role to a pool of {', '.join(targets)}. "
-                            f"First to call coord_accept_role(task_id="
-                            f"{task_id!r}, role={target_role!r}) wins."
-                        )
-                    else:
-                        wake_prompt = (
-                            f"Coach advanced task {task_id} to "
-                            f"{stage!r} and assigned you as "
-                            f"{target_role}. Read coord_my_assignments "
-                            f"for the role context, do the work, then "
-                            f"call the matching completion tool "
-                            f"(coord_assign_{role_label}'s response "
-                            f"explains which one)."
-                        )
-                    ok, _msg, _slots = await _assign_role_helper(
-                        c, task_id=task_id, role=target_role,
-                        targets=targets,
-                        wake_prompt_for_role=wake_prompt,
-                    )
-                    if not ok:
-                        return _err(
-                            f"assignee planting failed for "
-                            f"{target_role}; task not advanced."
-                        )
-                    planted_targets = targets
-                else:
-                    # No assignee provided — the existing active role
-                    # row must already have owner / non-empty
-                    # eligible_owners. Without one, the wake fires
-                    # `stage_assignment_needed` back at Coach — at
-                    # which point the advance is moot. Reject loudly
-                    # so Coach plants the assignee atomically with
-                    # the advance.
-                    cur = await c.execute(
-                        "SELECT owner, eligible_owners FROM "
-                        "task_role_assignments "
-                        "WHERE task_id = ? AND role = ? "
-                        "AND completed_at IS NULL "
-                        "AND superseded_by IS NULL "
-                        "ORDER BY assigned_at DESC LIMIT 1",
-                        (task_id, target_role),
-                    )
-                    rrow = await cur.fetchone()
-                    has_assignee = False
-                    if rrow:
-                        rd = dict(rrow)
-                        if rd.get("owner"):
-                            has_assignee = True
-                        else:
-                            try:
-                                lst = json.loads(
-                                    rd.get("eligible_owners") or "[]"
-                                )
-                                if isinstance(lst, list) and lst:
-                                    has_assignee = True
-                            except Exception:
-                                has_assignee = False
-                    if not has_assignee:
-                        role_token = _role_token_for_stage(stage)
-                        if stage in ("audit_syntax", "audit_semantics"):
-                            kind = (
-                                "syntax" if stage == "audit_syntax"
-                                else "semantics"
-                            )
-                            tool_template = (
-                                f"coord_assign_auditor(task_id="
-                                f"{task_id!r}, kind={kind!r}, "
-                                f"to=<slot>, focus=<...>)"
-                            )
-                        else:
-                            tool_template = (
-                                f"coord_assign_{role_token}("
-                                f"task_id={task_id!r}, to=<slot>)"
-                            )
-                        return _err(
-                            f"target stage {stage!r} has no eligible "
-                            f"{target_role}. Pass `assignee='pN'` "
-                            f"(single slot) or `assignee='pN,pM'` "
-                            f"(pool) to plant the role atomically "
-                            f"with the advance, or call "
-                            f"{tool_template} first and retry "
-                            f"without `assignee`."
-                        )
-
             now = _now_iso()
-            # Stamp last_stage_change_at + clear stale_alert_at on every
-            # status change (audit-2026-05-04 item 6).
-            if stage == "archive":
+            await c.execute(
+                "UPDATE task_role_assignments "
+                "SET completed_at = ? "
+                "WHERE task_id = ? "
+                "AND completed_at IS NULL AND superseded_by IS NULL",
+                (now, task_id),
+            )
+            await c.execute(
+                "UPDATE tasks SET status = 'archive', "
+                "completed_at = ?, archived_at = ?, "
+                "last_stage_change_at = ?, stale_alert_at = NULL, "
+                "stall_escalation_level = 0 "
+                "WHERE id = ? AND project_id = ?",
+                (now, now, now, task_id, project_id),
+            )
+            if old_owner:
                 await c.execute(
-                    "UPDATE tasks SET status = 'archive', "
-                    "completed_at = ?, archived_at = ?, "
-                    "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
-                    "WHERE id = ? AND project_id = ?",
-                    (now, now, now, task_id, project_id),
-                )
-                if owner:
-                    await c.execute(
-                        "UPDATE agents SET current_task_id = NULL "
-                        "WHERE id = ? AND current_task_id = ?",
-                        (owner, task_id),
-                    )
-            else:
-                await c.execute(
-                    "UPDATE tasks SET status = ?, "
-                    "last_stage_change_at = ?, stale_alert_at = NULL, stall_escalation_level = 0 "
-                    "WHERE id = ? AND project_id = ?",
-                    (stage, now, task_id, project_id),
+                    "UPDATE agents SET current_task_id = NULL "
+                    "WHERE id = ? AND current_task_id = ?",
+                    (old_owner, task_id),
                 )
             await c.commit()
         finally:
             await c.close()
 
-        await bus.publish(
-            {
-                "ts": _now_iso(),
-                "agent_id": caller_id,
-                "type": "task_stage_changed",
-                "task_id": task_id,
-                "from": old_status,
-                "to": stage,
-                "reason": "manual",
-                "note": note or None,
-                "owner": owner,
-            }
+        ts = _now_iso()
+        # task_stage_changed for the board UI + project_events log.
+        await bus.publish({
+            "ts": ts,
+            "agent_id": caller_id,
+            "type": "task_stage_changed",
+            "task_id": task_id,
+            "from": old_status,
+            "to": "archive",
+            "reason": "coord_archive_task",
+            "owner": old_owner,
+        })
+        # task_archived carries the user-facing summary; forwarded to
+        # Telegram per the existing user-triggered-turn filter.
+        await bus.publish({
+            "ts": ts,
+            "agent_id": caller_id,
+            "type": "task_archived",
+            "task_id": task_id,
+            "summary": summary,
+            "body": summary,
+            "owner": old_owner,
+        })
+        return _ok(
+            f"Archived {task_id} with user-facing summary "
+            f"({len(summary)} chars). All active role rows closed; "
+            f"task is read-only. The summary will surface in your pane "
+            f"and forward to Telegram (when the originating turn was "
+            f"user-triggered)."
         )
-        suffix_note = f" — {note}" if note else ""
-        head = (
-            f"Advanced {task_id}: {old_status} → {stage} (manual)"
-            f"{suffix_note}."
+
+    @tool(
+        "coord_role_complete",
+        (
+            "Player-only. Generic completion for roles whose real work "
+            "happens via other tools — non-git executors who wrote a "
+            "file via Write / coord_save_output / coord_write_knowledge, "
+            "or shippers who merged / published / sent via Bash or "
+            "external CLIs. Replaces v1's coord_complete_execution + "
+            "coord_mark_shipped (one tool, role inferred from your "
+            "active role row at the task's current stage).\n"
+            "\n"
+            "Code work uses coord_commit_push (which carries its own "
+            "completion). Spec writes use coord_write_task_spec. Audit "
+            "reports use coord_submit_audit_report. This tool is for "
+            "the rest.\n"
+            "\n"
+            "ARTIFACT GATE: when you pass `artifact_path`, the harness "
+            "verifies the file exists on disk under the project root. "
+            "Don't pre-declare a path you haven't written yet — save "
+            "the file first, then call this. Resolution mirrors "
+            "v1.3.14's coord_complete_execution.\n"
+            "\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- message_to_coach: one-line note Coach reads on the next "
+            "tick (required — what you produced, any caveats, "
+            "what the next person should know). Carried verbatim in "
+            "the `task_role_completed` event payload.\n"
+            "- artifact_path: optional durable path; verified on disk"
+        ),
+        {
+            "task_id": str, "message_to_coach": str, "artifact_path": str,
+        },
+    )
+    async def role_complete(args: dict[str, Any]) -> dict[str, Any]:
+        if caller_is_coach:
+            return _err(
+                "Coach doesn't execute work. Assign a Player via "
+                "coord_approve_stage."
+            )
+        task_id = (args.get("task_id") or "").strip()
+        message_to_coach = (args.get("message_to_coach") or "").strip()
+        artifact_path = (args.get("artifact_path") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+        if not message_to_coach:
+            return _err(
+                "message_to_coach is required — Coach reads it on the "
+                "next tick to decide what's next. Tell Coach what you "
+                "produced, any caveats, what the next person should "
+                "know."
+            )
+        if len(message_to_coach) > 2000:
+            return _err(
+                f"message_to_coach too long ({len(message_to_coach)} "
+                f"chars, max 2000)"
+            )
+        if len(artifact_path) > 1000:
+            return _err("artifact_path too long (max 1000 chars)")
+
+        project_id = await resolve_active_project()
+
+        # Artifact-gate (v1.3.14 pattern, copied from coord_complete_execution).
+        artifact_resolved: str | None = None
+        if artifact_path:
+            from pathlib import Path
+            from server.paths import project_paths
+            pp = project_paths(project_id)
+            try:
+                project_root = pp.root.resolve()
+            except Exception as exc:
+                return _err(
+                    f"could not resolve project root: {exc}"
+                )
+            try:
+                candidate = Path(artifact_path)
+                if not candidate.is_absolute():
+                    candidate = pp.root / candidate
+                resolved = candidate.resolve()
+            except Exception as exc:
+                return _err(
+                    f"could not resolve artifact_path "
+                    f"{artifact_path!r}: {exc}"
+                )
+            try:
+                resolved.relative_to(project_root)
+            except ValueError:
+                return _err(
+                    f"artifact_path {artifact_path!r} resolves outside "
+                    f"the project root ({project_root}). Pass a path "
+                    f"under the project."
+                )
+            if not resolved.exists():
+                return _err(
+                    f"artifact_path {artifact_path!r} does not exist "
+                    f"on disk (resolved to {resolved}). Save the "
+                    f"deliverable first via Write / coord_save_output "
+                    f"/ coord_write_knowledge / coord_write_decision, "
+                    f"then call coord_role_complete again."
+                )
+            artifact_resolved = str(resolved)
+
+        from server.kanban import _role_for_stage as _kanban_role_for_stage
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT status, owner FROM tasks "
+                "WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(
+                    f"task {task_id} not found in active project"
+                )
+            t = dict(row)
+            current_stage = t.get("status")
+            if current_stage == "archive":
+                return _err(
+                    f"task {task_id} is archived; cannot complete a "
+                    f"role on it."
+                )
+            target_role = _kanban_role_for_stage(current_stage)
+            if not target_role:
+                return _err(
+                    f"task {task_id} stage {current_stage!r} has no "
+                    f"role — nothing to complete."
+                )
+            cur = await c.execute(
+                "SELECT id FROM task_role_assignments "
+                "WHERE task_id = ? AND role = ? AND owner = ? "
+                "AND completed_at IS NULL AND superseded_by IS NULL "
+                "ORDER BY assigned_at DESC LIMIT 1",
+                (task_id, target_role, caller_id),
+            )
+            role_row = await cur.fetchone()
+            if not role_row:
+                return _err(
+                    f"you have no active {target_role} role on task "
+                    f"{task_id} — Coach hasn't assigned you, or your "
+                    f"role was already completed/superseded. Check "
+                    f"coord_my_assignments for what's actionable."
+                )
+            role_id = dict(role_row)["id"]
+            now = _now_iso()
+            await c.execute(
+                "UPDATE task_role_assignments SET completed_at = ? "
+                "WHERE id = ?",
+                (now, role_id),
+            )
+            if artifact_path:
+                cur = await c.execute(
+                    "SELECT artifacts FROM tasks "
+                    "WHERE id = ? AND project_id = ?",
+                    (task_id, project_id),
+                )
+                arow = await cur.fetchone()
+                try:
+                    artifacts = (
+                        json.loads(dict(arow).get("artifacts") or "[]")
+                        if arow else []
+                    )
+                    if not isinstance(artifacts, list):
+                        artifacts = []
+                except Exception:
+                    artifacts = []
+                if artifact_path not in artifacts:
+                    artifacts.append(artifact_path)
+                    await c.execute(
+                        "UPDATE tasks SET artifacts = ? "
+                        "WHERE id = ? AND project_id = ?",
+                        (
+                            json.dumps(artifacts, separators=(",", ":")),
+                            task_id, project_id,
+                        ),
+                    )
+            await c.commit()
+        finally:
+            await c.close()
+
+        ts = _now_iso()
+        await bus.publish({
+            "ts": ts,
+            "agent_id": caller_id,
+            "type": "task_role_completed",
+            "task_id": task_id,
+            "role": target_role,
+            "owner": caller_id,
+            "artifact_path": artifact_path or None,
+            "message_to_coach": message_to_coach or None,
+            "to": caller_id,
+        })
+        artifact_clause = (
+            f" → {artifact_path} (verified at {artifact_resolved})"
+            if artifact_resolved else ""
         )
-        if stage == "archive":
+        return _ok(
+            f"Completed {target_role} role on {task_id}{artifact_clause}. "
+            f"Your message reached Coach via the event log; Coach "
+            f"will review on the next tick and decide whether to "
+            f"approve the next stage, request rework, or archive."
+        )
+
+    @tool(
+        "coord_request_plan_review",
+        (
+            "Coach-only. Wake a Player with plan-mode enabled so they "
+            "produce an ExitPlanMode artifact before touching tools. "
+            "The plan lands as `pending_plan{route='coach'}` for Coach "
+            "to review; once Coach approves (or rewrites), Coach calls "
+            "coord_approve_stage with the chosen note to dispatch the "
+            "Player into execution.\n"
+            "\n"
+            "Use for non-trivial work where you'd rather see the "
+            "Player's plan up front than read commits + audits at the "
+            "end. The wake body references the task's current spec "
+            "(when present); the Player composes the plan and submits "
+            "via ExitPlanMode (which lands as a pending_plan event the "
+            "harness routes to Coach per the v2 plan-mode policy).\n"
+            "\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- slot: target Player slot (p1..p10)"
+        ),
+        {"task_id": str, "slot": str},
+    )
+    async def request_plan_review(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err(
+                "coord_request_plan_review is Coach-only."
+            )
+        task_id = (args.get("task_id") or "").strip()
+        slot = (args.get("slot") or "").strip().lower()
+        if not task_id:
+            return _err("task_id is required")
+        if (
+            slot not in VALID_RECIPIENTS
+            or slot in ("coach", "broadcast")
+        ):
+            return _err(
+                f"slot must be a Player slot (p1..p10), not {slot!r}"
+            )
+        if await _is_locked(slot):
+            return _err(
+                f"Player {slot} is locked; pick an unlocked Player."
+            )
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT title, status, spec_path FROM tasks "
+                "WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"task {task_id} not found")
+            t = dict(row)
+        finally:
+            await c.close()
+
+        title = t.get("title") or "(no title)"
+        stage = t.get("status") or "?"
+        spec_clause = (
+            f" (spec at {t['spec_path']})"
+            if t.get("spec_path") else " (no spec yet)"
+        )
+        wake_body = (
+            f"Coach is requesting a plan review for task {task_id} "
+            f"({title!r}, currently in stage {stage!r}){spec_clause}.\n\n"
+            f"Plan-mode is enabled for this turn: produce an ExitPlanMode "
+            f"artifact describing what you'd do, in what order, with "
+            f"what risks. Do NOT touch tools yet — your plan goes to "
+            f"Coach for review first. Coach will then approve, request "
+            f"changes, or rewrite the plan and dispatch you to execute "
+            f"via coord_approve_stage."
+        )
+
+        ts = _now_iso()
+        await bus.publish({
+            "ts": ts,
+            "agent_id": caller_id,
+            "type": "plan_review_requested",
+            "task_id": task_id,
+            "slot": slot,
+            "to": slot,
+        })
+
+        from server.agents import maybe_wake_agent
+        try:
+            woken = await maybe_wake_agent(
+                slot, wake_body,
+                bypass_debounce=True,
+                wake_source="kanban_plan_review",
+                plan_mode=True,
+            )
+        except Exception:
+            woken = False
+        if not woken:
             return _ok(
-                f"{head} Task is closed. NO auto-summary fires for "
-                f"manual archives (you decided to kill it, so you "
-                f"decide what to tell the user). If you want the "
-                f"user notified, call coord_request_human or "
-                f"coord_send_message yourself."
+                f"Plan review requested for {task_id} → {slot}, but the "
+                f"wake didn't fire (slot may be busy / paused / cost-"
+                f"capped). The request was logged; Coach should retry "
+                f"after the slot clears or pick another Player."
             )
-        if planted_targets:
-            assignee_clause = (
-                f"{planted_targets[0]} (hard-assign)"
-                if len(planted_targets) == 1
-                else f"pool [{', '.join(planted_targets)}]"
-            )
-            tail = (
-                f" Planted {target_role} role → {assignee_clause}; "
-                f"the kanban auto-wakes them with the role context. "
-                f"Do NOT follow up with coord_send_message; the wake "
-                f"covers it."
-            )
-        else:
-            tail = (
-                f" The kanban auto-wakes the new-stage assignee. "
-                f"Note: this bypassed the normal role-completion "
-                f"gate, so the previous stage's role row stays open "
-                f"unless you intended to skip it entirely."
-            )
-        return _ok(head + tail)
+        return _ok(
+            f"Plan review requested for {task_id} → {slot}. {slot} is "
+            f"woken with plan-mode enabled; their plan will land as a "
+            f"pending_plan event for your review."
+        )
 
     @tool(
         "coord_set_task_blocked",
@@ -6981,21 +6409,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     _tools = [
         list_tasks,
         create_task,
-        claim_task,
-        accept_role,
         update_task,
-        assign_task,
-        # Kanban additions
         write_task_spec,
-        assign_planner,
-        assign_auditor,
-        assign_shipper,
         submit_audit_report,
-        mark_shipped,
         my_assignments,
         set_task_trajectory,
         set_task_workflow,
-        advance_task_stage,
+        # Kanban v2 (Docs/kanban-specs-v2.md §7.1, §7.2)
+        approve_stage,
+        archive_task,
+        role_complete,
+        request_plan_review,
         set_task_blocked,
         send_message,
         read_inbox,
@@ -7003,7 +6427,6 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         read_memory,
         update_memory,
         commit_push,
-        complete_execution,
         write_decision,
         propose_file_write,
         read_file,
@@ -7059,17 +6482,13 @@ _EFFORT_VALUE_LABELS = {1: "low", 2: "medium", 3: "high", 4: "max"}
 ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_list_tasks",
     "mcp__coord__coord_create_task",
-    "mcp__coord__coord_claim_task",
-    "mcp__coord__coord_accept_role",
     "mcp__coord__coord_update_task",
-    "mcp__coord__coord_assign_task",
     "mcp__coord__coord_send_message",
     "mcp__coord__coord_read_inbox",
     "mcp__coord__coord_list_memory",
     "mcp__coord__coord_read_memory",
     "mcp__coord__coord_update_memory",
     "mcp__coord__coord_commit_push",
-    "mcp__coord__coord_complete_execution",
     "mcp__coord__coord_write_decision",
     "mcp__coord__coord_propose_file_write",
     "mcp__coord__coord_read_file",
@@ -7098,24 +6517,19 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__compass_audit",
     "mcp__coord__compass_brief",
     "mcp__coord__compass_status",
-    # Kanban lifecycle — Docs/kanban-specs.md §6. Same convention as
-    # compass: Coach-only assignment/meta tools are listed here too so
-    # the SDK doesn't pre-reject; the caller_is_coach gate inside each
-    # handler enforces the Coach-only invariant. Player-only tools
-    # (coord_my_assignments / coord_submit_audit_report /
-    # coord_mark_shipped) validate the caller has the relevant role
-    # assignment in their handler.
+    # Kanban v2 lifecycle (Docs/kanban-specs-v2.md §7.1, §7.2).
+    # Coach-only enforcement is in each tool body; listing here lets
+    # the SDK accept the call.
     "mcp__coord__coord_write_task_spec",
-    "mcp__coord__coord_assign_planner",
-    "mcp__coord__coord_assign_auditor",
-    "mcp__coord__coord_assign_shipper",
     "mcp__coord__coord_submit_audit_report",
-    "mcp__coord__coord_mark_shipped",
     "mcp__coord__coord_my_assignments",
     "mcp__coord__coord_set_task_trajectory",
     "mcp__coord__coord_set_task_workflow",
-    "mcp__coord__coord_advance_task_stage",
     "mcp__coord__coord_set_task_blocked",
+    "mcp__coord__coord_approve_stage",
+    "mcp__coord__coord_archive_task",
+    "mcp__coord__coord_role_complete",
+    "mcp__coord__coord_request_plan_review",
 ]
 
 MEMORY_TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")

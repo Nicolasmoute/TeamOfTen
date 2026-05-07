@@ -635,16 +635,32 @@ def test_key_for_audit_fail() -> None:
     assert esc._key_for_pending(ev_first) is None
 
 
-def test_key_for_stage_assignment_needed() -> None:
+def test_key_for_kanban_board_stalled() -> None:
+    """v2 §10.4 board safety ring fires `kanban_board_stalled`. The
+    key is the project_id — one re-armable timer per project."""
+    ev = {
+        "type": "kanban_board_stalled",
+        "project_id": "misc",
+        "age_seconds": 1860,
+        "active_task_count": 3,
+    }
+    assert esc._key_for_pending(ev) == ("board_stalled", "misc")
+
+
+def test_key_for_kanban_board_stalled_missing_project_drops() -> None:
+    ev = {"type": "kanban_board_stalled"}
+    assert esc._key_for_pending(ev) is None
+
+
+def test_stage_assignment_needed_no_longer_keyed() -> None:
+    """v2 §18 removes the v0.3 stage_assignment_needed event —
+    `coord_approve_stage` plants role + assignee atomically."""
     ev = {
         "type": "stage_assignment_needed",
         "task_id": "t-2026-05-03-aaaaaaaa",
         "role": "auditor_syntax",
     }
-    assert esc._key_for_pending(ev) == (
-        "stage_assignment_needed",
-        "t-2026-05-03-aaaaaaaa:auditor_syntax",
-    )
+    assert esc._key_for_pending(ev) is None
 
 
 def test_key_for_audit_self_review() -> None:
@@ -659,19 +675,15 @@ def test_key_for_audit_self_review() -> None:
     )
 
 
-def test_resolution_task_role_assigned_cancels_stage_assignment_needed() -> None:
-    """When Coach finally fills the role, the assignment-needed
-    timer should be cancelled (v0.3: now keyed under
-    stage_assignment_needed)."""
+def test_resolution_task_role_assigned_no_longer_resolves() -> None:
+    """v2 §18: stage_assignment_needed was dropped, so
+    `task_role_assigned` no longer resolves any pending key."""
     ev = {
         "type": "task_role_assigned",
         "task_id": "t-2026-05-03-aaaaaaaa",
         "role": "auditor_syntax",
     }
-    assert esc._key_for_resolution(ev) == (
-        "stage_assignment_needed",
-        "t-2026-05-03-aaaaaaaa:auditor_syntax",
-    )
+    assert esc._key_for_resolution(ev) is None
 
 
 async def test_audit_fail_fires_with_message_body(
@@ -737,35 +749,34 @@ async def test_audit_fail_formatter_includes_task_context(
     assert "priority=urgent" in body
 
 
-async def test_stage_assignment_needed_cancelled_by_role_assigned(
+async def test_kanban_board_stalled_fires_with_message_body(
     fresh_db: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If Coach assigns the auditor before the timer expires, no
-    Telegram message goes out (v0.3 event name)."""
+    """v2 §10.4: board safety ring fires `kanban_board_stalled` →
+    Telegram receives a project-level stall escalation immediately
+    (no resolution event since Coach acting on the wake is the
+    natural fix and there's no signal that the wake worked)."""
     await init_db()
     sent = _stub_send(monkeypatch)
-    monkeypatch.setenv("HARNESS_TELEGRAM_ESCALATION_SECONDS", "60")
-    monkeypatch.setenv("HARNESS_TELEGRAM_ESCALATION_GRACE", "60")
+    monkeypatch.setenv("HARNESS_TELEGRAM_ESCALATION_SECONDS", "1")
+    monkeypatch.setenv("HARNESS_TELEGRAM_ESCALATION_GRACE", "0")
 
     await esc.start_escalation_watcher()
     try:
         await bus.publish({
-            "type": "stage_assignment_needed",
-            "task_id": "t-2026-05-03-cccccccc",
-            "role": "auditor_syntax",
-            "ts": "2026-05-03T14:00:00+00:00",
+            "type": "kanban_board_stalled",
+            "project_id": "misc",
+            "last_stage_change_at": "2026-05-07T12:00:00+00:00",
+            "age_seconds": 1860,
+            "active_task_count": 3,
+            "ts": "2026-05-07T12:31:00+00:00",
         })
-        await _drain(0.05)
-        assert esc.pending_count() == 1
-        # Coach assigns the auditor — cancels the timer.
-        await bus.publish({
-            "type": "task_role_assigned",
-            "task_id": "t-2026-05-03-cccccccc",
-            "role": "auditor_syntax",
-        })
-        await _drain(0.1)
-        assert esc.pending_count() == 0
-        assert sent == []
+        await _drain(0.2)
+        assert len(sent) == 1
+        body = sent[0]
+        assert "Kanban board stalled" in body
+        assert "misc" in body
+        assert "Active tasks: 3" in body
     finally:
         await esc.stop_escalation_watcher()
 

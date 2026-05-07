@@ -114,7 +114,6 @@ async def test_update_task_execute_to_audit_syntax_rejected_without_commit(
     })
     msg = _err_text(result)
     assert "coord_commit_push" in msg
-    assert "coord_advance_task_stage" in msg
 
 
 async def test_update_task_audit_syntax_to_audit_semantics_requires_pass_verdict(
@@ -156,7 +155,7 @@ async def test_update_task_ship_to_archive_requires_completed_shipper(
 ) -> None:
     await init_db()
     await _seed_task(status="ship", owner="p3", spec_path="x")
-    # Shipper assigned but hasn't called coord_mark_shipped (no completed_at).
+    # Shipper assigned but hasn't called coord_role_complete (no completed_at).
     await _insert_role_row(role="shipper", owner="p5")
     # Owner (p3) attempts the move — gate rejects (delivery, not cancel).
     server = _server_for("p3")
@@ -165,7 +164,7 @@ async def test_update_task_ship_to_archive_requires_completed_shipper(
         "status": "archive",
     })
     msg = _err_text(result)
-    assert "coord_mark_shipped" in msg
+    assert "coord_role_complete" in msg
 
 
 async def test_update_task_ship_to_archive_passes_when_shipper_completed(
@@ -245,21 +244,21 @@ async def test_update_task_plan_to_execute_rejected_without_executor(
         "status": "execute",
     })
     msg = _err_text(result)
-    assert "no claimed executor" in msg
+    assert "no executor assigned" in msg
 
 
-# ---------- Coach override (advance_task_stage) bypasses the gate ----------
+# ---------- Coach override (coord_approve_stage) bypasses the gate ----------
 
 
-async def test_advance_task_stage_bypasses_role_gate(fresh_db: str) -> None:
+async def test_approve_stage_bypasses_role_gate(fresh_db: str) -> None:
     await init_db()
     # Force ship → archive without a completed shipper.
     await _seed_task(status="ship", owner="p3", spec_path="x")
     await _insert_role_row(role="shipper", owner="p5")  # incomplete
     server = _server_for("coach")
-    result = await _handler(server, "advance_task_stage")({
+    result = await _handler(server, "approve_stage")({
         "task_id": "t-2026-05-03-abc12345",
-        "stage": "archive",
+        "next_stage": "archive",
         "note": "shipper went silent",
     })
     _ok_text(result)

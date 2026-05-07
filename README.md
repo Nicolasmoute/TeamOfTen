@@ -121,7 +121,7 @@ Coach plans and assigns. Players execute, review, and ship. Standard tasks need 
 
 That matters for drift control because the work now has intermediate artifacts, not just final output: `spec.md`, `audits/audit_<round>_<kind>.md`, Compass audit reports, role assignments, stage-change events, and kDrive-mirrored task folders. Compass still provides the strategic drift signal; kanban makes the operational drift visible while there is still a responsible Player and a concrete next gate.
 
-Full subsystem spec: [Docs/kanban-specs.md](Docs/kanban-specs.md).
+Full subsystem spec: [Docs/kanban-specs-v2.md](Docs/kanban-specs-v2.md) (canonical, draft as of 2026-05-07; the running container still implements v1 — archived at [Docs/kanban-specs-v1-archived.md](Docs/kanban-specs-v1-archived.md)).
 
 ---
 
@@ -133,6 +133,7 @@ Here, **the agent chatter *is* the interface.** A tileable multi-pane web UI str
 
 - Drag panes around, stack them into columns, split + resize, maximize one pane, export a conversation to markdown.
 - **Per-pane settings.** Override model / runtime / plan-mode / effort per pane via a gear popover. Settings persist in localStorage.
+- **Live token streaming.** Agent answers render character-by-character as the SDK emits them — no waiting for the full turn to complete. On by default; set `HARNESS_STREAM_TOKENS=false` to disable.
 - **Live token/context bar** in every pane header — knows when an auto-compact is about to fire.
 - **Image paste** into any agent's input. Drop a screenshot, the agent reads it.
 - **Slash commands** — `/plan` `/model` `/effort` `/brief` `/tools` `/clear` `/loop` `/tick` `/status` `/spend` `/compact`.
@@ -169,7 +170,7 @@ Coach on Claude, half the Players on Codex, slot p7 on whichever model writes th
 8. You're part of the team: open any agent's pane to read what they're saying, send them a direct prompt, watch the live tool-use stream, override their model / runtime / effort / plan-mode, or pause/cancel a runaway turn.
 9. Everything human-readable mirrors to your **WebDAV cloud drive** (kDrive, Nextcloud, ownCloud, Fastmail) so you can read/edit it from anywhere — even with the harness offline. Point Obsidian at the synced folder and you have a live second-brain the agents write into.
 
-Full details: [Docs/TOT-specs.md](Docs/TOT-specs.md). Kanban subsystem detail: [Docs/kanban-specs.md](Docs/kanban-specs.md). Rules agents follow when editing this repo: [CLAUDE.md](CLAUDE.md).
+Full details: [Docs/TOT-specs.md](Docs/TOT-specs.md). Kanban subsystem detail: [Docs/kanban-specs-v2.md](Docs/kanban-specs-v2.md). Rules agents follow when editing this repo: [CLAUDE.md](CLAUDE.md).
 
 ---
 
@@ -293,7 +294,8 @@ Dockerfile                    Python 3.12 + Node 20 + claude CLI + codex CLI + g
 mcp-servers.example.json      Template for wiring external MCP servers
 truth/                        The project's source-of-truth (write-protected for agents)
 Docs/TOT-specs.md             Full spec (data model, coordination, tool surface, UI)
-Docs/kanban-specs.md          Kanban task lifecycle — stages, roles, audits, auto-advance
+Docs/kanban-specs-v2.md       Kanban task lifecycle (canonical, shape-(2) routing through Coach)
+Docs/kanban-specs-v1-archived.md  Kanban v1 (auto-routing, deployed) — historical archive
 Docs/COMPASS_SPEC.md          Compass design — lattice, Q&A, audit semantics
 Docs/CODEX_RUNTIME_SPEC.md    Codex runtime design + parser specifics
 CLAUDE.md                     Rules for any agent editing this codebase

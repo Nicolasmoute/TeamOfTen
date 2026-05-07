@@ -620,17 +620,12 @@ async def test_stage_progression_resets_escalation_level(
         await c.close()
     assert before["stall_escalation_level"] == 1
 
-    # Coach forces a stage move via coord_advance_task_stage.
+    # Coach forces a stage move via coord_approve_stage (v2).
     coach = build_coord_server("coach", include_proxy_metadata=True)
-    handler = (
-        coach["_handlers"].get("coord_advance_task_stage")
-        or coach["_handlers"].get("advance_task_stage")
-    )
-    # The seeded task has no shipper role row planted; supply
-    # `assignee` so the advance plants it atomically.
+    handler = coach["_handlers"]["coord_approve_stage"]
     result = await handler({
         "task_id": "t-2026-05-06-stallesc",
-        "stage": "ship",
+        "next_stage": "ship",
         "assignee": "p3",
     })
     assert not result.get("isError"), result

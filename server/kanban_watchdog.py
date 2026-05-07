@@ -1,4 +1,4 @@
-"""Soft-stall watchdog (Docs/kanban-specs.md §10.7).
+﻿"""Soft-stall watchdog (Docs/kanban-specs-v2.md §10.7).
 
 The §10.5 stall ladder operates on `tasks.last_stage_change_at` —
 catches tasks where nothing has progressed for at least 30 min. The

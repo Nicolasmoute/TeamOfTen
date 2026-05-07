@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import logging
@@ -66,11 +66,11 @@ CREATE TABLE IF NOT EXISTS agents (
     -- The poller skips a Player whose last_idle_wake_at is within
     -- HARNESS_IDLE_POLL_DEBOUNCE_SECONDS of now (default 30 min) so a
     -- Player who declined a wake isn't pestered every cycle. See
-    -- Docs/kanban-specs.md §10.
+    -- Docs/kanban-specs-v2.md §10.
     last_idle_wake_at     TEXT
 );
 
--- Kanban-shaped task lifecycle (Docs/kanban-specs.md). Status enum is
+-- Kanban-shaped task lifecycle (Docs/kanban-specs-v2.md). Status enum is
 -- the kanban stage (`plan` / `execute` / `audit_syntax` / `audit_semantics`
 -- / `ship` / `archive`). The legacy enum (open/claimed/in_progress/
 -- blocked/done/cancelled) was migrated to this shape via a one-shot
@@ -157,7 +157,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project    ON tasks(project_id);
 -- existence at CREATE INDEX time, so an upgraded DB whose tasks table
 -- still has the legacy schema would crash here on every boot.
 
--- Task role assignments (Docs/kanban-specs.md §4). A task has multiple
+-- Task role assignments (Docs/kanban-specs-v2.md §4). A task has multiple
 -- Players involved in different roles across stages: planner (optional —
 -- Coach by default), executor, formal reviewer, semantic reviewer, shipper.
 -- Each role can be hard-assigned to one Player or posted to a pool of
@@ -192,7 +192,7 @@ CREATE TABLE IF NOT EXISTS task_role_assignments (
     -- Free-text Coach-set focus naming what the auditor should check
     -- (math invariants? brand voice? race conditions?). REQUIRED for
     -- auditor_semantics rows; defaults applied at wake-prompt time
-    -- when NULL on auditor_syntax rows. See kanban-specs.md §4.6.
+    -- when NULL on auditor_syntax rows. See kanban-specs-v2.md §4.6.
     focus           TEXT
 );
 
@@ -238,6 +238,58 @@ CREATE INDEX IF NOT EXISTS idx_events_type_id ON events(type, id);
 -- by type"). They sit alongside payload_to / payload_owner above.
 CREATE INDEX IF NOT EXISTS idx_events_to    ON events(type, payload_to, id);
 CREATE INDEX IF NOT EXISTS idx_events_owner ON events(type, payload_owner, id);
+
+-- Per-project event log (Docs/kanban-specs-v2.md §9). Coach reads the
+-- unread tail on every tick via the `## Recent events` prompt block.
+-- Sibling write to the existing events table — every v2-mappable bus
+-- event produces exactly one row here (see server/project_events.py),
+-- with payload_pointer pre-extracted (sha / spec_path / report_path /
+-- message body / etc.) so render-time doesn't have to JSON-parse.
+-- read_by_coach_at: NULL = unread; stamped after Coach's tick reads
+-- the row (the prompt builder collects surfaced ids and the post-turn
+-- handler updates them once ResultMessage lands). Older unread rows
+-- (beyond HARNESS_PROJECT_EVENTS_PER_TICK, default 50) roll forward
+-- to subsequent ticks — see §9.3.
+CREATE TABLE IF NOT EXISTS project_events (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id       TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    ts               TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    actor            TEXT NOT NULL,    -- 'p1'..'p10' / 'coach' / 'compass' / 'system' / 'human'
+    type             TEXT NOT NULL,    -- see §9.2 enum
+    task_id          TEXT,             -- nullable; some events aren't task-scoped
+    payload_json     TEXT NOT NULL DEFAULT '{}',
+    payload_pointer  TEXT,             -- relative path to artifact OR short text body
+    read_by_coach_at TEXT              -- NULL = unread; stamped post-tick
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_events_project_unread
+    ON project_events(project_id, read_by_coach_at, ts);
+CREATE INDEX IF NOT EXISTS idx_project_events_task   ON project_events(task_id, ts);
+CREATE INDEX IF NOT EXISTS idx_project_events_actor  ON project_events(actor, ts);
+
+-- Validation instrumentation for kanban v2 (Docs/kanban-specs-v2.md §22.1).
+-- A row is inserted when Coach's coord_approve_stage note flags a
+-- deviation, OR an audit submits with verdict='fail', OR the human
+-- flags via POST /api/tasks/{id}/flag_deviation. The off_spec_completion_count
+-- Player-health counter (§11.1) reads from this table.
+-- noticed_at:
+--   'push'  — Coach noticed the deviation while task was still in execute
+--             (before any audit role row completed for the current round).
+--   'audit' — surfaced via an audit FAIL.
+--   'human' — flagged manually via the kanban UI.
+CREATE TABLE IF NOT EXISTS deviations_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    ts              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    task_id         TEXT NOT NULL,
+    executor        TEXT NOT NULL,        -- the slot that did the work
+    noticed_at      TEXT NOT NULL CHECK(noticed_at IN ('push', 'audit', 'human')),
+    description     TEXT,                  -- short reason — Coach's note, audit body summary, or human flag
+    source_event_id INTEGER                -- pointer to project_events row that triggered this
+);
+
+CREATE INDEX IF NOT EXISTS idx_deviations_log_project_executor
+    ON deviations_log(project_id, executor, ts);
 
 CREATE TABLE IF NOT EXISTS messages (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -699,7 +751,7 @@ async def init_db() -> None:
                 "agents",
                 [
                     ("runtime_override", "runtime_override TEXT"),
-                    # Idle-poller debounce timestamp; see Docs/kanban-specs.md §10.
+                    # Idle-poller debounce timestamp; see Docs/kanban-specs-v2.md §10.
                     ("last_idle_wake_at", "last_idle_wake_at TEXT"),
                 ],
             )
@@ -842,6 +894,19 @@ async def init_db() -> None:
                 "('coach', ?, 'Coach', 'Team captain')",
                 (MISC_PROJECT_ID,),
             )
+
+            # Kanban v0.3 → v2 (Docs/kanban-specs-v2.md §16.4). Runs
+            # AFTER the misc project is ensured because the synthetic
+            # kanban_v2_cutover row has a FK on projects(id). The new
+            # tables themselves (project_events, deviations_log) were
+            # created by SCHEMA above (CREATE TABLE IF NOT EXISTS).
+            # This step backfills project_events from the existing
+            # events table (last 30 days, mappable types, stamped
+            # read_by_coach_at so Coach's first tick sees only fresh
+            # signals) + inserts one synthetic kanban_v2_cutover row
+            # per project (UNREAD). Idempotent via
+            # team_config['tasks_kanban_v2_migrated'].
+            await _rebuild_tasks_for_kanban_v2(db)
 
             await db.commit()
 
@@ -1509,6 +1574,229 @@ async def _rebuild_tasks_for_kanban_v3(
             raise
     finally:
         await db.execute("PRAGMA foreign_keys = ON")
+
+
+# ----------------------------------------------------------------------
+# Kanban v2 migration (Docs/kanban-specs-v2.md §16.4)
+# ----------------------------------------------------------------------
+#
+# v2 adds two tables (project_events + deviations_log) declared in
+# SCHEMA, so fresh installs don't need a rebuild — the CREATE TABLE IF
+# NOT EXISTS lines handle them. This function only does the post-create
+# work for migrated DBs:
+#   1. Backfill `project_events` from the existing `events` table
+#      (last 30 days, mappable types, read_by_coach_at = now() so
+#      Coach's first tick doesn't drown in 30 days of history).
+#   2. Insert one synthetic `kanban_v2_cutover` row (UNREAD) so Coach
+#      explicitly walks the in-flight board on the first v2 tick.
+# Idempotent via team_config['tasks_kanban_v2_migrated'].
+#
+# NOTE on type renames per §16.4: a few v1 bus event types are renamed
+# in v2 (`message_sent` → `coord_send_message`, `knowledge_written` →
+# `coord_write_knowledge`, `decision_written` → `coord_write_decision`,
+# `compass_audit_logged` → `compass_audit`). The backfill applies these
+# rewrites; everything else passes through. v1-only types that have no
+# v2 equivalent (`task_completed`, `task_execution_completed`,
+# `task_shipped`) are skipped — they'll be replaced by v2 events going
+# forward and surfacing them once on first tick adds noise without
+# signal.
+
+# Bus-event type → project_events.type mapping. Same name unless
+# explicitly renamed. Imported from server.project_events at runtime
+# (the helper module owns the canonical mapping); duplicated here so
+# the migration can run before any of that module's imports resolve.
+_V2_BACKFILL_RENAMES: dict[str, str] = {
+    "message_sent": "coord_send_message",
+    "knowledge_written": "coord_write_knowledge",
+    "decision_written": "coord_write_decision",
+    "compass_audit_logged": "compass_audit",
+}
+
+# v2-mappable bus event types — anything not in this set is dropped
+# during backfill. Keep in sync with `_BUS_TO_LOG_TYPE` in
+# server/project_events.py.
+_V2_BACKFILL_TYPES: frozenset[str] = frozenset({
+    # Direct pass-through
+    "commit_pushed",
+    "task_spec_written",
+    "task_role_completed",
+    "audit_report_submitted",
+    "audit_fail_notification",
+    "task_stage_changed",
+    "task_role_assigned",
+    "task_role_stand_down",
+    "task_trajectory_changed",
+    "task_blocked_changed",
+    "task_archived",
+    "commit_without_task_id_warning",
+    "task_stage_stale",
+    "task_stall_persisting",
+    "task_stall_auto_reassigned",
+    "task_stall_no_alternative",
+    "task_stall_auto_archived",
+    "task_spec_unrecorded",
+    "task_audit_unrecorded",
+    "watchdog_finding",
+    "pending_plan",
+    "human_attention",
+    "auto_compact_triggered",
+    "session_compacted",
+    "kanban_board_stalled",
+    # Renamed (key = v1 bus type, value = v2 log type) — see _V2_BACKFILL_RENAMES
+    "message_sent",
+    "knowledge_written",
+    "decision_written",
+    "compass_audit_logged",
+})
+
+
+def _v2_backfill_pointer(log_type: str, payload: dict[str, Any]) -> str | None:
+    """Extract payload_pointer per §9.2 by event type. None when the
+    type doesn't carry a structured pointer."""
+    if log_type == "commit_pushed":
+        return payload.get("sha") or None
+    if log_type == "task_spec_written":
+        return payload.get("spec_path") or None
+    if log_type == "task_role_completed":
+        return payload.get("artifact_path") or None
+    if log_type == "audit_report_submitted":
+        return payload.get("report_path") or None
+    if log_type == "coord_send_message":
+        body = payload.get("body") or payload.get("text") or ""
+        if not body:
+            return None
+        return body[:500]
+    if log_type in ("coord_write_knowledge", "coord_write_decision"):
+        return payload.get("path") or payload.get("relative_path") or None
+    return None
+
+
+async def _rebuild_tasks_for_kanban_v2(
+    db: aiosqlite.Connection,
+) -> None:
+    """One-shot post-v0.3 work for kanban v2 (Docs/kanban-specs-v2.md
+    §16.4): backfill project_events from the events table, insert the
+    synthetic kanban_v2_cutover event.
+
+    The new tables themselves are created by the SCHEMA constant above
+    (CREATE TABLE IF NOT EXISTS). This function handles the data side
+    only.
+
+    Idempotent via team_config['tasks_kanban_v2_migrated'].
+    """
+    cur = await db.execute(
+        "SELECT value FROM team_config WHERE key = 'tasks_kanban_v2_migrated'"
+    )
+    if await cur.fetchone():
+        return  # already migrated
+
+    logger.info(
+        "init_db: kanban v2 backfill — copying mappable events into "
+        "project_events (last 30 days)"
+    )
+
+    # Backfill: SELECT events of mappable types from the last 30 days
+    # that have a resolvable project_id. Stamp them as already-read so
+    # Coach's first v2 tick sees only fresh signals.
+    type_placeholders = ",".join("?" for _ in _V2_BACKFILL_TYPES)
+    cur = await db.execute(
+        f"""
+        SELECT id, ts, agent_id, project_id, type, payload
+        FROM events
+        WHERE type IN ({type_placeholders})
+          AND project_id IS NOT NULL
+          AND ts >= datetime('now', '-30 days')
+        ORDER BY ts ASC
+        """,
+        list(_V2_BACKFILL_TYPES),
+    )
+    rows = list(await cur.fetchall())
+
+    backfilled = 0
+    for row in rows:
+        try:
+            ts = row[1]
+            actor = row[2] or "system"
+            project_id = row[3]
+            v1_type = row[4]
+            payload_raw = row[5] or "{}"
+            try:
+                payload = json.loads(payload_raw)
+                if not isinstance(payload, dict):
+                    payload = {}
+            except Exception:
+                payload = {}
+            log_type = _V2_BACKFILL_RENAMES.get(v1_type, v1_type)
+            task_id = payload.get("task_id") or None
+            pointer = _v2_backfill_pointer(log_type, payload)
+            await db.execute(
+                """
+                INSERT INTO project_events
+                    (project_id, ts, actor, type, task_id,
+                     payload_json, payload_pointer, read_by_coach_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_id, ts, actor, log_type, task_id,
+                    payload_raw, pointer, ts,
+                ),
+            )
+            backfilled += 1
+        except Exception:
+            # Per §16.4 + the spec's risk-mitigation note: best-effort.
+            # A single malformed row never fails the migration.
+            logger.exception(
+                "kanban v2 backfill: skipped event id=%s type=%s",
+                row[0] if row else "?", row[4] if row else "?",
+            )
+
+    # Synthetic cutover event — UNREAD so Coach's first v2 tick walks
+    # the active board. Fired once per project that has any rows in
+    # `tasks` (a fresh install has just `misc` with no tasks; we still
+    # fire it so Coach sees "v2 is live" on the first turn).
+    cur = await db.execute("SELECT id FROM projects")
+    projects = [r[0] for r in await cur.fetchall()]
+    cutover_body = (
+        "Kanban has been migrated to v2 (shape-(2) routing). "
+        "Walk the active board: for each non-archive task, decide the "
+        "next move (advance via coord_approve_stage, reassign, archive, "
+        "or leave in place) and act accordingly. From now on every "
+        "stage transition is your call — there is no auto-routing."
+    )
+    cutover_payload = json.dumps({
+        "type": "kanban_v2_cutover",
+        "to": "coach",
+        "body": cutover_body,
+    })
+    cutover_count = 0
+    for project_id in projects:
+        try:
+            await db.execute(
+                """
+                INSERT INTO project_events
+                    (project_id, actor, type, task_id,
+                     payload_json, payload_pointer, read_by_coach_at)
+                VALUES (?, 'system', 'kanban_v2_cutover', NULL,
+                        ?, ?, NULL)
+                """,
+                (project_id, cutover_payload, cutover_body),
+            )
+            cutover_count += 1
+        except Exception:
+            logger.exception(
+                "kanban v2 cutover insert failed for project_id=%s",
+                project_id,
+            )
+
+    await db.execute(
+        "INSERT OR IGNORE INTO team_config (key, value) VALUES "
+        "('tasks_kanban_v2_migrated', '1')"
+    )
+    await db.commit()
+    logger.info(
+        "init_db: kanban v2 backfill complete (events_copied=%d, "
+        "cutover_rows=%d)", backfilled, cutover_count,
+    )
 
 
 async def _seed_recurrence_from_env(db: aiosqlite.Connection) -> None:
