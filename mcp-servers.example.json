@@ -29,11 +29,11 @@
       }
     },
 
-    "_comment_playwright": "Browser automation. The @playwright/mcp package and Chromium are pre-baked in the Dockerfile, so spawn is fast and offline. --isolated gives each session a fresh ephemeral profile (no cookie/cache leakage between turns). Drop --isolated if agents need persistent login state across turns.",
+    "_comment_playwright": "Browser automation. The @playwright/mcp package and Chromium are pre-baked in the Dockerfile, so spawn is fast and offline. --browser chromium points the MCP at the bundle we installed (its default is `chrome` — Google Chrome stable — which we deliberately do not bake in to keep the image lean). --isolated gives each session a fresh ephemeral profile (no cookie/cache leakage between turns). Drop --isolated if agents need persistent login state across turns.",
     "playwright": {
       "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest", "--isolated"]
+      "args": ["-y", "@playwright/mcp@latest", "--browser", "chromium", "--isolated"]
     }
   },
 

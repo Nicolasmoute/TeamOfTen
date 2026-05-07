@@ -5391,6 +5391,46 @@ function MCPServersSection() {
     await reload();
   }, [reload]);
 
+  // PATCH config_json. Returns { ok: bool, error?: string } so the
+  // card can render server-side validation errors (invalid JSON,
+  // unredacted-secret warnings) inline without bubbling.
+  const saveConfig = useCallback(async (name, configStr, allowSecretsArg) => {
+    try {
+      const res = await authFetch("/api/mcp/servers/" + encodeURIComponent(name), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          config_json: configStr,
+          allow_secrets: !!allowSecretsArg,
+        }),
+      });
+      if (res.ok) {
+        await reload();
+        return { ok: true };
+      }
+      let detail = "save failed";
+      try {
+        const data = await res.json();
+        if (data && data.detail) {
+          if (typeof data.detail === "string") {
+            detail = data.detail;
+          } else if (data.detail.secret_warnings) {
+            detail = "Possible secrets detected: "
+              + data.detail.secret_warnings.join(", ")
+              + ". " + (data.detail.hint || "");
+          } else {
+            detail = JSON.stringify(data.detail);
+          }
+        }
+      } catch (_) {
+        detail = "HTTP " + res.status;
+      }
+      return { ok: false, error: detail };
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
+  }, [reload]);
+
   const remove = useCallback(async (name) => {
     if (!confirm("Delete MCP server '" + name + "'? Can be re-added from paste."))
       return;
@@ -5472,6 +5512,7 @@ function MCPServersSection() {
               testing=${testing === s.name}
               onToggle=${(e) => toggle(s.name, e)}
               onSaveTools=${(t) => saveTools(s.name, t)}
+              onSaveConfig=${(cfg, allow) => saveConfig(s.name, cfg, allow)}
               onDelete=${() => remove(s.name)}
               onTest=${() => test(s.name)}
             />`)
@@ -5480,11 +5521,39 @@ function MCPServersSection() {
   </section>`;
 }
 
-function MCPServerCard({ server, testing, onToggle, onSaveTools, onDelete, onTest }) {
+// Lucide-derived icon set for the MCP card row. All glyphs honor
+// `currentColor` so the parent button can color them via CSS.
+const MCP_ICON = {
+  power: html`<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v9"/><path d="M18.36 6.64a9 9 0 1 1-12.72 0"/></svg>`,
+  zap: html`<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>`,
+  pencil: html`<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>`,
+  trash: html`<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>`,
+};
+
+function MCPServerCard({ server, testing, onToggle, onSaveTools, onSaveConfig, onDelete, onTest }) {
   const [toolsDraft, setToolsDraft] = useState(
     (server.allowed_tools || []).join(", ")
   );
   const toolsDirty = toolsDraft !== (server.allowed_tools || []).join(", ");
+  const initialConfig = useMemo(
+    () => JSON.stringify(server.config || {}, null, 2),
+    [server.config]
+  );
+  const [editing, setEditing] = useState(false);
+  const [configDraft, setConfigDraft] = useState(initialConfig);
+  const [editAllowSecrets, setEditAllowSecrets] = useState(false);
+  const [editMsg, setEditMsg] = useState(null);  // { kind: "ok"|"err", text }
+  const [editSaving, setEditSaving] = useState(false);
+  // Reset draft to current redacted config whenever the row reloads
+  // (e.g. after a successful save).
+  useEffect(() => {
+    if (!editing) {
+      setConfigDraft(initialConfig);
+      setEditAllowSecrets(false);
+      setEditMsg(null);
+    }
+  }, [initialConfig, editing]);
+
   const dot = server.last_ok === null
     ? "color: var(--muted);"
     : server.last_ok
@@ -5493,19 +5562,79 @@ function MCPServerCard({ server, testing, onToggle, onSaveTools, onDelete, onTes
   const when = server.last_tested_at
     ? new Date(server.last_tested_at).toLocaleString()
     : "never tested";
+
+  const startEdit = () => {
+    setConfigDraft(initialConfig);
+    setEditAllowSecrets(false);
+    setEditMsg(null);
+    setEditing(true);
+  };
+  const cancelEdit = () => {
+    setEditing(false);
+  };
+  const submitEdit = async () => {
+    setEditSaving(true);
+    setEditMsg(null);
+    try {
+      // Pre-flight JSON validation so the user sees a parse error
+      // without a server round-trip.
+      try {
+        JSON.parse(configDraft);
+      } catch (e) {
+        setEditMsg({ kind: "err", text: "Invalid JSON: " + String(e.message || e) });
+        return;
+      }
+      const result = await onSaveConfig(configDraft, editAllowSecrets);
+      if (result.ok) {
+        setEditing(false);
+      } else {
+        setEditMsg({ kind: "err", text: result.error || "save failed" });
+      }
+    } finally {
+      setEditSaving(false);
+    }
+  };
+
+  const iconBtnStyle = "background: transparent; border: 1px solid var(--border); border-radius: 3px; padding: 3px 5px; line-height: 0; color: var(--fg); cursor: pointer; display: inline-flex; align-items: center; justify-content: center;";
+  const iconBtnDanger = iconBtnStyle + " color: var(--err);";
+  const iconBtnActive = iconBtnStyle + " color: var(--accent); border-color: var(--accent);";
+  const iconBtnDimmed = iconBtnStyle + " color: var(--muted);";
+
   return html`<div style="border: 1px solid var(--border); border-radius: 4px; padding: 8px 10px; margin-bottom: 6px; font-size: 12px; opacity: ${server.enabled ? 1 : 0.6};">
     <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
       <span style=${"font-size: 14px; " + dot}>●</span>
       <strong>${server.name}</strong>
       <span class="muted" style="font-size: 10px;">${when}</span>
-      <span style="margin-left: auto; display: flex; gap: 6px;">
-        <button onClick=${() => onToggle(!server.enabled)}>
-          ${server.enabled ? "disable" : "enable"}
-        </button>
-        <button disabled=${testing} onClick=${onTest}>
-          ${testing ? "testing…" : "test"}
-        </button>
-        <button onClick=${onDelete} style="color: var(--err);">delete</button>
+      <span style="margin-left: auto; display: flex; gap: 4px;">
+        <button
+          type="button"
+          title=${server.enabled ? "Disable — agents stop seeing this server's tools" : "Enable — agents see this server's tools again"}
+          aria-label=${server.enabled ? "disable" : "enable"}
+          style=${server.enabled ? iconBtnStyle : iconBtnDimmed}
+          onClick=${() => onToggle(!server.enabled)}
+        >${MCP_ICON.power}</button>
+        <button
+          type="button"
+          disabled=${testing}
+          title=${testing ? "Smoke test in flight…" : "Smoke test — call tools/list and update the status dot"}
+          aria-label="test"
+          style=${iconBtnStyle}
+          onClick=${onTest}
+        >${MCP_ICON.zap}</button>
+        <button
+          type="button"
+          title=${editing ? "Close the config editor" : "Edit the underlying config (command/args/env/url)"}
+          aria-label="edit"
+          style=${editing ? iconBtnActive : iconBtnStyle}
+          onClick=${editing ? cancelEdit : startEdit}
+        >${MCP_ICON.pencil}</button>
+        <button
+          type="button"
+          title="Delete this server"
+          aria-label="delete"
+          style=${iconBtnDanger}
+          onClick=${onDelete}
+        >${MCP_ICON.trash}</button>
       </span>
     </div>
     ${server.last_error
@@ -5526,6 +5655,41 @@ function MCPServerCard({ server, testing, onToggle, onSaveTools, onDelete, onTes
     <div class="muted" style="font-size: 10px; margin-top: 4px;">
       type: ${(server.config && (server.config.type || (server.config.url ? "http" : server.config.command ? "stdio" : "?"))) || "?"}
     </div>
+    ${editing
+      ? html`<div style="margin-top: 8px; padding: 8px; border: 1px solid var(--border); border-radius: 3px; background: #10131a;">
+          <div class="muted" style="font-size: 10px; margin-bottom: 4px; line-height: 1.4;">
+            Edit command/args/env/url/headers. Values shown as <code>"***"</code> are
+            redacted secrets — leave them as-is to keep the stored value, or replace
+            them with a <code>\${VAR}</code> placeholder. URLs with masked
+            <code>***@host</code> userinfo behave the same way.
+          </div>
+          <textarea
+            value=${configDraft}
+            onInput=${(e) => setConfigDraft(e.target.value)}
+            rows=${Math.min(14, Math.max(6, configDraft.split("\n").length + 1))}
+            style="width: 100%; font-family: ui-monospace, monospace; font-size: 11px; background: #0a0d12; color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 6px 8px; resize: vertical;"
+          />
+          <div style="display: flex; gap: 8px; align-items: center; margin-top: 6px; flex-wrap: wrap;">
+            <label style="font-size: 10px; color: var(--muted);">
+              <input
+                type="checkbox"
+                checked=${editAllowSecrets}
+                onChange=${(e) => setEditAllowSecrets(e.target.checked)}
+              />
+              save even if secrets detected
+            </label>
+            <span style="margin-left: auto; display: flex; gap: 6px;">
+              <button type="button" disabled=${editSaving} onClick=${cancelEdit}>cancel</button>
+              <button class="primary" type="button" disabled=${editSaving} onClick=${submitEdit}>${editSaving ? "saving…" : "save"}</button>
+            </span>
+          </div>
+          ${editMsg
+            ? html`<div style=${"font-size: 11px; margin-top: 6px; padding: 4px 8px; border-radius: 3px; " + (editMsg.kind === "ok"
+                  ? "color: var(--ok); border: 1px solid var(--ok); background: rgba(63,185,80,0.08);"
+                  : "color: var(--err); border: 1px solid var(--err); background: rgba(248,81,73,0.08); white-space: pre-wrap;")}>${editMsg.text}</div>`
+            : null}
+        </div>`
+      : null}
   </div>`;
 }
 

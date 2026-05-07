@@ -1978,28 +1978,68 @@ produces a fully-rendered handoff suffix).
 
 Suite at 1297/1297.
 
-**Recent (2026-05-06, follow-up) — Playwright MCP wired up:**
+**Recent (2026-05-07) — Playwright MCP + MCP-card edit feature:**
 
-The Dockerfile already baked in Python `playwright` + Chromium for
-project test suites that drive a real browser via `Bash`, but agents
-had no first-class browser tools — they had to script everything.
-Closed the gap by adding the **`@playwright/mcp`** npm package to
-the Dockerfile's `npm install -g` line (alongside `@anthropic-ai/claude-code`
-and `@openai/codex`) and adding a `playwright` server stanza to
-[mcp-servers.example.json](mcp-servers.example.json) with a
-recommended `allowed_tools` list (`browser_navigate`, `browser_click`,
-`browser_type`, `browser_snapshot`, `browser_take_screenshot`,
-`browser_evaluate`, `browser_console_messages`,
-`browser_network_requests`, tab controls, etc.).
+Two related fixes shipped together:
 
-The MCP server is OFF by default — projects that need it enable it
-via Options → MCP servers (paste the stanza). `--isolated` flag
-gives each session a fresh ephemeral profile so cookie/cache state
-doesn't leak across turns; drop the flag if persistent login state
-is needed. Both consumers (the Python lib via Bash and the MCP
-server via npm) share the same `~/.cache/ms-playwright` browser
-cache so Chromium is downloaded exactly once at image build time.
-Spec mirror: `Docs/TOT-specs.md` §3 deployment bullet list.
+- **Playwright MCP wired up correctly.** The Dockerfile bakes in the
+  `@playwright/mcp` npm package (alongside `@anthropic-ai/claude-code`
+  and `@openai/codex`) plus a Node-side Chromium install (`npx -p
+  @playwright/mcp@latest playwright install --with-deps chromium`).
+  The Node-side install matters: `@playwright/mcp` bundles its own
+  `playwright` Node package, which keys browsers by revision number
+  in `~/.cache/ms-playwright`. A Python-side `playwright install`
+  drifts away from the Node side over time and the MCP errors with
+  "needs npx playwright install chrome" at first launch (real
+  symptom that surfaced during MWC visual-check on 2026-05-06). The
+  `playwright` server stanza in
+  [mcp-servers.example.json](mcp-servers.example.json) passes
+  `--browser chromium --isolated` so the MCP uses the chromium we
+  installed (its default is `chrome`, the Google Chrome stable
+  binary, which we deliberately don't bake in to keep the image
+  lean) and gets a fresh ephemeral profile per session. The MCP is
+  OFF by default; projects opt in via Options → MCP servers (paste
+  the stanza). Recommended `allowed_tools` covers
+  `browser_navigate`, `browser_click`, `browser_type`,
+  `browser_snapshot`, `browser_take_screenshot`,
+  `browser_evaluate`, `browser_console_messages`,
+  `browser_network_requests`, tab controls, etc. — full list in
+  the example file. Spec mirror: `Docs/TOT-specs.md` §3 deployment
+  bullet list.
+
+- **MCP card gains an edit feature.** Previously the only way to
+  fix a saved MCP server's config (`command` / `args` / `env` /
+  `url` / `headers`) was delete-and-re-paste, which is rough
+  because the original paste isn't recoverable from the UI.
+  `PATCH /api/mcp/servers/{name}` now accepts `config_json` (a
+  raw JSON string of the new flat config), runs it through the
+  same secret-scan as save (with `allow_secrets` override), and
+  persists. Footgun fix:
+  [server/main.py:_merge_redacted_config](server/main.py) restores
+  `***` sentinels in `env`/`headers` and masked URL userinfo from
+  the existing stored value before write — so editing an unrelated
+  field never overwrites a stored secret with the literal redaction
+  string. Edit endpoint also returns `secret_warnings` so the UI
+  can echo them when `allow_secrets=true`. **Defensive existence
+  check up front** in `patch_mcp_server` (404 before the UPDATE)
+  avoids acquiring a useless write lock when the named server is
+  gone — fixes a latent contention bug that surfaced during tests
+  on a busy harness with background subscribers.
+  [server/static/app.js](server/static/app.js): `MCPServerCard`'s
+  text `disable / test / delete` row collapsed into icon buttons
+  (lucide-style power / zap / pencil / trash SVGs, `currentColor`,
+  matching the codebase's no-emoji convention) so a fourth `edit`
+  button fits next to the row name + last-tested timestamp without
+  spilling. Edit reveals an inline textarea pre-filled with
+  `JSON.stringify(server.config, null, 2)` plus an
+  `allow_secrets` checkbox + cancel/save. 19 new tests in
+  [server/tests/test_mcp_patch_config.py](server/tests/test_mcp_patch_config.py)
+  cover the merge helper (env preservation, header preservation,
+  URL userinfo, var placeholders, missing-section, non-dict
+  inputs) and the HTTP path (round-trip, secret round-trip,
+  raw-token rejection + override, `${VAR}` acceptance, invalid
+  JSON, non-dict, unknown-server 404, mixed-field PATCH,
+  empty-PATCH 400). Suite at 1316/1316.
 
 **Recent (2026-05-06, follow-up) — Soft-stall watchdog (Haiku-tiered):**
 

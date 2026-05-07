@@ -130,9 +130,15 @@ prompt from project state, with priority:
    anything before the auto-actions fire (auto-reassign at 2h,
    auto-archive at 4h). The escalation ladder is a safety net, not a
    plan; Coach should beat it whenever possible.
-2. **Todos** — if no pending problems remain, pick the most relevant
-   open `coach-todos.md` entry (consider deadlines, dependencies) and
-   act on it.
+2. **Todos** — for each open `coach-todos.md` entry, find the smallest
+   movable next step and take it. External blockers (pending user
+   verdict, prod soak, Player unavailable, env issues outside scope)
+   change *what* the next move is, never *whether* one exists.
+   Zero-cost forward motions are always available — probe DMs, status
+   pings, clarifying questions to the human, read-only diagnostics,
+   capturing fresh observations, or splitting a todo into smaller
+   pieces. The branch explicitly rejects "everything is gated" and
+   "marginal value has gone to zero" as rationalizations.
 3. **Objectives** — if no inbox items, no kanban issues, and no open
    todos, consult `project-objectives.md` and pick **one concrete
    action** that materially advances an objective. Coach must take
@@ -160,9 +166,17 @@ prompt is short — it just orients Coach to the priority order:
 > prompt above — auto-reassign fires at 2h, auto-archive at 4h.
 > Intervene before the safety net does (nudge the blocker, reassign,
 > or bump effort/model for repeat audit fails).
-> (2) Open coach-todos — if inbox is clear, pick the todo most aligned
-> with current priorities and act on it (assign to a Player, break it
-> into smaller steps, or do the work yourself).
+> (2) Open coach-todos — for each open todo, find the smallest movable
+> next step and take it. External blockers (pending user verdict, prod
+> soak running, Player unavailable, harness env outside Coach scope)
+> change WHAT the next move is, never WHETHER one exists. Zero-cost
+> forward motions are always available: a probe DM to a silent Player,
+> a status ping or clarifying question to the human, a read-only
+> diagnostic, a fresh observation captured to memory, or splitting the
+> todo into smaller pieces. Reject "everything is gated" and "marginal
+> value has gone to zero" — those are rationalizations that mask a
+> movable smallest-step. End this branch only after examining each
+> open todo through this lens.
 > (3) Drive the objectives — if inbox AND todos are both empty, you
 > must still pick one concrete action that materially advances a
 > project objective. Examples: assign a Player to scout an open
@@ -184,6 +198,19 @@ quiet ticks idle even when the project had clear objectives. The fix
 makes step (3) emphatic ("you must still pick one concrete action") and
 gates the end-quietly path strictly on objectives being absent — nothing
 else.
+
+The todos branch (step 2) is similarly directive for similar reasons.
+The earlier wording ("pick the todo most aligned with current
+priorities and act on it") gave Coach an out: in observed sessions,
+Coach read its open todos, classified each as "gated" on some
+external blocker (pending user verdict, prod soak running, Player
+unavailable, env issue outside scope), and concluded "marginal value
+has gone to zero — standing by." Coach was wrong every time we
+challenged it: a probe DM to the unavailable Player, a status ping
+on a prod soak, a clarifying question to push a verdict forward —
+all turned out to be available zero-cost moves. The new wording
+treats those moves as the *default* and frames "everything is gated"
+as the rationalization it almost always is.
 
 This replaces today's `COACH_TICK_PROMPT`.
 

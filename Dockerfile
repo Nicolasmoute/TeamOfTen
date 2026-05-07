@@ -36,20 +36,28 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Playwright Chromium + system libs. Two consumers:
-#   1. Project-side test suites that drive a real browser via the
-#      Python `playwright` library through Bash.
-#   2. The `@playwright/mcp` server (installed above via npm) which
+#   1. The `@playwright/mcp` server (installed above via npm) which
 #      exposes browser_navigate / browser_click / browser_snapshot /
 #      browser_take_screenshot / etc. as MCP tools to every agent
-#      whose project enables it via the Options drawer.
-# Both share the same browser cache (~/.cache/ms-playwright). Without
-# the bundle pre-baked every redeploy would need a manual
-# `playwright install` and the cache wipe means agents would lose it
-# on the next harness redeploy.
-# `--with-deps` pulls X11/font/audio shared libs Chromium needs to
-# launch headless. Adds ~300 MB to the image.
-RUN pip install --no-cache-dir playwright \
-    && python -m playwright install --with-deps chromium
+#      whose project enables it via the Options drawer. Default
+#      browser is `chrome` (Google Chrome stable) — the example
+#      config in `mcp-servers.example.json` passes
+#      `--browser chromium` so it uses the bundle below.
+#   2. Project-side test suites that drive a real browser via the
+#      Python `playwright` library through Bash. Pulled in by
+#      pyproject.toml's runtime deps where applicable; the Node
+#      install below shares the same `~/.cache/ms-playwright`
+#      directory so Python Playwright finds the chromium revision
+#      installed here.
+# Important: we install via the Node side (`npx -p @playwright/mcp@latest
+# playwright install`) so the Chromium revision matches what the Node
+# Playwright bundled inside `@playwright/mcp` expects at runtime.
+# Installing via Python first would download a different revision
+# whenever the Python `playwright` package's pin drifts away from the
+# Node side's, breaking the MCP. `--with-deps` pulls X11/font/audio
+# shared libs Chromium needs to launch headless. Adds ~400 MB to the
+# image.
+RUN npx -y -p @playwright/mcp@latest playwright install --with-deps chromium
 
 # Default git identity for agents that commit. Override via env at deploy
 # time if you want per-deployment attribution.

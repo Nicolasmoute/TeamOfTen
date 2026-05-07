@@ -2010,6 +2010,47 @@ def _validate_mcp_name(name: str) -> None:
         )
 
 
+def _merge_redacted_config(
+    new_cfg: dict[str, Any], stored_cfg: dict[str, Any]
+) -> dict[str, Any]:
+    """Restore secrets from `stored_cfg` whenever `new_cfg` carries the
+    redaction sentinel. Without this, round-tripping a config through
+    GET (which masks env/headers values to `"***"` and URL userinfo via
+    `_mask_repo_url`) → edit → PATCH would overwrite the user's stored
+    token with the literal sentinel string. Only env/headers/url are
+    redacted by `_redact_mcp_config`, so only those are merged back.
+    """
+    if not isinstance(new_cfg, dict):
+        return {}
+    if not isinstance(stored_cfg, dict):
+        return new_cfg
+    out: dict[str, Any] = {}
+    for k, v in new_cfg.items():
+        if k in ("env", "headers") and isinstance(v, dict):
+            stored_section = stored_cfg.get(k)
+            merged: dict[str, Any] = {}
+            for kk, vv in v.items():
+                if (
+                    isinstance(vv, str)
+                    and vv == "***"
+                    and isinstance(stored_section, dict)
+                    and kk in stored_section
+                ):
+                    merged[kk] = stored_section[kk]
+                else:
+                    merged[kk] = vv
+            out[k] = merged
+        elif k == "url" and isinstance(v, str):
+            stored_url = stored_cfg.get("url")
+            if isinstance(stored_url, str) and v == _mask_repo_url(stored_url):
+                out[k] = stored_url
+            else:
+                out[k] = v
+        else:
+            out[k] = v
+    return out
+
+
 def _redact_mcp_config(cfg: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of a server config with sensitive fields masked,
     so GET endpoints never leak stored tokens.
@@ -2213,6 +2254,14 @@ async def save_mcp_server(
 class MCPServerPatch(BaseModel):
     enabled: bool | None = None
     allowed_tools: list[str] | None = None
+    config_json: str | None = Field(
+        default=None,
+        description="Raw JSON string of the new config (flat: command/args/env or url/headers). Replaces the stored config; `***` sentinels in env/headers and masked URL userinfo are merged back from the existing stored value so an unrelated edit never overwrites a secret.",
+    )
+    allow_secrets: bool = Field(
+        default=False,
+        description="Pass true to override the inline-secret warning when patching the config.",
+    )
 
 
 @app.patch("/api/mcp/servers/{name}", dependencies=[Depends(require_token)])
@@ -2221,8 +2270,10 @@ async def patch_mcp_server(
     req: MCPServerPatch,
     actor: dict = Depends(audit_actor),
 ) -> dict[str, object]:
-    """Toggle enabled and/or update the allowed_tools list for an
-    existing row. Leaves config_json alone."""
+    """Toggle enabled, update the allowed_tools list, and/or replace
+    the underlying config for an existing row. config_json edits run
+    through the same secret-scan + redaction-merge as save."""
+    from server.mcp_config import detect_secrets
     _validate_mcp_name(name)
     import sqlite3
     from server.db import DB_PATH
@@ -2235,12 +2286,62 @@ async def patch_mcp_server(
         clean = [t for t in req.allowed_tools if isinstance(t, str) and t]
         updates.append("allowed_tools_json = ?")
         params.append(json.dumps(clean))
-    if not updates:
-        raise HTTPException(400, detail="nothing to update")
-    updates.append("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
-    params.append(name)
+    merged_cfg: dict[str, Any] | None = None
+    secret_warnings: list[str] = []
+    pending_new_cfg: dict[str, Any] | None = None
+    if req.config_json is not None:
+        try:
+            pending_new_cfg = json.loads(req.config_json)
+        except Exception as e:
+            raise HTTPException(400, detail=f"invalid config JSON: {e}")
+        if not isinstance(pending_new_cfg, dict):
+            raise HTTPException(400, detail="config must be a JSON object")
+    # Single connection handles the probe (SELECT for redaction-merge)
+    # and the UPDATE. Two back-to-back sqlite3.connect() calls against
+    # the same file can leave the OS-level lock state in a way that
+    # makes the second commit() raise OperationalError("database is
+    # locked") under a still-running event loop, even after explicit
+    # close() of the first.
     conn = sqlite3.connect(DB_PATH, timeout=5.0)
     try:
+        # Existence check up front — issuing a write against a missing
+        # row still acquires the SQLite write lock and races with
+        # background readers on a busy harness. Surfacing 404 early
+        # avoids the pointless lock.
+        existing_row = conn.execute(
+            "SELECT config_json FROM mcp_servers WHERE name = ?",
+            (name,),
+        ).fetchone()
+        if existing_row is None:
+            raise HTTPException(404, detail=f"server {name!r} not found")
+        if pending_new_cfg is not None:
+            stored_cfg: dict[str, Any] = {}
+            if existing_row[0]:
+                try:
+                    parsed = json.loads(existing_row[0])
+                    if isinstance(parsed, dict):
+                        stored_cfg = parsed
+                except Exception:
+                    stored_cfg = {}
+            merged_cfg = _merge_redacted_config(pending_new_cfg, stored_cfg)
+            # Secret scan after merge so restored placeholders don't trip
+            # the warning, but freshly-pasted raw tokens still do.
+            secret_warnings = detect_secrets(json.dumps(merged_cfg))
+            if secret_warnings and not req.allow_secrets:
+                raise HTTPException(
+                    400,
+                    detail={
+                        "secret_warnings": secret_warnings,
+                        "hint": "Replace raw tokens with ${VAR} placeholders. "
+                        "Re-submit with allow_secrets=true to override.",
+                    },
+                )
+            updates.append("config_json = ?")
+            params.append(json.dumps(merged_cfg))
+        if not updates:
+            raise HTTPException(400, detail="nothing to update")
+        updates.append("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+        params.append(name)
         cur = conn.execute(
             f"UPDATE mcp_servers SET {', '.join(updates)} WHERE name = ?",
             params,
@@ -2257,6 +2358,7 @@ async def patch_mcp_server(
             "agent_id": "system",
             "type": "mcp_server_updated",
             "name": name,
+            "config_changed": merged_cfg is not None,
             "actor": actor,
         }
     )
@@ -2265,7 +2367,7 @@ async def patch_mcp_server(
         await _codex_evict_all()
     except Exception:
         logger.exception("codex evict_all_clients failed after mcp patch")
-    return {"ok": True}
+    return {"ok": True, "secret_warnings": secret_warnings}
 
 
 @app.delete("/api/mcp/servers/{name}", dependencies=[Depends(require_token)])

@@ -2953,7 +2953,7 @@ present.
 | --- | --- |
 | `GET /api/mcp/servers` | List DB MCP servers, redacted |
 | `POST /api/mcp/servers` | Save one or more server configs from paste; evicts cached Codex clients |
-| `PATCH /api/mcp/servers/{name}` | Toggle enabled/tools; evicts cached Codex clients |
+| `PATCH /api/mcp/servers/{name}` | Toggle enabled, update allowed_tools, and/or replace config_json (with `***`-sentinel merge to preserve stored secrets when the user edits unrelated fields); evicts cached Codex clients |
 | `DELETE /api/mcp/servers/{name}` | Delete DB MCP server; evicts cached Codex clients |
 | `POST /api/mcp/servers/{name}/test` | Smoke-test command/url |
 | `GET /api/secrets` | List secret metadata and store status |
