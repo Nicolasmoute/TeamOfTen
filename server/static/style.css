@@ -123,8 +123,8 @@ body {
     align-items: center !important;
     width: 100% !important;
     flex: 0 0 auto !important;
-    padding: 1px 6px !important;
-    gap: 4px !important;
+    padding: 1px 4px !important;
+    gap: 2px !important;
   }
   .rail-bottom .rail-group { padding: 0; }
   .rail-bottom .mobile-ws-dot { flex: 0 0 auto; }
@@ -157,25 +157,26 @@ body {
   .rail-group.rail-actions .rail-layout-presets {
     display: contents;
   }
-  /* Compact gear footprint on mobile. flex-shrink: 1 lets the 6
-     tools buttons squeeze below the 26px nominal width if a 320px
-     phone needs it, instead of one wrapping. */
+  /* Compact gear footprint on mobile. flex-shrink: 1 lets the 7
+     tools buttons (files / project / compass / playbook / kanban /
+     recurrence / env) squeeze below the nominal width if a 320px
+     phone needs it, instead of one wrapping to a second row. */
   .rail-bottom .gear {
-    width: 26px;
+    width: 24px;
     height: 24px;
-    flex: 0 1 26px;
+    flex: 0 1 24px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    font-size: 15px;
-    min-width: 22px;
+    font-size: 14px;
+    min-width: 18px;
   }
   /* The project-switcher wrapper is a flex child of rail-tools (not
      the .gear button itself), so propagate the same shrink rule
      to it explicitly. */
   .rail-group.rail-tools .project-switcher {
-    flex: 0 1 26px;
-    min-width: 22px;
+    flex: 0 1 24px;
+    min-width: 18px;
   }
   .rail-bottom .gear.project-placeholder {
     width: 24px;
