@@ -243,10 +243,50 @@ One JSON line per reflection run. Each line:
 
 `relevance_increments` is the sum of all `applied_count` increments applied this run (so the run row reflects the activity volume that Coach observed). Trim to last `HARNESS_PLAYBOOK_RUNS_RETENTION` lines (default 90 = ~3 months) on each write.
 
+**Bootstrap rows** (`kind: "bootstrap"`) use a reduced shape — bootstrap has no evidence and no proposals, just seed insertions. For bootstrap rows:
+- `evidence_window` is `null`.
+- `evidence_summary` is `null`.
+- `relevance_increments` is `0`.
+- `proposals_applied` and `proposals_rejected` are empty arrays.
+- `engine_actions` is empty array.
+- A new optional field `seeds_inserted: int` carries the count of seed statements persisted (zero when the prose template is missing on disk).
+- A new optional field `source: "boot" | "reset"` mirrors the bus-event source.
+- `outcome` is one of `applied` (≥1 seed inserted), `no_changes` (zero seeds — empty-template path), `skipped_cost_cap` (G3), `error_llm`, or `error_parse`.
+
+Example bootstrap row:
+
+```json
+{
+  "run_id": "pbboot-2026-05-08-12-34-56",
+  "started_at": "2026-05-08T12:34:56Z",
+  "finished_at": "2026-05-08T12:35:42Z",
+  "kind": "bootstrap",
+  "evidence_window": null,
+  "evidence_summary": null,
+  "relevance_increments": 0,
+  "proposals_applied": [],
+  "proposals_rejected": [],
+  "engine_actions": [],
+  "seeds_inserted": 34,
+  "source": "boot",
+  "llm_call": {
+    "model": "claude-sonnet-4-6",
+    "runtime": "claude",
+    "input_tokens": 6204,
+    "output_tokens": 2871,
+    "cost_basis": "playbook:bootstrap",
+    "cost_usd": 0.0394
+  },
+  "outcome": "applied"
+}
+```
+
 ### 3.4 `team_config` keys
 
 - `playbook_bootstrap_done` — `"1"` once bootstrap has run successfully. Idempotency guard.
-- `playbook_bootstrap_retries` — counter (string-encoded int) for failed bootstrap attempts; cleared on success or after 3 attempts trigger escalation.
+- `playbook_bootstrap_retries` — counter (string-encoded int) for failed bootstrap attempts. Incremented on each failed attempt; cleared on bootstrap success.
+- `playbook_bootstrap_blocked` — `"1"` set when 3 consecutive bootstrap attempts have failed. Scheduler skips bootstrap while set. Cleared only by `POST /api/playbook/reset` (operator-explicit re-arm). Default unset.
+- `playbook_reset_at` — ISO timestamp of the most recent reset call. Read by the bootstrap runner to populate `source` on the next bootstrap event (`"reset"` if set, `"boot"` if unset). Cleared after the next successful bootstrap.
 - `playbook_last_run_at` — ISO timestamp of the most recent run (any kind).
 - `playbook_disabled` — `"1"` to disable the engine entirely (skip scheduler ticks; lattice still readable; no writes). Default unset.
 
@@ -282,15 +322,24 @@ Single direct `claude_agent_sdk.query()` call with `model="latest_sonnet"`, `eff
 >
 > Skip the prose. Return only the JSON list.
 
-The LLM returns ~30-40 statements. Engine validates each (length, character cap, no duplicates among the returned list), assigns ids `pb-001..pb-NNN`, persists to `lattice.json` with `created_by="bootstrap-playbook"`, sets `playbook_bootstrap_done = "1"`, clears `playbook_bootstrap_retries`.
+**Cost gate:** before the LLM call, check `_today_spend()` vs `HARNESS_TEAM_DAILY_CAP` (same gate as §5.3). Over cap → log a runs.jsonl row with `kind="bootstrap"`, `outcome="skipped_cost_cap"`, no LLM call. **Cost-skip does NOT increment `playbook_bootstrap_retries`** — this is a deferred-not-failed outcome; the next scheduler tick retries when budget allows. Emit `playbook_run_skipped{run_id, reason: "cost_cap"}` for dashboard visibility.
+
+**Emission points:**
+- Before the LLM call (after cost gate passes): emit `playbook_bootstrap_started{source, retry_attempt}` where `source = "reset"` if `team_config['playbook_reset_at']` is set, else `"boot"`; `retry_attempt = playbook_bootstrap_retries + 1`.
+- After successful persist: emit `playbook_bootstrap_completed{statement_count, source}`. Clear `playbook_reset_at` (so subsequent re-bootstrap from a fresh deploy reads as `"boot"` not `"reset"`).
+- On failure: see §4.4.
+
+The LLM returns ~30-40 statements. Engine validates each (length, character cap, no duplicates among the returned list), assigns ids `pb-001..pb-NNN`, persists to `lattice.json` with `created_by="bootstrap-playbook"`, sets `playbook_bootstrap_done = "1"`, clears `playbook_bootstrap_retries`, clears `playbook_reset_at`.
+
+**Soft cap at bootstrap:** apply §5.7's three-branch cap to the LLM output (active count is 0 at bootstrap, so `pressure = seed_count`). If the LLM returned > 100 candidate seeds, drop from the **end of the LLM-returned list** (deterministic — the prose extraction is order-stable) until count ≤ 100. If > 110 (hard cap), drop down to 100 and additionally fire `playbook_soft_cap_exceeded{count: returned, dropped: returned - 100}` event. Bootstrap does NOT fail on over-cap — partial seeding is preferable to no seeding. The `seeds_inserted` field in the runs.jsonl row reflects the post-cap count.
 
 No bedrock / immutable seeding step (§1.4).
 
 ### 4.4 Failure
 
-The bootstrap LLM response is parsed tolerantly: extract the first balanced JSON-array literal from the response (handles the common case where Sonnet wraps the JSON in prose). If extraction yields no parsable array, OR the LLM call itself raises, OR validation rejects every returned statement: increment `team_config['playbook_bootstrap_retries']` and skip; next scheduler tick retries.
+The bootstrap LLM response is parsed tolerantly: extract the first balanced JSON-array literal from the response (handles the common case where Sonnet wraps the JSON in prose). If extraction yields no parsable array, OR the LLM call itself raises, OR validation rejects every returned statement: increment `team_config['playbook_bootstrap_retries']`, emit `playbook_bootstrap_failed{error, retries: <new_count>, blocked: false}` (no `human_attention` — the retry path is opaque to the operator until the 3rd attempt), skip; next scheduler tick retries.
 
-After 3 failed attempts: emit `playbook_bootstrap_failed{error, retries: 3}` + `human_attention`, clear `playbook_bootstrap_retries` (so a manual reset re-arms cleanly). The lattice stays empty until the operator intervenes.
+After 3 failed attempts: emit `playbook_bootstrap_failed{error, retries: 3, blocked: true}` + `human_attention`, set `team_config['playbook_bootstrap_blocked'] = "1"`. The scheduler will skip bootstrap on every subsequent tick while the flag is set — operator must call `POST /api/playbook/reset` (which clears `playbook_bootstrap_blocked` and `playbook_bootstrap_retries`) to re-arm. The lattice stays empty until the operator intervenes. This breaks the loop hazard where clearing the retry counter alone would cause the next tick to retry-fail-escalate-clear-retry indefinitely.
 
 If the prose template file is missing on disk, bootstrap completes with an **empty lattice** (no LLM call). No `## Orchestration playbook` section appears in agents' system prompts (render returns empty string per §6.2). The first daily reflection run that triggers will start populating the lattice from observed evidence. Slower cold-start than the prose-seeded path but functionally identical after a few days.
 
@@ -321,6 +370,8 @@ Distinct from §4.1-§4.4 (which describe the engine's first-run *content seedin
 7. **Player role-prompt awareness.** Players' role prompts in [server/agents.py:_system_prompt_for](../server/agents.py) don't need a dedicated playbook section — the rendered playbook header (§6.2) carries the Players-follow-but-don't-influence framing inline.
 
 8. **Migration on existing harness deployments.** No special handling required. First boot post-implementation adds the new `## Orchestration playbook` section to every agent's next system prompt (one cache-miss per agent on next turn). No session reset, no agent restart, no DB migration. Existing Compass installations are untouched. Boot order: shared/codex_llm.py refactor → playbook engine module load → scheduler task starts → first scheduler tick triggers bootstrap.
+
+   **Cold-start window.** The scheduler ticks every 5 min by default (`HARNESS_PLAYBOOK_SCHEDULER_TICK_SECONDS`). On a fresh deploy, the first bootstrap fires up to 5 min after process start — during that window, agent system prompts have no `## Orchestration playbook` section. To eliminate the wait, the operator can hit `POST /api/playbook/bootstrap` (G7) immediately after deploy.
 
 ---
 
@@ -436,7 +487,7 @@ Op apply order is **fixed**:
 
 **Cross-op conflict:** any op targeting an id that an earlier op archived (via merge in step 1) is rejected with reason `"id_archived_in_same_run"`. Adjusts and creations referencing freshly-merged ids fall through to this rule.
 
-**`relevant_ids` increment:** independent of op apply. After all ops process, walk `relevant_ids` and increment `applied_count += 1` for each id (one increment per statement per run, regardless of how many evidence items mention it). Ids that don't exist in the active lattice OR that were just archived in step 1 are skipped silently.
+**`relevant_ids` increment:** independent of op apply. After all ops process, walk `relevant_ids` and increment `applied_count += 1` for each id (one increment per statement per run, regardless of how many evidence items mention it). Each entry must be a non-empty string matching `^pb-\d+$`; entries that fail this regex (non-string, malformed, empty, nested object, etc.) are skipped silently. Valid-shape ids that don't exist in the active lattice OR that were just archived in step 1 are also skipped silently. Duplicate ids in the list are deduplicated before increment (so Coach listing the same id twice doesn't double-increment).
 
 ### 5.7 Soft / hard cap enforcement
 
@@ -479,7 +530,15 @@ The "≥ 7 days old history entry" requirement prevents brand-new high-confidenc
 
 ### 5.9 Run finalization
 
-Atomic writes (tempfile + os.replace) for `lattice.json` + `archived.json`. Synchronous kDrive mirror after disk write. Append run row to `runs.jsonl`. Update `team_config['playbook_last_run_at']`. Emit `playbook_run_completed{kind, outcome, applied_count, evidence_summary, relevance_increments}` event for the dashboard.
+Atomic writes (tempfile + os.replace) for `lattice.json` + `archived.json` on local disk first. Append run row to `runs.jsonl`. Update `team_config['playbook_last_run_at']`. Emit `playbook_run_completed{kind, outcome, applied_count, evidence_summary, relevance_increments}` event for the dashboard.
+
+**kDrive mirror failure handling.** After local disk writes succeed, attempt the synchronous kDrive mirror (`TOT/playbook/{lattice,archived}.json` + runs.jsonl append). If the kDrive call fails (token expired, network error, 5xx response):
+- Log a warning.
+- Emit a `playbook_kdrive_mirror_failed{error: str, files: list[str]}` event (dashboard surfaces a small banner).
+- **Do NOT roll back the local disk write.** Local is the source of truth; kDrive is a durability mirror. A persistent kDrive outage must not break the engine.
+- Next successful write (any subsequent run, override, or proposal apply) re-syncs the affected files in full — the mirror is idempotent because kDrive writes are full-file replacements, not incremental.
+
+This matches the precedent in Compass and the existing kDrive sync loop ([CLAUDE.md "M-3" entries](../CLAUDE.md)).
 
 ---
 
@@ -566,9 +625,13 @@ Cap: ≤ 5 operations per call (so a single hallucinating Coach turn can't flood
 
 **Cost gate:** none. The MCP call doesn't make an LLM call — it just mutates a JSON file. The Coach turn already pays the cost cap to run.
 
+**Lock acquisition:** the MCP path attempts `_run_lock.acquire(timeout=0)` (non-blocking) before mutating. If the lock is held (daily reflection / bootstrap / reset / another MCP call in flight), return the contention message (§7.1 return shape, see N9) without mutating. Coach is expected to retry next turn — no internal retry loop. This prevents Coach's mid-turn proposal from racing with a daily reflection that's about to overwrite the lattice.
+
 **Apply:** atomic; same engine path as the daily runner. Emits `playbook_changes_applied{operations_count, source="coach_mid_turn"}`.
 
-**Returns:** human-readable text block:
+**Returns:** human-readable text block.
+
+Happy path:
 
 ```
 Applied 2 of 3 proposed changes:
@@ -579,6 +642,14 @@ Applied 2 of 3 proposed changes:
 Active statement count: 47 / 100 soft cap.
 ```
 
+Lock-contention path (G8 — daily reflection / bootstrap / reset / another MCP call in flight):
+
+```
+playbook engine busy — another run is in flight. Retry on your next turn; no changes applied.
+```
+
+The leading literal `"playbook engine busy"` lets Coach pattern-match the contention case in its own reasoning without re-parsing the rest of the message. Coach is expected to surface the contention to itself (no proposal applied this turn) and re-evaluate whether the proposed changes are still warranted on the next turn — they may be obsolete after the in-flight run completes.
+
 ---
 
 ## 8 · HTTP API
@@ -588,7 +659,8 @@ All endpoints under `/api/playbook/*`, gated by `HARNESS_TOKEN`. CRUD for the da
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/playbook/state` | Returns full lattice + recent runs (paginated). Used by the dashboard initial load. |
-| POST | `/api/playbook/run` | Manually trigger a reflection run. Bypasses the daily schedule but enforces the activity gate + cost gate by default. Body: `{force_through_no_activity?: bool}` (default false). |
+| POST | `/api/playbook/run` | Manually trigger a reflection run. Bypasses the daily schedule but enforces the activity gate + cost gate by default. Body: `{force_through_no_activity?: bool}` (default false). Returns 409 if `playbook_bootstrap_done` is unset (run bootstrap first). |
+| POST | `/api/playbook/bootstrap` | Manually trigger bootstrap immediately, bypassing the 5-min scheduler tick wait. Useful after `/api/playbook/reset` when the operator doesn't want to wait. Returns 409 when `playbook_bootstrap_done` is already set (use reset first), when `playbook_bootstrap_blocked` is set (reset first to clear), or when `_run_lock` cannot be acquired within 5s. Cost gate + soft cap (§4.3) still apply. Body: `{}` (no parameters). |
 | POST | `/api/playbook/proposals/{adjust\|create\|merge}/{id}` | Apply an individual proposal that was logged but not auto-applied (e.g. soft-cap rejected, human wants to apply manually). Body for adjust: `{delta: float}`; create: `{text, weight}`; merge: `{keep_id, drop_id}`. |
 | POST | `/api/playbook/statements/{id}/weight` | Direct human override. Body: `{weight: 0.0 \| 0.5 \| 1.0}`. Mirrors Compass's NO/½/YES override. Records `weight_history` entry with `reason="human_override"`. Rejects when `immutable=true`. |
 | POST | `/api/playbook/statements/{id}/restore` | Move an archived statement back to active. Body: `{weight?: float}` (default = the value at archive time). |
@@ -604,9 +676,9 @@ All write endpoints carry the `audit_actor` dependency (mirrors kanban-specs-v2 
 
 | Event | Payload | Routing |
 |---|---|---|
-| `playbook_bootstrap_started` | `{source: "boot" \| "manual"}` | Dashboard |
-| `playbook_bootstrap_completed` | `{statement_count: int, source: ...}` | Dashboard |
-| `playbook_bootstrap_failed` | `{error: str, retries: int}` | Dashboard + `human_attention` |
+| `playbook_bootstrap_started` | `{source: "boot" \| "reset", retry_attempt: int}` | Dashboard — fired immediately before the LLM call (or before empty-lattice persist when prose template missing). `source="reset"` when `playbook_reset_at` is set (cleared on success); `"boot"` otherwise. `retry_attempt` is 1 for the first try, up to 3. |
+| `playbook_bootstrap_completed` | `{statement_count: int, source: "boot" \| "reset"}` | Dashboard — fired after successful persist. Same `source` semantics. |
+| `playbook_bootstrap_failed` | `{error: str, retries: int, blocked: bool}` | Dashboard + `human_attention` (only when `blocked=true`, i.e. 3rd failure) — fired after each failed attempt. `blocked=true` on the 3rd attempt to signal the operator-reset escalation. |
 | `playbook_run_started` | `{run_id, kind}` | Dashboard |
 | `playbook_run_completed` | `{run_id, outcome, applied_count, evidence_summary, relevance_increments, llm_cost_usd}` | Dashboard |
 | `playbook_run_skipped` | `{run_id, reason}` | Dashboard |
@@ -617,6 +689,7 @@ All write endpoints carry the `audit_actor` dependency (mirrors kanban-specs-v2 
 | `playbook_soft_cap_exceeded` | `{count, dropped}` | Dashboard + `human_attention` |
 | `playbook_llm_call` | `{run_id, model, runtime, tokens, cost_usd}` | Dashboard live counter |
 | `playbook_reset` | `{actor}` | Dashboard |
+| `playbook_kdrive_mirror_failed` | `{error: str, files: list[str]}` | Dashboard (small banner — non-fatal) |
 
 ---
 
@@ -626,7 +699,9 @@ All write endpoints carry the `audit_actor` dependency (mirrors kanban-specs-v2 
 
 1. Skip if `playbook_disabled` flag set.
 2. Skip if no active project (the harness as a whole is unconfigured).
-3. Bootstrap if `playbook_bootstrap_done` unset (subject to retry counter).
+3. If `playbook_bootstrap_done` unset:
+   - Skip if `playbook_bootstrap_blocked` is set (operator must reset to re-arm).
+   - Otherwise run bootstrap (§4) and return — no daily-run path on the same tick.
 4. Otherwise, daily run if all of:
    - Current UTC time is past `HARNESS_PLAYBOOK_RUN_HOUR_UTC` (default 04).
    - `playbook_last_run_at` is from a different UTC date than today.
@@ -696,13 +771,17 @@ Behavior matches Compass §5.5.2: `_call_claude` raise OR `is_error=True` trigge
 
 ## 12 · Reset
 
-`POST /api/playbook/reset {confirm: "yes"}` wipes:
+`POST /api/playbook/reset {confirm: "yes"}` is a **blocking** call: it acquires `_run_lock` (the same lock daily reflection / bootstrap / MCP tool path acquire — see §15) before any wipe. If a run is in flight, reset waits until it completes (cap: 60s; on timeout return 503 with retry-after). This prevents the race where a mid-bootstrap write lands after the reset has cleared files, silently undoing the operator's reset.
+
+Once the lock is held, reset wipes:
 
 - `lattice.json` (kept on disk as empty object, not deleted — keeps file watchers happy)
 - `archived.json` (same)
 - `runs.jsonl` (same)
 - `team_config['playbook_bootstrap_done']` unset
 - `team_config['playbook_bootstrap_retries']` unset
+- `team_config['playbook_bootstrap_blocked']` unset
+- `team_config['playbook_reset_at']` set to now (so the next bootstrap fires `source="reset"`)
 
 Emits `playbook_reset{actor}`. Next scheduler tick (≤ 5 min) re-bootstraps from `app_dev_playbook.md`.
 
@@ -782,15 +861,32 @@ server/tests/
 
 server/shared/
   codex_llm.py     # MOVED from server/compass/codex_llm.py — used by both Compass and Playbook
+
+server/static/
+  playbook.js      # dashboard component (mirrors server/static/compass.js shape)
+  playbook.css     # dashboard styling (mirrors server/static/compass.css)
+  # plus minimal touches to:
+  #   app.js       — register the __playbook LeftRail slot + icon + WS event handlers
+  #                  (mirrors how __compass is registered)
+  #   style.css    — add the .leftrail-icon-playbook CSS-drawn icon (no emoji per
+  #                  CLAUDE.md "no emoji in the UI" invariant)
 ```
 
 Module guidelines:
 
 - `store.py`, `mutate.py` are pure — no LLM calls, no event bus.
 - `llm.py` owns the LLM call surface; mockable in tests.
-- `runner.py` is the orchestrator and the only place that knows about evidence-bundle composition.
-- `render.py` is called from [server/context.py:build_system_prompt_suffix](../server/context.py).
-- `bootstrap.py` is invoked from `scheduler.py`; isolated so reset → re-bootstrap is a one-line call.
+- `runner.py` is the orchestrator and the only place that knows about evidence-bundle composition. **`runner.py` owns the canonical `_run_lock: asyncio.Lock`** (module-level singleton). All other modules that need the lock import it from `runner._run_lock`. Paths that acquire:
+  - `runner.run_daily_reflection()` — blocking acquire.
+  - `bootstrap.run_bootstrap()` — blocking acquire (called from `scheduler.py`).
+  - `api.reset_playbook()` — blocking acquire with 60s timeout (§12, G2).
+  - `api.run_playbook()` (manual reflection) — blocking acquire.
+  - `api.bootstrap_playbook()` (manual bootstrap, G7) — blocking acquire with 5s timeout.
+  - `mutate.apply_coach_proposals()` (called from the MCP tool path in `server/tools.py`) — non-blocking acquire (`timeout=0`); contention returns the §7.1 contention string (G8 + N9).
+- `render.py` is called from [server/context.py:build_system_prompt_suffix](../server/context.py). Function signature: `def render_playbook_block() -> str` — synchronous, no parameters, reads the lattice from disk via `store.load_lattice()`. Returns the **full self-contained markdown block** matching §6.2 verbatim (including the leading `## Orchestration playbook` heading and the meta description). Returns the empty string when lattice has zero active statements, when the file is missing, or when `playbook_disabled` is set — caller treats empty string as "skip the section entirely" (don't append a heading with no body). Sync I/O is acceptable from the async caller — same pattern as `_read_text_safe()` already uses for CLAUDE.md ([server/context.py:44](../server/context.py#L44)). Caller in `build_system_prompt_suffix` joins non-empty CLAUDE.md / playbook sections with the existing `"\n\n---\n\n"` separator.
+- `bootstrap.py` is invoked from `scheduler.py` AND from `api.py` (manual trigger); isolated so reset → re-bootstrap is a one-line call.
+
+**Known duplication (deliberate for v1).** `server/playbook/paths.py` will mirror the shape of `server/compass/paths.py` (disk path + kDrive path resolution). `server/playbook/llm.py`'s `_call_claude` wrapper mirrors `server/compass/llm.py`'s. Unifying both into `server/shared/{paths,llm}.py` is a bigger refactor and premature for v1 — leave duplicated. The Codex fallback IS unified (§4.5 step 4) because that helper is genuinely identical and was already going to land in `shared/`. Re-evaluate at v2 once a third subsystem appears with the same shape.
 
 ---
 
@@ -847,6 +943,83 @@ End-to-end on a deployed Zeabur instance after the implementation PR ships:
 16. **Override + restore.** Click NO on a high-weight statement; weight drops to 0.0; click restore via dashboard archive view; statement comes back at original weight.
 17. **Reset.** Click Reset twice; lattice + archived + runs all clear; next scheduler tick re-bootstraps from prose.
 18. **Coach behaves.** Over a week of normal operation, Coach's `coord_approve_stage` notes show evidence of following high-confidence patterns. Validation criterion §17(a) is the formal measure.
+
+### 18.1 Unit-test coverage matrix
+
+The §15 test files must cover the following surface — these are the edge cases that distinguish a correct implementation from a happy-path-only implementation. Aim for one assertion per bullet:
+
+**`test_playbook_store.py`:**
+- Missing `lattice.json` returns empty schema; first write creates the file atomically.
+- Concurrent reads see consistent state (atomic-rename invariant).
+- `weight_history` cap at 50 entries — older entries trimmed on write.
+- Schema_version mismatch on read raises (no silent migration in v1).
+- kDrive mirror failure: disk write succeeds, warning logged, `playbook_kdrive_mirror_failed` event emitted, no rollback (N2).
+
+**`test_playbook_mutate.py`:**
+- Adjust delta cap ±0.25 rejection.
+- Adjust on immutable rejected.
+- Merge: `keep_id` weight = max; `applied_count` summed; `last_validated_at` = max (NULL-safe).
+- Merge with immutable target rejected.
+- Settle predicate: requires ≥7-day-old history entry (rejects same-day-created statements).
+- Stale-low predicate: same 7-day requirement; immutable skipped.
+- Stale-unused predicate: 30-day age + applied_count==0; immutable skipped.
+- Override (NO/½/YES): rejects when immutable.
+
+**`test_playbook_bootstrap.py`:**
+- Happy path: prose → ~30 statements → lattice persisted → flag set → `playbook_reset_at` cleared.
+- Missing prose template: empty lattice persisted, flag set (no LLM call, no retry counter increment).
+- Tolerant JSON-array extraction from prose-wrapped LLM response.
+- Malformed LLM response → retry counter increments, `_failed{blocked: false}` event.
+- 3rd consecutive failure → `_failed{blocked: true}` + `human_attention` + `playbook_bootstrap_blocked` set.
+- Scheduler tick with `playbook_bootstrap_blocked` set → no bootstrap attempted (G1 infinite-loop test).
+- Cost cap exceeded: `outcome="skipped_cost_cap"` row, no LLM call, no retry counter increment (G3).
+- Soft cap at bootstrap: LLM returns 120 → 100 inserted, 20 dropped from end (G4).
+- Hard cap at bootstrap: LLM returns 130 → 100 inserted, `playbook_soft_cap_exceeded` event fires.
+- `source` field: first-deploy bootstrap → `"boot"`; post-reset bootstrap → `"reset"` (with `playbook_reset_at` set then cleared on success).
+
+**`test_playbook_runner.py`:**
+- Activity gate: zero activity → skip; threshold-1 activity → skip; threshold activity → run.
+- Cost gate: over cap → skip; cost-skip doesn't increment retry counter or update `last_run_at`.
+- Evidence bundle composition: archived task buckets (clean/friction/failed/cancelled) computed correctly from kanban-v2 fixtures.
+- Median window fallback when trajectory shape has < 5 samples; `median_cost_fallback_fired` flagged.
+- Op apply order: merges → creates → adjusts; cross-op conflict (adjust on freshly-merged id) rejected with `id_archived_in_same_run`.
+- `relevant_ids` increment: valid ids increment; malformed entries skipped per regex (N5); duplicates deduped.
+- Soft cap pressure: drops from end of input list; survivors apply.
+- Hard cap pressure: drops ALL creations; `human_attention` fires; adjusts/merges still apply.
+- LLM parse failure → `outcome="error_parse"`; no retry within day.
+- All proposals rejected → `outcome="no_changes"`.
+- Codex fallback: Claude raises → Codex called; runs.jsonl row reflects `runtime="codex"`.
+
+**`test_playbook_scheduler.py`:**
+- Skip on `playbook_disabled`.
+- Skip on no active project.
+- Bootstrap path gated by `playbook_bootstrap_blocked` (G1).
+- Daily-run path gated by past run hour + last-run-date + activity + cost.
+- `_run_lock` prevents concurrent scheduler + manual run.
+
+**`test_playbook_api.py`:**
+- All endpoints require `HARNESS_TOKEN`.
+- `audit_actor` recorded on write events.
+- `POST /run`: 409 when `playbook_bootstrap_done` unset.
+- `POST /bootstrap` (G7): 409 when bootstrap already done; 409 when blocked; 409 on lock contention.
+- `POST /reset`: blocking lock acquisition with 60s timeout; 503 on timeout (G2). Confirm flag clears (`done`, `retries`, `blocked`) + `reset_at` set.
+- `POST /statements/{id}/weight`: rejects when immutable.
+- `POST /statements/{id}/restore`: round-trips an archived statement.
+
+**`test_playbook_render.py`:**
+- Empty lattice → empty string.
+- `playbook_disabled` set → empty string.
+- Bucketing by weight ranges (validated / working / uncertain / anti-pattern).
+- Within-bucket sort by `weight × log(1 + applied_count)` descending.
+- Size budget: > 8 KB lattice → "Uncertain" bucket dropped from rendered output.
+- Output is self-contained markdown (includes `## Orchestration playbook` heading per N4).
+
+**`test_playbook_mcp_tool.py`:**
+- Coach-only enforcement (Player call rejected).
+- Cap of 5 ops per call enforced.
+- Same op apply order as runner (merges → creates → adjusts).
+- Lock contention: returns string starting with `"playbook engine busy"` (G8 + N9); no mutation.
+- Codex Coach reaches the tool via the proxy path (smoke test against the runtime dispatch fixture).
 
 ---
 

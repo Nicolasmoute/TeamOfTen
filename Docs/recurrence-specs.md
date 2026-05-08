@@ -122,127 +122,95 @@ with no tick; the operator enables it via `/tick 60` or the pane.
 The tick has **no user-supplied prompt**. The harness assembles a per-fire
 prompt from project state, with priority:
 
-1. **Inbox + active problems** — if Coach has unread human messages or
-   unread Player updates, address those. Then scan the
-   `## Active task health` and `## Stalled tasks` rollups (along with
-   the `## Player health`, `## Audit history`, `## Recent patterns`,
-   and `## Recent events` blocks injected into the system prompt by
-   the kanban observer — see [kanban-specs-v2.md](kanban-specs-v2.md)
-   §11, §14) and intervene on anything before the auto-actions fire
-   (auto-reassign at 2h, auto-archive at 4h). The escalation ladder
-   is a safety net, not a plan; Coach should beat it whenever
-   possible. Stage transitions themselves require Coach to call
-   `coord_approve_stage` — the kanban records, Coach routes.
-2. **Todos** — pick exactly ONE open `coach-todos.md` entry and execute
-   toward **closing** it this turn. The branch's goal is
-   `coord_complete_todo`. If a single turn is enough, finish the work
-   and complete the todo now. If not, the action must materially
-   advance the SAME todo toward closure (assign to a Player with a
-   clear deliverable, draft and send the deliverable, write the
-   decision, schedule the dependency). Probe DMs, pings, and
-   observations are legitimate **only** when they directly enable the
-   next closure step on the same todo — not as standalone activity.
-   Skimming across todos to drop a micro-touch on each is the
-   antipattern this branch exists to prevent. External blockers
-   (pending user verdict, prod soak, Player unavailable, env outside
-   scope) change *what* the closure step is, never *whether* one
-   exists. The branch explicitly rejects "everything is gated" and
-   "marginal value has gone to zero" as rationalizations. Pick the
-   most closable item, focus, close it (or move it visibly closer),
-   then stop.
-3. **Objectives** — if no inbox items, no kanban issues, and no open
-   todos, consult `project-objectives.md` and pick **one concrete
-   action** that materially advances an objective. Coach must take
-   action on every fire when objectives exist; this branch is the
-   whole point of a recurring tick. Action shapes include: assign a
-   Player, send a status update or coordination message, add a new
-   coach-todo for the operator to refine, audit Player work in
-   progress, or just propose a useful next step and execute it.
-4. **Empty state — objectives absent or empty** — only when no
+1. **Inbox** — call `coord_read_inbox`; respond to anything pending
+   from the human or teammates.
+2. **Kanban** — scan the `## Active task health`, `## Stalled tasks`,
+   and open-task rollups injected by the kanban observer (see
+   [kanban-specs-v2.md](kanban-specs-v2.md) §11, §14, plus the
+   `## Player health`, `## Audit history`, `## Recent patterns`, and
+   `## Recent events` blocks). Move things forward: approve stage
+   transitions with `coord_approve_stage`, nudge silent assignees,
+   reassign past the stall threshold, claim unassigned stages, bump
+   effort then model on the 2nd same-kind audit fail. Auto-reassign
+   fires at 2h and auto-archive at 4h — beat the safety net. Stage
+   transitions are Coach's responsibility; the kanban records, Coach
+   routes.
+3. **Coach-todos** — pick exactly ONE open `coach-todos.md` entry and
+   act to **close** it. The branch's goal is `coord_complete_todo`.
+   If a single turn is enough, finish the work and complete now. If
+   not, the action must materially advance the SAME todo toward
+   closure (assign with a clear deliverable, draft and send the
+   deliverable, write the decision, schedule the dependency). Probe
+   DMs, pings, and observations are legitimate **only** when they
+   directly enable the next closure step on the same todo — not as
+   standalone activity. Skimming many todos to drop a micro-touch on
+   each is the antipattern. External blockers change *what* the
+   closure step is, never *whether* one exists. The branch rejects
+   "everything is gated" as rationalization.
+4. **Objectives** — if (1)–(3) yield nothing actionable, consult
+   `project-objectives.md` and pick **one concrete action** that
+   materially advances an objective (assign a Player, send a
+   coordination message, capture a new coach-todo, audit Player
+   work, propose-and-execute a next step). Don't end idle when
+   objectives exist.
+5. **Empty state — objectives absent or empty** — only when no
    `## Project objectives` section appears in the system prompt
    (file missing, empty, or fully whitespace) does Coach end the
-   turn without acting. The next tick will check again.
+   turn without acting. Nothing else licenses an idle end.
 
 The composed prompt is sent as a normal user-role message. The system prompt
 already contains the project objectives + open todos (see §6), so the user
 prompt is short — it just orients Coach to the priority order:
 
-> Routine tick. Work the project — do something useful every fire.
+> Routine tick. Walk the priority list, act on the first non-empty
+> rung, then stop.
 >
-> Priority order:
+> (1) Inbox — call coord_read_inbox; respond to anything pending
+> from the human or teammates.
+> (2) Kanban — scan "## Active task health", "## Stalled tasks",
+> and the open-task list in your system prompt above. Move things
+> forward: approve stage transitions with coord_approve_stage, nudge
+> silent assignees, reassign past the stall threshold, claim
+> unassigned stages, bump effort then model on the 2nd same-kind
+> audit fail. Auto-reassign fires at 2h and auto-archive at 4h —
+> beat the safety net.
+> (3) coach-todos — pick exactly ONE open todo and act to CLOSE
+> it. The branch goal is coord_complete_todo. If a single turn is
+> enough, finish and complete now; otherwise the action must
+> materially advance the SAME todo toward closure (assign with a
+> clear deliverable, draft and send the deliverable, write the
+> decision, schedule the dependency). Probes, pings, and
+> observations are legitimate ONLY when they directly enable the
+> next closure step on the same todo. Skimming many todos with
+> micro-touches is the antipattern. Reject "everything is gated"
+> — rationalization.
+> (4) Objectives — if (1)–(3) are empty, pick ONE concrete action
+> grounded in project-objectives.md (assign a Player, send a
+> coordination message, capture a new coach-todo, audit Player
+> work, propose-and-execute a next step). Don't end idle when
+> objectives exist.
 >
-> (1) Inbox first — call coord_read_inbox. Respond to anything pending
-> from the human or your teammates. Then scan "## Active task health"
-> and "## Stalled tasks" if those sections appear in your system
-> prompt above — auto-reassign fires at 2h, auto-archive at 4h.
-> Intervene before the safety net does (nudge the blocker, reassign,
-> or bump effort/model for repeat audit fails).
-> (2) Open coach-todos — pick exactly ONE todo and execute toward
-> CLOSING it this turn. The goal of this branch is
-> coord_complete_todo. If you can finish the work in this turn,
-> finish it now and call coord_complete_todo. If a single turn isn't
-> enough, the action you take must materially advance the SAME todo
-> toward closure: assign it to a Player with a clear deliverable,
-> draft and send the actual deliverable, write the decision, schedule
-> the dependency. Probe DMs, status pings, and observations are
-> legitimate ONLY when they directly enable the next closure step on
-> the same todo — never as standalone "I touched something" activity.
-> Skimming across todos to drop a micro-touch on each is the
-> antipattern this branch exists to prevent. External blockers
-> (pending user verdict, prod soak, Player unavailable, env outside
-> scope) change WHAT the next closure step is, never WHETHER one
-> exists. Reject "everything is gated" and "marginal value has gone
-> to zero" — they are rationalizations. Pick the most closable item,
-> focus on it, close it (or move it visibly closer to closed), then
-> stop.
-> (3) Drive the objectives — if inbox AND todos are both empty, you
-> must still pick one concrete action that materially advances a
-> project objective. Examples: assign a Player to scout an open
-> question, send a status update or coordination message, capture a
-> new coach-todo for the operator to refine, audit recent Player work
-> for blockers, propose a useful next step and execute it. Don't end
-> the turn idle when objectives exist — invent forward motion
-> grounded in them.
->
-> Only end the turn without acting when project objectives are absent
-> or empty (no "## Project objectives" section in your system
-> prompt). In that case, end quietly — there's nothing to anchor
-> invented work to.
+> End the turn without acting only when no "## Project objectives"
+> section appears in your system prompt above (file absent or
+> whitespace-only). Nothing else licenses an idle end.
 
-The objectives branch is intentionally directive. Earlier wording asked
-for "one concrete action" but closed with a blanket "Don't invent work"
-line; in practice Coach read the closer as the dominant rule and ended
-quiet ticks idle even when the project had clear objectives. The fix
-makes step (3) emphatic ("you must still pick one concrete action") and
-gates the end-quietly path strictly on objectives being absent — nothing
-else.
-
-The todos branch (step 2) is similarly directive for similar reasons.
-The earlier wording ("pick the todo most aligned with current
-priorities and act on it") gave Coach an out: in observed sessions,
-Coach read its open todos, classified each as "gated" on some
-external blocker (pending user verdict, prod soak running, Player
-unavailable, env issue outside scope), and concluded "marginal value
-has gone to zero — standing by." Coach was wrong every time we
-challenged it: a probe DM to the unavailable Player, a status ping
-on a prod soak, a clarifying question to push a verdict forward —
-all turned out to be available zero-cost moves. The new wording
-treats those moves as the *default* and frames "everything is gated"
-as the rationalization it almost always is.
-
-A second iteration tightened step (2) further. The
-"smallest-movable-next-step" framing turned out to permit a different
-failure mode: Coach would skim across many todos, drop a micro-touch
-(a ping, a status note, a captured observation) on each, and end the
-turn having moved nothing closer to `coord_complete_todo`. The
-current wording requires Coach to (a) pick **exactly one** todo,
-(b) aim the action at **closing** it (`coord_complete_todo` is the
-explicit branch goal), and (c) treat probes / pings / observations
-as legitimate only when they directly enable the next closure step
-on the *same* todo — not as standalone activity. Skimming is named
-as the antipattern. The branch ends with the chosen todo either
-completed or visibly closer to completion; cross-todo touch-passes
-are not the goal.
+Each branch is intentionally directive. The end-quietly clause is
+gated strictly on objectives being absent — nothing else licenses
+an idle end. Two failure modes the wording deliberately blocks,
+both observed in production: (a) the **gated** rationalization
+(Coach reads its todos, classifies each as blocked on some external
+factor, concludes "standing by" — when in fact zero-cost probes,
+pings, or clarifying questions were available); (b) the **skimming**
+rationalization (Coach drops a micro-touch on many todos in one
+turn — pinging here, observing there — without closing or
+materially advancing any). Step (3) blocks (a) by rejecting
+"everything is gated" by name and (b) by requiring exactly ONE
+todo per turn, aimed at `coord_complete_todo`, with probes /
+pings / observations admissible only when they directly enable the
+next closure step on the same todo. Step (2) (kanban) is the
+explicit place for "go check what's stuck and unblock it" so step
+(3) can stay focused on todo closure without competing with kanban
+maintenance.
 
 This replaces today's `COACH_TICK_PROMPT`.
 
