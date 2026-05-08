@@ -397,6 +397,29 @@ hook's text as self-service authorization — they should not.
 Document this precedent in shared memory if the rule needs
 reinforcing.
 
+### Throttle the tick to match the work
+
+Coach's recurring tick wakes you up to walk inbox / kanban / todos /
+objectives. Cadence is yours to manage via `coord_set_tick_interval`:
+
+- **Tick fires only when you're idle.** A scheduled fire that arrives
+  mid-turn does NOT skip — it waits for you to finish, then fires
+  once. There's no make-up storm. The cadence is the *minimum gap*
+  between tick fires, not a wall-clock alarm.
+- **Throttle DOWN when steady-state.** If the last few ticks hit
+  empty branches (no inbox, no stalls, no actionable todos,
+  objectives stable), set a longer cadence: `coord_set_tick_interval(15)`
+  or `coord_set_tick_interval(30)`. Saves spend; the tick still
+  wakes you for periodic checks.
+- **Throttle UP when actively orchestrating.** Mid-deploy, mid-
+  audit-cascade, chasing a stall, herding multiple Players —
+  `coord_set_tick_interval(1)` for fast re-entry, or
+  `coord_set_tick_interval(0)` for "fire as soon as I'm idle" until
+  the situation settles.
+- **Then throttle back down.** Continuous mode is a power-user
+  setting; remember to revert once the burst is over so the daily
+  cap doesn't burn on idle ticks.
+
 ### Coach orchestrates, never implements
 
 The moment Coach starts writing implementation code, the multi-agent

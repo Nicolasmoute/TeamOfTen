@@ -758,7 +758,8 @@ Both panes refresh on these WebSocket events:
 | `recurrence_changed` | id, kind, before, after, project_id | Recurrence pane only |
 | `recurrence_deleted` | id, kind, project_id | Recurrence pane only |
 | `recurrence_fired` | id, kind, prompt_excerpt, project_id | Coach pane (subtle, sticky off) |
-| `recurrence_skipped` | id, kind, reason (`"coach_busy"` / `"cost_capped"`), project_id | Coach pane (system row) |
+| `recurrence_skipped` | id, kind, reason (`"coach_busy"` / `"cost_capped"`), project_id | Coach pane (system row). Repeat / cron only — tick rows defer instead |
+| `recurrence_deferred` | id, kind (`"tick"`), reason (`"coach_busy"` / `"cost_capped"`), project_id | Coach pane (subtle). Emitted ONCE per defer episode (on transition into deferred state), not every scheduler pass — otherwise a long Coach turn with a 5-minute tick would spam the log. The next `recurrence_fired` resets the latch |
 | `recurrence_disabled` | id, kind, reason (`"one_shot_complete"`), project_id | Coach pane + Recurrence pane |
 | `coach_todo_added` | id, title, due | Coach pane + EnvPane |
 | `coach_todo_completed` | id, title | Coach pane + EnvPane |
@@ -823,14 +824,29 @@ When `coord_create_project` (or whatever creates a project today) runs:
 
 1. **Multiple due rows in one scheduler tick**: fire them sequentially
    (don't parallelize Coach turns). After the first fires, the rest
-   skip with `reason="coach_busy"`; their `next_fire_at` advances past
-   the first fire's end. Implementation note: because the scheduler
-   `await`s the full Coach turn in `_fire_row`, by the time the next
-   row's iteration runs `_coach_is_working()` would return `False`
-   again — so the loop also keeps a local `fired_in_pass` flag and
-   forces `busy=True` for any subsequent rows in the same pass.
-   Without that flag, a busy day with several due rows would stack
-   turns back-to-back instead of skipping.
+   defer (tick) or skip (repeat/cron) with `reason="coach_busy"`. For
+   repeat/cron, `next_fire_at` advances past the first fire's end; for
+   tick, `next_fire_at` is left in place so the row picks up next
+   pass. Implementation note: because the scheduler `await`s the full
+   Coach turn in `_fire_row`, by the time the next row's iteration
+   runs `_coach_is_working()` would return `False` again — so the
+   loop also keeps a local `fired_in_pass` flag and forces
+   `busy=True` for any subsequent rows in the same pass. Without
+   that flag, a busy day with several due rows would stack turns
+   back-to-back instead of deferring/skipping.
+
+1b. **Tick + cadence 0 + nothing to do**: Coach's tick prompt walks
+    the priority list (§4) and ends quietly when objectives are
+    absent. With cadence `0`, the next pass would re-fire instantly
+    — and the empty branches would burn budget on a tight loop. Two
+    natural backstops keep this safe: (a) the §4 prompt explicitly
+    licenses ending without acting only when objectives are absent,
+    so the typical project has at least one actionable rung; (b) the
+    daily cost cap and `coord_set_tick_interval` give Coach the
+    knob to throttle DOWN once it notices the loop is empty (e.g.
+    "no inbox, no kanban, no todos, objectives stable → set tick to
+    30min"). Cadence `0` is a power-user mode — Coach is expected
+    to manage it.
 
 2. **Project switch mid-fire**: the in-flight Coach turn completes against
    the original project. The scheduler's next pass picks up the new
