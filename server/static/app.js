@@ -1802,14 +1802,15 @@ function App() {
       // Broadcasts fan to every agent id we know about.
       // Recurrence pane live refresh (recurrence-specs.md §12.4).
       // Any of these events means a row was added/removed/changed/
-      // fired/skipped/disabled — reload the list so timestamps and
-      // counts stay accurate.
+      // fired/skipped/deferred/disabled — reload the list so
+      // timestamps and counts stay accurate.
       if (
         ev.type === "recurrence_added" ||
         ev.type === "recurrence_changed" ||
         ev.type === "recurrence_deleted" ||
         ev.type === "recurrence_fired" ||
         ev.type === "recurrence_skipped" ||
+        ev.type === "recurrence_deferred" ||
         ev.type === "recurrence_disabled"
       ) {
         if (recurrenceOpen) refreshRecurrences();

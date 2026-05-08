@@ -1898,6 +1898,8 @@ UI slash commands (Coach pane only):
 - `/tick` — fire one tick now.
 - `/tick N` — set recurring tick every N minutes; auto-enables.
 - `/tick off` — disable recurring tick.
+- `/tick 0` — fire continuously (as soon as Coach is idle); same as
+  `coord_set_tick_interval(0)`.
 - `/repeat` — list active repeats; `/repeat N <prompt>` adds; `/repeat
   rm <id>` deletes.
 - `/cron` — list active crons; `/cron <when> <prompt>` adds (DSL); 
@@ -1913,14 +1915,21 @@ UI surface:
 - **EnvPane sections** — `Project objectives` (multiline editor) +
   `Coach todos` (checkbox list, click-to-expand, archive toggle).
 
-Skips when paused, Coach is already working, or daily cost cap hit
-(emits `recurrence_skipped` with `reason="coach_busy"` /
-`reason="cost_capped"`).
+Busy-Coach behavior splits by kind (recurrence-specs.md §2 / §11):
+
+- **Tick rows DEFER** — keep `next_fire_at` in place and re-evaluate next
+  pass; fire as soon as Coach is idle. Emits `recurrence_deferred` once
+  per defer episode (latch resets on next fire). Cadence `0` is allowed
+  and means "fire continuously as soon as Coach is idle"; the cap stays
+  the floor. Coach can self-throttle via `coord_set_tick_interval`.
+- **Repeat / cron rows SKIP** — wall-clock semantics; the slot is
+  dropped, `next_fire_at` advances. Emits `recurrence_skipped` with
+  `reason="coach_busy"` / `reason="cost_capped"`.
 
 Events emitted: `recurrence_added`, `recurrence_changed`,
 `recurrence_deleted`, `recurrence_fired`, `recurrence_skipped`,
-`recurrence_disabled`. Plus `coach_todo_added`, `coach_todo_completed`,
-`coach_todo_updated`, `objectives_updated`.
+`recurrence_deferred`, `recurrence_disabled`. Plus `coach_todo_added`,
+`coach_todo_completed`, `coach_todo_updated`, `objectives_updated`.
 
 Migration: `HARNESS_COACH_TICK_INTERVAL` is honored only on first
 migration via `db._seed_recurrence_from_env`; the `recurrence_v1_seeded`
@@ -3105,6 +3114,7 @@ Recurrences and runtime:
 - `recurrence_deleted`
 - `recurrence_fired`
 - `recurrence_skipped`
+- `recurrence_deferred`
 - `recurrence_disabled`
 - `coach_todo_added`
 - `coach_todo_completed`
