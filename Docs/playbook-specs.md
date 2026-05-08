@@ -294,6 +294,34 @@ After 3 failed attempts: emit `playbook_bootstrap_failed{error, retries: 3}` + `
 
 If the prose template file is missing on disk, bootstrap completes with an **empty lattice** (no LLM call). No `## Orchestration playbook` section appears in agents' system prompts (render returns empty string per §6.2). The first daily reflection run that triggers will start populating the lattice from observed evidence. Slower cold-start than the prose-seeded path but functionally identical after a few days.
 
+### 4.5 Operational bootstrap (first deploy)
+
+Distinct from §4.1-§4.4 (which describe the engine's first-run *content seeding*), this section lists the operational steps the implementation PR must include so the engine works on first boot.
+
+1. **Directory creation.** `paths.py` exposes `playbook_dir()` → `/data/playbook/` and `playbook_kdrive_dir()` → `TOT/playbook/`. Both call `mkdir(parents=True, exist_ok=True)` on access — no eager mkdir in lifespan. Same lazy-create pattern as Compass paths.
+
+2. **Initial file state.** `store.py` read functions tolerate a missing file by returning the empty schema (`{"schema_version": 1, "statements": []}` for lattice/archived; empty list for runs.jsonl). First write creates the file atomically (tempfile + os.replace). No explicit initialization step in lifespan.
+
+3. **MCP tool registration.** Add `coord_propose_playbook_changes` (§7.1) to the `_tools` map and `ALLOWED_COORD_TOOLS` set in [server/tools.py](../server/tools.py). Coach-only enforcement via the existing `_require_coach` helper.
+
+4. **Shared Codex fallback module.** Per §11.3, the implementation PR moves [server/compass/codex_llm.py](../server/compass/codex_llm.py) to `server/shared/codex_llm.py` and updates Compass's import in the same PR. Order matters — the move + Compass import update + new Playbook import must land atomically or Compass breaks at boot.
+
+5. **Lifecycle policy pointer.** Extend [server/agents.py:_build_coach_coordination_block](../server/agents.py)'s lifecycle-policy block (kanban-specs-v2 §14.1) with one line at the end:
+
+   > Read the orchestration playbook (loaded after CLAUDE.md, see `## Orchestration playbook`). High-confidence statements are established discipline; deviate only with explicit reason. You can propose updates mid-turn via `coord_propose_playbook_changes`.
+
+   This is a procedural pointer (where to look, what tool to use), not a learned pattern — it belongs in the lifecycle policy, not in the playbook itself. Without it, Coach may treat the new system-prompt section as descriptive documentation rather than directive guidance.
+
+6. **Canonical project CLAUDE.md template enrichment.** Extend [server/templates/app_dev_claude_md.md](../server/templates/app_dev_claude_md.md) with a short section (under a new heading, e.g. `### Team-wide orchestration playbook`):
+
+   > A harness-wide orchestration playbook is loaded into every agent's system prompt under `## Orchestration playbook`. It captures the team's evolving discipline as weighted statements (e.g. *"audit every code change except trivially mechanical edits"*) — each weight is the engine's current confidence that the pattern is the right play for this team. Treat high-weight statements as established discipline; deviate only with explicit reason. Coach can propose updates mid-turn via `coord_propose_playbook_changes`, and a daily reflection run evolves the lattice from observed events. Players follow the playbook as guidance and cannot influence it. The playbook is harness-wide — every project's Coach reads the same lattice, so improvements compound across projects.
+
+   The Coach-driven reconciliation flow at [server/project_claude_md.py:update_claude_md_via_coach](../server/project_claude_md.py) propagates this template change to every existing project's CLAUDE.md on next activation (and once at boot for the active project) — no per-project manual edit needed. Per the harness convention (CLAUDE.md "Keep the canonical project CLAUDE.md template current"), updating the template is mandatory when shipping harness functionality projects need to know about.
+
+7. **Player role-prompt awareness.** Players' role prompts in [server/agents.py:_system_prompt_for](../server/agents.py) don't need a dedicated playbook section — the rendered playbook header (§6.2) carries the Players-follow-but-don't-influence framing inline.
+
+8. **Migration on existing harness deployments.** No special handling required. First boot post-implementation adds the new `## Orchestration playbook` section to every agent's next system prompt (one cache-miss per agent on next turn). No session reset, no agent restart, no DB migration. Existing Compass installations are untouched. Boot order: shared/codex_llm.py refactor → playbook engine module load → scheduler task starts → first scheduler tick triggers bootstrap.
+
 ---
 
 ## 5 · Reflection runner — daily post-mortem
@@ -480,7 +508,7 @@ Natural progression for Coach: lifecycle policy (in coord block — bedrock mech
 ```markdown
 ## Orchestration playbook
 
-Learned patterns for orchestrating this team. Each entry has a confidence weight in [0, 1] — high = validated discipline, low = validated anti-pattern, ~0.5 = uncertain. Apply high-confidence patterns by default; deviate with explicit reason.
+Learned patterns for orchestrating this team. Each entry has a confidence weight in [0, 1] — high = validated discipline, low = validated anti-pattern, ~0.5 = uncertain. Apply high-confidence patterns by default; deviate with explicit reason. Coach updates this lattice mid-turn via `coord_propose_playbook_changes` and via a nightly reflection run; Players follow it as guidance and cannot influence it.
 
 **Validated (weight ≥ 0.85):**
 - [0.92] Audit every code-touching task except trivially mechanical edits.
@@ -721,6 +749,7 @@ Listens to `playbook_*` bus events on the existing `/ws` channel and re-fetches 
 - [kanban-specs-v2.md](kanban-specs-v2.md) — the playbook reads §22.1 deviations_log + §11.1 player health counters + §9.2 project_events as evidence; the playbook injection follows project CLAUDE.md in `build_system_prompt_suffix`, downstream of the Coach coordination block (which still owns the §14 lifecycle policy). **Binding dependency:** the runner's evidence-bundle composition is hardwired to these three v2 surfaces. A schema change in any of them (column rename, table restructure, event type rename) requires a coordinated playbook-runner update.
 - [recurrence-specs.md](recurrence-specs.md) — the playbook scheduler is a sibling background task, not a recurrence (no Coach turns spawned by the scheduler itself; the reflection is a direct `claude_agent_sdk.query()` call under `agent_id="playbook"`).
 - [server/templates/app_dev_playbook.md](../server/templates/app_dev_playbook.md) — the bootstrap corpus. Kept on disk after bootstrap as historical reference + re-bootstrap source.
+- [server/templates/app_dev_claude_md.md](../server/templates/app_dev_claude_md.md) — canonical project CLAUDE.md template. Per §4.5 step 6, gains a `### Team-wide orchestration playbook` section so every project's Coach has the awareness baked in. Propagated to existing projects via [server/project_claude_md.py:update_claude_md_via_coach](../server/project_claude_md.py).
 
 ---
 
