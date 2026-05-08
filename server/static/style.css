@@ -119,13 +119,17 @@ body {
      longer wraps to a 2nd line). */
   .rail-bottom {
     display: flex !important;
-    flex-direction: row;
+    flex-direction: row !important;
+    flex-wrap: nowrap !important;
     align-items: center !important;
     width: 100% !important;
     flex: 0 0 auto !important;
     padding: 1px 4px !important;
     gap: 2px !important;
+    overflow-x: hidden;
   }
+  .rail-group.rail-tools,
+  .rail-group.rail-actions { flex-wrap: nowrap !important; }
   .rail-bottom .rail-group { padding: 0; }
   .rail-bottom .mobile-ws-dot { flex: 0 0 auto; }
   /* Hairline dividers are vertical-rail decoration only — the mobile
@@ -162,30 +166,49 @@ body {
      recurrence / env) squeeze below the nominal width if a 320px
      phone needs it, instead of one wrapping to a second row. */
   .rail-bottom .gear {
-    width: 24px;
-    height: 24px;
-    flex: 0 1 24px;
+    width: 22px;
+    height: 22px;
+    flex: 0 1 22px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    font-size: 14px;
-    min-width: 18px;
+    font-size: 13px;
+    min-width: 16px;
+    padding: 0 !important;
   }
   /* The project-switcher wrapper is a flex child of rail-tools (not
      the .gear button itself), so propagate the same shrink rule
      to it explicitly. */
   .rail-group.rail-tools .project-switcher {
-    flex: 0 1 24px;
-    min-width: 18px;
+    flex: 0 1 22px;
+    min-width: 16px;
+  }
+  /* Override the desktop rail-actions size rules at mobile width too,
+     so pause + settings can shrink alongside the tools instead of
+     hogging fixed 26px each and forcing the row to wrap. */
+  .rail-group.rail-actions .gear,
+  .rail-group.rail-actions .gear.pause-toggle,
+  .rail-group.rail-actions .gear.settings-toggle {
+    width: 22px !important;
+    height: 22px !important;
+    min-width: 16px !important;
+    flex: 0 1 22px !important;
+    font-size: 13px !important;
   }
   .rail-bottom .gear.project-placeholder {
     width: 24px;
     font-size: 11px;
   }
   .rail-bottom .files-icon {
-    width: 16px;
-    height: 12px;
+    width: 14px;
+    height: 11px;
   }
+  .rail-bottom .compass-icon,
+  .rail-bottom .playbook-icon,
+  .rail-bottom .recurrence-icon { width: 15px; height: 15px; }
+  .rail-bottom .compass-icon svg,
+  .rail-bottom .playbook-icon svg,
+  .rail-bottom .recurrence-icon svg { width: 100%; height: 100%; }
   /* Tighter slot buttons on mobile so 11 slots fit without scroll on
      360px-wide phones. */
   .rail-group.rail-agents .slot {
@@ -2624,6 +2647,11 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
    buttons next to it. */
 .gear.playbook-open { padding: 6px; line-height: 0; }
 .gear.playbook-open.active { color: var(--accent); }
+
+.pb-pane-head .pane-head-label { display: inline-flex; align-items: center; gap: 6px; }
+.pb-pane-head .pane-head-actions { margin-left: auto; display: inline-flex; align-items: center; gap: 2px; }
+.cmp-pane-head .pane-head-label { display: inline-flex; align-items: center; gap: 6px; }
+.cmp-pane-head .pane-head-actions { margin-left: auto; display: inline-flex; align-items: center; gap: 2px; }
 .playbook-icon {
   display: inline-flex;
   align-items: center;

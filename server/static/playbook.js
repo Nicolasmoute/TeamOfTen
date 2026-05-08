@@ -272,9 +272,9 @@ function PlaybookPaneHeader({ onClose, isMaximized, onToggleMaximize }) {
       </div>
       <div class="pane-head-actions">
         ${onToggleMaximize
-          ? html`<button class="pane-head-btn" title=${isMaximized ? "Restore" : "Maximize"} onClick=${onToggleMaximize}>${isMaximized ? "❐" : "⛶"}</button>`
+          ? html`<button class="pane-maximize" title=${isMaximized ? "Restore" : "Maximize"} onClick=${onToggleMaximize}>${isMaximized ? "❐" : "⛶"}</button>`
           : null}
-        <button class="pane-head-btn" title="Close" onClick=${onClose}>×</button>
+        <button class="pane-close" title="Close" onClick=${onClose}>×</button>
       </div>
     </header>
   `;

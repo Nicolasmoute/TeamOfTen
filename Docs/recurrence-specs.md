@@ -36,11 +36,11 @@ drive Coach forward when there's nothing in the inbox.
 
 ## 2. Concepts
 
-| Flavor | When it fires | Prompt source | Cardinality |
-|---|---|---|---|
-| **Tick** | Fixed interval, in minutes | Harness-composed (smart) | 1 per project (singleton) |
-| **Repeat** | Fixed interval, in minutes | User-supplied | Many per project |
-| **Cron** | Wall-clock (friendly DSL) | User-supplied | Many per project |
+| Flavor | When it fires | Prompt source | Cardinality | Busy-Coach behavior |
+|---|---|---|---|---|
+| **Tick** | Cadence in minutes; `0` = fire continuously | Harness-composed (smart) | 1 per project (singleton) | **Defer** (wait until idle, then fire) |
+| **Repeat** | Fixed interval, in minutes (`>= 1`) | User-supplied | Many per project | **Skip** (drop, advance to next slot) |
+| **Cron** | Wall-clock (friendly DSL) | User-supplied | Many per project | **Skip** (drop, advance to next slot) |
 
 A recurrence is **always Coach-only**. Players have no recurrences in v2.
 
@@ -48,13 +48,29 @@ A recurrence is **always project-scoped**. Switching the active project
 switches which recurrences are live. Recurrences for inactive projects do
 not fire.
 
-A recurrence **skips** if Coach is already mid-turn when its fire-time
-arrives. Skipped fires are dropped (not queued) and recorded as a
-`recurrence_skipped` event. The next due fire is the next scheduled one,
-not the missed one.
+**Tick is throttle-driven, not slot-driven.** When the tick's fire-time
+arrives and Coach is mid-turn, the tick does NOT skip — it waits. The
+scheduler keeps `next_fire_at` in the past and re-evaluates on every
+pass; as soon as Coach goes idle (and the cost cap clears), the tick
+fires. There is no "missed slot" concept for tick: the cadence is the
+**minimum gap between tick fires**, not a wall-clock alarm. A tick set
+to 5 minutes during a 30-minute Coach turn fires once at minute 30
+(immediately after idle), not six times back-to-back.
+
+Cadence `0` means **fire continuously**: as soon as Coach finishes a
+turn, the next tick is queued. This is the "as fast as possible" mode —
+Coach may want it during heavy active orchestration. The
+`recurrence_fired` event still emits per fire so spend stays visible.
+
+**Repeat and cron retain skip-on-busy semantics** (existing behavior).
+They are wall-clock schedules — a missed 09:00 slot doesn't get a
+make-up fire at 09:30; it just waits for the next scheduled slot.
 
 **Default tick interval: 60 minutes**, off by default. New projects start
-with no tick; the operator enables it via `/tick 60` or the pane.
+with no tick; the operator enables it via `/tick 60` or the pane. Coach
+can adjust cadence at any time via `coord_set_tick_interval` (§7.6) —
+throttle down to 1/15min when there's nothing pressing, throttle up to
+`/tick 1` or `/tick 0` when actively orchestrating.
 
 ---
 
@@ -406,6 +422,29 @@ injection). No MCP tool needed.
 and Coach. Coach uses the standard `Write` tool. No MCP tool. The harness
 allows direct writes to that one path under the project root.
 
+### 7.6 `coord_set_tick_interval`
+
+```
+coord_set_tick_interval(minutes: int, enabled: bool | None = None)
+```
+
+- **Coach-only.** Throttles the active project's tick row up or down.
+- `minutes >= 1` sets the cadence; `minutes == 0` switches to
+  "continuous" mode (fire as soon as idle); negative values rejected.
+- If no tick row exists for the active project, one is created; if the
+  row is disabled and `enabled` is omitted, setting cadence re-enables
+  it (matches `/tick N` semantics in §8).
+- `enabled=False` disables without changing cadence (mirrors
+  `/tick off`); `enabled=True` re-enables.
+- Emits `recurrence_changed` (or `recurrence_added` on first call).
+- **When Coach should call it:**
+  - Throttle DOWN (e.g. `60` or `15`) when the team is steady-state
+    and the tick is mostly hitting empty branches — saves spend.
+  - Throttle UP (e.g. `1` or `0`) when Coach is actively herding
+    Players, monitoring a deploy, or chasing a stall — Coach gets
+    re-entered as fast as the budget allows.
+  - The cost cap remains the floor; throttling cannot bypass it.
+
 ---
 
 ## 8. Slash commands
@@ -413,7 +452,7 @@ allows direct writes to that one path under the project root.
 | Command | Behavior |
 |---|---|
 | `/tick` | Fire one tick now, regardless of recurring state |
-| `/tick N` | Set recurring tick to every N minutes; enables if disabled |
+| `/tick N` | Set recurring tick to every N minutes; enables if disabled. `N=0` means fire continuously (as soon as Coach is idle) |
 | `/tick off` | Disable the recurring tick (keeps row, sets `enabled=false`) |
 | `/repeat` | List active repeats with ids |
 | `/repeat N "<prompt>"` | Add a repeat (every N minutes) |
@@ -556,14 +595,24 @@ loops. On every tick (every 30 seconds, configurable via
    `next_fire_at <= now_utc`.
 2. For each due row (sequentially; see §15.1 for ordering):
    - If Coach is mid-turn OR a prior row in this same pass already
-     fired → emit `recurrence_skipped` (reason `coach_busy`), advance
-     `next_fire_at` past now, continue. Tracking the "already fired
-     this pass" flag locally is essential because `await run_agent`
-     blocks until the Coach turn completes — without the flag, the
-     next due row would see `_coach_is_working() == False` again and
-     stack onto the just-finished turn.
-   - Else if the daily cost cap is hit → emit `recurrence_skipped`
-     (reason `cost_capped`), advance `next_fire_at`, continue.
+     fired:
+     - **Tick rows** → emit `recurrence_deferred` (reason
+       `coach_busy`), do NOT advance `next_fire_at`. The row stays
+       overdue and re-evaluates next pass; as soon as Coach goes idle
+       it fires. No make-up storm — only one fire per idle window.
+     - **Repeat / cron rows** → emit `recurrence_skipped` (reason
+       `coach_busy`), advance `next_fire_at` past now, continue.
+       Tracking the "already fired this pass" flag locally is
+       essential because `await run_agent` blocks until the Coach
+       turn completes — without the flag, the next due row would see
+       `_coach_is_working() == False` again and stack onto the
+       just-finished turn.
+   - Else if the daily cost cap is hit:
+     - **Tick rows** → emit `recurrence_deferred` (reason
+       `cost_capped`); do NOT advance. Re-evaluates next pass (caps
+       roll over at UTC midnight or when spend rolls off).
+     - **Repeat / cron rows** → emit `recurrence_skipped` (reason
+       `cost_capped`), advance `next_fire_at`, continue.
    - Else → spawn the appropriate Coach turn:
      - `tick` → §4 composed prompt.
      - `repeat` → row's `prompt`.
@@ -577,8 +626,15 @@ loops. On every tick (every 30 seconds, configurable via
      `reason: one_shot_complete`. The skip carries the cause; the
      disable closes the row. Both events are needed so the operator
      can audit why a one-shot never fired.
-3. Recompute `next_fire_at`:
-   - tick / repeat: `last_fired_at + cadence_minutes` (in UTC).
+3. Recompute `next_fire_at` (only for rows that fired this pass —
+   deferred rows keep their existing `next_fire_at`):
+   - tick: `last_fired_at + max(cadence_minutes, 0)` (in UTC). Cadence
+     `0` means `next_fire_at = last_fired_at`, so the next scheduler
+     pass treats the row as immediately due — and the only thing that
+     keeps it from re-firing instantly is the busy/cost-cap defer
+     check. Effectively: "fire as soon as Coach is idle, every time."
+   - repeat: `last_fired_at + cadence_minutes` (in UTC). Repeat
+     cadence MUST be `>= 1`.
    - cron: parse DSL, compute next match in row's TZ, convert to UTC.
 4. Persist updated `last_fired_at` and `next_fire_at`.
 
