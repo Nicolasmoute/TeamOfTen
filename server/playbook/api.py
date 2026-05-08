@@ -210,7 +210,7 @@ def build_router(
     # ---- POST /bootstrap (manual bootstrap trigger, G7)
     @router.post("/bootstrap", dependencies=deps)
     async def post_bootstrap(
-        body: BootstrapBody,
+        _body: BootstrapBody,  # required by FastAPI shape contract; no fields used
         request: Request,
     ) -> dict[str, Any]:
         if _read_team_config(config.PLAYBOOK_BOOTSTRAP_DONE_KEY) == "1":
@@ -286,6 +286,12 @@ def build_router(
             raise HTTPException(status_code=503, detail="playbook engine busy")
         try:
             lattice = load_lattice()
+            # Spec §9: payload includes `from` — capture pre-override weight.
+            prev_weight: float | None = None
+            for s in lattice.statements:
+                if s.id == sid:
+                    prev_weight = s.weight
+                    break
             actor_str = (actor.get("source") if isinstance(actor, dict) else None) or "human"
             ok, err = mutate.override_weight(
                 lattice, sid, weight=body.weight, actor=str(actor_str),
@@ -298,6 +304,7 @@ def build_router(
         await _publish({
             "type": "playbook_statement_overridden",
             "id": sid,
+            "from": prev_weight,
             "to": body.weight,
             "actor": actor,
         })

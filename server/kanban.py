@@ -1148,12 +1148,16 @@ async def _completion_hint_for_role(task_id: str, role: str) -> str:
     quietly."""
     if role == "planner":
         return (
-            f"Write the spec by calling coord_write_task_spec("
-            f"task_id={task_id!r}, body=<spec>, "
-            f"message_to_coach=<your response>). Your turn ends "
-            f"there — Coach reviews on the next tick and approves "
-            f"the next stage via coord_approve_stage. The kanban "
-            f"does NOT auto-advance in v2.{_TOOL_NOT_VISIBLE_ESCAPE}"
+            f"Draft the spec, then SIGNAL COACH by calling "
+            f"coord_write_task_spec(task_id={task_id!r}, body=<spec>, "
+            f"message_to_coach=<one-line summary>). That tool call "
+            f"IS your message to Coach — the kanban only knows you're "
+            f"done when you call it. Writing the spec to disk is not "
+            f"enough; the disk-write + skipped-call pattern is the "
+            f"#1 stall cause. Your turn ends only after the call "
+            f"lands. Coach reviews on the next tick and approves the "
+            f"next stage via coord_approve_stage."
+            f"{_TOOL_NOT_VISIBLE_ESCAPE}"
         )
     if role == "executor":
         # Trajectory-aware: when no audit stage follows execute, the
@@ -1181,31 +1185,42 @@ async def _completion_hint_for_role(task_id: str, role: str) -> str:
             "tool below."
         )
         return (
+            f"Do the work, then SIGNAL COACH by calling the matching "
+            f"completion tool. That tool call IS your message to Coach "
+            f"— without it your work is invisible to the team and the "
+            f"kanban can't record it. Writing the deliverable to disk "
+            f"is not enough on its own.\n\n"
             f"For code changes: coord_commit_push(message=<msg>, "
-            f"task_id={task_id!r}, message_to_coach=<your response>). "
+            f"task_id={task_id!r}, message_to_coach=<one-line summary>). "
             f"For non-code deliverables: coord_role_complete("
-            f"task_id={task_id!r}, message_to_coach=<your response>, "
-            f"artifact_path=<path?>). Pass `task_id={task_id!r}` so "
-            f"the event log routes correctly.{self_audit} Coach "
-            f"reviews on the next tick.{_TOOL_NOT_VISIBLE_ESCAPE}"
+            f"task_id={task_id!r}, message_to_coach=<one-line summary>, "
+            f"artifact_path=<path?>).{self_audit}\n\n"
+            f"Your turn ends only after the call lands. Coach reviews "
+            f"on the next tick.{_TOOL_NOT_VISIBLE_ESCAPE}"
         )
     if role in ("auditor_syntax", "auditor_semantics"):
         kind = "syntax" if role == "auditor_syntax" else "semantics"
         return (
-            f"Read the spec + the executor's commit/artifact, then call "
+            f"Read the spec + the executor's commit/artifact, then "
+            f"SIGNAL COACH with your verdict by calling "
             f"coord_submit_audit_report(task_id={task_id!r}, "
             f"kind={kind!r}, body=<your review>, "
             f"verdict='pass' or 'fail', "
-            f"message_to_coach=<your response>). The verdict is "
-            f"recorded; Coach reviews and decides. FAIL does NOT "
-            f"auto-revert in v2 — wait for Coach's wake.{_TOOL_NOT_VISIBLE_ESCAPE}"
+            f"message_to_coach=<one-line summary>). That tool call IS "
+            f"your message to Coach — writing audit_<kind>.md to disk "
+            f"and stopping is the #1 stall cause; don't fail silently.\n\n"
+            f"Coach reviews and decides. FAIL does NOT auto-revert in "
+            f"v2 — wait for Coach's wake; do not start fixing things "
+            f"based on a FAIL you saw.{_TOOL_NOT_VISIBLE_ESCAPE}"
         )
     if role == "shipper":
         return (
-            f"Merge / publish / hand-off the deliverable, then call "
-            f"coord_role_complete(task_id={task_id!r}, "
-            f"message_to_coach='shipped at <ref>'). Coach reviews "
-            f"and archives with a user-facing summary via "
+            f"Merge / publish / hand-off the deliverable, then SIGNAL "
+            f"COACH by calling coord_role_complete(task_id={task_id!r}, "
+            f"message_to_coach='shipped at <ref>'). That tool call IS "
+            f"your message to Coach — without it Coach has no idea "
+            f"the ship landed and won't archive the task. Coach "
+            f"reviews and archives with a user-facing summary via "
             f"coord_archive_task.{_TOOL_NOT_VISIBLE_ESCAPE}"
         )
     return (

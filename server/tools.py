@@ -1796,28 +1796,34 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     @tool(
         "coord_commit_push",
         (
-            "Commit staged+unstaged changes in your worktree and push the "
-            "branch. Players only (Coach never writes code). Runs:\n"
-            "  git add -A\n"
-            "  git commit -m <message>\n"
-            "  git push origin HEAD    (unless push='false')\n"
+            "**Your message to Coach that the executor work is done.** "
+            "Players only (Coach never writes code). Calling this tool "
+            "IS the act of telling Coach you've delivered — without it, "
+            "Coach has no idea your work exists, and the kanban can't "
+            "record it. Writing the code to your worktree without "
+            "calling this tool is silence.\n\n"
+            "Runs git add -A; git commit -m <message>; git push origin "
+            "HEAD (unless push='false') in your worktree, then signals "
+            "Coach via `commit_pushed` event in the per-project log.\n\n"
             "Params:\n"
             "- message: commit message (required)\n"
             "- push: 'true' (default) or 'false' to skip the push.\n"
-            "- task_id: the kanban task this commit is delivering against "
+            "- task_id: the kanban task this commit delivers against "
             "(optional but STRONGLY RECOMMENDED). When provided, the "
-            "kanban subscriber sees `commit_pushed` with task_id and "
-            "auto-routes the task to the next required review, ship, or "
-            "archive. Without task_id the commit still works but the "
-            "kanban board doesn't move (Coach has to advance manually).\n"
-            "Returns 'nothing to commit' as a soft-OK if the working tree "
-            "is clean. Requires the active project to have a repo URL "
-            "configured; push also needs pushable credentials (typically "
-            "a PAT embedded in the project repo URL).\n"
-            "- message_to_coach: optional one-line note Coach reads on "
-            "the next tick. Use this to flag what you noticed, any "
-            "caveats, what the next person should know. Carried verbatim "
-            "in the `commit_pushed` event payload."
+            "event log row carries `task_id` so Coach correlates the "
+            "commit with the right task on the next tick. Without "
+            "task_id the commit still works but lands without a "
+            "kanban link — Coach has to figure out which task it was "
+            "for.\n"
+            "- message_to_coach: ONE-LINE summary Coach reads as your "
+            "primary signal. Use this to flag what you noticed, any "
+            "caveats, what the next person should know. Carried "
+            "verbatim in the `commit_pushed` payload — this is the "
+            "field Coach reads first.\n\n"
+            "Returns 'nothing to commit' as a soft-OK if the working "
+            "tree is clean. Requires the active project to have a repo "
+            "URL configured; push also needs pushable credentials "
+            "(typically a PAT embedded in the project repo URL)."
         ),
         {
             "message": str, "push": str, "task_id": str,
@@ -4090,19 +4096,22 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         finally:
             pb_runner._run_lock.release()
 
-        # Bus event for the dashboard's live counter (§9).
-        try:
-            from server.events import bus  # noqa: PLC0415
+        # Bus event for the dashboard's live counter (§9). Skip when
+        # nothing applied so the dashboard isn't pinged with empty
+        # 0-op announcements (e.g. all proposals rejected).
+        if applied:
+            try:
+                from server.events import bus  # noqa: PLC0415
 
-            await bus.publish({
-                "ts": _now_iso(),
-                "agent_id": "coach",
-                "type": "playbook_changes_applied",
-                "operations_count": len(applied),
-                "source": "coach_mid_turn",
-            })
-        except Exception:
-            pass
+                await bus.publish({
+                    "ts": _now_iso(),
+                    "agent_id": "coach",
+                    "type": "playbook_changes_applied",
+                    "operations_count": len(applied),
+                    "source": "coach_mid_turn",
+                })
+            except Exception:
+                pass
 
         # Render the human-readable summary (§7.1 return shape).
         lines = []
@@ -4168,9 +4177,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     @tool(
         "coord_write_task_spec",
         (
-            "Write the spec.md for a task. Required before a task whose "
-            "trajectory includes `plan` can move plan→execute (gate "
-            "enforced in coord_assign_task / coord_claim_task). "
+            "**Your message to Coach that the planner work is done.** "
+            "Calling this tool IS the act of submitting your spec to "
+            "Coach — without it, Coach has no idea you've drafted "
+            "anything, and the kanban can't record the spec. Writing "
+            "spec.md to disk without calling this is silence; the "
+            "disk-write + skipped-call pattern is the #1 stall cause.\n"
+            "\n"
+            "Writes spec.md to the task's working dir + emits "
+            "`task_spec_written` to the per-project event log so "
+            "Coach reads it on the next tick. Required before a task "
+            "whose trajectory includes `plan` can move plan→execute. "
             "Trajectories without `plan` skip the spec gate.\n"
             "\n"
             "Permission: Coach can spec any task (emergency override). A "
@@ -4688,7 +4705,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     @tool(
         "coord_submit_audit_report",
         (
-            "Submit an audit report for a task.\n"
+            "**Your message to Coach that the audit is done.** "
+            "Calling this tool IS the act of delivering your verdict "
+            "+ review body to Coach — without it, Coach has no idea "
+            "you've reviewed anything, and the kanban can't record "
+            "the verdict. Writing audit_<round>_<kind>.md to disk "
+            "without calling this tool is silence; this is the #1 "
+            "stall cause for auditor roles.\n"
+            "\n"
+            "Writes the markdown report to the task's working dir + "
+            "emits `audit_report_submitted` (and `audit_fail_notification` "
+            "on FAIL) so Coach reads on the next tick.\n"
             "\n"
             "Normal use (Player-only): you have an active auditor "
             "assignment matching `kind` and submit your own review.\n"
@@ -6221,13 +6248,20 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     @tool(
         "coord_role_complete",
         (
-            "Player-only. Generic completion for roles whose real work "
-            "happens via other tools — non-git executors who wrote a "
-            "file via Write / coord_save_output / coord_write_knowledge, "
-            "or shippers who merged / published / sent via Bash or "
-            "external CLIs. Replaces v1's coord_complete_execution + "
-            "coord_mark_shipped (one tool, role inferred from your "
-            "active role row at the task's current stage).\n"
+            "**Your message to Coach that this role is done.** "
+            "Player-only. Generic completion for roles whose real "
+            "work happens via other tools — non-git executors who "
+            "wrote a file via Write / coord_save_output / "
+            "coord_write_knowledge, or shippers who merged / "
+            "published / sent via Bash or external CLIs. Calling "
+            "this tool IS the act of telling Coach you're done — "
+            "without it, Coach has no idea your work landed. "
+            "Writing the file or completing the merge without "
+            "calling this is silence; the disk-write + skipped-"
+            "call pattern is the #1 stall cause.\n"
+            "\n"
+            "Emits `task_role_completed` with your `message_to_coach` "
+            "so Coach reads on the next tick.\n"
             "\n"
             "Code work uses coord_commit_push (which carries its own "
             "completion). Spec writes use coord_write_task_spec. Audit "

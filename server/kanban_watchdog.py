@@ -822,6 +822,52 @@ async def _emit_findings(
             except Exception:
                 pass
 
+        # Self-correction nudge: when the watchdog detects a Player
+        # finished work but didn't message Coach, wake the Player
+        # directly so they get a chance to call the completion tool
+        # before Coach has to step in. Production failure mode (recurring
+        # 6th instance on 2026-05-08): Players write deliverables to
+        # disk and return idle without calling coord_*. The Coach wake
+        # below triggers an on_behalf_of override; the assignee wake
+        # here gives the Player a chance to self-correct first.
+        if verdict == VERDICT_FINISHED_NOT_REPORTED and cand.slot:
+            try:
+                from server.agents import maybe_wake_agent  # noqa: PLC0415
+                tid = cand.current_task_id or "(no task)"
+                self_nudge = (
+                    f"You appear to have finished work on task {tid} "
+                    f"but didn't send Coach the wrap-up. Watchdog "
+                    f"noticed: {v['reason'] or '(no detail)'}.\n\n"
+                    f"Your turn isn't done until you've signalled Coach "
+                    f"with the matching completion tool — writing the "
+                    f"deliverable to disk is not enough on its own. "
+                    f"Coach reads the kanban event log; if you don't "
+                    f"call the tool, Coach has no idea your work "
+                    f"exists.\n\n"
+                    f"Call ONE of these now (whichever matches your "
+                    f"role — pass `task_id={tid!r}` and a one-line "
+                    f"`message_to_coach=...` describing what you "
+                    f"delivered + any caveats):\n"
+                    f"  - coord_commit_push (code changes)\n"
+                    f"  - coord_submit_audit_report (audits)\n"
+                    f"  - coord_write_task_spec (specs)\n"
+                    f"  - coord_role_complete (everything else: "
+                    f"non-code executors, shippers)\n\n"
+                    f"If the tool isn't visible in your runtime, "
+                    f"message Coach via coord_send_message instead — "
+                    f"don't write to disk and stop."
+                )
+                await maybe_wake_agent(
+                    cand.slot, self_nudge,
+                    bypass_debounce=False,
+                    wake_source="watchdog_finished_not_reported_self",
+                )
+            except Exception:
+                logger.exception(
+                    "watchdog: assignee self-nudge wake failed "
+                    "(slot=%s)", cand.slot,
+                )
+
         if wake_high and verdict in HIGH_SEVERITY_VERDICTS:
             try:
                 from server.agents import maybe_wake_agent  # noqa: PLC0415

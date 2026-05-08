@@ -687,9 +687,13 @@ All write endpoints carry the `audit_actor` dependency (mirrors kanban-specs-v2 
 | `playbook_settled` | `{id, final_weight}` | Dashboard |
 | `playbook_staled` | `{id, final_weight, reason: "stale_low" \| "stale_unused"}` | Dashboard |
 | `playbook_soft_cap_exceeded` | `{count, dropped}` | Dashboard + `human_attention` |
-| `playbook_llm_call` | `{run_id, model, runtime, tokens, cost_usd}` | Dashboard live counter |
+| `playbook_llm_call` | `{label, model, runtime, cost_usd, duration_ms, input_tokens, output_tokens, is_error, project_id}` | Dashboard live counter — fired by the LLM wrapper after each call (Claude or Codex). `label` is the cost-basis tag (e.g. `playbook:bootstrap`, `playbook:reflection`). The detailed per-run join lives in `runs.jsonl` keyed by `run_id`; this event is for at-a-glance UI feedback, so no `run_id` is plumbed through. |
 | `playbook_reset` | `{actor}` | Dashboard |
 | `playbook_kdrive_mirror_failed` | `{error: str, files: list[str]}` | Dashboard (small banner — non-fatal) |
+| `playbook_manual_run` | `{actor, outcome}` | Dashboard — fired alongside `playbook_run_started`/`_completed` for the dashboard's "you triggered this" feedback. Distinct from the reflection lifecycle events. |
+| `playbook_manual_bootstrap` | `{actor, outcome}` | Dashboard — same shape and rationale as `playbook_manual_run` but for the manual bootstrap trigger (G7). |
+| `playbook_statement_restored` | `{id, actor}` | Dashboard — fired by `POST /api/playbook/statements/{id}/restore`. |
+| `playbook_statement_deleted` | `{id, actor}` | Dashboard — fired by `DELETE /api/playbook/statements/{id}` (soft delete). |
 
 ---
 

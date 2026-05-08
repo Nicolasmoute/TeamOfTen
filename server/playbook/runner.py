@@ -42,7 +42,6 @@ from server.playbook.mutate import (
 from server.playbook.paths import ensure_playbook_dir
 from server.playbook.store import (
     Lattice,
-    Statement,
     append_run,
     load_archive,
     load_lattice,
@@ -843,7 +842,10 @@ async def run_daily_reflection(*, manual: bool = False, force_through_no_activit
         await _publish({
             "type": "playbook_changes_applied",
             "operations_count": len(applied),
-            "source": "manual_reflection" if manual else "daily_reflection",
+            # Spec §9 enum: coach_mid_turn | daily_reflection | human_dashboard.
+            # Manual runs are triggered via POST /api/playbook/run (the
+            # dashboard's "Run now" button), hence human_dashboard.
+            "source": "human_dashboard" if manual else "daily_reflection",
         })
 
     # --- Settle / stale events
@@ -944,6 +946,7 @@ async def _persist_failure_row(
         "proposals_rejected": [],
         "engine_actions": [],
         "llm_call": llm_call,
+        "error": error,
         "outcome": outcome,
     }
     await append_run(row)

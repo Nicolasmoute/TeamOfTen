@@ -183,7 +183,11 @@ All registered in [server/tools.py](server/tools.py)'s `_tools` map and `ALLOWED
 
 ### 7.2 Player-callable — completion (signal Coach)
 
-Each completion tool does its specific real work + carries an optional `message_to_coach` field. The message is the Player's response — what they noticed, any caveats, what the next person should know. It lands in the event log row's `payload_json` and Coach reads it on the next tick.
+**Players report to Coach, not to the kanban.** The kanban is Coach's log of what Players have told them. Each completion tool below does its specific real work AND, more importantly, **IS the Player's act of signalling Coach that the role is done**. Without the tool call, Coach has no idea the Player finished — the kanban can't record what it never heard about.
+
+`message_to_coach` is the Player's primary signal: a one-line summary Coach reads first ("committed at sha X, tests pass", "lgtm — cleanly structured", "shipped to main", "spec is rough — wanted to ship something for Coach to react to"). It lands in the event log row's `payload_json` and Coach surfaces it under `## Recent events` on the next tick.
+
+**The recurring failure mode (recurring 6th instance on 2026-05-08):** Players write the deliverable to disk (spec.md, audit_<kind>.md, code commit, knowledge file) AND THEN STOP without calling the matching completion tool. The work is done; the team can't see it. The watchdog (§10.6) catches this with a `finished_not_reported` verdict and now wakes both Coach (override path) AND the assignee directly (self-correction nudge), but the proactive prevention is the framing: the wake bodies Players read on entry already say "your turn isn't done at the disk-write — it's done when Coach has received your signal."
 
 | Tool | Params | Real work it does |
 |---|---|---|
