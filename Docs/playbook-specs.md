@@ -6,9 +6,9 @@
 > system-prompt injection path) but cannot redefine fields, endpoints,
 > events, or invariants that TOT-specs declares.
 
-**Status:** DRAFT (2026-05-07). Pre-implementation, post-audit.
+**Status:** DRAFT (2026-05-08). Pre-implementation, post-second-audit.
 **Target:** TeamOfTen multi-agent harness (Python, Claude Agent SDK, kDrive-backed shared state, single-VPS)
-**Version:** 0.2 (post-audit)
+**Version:** 0.3 (post-second-audit)
 
 ---
 
@@ -117,7 +117,7 @@ What **carries over** from Compass:
 ```
 /data/playbook/
   lattice.json           # active statements (cap soft 100, hard 110)
-  archived.json          # settled / stale / merged / superseded / deleted
+  archived.json          # settled / stale_low / stale_unused / merged / superseded / deleted
   runs.jsonl             # one line per reflection run
 
 # kDrive mirror (synchronous on every write):
@@ -168,7 +168,7 @@ Field notes:
 - `weight_history` — append-only list of weight transitions with reason. Cap at 50 most recent entries (older trimmed during write); `runs.jsonl` is the durable audit trail.
 - `applied_count` — integer; incremented by the daily reflection based on Coach's `relevant_ids` list (§5.5) — every statement Coach lists as "the day's events touched on this pattern" gets `+1`, whether or not weight was adjusted. Used by the dashboard to surface "frequently observed" via the sort key `weight × log(1 + applied_count)` (so a high-weight rule that fires often ranks above a high-weight rule that almost never fires). Monotonic — never decrements.
 - `immutable` — when true, weight is locked at 1.0 and neither the daily runner nor `coord_propose_playbook_changes` can adjust weight. **No statements ship with this flag set in v1.** The flag remains in the schema as latent capability for future genuinely-must-never-erode patterns. Default false.
-- `last_validated_at` — UTC timestamp of the most recent reflection run that confirmed (validated or contradicted) this statement against evidence. NULL until first observation.
+- `last_validated_at` — UTC timestamp of the most recent reflection run that touched this statement in any way: appearance in `relevant_ids`, application of an `adjust` op, OR receipt of merged-in `applied_count` from a `drop_id`. NULL until first observation.
 
 ### 3.2 `archived.json`
 
@@ -237,7 +237,7 @@ One JSON line per reflection run. Each line:
     "cost_basis": "playbook:reflection",
     "cost_usd": 0.0184
   },
-  "outcome": "applied" | "no_changes" | "skipped_no_activity" | "skipped_cost_cap" | "error_llm" | "error_parse" | "error_validation"
+  "outcome": "applied" | "no_changes" | "skipped_no_activity" | "skipped_cost_cap" | "error_llm" | "error_parse"
 }
 ```
 
@@ -292,7 +292,7 @@ The bootstrap LLM response is parsed tolerantly: extract the first balanced JSON
 
 After 3 failed attempts: emit `playbook_bootstrap_failed{error, retries: 3}` + `human_attention`, clear `playbook_bootstrap_retries` (so a manual reset re-arms cleanly). The lattice stays empty until the operator intervenes.
 
-If the prose template file is missing on disk, bootstrap completes with an **empty lattice** (no LLM call). Every agent sees an empty `## Orchestration playbook` section in their system prompt — the section block produces empty content and concatenates to nothing in the rendered prompt. The first daily reflection run that triggers will start populating the lattice from observed evidence. Slower cold-start than the prose-seeded path but functionally identical after a few days.
+If the prose template file is missing on disk, bootstrap completes with an **empty lattice** (no LLM call). No `## Orchestration playbook` section appears in agents' system prompts (render returns empty string per §6.2). The first daily reflection run that triggers will start populating the lattice from observed evidence. Slower cold-start than the prose-seeded path but functionally identical after a few days.
 
 ---
 
@@ -324,7 +324,12 @@ Pre-flight check against `_today_spend()` vs `HARNESS_TEAM_DAILY_CAP` (read live
 
 The runner composes a structured digest of the last 24h, NOT raw events. Sections (each capped to keep prompt size bounded):
 
-- **Archived tasks (last 24h)** — up to 15. For each: `id, title, trajectory_shape, executor, audit_chain_summary, outcome_bucket ∈ {clean, friction, failed, cancelled}, cost_usd_total`. Outcome bucket from kanban-specs-v2 §22.1 + §11.1 instrumentation:
+- **Archived tasks (last 24h)** — up to 15. For each: `id, title, trajectory_shape, executor, audit_chain_summary, outcome_bucket ∈ {clean, friction, failed, cancelled}, cost_usd_total`. Field formats:
+  - `trajectory_shape` — actual stages walked, joined with `→`. Example: `"plan→execute→audit_syntax→ship"`.
+  - `audit_chain_summary` — round-by-round verdicts. Example: `"audit_syntax round 1 FAIL → round 2 PASS; audit_semantics round 1 PASS"`. Empty string when the task had no audit stages.
+  - `cost_usd_total` — sum of `turns.cost_usd` for rows where `turns.task_id = <task.id>`.
+
+  Outcome bucket from kanban-specs-v2 §22.1 + §11.1 instrumentation:
   - `clean` = no audit FAIL rounds, no rung-2+ stalls, no human_attention, no deviations_log entries, cost ≤ 1.5× median for trajectory shape.
   - `friction` = ≤ 1 audit FAIL OR rung-1 stall OR deviation noticed at audit time.
   - `failed` = ≥ 2 audit FAILs, OR rung-2+ stall, OR human_attention fired, OR deviation noticed by human.
@@ -370,7 +375,7 @@ Return a JSON object with four lists:
 {
   "relevant_ids": ["pb-XXX", "pb-YYY", ...],
   "adjustments": [
-    {"id": "pb-XXX", "delta": +0.10, "reason": "validated by 3 clean outcomes in t-abc, t-def, t-ghi"}
+    {"id": "pb-XXX", "delta": 0.10, "reason": "validated by 3 clean outcomes in t-abc, t-def, t-ghi"}
   ],
   "creations": [
     {"text": "<single sentence, conceptual, runtime-agnostic, observable>", "weight": 0.6, "reason": "pattern observed in 3 archived tasks t-..., t-..., t-..."}
@@ -393,32 +398,34 @@ Return ONLY the JSON object. No prose.
 
 ### 5.6 Validation + apply
 
-The runner parses the JSON tolerantly (same first-balanced-JSON-object extraction as bootstrap §4.4). On parse failure → log `outcome="error_parse"` + skip; no retry within the same day (next scheduler tick re-checks the daily-run gate).
+The runner parses the JSON tolerantly (same first-balanced-JSON-object extraction as bootstrap §4.4). On parse failure → log `outcome="error_parse"` + skip; no retry within the same day (next scheduler tick re-checks the daily-run gate). When parsing succeeds but every proposal is rejected by validation (and `relevant_ids` is empty), log `outcome="no_changes"` — that's a clean run that produced no useful signal, not an error.
 
 Op apply order is **fixed**:
 
-1. **Merges first.** Each merge: validate both ids exist in active lattice, neither immutable. `keep_id` retains its weight (max of the two). `drop_id` moves to `archived.json` with `archive_reason="merged"`, `merged_into=keep_id`. `keep_id`'s `weight_history` records the merge; `keep_id.applied_count += dropped.applied_count`.
-2. **Creations next** (against post-merge state). Each create: validate `text` length ≤ 500, weight ∈ [0, 1], no near-duplicate of existing statement (cosine similarity ≥ 0.85 against existing active statements via simple token overlap heuristic — full embedding matching deferred to v2). Mint new id `pb-NNN`, persist with `created_by="reflection"`. Soft cap (§5.7) checked first.
+1. **Merges first.** Each merge: validate both ids exist in active lattice, neither immutable. `keep_id` retains its weight (max of the two). `drop_id` moves to `archived.json` with `archive_reason="merged"`, `merged_into=keep_id`. `keep_id`'s `weight_history` records the merge; `keep_id.applied_count += dropped.applied_count`; `keep_id.last_validated_at = max(keep_id.last_validated_at, dropped.last_validated_at)` (NULL-safe — NULL participates as "older than any timestamp").
+2. **Creations next** (against post-merge state). Each create: validate `text` length ≤ 500, weight ∈ [0, 1], no near-duplicate of existing statement. **Near-duplicate algorithm:** Jaccard similarity over lowercased whitespace-tokenized word sets, after stripping ASCII punctuation and a small English stopword list (`a, an, the, and, or, of, to, for, in, on, at, with, is, are, be`). Threshold: Jaccard ≥ 0.7. Embedding-based dedup deferred to v2. Mint new id `pb-NNN`, persist with `created_by="reflection"`. Soft cap (§5.7) checked first.
 3. **Adjustments last** (against post-merge, post-creation state). Each adjust: validate `id` exists, not immutable, |delta| ≤ 0.25, target weight stays in [0, 1] after clamp. Apply: update `weight`, append to `weight_history`, update `last_validated_at`. Reject silently otherwise (logged in `proposals_rejected`).
 
 **Cross-op conflict:** any op targeting an id that an earlier op archived (via merge in step 1) is rejected with reason `"id_archived_in_same_run"`. Adjusts and creations referencing freshly-merged ids fall through to this rule.
 
 **`relevant_ids` increment:** independent of op apply. After all ops process, walk `relevant_ids` and increment `applied_count += 1` for each id (one increment per statement per run, regardless of how many evidence items mention it). Ids that don't exist in the active lattice OR that were just archived in step 1 are skipped silently.
 
-### 5.7 Soft cap enforcement
+### 5.7 Soft / hard cap enforcement
 
-Before applying creations (step 2), count active statements. If `active + new_creations > 100` (soft cap):
+Before applying creations (step 2), count active statements (post-merge). Apply pending engine-driven settle/stale (§5.8) actions FIRST so any creation-budget freed by archives is available. Then branch on `pressure = active + new_creations`:
 
-1. Force the runner to first apply any pending engine-driven settle/stale (§5.8) actions to free space.
-2. If still over cap, drop creations from the **end of the input list** (deterministic — Coach can prioritize by ordering its `creations` array). Log dropped creations in `proposals_rejected` with reason `"soft_cap_pressure"`.
+- **Branch A — `pressure ≤ 100` (soft cap):** apply all creations.
+- **Branch B — `100 < pressure ≤ 110`:** drop creations from the **end of the input list** (deterministic — Coach can prioritize by ordering its `creations` array) until `active + survivors == 100`. Survivors apply. Log dropped creations in `proposals_rejected` with reason `"soft_cap_pressure"`.
+- **Branch C — `pressure > 110` (hard cap):** drop **ALL** creations from the run atomically. Apply only adjusts and merges. Log every creation in `proposals_rejected` with reason `"hard_cap_pressure"`. Fire `playbook_soft_cap_exceeded{count: pressure, dropped: len(creations)}` event AND `human_attention`. Hitting the hard cap means soft-cap discipline is failing — needs operator review of the lattice.
 
-If after dropping the run would still exceed the **hard cap of 110**: drop ALL creations from the run atomically (apply only adjusts and merges), log all dropped creations, fire `playbook_soft_cap_exceeded{count, dropped}` event AND `human_attention`. Hitting hard cap means soft-cap discipline is failing — needs operator review of the lattice.
+The same cap logic applies to the `coord_propose_playbook_changes` MCP tool path (§7.1).
 
 ### 5.8 Engine-driven actions (settle / stale)
 
-After Coach's proposals are applied, the runner sweeps for engine-driven archives. Three semantically-tight predicates:
+After Coach's proposals are applied, the runner sweeps for engine-driven archives. Three semantically-tight predicates. **All three predicates also require `immutable = false`** — immutable statements are never archived by the engine.
 
 - **Settle:** an active statement is settle-eligible iff:
+  - `immutable = false`, AND
   - current `weight ≥ 0.95`, AND
   - at least one `weight_history` entry has `ts ≤ now - 7 days`, AND
   - no `weight_history` entry within the last 7 days recorded a `to` value below 0.95.
@@ -426,6 +433,7 @@ After Coach's proposals are applied, the runner sweeps for engine-driven archive
   Eligible statements move to `archived.json` with `archive_reason="settled"`.
 
 - **Stale-low:** an active statement is stale-low-eligible iff:
+  - `immutable = false`, AND
   - current `weight ≤ 0.15`, AND
   - at least one `weight_history` entry has `ts ≤ now - 7 days`, AND
   - no `weight_history` entry within the last 7 days recorded a `to` value above 0.15.
@@ -433,6 +441,7 @@ After Coach's proposals are applied, the runner sweeps for engine-driven archive
   Eligible statements move to `archived.json` with `archive_reason="stale_low"`.
 
 - **Stale-unused:** an active statement is stale-unused-eligible iff:
+  - `immutable = false`, AND
   - `applied_count == 0`, AND
   - `created_at ≤ now - 30 days`.
   
@@ -495,7 +504,7 @@ When `lattice.json` has zero active statements (cold-start before bootstrap, or 
 
 ### 6.3 Cost behavior
 
-Read every turn for every agent → cache-hits within the 5-min Anthropic prompt-cache window. Per-agent sessions each have their own cache; 8 KB × 11 agents ≈ 88 KB of cache-warm content distributed across agent sessions, but each individual turn pays only delta cost on cache hit. Lattice updates between turns invalidate cache for that agent's next turn → one full read, then back to cache hits. Net cost: trivial.
+Read every turn for every agent → cache-hits within the 5-min Anthropic prompt-cache window. Per-agent sessions each have their own cache; 8 KB × 11 agents ≈ 88 KB of cache-warm content distributed across agent sessions, but each individual turn pays only delta cost on cache hit. Lattice updates between turns invalidate cache for that agent's next turn → one full read, then back to cache hits. Net cost: trivial. Daily-run lattice updates invalidate the cache for every agent's next turn — amortized in practice because agents don't all turn simultaneously.
 
 ### 6.4 Why Players see it
 
@@ -576,7 +585,7 @@ All write endpoints carry the `audit_actor` dependency (mirrors kanban-specs-v2 
 | `playbook_changes_applied` | `{operations_count, source: "coach_mid_turn" \| "daily_reflection" \| "human_dashboard"}` | Dashboard |
 | `playbook_statement_overridden` | `{id, from, to, actor}` | Dashboard |
 | `playbook_settled` | `{id, final_weight}` | Dashboard |
-| `playbook_staled` | `{id, final_weight, reason: "low_weight" \| "unused"}` | Dashboard |
+| `playbook_staled` | `{id, final_weight, reason: "stale_low" \| "stale_unused"}` | Dashboard |
 | `playbook_soft_cap_exceeded` | `{count, dropped}` | Dashboard + `human_attention` |
 | `playbook_llm_call` | `{run_id, model, runtime, tokens, cost_usd}` | Dashboard live counter |
 | `playbook_reset` | `{actor}` | Dashboard |
@@ -679,7 +688,7 @@ A new `__playbook` slot in the LeftRail (CSS-drawn icon — distinct from Compas
 
 ### 13.1 Sections
 
-1. **Header bar** — capacity (`47 / 100`), last run timestamp, "Run now" button (calls `POST /api/playbook/run` with a confirm-modal that surfaces the activity-gate-bypass option).
+1. **Header bar** — capacity (`47 / 100`), last run timestamp (rendered in UTC; the dashboard's existing timezone toggle from the Display section applies if set), "Run now" button (calls `POST /api/playbook/run` with a confirm-modal that surfaces the activity-gate-bypass option).
 2. **Active statements** — grouped by weight bucket (Validated / Working / Uncertain / Anti-pattern). Within each bucket, sorted by `weight × log(1 + applied_count)` descending (so frequently-observed validated rules surface above rarely-observed ones). Each row:
    - Weight bar (visual: 0 left, 1 right, current weight as fill).
    - NO / ½ / YES override buttons (call `POST /api/playbook/statements/{id}/weight` with 0.0 / 0.5 / 1.0). Routed through a confirmation modal mirroring Compass's `OverrideModal`.
@@ -709,7 +718,7 @@ Listens to `playbook_*` bus events on the existing `/ws` channel and re-fetches 
 
 - [TOT-specs.md](TOT-specs.md) — umbrella spec.
 - [compass-specs.md](compass-specs.md) — Compass; the playbook borrows its lattice + proposal mechanism but operates harness-wide on AI orchestration patterns rather than per-project on human intent.
-- [kanban-specs-v2.md](kanban-specs-v2.md) — the playbook reads §22.1 deviations_log + §11.1 player health counters + §9.2 project_events as evidence; the playbook injection follows project CLAUDE.md in `build_system_prompt_suffix`, downstream of the Coach coordination block (which still owns the §14 lifecycle policy).
+- [kanban-specs-v2.md](kanban-specs-v2.md) — the playbook reads §22.1 deviations_log + §11.1 player health counters + §9.2 project_events as evidence; the playbook injection follows project CLAUDE.md in `build_system_prompt_suffix`, downstream of the Coach coordination block (which still owns the §14 lifecycle policy). **Binding dependency:** the runner's evidence-bundle composition is hardwired to these three v2 surfaces. A schema change in any of them (column rename, table restructure, event type rename) requires a coordinated playbook-runner update.
 - [recurrence-specs.md](recurrence-specs.md) — the playbook scheduler is a sibling background task, not a recurrence (no Coach turns spawned by the scheduler itself; the reflection is a direct `claude_agent_sdk.query()` call under `agent_id="playbook"`).
 - [server/templates/app_dev_playbook.md](../server/templates/app_dev_playbook.md) — the bootstrap corpus. Kept on disk after bootstrap as historical reference + re-bootstrap source.
 
@@ -775,7 +784,7 @@ Module guidelines:
 
 Measured against a representative ~30-day window after the engine ships. Pre-deploy baseline measurement is required for criterion (a).
 
-(a) **Coach behavior reflects high-confidence statements (vs baseline).** Pre-deploy: sample 50 Coach `coord_approve_stage` notes from a 7-day window. Manually classify which playbook patterns (taken from the prose template) Coach's decisions align with. Compute baseline alignment %. Post-deploy 30 days: same method against the actual lattice (high-confidence statements only). Improvement vs baseline = signal; flat = playbook isn't moving Coach.
+(a) **Coach behavior reflects high-confidence statements (vs baseline).** Pre-deploy: sample 50 Coach `coord_approve_stage` notes from a 7-day window. Manually classify which playbook patterns (taken from the prose template) Coach's decisions align with. Compute baseline alignment %. Post-deploy 30 days: same method against the actual lattice (high-confidence statements only). Improvement vs baseline = signal; flat = playbook isn't moving Coach. **Resource ask:** the manual classification takes ~30 minutes of operator time pre-deploy and again at the 30-day mark — schedule the work or this criterion goes unmeasured.
 
 (b) **Weights actually move.** Across the 30-day window, ≥ 50% of active statements should have at least one `weight_history` entry from a reflection run (i.e. the daily runner is finding signal, not just no-op'ing). If < 30% move, the activity gate or evidence bundle is not surfacing enough for Coach to reason about — sharpen the bundle composition (§5.4).
 
