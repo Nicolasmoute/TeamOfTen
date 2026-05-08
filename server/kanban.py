@@ -199,9 +199,10 @@ async def _handle_event(ev: dict[str, Any]) -> None:
     # of the v1 dispatch below — this just records, it doesn't drive
     # transitions. Failure-isolated inside the helper, so a DB hiccup
     # never breaks the v1 dispatch.
+    project_event_id: int | None = None
     try:
         from server.project_events import maybe_write_from_bus
-        await maybe_write_from_bus(ev)
+        project_event_id = await maybe_write_from_bus(ev)
     except Exception:
         logger.exception(
             "kanban: project_events mirror failed on event %r", etype
@@ -211,7 +212,9 @@ async def _handle_event(ev: dict[str, Any]) -> None:
     if etype == "commit_pushed":
         await _on_commit_pushed(ev)
     elif etype == "audit_report_submitted":
-        await _on_audit_submitted(ev)
+        # Pass the project_events row id so audit-FAIL deviations_log
+        # rows can carry source_event_id back to the triggering event.
+        await _on_audit_submitted(ev, project_event_id=project_event_id)
     elif etype == "compass_audit_logged":
         await _on_compass_audit_logged(ev)
 
@@ -240,12 +243,21 @@ async def _on_commit_pushed(ev: dict[str, Any]) -> None:
             _recent_commit_per_project[project_id] = (sha, task_id)
 
 
-async def _on_audit_submitted(ev: dict[str, Any]) -> None:
+async def _on_audit_submitted(
+    ev: dict[str, Any],
+    *,
+    project_event_id: int | None = None,
+) -> None:
     """v2 record-only handler. On verdict='fail' emits the Coach-bound
     `audit_fail_notification` (kind_round + escalate flag computed from
     fail history) and inserts a `deviations_log{noticed_at='audit'}`
     row so Coach sees the FAIL on the next tick and the §22.1
     instrumentation has the data point. NEVER reverts the stage.
+
+    `project_event_id` is the id of the `audit_report_submitted`
+    project_events row that triggered this handler — passed in from
+    `_handle_event` so the deviations_log row's `source_event_id`
+    column can carry the causal pointer per §22.1.
 
     Pass-verdict events get NO subscriber action — the project_events
     mirror in maybe_write_from_bus already records them. Coach reads
@@ -304,12 +316,13 @@ async def _on_audit_submitted(ev: dict[str, Any]) -> None:
                 await c.execute(
                     "INSERT INTO deviations_log "
                     "(project_id, ts, task_id, executor, "
-                    " noticed_at, description) "
-                    "VALUES (?, ?, ?, ?, 'audit', ?)",
+                    " noticed_at, description, source_event_id) "
+                    "VALUES (?, ?, ?, ?, 'audit', ?, ?)",
                     (
                         project_id,
                         datetime.now(timezone.utc).isoformat(),
                         task_id, executor, description,
+                        project_event_id,
                     ),
                 )
                 await c.commit()

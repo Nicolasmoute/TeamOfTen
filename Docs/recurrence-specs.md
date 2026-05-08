@@ -133,15 +133,23 @@ prompt from project state, with priority:
    is a safety net, not a plan; Coach should beat it whenever
    possible. Stage transitions themselves require Coach to call
    `coord_approve_stage` — the kanban records, Coach routes.
-2. **Todos** — for each open `coach-todos.md` entry, find the smallest
-   movable next step and take it. External blockers (pending user
-   verdict, prod soak, Player unavailable, env issues outside scope)
-   change *what* the next move is, never *whether* one exists.
-   Zero-cost forward motions are always available — probe DMs, status
-   pings, clarifying questions to the human, read-only diagnostics,
-   capturing fresh observations, or splitting a todo into smaller
-   pieces. The branch explicitly rejects "everything is gated" and
-   "marginal value has gone to zero" as rationalizations.
+2. **Todos** — pick exactly ONE open `coach-todos.md` entry and execute
+   toward **closing** it this turn. The branch's goal is
+   `coord_complete_todo`. If a single turn is enough, finish the work
+   and complete the todo now. If not, the action must materially
+   advance the SAME todo toward closure (assign to a Player with a
+   clear deliverable, draft and send the deliverable, write the
+   decision, schedule the dependency). Probe DMs, pings, and
+   observations are legitimate **only** when they directly enable the
+   next closure step on the same todo — not as standalone activity.
+   Skimming across todos to drop a micro-touch on each is the
+   antipattern this branch exists to prevent. External blockers
+   (pending user verdict, prod soak, Player unavailable, env outside
+   scope) change *what* the closure step is, never *whether* one
+   exists. The branch explicitly rejects "everything is gated" and
+   "marginal value has gone to zero" as rationalizations. Pick the
+   most closable item, focus, close it (or move it visibly closer),
+   then stop.
 3. **Objectives** — if no inbox items, no kanban issues, and no open
    todos, consult `project-objectives.md` and pick **one concrete
    action** that materially advances an objective. Coach must take
@@ -169,17 +177,24 @@ prompt is short — it just orients Coach to the priority order:
 > prompt above — auto-reassign fires at 2h, auto-archive at 4h.
 > Intervene before the safety net does (nudge the blocker, reassign,
 > or bump effort/model for repeat audit fails).
-> (2) Open coach-todos — for each open todo, find the smallest movable
-> next step and take it. External blockers (pending user verdict, prod
-> soak running, Player unavailable, harness env outside Coach scope)
-> change WHAT the next move is, never WHETHER one exists. Zero-cost
-> forward motions are always available: a probe DM to a silent Player,
-> a status ping or clarifying question to the human, a read-only
-> diagnostic, a fresh observation captured to memory, or splitting the
-> todo into smaller pieces. Reject "everything is gated" and "marginal
-> value has gone to zero" — those are rationalizations that mask a
-> movable smallest-step. End this branch only after examining each
-> open todo through this lens.
+> (2) Open coach-todos — pick exactly ONE todo and execute toward
+> CLOSING it this turn. The goal of this branch is
+> coord_complete_todo. If you can finish the work in this turn,
+> finish it now and call coord_complete_todo. If a single turn isn't
+> enough, the action you take must materially advance the SAME todo
+> toward closure: assign it to a Player with a clear deliverable,
+> draft and send the actual deliverable, write the decision, schedule
+> the dependency. Probe DMs, status pings, and observations are
+> legitimate ONLY when they directly enable the next closure step on
+> the same todo — never as standalone "I touched something" activity.
+> Skimming across todos to drop a micro-touch on each is the
+> antipattern this branch exists to prevent. External blockers
+> (pending user verdict, prod soak, Player unavailable, env outside
+> scope) change WHAT the next closure step is, never WHETHER one
+> exists. Reject "everything is gated" and "marginal value has gone
+> to zero" — they are rationalizations. Pick the most closable item,
+> focus on it, close it (or move it visibly closer to closed), then
+> stop.
 > (3) Drive the objectives — if inbox AND todos are both empty, you
 > must still pick one concrete action that materially advances a
 > project objective. Examples: assign a Player to scout an open
@@ -214,6 +229,20 @@ on a prod soak, a clarifying question to push a verdict forward —
 all turned out to be available zero-cost moves. The new wording
 treats those moves as the *default* and frames "everything is gated"
 as the rationalization it almost always is.
+
+A second iteration tightened step (2) further. The
+"smallest-movable-next-step" framing turned out to permit a different
+failure mode: Coach would skim across many todos, drop a micro-touch
+(a ping, a status note, a captured observation) on each, and end the
+turn having moved nothing closer to `coord_complete_todo`. The
+current wording requires Coach to (a) pick **exactly one** todo,
+(b) aim the action at **closing** it (`coord_complete_todo` is the
+explicit branch goal), and (c) treat probes / pings / observations
+as legitimate only when they directly enable the next closure step
+on the *same* todo — not as standalone activity. Skimming is named
+as the antipattern. The branch ends with the chosen todo either
+completed or visibly closer to completion; cross-todo touch-passes
+are not the goal.
 
 This replaces today's `COACH_TICK_PROMPT`.
 

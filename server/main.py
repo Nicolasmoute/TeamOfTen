@@ -3745,6 +3745,7 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
         # time.
         first_entry = trajectory[0]
         first_to: list[str] = first_entry.get("to") or []
+        planted_first_stage = False
         if len(first_to) == 1:
             first_role = role_for_stage[first_entry["stage"]]
             eligible_json = json.dumps(first_to, separators=(",", ":"))
@@ -3756,6 +3757,7 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
                 (task_id, first_role, eligible_json, first_to[0],
                  now_iso, now_iso),
             )
+            planted_first_stage = True
         await c.commit()
     finally:
         await c.close()
@@ -3774,20 +3776,28 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
             "trajectory": trajectory,
         }
     )
-    # v0.3 audit fix (item 2): emit task_stage_changed for the initial
-    # stage so the kanban subscriber wakes the first-stage assignee.
-    await bus.publish(
-        {
-            "ts": now_iso,
-            "agent_id": "system",
-            "type": "task_stage_changed",
-            "task_id": task_id,
-            "from": None,
-            "to": initial_status,
-            "reason": "task_created",
-            "owner": initial_owner,
-        }
-    )
+    # v2 §7.1: emit task_stage_changed ONLY when the first-stage role
+    # row was planted (single-name `to`). Pool/empty first-stage entries
+    # don't fire the stage-change event — Coach picks the assignee
+    # later via /approve_stage, which fires its own task_role_assigned
+    # (and skips task_stage_changed on the same-stage first plant).
+    # Without this gate, every UI-created pool/default task would write
+    # a misleading task_stage_changed row to project_events and falsely
+    # reset the board safety ring's "board moved" signal.
+    if planted_first_stage:
+        await bus.publish(
+            {
+                "ts": now_iso,
+                "agent_id": "system",
+                "type": "task_stage_changed",
+                "task_id": task_id,
+                "from": None,
+                "to": initial_status,
+                "reason": "task_created",
+                "owner": initial_owner,
+                "assignee": initial_owner,
+            }
+        )
     return {
         "ok": True,
         "task_id": task_id,
@@ -4163,7 +4173,41 @@ async def post_task_approve_stage(
                 400,
                 detail=f"task {task_id} is already archived; archived tasks are read-only.",
             )
-        if not _valid_transition(old_status, next_stage):
+        # v2 §7.1 same-stage allowance — mirrors the MCP coord_approve_stage
+        # logic. When a task was created with a pool/empty first-stage `to`,
+        # tasks.status is set to that stage but no role row plants; the
+        # human's first /approve_stage call has next_stage equal to current
+        # status. _valid_transition rejects same-stage by default, so
+        # special-case: allow same-stage IFF no active role row exists at
+        # the target stage. If a row already exists, this is a normal
+        # supersede attempt — reject and direct caller to the next stage.
+        is_same_stage_plant = False
+        if (
+            old_status == next_stage
+            and next_stage != "archive"
+            and target_role is not None
+        ):
+            cur = await c.execute(
+                "SELECT 1 FROM task_role_assignments "
+                "WHERE task_id = ? AND role = ? "
+                "AND completed_at IS NULL AND superseded_by IS NULL "
+                "LIMIT 1",
+                (task_id, target_role),
+            )
+            if await cur.fetchone():
+                raise HTTPException(
+                    400,
+                    detail=(
+                        f"task {task_id} is already in {next_stage!r} "
+                        f"with an active {target_role} role. Same-stage "
+                        f"approve_stage is only valid as the first plant "
+                        f"when the task was created with a pool/empty "
+                        f"first-stage `to`. Approve into the next stage "
+                        f"instead, or rewrite the trajectory."
+                    ),
+                )
+            is_same_stage_plant = True
+        if not is_same_stage_plant and not _valid_transition(old_status, next_stage):
             raise HTTPException(
                 400,
                 detail=f"invalid transition: {old_status} → {next_stage}",
@@ -4246,18 +4290,19 @@ async def post_task_approve_stage(
         await c.close()
 
     ts = datetime.now(timezone.utc).isoformat()
-    await bus.publish({
-        "ts": ts,
-        "agent_id": "human",
-        "type": "task_stage_changed",
-        "task_id": task_id,
-        "from": old_status,
-        "to": next_stage,
-        "reason": "approve_stage_human",
-        "assignee": assignee,
-        "note": req.note or None,
-        "owner": assignee if next_stage == "execute" else None,
-    })
+    if not is_same_stage_plant:
+        await bus.publish({
+            "ts": ts,
+            "agent_id": "human",
+            "type": "task_stage_changed",
+            "task_id": task_id,
+            "from": old_status,
+            "to": next_stage,
+            "reason": "approve_stage_human",
+            "assignee": assignee,
+            "note": req.note or None,
+            "owner": assignee if next_stage == "execute" else None,
+        })
     if next_stage != "archive" and target_role and assignee:
         await bus.publish({
             "ts": ts,

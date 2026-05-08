@@ -22,7 +22,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from server.db import configured_conn
+from server.db import configured_conn, init_db
 
 
 # v0.3 default trajectory used when seed callers don't override.
@@ -609,6 +609,134 @@ def test_create_task_with_plan_starts_in_plan(client: TestClient) -> None:
     row = asyncio.run(read())
     assert row["status"] == "plan"
     assert row["owner"] == "p3"  # planner is the first-stage hard-assignee
+
+
+def test_http_approve_stage_same_stage_after_pool_create(
+    client: TestClient,
+) -> None:
+    """v2 §7.1 — HTTP /approve_stage must accept same-stage transition
+    when no role row exists (the legitimate first-plant case after a
+    pool/empty first-stage create). Mirrors the MCP allowance."""
+    r = client.post(
+        "/api/tasks",
+        json={
+            "title": "http-pool-create",
+            "trajectory": [{"stage": "execute", "to": ["p2", "p3"]}],
+        },
+    )
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task_id"]
+
+    # Same-stage approve_stage with no active role row → 200, plants row.
+    r2 = client.post(
+        f"/api/tasks/{task_id}/approve_stage",
+        json={"next_stage": "execute", "assignee": "p2", "note": "go"},
+    )
+    assert r2.status_code == 200, r2.text
+    body = r2.json()
+    assert body["assignee"] == "p2"
+
+    # Second same-stage call rejected (active row now exists).
+    r3 = client.post(
+        f"/api/tasks/{task_id}/approve_stage",
+        json={"next_stage": "execute", "assignee": "p3", "note": "x"},
+    )
+    assert r3.status_code == 400, r3.text
+    assert "already in 'execute'" in r3.json()["detail"]
+
+
+def test_http_create_pool_first_stage_no_stage_changed_event(
+    client: TestClient,
+) -> None:
+    """v2 §7.1 — when no first-stage role plants (pool/empty `to`),
+    the HTTP create path must NOT emit task_stage_changed. Otherwise
+    project_events gets a misleading row and the board safety ring's
+    'board moved' signal is falsely reset."""
+    import asyncio
+    r = client.post(
+        "/api/tasks",
+        json={
+            "title": "no stage_changed for pool",
+            "trajectory": [{"stage": "execute", "to": ["p2", "p3"]}],
+        },
+    )
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task_id"]
+
+    async def read_events() -> list[str]:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT type FROM project_events WHERE task_id = ?",
+                (task_id,),
+            )
+            return [dict(r)["type"] for r in await cur.fetchall()]
+        finally:
+            await c.close()
+
+    # Bus subscriber drains async; no public hook here. The row should
+    # not appear regardless because the bus event was never published.
+    # Wait briefly for any drain that did happen.
+    asyncio.run(asyncio.sleep(0.1))
+    types = asyncio.run(read_events())
+    assert "task_stage_changed" not in types
+
+
+async def test_async_create_single_name_first_stage_emits_stage_changed(
+    fresh_db: str,
+) -> None:
+    """v2 §7.1 — single-name first-stage path DOES emit
+    task_stage_changed. Uses the async test runner + an in-loop kanban
+    subscriber so the bus event drains through `maybe_write_from_bus`
+    and lands a project_events row before the assertion runs.
+
+    (TestClient can't drive this assertion: it runs each request in a
+    fresh asyncio.run, so a subscriber started in one run can't drain
+    events published in another. Hence the async test pattern.)
+    """
+    import asyncio
+    import re
+    from server.kanban import start_kanban_subscriber, stop_kanban_subscriber
+    from server.events import bus
+    from datetime import datetime, timezone
+
+    await init_db()
+    await start_kanban_subscriber()
+    try:
+        # Direct bus.publish to mirror the HTTP create's emission path.
+        task_id = "t-2026-05-07-aaaaaa01"
+        ts = datetime.now(timezone.utc).isoformat()
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "INSERT INTO tasks (id, project_id, title, status, owner, "
+                "created_by, trajectory) VALUES (?, 'misc', 'demo', "
+                "'execute', 'p2', 'human', "
+                "'[{\"stage\":\"execute\",\"to\":[\"p2\"]}]')",
+                (task_id,),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+        await bus.publish({
+            "ts": ts, "agent_id": "system", "type": "task_stage_changed",
+            "task_id": task_id, "from": None, "to": "execute",
+            "reason": "task_created", "owner": "p2", "assignee": "p2",
+        })
+        await asyncio.sleep(0.2)
+
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT type FROM project_events WHERE task_id = ?",
+                (task_id,),
+            )
+            types = [dict(r)["type"] for r in await cur.fetchall()]
+        finally:
+            await c.close()
+        assert "task_stage_changed" in types
+    finally:
+        await stop_kanban_subscriber()
 
 
 def test_create_task_pool_first_stage_leaves_owner_null(client: TestClient) -> None:

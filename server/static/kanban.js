@@ -690,15 +690,19 @@ function AssignRoleModal({ target, onClose, onAssign }) {
         <div class="kbn-modal-head">Assign ${label}</div>
         <form onSubmit=${submit}>
           <div class="kbn-modal-task">${target.task.title || target.task.id}</div>
-          <label class="kbn-label">Player or pool</label>
+          <label class="kbn-label">Assignee (one Player)</label>
           <input
             class="kbn-input"
             type="text"
             value=${to}
-            placeholder="p3 or p3,p4"
+            placeholder="p3"
             onInput=${(e) => setTo(e.target.value)}
             autoFocus
           />
+          <div class="kbn-help-mini">
+            v2: pools are FYI only — pick one named Player. Calls
+            POST /api/tasks/&lt;id&gt;/approve_stage.
+          </div>
           ${err ? html`<div class="kbn-error">${err}</div>` : null}
           <div class="kbn-modal-actions">
             <button type="button" class="kbn-btn" onClick=${onClose} disabled=${busy}>Cancel</button>

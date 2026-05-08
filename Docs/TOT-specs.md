@@ -27,10 +27,11 @@ Dependent specs (subordinate to this document):
 - `Docs/kanban-specs-v2.md` — Kanban-shaped task lifecycle (shape (2)
   routing through Coach). Every Coach delegation is a tracked task;
   the kanban records and surfaces but does not auto-route. Coach
-  reviews every stage transition via `coord_approve_stage` unless the
-  task is created with `auto_advance: true` (mechanical fast-path).
-  Trajectory Coach defines on `coord_create_task` is the planned
-  contract; pools are advisory (Coach assigns one named Player).
+  reviews EVERY stage transition via `coord_approve_stage` — there is
+  no `auto_advance` flag and no auto-routing escape hatch (per
+  kanban-specs-v2.md §16.2 + §23). Trajectory Coach defines on
+  `coord_create_task` is the planned contract; pools are FYI only
+  (Coach explicitly assigns one named Player at each transition).
   Stages: plan → execute → audit_syntax → audit_semantics → ship →
   archive. A new per-project event log feeds Coach's tick context;
   pattern-detection counters (Player health, audit aggregator,
@@ -469,8 +470,9 @@ Sessions are project-scoped:
 Coach:
 
 - Reads human goals and Player reports.
-- Creates top-level tasks.
-- Assigns Players using `coord_assign_task`.
+- Creates top-level tasks (`coord_create_task` with a trajectory).
+- Drives stage transitions and assigns Players via
+  `coord_approve_stage` (the single v2 transition tool).
 - Assigns player names/roles with `coord_set_player_role`.
 - Tunes per-Player execution knobs via
   `coord_set_player_runtime` / `coord_set_player_model` /
@@ -550,7 +552,7 @@ Soft enforcement:
 
 When a Player is locked:
 
-- Coach `coord_assign_task` to that Player fails.
+- Coach `coord_approve_stage(assignee=<locked-slot>)` fails.
 - Coach direct `coord_send_message` to that Player fails.
 - Coach broadcasts can be queued, but locked Players filter them out when
   calling `coord_read_inbox`.
@@ -1935,7 +1937,8 @@ ignore the env var. Documented as deprecated.
 
 Triggers:
 
-- Coach `coord_assign_task`: wakes assignee, bypasses debounce.
+- Coach `coord_approve_stage`: wakes the named assignee with the
+  `note` as the wake body, bypasses debounce.
 - Agent `coord_send_message` to direct recipient: wakes recipient, debounce
   applies.
 - Human `POST /api/messages` to direct recipient: wakes recipient, bypasses
@@ -2002,45 +2005,70 @@ so permissions do not depend on the model truthfully passing its identity.
 - Optional `status`.
 - Optional `owner`, with `null`/`none`/`unassigned` matching `owner IS NULL`.
 
-`coord_create_task(title, description?, parent_id?, priority?)`
+`coord_create_task(title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?)`
 
-- Coach can create top-level tasks.
-- Players can only create subtasks under tasks they own.
-- If a Player omits `parent_id`, their `current_task_id` is used.
+- Coach can create top-level tasks; Players can only create subtasks
+  under tasks they own. If a Player omits `parent_id`, their
+  `current_task_id` is used.
 - Priority: `low`, `normal`, `high`, `urgent`.
-- Emits `task_created`.
+- `trajectory` is REQUIRED for Coach: ordered list of `{stage, to,
+  focus?}` documenting the planned path. Pools are FYI only — the
+  first-stage entry is the only auto-plant (when `to` is a single
+  named slot). Subsequent stages never auto-plant; Coach drives them
+  via `coord_approve_stage`.
+- Emits `task_created` and (only when the first stage planted)
+  `task_role_assigned` + `task_stage_changed{from=null}`.
+- See `Docs/kanban-specs-v2.md` §7.1 for the canonical contract.
 
-`coord_claim_task(task_id)`
-
-- Players only.
-- Task must be `open`.
-- Player must not already have `current_task_id`.
-- Atomic update guarded by `status='open'`.
-- Sets `owner`, `status='claimed'`, `claimed_at`, and agent
-  `current_task_id`.
-- Emits `task_claimed`.
-
-`coord_update_task(task_id, status, note?)`
-
-- Status must be valid state-machine transition.
-- Owner can update.
-- Coach can cancel any task.
-- Completing/cancelling clears current owner pointer.
-- Emits `task_updated`.
-- If a non-human creator needs to know about done/blocked/cancelled, sends a
-  system message back to creator.
-
-`coord_assign_task(task_id, to)`
+`coord_approve_stage(task_id, next_stage, assignee, note?)`
 
 - Coach only.
-- Target must be `p1` to `p10`.
-- Target must not be locked.
-- Target must not already own a task.
-- Task must be `open`.
-- Atomic update to `claimed` and owner.
-- Sets target `current_task_id`.
-- Emits `task_assigned`.
-- Auto-wakes assignee.
+- THE single stage-transition tool in v2. Replaces v1's
+  `coord_advance_task_stage` and the four `coord_assign_*` variants.
+- `next_stage` ∈ {plan, execute, audit_syntax, audit_semantics, ship,
+  archive}; transition validated against the §3.1 state machine.
+- `assignee` is required for any non-archive `next_stage`; pass a
+  single Player slot. Pools are FYI only — pick one explicit name.
+- Atomically: stamps `last_stage_change_at`; deactivates any prior
+  active role row at the target stage (with stand-down wake);
+  deactivates the source-stage role row when Coach overrides without
+  source completion; plants the fresh role row; emits
+  `task_stage_changed` + `task_role_assigned`; fires the wake using
+  `note` as the verbatim brief.
+- Same-stage allowance (§7.1): when called with `next_stage` equal to
+  current status AND no active role row exists at the target, plants
+  the row without firing `task_stage_changed`. Used as the first plant
+  after a pool/empty first-stage create.
+- See `Docs/kanban-specs-v2.md` §7.1.
+
+`coord_archive_task(task_id, summary)`
+
+- Coach only.
+- Deliberate archive with a user-facing summary. Marks every active
+  role row complete, transitions to archive, emits `task_archived`
+  with the summary in the payload.
+- v2 has NO auto-archive on trajectory completion — every task ends
+  with this Coach-written wrap-up.
+
+`coord_set_task_trajectory(task_id, trajectory)`
+
+- Coach only.
+- Mid-flight reroute. Cannot remove a stage already entered; can
+  insert / drop unentered stages and change `to` candidates.
+- Emits `task_trajectory_changed`.
+
+`coord_update_task(task_id, status='archive', note?)`
+
+- DEPRECATED for stage transitions in v2 — use `coord_approve_stage`.
+- Tolerated only as the fast-cancellation backstop
+  (`status='archive'` without a user-facing summary). Prefer
+  `coord_archive_task` so the user sees a deliberate wrap-up.
+
+The v1 tools `coord_claim_task` / `coord_accept_role` /
+`coord_advance_task_stage` / `coord_assign_task` /
+`coord_assign_planner` / `coord_assign_auditor` /
+`coord_assign_shipper` / `coord_complete_execution` /
+`coord_mark_shipped` are REMOVED in v2 (see kanban-specs-v2.md §7.3).
 
 ### 12.2 Messaging
 
@@ -3241,9 +3269,9 @@ above peer chatter and tool narration):
   including broadcasts and inter-Player chatter), to
   `.event.task_assigned` (a task hand-off is an inter-agent comm act),
   and to `tool_use` cards for tools tagged `comm-tool`
-  (`coord_send_message`, `coord_assign_task` — the *moment* the agent
-  makes an inter-agent call). Distinct from Tier 1 at a glance without
-  competing for attention.
+  (`coord_send_message`, `coord_approve_stage` — the *moment* the
+  agent makes an inter-agent call). Distinct from Tier 1 at a glance
+  without competing for attention.
 - **Tier 3 — work narration.** Muted (`--muted`) body text. Applies
   to `.event.tool_use` (non-comm), `.event.tool_result`,
   `.event.thinking`, `.event.sys`, `.event.result`, and lifecycle
@@ -3270,7 +3298,7 @@ needs to be readable in chat too instead of buried in the
 Routing logic for `message_sent` lives in [server/static/app.js](../server/static/app.js)'s
 event renderer — it adds `.human-thread` or `.peer-thread` based on
 `from`/`to` ids before the CSS tiering takes over. The `comm-tool`
-class for `coord_send_message` / `coord_assign_task` is added in
+class for `coord_send_message` / `coord_approve_stage` is added in
 [server/static/tools.js](../server/static/tools.js)'s
 `renderGenericCard` via the `COMM_TOOLS` set.
 

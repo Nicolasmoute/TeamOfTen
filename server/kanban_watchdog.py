@@ -337,7 +337,7 @@ Read its last few events + current task state and classify each one.
 
 Verdicts (use exactly these strings):
 - progressing — actually fine, ignore. SQL flagged a false positive.
-- finished_not_reported — the agent declared completion in chat ("done", "wrote spec.md", "ready for review", "I've finished") but did NOT call the matching kanban completion tool (coord_write_task_spec / coord_commit_push / coord_complete_execution / coord_submit_audit_report / coord_mark_shipped) so the task is stuck.
+- finished_not_reported — the agent declared completion in chat ("done", "wrote spec.md", "ready for review", "I've finished") but did NOT call the matching v2 kanban completion tool (coord_write_task_spec for planners, coord_commit_push for code executors, coord_role_complete for non-code executors and shippers, coord_submit_audit_report for auditors) so the task is stuck.
 - blocked — the agent reported it cannot proceed (ambiguous spec, missing info, dependency gap, audit feedback unclear) and is waiting for Coach to clarify or unblock.
 - erroring — the agent encountered an error or exception in a recent tool_result and did NOT recover (no retry, no escalation, no message to Coach).
 - looping — the agent has repeated similar actions without progress (re-reading the same files, restating what it will do, calling the same tool with the same args).
@@ -828,11 +828,13 @@ async def _emit_findings(
                 body = (
                     f"Watchdog flagged {cand.slot} as {verdict}: "
                     f"{v['reason'] or '(no detail)'}. Decide whether to "
-                    f"clarify (coord_send_message), advance the task on "
-                    f"their behalf (coord_advance_task_stage / "
-                    f"coord_write_task_spec / coord_submit_audit_report "
-                    f"with on_behalf_of=...), reassign "
-                    f"(coord_assign_*), or escalate "
+                    f"clarify (coord_send_message), submit the artifact "
+                    f"on their behalf via coord_write_task_spec(..., "
+                    f"on_behalf_of=<slot>) or coord_submit_audit_report"
+                    f"(..., on_behalf_of=<slot>) and then advance via "
+                    f"coord_approve_stage, reassign within the stage via "
+                    f"coord_approve_stage(next_stage=<same>, "
+                    f"assignee=<other-slot>), or escalate "
                     f"(coord_request_human)."
                 )
                 await maybe_wake_agent(
