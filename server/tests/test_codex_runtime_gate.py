@@ -1713,12 +1713,14 @@ class _CompactFakeClient:
 
 
 async def test_codex_run_manual_compact_uses_native_compact(
-    monkeypatch,
+    monkeypatch, fresh_db,
 ) -> None:
     import server.agents as agentsmod
+    import server.db as dbmod
     import server.runtimes.codex as codex_mod
     from server.runtimes.base import TurnContext
 
+    await dbmod.init_db()
     monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
     captured = _capture_emit(monkeypatch)
     notes: list[tuple[str, str | None]] = []
@@ -1832,8 +1834,10 @@ async def test_codex_maybe_auto_compact_below_threshold_returns_false(
 
 
 async def test_codex_maybe_auto_compact_trips_native_compact(
-    monkeypatch,
+    monkeypatch, fresh_db,
 ) -> None:
+    import server.db as dbmod
+    await dbmod.init_db()
     """Used/window ratio over threshold → emit auto_compact_triggered,
     delegate to run_manual_compact (native client.compact_thread),
     persist continuity_note, clear codex_thread_id, emit
