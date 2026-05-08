@@ -20,18 +20,20 @@
 
 > AI agents are remarkable 90% of the time. The other 10% quietly compounds.
 
-A wrong assumption made on turn 3, baked in by turn 30. A constraint missed. A subtle drift from the spec — subtle, then sudden, then everywhere. **Longer prompts don't fix this.** Bigger swarms make it worse. Existing tools either hide drift behind a dashboard or trap you in one-on-one chat.
+A wrong assumption made on turn 3, baked in by turn 30. A constraint missed. A subtle drift from the spec — subtle, then sudden, then everywhere. **Longer prompts don't fix this.** Scale it across a swarm of agents, across multiple projects, and the 10% compounds into chaos. Existing tools either hide drift behind a dashboard or trap you in one-on-one chat.
 
-TeamOfTen is the opposite shape. Four things, working together:
+TeamOfTen is the opposite shape. The constraint is deliberate: **one Coach, ten Players, max** — small enough that one operator can keep the wheel. Six things, working together:
 
 | | | |
 |--|--|--|
-| 🧭 | **Compass** | A probabilistic strategy engine maintains a YES/NO world-model of your project. Asks *you* the high-uncertainty questions. Audits every artifact. Catches drift before it ships. |
-| 🔒 | **Truth** | A `truth/` folder agents *cannot write to.* Coach proposes diffs; you approve. The source-of-truth doesn't drift behind your back. |
-| 🗂️ | **Kanban lifecycle** | Tasks move through plan → execute → syntax audit → semantic audit → ship → archive. Every stage has an owner, a gate, and a markdown artifact. Execution drift has to show itself. |
-| 🪟 | **All glass** | Eleven panes, every tool call live, every agent steerable. The agent chatter *is* the interface. |
+| 🔒 | **Truth** | A `truth/` folder agents *cannot write to.* Coach proposes diffs; you approve. The spec is the spec — agents stay on track. |
+| 🧭 | **Compass** | A probabilistic strategy engine reads your specs, wiki, and answers — then maintains a YES/NO world-model of what you're actually trying to build, beyond what's literally written. Audits every artifact for drift. |
+| 🗂️ | **Kanban** | Every Coach-delegated task is logged to a kanban board with stage, owner, gate, and markdown artifacts. Drift has nowhere to hide; humans and agents share one ground-truth view of who is doing what. |
+| 📘 | **Playbook** | A self-improving lattice of orchestration patterns. The harness watches what works and what doesn't — *audit-every-code-change*, *don't loop the same pair twice* — and adapts. Adaptive learning, written down. |
+| ⏱️ | **Recurrence** | Coach fires on intervals you set: smart pulses, fixed repeats, calendar crons. Inbox swept every N minutes, daily briefings at 9am, weekly digests on Friday — set once and the team runs itself. |
+| 🪟 | **All glass** | Eleven panes, every tool call live, every agent steerable. The agent chatter *is* the interface — and it follows you. Web UI, mobile-optimized swipe deck, Telegram chat, a kDrive/Nextcloud-mirrored markdown wiki you can read from any device. The team is wherever you are. |
 
-One Coach. Ten Players. One operator. One VPS.
+One Coach. Ten Players. One operator. One VPS. **Full transparency, full control, available anywhere.**
 
 [![TeamOfTen multi-pane UI](Docs/Screenshot%202026-04-29%20230510.jpg)](Docs/Screenshot%202026-04-29%20230510.jpg)
 
@@ -39,10 +41,12 @@ One Coach. Ten Players. One operator. One VPS.
 
 ## Table of contents
 
-- [Compass — a strategy engine for your team](#compass--a-strategy-engine-for-your-team)
 - [Truth — write-protected by default](#truth--write-protected-by-default)
+- [Compass — a strategy engine for your team](#compass--a-strategy-engine-for-your-team)
 - [Kanban — drift control for execution](#kanban--drift-control-for-execution)
-- [All glass — eleven panes, no black box](#all-glass--eleven-panes-no-black-box)
+- [Playbook — adaptive orchestration learning](#playbook--adaptive-orchestration-learning)
+- [Recurrence — Coach on a schedule](#recurrence--coach-on-a-schedule)
+- [All glass — eleven panes, anywhere](#all-glass--eleven-panes-anywhere)
 - [Two runtimes — Claude Code & OpenAI Codex](#two-runtimes--claude-code--openai-codex)
 - [What it actually does, end-to-end](#what-it-actually-does-end-to-end)
 - [Quick start](#quick-start-any-linux-server)
@@ -54,9 +58,25 @@ One Coach. Ten Players. One operator. One VPS.
 
 ---
 
+## Truth — write-protected by default
+
+The `truth/` folder and project `CLAUDE.md` are **the source.** Everything Compass measures against, everything Coach plans from, everything the Players inherit in their briefs — it all routes through these files.
+
+Agents cannot write to them. A `PreToolUse` hook blocks every attempt:
+
+```
+p4 → Edit truth/principles.md             [blocked: truth is read-only for agents]
+coach → propose_truth_change(diff)        [staged: awaiting human review]
+human → approve · 1-tap                   [merged: committed by you]
+```
+
+Coach proposes diffs. You approve in the UI. The agents propose; the human disposes. The source-of-truth doesn't drift behind your back, ever — and because it's just markdown on disk, you edit it from any device through the kDrive mirror.
+
+---
+
 ## Compass — a strategy engine for your team
 
-Compass is the thing that makes ten agents safe to leave alone.
+Compass is the thing that makes ten agents safe to leave alone. Where Truth is what you wrote down, Compass is what you actually *meant* — derived from your specs, project objectives, and per-project wiki, then sharpened with focused Q&A.
 
 It maintains a **probabilistic lattice** of weighted YES/NO statements about your project — what it is, who it's for, how it works, what's load-bearing — each with a confidence weight in `[0.0, 1.0]`. Confirmed truths sit near 1.0 or 0.0; uncertain ones cluster near 0.5; statements are organized by region (pricing, architecture, customers, auth…).
 
@@ -93,22 +113,6 @@ The point isn't that Compass is always right. The point is that **drift becomes 
 
 ---
 
-## Truth — write-protected by default
-
-The `truth/` folder and project `CLAUDE.md` are **the source.** Everything Compass measures against, everything Coach plans from, everything the Players inherit in their briefs — it all routes through these files.
-
-Agents cannot write to them. A `PreToolUse` hook blocks every attempt:
-
-```
-p4 → Edit truth/principles.md             [blocked: truth is read-only for agents]
-coach → propose_truth_change(diff)        [staged: awaiting human review]
-human → approve · 1-tap                   [merged: committed by you]
-```
-
-Coach proposes diffs. You approve in the UI. The agents propose; the human disposes. The source-of-truth doesn't drift behind your back, ever.
-
----
-
 ## Kanban — drift control for execution
 
 The task board is no longer a loose todo list. It is a **kanban-shaped lifecycle**:
@@ -121,15 +125,39 @@ Coach plans and assigns. Players execute, review, and ship. Standard tasks need 
 
 That matters for drift control because the work now has intermediate artifacts, not just final output: `spec.md`, `audits/audit_<round>_<kind>.md`, Compass audit reports, role assignments, stage-change events, and kDrive-mirrored task folders. Compass still provides the strategic drift signal; kanban makes the operational drift visible while there is still a responsible Player and a concrete next gate.
 
-Full subsystem spec: [Docs/kanban-specs-v2.md](Docs/kanban-specs-v2.md) (canonical, draft as of 2026-05-07; the running container still implements v1 — archived at [Docs/kanban-specs-v1-archived.md](Docs/kanban-specs-v1-archived.md)).
+---
+
+## Playbook — adaptive orchestration learning
+
+Compass learns what your project is. The **Playbook** learns what *running the team* looks like when it's working — and when it isn't.
+
+It's a single harness-wide lattice of weighted statements about orchestration patterns: *"audit every code-touching task except trivially mechanical edits"* (0.85), *"medium effort with Sonnet handles ~80% of code tasks adequately"* (0.75), *"don't loop the same executor↔auditor pair more than twice on the same kind"* (0.70), *"continuity beats rotation — keep follow-up work with the Player who already has context"* (0.70). Each carries `weight ∈ [0.0, 1.0]` = P(this is the right play for this team).
+
+A daily reflection turn reads the last 24h — archived tasks, audit fails, stalls, Compass verdicts, deviations, *violations* of high-confidence rules — and proposes weight adjustments, new statements, or merges. Patterns that pay off climb; patterns that don't decay. Coach reads the active lattice on every turn, alongside CLAUDE.md.
+
+The team gets better at coordinating itself, written down where you can read it.
 
 ---
 
-## All glass — eleven panes, no black box
+## Recurrence — Coach on a schedule
+
+Set Coach loose on a cadence and the team runs itself.
+
+Three primitives:
+
+- **Tick** — smart pulse. Coach composes its own next prompt from inbox, todos, objectives, the Compass briefing, and the Playbook. Inbox swept every N minutes, forever.
+- **Repeat** — fixed cadence in seconds for a custom prompt. *"Every 2 hours, check the staging deploy and report anomalies."*
+- **Cron** — calendar-anchored. *"9am UTC Monday-Friday, draft the daily plan."* *"Friday 17:00, write the weekly digest into decisions/."*
+
+All three skip cleanly when Coach is busy or the daily cap is hit, log every fire and skip-reason, and can be flipped on/off at runtime via `/tick N`, `/tick off`, or the API.
+
+---
+
+## All glass — eleven panes, anywhere
 
 Most multi-agent orchestrators abstract agents behind dashboards, tickets, or pipeline logs. You see the org chart and the deliverables, but you lose contact with what the agents are actually doing.
 
-Here, **the agent chatter *is* the interface.** A tileable multi-pane web UI streams every agent's tool use live, side by side:
+Here, **the agent chatter *is* the interface.** And it travels with you — desktop, phone, Telegram, or any device that can read a markdown folder synced through your cloud drive. A tileable multi-pane web UI streams every agent's tool use live, side by side:
 
 - Drag panes around, stack them into columns, split + resize, maximize one pane, export a conversation to markdown.
 - **Per-pane settings.** Override model / runtime / plan-mode / effort per pane via a gear popover. Settings persist in localStorage.
@@ -170,7 +198,7 @@ Coach on Claude, half the Players on Codex, slot p7 on whichever model writes th
 8. You're part of the team: open any agent's pane to read what they're saying, send them a direct prompt, watch the live tool-use stream, override their model / runtime / effort / plan-mode, or pause/cancel a runaway turn.
 9. Everything human-readable mirrors to your **WebDAV cloud drive** (kDrive, Nextcloud, ownCloud, Fastmail) so you can read/edit it from anywhere — even with the harness offline. Point Obsidian at the synced folder and you have a live second-brain the agents write into.
 
-Full details: [Docs/TOT-specs.md](Docs/TOT-specs.md). Kanban subsystem detail: [Docs/kanban-specs-v2.md](Docs/kanban-specs-v2.md). Rules agents follow when editing this repo: [CLAUDE.md](CLAUDE.md).
+Rules agents follow when editing this repo: [CLAUDE.md](CLAUDE.md).
 
 ---
 
@@ -296,7 +324,9 @@ truth/                        The project's source-of-truth (write-protected for
 Docs/TOT-specs.md             Full spec (data model, coordination, tool surface, UI)
 Docs/kanban-specs-v2.md       Kanban task lifecycle (canonical, shape-(2) routing through Coach)
 Docs/kanban-specs-v1-archived.md  Kanban v1 (auto-routing, deployed) — historical archive
-Docs/COMPASS_SPEC.md          Compass design — lattice, Q&A, audit semantics
+Docs/compass-specs.md         Compass design — lattice, Q&A, audit semantics
+Docs/playbook-specs.md        Playbook — adaptive orchestration lattice
+Docs/recurrence-specs.md      Recurrence scheduler (tick / repeat / cron)
 Docs/CODEX_RUNTIME_SPEC.md    Codex runtime design + parser specifics
 CLAUDE.md                     Rules for any agent editing this codebase
 .env.example                  Every env var, grouped by purpose, with defaults
@@ -308,7 +338,7 @@ CLAUDE.md                     Rules for any agent editing this codebase
 
 ```bash
 uv sync --extra dev
-uv run pytest                          # Full test suite (~420 tests)
+uv run pytest                          # Full test suite (~1300 tests)
 uv run uvicorn server.main:app --reload
 ```
 
