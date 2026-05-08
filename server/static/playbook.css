@@ -1,0 +1,514 @@
+/* Playbook dashboard styles. Reuses harness CSS variables from style.css.
+   Class prefix: `pb-`. No emoji per CLAUDE.md "no emoji in the UI" rule —
+   icons are inline SVG or CSS-drawn shapes. */
+
+.pb-pane {
+  padding: 16px;
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--bg);
+  height: 100%;
+  overflow-y: auto;
+}
+
+.pb-loading,
+.pb-empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--muted);
+  font-style: italic;
+}
+
+.pb-error {
+  padding: 16px;
+  background: rgba(255, 80, 80, 0.1);
+  color: var(--err);
+  border: 1px solid var(--err);
+  border-radius: 4px;
+  margin-bottom: 12px;
+}
+
+/* ---------------------------------------------------------------- header */
+
+.pb-header {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 16px;
+}
+
+.pb-cap-label {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.pb-cap-bar {
+  width: 100%;
+  height: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.pb-cap-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.3s ease;
+}
+
+.pb-header-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.pb-header-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.pb-tag-warn,
+.pb-tag-err {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 3px;
+  letter-spacing: 0.5px;
+}
+
+.pb-tag-warn { background: var(--warn); color: var(--bg); }
+.pb-tag-err  { background: var(--err); color: var(--bg); }
+
+.pb-banner {
+  padding: 10px 12px;
+  border-radius: 4px;
+  margin-bottom: 16px;
+  font-size: 12px;
+}
+
+.pb-banner-err {
+  background: rgba(255, 80, 80, 0.1);
+  color: var(--err);
+  border: 1px solid var(--err);
+}
+
+/* ---------------------------------------------------------------- buttons */
+
+.pb-btn,
+.pb-btn-mini,
+.pb-btn-no,
+.pb-btn-half,
+.pb-btn-yes,
+.pb-btn-secondary,
+.pb-btn-danger {
+  font-family: inherit;
+  font-size: 12px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--fg);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.pb-btn:hover:not(:disabled),
+.pb-btn-mini:hover:not(:disabled),
+.pb-btn-secondary:hover:not(:disabled) {
+  background: var(--surface-2, var(--bg));
+  border-color: var(--accent);
+}
+
+.pb-btn:disabled,
+.pb-btn-mini:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.pb-btn-mini {
+  font-size: 11px;
+  padding: 3px 8px;
+}
+
+.pb-btn-secondary {
+  background: transparent;
+  color: var(--muted);
+}
+
+.pb-btn-danger {
+  background: var(--err);
+  color: var(--bg);
+  border-color: var(--err);
+}
+.pb-btn-danger:hover:not(:disabled) { opacity: 0.9; }
+
+.pb-btn-link {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  text-decoration: underline;
+}
+
+.pb-btn-no { background: var(--err); color: var(--bg); border-color: var(--err); }
+.pb-btn-yes { background: var(--ok); color: var(--bg); border-color: var(--ok); }
+.pb-btn-half { background: var(--muted); color: var(--bg); border-color: var(--muted); }
+
+/* ---------------------------------------------------------------- buckets */
+
+.pb-section {
+  margin-bottom: 24px;
+}
+
+.pb-section-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 8px 0;
+}
+
+.pb-bucket {
+  margin-bottom: 16px;
+}
+
+.pb-bucket-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 6px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.pb-bucket-count {
+  display: inline-block;
+  margin-left: 6px;
+  background: var(--surface);
+  color: var(--fg);
+  font-weight: 400;
+  padding: 1px 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.pb-bucket-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* ---------------------------------------------------------------- statement row */
+
+.pb-row {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 12px;
+  background: var(--surface);
+}
+
+.pb-row-top {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.pb-row-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.pb-id { font-family: var(--mono, monospace); color: var(--accent); }
+.pb-w  { font-weight: 600; color: var(--fg); }
+
+.pb-badge-locked {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 4px;
+  background: var(--muted);
+  color: var(--bg);
+  border-radius: 2px;
+  letter-spacing: 0.5px;
+}
+
+.pb-row-text {
+  cursor: pointer;
+  line-height: 1.4;
+  margin-bottom: 6px;
+}
+
+.pb-row-bottom {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.pb-applied { font-weight: 600; }
+
+.pb-history {
+  margin-top: 8px;
+  padding: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 11px;
+}
+
+.pb-history-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: var(--muted);
+}
+
+.pb-history-row {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  gap: 8px;
+  padding: 2px 0;
+  border-bottom: 1px dotted var(--border);
+}
+
+.pb-history-row:last-child { border-bottom: none; }
+
+.pb-history-ts { color: var(--muted); }
+.pb-history-delta { font-family: var(--mono, monospace); }
+.pb-history-reason { color: var(--muted); font-style: italic; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------------------------------------------------------------- weight bar */
+
+.pb-weight-bar {
+  position: relative;
+  height: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.pb-weight-fill {
+  height: 100%;
+  transition: width 0.3s ease;
+}
+
+.pb-weight-marker {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--muted);
+  opacity: 0.4;
+}
+
+/* ---------------------------------------------------------------- archived */
+
+.pb-archived {
+  margin-bottom: 16px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.pb-archived summary {
+  padding: 10px 12px;
+  cursor: pointer;
+  font-weight: 600;
+  user-select: none;
+}
+
+.pb-archived[open] summary {
+  border-bottom: 1px solid var(--border);
+}
+
+.pb-archived-list {
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pb-archived-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 12px;
+  align-items: center;
+  padding: 6px 8px;
+  background: var(--bg);
+  border-radius: 3px;
+}
+
+.pb-archived-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.pb-archived-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pb-archived-reason {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 2px;
+  letter-spacing: 0.5px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.pb-reason-settled { color: var(--ok); border-color: var(--ok); }
+.pb-reason-stale_low,
+.pb-reason-stale_unused { color: var(--warn); border-color: var(--warn); }
+.pb-reason-merged { color: var(--accent); border-color: var(--accent); }
+.pb-reason-deleted { color: var(--err); border-color: var(--err); }
+
+/* ---------------------------------------------------------------- runs */
+
+.pb-run-row {
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  margin-bottom: 4px;
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.pb-run-summary {
+  display: grid;
+  grid-template-columns: auto auto auto auto auto auto;
+  gap: 12px;
+  padding: 6px 12px;
+  font-size: 11px;
+  align-items: center;
+}
+
+.pb-run-time { color: var(--muted); }
+.pb-run-kind { font-weight: 600; color: var(--accent); }
+.pb-run-cost { color: var(--muted); font-family: var(--mono, monospace); }
+
+.pb-out-ok    { color: var(--ok); font-weight: 600; }
+.pb-out-noop  { color: var(--muted); }
+.pb-out-skip  { color: var(--warn); }
+.pb-out-err   { color: var(--err); font-weight: 600; }
+
+.pb-run-details {
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  font-size: 11px;
+  font-family: var(--mono, monospace);
+}
+
+.pb-op-row {
+  padding: 2px 0;
+  word-break: break-all;
+}
+
+.pb-op-rejected { color: var(--err); }
+
+/* ---------------------------------------------------------------- danger */
+
+.pb-footer {
+  margin-top: 24px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.pb-footer summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 11px;
+  user-select: none;
+}
+
+.pb-danger {
+  margin-top: 12px;
+  padding: 12px;
+  background: rgba(255, 80, 80, 0.05);
+  border: 1px dashed var(--err);
+  border-radius: 3px;
+}
+
+.pb-danger-note {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* ---------------------------------------------------------------- modal */
+
+.pb-modal-bg {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.pb-modal {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  max-width: 480px;
+  width: 90%;
+  padding: 20px;
+}
+
+.pb-modal h3 {
+  margin: 0 0 12px 0;
+  font-size: 14px;
+}
+
+.pb-stmt-text {
+  padding: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  margin-bottom: 8px;
+  line-height: 1.4;
+}
+
+.pb-modal-meta {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 16px;
+}
+
+.pb-modal-buttons {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.pb-modal-buttons button { flex: 1; padding: 8px; }
+
+.pb-modal-cancel {
+  text-align: center;
+}
+
+/* ---------------------------------------------------------------- LeftRail icon */
+
+.gear.playbook-open {
+  /* Match the .gear pattern from style.css; specific overrides only. */
+}
+
+.playbook-icon svg {
+  display: block;
+}

@@ -516,6 +516,29 @@ cycles. Each cycle catches its own bugs and produces shippable
 state. Weeks of work ship without a big-bang merge; the human
 stays informed without being interrupted.
 
+## Team-wide orchestration playbook
+
+A harness-wide orchestration playbook is loaded into every agent's
+system prompt under `## Orchestration playbook`. It captures the
+team's evolving discipline as weighted statements (e.g. *"audit
+every code change except trivially mechanical edits"*) — each weight
+is the engine's current confidence that the pattern is the right
+play for this team. Treat high-weight statements (≥ 0.85) as
+established discipline; deviate only with explicit reason.
+
+Coach can propose updates mid-turn via
+`coord_propose_playbook_changes` (adjust / create / merge — up to 5
+ops per call). A daily reflection run also evolves the lattice from
+observed events (archived tasks, audit fails, stalls, Compass
+verdicts, deviations log). Players follow the playbook as guidance
+and cannot influence it.
+
+The playbook is **harness-wide**, not per-project — every project's
+Coach reads the same lattice, so improvements compound across
+projects. Project-specific patterns belong in this CLAUDE.md, not
+the playbook. See [Docs/playbook-specs.md](../../../Docs/playbook-specs.md)
+for the full spec.
+
 ## truth/
 
 User-validated source-of-truth lives at

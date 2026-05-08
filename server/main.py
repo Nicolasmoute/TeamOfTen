@@ -148,11 +148,13 @@ try:
     _v_app = _stamp("app.js")
     _v_css = _stamp("style.css")
     _v_compass_css = _stamp("compass.css")
+    _v_playbook_css = _stamp("playbook.css")
     INDEX_HTML = (
         _index_raw
         .replace('"/static/app.js"', f'"/static/app.js?v={_v_app}"')
         .replace('"/static/style.css"', f'"/static/style.css?v={_v_css}"')
         .replace('"/static/compass.css"', f'"/static/compass.css?v={_v_compass_css}"')
+        .replace('"/static/playbook.css"', f'"/static/playbook.css?v={_v_playbook_css}"')
     )
 except Exception as e:
     logger.error("static/index.html missing (%s): UI will show a fallback page", e)
@@ -367,6 +369,16 @@ async def lifespan(app: FastAPI):
         await start_audit_watcher()
     except Exception:
         logger.exception("compass audit watcher failed to start (non-fatal)")
+    # Playbook scheduler — fires daily reflection + bootstrap runs.
+    # See Docs/playbook-specs.md §10 and server/playbook/scheduler.py.
+    # Owns its own task handle (mirrors telegram + audit_watcher pattern).
+    from server.playbook.scheduler import (
+        start_playbook_scheduler, stop_playbook_scheduler,
+    )
+    try:
+        await start_playbook_scheduler()
+    except Exception:
+        logger.exception("playbook scheduler failed to start (non-fatal)")
     from server.telegram import start_telegram_bridge, stop_telegram_bridge
     # Telegram bridge owns its own task handle (so the UI can reload it
     # live via /api/team/telegram). Lifespan only kicks it off + tears
@@ -466,6 +478,10 @@ async def lifespan(app: FastAPI):
             await stop_audit_watcher()
         except Exception:
             logger.exception("compass audit watcher shutdown failed")
+        try:
+            await stop_playbook_scheduler()
+        except Exception:
+            logger.exception("playbook scheduler shutdown failed")
         # Cancel any in-flight project-provisioning tasks (auto-fired
         # on POST/PATCH /api/projects). Without this, a clone in
         # progress at SIGTERM gets abandoned by the GC and leaves a
@@ -574,6 +590,13 @@ app.include_router(_build_projects_router(
 # circular imports). The router lives under /api/compass/*.
 from server.compass.api import build_router as _build_compass_router
 app.include_router(_build_compass_router(
+    require_token=require_token, audit_actor=audit_actor,
+))
+
+# Playbook — orchestration-strategy engine HTTP API. Mirrors the
+# Compass mount pattern. Lives under /api/playbook/*.
+from server.playbook.api import build_router as _build_playbook_router
+app.include_router(_build_playbook_router(
     require_token=require_token, audit_actor=audit_actor,
 ))
 

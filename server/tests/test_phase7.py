@@ -412,8 +412,8 @@ async def test_audit_coord_block_locked_player_includes_prose(
     block = await _build_coach_coordination_block()
     # Inline tag still present.
     assert "(LOCKED — unavailable)" in block
-    # Prose folded into block as a sub-section (### not ##).
-    assert "### Roster availability" in block
+    # v2: promoted to a top-level section per spec §14 (was ###).
+    assert "## Roster availability" in block
     assert "Do NOT assign tasks to them" in block
 
 
@@ -427,7 +427,7 @@ async def test_audit_coord_block_skips_locked_prose_when_none_locked(
     await _seed_misc_project_with_team_and_tasks()
     block = await _build_coach_coordination_block()
     assert "(LOCKED — unavailable)" not in block
-    assert "### Roster availability" not in block
+    assert "## Roster availability" not in block
 
 
 def test_audit_update_wiki_index_handles_empty_subfolder(fresh_db) -> None:

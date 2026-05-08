@@ -1,25 +1,32 @@
-"""Compass Codex one-shot caller — fallback for the Claude path.
+"""Stateless Codex one-shot caller — fallback for Claude paths.
 
-When `compass.llm.call` (Claude) fails, Compass routes the same
-`(system, user)` prompt through this module to OpenAI Codex. Stateless
-by design: every call spawns a fresh `codex app-server` subprocess,
-starts an ephemeral thread (no resume, no persistence), sends one
-chat, accumulates the assistant text, then closes the thread + client.
+Originally lived in `server/compass/codex_llm.py`. Lifted here so that
+multiple subsystems (Compass, Playbook, ...) can share the same Codex
+fallback without each defining its own copy.
+
+When a subsystem's Claude path fails, route the same `(system, user)`
+prompt through this module to OpenAI Codex. Stateless by design: every
+call spawns a fresh `codex app-server` subprocess, starts an ephemeral
+thread (no resume, no persistence), sends one chat, accumulates the
+assistant text, then closes the thread + client.
 
 Why a separate module instead of reusing the agent runtime in
 `server/runtimes/codex.py`:
   - That runtime is thread/session-oriented (persists `codex_thread_id`
     in `agent_sessions`, caches the client per-slot, expects a full
     `TurnContext` with workspace, MCP servers, sandbox policy, etc.).
-  - Compass calls have none of that: no agent identity, no MCP, no
-    workspace, no resume. A fresh client + ephemeral thread per call
+  - Subsystem one-shots have none of that: no agent identity, no MCP,
+    no workspace, no resume. A fresh client + ephemeral thread per call
     is simpler than retro-fitting the runtime to support stateless
     operation.
 
 Cost path mirrors the runtime: ChatGPT auth → cost_basis='plan_included'
 (zero $); API-key auth → priced via `pricing.codex_cost_usd`. Ledger
-row written under `agent_id='compass'`, `runtime='codex'` so the
-existing turn-cost rollups pick it up alongside Claude calls.
+row written under the caller-supplied `agent_id`, `runtime='codex'`
+so the existing turn-cost rollups pick it up alongside Claude calls.
+
+Caller-supplied parameters (`agent_id`, `event_type`, fallback model
++ effort defaults) are what makes this generic across subsystems.
 """
 
 from __future__ import annotations
@@ -30,9 +37,9 @@ import sys
 from datetime import datetime, timezone
 from typing import Any
 
-from server.compass.llm import CompassLLMError, CompassLLMResult
+from server.shared.llm_types import LLMError, LLMResult
 
-logger = logging.getLogger("harness.compass.codex_llm")
+logger = logging.getLogger("harness.shared.codex_llm")
 if not logger.handlers:
     h = logging.StreamHandler(sys.stdout)
     h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s | %(message)s"))
@@ -47,25 +54,22 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _resolve_codex_model(model: str | None) -> str | None:
-    """Resolve the Codex fallback model. Empty / None → catalog default
-    alias (`latest_mini`); aliases run through `resolve_model_alias`
-    so the SDK + ledger see a concrete id."""
-    from server.compass import config
+def _resolve_codex_model(model: str | None, default_alias: str) -> str | None:
+    """Resolve the Codex fallback model. Empty / None → caller's
+    default alias; aliases run through `resolve_model_alias` so the
+    SDK + ledger see a concrete id."""
     from server.models_catalog import resolve_model_alias  # noqa: PLC0415
 
-    raw = (model or config.LLM_FALLBACK_MODEL_ALIAS).strip()
+    raw = (model or default_alias or "").strip()
     if not raw:
         return None
     return resolve_model_alias(raw)
 
 
-def _resolve_codex_effort(effort: str | None) -> str | None:
+def _resolve_codex_effort(effort: str | None, default_effort: str | None) -> str | None:
     """Validate the Codex effort string. Invalid → None (SDK uses its
     built-in default). Mirrors the Claude path's permissive shape."""
-    from server.compass import config
-
-    raw = (effort or config.LLM_FALLBACK_EFFORT or "").strip().lower()
+    raw = (effort or default_effort or "").strip().lower()
     if raw in _VALID_EFFORTS:
         return raw
     return None
@@ -83,24 +87,40 @@ async def call_codex(
     system: str,
     user: str,
     *,
+    agent_id: str,
+    event_type: str,
+    default_model_alias: str,
+    default_effort: str | None,
     model: str | None = None,
     effort: str | None = None,
     project_id: str | None = None,
-    label: str = "compass:codex",
-) -> CompassLLMResult:
+    label: str = "codex",
+    cwd_env_var: str = "HARNESS_SHARED_CODEX_CWD",
+) -> LLMResult:
     """Run one round-trip Codex call. Stateless: spawns + tears down
     a fresh codex app-server subprocess per call.
 
-    Raises `CompassLLMError` when:
+    Required caller-supplied parameters:
+      - `agent_id`: ledger row identity (e.g. "compass" or "playbook").
+      - `event_type`: bus-event `type` for the live UI counter
+        (e.g. "compass_llm_call" or "playbook_llm_call").
+      - `default_model_alias`: alias used when `model` is None/empty
+        (e.g. "latest_mini" for both Compass and Playbook).
+      - `default_effort`: effort fallback when `effort` is None/empty
+        (typically "medium").
+      - `label`: `cost_basis` value persisted in the turn ledger
+        (e.g. "compass:audit", "playbook:reflection").
+
+    Raises `LLMError` when:
       - Codex SDK isn't installed.
       - Codex auth resolves to 'none' (no ChatGPT session, no API key).
       - The thread / chat itself raises before producing any assistant
         text (real failure, not a soft is_error result).
 
-    On success returns a `CompassLLMResult` with the assistant text +
-    usage. Soft errors from the SDK (no agentMessage, empty stream)
-    return a result with `is_error=True` and empty text — the caller
-    decides whether to skip the stage.
+    On success returns an `LLMResult` with the assistant text + usage.
+    Soft errors from the SDK (no agentMessage, empty stream) return a
+    result with `is_error=True` and empty text — the caller decides
+    whether to skip the stage.
     """
     from server.runtimes.codex import (
         _import_codex_sdk,
@@ -111,17 +131,17 @@ async def call_codex(
     try:
         sdk = _import_codex_sdk()
     except ImportError as exc:
-        raise CompassLLMError(f"Codex SDK unavailable: {exc}") from exc
+        raise LLMError(f"Codex SDK unavailable: {exc}") from exc
 
     method, env_overrides = await resolve_auth()
     if method == "none":
-        raise CompassLLMError(
+        raise LLMError(
             "Codex fallback unavailable: no ChatGPT session at "
             "$CODEX_HOME/auth.json and no openai_api_key in secrets"
         )
 
-    chosen_model = _resolve_codex_model(model)
-    chosen_effort = _resolve_codex_effort(effort)
+    chosen_model = _resolve_codex_model(model, default_model_alias)
+    chosen_effort = _resolve_codex_effort(effort, default_effort)
 
     # Build a scrubbed env for the codex app-server subprocess. Same
     # rationale as agent runtimes: don't leak HARNESS_TOKEN, KDRIVE_*,
@@ -129,13 +149,13 @@ async def call_codex(
     from server.agent_env import build_clean_agent_env  # noqa: PLC0415
 
     env = build_clean_agent_env(extra=env_overrides)
-    # Compass calls have no MCP and no coord proxy — drop the proxy
+    # One-shot calls have no MCP and no coord proxy — drop the proxy
     # token if it leaked through the clean-env build.
     env.pop("HARNESS_COORD_PROXY_TOKEN", None)
 
-    # Compass calls don't need a workspace cwd. Use /tmp (or the
+    # One-shot calls don't need a workspace cwd. Use /tmp (or the
     # platform equivalent) so the subprocess has a real working dir.
-    cwd = os.environ.get("HARNESS_COMPASS_CODEX_CWD", "/tmp").strip() or "/tmp"
+    cwd = os.environ.get(cwd_env_var, "/tmp").strip() or "/tmp"
 
     started = _now_iso()
     started_mono_ns = _monotonic_ns()
@@ -157,7 +177,7 @@ async def call_codex(
 
         # Build a minimal thread config: no MCP, read-only sandbox,
         # never approve (the call should never need to side-channel
-        # the harness for command/file approval — Compass prompts
+        # the harness for command/file approval — these prompts
         # only ask for text).
         config_overrides: dict[str, Any] = {"mcp_servers": {}}
         thread_config_kwargs: dict[str, Any] = {
@@ -193,7 +213,7 @@ async def call_codex(
 
         stream = thread.chat(
             user,
-            user="compass",
+            user=agent_id,
             metadata={"project_id": project_id} if project_id else None,
             turn_overrides=turn_overrides,
         )
@@ -209,7 +229,7 @@ async def call_codex(
                 if txt:
                     text_parts.append(txt)
             # Other item types (reasoning, tool_call, etc.) are
-            # ignored — Compass prompts ask for plain text + JSON only.
+            # ignored — these prompts ask for plain text + JSON only.
 
         # Pull usage from the rollout file. Best-effort; missing usage
         # → zeros, ledger row still gets written.
@@ -245,25 +265,25 @@ async def call_codex(
                 usage = _extract_usage_codex(usage_raw)
         except Exception:
             logger.exception(
-                "compass.codex_llm: usage extraction failed "
+                "shared.codex_llm: usage extraction failed "
                 "(continuing with zeros)"
             )
 
     except Exception as exc:
         # Real pre-result failure: SDK never produced an assistant
-        # message stream. Surface as CompassLLMError so the caller can
+        # message stream. Surface as LLMError so the caller can
         # decide (skip stage, mark run as failed).
-        logger.exception("compass.codex_llm: chat failed")
+        logger.exception("shared.codex_llm: chat failed")
         try:
             close = client.close()
             if hasattr(close, "__await__"):
                 await close
         except Exception:
             logger.exception(
-                "compass.codex_llm: close() during failure raised "
+                "shared.codex_llm: close() during failure raised "
                 "(ignoring)"
             )
-        raise CompassLLMError(f"{type(exc).__name__}: {str(exc)[:300]}") from exc
+        raise LLMError(f"{type(exc).__name__}: {str(exc)[:300]}") from exc
     else:
         # Best-effort close — leak the subprocess on close failure
         # rather than raise; the result is already complete.
@@ -272,7 +292,7 @@ async def call_codex(
             if hasattr(close, "__await__"):
                 await close
         except Exception:
-            logger.exception("compass.codex_llm: close() raised (ignoring)")
+            logger.exception("shared.codex_llm: close() raised (ignoring)")
 
     result_text = "".join(text_parts).strip()
     duration_ms = int((_monotonic_ns() - started_mono_ns) / 1_000_000)
@@ -295,15 +315,15 @@ async def call_codex(
                 },
             )
         except Exception:
-            logger.exception("compass.codex_llm: pricing failed")
+            logger.exception("shared.codex_llm: pricing failed")
             cost_usd = None
 
-    # Ledger insert. Lazy import to dodge agents↔compass back-edge.
+    # Ledger insert. Lazy import to dodge agents↔shared back-edges.
     try:
         from server.agents import _insert_turn_row  # noqa: PLC0415
 
         await _insert_turn_row(
-            agent_id="compass",
+            agent_id=agent_id,
             started_at=started,
             ended_at=_now_iso(),
             duration_ms=duration_ms,
@@ -323,7 +343,7 @@ async def call_codex(
             cost_basis=label,
         )
     except Exception:
-        logger.exception("compass.codex_llm: turn ledger insert failed (continuing)")
+        logger.exception("shared.codex_llm: turn ledger insert failed (continuing)")
 
     # Bus event for live UI counters.
     try:
@@ -331,8 +351,8 @@ async def call_codex(
 
         await bus.publish({
             "ts": _now_iso(),
-            "agent_id": "compass",
-            "type": "compass_llm_call",
+            "agent_id": agent_id,
+            "type": event_type,
             "label": label,
             "model": effective_model,
             "runtime": "codex",
@@ -352,7 +372,7 @@ async def call_codex(
     if not result_text:
         is_error = True
 
-    return CompassLLMResult(
+    return LLMResult(
         text=result_text,
         is_error=is_error,
         cost_usd=cost_usd,

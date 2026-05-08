@@ -185,9 +185,11 @@ async def test_pending_review_surfaces_audit_report(
     assert "t-2026-05-06-00000022" in next_action
 
 
-async def test_pending_ship_surfaces_mark_shipped(
+async def test_pending_ship_surfaces_role_complete(
     fresh_db: str,
 ) -> None:
+    """v2: ship-stage Next action surfaces coord_role_complete (the
+    v2 collapsed completion tool)."""
     await init_db()
     await _seed_task(task_id="t-2026-05-06-00000023", status="ship")
     await _seed_role(
@@ -196,16 +198,17 @@ async def test_pending_ship_surfaces_mark_shipped(
     server = _server_for("p3")
     text = _ok_text(await _handler(server, "my_assignments")({}))
     next_action = text.split("## Next action:")[1]
-    assert "coord_mark_shipped" in next_action
+    assert "coord_role_complete" in next_action
+    assert "coord_mark_shipped" not in next_action
     assert "t-2026-05-06-00000023" in next_action
 
 
-async def test_eligible_pool_surfaces_accept_role(
+async def test_eligible_pool_surfaces_wait_for_coach(
     fresh_db: str,
 ) -> None:
-    """When the only work is a pool (Player not yet claimed), the
-    Next action says coord_accept_role — and explicitly warns
-    against doing the role work without claiming."""
+    """v2: pools are FYI only. The Next action tells the Player to
+    wait for Coach's coord_approve_stage wake — there is no claim
+    path. coord_accept_role is removed."""
     await init_db()
     await _seed_task(task_id="t-2026-05-06-00000024", status="plan")
     await _seed_role(
@@ -215,9 +218,9 @@ async def test_eligible_pool_surfaces_accept_role(
     server = _server_for("p3")
     text = _ok_text(await _handler(server, "my_assignments")({}))
     next_action = text.split("## Next action:")[1]
-    assert "coord_accept_role" in next_action
-    assert "first accepted claim wins" in next_action
-    assert "Do NOT do the role work without an accepted claim" in next_action
+    assert "coord_accept_role" not in next_action
+    # v2 messaging: pools FYI only, wait for Coach.
+    assert "FYI" in next_action or "Wait" in next_action or "coord_approve_stage" in next_action
 
 
 async def test_empty_plate_surfaces_idle_message(

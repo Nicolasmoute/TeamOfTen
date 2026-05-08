@@ -536,6 +536,7 @@ function ComposerModal({ open, onClose, onCreate }) {
   const [presetId, setPresetId] = useState("code_formal");
   const [workflow, setWorkflow] = useState("generic");
   const [trackingReason, setTrackingReason] = useState("");
+  const [firstAssignee, setFirstAssignee] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
 
@@ -547,8 +548,20 @@ function ComposerModal({ open, onClose, onCreate }) {
       setErr("title is required");
       return;
     }
+    // v2.0.1: every task is fired AT a Player. trajectory[0].to must
+    // name exactly one Player; otherwise the API rejects the create.
+    const assignee = firstAssignee.trim();
+    if (!/^p([1-9]|10)$/.test(assignee)) {
+      setErr("assignee for the first stage is required (e.g. p3)");
+      return;
+    }
     const preset = TRAJECTORY_PRESETS.find((p) => p.id === presetId)
       || TRAJECTORY_PRESETS[0];
+    // Clone the preset trajectory and put the assignee on the first
+    // stage. Subsequent stages stay FYI/empty as the preset defines.
+    const trajectory = preset.trajectory.map((entry, idx) =>
+      idx === 0 ? { ...entry, to: [assignee] } : { ...entry }
+    );
     setBusy(true);
     setErr(null);
     try {
@@ -556,7 +569,7 @@ function ComposerModal({ open, onClose, onCreate }) {
         title: title.trim(),
         description: description.trim(),
         priority,
-        trajectory: preset.trajectory,
+        trajectory,
         workflow,
         tracking_reason: trackingReason.trim() || null,
       });
@@ -566,6 +579,7 @@ function ComposerModal({ open, onClose, onCreate }) {
       setPresetId("code_formal");
       setWorkflow("generic");
       setTrackingReason("");
+      setFirstAssignee("");
       onClose();
     } catch (e) {
       setErr(e.message || String(e));
@@ -622,22 +636,32 @@ function ComposerModal({ open, onClose, onCreate }) {
                 <option value="ops">ops</option>
               </select>
             </label>
-            <label class="kbn-label">Tracking reason (optional)
+            <label class="kbn-label">First-stage assignee (required)
               <input
                 class="kbn-input"
                 type="text"
-                value=${trackingReason}
-                onInput=${(e) => setTrackingReason(e.target.value)}
-                placeholder="(free text, optional)"
-                maxlength="80"
+                value=${firstAssignee}
+                onInput=${(e) => setFirstAssignee(e.target.value)}
+                placeholder="p3"
+                maxlength="3"
               />
             </label>
           </div>
+          <label class="kbn-label">Tracking reason (optional)
+            <input
+              class="kbn-input"
+              type="text"
+              value=${trackingReason}
+              onInput=${(e) => setTrackingReason(e.target.value)}
+              placeholder="(free text, optional)"
+              maxlength="80"
+            />
+          </label>
           <div class="kbn-help">
-            Coach can later reroute via coord_set_task_trajectory or
-            POST /api/tasks/&lt;id&gt;/trajectory. Per-stage assignees
-            default to the unassigned pool — assign Players from the
-            board.
+            v2: every task is fired AT a Player. trajectory[0].to is
+            the named slot above (e.g. p3). Subsequent stages stay
+            FYI; Coach picks each later assignee at coord_approve_stage
+            time. Reroute mid-flight via POST /api/tasks/&lt;id&gt;/trajectory.
           </div>
           ${err ? html`<div class="kbn-error">${err}</div>` : null}
           <div class="kbn-modal-actions">

@@ -89,6 +89,23 @@ async def build_system_prompt_suffix() -> str:
                 f"## Project rules ({active}/CLAUDE.md)\n\n" + proj_body
             )
 
+    # Playbook — harness-wide AI orchestration-strategy lattice.
+    # Sync render returns a self-contained markdown block (already
+    # includes the `## Orchestration playbook` heading) or empty
+    # string when the lattice is empty / disabled / file missing.
+    # Sync I/O is acceptable from this async caller — same pattern
+    # as `_read_text_safe` above. See Docs/playbook-specs.md §6.
+    try:
+        from server.playbook.render import render_playbook_block  # noqa: PLC0415
+
+        playbook_body = render_playbook_block()
+        if playbook_body:
+            parts.append(playbook_body)
+    except Exception:
+        # Render failure is non-fatal — the playbook is read-only
+        # context for the agent. Log + continue without it.
+        logger.exception("playbook render failed (continuing without)")
+
     if not parts:
         return ""
     return "\n\n" + "\n\n---\n\n".join(parts)

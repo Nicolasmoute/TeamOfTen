@@ -3833,6 +3833,20 @@ async def _build_coach_coordination_block(
         "stages already entered."
     )
     lines.append("")
+    lines.append(
+        "**Orchestration playbook (loaded after CLAUDE.md, see "
+        "`## Orchestration playbook`).** A harness-wide weighted "
+        "lattice of learned coordination patterns. High-confidence "
+        "statements (weight ≥ 0.85) are established discipline; "
+        "deviate only with explicit reason. You can propose updates "
+        "mid-turn via `coord_propose_playbook_changes` (adjust / "
+        "create / merge — up to 5 ops per call). A daily reflection "
+        "run also evolves the lattice from observed evidence — "
+        "duplication is fine, but for routine evolution let the "
+        "daily run handle it; use the mid-turn tool only for "
+        "load-bearing patterns you observe in real time."
+    )
+    lines.append("")
     from server.paths import global_paths
     gp = global_paths()
     lines.append(

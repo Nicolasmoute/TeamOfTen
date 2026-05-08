@@ -4003,6 +4003,161 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         return _ok("\n".join(lines))
 
     # ====================================================================
+    # Playbook (Docs/playbook-specs.md §7.1) — Coach-only mid-turn
+    # proposal tool. Players read the lattice via system-prompt
+    # injection but cannot influence it.
+    @tool(
+        "coord_propose_playbook_changes",
+        (
+            "Coach-only. Propose changes to the harness-wide "
+            "orchestration playbook from inside any normal turn. The "
+            "playbook is a weighted lattice of conceptual patterns "
+            "about how to coordinate the team — readable to all "
+            "agents (it appears as `## Orchestration playbook` in "
+            "every system prompt), writable only by Coach via this "
+            "tool or the daily reflection run.\n"
+            "\n"
+            "Use when you observe a load-bearing pattern in real time "
+            "and don't want to wait for the daily reflection. For "
+            "routine evolution, the daily run handles updates from "
+            "evidence (archived tasks, audit fails, stalls) "
+            "automatically — don't duplicate that here.\n"
+            "\n"
+            "Params:\n"
+            "- operations: list of up to 5 op dicts. Each one of:\n"
+            "    {'op': 'adjust', 'id': 'pb-XXX', 'delta': float, "
+            "'reason': str}\n"
+            "    {'op': 'create', 'text': str, 'weight': float, "
+            "'reason': str}\n"
+            "    {'op': 'merge', 'keep_id': 'pb-XXX', 'drop_id': "
+            "'pb-XXX', 'reason': str}\n"
+            "  Adjust delta is capped at ±0.25 per single proposal. "
+            "Create weight defaults to 0.60 (mid-cycle creation) if "
+            "omitted. Merge drops the second id into the first; "
+            "kept weight = max of the two."
+        ),
+        {"operations": list},
+    )
+    async def propose_playbook_changes(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err(
+                "coord_propose_playbook_changes is Coach-only. "
+                "Players read the playbook in their system prompt; "
+                "they cannot influence it."
+            )
+        ops_raw = args.get("operations")
+        if not isinstance(ops_raw, list):
+            return _err("operations must be a list")
+        if len(ops_raw) == 0:
+            return _err("at least one operation required")
+        from server.playbook import config as pb_config  # noqa: PLC0415
+        if len(ops_raw) > pb_config.COACH_PROPOSAL_OPS_CAP:
+            return _err(
+                f"too many operations (got {len(ops_raw)}, cap "
+                f"{pb_config.COACH_PROPOSAL_OPS_CAP}) — split across "
+                f"multiple turns"
+            )
+
+        # Acquire the lock non-blocking. On contention, return the
+        # canonical "playbook engine busy" string so Coach can
+        # pattern-match and retry next turn.
+        from server.playbook import mutate as pb_mutate  # noqa: PLC0415
+        from server.playbook import runner as pb_runner  # noqa: PLC0415
+        from server.playbook.store import (  # noqa: PLC0415
+            load_archive,
+            load_lattice,
+            save_archive,
+            save_lattice,
+        )
+
+        if pb_runner._run_lock.locked():
+            return _ok(
+                "playbook engine busy — another run is in flight. "
+                "Retry on your next turn; no changes applied."
+            )
+
+        await pb_runner._run_lock.acquire()
+        try:
+            lattice = load_lattice()
+            archive = load_archive()
+            applied, rejected, hard_cap_hit = pb_mutate.apply_coach_proposals(
+                lattice, archive, ops_raw,
+                creation_weight=pb_config.COACH_CREATION_WEIGHT,
+            )
+            if applied:
+                await save_lattice(lattice)
+                await save_archive(archive)
+        finally:
+            pb_runner._run_lock.release()
+
+        # Bus event for the dashboard's live counter (§9).
+        try:
+            from server.events import bus  # noqa: PLC0415
+
+            await bus.publish({
+                "ts": _now_iso(),
+                "agent_id": "coach",
+                "type": "playbook_changes_applied",
+                "operations_count": len(applied),
+                "source": "coach_mid_turn",
+            })
+        except Exception:
+            pass
+
+        # Render the human-readable summary (§7.1 return shape).
+        lines = []
+        total_lines = []
+        if applied:
+            lines.append(f"Applied {len(applied)} of {len(ops_raw)} proposed changes:")
+            for op in applied:
+                if op.get("op") == "adjust":
+                    f = op.get("from")
+                    t = op.get("to")
+                    delta = op.get("delta")
+                    delta_s = (
+                        f" ({'+' if isinstance(delta, (int, float)) and delta >= 0 else ''}{delta:.2f})"
+                        if isinstance(delta, (int, float)) else ""
+                    )
+                    lines.append(
+                        f"  - adjust {op.get('id')}: "
+                        f"{f:.2f} → {t:.2f}{delta_s} — \"{op.get('reason') or ''}\""
+                    )
+                elif op.get("op") == "create":
+                    lines.append(
+                        f"  - create {op.get('new_id')}: weight "
+                        f"{op.get('weight'):.2f} — \"{op.get('text') or ''}\""
+                    )
+                elif op.get("op") == "merge":
+                    lines.append(
+                        f"  - merge: dropped {op.get('drop_id')} into "
+                        f"{op.get('keep_id')} — \"{op.get('reason') or ''}\""
+                    )
+        else:
+            lines.append(f"Applied 0 of {len(ops_raw)} proposed changes.")
+        if rejected:
+            for op in rejected:
+                op_kind = op.get("op", "?")
+                ident = op.get("id") or op.get("keep_id") or "(new)"
+                lines.append(
+                    f"  - REJECTED {op_kind} {ident}: "
+                    f"{op.get('reason', 'unknown_error')}"
+                )
+        if hard_cap_hit:
+            lines.append(
+                "  ! hard cap pressure — all proposed creations dropped; "
+                "operator must review the lattice."
+            )
+
+        # Active count footer.
+        from server.playbook.store import load_lattice as _ll  # noqa: PLC0415
+        n_active = len(_ll().statements)
+        lines.append(
+            f"\nActive statement count: {n_active} / "
+            f"{pb_config.SOFT_STATEMENT_CAP} soft cap."
+        )
+        return _ok("\n".join(lines))
+
+    # ====================================================================
     # Kanban tools (Docs/kanban-specs.md). The state-machine + existing
     # tool updates (claim_task, assign_task, update_task, commit_push)
     # live above; the new tools below add the role-assignment surface
@@ -6507,6 +6662,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         compass_audit,
         compass_brief,
         compass_status,
+        # Playbook (Docs/playbook-specs.md §7.1) — Coach-only mid-turn
+        # proposal tool; readable surface lives in every system prompt
+        # via build_system_prompt_suffix.
+        propose_playbook_changes,
     ]
     server = create_sdk_mcp_server(name="coord", version="0.8.0", tools=_tools)
     # Stash a name → handler map so the coord_mcp proxy endpoint
@@ -6574,6 +6733,10 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__compass_audit",
     "mcp__coord__compass_brief",
     "mcp__coord__compass_status",
+    # Playbook (Docs/playbook-specs.md §7.1) — Coach-only at runtime;
+    # listed here so the SDK accepts the call. The body's caller_is_coach
+    # gate enforces the Coach-only invariant.
+    "mcp__coord__coord_propose_playbook_changes",
     # Kanban v2 lifecycle (Docs/kanban-specs-v2.md §7.1, §7.2).
     # Coach-only enforcement is in each tool body; listing here lets
     # the SDK accept the call.

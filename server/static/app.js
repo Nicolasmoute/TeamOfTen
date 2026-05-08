@@ -19,12 +19,16 @@ import {
 } from "/static/tools.js";
 import { CompassPane, createCompassEventRouter } from "/static/compass.js?v=1777887411";
 import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js";
+import { PlaybookPane, createPlaybookEventRouter } from "/static/playbook.js";
 
 const html = htm.bind(h);
 // Module-level event router for compass events. CompassPane(s) subscribe;
 // the WS handler below publishes incoming compass_* events. The router
 // is per-window — multiple panes can mount and unmount cleanly.
 const compassEvents = createCompassEventRouter();
+// Playbook event router — same shape as compass but for the
+// harness-wide orchestration playbook (Docs/playbook-specs.md).
+const playbookEvents = createPlaybookEventRouter();
 // Same shape for the kanban dashboard. Subscribers are open KanbanPane
 // instances; the WS dispatch publishes task_* / commit_pushed /
 // compass_audit_logged events here so the board refreshes live.
@@ -1756,6 +1760,9 @@ function App() {
       // are fine. Compass events still flow through the rest of the
       // dispatch (e.g. for activity/cost rollup) — we don't return
       // here, just publish + continue.
+      if (ev.type && typeof ev.type === "string" && ev.type.startsWith("playbook_")) {
+        try { playbookEvents.publish(ev); } catch (_) {}
+      }
       if (ev.type && typeof ev.type === "string" && ev.type.startsWith("compass_")) {
         try { compassEvents.publish(ev); } catch (_) {}
       }
@@ -2829,6 +2836,20 @@ function App() {
                           compassEvents=${compassEvents}
                         />`;
                       }
+                      if (slot === "__playbook") {
+                        return html`<${PlaybookPane}
+                          key=${slot}
+                          slot=${slot}
+                          authedFetch=${authedFetch}
+                          onClose=${() => closePane(slot)}
+                          onDropEdge=${dropOnPaneEdge}
+                          onPopOut=${moveToNewColumn}
+                          stacked=${col.length > 1}
+                          isMaximized=${maximizedSlot === slot}
+                          onToggleMaximize=${() => toggleMaximize(slot)}
+                          playbookEvents=${playbookEvents}
+                        />`;
+                      }
                       if (slot === "__kanban") {
                         return html`<${KanbanPane}
                           key=${slot}
@@ -3505,6 +3526,25 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
                 <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.6"/>
                 <path d="M12 4 L13.4 12 L12 20 L10.6 12 Z" fill="currentColor"/>
                 <path d="M4 12 L12 10.6 L20 12 L12 13.4 Z" fill="currentColor" opacity="0.55"/>
+              </svg>
+            </span>
+          </button>
+          <button
+            class=${"gear playbook-open" + (openSlots.includes("__playbook") ? " active" : "")}
+            title="Open the Playbook dashboard — harness-wide AI orchestration-strategy lattice"
+            onClick=${() => onOpen("__playbook")}
+          >
+            <span class="playbook-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="20" height="20">
+                <!-- Open-book glyph: two pages meeting at a center spine -->
+                <path d="M3 5 L11 6 L11 19 L3 18 Z" fill="none" stroke="currentColor" stroke-width="1.4"/>
+                <path d="M21 5 L13 6 L13 19 L21 18 Z" fill="none" stroke="currentColor" stroke-width="1.4"/>
+                <line x1="5" y1="9" x2="9" y2="9" stroke="currentColor" stroke-width="1" opacity="0.6"/>
+                <line x1="5" y1="12" x2="9" y2="12" stroke="currentColor" stroke-width="1" opacity="0.6"/>
+                <line x1="5" y1="15" x2="9" y2="15" stroke="currentColor" stroke-width="1" opacity="0.6"/>
+                <line x1="15" y1="9" x2="19" y2="9" stroke="currentColor" stroke-width="1" opacity="0.6"/>
+                <line x1="15" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="1" opacity="0.6"/>
+                <line x1="15" y1="15" x2="19" y2="15" stroke="currentColor" stroke-width="1" opacity="0.6"/>
               </svg>
             </span>
           </button>

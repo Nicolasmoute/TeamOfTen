@@ -211,13 +211,16 @@ async def test_full_v2_lifecycle_smoke(
     }))
     assert await _task_status(tid) == "archive"
 
-    # Give the bus subscriber a moment to drain so project_events
-    # rows are flushed before we assert on them.
+    # Poll for the final task_archived event to land in
+    # project_events (the kanban subscriber drains async; a fixed
+    # sleep can race under load).
     import asyncio
-    await asyncio.sleep(0.2)
-
-    # ---- Verify project_events stream covers every step ----
-    types = await _project_event_types("misc")
+    types: list[str] = []
+    for _ in range(50):  # up to 5s
+        types = await _project_event_types("misc")
+        if "task_archived" in types:
+            break
+        await asyncio.sleep(0.1)
     await stop_kanban_subscriber()
     assert "task_stage_changed" in types
     assert "task_spec_written" in types
@@ -275,15 +278,21 @@ async def test_audit_fail_does_not_auto_revert(
         "body": "## Summary\nbroken\n", "verdict": "fail",
     }))
 
-    # Drain bus.
+    # Poll for the audit_fail_notification event to land in
+    # project_events (the kanban subscriber drains async; a fixed
+    # sleep can race under load).
     import asyncio
-    await asyncio.sleep(0.2)
+    types: list[str] = []
+    for _ in range(50):  # up to 5s
+        types = await _project_event_types("misc")
+        if "audit_fail_notification" in types:
+            break
+        await asyncio.sleep(0.1)
 
     # Task did NOT revert to execute on its own.
     assert await _task_status(tid) == "audit_syntax"
 
     # audit_fail_notification + deviations_log row both fired.
-    types = await _project_event_types("misc")
     await stop_kanban_subscriber()
     assert "audit_report_submitted" in types
     assert "audit_fail_notification" in types

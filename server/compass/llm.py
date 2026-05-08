@@ -37,7 +37,6 @@ import json
 import logging
 import re
 import sys
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
@@ -51,26 +50,14 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-class CompassLLMError(RuntimeError):
-    """Raised when an LLM call fails before producing usable output.
-    Caller decides whether to retry, fall back to a stub, or skip
-    the pipeline stage. Compass runs are best-effort: a failed
-    digest is logged and the run continues with the next stage."""
+from server.shared.llm_types import LLMError, LLMResult
 
-
-@dataclass
-class CompassLLMResult:
-    text: str
-    is_error: bool = False
-    cost_usd: float | None = None
-    duration_ms: int | None = None
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cache_read_tokens: int = 0
-    cache_creation_tokens: int = 0
-    session_id: str | None = None
-    stop_reason: str | None = None
-    errors: list[str] = field(default_factory=list)
+# Backward-compat aliases — these names are still imported by some
+# callers (compass.runner, audit, codex_llm). The canonical types
+# live in `server/shared/llm_types.py` so multiple subsystems can
+# share the Codex fallback module.
+CompassLLMError = LLMError
+CompassLLMResult = LLMResult
 
 
 def _now_iso() -> str:
@@ -241,12 +228,20 @@ async def _call_codex_via_helper(
     label: str,
 ) -> CompassLLMResult:
     """Indirection so tests can monkeypatch the Codex path on this
-    module without importing `compass.codex_llm` (which has a hard
+    module without importing `shared.codex_llm` (which has a hard
     dependency on the Codex SDK)."""
-    from server.compass.codex_llm import call_codex  # noqa: PLC0415
+    from server.shared.codex_llm import call_codex  # noqa: PLC0415
 
     return await call_codex(
-        system, user, project_id=project_id, label=label,
+        system,
+        user,
+        agent_id="compass",
+        event_type="compass_llm_call",
+        default_model_alias=config.LLM_FALLBACK_MODEL_ALIAS,
+        default_effort=config.LLM_FALLBACK_EFFORT,
+        project_id=project_id,
+        label=label,
+        cwd_env_var="HARNESS_COMPASS_CODEX_CWD",
     )
 
 

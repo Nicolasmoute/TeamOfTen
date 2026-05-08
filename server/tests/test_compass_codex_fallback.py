@@ -314,42 +314,42 @@ async def test_standalone_call_no_scope_retries_per_call(
 
 
 def test_resolve_codex_model_default_to_latest_mini_concrete() -> None:
-    """No param → falls through to `latest_mini` alias and resolves
-    to a concrete Codex mini id. The alias map in models_catalog is
-    the single source of truth."""
-    from server.compass.codex_llm import _resolve_codex_model
+    """No param → falls through to caller's default alias (Compass uses
+    `latest_mini`) and resolves to a concrete Codex mini id. The alias
+    map in models_catalog is the single source of truth."""
+    from server.shared.codex_llm import _resolve_codex_model
 
-    resolved = _resolve_codex_model(None)
+    resolved = _resolve_codex_model(None, "latest_mini")
     assert resolved is not None
     assert resolved != "latest_mini"  # alias was resolved
     assert "mini" in resolved.lower()
 
 
 def test_resolve_codex_model_explicit_param_wins() -> None:
-    from server.compass.codex_llm import _resolve_codex_model
+    from server.shared.codex_llm import _resolve_codex_model
 
-    resolved = _resolve_codex_model("gpt-5.4")
+    resolved = _resolve_codex_model("gpt-5.4", "latest_mini")
     assert resolved == "gpt-5.4"
 
 
 def test_resolve_codex_effort_default_medium() -> None:
-    from server.compass.codex_llm import _resolve_codex_effort
+    from server.shared.codex_llm import _resolve_codex_effort
 
-    assert _resolve_codex_effort(None) == "medium"
+    assert _resolve_codex_effort(None, "medium") == "medium"
 
 
 def test_resolve_codex_effort_invalid_falls_through_to_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from server.compass.codex_llm import _resolve_codex_effort
+    from server.shared.codex_llm import _resolve_codex_effort
 
     # Explicit garbage param drops to None.
-    assert _resolve_codex_effort("ULTRA") is None
-    assert _resolve_codex_effort("bogus") is None
+    assert _resolve_codex_effort("ULTRA", "medium") is None
+    assert _resolve_codex_effort("bogus", "medium") is None
 
 
 def test_resolve_codex_effort_accepts_valid_values() -> None:
-    from server.compass.codex_llm import _resolve_codex_effort
+    from server.shared.codex_llm import _resolve_codex_effort
 
     for level in ("low", "medium", "high", "max"):
-        assert _resolve_codex_effort(level) == level
+        assert _resolve_codex_effort(level, "medium") == level
