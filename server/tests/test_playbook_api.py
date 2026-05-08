@@ -39,7 +39,7 @@ def api_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
 
     app = FastAPI()
 
-    async def _no_auth(*a, **kw):
+    async def _no_auth() -> None:
         return None
 
     def _no_actor(request: Request) -> dict:

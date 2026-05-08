@@ -35,7 +35,7 @@ def test_empty_returns_empty_rows(client: TestClient) -> None:
     """Healthy team — no deviations, endpoint returns empty rows so
     the UI hides the section."""
     import asyncio
-    asyncio.get_event_loop().run_until_complete(init_db())
+    asyncio.new_event_loop().run_until_complete(init_db())
     r = client.get("/api/team/player_health")
     assert r.status_code == 200
     body = r.json()
@@ -46,8 +46,8 @@ def test_empty_returns_empty_rows(client: TestClient) -> None:
 def test_seeded_deviation_surfaces_in_rows(client: TestClient) -> None:
     """A seeded deviation produces a row with the right counter."""
     import asyncio
-    asyncio.get_event_loop().run_until_complete(init_db())
-    asyncio.get_event_loop().run_until_complete(
+    asyncio.new_event_loop().run_until_complete(init_db())
+    asyncio.new_event_loop().run_until_complete(
         _seed_deviation(project_id="misc", executor="p3", noticed_at="audit")
     )
     r = client.get("/api/team/player_health")
@@ -63,8 +63,8 @@ def test_row_shape(client: TestClient) -> None:
     """Schema contract: each row has slot/deviations/push_before_audit/
     off_spec_completions int fields."""
     import asyncio
-    asyncio.get_event_loop().run_until_complete(init_db())
-    asyncio.get_event_loop().run_until_complete(
+    asyncio.new_event_loop().run_until_complete(init_db())
+    asyncio.new_event_loop().run_until_complete(
         _seed_deviation(project_id="misc", executor="p7", noticed_at="push")
     )
     rows = client.get("/api/team/player_health").json()["rows"]
