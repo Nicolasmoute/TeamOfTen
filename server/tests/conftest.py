@@ -105,3 +105,21 @@ def fresh_db(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
             pass
         shutil.rmtree(data_root, ignore_errors=True)
         shutil.rmtree(workspaces, ignore_errors=True)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Hard-exit after pytest writes its summary.
+
+    Many tests open aiosqlite connections whose worker threads try to
+    talk back to per-test event loops that pytest-asyncio has already
+    closed. Those threads stay alive harmlessly, but on CI they keep
+    pytest's main thread from returning long after the run is done —
+    the GitHub runner then kills the job at the 10-minute job timeout
+    and marks the build red even though every test passed.
+    Hard-exiting once the summary line is written cuts the dead-time
+    so CI sees the real exit status.
+    """
+    import sys
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(exitstatus)
