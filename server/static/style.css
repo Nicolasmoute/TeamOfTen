@@ -2617,6 +2617,32 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
    state like the other rail icons. */
 .gear.recurrence-toggle { padding: 6px; line-height: 0; }
 .gear.recurrence-toggle.active { color: var(--accent); }
+
+/* Playbook open-book icon — match the rail's other inline-SVG icons.
+   Without explicit flex centering the svg sat on the text baseline,
+   nudging the glyph upward relative to the compass / recurrence
+   buttons next to it. */
+.gear.playbook-open { padding: 6px; line-height: 0; }
+.gear.playbook-open.active { color: var(--accent); }
+.playbook-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+}
+.playbook-icon svg { width: 100%; height: 100%; display: block; }
+/* Same hardening for the other rail SVG icons so the row reads
+   evenly even if a future SVG has different intrinsic baseline. */
+.gear.compass-open { padding: 6px; line-height: 0; }
+.compass-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+}
+.compass-icon svg { width: 100%; height: 100%; display: block; }
 .recurrence-icon {
   display: inline-block;
   width: 18px;

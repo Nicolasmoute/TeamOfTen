@@ -258,7 +258,29 @@ function RunRow({ row }) {
 
 // ---------------------------------------------------------------- main pane
 
-export function PlaybookPane({ slot, authedFetch, playbookEvents }) {
+function PlaybookPaneHeader({ onClose, isMaximized, onToggleMaximize }) {
+  return html`
+    <header class="pane-head pb-pane-head">
+      <div class="pane-head-label">
+        <span class="pb-pane-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="18" height="18">
+            <path d="M3 5 L11 6 L11 19 L3 18 Z" fill="none" stroke="currentColor" stroke-width="1.4"/>
+            <path d="M21 5 L13 6 L13 19 L21 18 Z" fill="none" stroke="currentColor" stroke-width="1.4"/>
+          </svg>
+        </span>
+        <span class="pane-head-slot">Playbook</span>
+      </div>
+      <div class="pane-head-actions">
+        ${onToggleMaximize
+          ? html`<button class="pane-head-btn" title=${isMaximized ? "Restore" : "Maximize"} onClick=${onToggleMaximize}>${isMaximized ? "❐" : "⛶"}</button>`
+          : null}
+        <button class="pane-head-btn" title="Close" onClick=${onClose}>×</button>
+      </div>
+    </header>
+  `;
+}
+
+export function PlaybookPane({ slot, authedFetch, playbookEvents, onClose, onDropEdge, onPopOut, stacked, isMaximized, onToggleMaximize }) {
   const [state, setState] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -369,24 +391,27 @@ export function PlaybookPane({ slot, authedFetch, playbookEvents }) {
     return out;
   }, [state]);
 
+  const header = PlaybookPaneHeader({ onClose, isMaximized, onToggleMaximize });
   if (loading && !state) {
-    return html`<div class="pb-pane"><div class="pb-loading">Loading playbook…</div></div>`;
+    return html`<div class="pb-pane">${header}<div class="pb-loading">Loading playbook…</div></div>`;
   }
   if (error) {
     return html`
       <div class="pb-pane">
+        ${header}
         <div class="pb-error">Error: ${error}</div>
         <button class="pb-btn" onClick=${refresh}>Retry</button>
       </div>
     `;
   }
-  if (!state) return html`<div class="pb-pane"><div class="pb-loading">No state.</div></div>`;
+  if (!state) return html`<div class="pb-pane">${header}<div class="pb-loading">No state.</div></div>`;
 
   const { active = [], archived = [], runs = [], flags = {}, caps = {} } = state;
   const capPct = caps.soft ? (caps.active_count / caps.soft) * 100 : 0;
 
   return html`
     <div class="pb-pane">
+      ${header}
       ${overrideTarget ? html`
         <${OverrideModal}
           statement=${overrideTarget}
