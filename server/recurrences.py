@@ -293,7 +293,17 @@ async def _compute_next_for_row(
     signal the row must be disabled (one-shot complete or unparsable)."""
     kind = row["kind"]
     cadence = row["cadence"]
-    if kind in ("tick", "repeat"):
+    if kind == "tick":
+        # recurrence-specs.md §2 + §11: tick cadence 0 means "fire as
+        # soon as Coach is idle". Returning ``after_utc`` makes the row
+        # immediately re-due on the next scheduler pass; the busy /
+        # cost-cap check is what gates the fire, not the clock.
+        try:
+            minutes = max(0, int(cadence))
+        except (TypeError, ValueError):
+            return None
+        return after_utc + timedelta(minutes=minutes)
+    if kind == "repeat":
         try:
             minutes = max(1, int(cadence))
         except (TypeError, ValueError):
@@ -470,14 +480,46 @@ async def _fire_row(row: dict[str, Any]) -> None:
     await run_agent("coach", prompt)
 
 
+_DEFER_LATCH: set[int] = set()
+"""Row ids for which a ``recurrence_deferred`` event has already been
+emitted in the current defer episode. Reset on the next successful
+fire (recurrence-specs.md §13). Module-level / in-memory by design —
+a process restart simply re-emits one fresh defer event the first
+time the row defers again, which is the right outcome."""
+
+
+async def _defer_tick_row(
+    row: dict[str, Any], reason: str,
+) -> None:
+    """Tick rows defer when Coach is busy or cost-capped: do NOT advance
+    ``next_fire_at``, just leave the row overdue so the next scheduler
+    pass re-evaluates. Emits ``recurrence_deferred`` once per defer
+    episode (recurrence-specs.md §11, §13).
+    """
+    rid = row["id"]
+    if rid in _DEFER_LATCH:
+        return
+    _DEFER_LATCH.add(rid)
+    await _emit({
+        "type": "recurrence_deferred",
+        "id": rid,
+        "kind": row["kind"],
+        "reason": reason,
+        "project_id": row["project_id"],
+    })
+
+
 async def _skip_row(
     db: Any, row: dict[str, Any], reason: str, now: datetime,
 ) -> None:
-    """Persist the deferred fire and emit ``recurrence_skipped``.
+    """Persist the skipped fire and emit ``recurrence_skipped``.
 
-    Advances ``next_fire_at`` past now so the row doesn't immediately
-    re-fire on the next 30s scheduler pass. One-shot crons whose schedule
-    is now in the past are disabled instead.
+    Repeat / cron rows skip-and-advance: ``next_fire_at`` is moved past
+    now so the row doesn't immediately re-fire on the next 30s pass.
+    Wall-clock semantics — a missed slot is dropped, not queued.
+    Tick rows go through :func:`_defer_tick_row` instead (defer-and-wait,
+    keeping ``next_fire_at`` in place). One-shot crons whose schedule
+    is now in the past are disabled here as a terminal step.
     """
     rid = row["id"]
     kind = row["kind"]
@@ -534,17 +576,28 @@ async def _handle_due_row(
     project_id = row["project_id"]
 
     if coach_busy:
-        await _skip_row(db, row, "coach_busy", now)
+        # recurrence-specs.md §11: tick rows DEFER (wait for idle) —
+        # repeat / cron rows SKIP (drop the slot, advance next_fire_at).
+        if kind == "tick":
+            await _defer_tick_row(row, "coach_busy")
+        else:
+            await _skip_row(db, row, "coach_busy", now)
         return False
 
     # §15.9: a recurrence fire is subject to the same per-agent and
-    # team-daily cost caps as any other Coach turn. Skip with
-    # reason=cost_capped instead of letting run_agent emit the noisier
-    # cost_capped event so the recurrence pane sees a single skip.
+    # team-daily cost caps as any other Coach turn. Same defer-vs-skip
+    # split as the busy branch.
     allowed, _reason = await _check_cost_caps("coach")
     if not allowed:
-        await _skip_row(db, row, "cost_capped", now)
+        if kind == "tick":
+            await _defer_tick_row(row, "cost_capped")
+        else:
+            await _skip_row(db, row, "cost_capped", now)
         return False
+
+    # Successful fire path — clear the defer-latch for this row so
+    # the NEXT defer episode emits a fresh recurrence_deferred event.
+    _DEFER_LATCH.discard(rid)
 
     # Coach is free + under cap — fire the row. last_fired_at stamps
     # before the spawn so a long-running turn doesn't push next_fire_at
@@ -698,6 +751,14 @@ async def _count_enabled(project_id: str) -> int:
 
 
 def _validate_minutes(cadence: str | int) -> int:
+    """Validate a repeat-style cadence (>= 1 minute).
+
+    Tick rows go through :func:`_validate_tick_minutes` instead and allow
+    0, which means "fire as soon as Coach is idle" (recurrence-specs.md
+    §2). Repeat / cron cadences must be positive — there is no
+    "fire continuously" mode for them, since their busy-time semantics
+    are skip-the-slot, not defer.
+    """
     try:
         mins = int(cadence)
     except (TypeError, ValueError) as exc:
@@ -705,6 +766,22 @@ def _validate_minutes(cadence: str | int) -> int:
     if mins < 1:
         raise ValueError("cadence must be at least 1 minute")
     if mins > 525_600:  # 365 days
+        raise ValueError("cadence absurdly large; pick something < 525600")
+    return mins
+
+
+def _validate_tick_minutes(cadence: str | int) -> int:
+    """Validate a tick cadence. 0 is allowed and means "fire as soon as
+    Coach is idle" (recurrence-specs.md §2). Negative is rejected; the
+    upper bound mirrors :func:`_validate_minutes`.
+    """
+    try:
+        mins = int(cadence)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("cadence must be an integer number of minutes") from exc
+    if mins < 0:
+        raise ValueError("tick cadence cannot be negative (use 0 for continuous)")
+    if mins > 525_600:
         raise ValueError("cadence absurdly large; pick something < 525600")
     return mins
 
@@ -832,7 +909,7 @@ async def upsert_tick(
     if minutes is None and enabled is None:
         raise ValueError("must pass minutes or enabled")
     if minutes is not None:
-        minutes = _validate_minutes(minutes)
+        minutes = _validate_tick_minutes(minutes)
 
     c = await configured_conn()
     try:
@@ -912,6 +989,10 @@ async def upsert_tick(
     finally:
         await c.close()
 
+    # Cadence / enabled changes invalidate any in-flight defer episode:
+    # treat the next defer as fresh so the operator sees the event.
+    _DEFER_LATCH.discard(int(rec_id))
+
     row = await get_recurrence(int(rec_id))
     if row is None:
         return None
@@ -976,7 +1057,15 @@ async def update_recurrence(
     new_next_fire: str | None = row["next_fire_at"]
 
     if cadence is not None or tz is not None:
-        if row["kind"] == "tick" or row["kind"] == "repeat":
+        if row["kind"] == "tick":
+            mins_input = cadence if cadence is not None else new_cadence
+            minutes = _validate_tick_minutes(mins_input)
+            new_cadence = str(minutes)
+            new_tz = None
+            base = _now_utc()
+            new_next_fire = _format_iso(base + timedelta(minutes=minutes))
+            next_fire_changed = True
+        elif row["kind"] == "repeat":
             mins_input = cadence if cadence is not None else new_cadence
             minutes = _validate_minutes(mins_input)
             new_cadence = str(minutes)
@@ -1023,6 +1112,8 @@ async def update_recurrence(
     finally:
         await c.close()
 
+    _DEFER_LATCH.discard(rec_id)
+
     after = await get_recurrence(rec_id)
     assert after is not None
     event: dict[str, Any] = {
@@ -1060,6 +1151,7 @@ async def delete_recurrence(
         await c.commit()
     finally:
         await c.close()
+    _DEFER_LATCH.discard(rec_id)
     event: dict[str, Any] = {
         "type": "recurrence_deleted",
         "id": rec_id,

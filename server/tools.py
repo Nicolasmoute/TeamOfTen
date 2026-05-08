@@ -3787,6 +3787,104 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         })
         return _ok(f"todo {todo.id} updated: {todo.title}")
 
+    @tool(
+        "coord_set_tick_interval",
+        (
+            "Coach-only. Throttle the active project's recurring tick "
+            "up or down. The tick wakes you to walk the priority list "
+            "(inbox / kanban / coach-todos / objectives) — cadence is "
+            "yours to manage based on how active the team is "
+            "(recurrence-specs.md §7.6).\n"
+            "\n"
+            "Tick fires only when you're idle. A scheduled fire that "
+            "arrives mid-turn does NOT skip — it waits for you to "
+            "finish, then fires once. The cadence is the *minimum gap* "
+            "between tick fires, not a wall-clock alarm.\n"
+            "\n"
+            "When to call:\n"
+            "- Throttle DOWN (e.g. minutes=15 or 30) when steady-state "
+            "  and recent ticks hit empty branches. Saves spend.\n"
+            "- Throttle UP (minutes=1) when actively orchestrating, "
+            "  monitoring a deploy, chasing a stall.\n"
+            "- minutes=0 means 'fire continuously as soon as I'm "
+            "  idle' — power-user mode. Remember to throttle back "
+            "  down once the burst is over so the daily cap doesn't "
+            "  burn on idle ticks.\n"
+            "\n"
+            "If no tick row exists yet, this creates one. Setting "
+            "minutes on a disabled row re-enables it (matches "
+            "/tick N semantics).\n"
+            "\n"
+            "Params:\n"
+            "- minutes: integer >= 0. Required unless `enabled` is "
+            "  passed alone.\n"
+            "- enabled: 'on' | 'off' to toggle without changing "
+            "  cadence. Aliases: 'true'/'1'/'yes' → on, "
+            "  'false'/'0'/'no' → off. Empty string or omitted = "
+            "  no change to enabled state."
+        ),
+        {"minutes": int, "enabled": str},
+    )
+    async def set_tick_interval(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err(
+                "Only Coach throttles the recurring tick. Players: "
+                "send a coord_send_message to coach if you want a "
+                "different cadence."
+            )
+
+        minutes_raw = args.get("minutes", None)
+        enabled_raw = args.get("enabled", None)
+
+        minutes_value: int | None = None
+        if minutes_raw is not None and str(minutes_raw).strip() != "":
+            try:
+                minutes_value = int(minutes_raw)
+            except (TypeError, ValueError):
+                return _err(
+                    f"invalid minutes {minutes_raw!r} — expected "
+                    "non-negative integer"
+                )
+            if minutes_value < 0:
+                return _err("minutes cannot be negative (use 0 for continuous)")
+
+        enabled_value: bool | None = None
+        if enabled_raw is not None and str(enabled_raw).strip() != "":
+            ev = str(enabled_raw).strip().lower()
+            if ev in ("on", "true", "1", "yes", "enable", "enabled"):
+                enabled_value = True
+            elif ev in ("off", "false", "0", "no", "disable", "disabled"):
+                enabled_value = False
+            else:
+                return _err(
+                    f"invalid enabled {enabled_raw!r} — expected "
+                    "'on' | 'off'"
+                )
+
+        if minutes_value is None and enabled_value is None:
+            return _err("pass at least one of: minutes, enabled")
+
+        from server.recurrences import upsert_tick
+        project_id = await resolve_active_project()
+        try:
+            row = await upsert_tick(
+                project_id=project_id,
+                minutes=minutes_value,
+                enabled=enabled_value,
+                created_by="coach",
+            )
+        except ValueError as exc:
+            return _err(str(exc))
+
+        if row is None:
+            return _ok("no tick row exists yet, and enabled=off was a no-op")
+        cadence = row["cadence"]
+        if not row["enabled"]:
+            return _ok(f"tick disabled (cadence preserved: every {cadence} min)")
+        if str(cadence) == "0":
+            return _ok("tick set: continuous (fires as soon as Coach is idle)")
+        return _ok(f"tick set: every {cadence} min")
+
     # ============================================================
     # Compass tools — Coach-only strategy-engine surface.
     # All four reject Player calls with the same canonical message
@@ -6692,6 +6790,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         add_todo,
         complete_todo,
         update_todo,
+        set_tick_interval,
         compass_ask,
         compass_audit,
         compass_brief,
@@ -6759,6 +6858,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_add_todo",
     "mcp__coord__coord_complete_todo",
     "mcp__coord__coord_update_todo",
+    "mcp__coord__coord_set_tick_interval",
     # Compass — Coach-only at runtime; included in the allowlist for
     # both roles so the SDK doesn't pre-reject the call. The
     # caller_is_coach gate inside each handler is what enforces the

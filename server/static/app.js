@@ -520,7 +520,7 @@ const SLASH_COMMANDS = [
   { cmd: "/clear",   desc: "clear session so the next turn starts fresh" },
   { cmd: "/compact", desc: "summarize current session; next turn resumes with summary" },
   { cmd: "/cancel",  desc: "cancel the in-flight turn on this pane" },
-  { cmd: "/tick",   desc: "/tick → fire now · /tick N → every N min · /tick off" },
+  { cmd: "/tick",   desc: "/tick → fire now · /tick N → every N min · /tick 0 → continuous · /tick off" },
   { cmd: "/repeat", desc: "Coach repeat: /repeat → list · /repeat N <prompt> · /repeat rm <id>" },
   { cmd: "/cron",   desc: "Coach cron: /cron → list · /cron <when> <prompt> · /cron rm <id>" },
   { cmd: "/status", desc: "show server runtime state (paused, running, spend)" },
@@ -10698,7 +10698,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
       }
       case "/tick": {
         // /tick           → fire one tick now
-        // /tick N         → set recurring tick to every N minutes
+        // /tick N         → set recurring tick to every N minutes (0 = continuous)
         // /tick off       → disable recurring tick
         const a = arg.trim().toLowerCase();
         if (!a) {
@@ -10711,7 +10711,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
             .catch((e) => setInfoText("tick failed: " + String(e)));
           return true;
         }
-        if (a === "off" || a === "0" || a === "stop") {
+        if (a === "off" || a === "stop") {
           authFetch("/api/coach/tick", {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
@@ -10725,10 +10725,13 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
             .catch((e) => setInfoText("tick off failed: " + String(e)));
           return true;
         }
+        // /tick 0 means "fire continuously as soon as Coach is idle"
+        // (recurrence-specs.md §2). Use Number.isInteger so we can
+        // accept 0 without tripping the truthy guard the prior code had.
         const minutes = parseInt(a, 10);
-        if (!minutes || minutes < 1) {
+        if (!Number.isInteger(minutes) || minutes < 0) {
           setInfoText(
-            "usage: /tick (fire now)  ·  /tick <minutes>  ·  /tick off"
+            "usage: /tick (fire now)  ·  /tick <minutes>  ·  /tick 0 (continuous)  ·  /tick off"
           );
           return true;
         }
@@ -10739,7 +10742,11 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
         })
           .then(async (r) => {
             if (!r.ok) throw new Error("HTTP " + r.status);
-            setInfoText(`Recurring tick: every ${minutes} min.`);
+            if (minutes === 0) {
+              setInfoText("Recurring tick: continuous (fires as soon as Coach is idle).");
+            } else {
+              setInfoText(`Recurring tick: every ${minutes} min.`);
+            }
           })
           .catch((e) => setInfoText("tick set failed: " + String(e)));
         return true;

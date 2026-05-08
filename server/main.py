@@ -1379,7 +1379,9 @@ class RecurrencePatchRequest(BaseModel):
 
 
 class CoachTickPutRequest(BaseModel):
-    minutes: int | None = Field(default=None, ge=1, le=525_600)
+    # ge=0 enables the "fire continuously when Coach is idle" mode
+    # introduced in recurrence-specs.md §2.
+    minutes: int | None = Field(default=None, ge=0, le=525_600)
     enabled: bool | None = None
 
 

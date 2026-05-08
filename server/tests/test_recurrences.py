@@ -820,16 +820,19 @@ async def test_scheduler_uses_compose_tick_prompt(
 async def test_scheduler_skips_when_cost_capped(
     fresh_db: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """§15.9 — when over the daily cost cap, fires are skipped with
-    reason=cost_capped instead of letting run_agent emit cost_capped."""
+    """§15.9 — when over the daily cost cap, repeat / cron fires are
+    skipped with reason=cost_capped instead of letting run_agent emit
+    cost_capped. Tick rows defer instead (see
+    test_tick_cost_capped_defers_not_skips)."""
     monkeypatch.setenv("HARNESS_COACH_TICK_INTERVAL", "0")
     await init_db()
+    recmod._DEFER_LATCH.clear()
     c = await configured_conn()
     try:
         await c.execute(
             "INSERT INTO coach_recurrence "
-            "(project_id, kind, cadence, enabled, next_fire_at) "
-            "VALUES ('misc', 'tick', '60', 1, "
+            "(project_id, kind, cadence, prompt, enabled, next_fire_at) "
+            "VALUES ('misc', 'repeat', '30', 'do thing', 1, "
             "'2020-01-01T00:00:00.000Z')"
         )
         await c.commit()
@@ -868,7 +871,7 @@ async def test_scheduler_skips_when_cost_capped(
     assert fired == []
     assert len(skipped) == 1
     assert skipped[0]["reason"] == "cost_capped"
-    assert skipped[0]["kind"] == "tick"
+    assert skipped[0]["kind"] == "repeat"
 
 
 async def test_recurrence_fired_payload_uses_id_key(
@@ -1169,3 +1172,466 @@ async def test_schema_version_stamped(fresh_db: str) -> None:
         await c.close()
     assert row is not None
     assert dict(row)["value"] == "recurrence_v1"
+
+
+# --- Tick defer-on-busy semantics (recurrence-specs.md §2 / §11) ----
+
+
+def _busy_iter_patches():
+    """Convenience: patch the three things _scheduler_iteration imports."""
+    return (
+        patch(
+            "server.agents._coach_is_working",
+            new=lambda: _async_const(True),
+        ),
+        patch("server.agents.is_paused", new=lambda: False),
+    )
+
+
+async def _async_const(val: Any) -> Any:
+    return val
+
+
+async def test_tick_busy_defers_does_not_advance_next_fire_at(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A busy Coach must NOT advance a tick row's next_fire_at — the
+    row stays overdue so the next pass fires it as soon as Coach is
+    idle (recurrence-specs.md §11)."""
+    monkeypatch.setenv("HARNESS_COACH_TICK_INTERVAL", "0")
+    await init_db()
+    recmod._DEFER_LATCH.clear()
+    original_next_fire = "2020-01-01T00:00:00.000Z"
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, enabled, next_fire_at) "
+            "VALUES ('misc', 'tick', '60', 1, ?)",
+            (original_next_fire,),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    events: list[dict[str, Any]] = []
+
+    async def fake_run(*a: Any, **kw: Any) -> None:
+        return None
+
+    async def fake_busy() -> bool:
+        return True
+
+    def fake_paused() -> bool:
+        return False
+
+    real_publish = recmod.bus.publish
+
+    async def capture(event: dict[str, Any]) -> None:
+        if str(event.get("type", "")).startswith("recurrence_"):
+            events.append(event)
+        await real_publish(event)
+
+    with patch("server.agents.run_agent", fake_run), \
+            patch("server.agents._coach_is_working", fake_busy), \
+            patch("server.agents.is_paused", fake_paused), \
+            patch.object(recmod.bus, "publish", capture):
+        await recmod._scheduler_iteration()
+
+    # No skipped event for tick — only deferred.
+    assert any(e["type"] == "recurrence_deferred" for e in events)
+    assert not any(e["type"] == "recurrence_skipped" for e in events)
+    deferred = next(e for e in events if e["type"] == "recurrence_deferred")
+    assert deferred["reason"] == "coach_busy"
+    assert deferred["kind"] == "tick"
+
+    # next_fire_at is unchanged — that's the whole point of "defer".
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT next_fire_at FROM coach_recurrence WHERE kind = 'tick'"
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    assert dict(row)["next_fire_at"] == original_next_fire
+
+
+async def test_tick_defer_event_emitted_once_per_episode(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """recurrence_deferred fires ONCE per defer episode (latch). Two
+    busy passes in a row produce one event, not two — otherwise a long
+    Coach turn with a fast tick spams the log."""
+    monkeypatch.setenv("HARNESS_COACH_TICK_INTERVAL", "0")
+    await init_db()
+    recmod._DEFER_LATCH.clear()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, enabled, next_fire_at) "
+            "VALUES ('misc', 'tick', '60', 1, "
+            "'2020-01-01T00:00:00.000Z')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    deferred: list[dict[str, Any]] = []
+    real_publish = recmod.bus.publish
+
+    async def capture(event: dict[str, Any]) -> None:
+        if event.get("type") == "recurrence_deferred":
+            deferred.append(event)
+        await real_publish(event)
+
+    async def fake_run(*a: Any, **kw: Any) -> None:
+        return None
+
+    async def fake_busy() -> bool:
+        return True
+
+    def fake_paused() -> bool:
+        return False
+
+    with patch("server.agents.run_agent", fake_run), \
+            patch("server.agents._coach_is_working", fake_busy), \
+            patch("server.agents.is_paused", fake_paused), \
+            patch.object(recmod.bus, "publish", capture):
+        await recmod._scheduler_iteration()
+        await recmod._scheduler_iteration()
+        await recmod._scheduler_iteration()
+
+    assert len(deferred) == 1
+
+
+async def test_tick_defer_latch_resets_on_successful_fire(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After Coach goes idle and the tick fires, a SUBSEQUENT busy
+    pass should emit a fresh recurrence_deferred — the latch is per
+    defer-episode, not per row-lifetime."""
+    monkeypatch.setenv("HARNESS_COACH_TICK_INTERVAL", "0")
+    await init_db()
+    recmod._DEFER_LATCH.clear()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, enabled, next_fire_at) "
+            "VALUES ('misc', 'tick', '60', 1, "
+            "'2020-01-01T00:00:00.000Z')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    deferred: list[dict[str, Any]] = []
+    real_publish = recmod.bus.publish
+
+    async def capture(event: dict[str, Any]) -> None:
+        if event.get("type") == "recurrence_deferred":
+            deferred.append(event)
+        await real_publish(event)
+
+    busy_state = {"value": True}
+
+    async def fake_busy() -> bool:
+        return busy_state["value"]
+
+    async def fake_run(*a: Any, **kw: Any) -> None:
+        return None
+
+    def fake_paused() -> bool:
+        return False
+
+    async def fake_caps(agent_id: str) -> tuple[bool, str]:
+        return True, ""
+
+    with patch("server.agents.run_agent", fake_run), \
+            patch("server.agents._coach_is_working", fake_busy), \
+            patch("server.agents.is_paused", fake_paused), \
+            patch("server.agents._check_cost_caps", fake_caps), \
+            patch.object(recmod.bus, "publish", capture):
+        await recmod._scheduler_iteration()  # busy → defer 1
+        busy_state["value"] = False
+        # Re-set next_fire_at to keep the row due (since the prior
+        # successful fire would advance it; we want to test that a
+        # subsequent busy episode after a fire emits a fresh defer).
+        await recmod._scheduler_iteration()  # idle → fire (clears latch)
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE coach_recurrence SET next_fire_at = ? "
+                "WHERE kind = 'tick'",
+                ("2020-01-01T00:00:00.000Z",),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+        busy_state["value"] = True
+        await recmod._scheduler_iteration()  # busy → defer 2
+
+    assert len(deferred) == 2
+
+
+async def test_tick_cost_capped_defers_not_skips(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cost-capped tick should DEFER (not skip) — caps roll over and
+    the row should fire as soon as the cap clears."""
+    monkeypatch.setenv("HARNESS_COACH_TICK_INTERVAL", "0")
+    await init_db()
+    recmod._DEFER_LATCH.clear()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, enabled, next_fire_at) "
+            "VALUES ('misc', 'tick', '60', 1, "
+            "'2020-01-01T00:00:00.000Z')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    events: list[dict[str, Any]] = []
+
+    async def fake_run(*a: Any, **kw: Any) -> None:
+        return None
+
+    async def fake_busy() -> bool:
+        return False
+
+    def fake_paused() -> bool:
+        return False
+
+    async def fake_caps(agent_id: str) -> tuple[bool, str]:
+        return False, "over cap"
+
+    real_publish = recmod.bus.publish
+
+    async def capture(event: dict[str, Any]) -> None:
+        if str(event.get("type", "")).startswith("recurrence_"):
+            events.append(event)
+        await real_publish(event)
+
+    with patch("server.agents.run_agent", fake_run), \
+            patch("server.agents._coach_is_working", fake_busy), \
+            patch("server.agents.is_paused", fake_paused), \
+            patch("server.agents._check_cost_caps", fake_caps), \
+            patch.object(recmod.bus, "publish", capture):
+        await recmod._scheduler_iteration()
+
+    assert not any(e["type"] == "recurrence_skipped" for e in events)
+    deferred = [e for e in events if e["type"] == "recurrence_deferred"]
+    assert len(deferred) == 1
+    assert deferred[0]["reason"] == "cost_capped"
+
+
+async def test_repeat_busy_still_skips_and_advances(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeat rows preserve the existing skip-and-advance semantics —
+    they're wall-clock alarms, not minimum-gap throttles."""
+    monkeypatch.setenv("HARNESS_COACH_TICK_INTERVAL", "0")
+    await init_db()
+    recmod._DEFER_LATCH.clear()
+    original_next_fire = "2020-01-01T00:00:00.000Z"
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, prompt, enabled, next_fire_at) "
+            "VALUES ('misc', 'repeat', '30', 'do thing', 1, ?)",
+            (original_next_fire,),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    events: list[dict[str, Any]] = []
+    real_publish = recmod.bus.publish
+
+    async def capture(event: dict[str, Any]) -> None:
+        if str(event.get("type", "")).startswith("recurrence_"):
+            events.append(event)
+        await real_publish(event)
+
+    async def fake_run(*a: Any, **kw: Any) -> None:
+        return None
+
+    async def fake_busy() -> bool:
+        return True
+
+    def fake_paused() -> bool:
+        return False
+
+    with patch("server.agents.run_agent", fake_run), \
+            patch("server.agents._coach_is_working", fake_busy), \
+            patch("server.agents.is_paused", fake_paused), \
+            patch.object(recmod.bus, "publish", capture):
+        await recmod._scheduler_iteration()
+
+    assert any(e["type"] == "recurrence_skipped" for e in events)
+    assert not any(e["type"] == "recurrence_deferred" for e in events)
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT next_fire_at FROM coach_recurrence WHERE kind = 'repeat'"
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    assert dict(row)["next_fire_at"] != original_next_fire
+
+
+# --- Tick cadence 0 (continuous mode) -------------------------------
+
+
+async def test_tick_minutes_zero_accepted(fresh_db: str) -> None:
+    """recurrence-specs.md §2: tick cadence 0 means 'fire as soon as
+    Coach is idle'."""
+    await init_db()
+    row = await recmod.upsert_tick(project_id="misc", minutes=0)
+    assert row is not None
+    assert row["cadence"] == "0"
+    assert row["enabled"] is True
+
+
+async def test_tick_minutes_negative_rejected(fresh_db: str) -> None:
+    await init_db()
+    with pytest.raises(ValueError, match="negative"):
+        await recmod.upsert_tick(project_id="misc", minutes=-1)
+
+
+async def test_repeat_minutes_zero_still_rejected(fresh_db: str) -> None:
+    """Cadence 0 is a tick-only feature. Repeat / cron remain >= 1."""
+    await init_db()
+    with pytest.raises(ValueError, match="at least 1"):
+        await recmod.create_recurrence(
+            project_id="misc", kind="repeat", cadence=0, prompt="x",
+        )
+
+
+async def test_tick_zero_fires_immediately_when_idle(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With cadence 0, after firing, next_fire_at is now (no delta) —
+    the next scheduler pass would re-fire if Coach is still idle."""
+    monkeypatch.setenv("HARNESS_COACH_TICK_INTERVAL", "0")
+    await init_db()
+    recmod._DEFER_LATCH.clear()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, enabled, next_fire_at) "
+            "VALUES ('misc', 'tick', '0', 1, "
+            "'2020-01-01T00:00:00.000Z')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    fired: list[Any] = []
+
+    async def fake_run(agent_id: str, prompt: str, **kw: Any) -> None:
+        fired.append(agent_id)
+
+    async def fake_busy() -> bool:
+        return False
+
+    def fake_paused() -> bool:
+        return False
+
+    async def fake_caps(agent_id: str) -> tuple[bool, str]:
+        return True, ""
+
+    with patch("server.agents.run_agent", fake_run), \
+            patch("server.agents._coach_is_working", fake_busy), \
+            patch("server.agents.is_paused", fake_paused), \
+            patch("server.agents._check_cost_caps", fake_caps):
+        await recmod._scheduler_iteration()
+
+    assert fired == ["coach"]
+    # next_fire_at advanced by 0 minutes — i.e. it's roughly "now",
+    # which is in the past relative to the next scheduler pass.
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT next_fire_at FROM coach_recurrence WHERE kind = 'tick'"
+        )
+        next_fire_at = dict(await cur.fetchone())["next_fire_at"]
+    finally:
+        await c.close()
+    parsed = recmod._parse_iso(next_fire_at)
+    assert parsed is not None
+    # Should be within a few seconds of now — i.e. immediately re-due.
+    delta = (recmod._now_utc() - parsed).total_seconds()
+    assert -2 <= delta <= 5
+
+
+# --- coord_set_tick_interval MCP tool -------------------------------
+
+
+async def test_coord_set_tick_interval_creates_row(fresh_db: str) -> None:
+    """Smoke test: Coach can call the tool to create a tick row."""
+    await init_db()
+    from server.tools import build_coord_server
+    srv = build_coord_server("coach", include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_set_tick_interval"]
+    result = await handler({"minutes": 30})
+    assert result.get("isError") is not True
+    rows = await recmod.list_recurrences("misc")
+    ticks = [r for r in rows if r["kind"] == "tick"]
+    assert len(ticks) == 1
+    assert ticks[0]["cadence"] == "30"
+
+
+async def test_coord_set_tick_interval_rejects_player(fresh_db: str) -> None:
+    await init_db()
+    from server.tools import build_coord_server
+    srv = build_coord_server("p3", include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_set_tick_interval"]
+    result = await handler({"minutes": 30})
+    assert result["isError"] is True
+    assert "Coach" in result["content"][0]["text"]
+
+
+async def test_coord_set_tick_interval_zero_for_continuous(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    from server.tools import build_coord_server
+    srv = build_coord_server("coach", include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_set_tick_interval"]
+    result = await handler({"minutes": 0})
+    assert result.get("isError") in (False, None)
+    rows = await recmod.list_recurrences("misc")
+    ticks = [r for r in rows if r["kind"] == "tick"]
+    assert ticks[0]["cadence"] == "0"
+
+
+async def test_coord_set_tick_interval_negative_rejected(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    from server.tools import build_coord_server
+    srv = build_coord_server("coach", include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_set_tick_interval"]
+    result = await handler({"minutes": -5})
+    assert result["isError"] is True
+
+
+async def test_coord_set_tick_interval_disable(fresh_db: str) -> None:
+    await init_db()
+    from server.tools import build_coord_server
+    await recmod.upsert_tick(project_id="misc", minutes=60)
+    srv = build_coord_server("coach", include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_set_tick_interval"]
+    result = await handler({"enabled": "off"})
+    assert result.get("isError") in (False, None)
+    rows = await recmod.list_recurrences("misc")
+    assert rows[0]["enabled"] is False
