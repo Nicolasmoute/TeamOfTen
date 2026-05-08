@@ -3733,6 +3733,19 @@ async def _build_coach_coordination_block(
     )
     lines.append("")
     lines.append(
+        "**Tasks are work fired at one Player.** Every "
+        "`coord_create_task` puts a task on the kanban — and the kanban "
+        "is a log of work you have actually dispatched. So "
+        "`trajectory[0].to` MUST be a single named Player (e.g. "
+        "['p3']) — no pools, no empty list. If you don't know who yet, "
+        "you don't have a task yet, you have pre-task reasoning. Decide "
+        "first (read ## Player health, ## Recent events, "
+        "coord_get_player_settings), then create. Subsequent stages "
+        "remain FYI — fill them in or leave empty as you see fit; "
+        "you'll pick each later assignee via coord_approve_stage."
+    )
+    lines.append("")
+    lines.append(
         "**Single transition tool.** Every stage transition is "
         "`coord_approve_stage(task_id, next_stage, assignee, note?)`. "
         "There is no auto-advance and no implicit assignment. Pick the "

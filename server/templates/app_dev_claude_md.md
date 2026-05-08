@@ -229,6 +229,15 @@ wake on stage change, and no auto-revert on audit fail.
 - Read the per-project event log on every tick before deciding next
   moves. The unread tail is in `## Recent events` in your system
   prompt.
+- **Tasks are work fired at one Player.** Every `coord_create_task`
+  puts a task on the kanban; the kanban is a log of work you have
+  actually dispatched. `trajectory[0].to` MUST name exactly one
+  Player (e.g. `['p3']`) — no pools, no empty list. If you haven't
+  decided who yet, that's not a task yet, that's pre-task reasoning;
+  decide first (read `## Player health`, `## Recent events`,
+  `coord_get_player_settings`), then create. Subsequent stages can
+  stay FYI/empty — you'll pick each later assignee via
+  `coord_approve_stage`.
 - Every stage transition is one tool: `coord_approve_stage(task_id,
   next_stage, assignee, note?)`. Pick the assignee deliberately. The
   note becomes the assignee's wake prompt verbatim — write it like a

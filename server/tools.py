@@ -286,6 +286,8 @@ def _coerce_player_slots(value: Any) -> list[str] | str:
 
 def _validate_trajectory(
     raw: Any,
+    *,
+    enforce_first_stage_assigned: bool = True,
 ) -> tuple[list[dict[str, Any]] | None, str | None]:
     """Validate a trajectory list per Docs/kanban-specs.md §3.2.
 
@@ -322,7 +324,10 @@ def _validate_trajectory(
             parsed = json.loads(text)
         except Exception:
             return None, "trajectory JSON could not be parsed"
-        return _validate_trajectory(parsed)
+        return _validate_trajectory(
+            parsed,
+            enforce_first_stage_assigned=enforce_first_stage_assigned,
+        )
     if not isinstance(raw, list):
         return None, "trajectory must be a list of {stage, to, focus?} objects"
     if not raw:
@@ -383,6 +388,38 @@ def _validate_trajectory(
 
     if "execute" not in seen_stages:
         return None, "trajectory must include 'execute'"
+
+    # v2.0.1 (2026-05-08): the first trajectory entry's `to` must name
+    # exactly one Player AT CREATION TIME. The kanban is a log of work
+    # Coach has fired at Players — tasks without an assignee aren't on
+    # the kanban yet, they're pre-task reasoning. Pool/empty
+    # first-stage `to` is rejected at the trajectory-validation
+    # boundary so both MCP (`coord_create_task`) and HTTP
+    # (`POST /api/tasks`) layers honor the rule. Subsequent entries
+    # can still be pool/empty (FYI only; Coach picks each later
+    # stage's assignee at coord_approve_stage time, which already
+    # enforces single-named).
+    #
+    # `enforce_first_stage_assigned=False` is set by
+    # `coord_set_task_trajectory` callers — mid-flight reroute happens
+    # AFTER the task already has role rows planted; the original
+    # first-stage assignment is in the role-row table, not the
+    # trajectory's first entry. So a reroute can rewrite the first
+    # entry to empty/pool without violating the create-time invariant.
+    if enforce_first_stage_assigned:
+        first_to = normalized[0].get("to") or []
+        if len(first_to) != 1:
+            return None, (
+                "trajectory[0].to must name exactly one Player (e.g. "
+                "['p3']) — coord_create_task fires a piece of work AT "
+                "someone. Pool/empty first-stage `to` is rejected: an "
+                "undispatched task isn't on the kanban yet, it's "
+                "pre-task reasoning. If you haven't decided who, decide "
+                "now (look at coord_get_player_settings, ## Player "
+                "health, and ## Recent events) and put their slot in "
+                "the trajectory. Subsequent stages can be FYI / empty; "
+                "only the first must be named."
+            )
 
     return normalized, None
 
@@ -739,24 +776,26 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- trajectory: REQUIRED for Coach. Ordered list of {stage, to, "
             "focus?} objects documenting the planned path and the candidate "
             "slots. `stage` ∈ {plan, execute, audit_syntax, audit_semantics, "
-            "ship}; canonical order; execute is mandatory. `to` is a single "
-            "Player slot ('p3') OR a list (['p1','p2']) OR empty (). In v2 "
-            "the trajectory is FYI only — pools do NOT auto-resolve and the "
-            "kanban does NOT auto-route. Coach drives every stage transition "
-            "explicitly via coord_approve_stage. The first-stage entry is the "
-            "ONLY auto-plant: when its `to` is a single named slot, the role "
-            "row plants at create time (equivalent to Coach pre-picking via "
-            "the trajectory itself). Pool/empty first-stage entries plant no "
-            "row; Coach calls coord_approve_stage(next_stage=<first_stage>, "
-            "assignee=<slot>) to pick. Subsequent stages' `to` lists never "
-            "auto-plant. `focus` is required on every audit_semantics entry. "
-            "Examples: [{stage:'execute',to:'p2'}] (single-Player executor, "
-            "Coach reviews after the commit before archiving via "
+            "ship}; canonical order; execute is mandatory. **trajectory[0].to "
+            "MUST name exactly one Player** (single-element list like "
+            "['p3']). The kanban is a log of work Coach has fired AT a "
+            "specific Player — pool/empty first-stage `to` is rejected, "
+            "because an undispatched task isn't on the kanban yet, it's "
+            "pre-task reasoning. If you haven't decided who, decide now "
+            "(look at coord_get_player_settings / ## Player health / "
+            "## Recent events) and name them. Subsequent stages' `to` "
+            "may be a single name, a list (['p1','p2']), or empty — they "
+            "are FYI only; Coach picks each later stage's assignee at "
+            "coord_approve_stage time. `focus` is required on every "
+            "audit_semantics entry. Examples: [{stage:'execute',to:'p2'}] "
+            "(fired at p2; Coach reviews after the commit, archives via "
             "coord_archive_task); [{stage:'plan',to:'p5'},"
-            "{stage:'execute',to:'p2'},"
+            "{stage:'execute',to:['p2']},"
             "{stage:'audit_syntax',to:'p4'},{stage:'ship',to:'p2'}] (full "
-            "code path; Coach approves each transition). Players inherit "
-            "the parent's trajectory when subtasking."
+            "code path; Coach approves each later transition). Players "
+            "inherit the parent's trajectory when subtasking; the rule "
+            "still applies — name yourself or another Player as "
+            "trajectory[0].to."
         ),
         {
             "title": str, "description": str, "parent_id": str,
@@ -5163,7 +5202,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         task_id = (args.get("task_id") or "").strip()
         if not task_id:
             return _err("task_id is required")
-        trajectory, traj_err = _validate_trajectory(args.get("trajectory"))
+        # Mid-flight reroute: the create-time first-stage-assigned rule
+        # doesn't apply (role rows already exist in the assignments
+        # table; trajectory is FYI for subsequent stages).
+        trajectory, traj_err = _validate_trajectory(
+            args.get("trajectory"),
+            enforce_first_stage_assigned=False,
+        )
         if traj_err:
             return _err(f"invalid trajectory: {traj_err}")
         assert trajectory is not None

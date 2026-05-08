@@ -3687,15 +3687,24 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
         else None
     )
 
-    # Validate trajectory (or default to bare execute).
+    # Validate trajectory. v2.0.1 (2026-05-08): the legacy default of
+    # [{stage:'execute', to:[]}] is gone — the caller must supply a
+    # trajectory whose first stage names exactly one Player. Otherwise
+    # the kanban would be polluted with undispatched tasks.
     if req.trajectory is None:
-        trajectory = [{"stage": "execute", "to": []}]
-    else:
-        validated, err = _validate_trajectory(req.trajectory)
-        if err:
-            raise HTTPException(400, detail=f"invalid trajectory: {err}")
-        assert validated is not None
-        trajectory = validated
+        raise HTTPException(
+            400,
+            detail=(
+                "trajectory is required: pass a list of {stage, to, "
+                "focus?} objects. trajectory[0].to must name exactly "
+                "one Player (e.g. [{'stage':'execute','to':['p3']}])."
+            ),
+        )
+    validated, err = _validate_trajectory(req.trajectory)
+    if err:
+        raise HTTPException(400, detail=f"invalid trajectory: {err}")
+    assert validated is not None
+    trajectory = validated
     trajectory_json = json.dumps(trajectory, separators=(",", ":"))
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -4474,8 +4483,12 @@ async def post_task_trajectory(
     `coord_set_task_trajectory`. Validates that stages already entered
     cannot be removed; supersedes role rows for removed stages and
     upserts rows for added stages. Emits `task_trajectory_changed`.
+    Mid-flight: the create-time first-stage-assigned rule doesn't
+    apply (role rows already exist).
     """
-    validated, err = _validate_trajectory(req.trajectory)
+    validated, err = _validate_trajectory(
+        req.trajectory, enforce_first_stage_assigned=False,
+    )
     if err:
         raise HTTPException(400, detail=f"invalid trajectory: {err}")
     assert validated is not None

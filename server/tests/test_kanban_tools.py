@@ -135,47 +135,33 @@ async def test_create_task_single_name_first_stage_plants_role_row(
     assert rows[0]["owner"] == "p2"
 
 
-async def test_create_task_pool_first_stage_does_not_plant(
+async def test_create_task_pool_first_stage_rejected(
     fresh_db: str,
 ) -> None:
+    """v2.0.1 (2026-05-08): pool first-stage `to` rejected at create."""
     await init_db()
     server = _server_for("coach")
-    text = _ok_text(await _handler(server, "create_task")({
+    err = _err_text(await _handler(server, "create_task")({
         "title": "demo",
         "trajectory": [
             {"stage": "execute", "to": ["p2", "p3"]},
         ],
     }))
-    assert "No role row planted" in text
-    c = await configured_conn()
-    try:
-        cur = await c.execute(
-            "SELECT COUNT(*) AS n FROM task_role_assignments"
-        )
-        n = dict(await cur.fetchone())["n"]
-    finally:
-        await c.close()
-    assert n == 0
+    assert "trajectory[0].to" in err
+    assert "exactly one Player" in err
 
 
-async def test_create_task_empty_first_stage_does_not_plant(
+async def test_create_task_empty_first_stage_rejected(
     fresh_db: str,
 ) -> None:
+    """v2.0.1: empty first-stage `to` rejected at create."""
     await init_db()
     server = _server_for("coach")
-    _ok_text(await _handler(server, "create_task")({
+    err = _err_text(await _handler(server, "create_task")({
         "title": "demo",
         "trajectory": [{"stage": "execute", "to": []}],
     }))
-    c = await configured_conn()
-    try:
-        cur = await c.execute(
-            "SELECT COUNT(*) AS n FROM task_role_assignments"
-        )
-        n = dict(await cur.fetchone())["n"]
-    finally:
-        await c.close()
-    assert n == 0
+    assert "trajectory[0].to" in err
 
 
 # ----------------------------------------------------------------

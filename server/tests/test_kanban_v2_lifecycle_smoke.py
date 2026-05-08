@@ -303,40 +303,27 @@ async def test_audit_fail_does_not_auto_revert(
 # ---------------------------------------------------------------- pool discipline
 
 
-async def test_pool_to_does_not_plant_role_or_wake(
+async def test_pool_first_stage_rejected_at_create(
     fresh_db: str, monkeypatch,
 ) -> None:
-    """v2 §7.1 + §10.1: a multi-name `to` on the first trajectory
-    entry is FYI only — no role row plants, no Player wakes. Coach
-    must call coord_approve_stage to actually pick one."""
+    """v2.0.1 (2026-05-08): pool/empty first-stage `to` is rejected at
+    `coord_create_task` — the kanban is a log of dispatched work, so
+    every task must name its first-stage Player. Pool/empty subsequent
+    stages remain FYI and are accepted."""
     await init_db()
-    wakes = await _stub_wake(monkeypatch)
+    await _stub_wake(monkeypatch)
 
     coach = _server_for("coach")
     create = _handler(coach, "create_task")
-    text = _ok(await create({
+    res = await create({
         "title": "pool demo", "description": "x",
         "trajectory": (
             '[{"stage":"plan","to":["p3","p7"]},'
             '{"stage":"execute","to":[]}]'
         ),
-    }))
-    import re
-    tid = re.search(r"t-\d{4}-\d{2}-\d{2}-[a-f0-9]{8}", text).group(0)
-
-    c = await configured_conn()
-    try:
-        cur = await c.execute(
-            "SELECT role, owner FROM task_role_assignments WHERE task_id = ?",
-            (tid,),
-        )
-        rows = [dict(r) for r in await cur.fetchall()]
-    finally:
-        await c.close()
-    # No active role row should have an owner — pool entries don't plant.
-    for r in rows:
-        assert r["owner"] is None, f"pool plant leaked: {r}"
-
-    # No wake fired for either pool member.
-    pool_wakes = [s for s, _ in wakes if s in ("p3", "p7")]
-    assert pool_wakes == [], f"pool wake fired unexpectedly: {pool_wakes}"
+    })
+    # Pool first-stage → rejected with the v2.0.1 error.
+    assert res.get("isError"), f"expected rejection, got {res}"
+    text = res["content"][0]["text"]
+    assert "trajectory[0].to" in text
+    assert "exactly one Player" in text

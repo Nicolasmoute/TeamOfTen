@@ -611,75 +611,31 @@ def test_create_task_with_plan_starts_in_plan(client: TestClient) -> None:
     assert row["owner"] == "p3"  # planner is the first-stage hard-assignee
 
 
-def test_http_approve_stage_same_stage_after_pool_create(
-    client: TestClient,
-) -> None:
-    """v2 §7.1 — HTTP /approve_stage must accept same-stage transition
-    when no role row exists (the legitimate first-plant case after a
-    pool/empty first-stage create). Mirrors the MCP allowance."""
+def test_http_create_rejects_pool_first_stage(client: TestClient) -> None:
+    """v2.0.1 (2026-05-08): pool first-stage `to` rejected at HTTP create.
+    Coach must name the first-stage Player; pool/empty no longer
+    produces an undispatched task on the kanban."""
     r = client.post(
         "/api/tasks",
         json={
-            "title": "http-pool-create",
+            "title": "http-pool-rejected",
             "trajectory": [{"stage": "execute", "to": ["p2", "p3"]}],
         },
     )
-    assert r.status_code == 200, r.text
-    task_id = r.json()["task_id"]
-
-    # Same-stage approve_stage with no active role row → 200, plants row.
-    r2 = client.post(
-        f"/api/tasks/{task_id}/approve_stage",
-        json={"next_stage": "execute", "assignee": "p2", "note": "go"},
-    )
-    assert r2.status_code == 200, r2.text
-    body = r2.json()
-    assert body["assignee"] == "p2"
-
-    # Second same-stage call rejected (active row now exists).
-    r3 = client.post(
-        f"/api/tasks/{task_id}/approve_stage",
-        json={"next_stage": "execute", "assignee": "p3", "note": "x"},
-    )
-    assert r3.status_code == 400, r3.text
-    assert "already in 'execute'" in r3.json()["detail"]
+    assert r.status_code == 400, r.text
+    assert "trajectory[0].to" in r.json()["detail"]
 
 
-def test_http_create_pool_first_stage_no_stage_changed_event(
-    client: TestClient,
-) -> None:
-    """v2 §7.1 — when no first-stage role plants (pool/empty `to`),
-    the HTTP create path must NOT emit task_stage_changed. Otherwise
-    project_events gets a misleading row and the board safety ring's
-    'board moved' signal is falsely reset."""
-    import asyncio
+def test_http_create_rejects_empty_first_stage(client: TestClient) -> None:
     r = client.post(
         "/api/tasks",
         json={
-            "title": "no stage_changed for pool",
-            "trajectory": [{"stage": "execute", "to": ["p2", "p3"]}],
+            "title": "http-empty-rejected",
+            "trajectory": [{"stage": "execute", "to": []}],
         },
     )
-    assert r.status_code == 200, r.text
-    task_id = r.json()["task_id"]
-
-    async def read_events() -> list[str]:
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT type FROM project_events WHERE task_id = ?",
-                (task_id,),
-            )
-            return [dict(r)["type"] for r in await cur.fetchall()]
-        finally:
-            await c.close()
-
-    # Bus subscriber drains async; no public hook here. The row should
-    # not appear regardless because the bus event was never published.
-    # Wait briefly for any drain that did happen.
-    asyncio.run(asyncio.sleep(0.1))
-    types = asyncio.run(read_events())
-    assert "task_stage_changed" not in types
+    assert r.status_code == 400, r.text
+    assert "trajectory[0].to" in r.json()["detail"]
 
 
 async def test_async_create_single_name_first_stage_emits_stage_changed(
@@ -739,11 +695,10 @@ async def test_async_create_single_name_first_stage_emits_stage_changed(
         await stop_kanban_subscriber()
 
 
-def test_create_task_pool_first_stage_leaves_owner_null(client: TestClient) -> None:
-    """v2 §7.1: a pool-form first stage (multiple candidates or empty)
-    plants NO role row at create time — Coach picks the assignee
-    later via coord_approve_stage. tasks.owner stays NULL until
-    assignment."""
+def test_create_task_pool_first_stage_rejected_at_http(client: TestClient) -> None:
+    """v2.0.1 (2026-05-08): pool first-stage `to` rejected at HTTP
+    create. The kanban is a log of dispatched work; pool/empty no
+    longer creates an undispatched task."""
     r = client.post(
         "/api/tasks",
         json={
@@ -751,41 +706,29 @@ def test_create_task_pool_first_stage_leaves_owner_null(client: TestClient) -> N
             "trajectory": [{"stage": "execute", "to": ["p2", "p3"]}],
         },
     )
-    assert r.status_code == 200, r.text
-    task_id = r.json()["task_id"]
-    import asyncio
+    assert r.status_code == 400, r.text
+    assert "trajectory[0].to" in r.json()["detail"]
 
-    async def read():
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT status, owner FROM tasks WHERE id = ?",
-                (task_id,),
-            )
-            task_row = dict(await cur.fetchone())
-            cur = await c.execute(
-                "SELECT COUNT(*) AS n FROM task_role_assignments "
-                "WHERE task_id = ?",
-                (task_id,),
-            )
-            role_count = int(dict(await cur.fetchone())["n"])
-            return task_row, role_count
-        finally:
-            await c.close()
 
-    task_row, role_count = asyncio.run(read())
-    assert task_row["status"] == "execute"
-    assert task_row["owner"] is None
-    # v2: pool/empty first stage plants no row.
-    assert role_count == 0
+def test_create_task_no_trajectory_rejected(client: TestClient) -> None:
+    """v2.0.1: omitting `trajectory` is no longer accepted — the
+    legacy [{stage:execute,to:[]}] default is gone. Caller must
+    supply a trajectory whose first stage names a Player."""
+    r = client.post("/api/tasks", json={"title": "no trajectory"})
+    assert r.status_code == 400, r.text
+    assert "trajectory is required" in r.json()["detail"]
 
 
 def test_create_task_default_trajectory_starts_in_execute(client: TestClient) -> None:
-    """When no trajectory is supplied, the default
-    [{"stage":"execute","to":[]}] applies and the task lands in
-    execute with no owner — matches the v0.3 default for human-side
-    creation."""
-    r = client.post("/api/tasks", json={"title": "no trajectory"})
+    """When the caller supplies a single-name first-stage trajectory,
+    the task lands in execute with that owner."""
+    r = client.post(
+        "/api/tasks",
+        json={
+            "title": "single-name default",
+            "trajectory": [{"stage": "execute", "to": ["p3"]}],
+        },
+    )
     assert r.status_code == 200, r.text
     task_id = r.json()["task_id"]
     import asyncio
@@ -803,7 +746,7 @@ def test_create_task_default_trajectory_starts_in_execute(client: TestClient) ->
 
     row = asyncio.run(read())
     assert row["status"] == "execute"
-    assert row["owner"] is None
+    assert row["owner"] == "p3"
 
 
 # --------------------------------------------------------------- /trajectory
