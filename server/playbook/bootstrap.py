@@ -361,15 +361,16 @@ def _read_corpus() -> str | None:
 
 def _validate_seeds(raw: list[Any]) -> list[dict[str, Any]]:
     """Filter the LLM output to well-formed seed dicts. Each seed must
-    have a non-empty `text` (≤ 500 chars) and a `suggested_weight` in
-    [0, 1]. Aliasing: `weight` accepted as a fallback key."""
+    have a non-empty `text` (<= config.STATEMENT_MAX_CHARS) and a
+    `suggested_weight` in [0, 1]. Aliasing: `weight` accepted as a
+    fallback key."""
     out: list[dict[str, Any]] = []
     seen_texts: set[str] = set()
     for item in raw:
         if not isinstance(item, dict):
             continue
         text = str(item.get("text") or "").strip()
-        if not text or len(text) > 500:
+        if not text or len(text) > config.STATEMENT_MAX_CHARS:
             continue
         if text.lower() in seen_texts:
             continue

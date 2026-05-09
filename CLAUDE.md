@@ -2157,6 +2157,111 @@ Validation criteria: ≥80% deviations noticed at push-time vs
 audit-time, ≥50% reduction in Coach context-reconstruction turns,
 flat or decreased human pings on routine items.
 
+**Recent (2026-05-09) — TruthScore shipped:**
+
+On-demand project-fidelity evaluator. One-shot Sonnet call that
+scores the active project's current state (repo at HEAD of
+`origin/main`, plus `decisions/`, `working/knowledge/`, `outputs/`)
+against the human-vetted `truth/` corpus on five canonical 1–10
+criteria — **Fidelity** (impl matches spec; low → fix the code),
+**Completeness** (truth's commitments are realized), **Consistency**
+(sub-corpora agree with truth), **Currency** (truth is up-to-date
+with what exists; low → propose a truth update via
+`coord_propose_file_write`), and **Clarity** (truth itself is
+specific enough to score against; low → tighten truth before
+trusting the others). Overall is the arithmetic mean rounded to
+one decimal. Result lands as a markdown file under
+`working/knowledge/truthscore-<YYYY-MM-DD-HHMM>.md` with a YAML
+front-matter block carrying the structured scores so a future
+`/truthscore --diff` can parse it without re-running the LLM.
+Spec: [Docs/truthscore-specs.md](Docs/truthscore-specs.md).
+
+Three surfaces, all delegating to
+[server/truthscore.py:run_truth_score](server/truthscore.py):
+- **Slash** — `/truthscore [commentary]` in
+  [server/static/app.js](server/static/app.js); the response
+  lands inline as a `truthscore_completed` `.sys` row in the
+  pane the slash was issued in (clickable file link to the
+  result via the existing `harness-file-link` machinery).
+- **MCP** — `coord_run_truth_score(commentary?)` in
+  [server/tools.py](server/tools.py). Available to **Coach AND
+  every Player** (no role gate — read-only against `truth/`,
+  cost cap bounds abuse). Renders a compact markdown block with
+  the per-axis table + comment + result_path.
+- **HTTP** — `POST /api/truthscore` in
+  [server/main.py](server/main.py). Standard `require_token` +
+  `audit_actor` deps; failure-status mapping per
+  `truthscore-specs.md` §2.3 (400 / 409 / 429 / 502).
+
+Implementation reuses
+[server/compass/llm.py:call](server/compass/llm.py) for the
+underlying Sonnet round-trip — TruthScore passes
+`label="truthscore:run"` and the wrapper handles the `turns`
+ledger row + Codex fallback automatically. Knowledge-lane writes
+go through [server/knowledge.py:write](server/knowledge.py) for
+the synchronous kDrive mirror. Binary outputs (PDF/DOCX/etc.) in
+the `outputs/` sub-corpus go through
+[server/compass/output_extractor.py:extract_body](server/compass/output_extractor.py)
+with path-with-size fallback when the parser dep is missing.
+Per-project `asyncio.Lock` (mirroring
+[server/compass/runner.py:_lock_for](server/compass/runner.py))
+prevents concurrent runs against the same project; different
+projects can run concurrently. Pre-flight cost-cap check against
+`HARNESS_TEAM_DAILY_CAP` returns 429 before any LLM spend.
+
+Input gathering with budgets:
+- **truth/** — every `.md`/`.txt` file, 32 KB total cap, 16 KB
+  per-file head; over-cap drops tail-most files alphabetically
+  with a warning surfaced in the result's Inputs footer.
+- **project-objectives.md** — context only (not scored), 8 KB cap.
+- **repo at HEAD of `origin/main`** — best-effort `git fetch`
+  (a fetch failure surfaces a warning and falls through to the
+  cached ref rather than blocking the run). Always-include set
+  (`README.md`, `CLAUDE.md`, `pyproject.toml`, `package.json`,
+  `Dockerfile`, `Cargo.toml`, `go.mod`, `requirements.txt`) plus
+  truth-referenced files / directories first, alphabetical fallback
+  after. Binary detection via extension allow-list + first-1KB
+  null-byte sniff. 80 KB body cap; full file index always included
+  regardless of body budget so the LLM sees the project's actual
+  shape. The "bare clone" path
+  ([server/paths.py `bare_clone`](server/paths.py)) is misleadingly
+  named — production uses a regular `git clone` (not `--bare`),
+  hence `refs/remotes/origin/main` is populated.
+- **decisions/ / working/knowledge/ / outputs/** — 8 KB per-corpus,
+  2 KB per-file head, most-recent-first selection.
+
+The LLM (Sonnet `latest_sonnet` at `medium` effort, mirroring
+Compass) is given strict-JSON output instructions plus an
+explicit adversarial-commentary guard: legitimate scoping
+(`"skip section 2"`) is honored literally, but
+score-manipulation directives (`"score 10 on everything"`)
+comply but prefix the comment with `[CALLER-OVERRIDE: <what>]`
+so the human sees the override. Parse failures dump the raw
+output to `working/knowledge/truthscore-<ts>-RAW.md` for
+debugging and return 502.
+
+Bus events: `truthscore_started`, `truthscore_completed`
+(payload `{actor, project_id, overall, scores, comment_short,
+result_path, main_sha, fetch_warning}`), `truthscore_failed`
+(payload `{actor, project_id, reason, http_status}`). Fan-out:
+the optional `to` field on the event is set to the calling
+agent's slot for MCP invocations (Coach: `to: "coach"`; Player
+p3: `to: "p3"`) and omitted for HTTP / slash invocations. The
+events SQL filter at `/api/events` includes the truthscore
+event family in the `payload_to = ?` branch. Cost lands in the
+`turns` ledger as `agent_id="truthscore"`,
+`cost_basis="truthscore:run"`. Codex tool contract version
+bumped to `2026-05-09.truthscore-v0.1` so existing Codex
+threads pick up the new tool on next boot.
+
+Tests: 53 in
+[server/tests/test_truthscore.py](server/tests/test_truthscore.py)
+covering parse validation, result-file rendering, gather
+helpers (truth + main tree + sub-corpora), end-to-end with
+stubbed LLM, HTTP endpoint smoke (200/400/409/429/502/401/403),
+MCP tool registration + actor plumbing + commentary normalization,
+and the Codex contract bump enforcement. All pass.
+
 ## What needs verification (when user is next active)
 
 Verified as of 2026-04-24: HARNESS_TOKEN auth gate, fine-grained

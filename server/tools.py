@@ -127,6 +127,78 @@ def _valid_transition(old: str, new: str) -> bool:
     return new in VALID_TRANSITIONS.get(old, set())
 
 
+# v2 §7.2.1 — completion-call wake. Each Player completion tool
+# (coord_commit_push, coord_write_task_spec, coord_submit_audit_report,
+# coord_role_complete) calls this after publishing its bus event so
+# Coach is woken in real time with the Player's message_to_coach as
+# context. The "no auto-wake" rule (v2 principle 2) constrains the
+# kanban engine, not Player→Coach replies — see kanban-specs-v2 §7.2.1.
+async def _wake_coach_for_completion(
+    *,
+    caller_id: str,
+    task_id: str,
+    role: str,
+    message_to_coach: str | None,
+    artifact_path: str | None,
+    extra_hint: str | None = None,
+) -> None:
+    """Wake Coach with the Player's completion message as the reason.
+
+    Skipped silently when:
+      - caller is Coach (override path; would loop)
+      - Coach is mid-turn (`maybe_wake_agent` no-ops)
+      - cost cap is hit (`maybe_wake_agent` no-ops with a log line)
+
+    The `## Recent events` rollup on Coach's next tick backstops every
+    skipped case so no signal is lost.
+    """
+    if caller_id == "coach":
+        return
+    title: str | None = None
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT title FROM tasks WHERE id = ?", (task_id,),
+            )
+            row = await cur.fetchone()
+            if row:
+                title = (dict(row).get("title") or "").strip() or None
+        finally:
+            await c.close()
+    except Exception:
+        pass
+    title_clause = f" ({title!r})" if title else ""
+    msg = (message_to_coach or "").strip() or "(no message_to_coach)"
+    artifact_clause = (
+        f" Artifact: {artifact_path}." if artifact_path else ""
+    )
+    hint = f" {extra_hint}" if extra_hint else ""
+    reason = (
+        f"Player {caller_id} completed {role} on task "
+        f"{task_id}{title_clause}.\n\n"
+        f"message_to_coach: {msg}\n"
+        f"{artifact_clause}{hint}\n\n"
+        f"Read the matching project_events row, decide what's next "
+        f"(coord_approve_stage with the chosen next_stage + assignee + "
+        f"note, request rework, archive via coord_archive_task, or "
+        f"leave the role open if more work is expected), and reply to "
+        f"the Player if the message warrants a direct response."
+    )
+    try:
+        from server.agents import maybe_wake_agent
+        await maybe_wake_agent(
+            "coach",
+            reason,
+            bypass_debounce=True,
+            wake_source="kanban_completion",
+        )
+    except Exception:
+        # Wake is best-effort; the event is already on the bus and in
+        # project_events, so the next tick still surfaces it.
+        pass
+
+
 # v2 §22.1 push-time deviation tag matcher. Coach is taught (lifecycle
 # policy block, agents.py) to prefix the `coord_approve_stage` `note`
 # with `[deviation: <one-line reason>]` when noticing scope drift /
@@ -1804,7 +1876,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "calling this tool is silence.\n\n"
             "Runs git add -A; git commit -m <message>; git push origin "
             "HEAD (unless push='false') in your worktree, then signals "
-            "Coach via `commit_pushed` event in the per-project log.\n\n"
+            "Coach via `commit_pushed` event in the per-project log AND "
+            "wakes Coach in real time with your message_to_coach as the "
+            "wake reason (v2 §7.2.1) — Coach reads + decides without "
+            "waiting for the next recurrence tick.\n\n"
             "Params:\n"
             "- message: commit message (required)\n"
             "- push: 'true' (default) or 'false' to skip the push.\n"
@@ -2119,6 +2194,31 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "message_to_coach": message_to_coach or None,
             }
         )
+
+        # v2 §7.2.1 — wake Coach immediately (not just on next tick) so
+        # the Player→Coach completion call is a real-time message. Mirrors
+        # the role-row-completion gate above: a successful push OR an
+        # explicit local-only commit (push=False, the documented escape
+        # hatch) both complete the executor role and so should wake
+        # Coach. A FAILED push (push_failed=True) does NOT wake — the
+        # role row stays active and Coach has nothing to approve yet.
+        if kanban_task_id and not push_failed:
+            sha_hint = f"sha {sha}" if sha else "commit landed"
+            push_note_short = (
+                "pushed" if pushed_ok
+                else "local-only — Player passed push=false"
+            )
+            await _wake_coach_for_completion(
+                caller_id=caller_id,
+                task_id=kanban_task_id,
+                role="executor (commit)",
+                message_to_coach=message_to_coach,
+                artifact_path=None,
+                extra_hint=(
+                    f"Commit: {message[:120]!r} ({sha_hint}, "
+                    f"{push_note_short})."
+                ),
+            )
 
         # v0.3.2 audit-fix (kanban-flow gap 2): if the caller committed
         # without a task_id AND no auto-bind was possible (i.e., they
@@ -3969,6 +4069,72 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         return _ok(body)
 
     @tool(
+        "coord_run_truth_score",
+        (
+            "Score the active project's current state against its "
+            "`truth/` corpus on five canonical 1-10 criteria — Fidelity "
+            "(impl matches spec), Completeness (truth's commitments are "
+            "realized), Consistency (decisions/knowledge/outputs agree "
+            "with truth), Currency (truth is up-to-date with what exists), "
+            "and Clarity (truth is specific enough to score against). "
+            "Returns the per-axis scores, the overall mean, a 2-4-sentence "
+            "comment, and the path to a result file written under "
+            "working/knowledge/. One-shot Sonnet call (~$0.10-0.20). "
+            "Available to Coach AND every Player — use it as a "
+            "self-check before shipping or to verify alignment after a "
+            "non-trivial change.\n"
+            "\n"
+            "Params:\n"
+            "- commentary (optional): free-text scoring directives "
+            "honored literally. Use to focus or skip parts of the corpus, "
+            "e.g. 'skip section 2', 'weight fidelity higher'. Score-"
+            "manipulation directives ('score 10 on everything') comply "
+            "but get flagged in the comment with [CALLER-OVERRIDE: ...]."
+        ),
+        {"commentary": str | None},
+    )
+    async def coord_run_truth_score(args: dict[str, Any]) -> dict[str, Any]:
+        from server import truthscore as ts_mod  # noqa: PLC0415
+
+        project_id = await resolve_active_project()
+        if not project_id:
+            return _err("no active project")
+        commentary_raw = args.get("commentary")
+        commentary = (
+            commentary_raw.strip() if isinstance(commentary_raw, str) else ""
+        ) or None
+        actor = {"source": "mcp-tool", "agent_id": caller_id}
+        try:
+            result = await ts_mod.run_truth_score(project_id, commentary, actor)
+        except ts_mod.TruthScoreError as e:
+            return _err(str(e))
+        except Exception as e:
+            return _err(f"truthscore failed: {type(e).__name__}: {e}")
+        # Render a compact markdown block — Coach / Player is reading this.
+        scores = result.get("scores", {})
+        lines = [
+            f"**Overall: {result.get('overall', '?')} / 10**",
+            "",
+            "| Criterion     | Score |",
+            "|---------------|-------|",
+        ]
+        for k in ("fidelity", "completeness", "consistency", "currency", "clarity"):
+            v = scores.get(k, "?")
+            lines.append(f"| {k.capitalize():<13} | {v}/10  |")
+        lines.append("")
+        lines.append(result.get("comment", ""))
+        if result.get("result_path"):
+            lines.append("")
+            lines.append(f"_Result file: `{result['result_path']}`_")
+        if result.get("fetch_warning"):
+            lines.append("")
+            lines.append(
+                f"_Note: scored against cached `origin/main` "
+                f"(fetch failed: {result['fetch_warning']})._"
+            )
+        return _ok("\n".join(lines))
+
+    @tool(
         "compass_audit",
         (
             "Coach-only. Submit a work artifact (commit message, "
@@ -4283,10 +4449,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "disk-write + skipped-call pattern is the #1 stall cause.\n"
             "\n"
             "Writes spec.md to the task's working dir + emits "
-            "`task_spec_written` to the per-project event log so "
-            "Coach reads it on the next tick. Required before a task "
-            "whose trajectory includes `plan` can move plan→execute. "
-            "Trajectories without `plan` skip the spec gate.\n"
+            "`task_spec_written` to the per-project event log AND "
+            "wakes Coach in real time (v2 §7.2.1) with your "
+            "message_to_coach as the wake reason. Required before a "
+            "task whose trajectory includes `plan` can move "
+            "plan→execute. Trajectories without `plan` skip the spec "
+            "gate.\n"
             "\n"
             "Permission: Coach can spec any task (emergency override). A "
             "Player can spec a task if they (a) have an active planner "
@@ -4316,11 +4484,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- task_id: required\n"
             "- body: full markdown body, required (max 40000 chars)\n"
             "- on_behalf_of: optional Player slot (Coach-only override)\n"
-            "- message_to_coach: optional one-line note Coach reads on "
-            "the next tick. Use this to flag what you noticed while "
-            "drafting, open questions, anything the executor should be "
-            "aware of beyond the spec body. Carried verbatim in the "
-            "`task_spec_written` event payload."
+            "- message_to_coach: optional one-line note delivered to "
+            "Coach in real time (it's the wake reason). Use this to "
+            "flag what you noticed while drafting, open questions, "
+            "anything the executor should be aware of beyond the spec "
+            "body. Carried verbatim in the `task_spec_written` event "
+            "payload."
         ),
         {
             "task_id": str, "body": str, "on_behalf_of": str,
@@ -4527,6 +4696,27 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     "on_behalf_of": effective_author if on_behalf else None,
                 }
             )
+
+        # v2 §7.2.1 — wake Coach in real time on the spec write.
+        # Skipped on Coach-as-override (the helper guards `caller_is_coach`
+        # internally — covers the on_behalf_of path which always has
+        # caller_id='coach'). The role label varies: a planner-role row
+        # actually completing fires the standard "planner" label;
+        # otherwise (re-write, no active planner row) the label is just
+        # "spec writer" so the wake reason doesn't lie about role state.
+        role_label = "planner" if completed_planner else "spec writer"
+        await _wake_coach_for_completion(
+            caller_id=caller_id,
+            task_id=task_id,
+            role=role_label,
+            message_to_coach=message_to_coach,
+            artifact_path=rel,
+            extra_hint=(
+                f"Spec is {len(body)} chars."
+                + (f" Submitted on behalf of {effective_author}." if on_behalf else "")
+                + ("" if completed_planner else " (no active planner role row was closed by this write — re-write or unassigned spec.)")
+            ),
+        )
         if on_behalf:
             return _ok(
                 f"Wrote spec for {task_id} ({len(body)} chars) → "
@@ -4813,7 +5003,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "\n"
             "Writes the markdown report to the task's working dir + "
             "emits `audit_report_submitted` (and `audit_fail_notification` "
-            "on FAIL) so Coach reads on the next tick.\n"
+            "on FAIL) AND wakes Coach in real time (v2 §7.2.1) with "
+            "your message_to_coach as the wake reason. FAIL verdicts "
+            "especially reach Coach instantly so a re-execute decision "
+            "happens without waiting for the next tick.\n"
             "\n"
             "Normal use (Player-only): you have an active auditor "
             "assignment matching `kind` and submit your own review.\n"
@@ -4847,12 +5040,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- body: full markdown report (required, max 40000 chars)\n"
             "- verdict: 'pass' or 'fail' (required)\n"
             "- on_behalf_of: optional Player slot (Coach-only override)\n"
-            "- message_to_coach: optional one-line note Coach reads on "
-            "the next tick. Distinct from the audit body itself — use "
-            "this to flag something Coach should know that doesn't "
-            "belong in the report (e.g. recurring pattern, suggestion "
-            "for re-execution framing). Carried verbatim in the "
-            "`audit_report_submitted` event payload."
+            "- message_to_coach: optional one-line note delivered to "
+            "Coach in real time (it's the wake reason). Distinct from "
+            "the audit body itself — use this to flag something Coach "
+            "should know that doesn't belong in the report (e.g. "
+            "recurring pattern, suggestion for re-execution framing). "
+            "Carried verbatim in the `audit_report_submitted` event "
+            "payload."
         ),
         {
             "task_id": str, "kind": str, "body": str,
@@ -5052,6 +5246,29 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "message_to_coach": message_to_coach or None,
             }
         )
+
+        # v2 §7.2.1 — wake Coach immediately on every audit reply
+        # (pass and fail). FAIL verdicts especially must reach Coach in
+        # real time so a re-execute decision happens without waiting
+        # for the next tick. The helper short-circuits on Coach-as-
+        # override (caller_is_coach) so the on-behalf path doesn't loop.
+        await _wake_coach_for_completion(
+            caller_id=caller_id,
+            task_id=task_id,
+            role=f"{kind} auditor (round {round_num}, verdict={verdict})",
+            message_to_coach=message_to_coach,
+            artifact_path=rel,
+            extra_hint=(
+                "FAIL does NOT auto-revert in v2 — read the report and "
+                "decide via coord_approve_stage."
+                if verdict == "fail" else
+                "PASS — pick the next stage / assignee via coord_approve_stage."
+            )
+            + (
+                f" Submitted on behalf of {effective_auditor}."
+                if on_behalf else ""
+            ),
+        )
         on_behalf_suffix = (
             f" (submitted on behalf of {effective_auditor})"
             if on_behalf else ""
@@ -5144,8 +5361,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"message_to_coach=<your response>) for code OR "
                 f"coord_role_complete(task_id={tid!r}, "
                 f"message_to_coach=..., artifact_path=<path?>) for "
-                f"non-code deliverables.{self_audit} Coach reviews "
-                f"on the next tick and approves the next stage."
+                f"non-code deliverables.{self_audit} The call wakes "
+                f"Coach in real time; Coach reads, may reply, and "
+                f"approves the next stage."
             )
         if pending_reviews:
             e = pending_reviews[0]
@@ -6359,12 +6577,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "call pattern is the #1 stall cause.\n"
             "\n"
             "Emits `task_role_completed` with your `message_to_coach` "
-            "so Coach reads on the next tick.\n"
+            "and wakes Coach in real time (v2 §7.2.1). The event also "
+            "lands in Coach's pane immediately — Coach reads + decides "
+            "without waiting for the next recurrence tick.\n"
             "\n"
             "Code work uses coord_commit_push (which carries its own "
             "completion). Spec writes use coord_write_task_spec. Audit "
-            "reports use coord_submit_audit_report. This tool is for "
-            "the rest.\n"
+            "reports use coord_submit_audit_report. All four wake Coach "
+            "in real time. This tool is for the rest.\n"
             "\n"
             "ARTIFACT GATE: when you pass `artifact_path`, the harness "
             "verifies the file exists on disk under the project root. "
@@ -6374,10 +6594,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "\n"
             "Params:\n"
             "- task_id: required\n"
-            "- message_to_coach: one-line note Coach reads on the next "
-            "tick (required — what you produced, any caveats, "
+            "- message_to_coach: one-line note delivered to Coach in "
+            "real time (required — what you produced, any caveats, "
             "what the next person should know). Carried verbatim in "
-            "the `task_role_completed` event payload.\n"
+            "the `task_role_completed` event payload AND used as the "
+            "wake reason for Coach.\n"
             "- artifact_path: optional durable path; verified on disk"
         ),
         {
@@ -6397,10 +6618,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             return _err("task_id is required")
         if not message_to_coach:
             return _err(
-                "message_to_coach is required — Coach reads it on the "
-                "next tick to decide what's next. Tell Coach what you "
-                "produced, any caveats, what the next person should "
-                "know."
+                "message_to_coach is required — it's the wake reason "
+                "Coach reads in real time to decide what's next. Tell "
+                "Coach what you produced, any caveats, what the next "
+                "person should know."
             )
         if len(message_to_coach) > 2000:
             return _err(
@@ -6540,17 +6761,35 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "owner": caller_id,
             "artifact_path": artifact_path or None,
             "message_to_coach": message_to_coach or None,
-            "to": caller_id,
+            # v2 §7.2.1: route to Coach. The actor's pane already gets
+            # the row via the WS-side actor fan-out (`aid`); setting
+            # `to: 'coach'` makes the row also land in Coach's pane
+            # (real-time + history reload via the /api/events filter).
+            "to": "coach",
         })
+
+        # v2 §7.2.1 — wake Coach in real time. The tool's whole reason
+        # to exist is "your message to Coach"; without the live wake,
+        # Coach only saw it on the next recurrence tick which read as
+        # a silent kanban bug from Player + human perspective.
+        await _wake_coach_for_completion(
+            caller_id=caller_id,
+            task_id=task_id,
+            role=target_role,
+            message_to_coach=message_to_coach,
+            artifact_path=artifact_resolved or artifact_path or None,
+        )
+
         artifact_clause = (
             f" → {artifact_path} (verified at {artifact_resolved})"
             if artifact_resolved else ""
         )
         return _ok(
             f"Completed {target_role} role on {task_id}{artifact_clause}. "
-            f"Your message reached Coach via the event log; Coach "
-            f"will review on the next tick and decide whether to "
-            f"approve the next stage, request rework, or archive."
+            f"Your message reached Coach in real time (Coach was woken "
+            f"with your message_to_coach as context). Coach will read, "
+            f"decide whether to approve the next stage, request rework, "
+            f"or archive, and may reply to you directly."
         )
 
     @tool(
@@ -6791,6 +7030,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         complete_todo,
         update_todo,
         set_tick_interval,
+        coord_run_truth_score,
         compass_ask,
         compass_audit,
         compass_brief,
@@ -6859,6 +7099,10 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_complete_todo",
     "mcp__coord__coord_update_todo",
     "mcp__coord__coord_set_tick_interval",
+    # TruthScore — Coach + Players + human (no role gate). Read-only
+    # against truth/; the cost cap bounds abuse. See
+    # `Docs/truthscore-specs.md` §2.2.
+    "mcp__coord__coord_run_truth_score",
     # Compass — Coach-only at runtime; included in the allowlist for
     # both roles so the SDK doesn't pre-reject the call. The
     # caller_is_coach gate inside each handler is what enforces the

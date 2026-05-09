@@ -397,8 +397,17 @@ def apply_coach_proposals(
         if not text:
             rejected.append({**op, "reason": "empty_text"})
             continue
-        if len(text) > 500:
-            rejected.append({**op, "reason": "text_too_long"})
+        if len(text) > config.STATEMENT_MAX_CHARS:
+            rejected.append({
+                **op,
+                "reason": (
+                    f"text_too_long: {len(text)} chars > "
+                    f"{config.STATEMENT_MAX_CHARS}-char cap. "
+                    "One line, imperative, no enumerated sub-items. "
+                    "Rationale + detail belong in the prose corpus, "
+                    "not the per-turn lattice injection."
+                ),
+            })
             continue
         try:
             weight = float(op.get("weight") if op.get("weight") is not None else creation_weight)

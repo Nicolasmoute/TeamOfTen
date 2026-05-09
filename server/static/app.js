@@ -1843,6 +1843,19 @@ function App() {
         // timeline. Server emits {to: pid, player_id: pid} so either
         // field is safe to read.
         if (ev.to) fanoutTargets.add(ev.to);
+      } else if (
+        ev.type === "commit_pushed" ||
+        ev.type === "task_spec_written" ||
+        ev.type === "audit_report_submitted" ||
+        ev.type === "task_role_completed"
+      ) {
+        // v2 §7.2.1 — Player completion calls ARE messages to Coach.
+        // Surface in Coach's pane in real time so the Player→Coach
+        // exchange reads as a live conversation, not a delayed log
+        // entry. Also honour any explicit `to:` (e.g. executor for
+        // audit fail) so the addressed Player keeps seeing the row.
+        fanoutTargets.add("coach");
+        if (ev.to && ev.to !== "broadcast") fanoutTargets.add(ev.to);
       }
       setConversations((prev) => {
         const next = new Map(prev);
@@ -3461,7 +3474,6 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
         onClick=${(e) => (e.shiftKey ? onStackInLast(a.id) : onOpen(a.id))}
       >
         <span class="slot-label">${slotShortLabel(a.id)}</span>
-        ${dot ? html`<span class=${"slot-dot dot-" + dot}></span>` : null}
         ${showLocked
           ? html`<span
               class="slot-lock"
@@ -10752,6 +10764,42 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
           .catch((e) => setInfoText("tick set failed: " + String(e)));
         return true;
       }
+      case "/truthscore": {
+        // One-shot Sonnet evaluator that scores the active project's
+        // current state (repo + decisions/ + knowledge/ + outputs/)
+        // against truth/ on five 1-10 criteria. Optional commentary
+        // is honored literally. Result file lands under
+        // working/knowledge/. See Docs/truthscore-specs.md.
+        const commentary = arg.trim();
+        setInfoText("TruthScore running… (Sonnet, ~$0.10–0.20)");
+        authFetch("/api/truthscore", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(
+            commentary ? { commentary } : {}
+          ),
+        })
+          .then(async (r) => {
+            if (r.ok) {
+              const d = await r.json();
+              const s = d.scores || {};
+              const summary =
+                `TruthScore ${d.overall}/10  ` +
+                `(F${s.fidelity || "?"} ` +
+                `Cm${s.completeness || "?"} ` +
+                `Cn${s.consistency || "?"} ` +
+                `Cu${s.currency || "?"} ` +
+                `Cl${s.clarity || "?"})  ` +
+                `— ${(d.comment || "").split(".")[0]}`;
+              setInfoText(summary);
+            } else {
+              const detail = await r.text().catch(() => "");
+              setInfoText("truthscore failed: HTTP " + r.status + " " + detail.slice(0, 200));
+            }
+          })
+          .catch((e) => setInfoText("truthscore failed: " + String(e)));
+        return true;
+      }
       case "/spend":
         // Per-agent spend breakdown over the last 24h (or whatever
         // hours arg, via `/spend 168` for a week etc.). Pulls from
@@ -11687,6 +11735,36 @@ function EventItem({ event }) {
   if (type === "decision_written") {
     return html`<div class="event sys">
       <div class="event-meta">${ts} · decision: ${event.title}</div>
+    </div>`;
+  }
+
+  if (type === "truthscore_started") {
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · TruthScore running…</div>
+    </div>`;
+  }
+
+  if (type === "truthscore_completed") {
+    const s = event.scores || {};
+    const summary =
+      `TruthScore ${event.overall}/10  ` +
+      `(F${s.fidelity || "?"} ` +
+      `Cm${s.completeness || "?"} ` +
+      `Cn${s.consistency || "?"} ` +
+      `Cu${s.currency || "?"} ` +
+      `Cl${s.clarity || "?"})`;
+    const link = event.result_path
+      ? html` · <a href="#" data-harness-path=${"/data/projects/" + (event.project_id || "") + "/" + event.result_path}>${event.result_path}</a>`
+      : null;
+    const tail = event.comment_short ? ` — ${event.comment_short}` : "";
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ${summary}${tail}${link}</div>
+    </div>`;
+  }
+
+  if (type === "truthscore_failed") {
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · TruthScore failed: ${(event.reason || "").slice(0, 200)}</div>
     </div>`;
   }
 

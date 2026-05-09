@@ -1154,9 +1154,10 @@ async def _completion_hint_for_role(task_id: str, role: str) -> str:
             f"IS your message to Coach — the kanban only knows you're "
             f"done when you call it. Writing the spec to disk is not "
             f"enough; the disk-write + skipped-call pattern is the "
-            f"#1 stall cause. Your turn ends only after the call "
-            f"lands. Coach reviews on the next tick and approves the "
-            f"next stage via coord_approve_stage."
+            f"#1 stall cause. The call wakes Coach in real time with "
+            f"your message_to_coach as the wake reason; Coach reads, "
+            f"may reply, and approves the next stage via "
+            f"coord_approve_stage."
             f"{_TOOL_NOT_VISIBLE_ESCAPE}"
         )
     if role == "executor":
@@ -1195,8 +1196,11 @@ async def _completion_hint_for_role(task_id: str, role: str) -> str:
             f"For non-code deliverables: coord_role_complete("
             f"task_id={task_id!r}, message_to_coach=<one-line summary>, "
             f"artifact_path=<path?>).{self_audit}\n\n"
-            f"Your turn ends only after the call lands. Coach reviews "
-            f"on the next tick.{_TOOL_NOT_VISIBLE_ESCAPE}"
+            f"Your turn ends only after the call lands. The call wakes "
+            f"Coach in real time with your message_to_coach as context, "
+            f"and the event surfaces in Coach's pane immediately — "
+            f"expect Coach to read, decide the next stage, and possibly "
+            f"reply to you directly.{_TOOL_NOT_VISIBLE_ESCAPE}"
         )
     if role in ("auditor_syntax", "auditor_semantics"):
         kind = "syntax" if role == "auditor_syntax" else "semantics"
@@ -1209,9 +1213,11 @@ async def _completion_hint_for_role(task_id: str, role: str) -> str:
             f"message_to_coach=<one-line summary>). That tool call IS "
             f"your message to Coach — writing audit_<kind>.md to disk "
             f"and stopping is the #1 stall cause; don't fail silently.\n\n"
-            f"Coach reviews and decides. FAIL does NOT auto-revert in "
-            f"v2 — wait for Coach's wake; do not start fixing things "
-            f"based on a FAIL you saw.{_TOOL_NOT_VISIBLE_ESCAPE}"
+            f"The call wakes Coach in real time and the row lands in "
+            f"Coach's pane immediately. FAIL does NOT auto-revert in "
+            f"v2 — wait for Coach's reply / next-stage approval; do "
+            f"not start fixing things based on a FAIL you "
+            f"saw.{_TOOL_NOT_VISIBLE_ESCAPE}"
         )
     if role == "shipper":
         return (
@@ -1219,8 +1225,9 @@ async def _completion_hint_for_role(task_id: str, role: str) -> str:
             f"COACH by calling coord_role_complete(task_id={task_id!r}, "
             f"message_to_coach='shipped at <ref>'). That tool call IS "
             f"your message to Coach — without it Coach has no idea "
-            f"the ship landed and won't archive the task. Coach "
-            f"reviews and archives with a user-facing summary via "
+            f"the ship landed and won't archive the task. The call "
+            f"wakes Coach in real time; Coach archives with a "
+            f"user-facing summary via "
             f"coord_archive_task.{_TOOL_NOT_VISIBLE_ESCAPE}"
         )
     return (

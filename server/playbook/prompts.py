@@ -27,7 +27,13 @@ The output is consumed by an automated engine, not a human. Return ONLY a JSON l
 """
 
 
-BOOTSTRAP_USER_TEMPLATE = """Below is a prose playbook on coordinating a multi-agent team. Extract every distinct, actionable orchestration pattern as a single conceptual statement (one sentence preferred, max 500 chars).
+BOOTSTRAP_USER_TEMPLATE = """Below is a prose playbook on coordinating a multi-agent team. Extract every distinct, actionable orchestration pattern as a single conceptual statement.
+
+Brevity (load-bearing — these statements are injected into every agent's system prompt on every turn):
+- Hard cap: 160 characters. Anything longer is rejected.
+- One line, imperative form. "When X -> do Y" or "X needs Y." No enumerated sub-items, no parenthetical clauses listing what-goes-in.
+- The WEIGHT carries confidence; the text just needs to trigger recall. Detail / rationale belongs in the prose corpus, not the lattice statement.
+- Aim for ~120 chars typical, 160 only when the trigger genuinely needs context.
 
 Constraints:
 - Statement must be conceptual and runtime-agnostic — no specific Player slot ids (p1..p10), no specific tool names from the harness (`coord_*`, `compass_*`), no specific tech-stack references.
@@ -85,7 +91,7 @@ Return a JSON object with four lists:
     {{"id": "pb-XXX", "delta": 0.10, "reason": "validated by 3 clean outcomes in t-abc, t-def, t-ghi"}}
   ],
   "creations": [
-    {{"text": "<single sentence, conceptual, runtime-agnostic, observable>", "weight": 0.6, "reason": "pattern observed in 3 archived tasks t-..., t-..., t-..."}}
+    {{"text": "<one line, imperative, <=160 chars, conceptual, runtime-agnostic, observable>", "weight": 0.6, "reason": "pattern observed in 3 archived tasks t-..., t-..., t-..."}}
   ],
   "merges": [
     {{"keep_id": "pb-XXX", "drop_id": "pb-YYY", "reason": "say the same thing"}}
@@ -97,6 +103,7 @@ Rules:
 - Each adjustment delta absolute value <= 0.25 (so a single noisy day cannot flip a stable consensus).
 - Justification must reference specific task ids / event types from the evidence bundle.
 - Creations should be supported by >= 3 distinct observations (instruction, not enforced — be honest).
+- **Creation text is hard-capped at 160 chars; longer creations are rejected.** One line, imperative ("When X -> do Y" or "X needs Y"), no enumerated sub-items, no parenthetical lists. The WEIGHT carries confidence; the text just triggers recall. Aim for ~120 chars typical.
 - Skip statements that are runtime-specific, project-specific, procedural-plumbing, or unobservable.
 - Empty lists are valid — return all four as `[]` if no real signal.
 

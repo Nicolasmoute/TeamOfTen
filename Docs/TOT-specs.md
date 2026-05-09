@@ -24,6 +24,15 @@ Dependent specs (subordinate to this document):
   `project-objectives.md`).
 - `Docs/compass-specs.md` — Compass autonomous strategy engine
   (lattice, regions, truth corpus, audits, briefings).
+- `Docs/truthscore-specs.md` — TruthScore on-demand fidelity
+  evaluator. One-shot Sonnet call that scores project state
+  (repo at `main`, decisions/, knowledge/, outputs/) against
+  the `truth/` corpus on five canonical 1–10 criteria
+  (Fidelity, Completeness, Consistency, Currency, Clarity)
+  plus a brief overall comment. Invoked via `/truthscore` slash,
+  `coord_run_truth_score` MCP tool (Coach + Players), or
+  `POST /api/truthscore`. No UI, no scheduler, no recurring run.
+  Result written to `working/knowledge/truthscore-<ts>.md`.
 - `Docs/kanban-specs-v2.md` — Kanban-shaped task lifecycle (shape (2)
   routing through Coach). Every Coach delegation is a tracked task;
   the kanban records and surfaces but does not auto-route. Coach
@@ -3205,9 +3214,14 @@ state library.
 
 Shows:
 
-- Agent buttons for Coach and Players.
-- Status dots.
-- Unread/problem indicators.
+- Agent buttons for Coach and Players. Each is a square tinted by
+  work state (`state-idle` / `state-working` / `state-problem`) with
+  the slot label inside; the previous comms-state dot overlay (the
+  small green/blue/orange pip) was removed. Tooltip still surfaces
+  comms hints ("has unread inbox", "waiting for a reply") via the
+  same `dotStates` Map computed in `App`.
+- Unread/problem indicators (square tint only — work state stays;
+  comms state is tooltip-only).
 - File explorer button.
 - Project switcher pill.
 - Pause toggle.

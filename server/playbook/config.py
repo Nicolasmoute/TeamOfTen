@@ -67,6 +67,12 @@ ADJUST_DELTA_CAP = _env_float("HARNESS_PLAYBOOK_ADJUST_DELTA_CAP", 0.25)
 SOFT_STATEMENT_CAP = _env_int("HARNESS_PLAYBOOK_SOFT_CAP", 100)
 HARD_STATEMENT_CAP = _env_int("HARNESS_PLAYBOOK_HARD_CAP", 110)
 
+# Per-statement character cap. Lattice statements are injected into
+# every agent's system prompt on every turn — verbose phrasing
+# multiplies token cost. Cap forces "trigger-then-action" imperative
+# form; longer rationale belongs in the prose corpus.
+STATEMENT_MAX_CHARS = _env_int("HARNESS_PLAYBOOK_STATEMENT_MAX_CHARS", 160)
+
 # ----------------------------------------------- settle / stale thresholds
 # A statement settles or stales after WEIGHT crosses the threshold AND
 # remains there for STABLE_DAYS without an excursion (spec §5.8).
@@ -163,6 +169,7 @@ __all__ = [
     "ADJUST_DELTA_CAP",
     "SOFT_STATEMENT_CAP",
     "HARD_STATEMENT_CAP",
+    "STATEMENT_MAX_CHARS",
     "SETTLE_THRESHOLD",
     "STALE_THRESHOLD",
     "SETTLE_STABLE_DAYS",

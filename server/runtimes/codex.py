@@ -57,7 +57,7 @@ _client_locks: dict[str, asyncio.Lock] = {}
 
 # Bump when the Codex-visible coord tool contract changes in a way that
 # old persisted Codex threads might not pick up on resume.
-_CODEX_TOOL_CONTRACT_VERSION = "2026-05-04.kanban-v0.3-tools"
+_CODEX_TOOL_CONTRACT_VERSION = "2026-05-09.truthscore-v0.1"
 
 
 class _CapturedStdioTransport:

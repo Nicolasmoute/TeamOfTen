@@ -25,13 +25,14 @@
 
 v1's kanban was an autonomous router. Stage transitions auto-fired on commit / audit / spec; auto-wakes pulled the next assignee; audit FAILs reverted to execute without Coach in the path. In production this produced stale wakes (Player wakes on a task since reassigned), silent audit reverts (the executor loops with the auditor without Coach noticing), missed deviations (scope drift only surfaced at audit time, not at push time), and pool-claim races where the wrong Player won an executor seat. The 2026-05-06/07 session made all four failure modes visible at once.
 
-v2 reshapes the system around five principles:
+v2 reshapes the system around six principles:
 
 1. **Coach is the team's continuous reasoning layer.** Every team event flows into Coach's context. The kanban records and surfaces; it does not route.
-2. **Players are specialized executors invoked by Coach explicitly.** No auto-wake on stage transitions. Coach composes the wake context after seeing the previous Player's output.
-3. **Pattern-noticing is a first-class deliverable.** Audit-fail trajectories, repeat issues, and Coach-flagged deviations are computed by the harness and surfaced explicitly so Coach can act on patterns proactively rather than after manual observation.
-4. **Default trajectories favor rigor.** Contract-first, plan-mode-when-useful, audits-before-merge are the default for non-trivial work. Trivial work doesn't get a free pass — Coach still reviews; the only optimization is that Coach's review can be a one-line "advance" rather than a paragraph of analysis.
-5. **Human escalation is the safety net, not the routing path.** The human is pinged only on decisions Coach genuinely cannot make alone. Coach absorbs more events but also more decisions; total Coach turns per day decrease (fewer tasks shipped, more reasoning per task) but each turn is heavier.
+2. **Players are specialized executors invoked by Coach explicitly.** No auto-wake of Players on stage transitions: the kanban engine never picks the next assignee. Coach composes the wake context after seeing the previous Player's output. *(Player→Coach completion calls are a different channel — they DO wake Coach in real time; see principle 3.)*
+3. **Completion calls are real-time messages to Coach.** Each Player completion tool (`coord_commit_push`, `coord_write_task_spec`, `coord_submit_audit_report`, `coord_role_complete`) is the Player's act of replying to Coach. The harness wakes Coach immediately on every such call (`bypass_debounce=True`, `wake_source='kanban_completion'`) and fans the event into Coach's pane in real time. Coach and Players hold a fluid, real-time conversation; the tool calls record the artifact + structure for the kanban while the live wake keeps the dialogue moving. The "no auto-wake" rule (principle 2) constrains the *kanban engine* — it does NOT silence Player→Coach replies.
+4. **Pattern-noticing is a first-class deliverable.** Audit-fail trajectories, repeat issues, and Coach-flagged deviations are computed by the harness and surfaced explicitly so Coach can act on patterns proactively rather than after manual observation.
+5. **Default trajectories favor rigor.** Contract-first, plan-mode-when-useful, audits-before-merge are the default for non-trivial work. Trivial work doesn't get a free pass — Coach still reviews; the only optimization is that Coach's review can be a one-line "advance" rather than a paragraph of analysis.
+6. **Human escalation is the safety net, not the routing path.** The human is pinged only on decisions Coach genuinely cannot make alone. Coach absorbs more events but also more decisions; total Coach turns per day decrease (fewer tasks shipped, more reasoning per task) but each turn is heavier.
 
 ---
 
@@ -43,13 +44,15 @@ A v2 task flows through five phases of attention:
 Player produces an artifact (commit / spec / audit / message)
   → Player calls completion tool with `message_to_coach`
   → harness writes a structured row to the per-project event log (§9)
-  → Coach's next tick reads the unread tail
-  → Coach decides what to do next (advance / reroute / clarify / archive)
+  → harness wakes Coach immediately (bypass_debounce=True) AND fans
+    the event into Coach's pane — the call is Coach's notification, not
+    a delayed log read
+  → Coach reads, decides what to do next (advance / reroute / clarify / archive)
   → Coach calls `coord_approve_stage` with the next assignee + a note
   → next Player wakes with Coach-composed context
 ```
 
-Contrast with v1: every step between "Player produces" and "next Player wakes" was automatic; Coach saw the trace afterwards (or not at all, on `aligned` Compass verdicts). In v2 each step is gated by Coach. The kanban itself is now a recording mechanism plus a surface that highlights what Coach should look at next. There is **no auto-advance escape hatch** — every transition is Coach-gated.
+Contrast with v1: every step between "Player produces" and "next Player wakes" was automatic; Coach saw the trace afterwards (or not at all, on `aligned` Compass verdicts). In v2 each *kanban transition* is Coach-gated, but the Player→Coach completion call still wakes Coach in real time so the conversation flows. The kanban itself is now a recording mechanism plus a surface that highlights what Coach should look at next. There is **no auto-advance escape hatch** — every transition is Coach-gated — but completion calls are not transitions; they're messages.
 
 ---
 
@@ -185,7 +188,24 @@ All registered in [server/tools.py](server/tools.py)'s `_tools` map and `ALLOWED
 
 **Players report to Coach, not to the kanban.** The kanban is Coach's log of what Players have told them. Each completion tool below does its specific real work AND, more importantly, **IS the Player's act of signalling Coach that the role is done**. Without the tool call, Coach has no idea the Player finished — the kanban can't record what it never heard about.
 
-`message_to_coach` is the Player's primary signal: a one-line summary Coach reads first ("committed at sha X, tests pass", "lgtm — cleanly structured", "shipped to main", "spec is rough — wanted to ship something for Coach to react to"). It lands in the event log row's `payload_json` and Coach surfaces it under `## Recent events` on the next tick.
+`message_to_coach` is the Player's primary signal: a one-line summary Coach reads first ("committed at sha X, tests pass", "lgtm — cleanly structured", "shipped to main", "spec is rough — wanted to ship something for Coach to react to"). It lands in the event log row's `payload_json` and is delivered to Coach two ways at once: (a) the event fans out into Coach's pane in real time so the conversation reads as a fluid dialogue; (b) the harness wakes Coach immediately with `bypass_debounce=True` and `wake_source='kanban_completion'`, passing `message_to_coach` plus minimal task context as the wake reason. Coach therefore acts on the reply without waiting for the next recurrence tick. The `## Recent events` rollup on the next tick is the catch-up surface for items Coach already saw live and for the rare wake-skipped case (cost cap, Coach already mid-turn — see §7.2.1).
+
+### 7.2.1 Real-time wake semantics
+
+For each of the four completion tools the harness performs, in order, after the per-tool real work commits:
+
+1. Publish the bus event (`commit_pushed` / `task_spec_written` / `audit_report_submitted` / `task_role_completed`).
+2. Append the row to `project_events` (§9).
+3. Fan the event into Coach's pane in real time (the four completion event types are unconditionally cc'd to Coach by the WS-side dispatcher, in addition to the actor's pane and any pre-existing `to:` recipient).
+4. Call `maybe_wake_agent("coach", reason=<formatted brief>, bypass_debounce=True, wake_source="kanban_completion")`. The wake reason is composed as: `"Player <slot> on task <id> (<title>) completed <role>: <message_to_coach>. <pointer to artifact when present>. Read the event log entry and decide whether to coord_approve_stage, request rework, archive, or leave the role open for further work."`
+
+**Skipped wake cases** (the call still publishes + records; only the wake is skipped):
+
+- `caller_is_coach` — when Coach calls a completion tool as an emergency override (e.g. `coord_write_task_spec(on_behalf_of=...)`). Coach is the actor; waking Coach inside Coach's own turn would loop.
+- `_coach_is_working()` — Coach is mid-turn; `maybe_wake_agent` no-ops by design (`agent_id in _running_tasks`). The event is still in the pane and the rollup catches it on the next tick.
+- Cost cap hit — `maybe_wake_agent` short-circuits silently to avoid a `cost_capped` storm. Same recovery path as above.
+
+These are the rationale for keeping the `## Recent events` rollup in §13: it backs up the live signal when the live wake genuinely cannot fire. Steady-state, Coach acts on the reply within seconds.
 
 **The recurring failure mode (recurring 6th instance on 2026-05-08):** Players write the deliverable to disk (spec.md, audit_<kind>.md, code commit, knowledge file) AND THEN STOP without calling the matching completion tool. The work is done; the team can't see it. The watchdog (§10.6) catches this with a `finished_not_reported` verdict and now wakes both Coach (override path) AND the assignee directly (self-correction nudge), but the proactive prevention is the framing: the wake bodies Players read on entry already say "your turn isn't done at the disk-write — it's done when Coach has received your signal."
 
@@ -690,6 +710,8 @@ Each item below names the v1 mechanism, the production failure mode it produced,
 **v1 mechanism:** `_on_stage_changed` in [server/kanban.py](server/kanban.py) auto-woke the next assignee with a generated wake prompt.
 **Failure mode:** stale wakes — Player wakes on a task since reassigned; Coach not in the loop.
 **v2 replacement:** Coach explicitly calls `coord_approve_stage(next_stage, assignee, note?)`. The note becomes the wake prompt verbatim. The auto-advance subscriber is repurposed: it consumes events for the event log and pattern counters but does NOT trigger transitions or wakes.
+
+**Scope of the rule.** "No auto-wake" applies to the *kanban engine* deciding by itself who works next — that's the path that produced stale wakes and pool races in v1. It does NOT silence Player→Coach replies: when a Player calls a completion tool the harness wakes Coach immediately (§7.2.1) so the Player→Coach channel stays a real-time conversation rather than a delayed log read. The two paths are different objects: stage transitions (Coach-gated) vs. completion replies (real-time).
 
 ### 21.2 R2 — Silent audit FAIL → executor revert
 

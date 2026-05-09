@@ -602,6 +602,37 @@ app.include_router(_build_playbook_router(
 
 
 # ------------------------------------------------------------------
+# TruthScore — on-demand project-fidelity evaluator. Single endpoint
+# (no router), so we mount it inline. See `Docs/truthscore-specs.md`.
+# ------------------------------------------------------------------
+
+
+@app.post("/api/truthscore")
+async def post_truthscore(
+    body: dict[str, Any] = Body(default={}),
+    _token: None = Depends(require_token),
+    actor: dict[str, str] = Depends(audit_actor),
+) -> dict[str, Any]:
+    """Run TruthScore for the active project. Returns the §2.3
+    response shape on success. See `Docs/truthscore-specs.md` §2.3
+    for the failure-status mapping (400/409/429/502)."""
+    from server import truthscore as ts  # noqa: PLC0415
+    from server.db import resolve_active_project as _rap  # noqa: PLC0415
+
+    project_id = await _rap()
+    if not project_id:
+        raise HTTPException(400, "no active project")
+    commentary_raw = body.get("commentary") if isinstance(body, dict) else None
+    commentary = (
+        commentary_raw.strip() if isinstance(commentary_raw, str) else None
+    ) or None
+    try:
+        return await ts.run_truth_score(project_id, commentary, actor)
+    except ts.TruthScoreError as e:
+        raise HTTPException(status_code=e.http_status, detail=str(e))
+
+
+# ------------------------------------------------------------------
 # Request models
 # ------------------------------------------------------------------
 
@@ -5975,6 +6006,10 @@ async def list_events(
         # haven't migrated the columns will still work — the columns
         # are just NULL there and the OR-branches contribute nothing,
         # which is the behaviour we want until init_db catches up.
+        # v2 §7.2.1 — when fetching Coach's history, every Player
+        # completion event is cc'd to Coach (matches the WS-side fan-out
+        # in app.js). The four event types are listed unconditionally
+        # so Coach's pane on reload mirrors what it showed live.
         where_parts.append(
             "("
             "agent_id = ?"
@@ -5989,10 +6024,19 @@ async def list_events(
             " OR (type = 'agent_model_set' AND payload_to = ?)"
             " OR (type = 'agent_effort_set' AND payload_to = ?)"
             " OR (type = 'agent_plan_mode_set' AND payload_to = ?)"
+            " OR (type IN ('truthscore_started','truthscore_completed',"
+            "             'truthscore_failed') AND payload_to = ?)"
+            " OR (type IN ('commit_pushed','task_spec_written',"
+            "             'audit_report_submitted','task_role_completed')"
+            "     AND ? = 'coach')"
+            " OR (type IN ('audit_report_submitted','task_spec_written',"
+            "             'task_role_completed')"
+            "     AND payload_to = ?)"
             ")"
         )
         params.extend([
             agent, agent, agent, agent, agent, agent, agent, agent, agent, agent,
+            agent, agent, agent,
         ])
     if type:
         where_parts.append("type = ?")
