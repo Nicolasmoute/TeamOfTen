@@ -10246,14 +10246,14 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
   // we got there). The retry uses the cached reqBody so per-pane
   // overrides (model / plan_mode / effort) match the original submit.
   //
-  // Throttle reject loops: if the entry has a `rejectedAt` stamp from
-  // a recent spawn_rejected, only retry once we've seen a boundary
+  // Boundary-only retry: if the entry has a `rejectedAt` stamp from a
+  // prior spawn_rejected, only retry once we've seen a turn-boundary
   // event (agent_stopped / agent_cancelled / result) for this slot
-  // newer than the rejection. Falls back to a 2s ceiling so a missed
-  // boundary never leaves the prompt queued forever. Without this
-  // gate, a fast reject→retry round-trip (~30ms) produces dozens of
-  // spawn_rejected rows per second when something else (recurrence
-  // tick, auto-wake) keeps reclaiming the slot.
+  // newer than the rejection. No timer fallback — without a boundary
+  // signal there's no reason to believe the agent freed up, and a
+  // periodic re-poke produces a flurry of spawn_rejected rows in the
+  // timeline while the user waits for the current turn to finish. The
+  // queued-state UI already shows the user that the prompt is parked.
   useEffect(() => {
     if (agent?.status === "working") return;
     const next = pending.find((p) => p.status === "queued");
@@ -10270,19 +10270,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
           const evMs = Date.parse(ev.ts || "");
           return Number.isFinite(evMs) && evMs > rejectedMs;
         });
-        const sinceReject = Date.now() - rejectedMs;
-        if (!boundary && sinceReject < 2000) {
-          // Schedule a retry-attempt re-trigger so we don't sit
-          // indefinitely if no boundary event arrives.
-          const t = setTimeout(() => {
-            setPending((prev) =>
-              prev.map((p) =>
-                p.id === next.id ? { ...p, _retryNudge: Date.now() } : p
-              )
-            );
-          }, 2000 - sinceReject + 50);
-          return () => clearTimeout(t);
-        }
+        if (!boundary) return;
       }
     }
     let cancelled = false;
@@ -10352,13 +10340,32 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
     return () => ro.disconnect();
   }, [isStreaming]);
 
+  // Suppress spawn_rejected rows whose prompt matches a pending entry
+  // (any status). The composer's "queued" pill is the user-facing
+  // signal that the prompt is parked; the timeline row is redundant
+  // noise. Non-matching rejections (synthetic / external callers) are
+  // still surfaced.
+  const pendingBodies = useMemo(() => {
+    const set = new Set();
+    for (const p of pending) {
+      if (typeof p.body === "string") set.add(p.body);
+    }
+    return set;
+  }, [pending]);
+
   // Filter allEvents by searchQuery for body render. No-op when the
   // query is empty; otherwise a case-insensitive substring match
   // against the most informative fields per type.
   const visibleEvents = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
-    if (!q) return allEvents;
-    return allEvents.filter((ev) => {
+    const base = pendingBodies.size === 0
+      ? allEvents
+      : allEvents.filter((ev) => {
+          if (ev.type !== "spawn_rejected") return true;
+          return !pendingBodies.has(ev.prompt || "");
+        });
+    if (!q) return base;
+    return base.filter((ev) => {
       const fields = [
         ev.content,
         ev.prompt,
@@ -10375,7 +10382,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
       ];
       return fields.some((f) => typeof f === "string" && f.toLowerCase().includes(q));
     });
-  }, [allEvents, searchQuery]);
+  }, [allEvents, searchQuery, pendingBodies]);
 
   // paste handler: capture images, upload, add to attachments strip
   const onPaste = useCallback(async (e) => {

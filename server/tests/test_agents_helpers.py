@@ -505,7 +505,7 @@ async def test_maybe_schedule_auto_continue_delayed_skips_after_clean_turn() -> 
     assert "auto_continue_scheduled" not in types
 
 
-# ---------- maybe_wake_agent: Coach todo nudge --------------------
+# ---------- maybe_wake_agent: prompt passthrough + queue-on-busy ----
 
 
 async def _capture_run_agent_prompt(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -529,12 +529,19 @@ async def _capture_run_agent_prompt(monkeypatch: pytest.MonkeyPatch) -> list[str
     monkeypatch.setattr(agents_mod, "_paused", False)
     agents_mod._running_tasks.pop("coach", None)
     agents_mod._last_turn_ended_at.pop("coach", None)
+    agents_mod._pending_wakes.pop("coach", None)
+    agents_mod._pending_wakes.pop("p3", None)
     return captured
 
 
-async def test_maybe_wake_agent_coach_appends_todo_nudge(
+async def test_maybe_wake_agent_passes_prompt_unmodified_for_coach(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Even with open Coach todos, the wake prompt passes through
+    untouched — the harness no longer appends a "scan your todos"
+    nudge. Coach's system prompt + per-tick coordination block
+    handle todo discipline; piggybacking on every reactive wake was
+    interfering noise."""
     import asyncio
 
     import server.agents as agents_mod
@@ -550,18 +557,13 @@ async def test_maybe_wake_agent_coach_appends_todo_nudge(
     await agents_mod.maybe_wake_agent(
         "coach", "New message from the human: hi"
     )
-    # Drain the create_task scheduled inside maybe_wake_agent.
     for _ in range(3):
         await asyncio.sleep(0)
 
-    assert len(captured) == 1
-    prompt = captured[0]
-    assert prompt.startswith("New message from the human: hi")
-    assert "scan your open coach-todos" in prompt
-    assert "(2 open)" in prompt
+    assert captured == ["New message from the human: hi"]
 
 
-async def test_maybe_wake_agent_coach_no_nudge_when_no_todos(
+async def test_maybe_wake_agent_passes_prompt_unmodified_no_todos(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import asyncio
@@ -577,20 +579,14 @@ async def test_maybe_wake_agent_coach_no_nudge_when_no_todos(
     assert captured == ["Player p3 finished t-7"]
 
 
-async def test_maybe_wake_agent_player_never_gets_nudge(
+async def test_maybe_wake_agent_passes_prompt_unmodified_for_player(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import asyncio
 
     import server.agents as agents_mod
-    import server.coach_todos as todos_mod
-    from server.db import resolve_active_project
 
     captured = await _capture_run_agent_prompt(monkeypatch)
-    # Even with open Coach todos, a Player wake gets the unmodified prompt.
-    project_id = await resolve_active_project()
-    await todos_mod.add_todo(project_id, title="Coach-only thing")
-    # Player wake bypasses the coach branch even with debounce reset.
     agents_mod._last_turn_ended_at.pop("p3", None)
     agents_mod._running_tasks.pop("p3", None)
 
@@ -599,3 +595,141 @@ async def test_maybe_wake_agent_player_never_gets_nudge(
         await asyncio.sleep(0)
 
     assert captured == ["you have a new task"]
+
+
+# ---------- maybe_wake_agent: queue-on-busy --------------------
+
+
+async def test_maybe_wake_agent_queues_when_target_busy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wake landing while the target is mid-turn is QUEUED (not
+    dropped). The queue entry stays parked in `_pending_wakes` until
+    the post-turn deferred-fire picks it up."""
+    import asyncio
+
+    import server.agents as agents_mod
+
+    captured = await _capture_run_agent_prompt(monkeypatch)
+
+    # Simulate Coach being mid-turn: insert a placeholder task.
+    loop = asyncio.get_running_loop()
+    fake_task = loop.create_task(asyncio.sleep(60))
+    agents_mod._running_tasks["coach"] = fake_task
+    try:
+        result = await agents_mod.maybe_wake_agent(
+            "coach", "p2 done on t-42", bypass_debounce=True,
+        )
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        # No spawn happened (run_agent stub uncalled) but the queue
+        # entry exists and the call returned True — the wake is
+        # accepted, just deferred.
+        assert result is True
+        assert captured == []
+        assert "coach" in agents_mod._pending_wakes
+        reason, source, plan, bypass = agents_mod._pending_wakes["coach"]
+        assert reason == "p2 done on t-42"
+        assert bypass is True
+    finally:
+        fake_task.cancel()
+        try:
+            await fake_task
+        except asyncio.CancelledError:
+            pass
+        agents_mod._running_tasks.pop("coach", None)
+        agents_mod._pending_wakes.pop("coach", None)
+
+
+async def test_maybe_wake_agent_queue_latest_wins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multiple wakes landing during a single busy stretch fold to
+    the most recent — the inbox + project_events tables retain the
+    actual content, so coalescing the prompt doesn't lose anything."""
+    import asyncio
+
+    import server.agents as agents_mod
+
+    captured = await _capture_run_agent_prompt(monkeypatch)
+
+    loop = asyncio.get_running_loop()
+    fake_task = loop.create_task(asyncio.sleep(60))
+    agents_mod._running_tasks["coach"] = fake_task
+    try:
+        await agents_mod.maybe_wake_agent("coach", "first wake")
+        await agents_mod.maybe_wake_agent("coach", "second wake")
+        await agents_mod.maybe_wake_agent(
+            "coach", "third wake", wake_source="kanban_completion",
+        )
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        assert captured == []
+        reason, source, _plan, _bypass = agents_mod._pending_wakes["coach"]
+        assert reason == "third wake"
+        assert source == "kanban_completion"
+    finally:
+        fake_task.cancel()
+        try:
+            await fake_task
+        except asyncio.CancelledError:
+            pass
+        agents_mod._running_tasks.pop("coach", None)
+        agents_mod._pending_wakes.pop("coach", None)
+
+
+async def test_maybe_wake_agent_no_queue_when_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the slot is free, the wake fires immediately and nothing
+    is parked in the queue."""
+    import asyncio
+
+    import server.agents as agents_mod
+
+    captured = await _capture_run_agent_prompt(monkeypatch)
+    agents_mod._pending_wakes.pop("coach", None)
+
+    await agents_mod.maybe_wake_agent("coach", "fresh wake")
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert captured == ["fresh wake"]
+    assert "coach" not in agents_mod._pending_wakes
+
+
+async def test_maybe_wake_agent_paused_does_not_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Harness pause beats every other guard — a wake landing while
+    paused is dropped, not queued (otherwise an unpause would unleash
+    a flood of stale wakes)."""
+    import asyncio
+
+    import server.agents as agents_mod
+
+    captured = await _capture_run_agent_prompt(monkeypatch)
+    monkeypatch.setattr(agents_mod, "_paused", True)
+
+    loop = asyncio.get_running_loop()
+    fake_task = loop.create_task(asyncio.sleep(60))
+    agents_mod._running_tasks["coach"] = fake_task
+    try:
+        result = await agents_mod.maybe_wake_agent(
+            "coach", "while-paused wake"
+        )
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+        assert result is False
+        assert captured == []
+        assert "coach" not in agents_mod._pending_wakes
+    finally:
+        fake_task.cancel()
+        try:
+            await fake_task
+        except asyncio.CancelledError:
+            pass
+        agents_mod._running_tasks.pop("coach", None)

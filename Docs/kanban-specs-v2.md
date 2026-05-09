@@ -624,6 +624,7 @@ Every Coach delegation goes through the kanban. Stages: plan → execute → aud
   - shipper → `coord_role_complete(task_id, message_to_coach)`
 - **`message_to_coach` is your response.** What you noticed, any caveats, what the next person should know. Write it like you're talking to Coach — because you are.
 - **The kanban does NOT advance until Coach reviews and approves.** Your turn ends when you've called the completion tool. Coach reads on the next tick.
+- **NEVER finish a turn without a `coord_*` update message to Coach.** Even if you called one earlier in the turn — if you did anything since (file read, Bash, more reasoning), call one more; Coach reads your LAST signal. If you have nothing material to add, `coord_send_message(to='coach', body='ack — <one line>')` is the right answer.
 - **Audit FAIL does NOT auto-revert.** The auditor records the verdict + body; Coach decides what happens next (re-spec / bump effort / clarify / abandon). Don't pre-emptively start fixing things based on a fail you saw — wait for Coach's wake.
 - Semantic audits require a stated `focus` at assignment time — Coach frames the check.
 - **If the named completion tool isn't visible in your runtime** (Codex stdio flake, MCP missing): message Coach IMMEDIATELY via `coord_send_message(to='coach', body='need to deliver task X but coord_* tool is not visible')`. Do NOT route around with raw git/Bash. Coach picks up via `on_behalf_of=<slot>` overrides on the relevant tool.

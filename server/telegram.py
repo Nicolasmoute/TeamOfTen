@@ -228,9 +228,7 @@ async def _post_human_message(chat_id: int, body: str) -> None:
     preview = body.replace("\n", " ")[:240]
     await maybe_wake_agent(
         "coach",
-        f'New message from the human (via Telegram): "{preview}"\n\n'
-        f"Call coord_read_inbox to mark it read and see any other "
-        f"queued messages, then respond.",
+        f'New message from the human (via Telegram): "{preview}"',
         bypass_debounce=True,
     )
 

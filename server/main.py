@@ -5181,9 +5181,7 @@ async def send_human_message(req: HumanMessageRequest) -> dict[str, Any]:
         # wake even if the agent just finished a turn.
         await maybe_wake_agent(
             to,
-            f"New message from the human{subj}: \"{preview_snippet}\"\n\n"
-            f"Call coord_read_inbox to mark it read and see any other "
-            f"queued messages, then respond.",
+            f"New message from the human{subj}: \"{preview_snippet}\"",
             bypass_debounce=True,
         )
     return {"ok": True, "message_id": msg_id}

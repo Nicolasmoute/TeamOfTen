@@ -1481,9 +1481,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 preview_snippet = body.strip().replace("\n", " ")[:240]
                 await maybe_wake_agent(
                     to,
-                    f"New message from {caller_id}{subj}: \"{preview_snippet}\"\n\n"
-                    f"Call coord_read_inbox to mark it read and see any "
-                    f"other queued messages, then respond as appropriate.",
+                    f"New message from {caller_id}{subj}: \"{preview_snippet}\"",
                     bypass_debounce=True,
                 )
             except Exception:

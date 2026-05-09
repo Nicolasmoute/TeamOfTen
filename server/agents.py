@@ -109,9 +109,7 @@ async def _deliver_system_message(
             subj = f" (subject: {subject})" if subject else ""
             await maybe_wake_agent(
                 to_id,
-                f"New message from {from_id}{subj}: \"{preview}\"\n\n"
-                f"Call coord_read_inbox to mark it read and see any "
-                f"other queued messages, then respond as appropriate.",
+                f"New message from {from_id}{subj}: \"{preview}\"",
             )
         except Exception:
             logger.exception("_deliver_system_message wake failed")
@@ -1263,6 +1261,17 @@ AUTOWAKE_DEBOUNCE_SECONDS = int(
     os.environ.get("HARNESS_AUTOWAKE_DEBOUNCE", "10")
 )
 _last_turn_ended_at: dict[str, float] = {}
+
+# Queue-on-busy: when maybe_wake_agent fires for a slot that is
+# already mid-turn, we stash the args here instead of dropping the
+# wake. After the turn ends (in run_agent's finally), the deferred
+# fire calls maybe_wake_agent again so a fresh turn picks up the
+# queued reason. Latest-wins coalescing — multiple wakes during a
+# single busy stretch fold into one follow-up turn (the inbox /
+# project_events tables retain the actual content; the prompt is
+# just the most recent trigger). Tuple shape:
+#   (reason, wake_source, plan_mode, bypass_debounce)
+_pending_wakes: dict[str, tuple[str, str | None, bool | None, bool]] = {}
 
 # Post-error auto-retry tracking. After a hard error (not the
 # suppressed post-result teardown variety), we schedule a single wake
@@ -4382,14 +4391,12 @@ def _system_prompt_for(agent_id: str) -> str:
         f"invisible to the team — Coach has no idea you finished, "
         f"the kanban has no record of it, and the team will assume "
         f"you're still working.\n\n"
-        f"**Common failure mode to avoid:** writing the deliverable "
-        f"(spec.md, audit report, code commit, knowledge file) to disk "
-        f"AND THEN STOPPING without calling the completion tool. Your "
-        f"turn isn't done at the disk write — it's done when Coach has "
-        f"received your signal. If a wake fires you up to finish work, "
-        f"the LAST thing you do before idling is call the tool. If the "
-        f"tool isn't visible in your runtime, message Coach via "
-        f"coord_send_message immediately — don't fail silently.\n\n"
+        f"**NEVER finish a turn without a `coord_*` update message "
+        f"to Coach.** Even if you called one earlier in the turn — if "
+        f"you did anything since (file read, Bash, more reasoning), "
+        f"call one more; Coach reads your LAST signal. If you have "
+        f"nothing material to add, `coord_send_message(to='coach', "
+        f"body='ack — <one line>')` is the right answer.\n\n"
         f"After you signal Coach, your turn ends. Coach reviews on the "
         f"next tick and decides whether to advance, request rework, or "
         f"archive. v2 does NOT auto-advance and audit FAIL does NOT "
@@ -5381,6 +5388,12 @@ async def run_agent(
         # attempt (after the user raises the cap / tomorrow rolls
         # over) isn't rejected for "already running".
         _running_tasks.pop(agent_id, None)
+        # A wake that landed in the brief window between our slot-
+        # claim and this early exit would have been queued; clear it
+        # (the cap is still hit so re-firing would cap again, and
+        # holding the entry would risk it firing later under a stale
+        # trigger context).
+        _pending_wakes.pop(agent_id, None)
         return
 
     # Read prior continuation before the start event. Codex may later
@@ -5942,6 +5955,30 @@ async def run_agent(
 
     await _emit(agent_id, "agent_stopped")
 
+    # Queue-on-busy: any wake that landed while this turn was running
+    # was stashed in _pending_wakes. Fire it now — calls back into
+    # maybe_wake_agent so the standard guards (paused / debounce /
+    # cost cap) still apply. Latest-wins: only the most recent queued
+    # wake fires. The inbox + project_events tables retain the actual
+    # message / event payloads, so coalescing the prompt doesn't lose
+    # information — Coach reads inbox in the next turn and sees
+    # everything that arrived while it was busy.
+    queued = _pending_wakes.pop(agent_id, None)
+    if queued is not None:
+        q_reason, q_source, q_plan, q_bypass = queued
+        try:
+            await maybe_wake_agent(
+                agent_id,
+                q_reason,
+                bypass_debounce=q_bypass,
+                wake_source=q_source,
+                plan_mode=q_plan,
+            )
+        except Exception:
+            logger.exception(
+                "post-turn deferred wake failed for %s", agent_id
+            )
+
 
 async def _get_status_of(agent_id: str) -> str | None:
     try:
@@ -6213,9 +6250,15 @@ async def maybe_wake_agent(
     only if all guards pass:
 
       - harness not paused
-      - agent not already running (don't stack turns)
       - this agent's previous turn ended more than
         AUTOWAKE_DEBOUNCE_SECONDS ago, UNLESS bypass_debounce=True
+
+    If the agent is already mid-turn, the wake is QUEUED instead of
+    dropped: the args are stashed in `_pending_wakes` and a fresh turn
+    fires automatically when the current one ends. Latest-wins
+    coalescing — multiple wakes during a single busy stretch fold into
+    one follow-up turn. The inbox + project_events tables retain the
+    actual content, so coalescing doesn't lose information.
 
     The debounce exists to prevent tight Coach↔Player ping-pong when
     agents chat-reply to each other. Discrete actions (task assignment,
@@ -6232,18 +6275,27 @@ async def maybe_wake_agent(
     'kanban_completion', 'kanban_stall', 'system_recovery'. None for
     user-originated wakes (UI composer, Telegram inbound, peer chat).
 
-    Returns True if a spawn was scheduled, False otherwise. Cost caps
-    are checked here AND inside run_agent — the early check avoids a
-    storm of cost_capped events when a cap is hit (e.g. Coach assigns
-    10 tasks while team-capped, each assign would otherwise spawn a
-    turn that immediately fails).
+    Returns True if a spawn was scheduled (immediately OR queued for
+    post-turn), False otherwise. Cost caps are checked here AND inside
+    run_agent — the early check avoids a storm of cost_capped events
+    when a cap is hit (e.g. Coach assigns 10 tasks while team-capped,
+    each assign would otherwise spawn a turn that immediately fails).
     """
     if agent_id == "system":
         return False
     if _paused:
         return False
     if agent_id in _running_tasks:
-        return False
+        # Queue-on-busy: stash the latest wake args so a fresh turn
+        # fires once the current one ends. Replaces any prior queued
+        # entry for this slot — latest-wins.
+        _pending_wakes[agent_id] = (
+            reason, wake_source, plan_mode, bypass_debounce,
+        )
+        logger.info(
+            "auto-wake queued (slot %s busy): %s", agent_id, reason[:80]
+        )
+        return True
     if not bypass_debounce:
         last_end = _last_turn_ended_at.get(agent_id, 0.0)
         if last_end and (time.monotonic() - last_end) < AUTOWAKE_DEBOUNCE_SECONDS:
@@ -6263,29 +6315,6 @@ async def maybe_wake_agent(
     if not allowed:
         logger.info("auto-wake skipped for %s: cost cap hit", agent_id)
         return False
-    # Coach-only: every reactive wake also nudges Coach to scan its
-    # todo list. Without this, wakes triggered by a Player message,
-    # human inbound, task-done, or stall escalation pull Coach into
-    # purely reactive mode and the todo list piles up untouched. The
-    # recurrence tick (recurrences._fire_row) calls run_agent directly
-    # and does NOT pass through here, so its prompt — which already
-    # lists "(2) Open coach-todos" — isn't double-nudged.
-    if agent_id == "coach":
-        try:
-            from server.coach_todos import load_open
-            project_id = await resolve_active_project()
-            open_count = len(load_open(project_id))
-            if open_count:
-                reason = (
-                    reason.rstrip()
-                    + f"\n\nAfter handling this, scan your open "
-                    f"coach-todos ({open_count} open) for anything "
-                    f"ready to act on."
-                )
-        except Exception:
-            logger.exception(
-                "coach wake: todo nudge composition failed"
-            )
     logger.info("auto-wake: spawning %s — %s", agent_id, reason[:80])
     asyncio.create_task(run_agent(
         agent_id, reason, wake_source=wake_source, plan_mode=plan_mode,

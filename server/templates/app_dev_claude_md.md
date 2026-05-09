@@ -100,15 +100,19 @@ on audit fail.**
     - executor (non-code) → `coord_role_complete(task_id, message_to_coach, artifact_path?)`
     - auditor → `coord_submit_audit_report(task_id, kind, body, verdict, message_to_coach)`
     - shipper → `coord_role_complete(task_id, message_to_coach)`
-- **#1 stall pattern: writing to disk and stopping without
-  calling the completion tool.** Disk writes are invisible to
-  the team until the tool fires.
+- **NEVER finish a turn without a `coord_*` update message to
+  Coach.** Even if you called one earlier in the turn — if you
+  did anything since (file read, Bash, more reasoning), call
+  one more; Coach reads your LAST signal. If you have nothing
+  material to add, `coord_send_message(to='coach', body='ack
+  — <one line>')` is the right answer.
 - **Audit FAIL does NOT auto-revert.** Auditor records; Coach
   decides next steps. Don't pre-emptively start fixing — wait
   for Coach's wake.
 - If a completion tool isn't visible in your runtime (Codex
-  stdio flake, MCP missing): message Coach IMMEDIATELY via
-  `coord_send_message`. Do NOT route around with raw git/Bash.
+  stdio flake, MCP missing): fall back to `coord_send_message`
+  IMMEDIATELY. Do NOT route around with raw git/Bash. Never
+  end a turn unaddressed.
 
 **For Coach:**
 

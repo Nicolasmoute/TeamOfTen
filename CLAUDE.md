@@ -2315,6 +2315,33 @@ stubbed LLM, HTTP endpoint smoke (200/400/409/429/502/401/403),
 MCP tool registration + actor plumbing + commentary normalization,
 and the Codex contract bump enforcement. All pass.
 
+**Recent (2026-05-09) — Spawn-rejection storm fix:**
+
+Submitting a prompt while Coach is mid-turn used to produce a
+flurry of `spawn rejected · already running a turn` rows in the
+pane (~1–2/sec). The reconciliation effect in
+[server/static/app.js](server/static/app.js) flipped the pending
+entry to `queued` and re-fired `postStart` on a 2s timer fallback
+whenever no boundary event (`agent_stopped` / `agent_cancelled` /
+`result`) had arrived — every retry produced another rejection
+row. Two changes:
+
+- **Boundary-only retry.** The 2s `setTimeout` fallback + the
+  `_retryNudge` poke are gone. The retry effect now waits strictly
+  for a boundary event newer than `rejectedAt` before re-POSTing.
+  Without a boundary signal there's no reason to believe the agent
+  freed up; the `queued` pill in the composer is the user-facing
+  wait signal. If the in-flight turn never emits a boundary, the
+  entry stays parked until the user cancels.
+- **Timeline noise suppression.** `spawn_rejected` rows whose
+  `prompt` matches a current pending entry's body (any status) are
+  filtered out of `visibleEvents` via a new `pendingBodies` set.
+  Non-matching rejections (synthetic / external callers) still
+  surface for diagnostics.
+
+Spec mirror: [Docs/TOT-specs.md](Docs/TOT-specs.md) "Pending-prompt
+queue" section.
+
 ## What needs verification (when user is next active)
 
 Verified as of 2026-04-24: HARNESS_TOKEN auth gate, fine-grained

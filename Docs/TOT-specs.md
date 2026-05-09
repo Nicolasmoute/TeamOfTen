@@ -3446,21 +3446,26 @@ Pending-prompt queue (optimistic local echo + auto-retry):
   re-POSTed with the original cached `reqBody` (model / plan_mode /
   effort overrides preserved). FIFO order; one retry per idle
   transition.
-- Reject-loop throttle: when reconciliation flips an entry to `queued`
+- Boundary-only retry: when reconciliation flips an entry to `queued`
   it stamps `rejectedAt` with the `spawn_rejected` event ts. The
-  auto-retry effect won't re-fire that entry until either a boundary
-  event for this slot (`agent_stopped` / `agent_cancelled` / `result`)
-  arrives strictly after `rejectedAt`, or a 2s ceiling elapses
-  (whichever comes first). A `setTimeout` nudges `pending` so the
-  effect re-evaluates exactly when the ceiling expires. Without this
-  gate, a tight reject→retry round-trip (~30ms) produces a storm of
-  `spawn_rejected` rows when something else (recurrence tick,
-  auto-wake, the brief window between `_set_status('idle')` and
-  `_running_tasks.pop()`) keeps reclaiming the slot the moment it
-  frees. With the gate, contention degrades to one attempt per ~2s
-  until the contender lets go. The stamp clears when the retry
-  actually fires so a fresh rejection on the next round-trip
+  auto-retry effect won't re-fire that entry until a boundary event
+  for this slot (`agent_stopped` / `agent_cancelled` / `result`)
+  arrives strictly after `rejectedAt`. There is no timer fallback —
+  without a boundary signal there's no reason to believe the agent
+  freed up, and re-poking on a fixed cadence produces a flurry of
+  `spawn_rejected` rows in the timeline while the user waits for the
+  current turn to finish. The `queued` state in the composer is the
+  user-facing wait signal; if the in-flight turn never emits a
+  boundary (truly stuck), the entry stays `queued` until the user
+  cancels it or the slot is cancelled. The stamp clears when the
+  retry actually fires so a fresh rejection on the next round-trip
   re-stamps with a current ts.
+- Timeline noise suppression: `spawn_rejected` rows whose `prompt`
+  matches a current pending entry's body (any status) are filtered
+  out of `visibleEvents` so the user-facing wait signal lives in the
+  composer's `queued` pill, not as a stack of redundant rejection
+  rows in the conversation. Non-matching rejections (synthetic /
+  external callers) still surface for diagnostics.
 - Cancel: each pending card has an `×` button to discard.
 - Per-pane state, in-memory only (lost on refresh — acceptable since
   prompts not yet started leave no server-side trace anyway).
