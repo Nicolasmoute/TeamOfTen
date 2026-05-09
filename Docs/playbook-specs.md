@@ -163,7 +163,7 @@ No `briefings/` subfolder — playbook doesn't generate daily summaries.
 Field notes:
 
 - `id` — stable string (`pb-NNN`, monotonic). Survives merges via `archived.json` cross-reference.
-- `text` — the statement body. Single sentence preferred; full paragraph allowed up to 500 chars.
+- `text` — the statement body. **Hard cap `STATEMENT_MAX_CHARS` (default 160 chars, env-overridable via `HARNESS_PLAYBOOK_STATEMENT_MAX_CHARS`)** enforced on every insert path (Coach `coord_propose_playbook_changes`, daily reflection creations, bootstrap seeds). One line, imperative, no enumerated sub-items — the WEIGHT carries confidence; the text just needs to trigger recall. Detail and rationale belong in the prose corpus, not the lattice statement (lattice statements get injected into every agent's system prompt on every turn). Aim for ~120 chars typical.
 - `weight` — float in [0.0, 1.0].
 - `weight_history` — append-only list of weight transitions with reason. Cap at 50 most recent entries (older trimmed during write); `runs.jsonl` is the durable audit trail.
 - `applied_count` — integer; incremented by the daily reflection based on Coach's `relevant_ids` list (§5.5) — every statement Coach lists as "the day's events touched on this pattern" gets `+1`, whether or not weight was adjusted. Used by the dashboard to surface "frequently observed" via the sort key `weight × log(1 + applied_count)` (so a high-weight rule that fires often ranks above a high-weight rule that almost never fires). Monotonic — never decrements.
@@ -310,7 +310,13 @@ First boot after the engine ships, OR `POST /api/playbook/reset` clears `playboo
 
 Single direct `claude_agent_sdk.query()` call with `model="latest_sonnet"`, `effort="medium"`, no MCP, no resume. The prompt:
 
-> Below is a prose playbook on coordinating a multi-agent team. Extract every distinct, actionable orchestration pattern as a single conceptual statement (one sentence preferred, max 500 chars).
+> Below is a prose playbook on coordinating a multi-agent team. Extract every distinct, actionable orchestration pattern as a single conceptual statement.
+>
+> Brevity (load-bearing — these statements are injected into every agent's system prompt on every turn):
+> - Hard cap: 160 characters. Anything longer is rejected.
+> - One line, imperative form. "When X -> do Y" or "X needs Y." No enumerated sub-items, no parenthetical clauses listing what-goes-in.
+> - The WEIGHT carries confidence; the text just needs to trigger recall. Detail / rationale belongs in the prose corpus, not the lattice statement.
+> - Aim for ~120 chars typical, 160 only when the trigger genuinely needs context.
 >
 > Constraints:
 > - Statement must be conceptual and runtime-agnostic — no specific Player slot ids, no specific tool names from the harness, no specific tech-stack references.
@@ -457,7 +463,7 @@ Return a JSON object with four lists:
     {"id": "pb-XXX", "delta": 0.10, "reason": "validated by 3 clean outcomes in t-abc, t-def, t-ghi"}
   ],
   "creations": [
-    {"text": "<single sentence, conceptual, runtime-agnostic, observable>", "weight": 0.6, "reason": "pattern observed in 3 archived tasks t-..., t-..., t-..."}
+    {"text": "<one line, imperative, <=160 chars, conceptual, runtime-agnostic, observable>", "weight": 0.6, "reason": "pattern observed in 3 archived tasks t-..., t-..., t-..."}
   ],
   "merges": [
     {"keep_id": "pb-XXX", "drop_id": "pb-YYY", "reason": "say the same thing"}
@@ -469,6 +475,7 @@ Rules:
 - Each adjustment delta ≤ ±0.25 (so a single noisy day cannot flip a stable consensus).
 - Justification must reference specific task ids / event types from the evidence bundle.
 - Creations should be supported by ≥ 3 distinct observations (instruction, not enforced — be honest).
+- **Creation text is hard-capped at 160 chars; longer creations are rejected.** One line, imperative ("When X -> do Y" or "X needs Y"), no enumerated sub-items, no parenthetical lists. The WEIGHT carries confidence; the text just triggers recall. Aim for ~120 chars typical.
 - Skip statements that are runtime-specific, project-specific, procedural-plumbing, or unobservable.
 - Empty lists are valid — return all four as `[]` if no real signal.
 
@@ -482,7 +489,7 @@ The runner parses the JSON tolerantly (same first-balanced-JSON-object extractio
 Op apply order is **fixed**:
 
 1. **Merges first.** Each merge: validate both ids exist in active lattice, neither immutable. `keep_id` retains its weight (max of the two). `drop_id` moves to `archived.json` with `archive_reason="merged"`, `merged_into=keep_id`. `keep_id`'s `weight_history` records the merge; `keep_id.applied_count += dropped.applied_count`; `keep_id.last_validated_at = max(keep_id.last_validated_at, dropped.last_validated_at)` (NULL-safe — NULL participates as "older than any timestamp").
-2. **Creations next** (against post-merge state). Each create: validate `text` length ≤ 500, weight ∈ [0, 1], no near-duplicate of existing statement. **Near-duplicate algorithm:** Jaccard similarity over lowercased whitespace-tokenized word sets, after stripping ASCII punctuation and a small English stopword list (`a, an, the, and, or, of, to, for, in, on, at, with, is, are, be`). Threshold: Jaccard ≥ 0.7. Embedding-based dedup deferred to v2. Mint new id `pb-NNN`, persist with `created_by="reflection"`. Soft cap (§5.7) checked first.
+2. **Creations next** (against post-merge state). Each create: validate `text` length ≤ `STATEMENT_MAX_CHARS` (default 160; rejection reason includes the cap, the form rule "one line, imperative, no enumerated sub-items", and a pointer to the prose corpus for rationale), weight ∈ [0, 1], no near-duplicate of existing statement. **Near-duplicate algorithm:** Jaccard similarity over lowercased whitespace-tokenized word sets, after stripping ASCII punctuation and a small English stopword list (`a, an, the, and, or, of, to, for, in, on, at, with, is, are, be`). Threshold: Jaccard ≥ 0.7. Embedding-based dedup deferred to v2. Mint new id `pb-NNN`, persist with `created_by="reflection"`. Soft cap (§5.7) checked first.
 3. **Adjustments last** (against post-merge, post-creation state). Each adjust: validate `id` exists, not immutable, |delta| ≤ 0.25, target weight stays in [0, 1] after clamp. Apply: update `weight`, append to `weight_history`, update `last_validated_at`. Reject silently otherwise (logged in `proposals_rejected`).
 
 **Cross-op conflict:** any op targeting an id that an earlier op archived (via merge in step 1) is rejected with reason `"id_archived_in_same_run"`. Adjusts and creations referencing freshly-merged ids fall through to this rule.
@@ -732,6 +739,7 @@ COACH_CREATION_WEIGHT = 0.60
 ADJUST_DELTA_CAP = 0.25
 SOFT_STATEMENT_CAP = 100
 HARD_STATEMENT_CAP = 110
+STATEMENT_MAX_CHARS = 160     # per-statement char cap; env: HARNESS_PLAYBOOK_STATEMENT_MAX_CHARS
 SETTLE_THRESHOLD = 0.95
 STALE_THRESHOLD = 0.15
 SETTLE_STABLE_DAYS = 7

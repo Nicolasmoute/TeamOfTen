@@ -1886,7 +1886,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- task_id: the kanban task this commit delivers against "
             "(optional but STRONGLY RECOMMENDED). When provided, the "
             "event log row carries `task_id` so Coach correlates the "
-            "commit with the right task on the next tick. Without "
+            "commit with the right task when reading the wake. Without "
             "task_id the commit still works but lands without a "
             "kanban link — Coach has to figure out which task it was "
             "for.\n"

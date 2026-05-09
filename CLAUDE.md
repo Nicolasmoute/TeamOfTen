@@ -2157,6 +2157,35 @@ Validation criteria: ≥80% deviations noticed at push-time vs
 audit-time, ≥50% reduction in Coach context-reconstruction turns,
 flat or decreased human pings on routine items.
 
+**Recent (2026-05-09) — Playbook statement brevity cap:**
+
+Lattice statements are injected into every agent's system prompt on
+every turn — verbose phrasing was multiplying token cost across the
+team. New `STATEMENT_MAX_CHARS = 160` cap (env-overridable via
+`HARNESS_PLAYBOOK_STATEMENT_MAX_CHARS`) enforced on every insert
+path: Coach via `coord_propose_playbook_changes`, daily reflection
+creations, and bootstrap seeds from the prose corpus. Rejection
+reason is actionable: tells the caller the cap, the form rule
+("one line, imperative, no enumerated sub-items"), and where
+rationale belongs (prose corpus, not the lattice). Plus brevity
+guidance added to both LLM prompts in
+[server/playbook/prompts.py](server/playbook/prompts.py)
+(`BOOTSTRAP_USER_TEMPLATE` and `REFLECTION_USER_TEMPLATE`) so the
+LLM aims terse from the start instead of relying on rejection-
+retry. Also tightened the defensive `[:500]` clip in
+`insert_statement` to use the same constant. Project CLAUDE.md
+template was trimmed alongside (598 → 222 lines) to defer general
+engineering discipline to the playbook lattice. Spec mirror in
+`Docs/playbook-specs.md` §3.1 (schema), §4.3 (bootstrap prompt),
+§5.5 (reflection prompt), §5.6 (validation rule), §11 (config
+constants).
+
+Existing pre-cap lattice rows (none currently in the wild — this
+ships before the lattice has accumulated long-form statements)
+would persist unchanged; the cap only fires on new inserts.
+A render-time warning surface for over-cap legacy rows is a
+follow-up if the lattice ever has them.
+
 **Recent (2026-05-09) — TruthScore shipped:**
 
 On-demand project-fidelity evaluator. One-shot Sonnet call that

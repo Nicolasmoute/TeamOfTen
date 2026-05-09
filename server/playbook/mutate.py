@@ -165,7 +165,7 @@ def insert_statement(
     weight_clamped = max(0.0, min(1.0, float(weight)))
     stmt = Statement(
         id=sid,
-        text=text.strip()[:500],
+        text=text.strip()[:config.STATEMENT_MAX_CHARS],
         weight=weight_clamped,
         weight_history=[
             WeightHistoryEntry(
