@@ -1584,26 +1584,98 @@ Global loop:
 Prompt layers (order matches `agents.py:run_agent`):
 
 1. Per-agent identity block from `agent_project_roles`.
-2. Coach-only coordination block from current project/team/tasks/inbox/wiki.
-3. Baseline Coach or Player role prompt.
-4. Global rules from `/data/CLAUDE.md`.
-5. Active project rules from `/data/projects/<slug>/CLAUDE.md`.
+2. Baseline Coach or Player role prompt.
+3. Global rules from `/data/CLAUDE.md`.
+4. Active project rules from `/data/projects/<slug>/CLAUDE.md`.
+5. Orchestration playbook lattice (see `playbook-specs.md`), when
+   non-empty.
 6. Per-agent `brief` from `agent_project_roles`.
-7. **Coach-only**: `## Project objectives` (verbatim from
+7. Coach-only coordination block from current
+   project/team/tasks/inbox/wiki/decisions/health rollups.
+8. **Coach-only**: `## Project objectives` (verbatim from
    `/data/projects/<slug>/project-objectives.md`) followed by
    `## Open coach todos` (verbatim from `coach-todos.md`). Both are
    re-read every turn; either section is omitted entirely when its
    file is missing or empty. Defined by
    [recurrence-specs.md](recurrence-specs.md) §6. This is the
    **single canonical surface for goal content** — neither the
-   coordination block (#2) nor the per-project CLAUDE.md (#5)
+   coordination block (#7) nor the per-project CLAUDE.md (#4)
    carries a `Goal:` line or `## Goal` section. See
    recurrence-specs §6.1 for the rationale and §8.3 above for the
    stub template that points to this file.
-8. Continuity handoff after `/compact`, when present.
+9. One-shot `## Prior turn note` when the previous turn ended with
+   `is_error=True` (popped after one consumption; skipped on
+   compact-mode spawns so the note reaches the user-facing turn).
+10. Continuity handoff after `/compact`, when present.
 
 `server/context.py` re-reads the global and project `CLAUDE.md` files every turn.
 Each file is truncated at 200,000 chars to prevent runaway prompt bloat.
+
+### 10.0 Section ordering and Anthropic prompt caching
+
+The order above is tuned for Anthropic's automatic prompt cache, not
+for the most natural reading order. The Claude CLI applies cache
+breakpoints automatically, but only the **longest stable byte-prefix**
+across consecutive turns is reused — any change in section N
+invalidates everything from section N onward. Because the per-turn
+prompt-log analysis (§10.5) showed `context_suffix` (#3+#4+#5) is
+~97% of the prompt's bytes, putting any per-turn-mutating block in
+front of it busts the cache for the heavy body on every turn.
+
+The rule the assembly follows: **stable blocks first, dynamic blocks
+last.** Per-agent stability:
+
+| Section | Stability                                            |
+|---------|------------------------------------------------------|
+| identity | per (slot, project), changes on rare edits          |
+| role baseline | constant per slot                              |
+| global CLAUDE.md | per file mtime                              |
+| project CLAUDE.md | per file mtime                             |
+| playbook | per lattice edit                                    |
+| brief    | per `agents.brief` edit                             |
+| coordination | per Coach turn (Coach only; empty for Players)  |
+| coach supplement | per objectives/todos change (Coach only)    |
+| prior_error | one-shot, present only after a failed turn       |
+| handoff | present only on the first turn after `/compact`      |
+
+Players' prompts are stable across turns within a session (no
+coordination/supplement injection), so cache hit rates are typically
+high. Coach's prompt mutates on every turn — the ordering ensures the
+mutation hits the **end** of the prompt, leaving the cached prefix
+intact through the heavy body.
+
+`cost_usd` recorded on each turn already reflects the cache discount
+the SDK applied, so a higher cache hit rate shows up in BOTH
+`cache_hit_pct` (higher) and `cost_usd` (lower) — the two are
+correlated, not double-counted.
+
+Monitoring:
+
+- `GET /api/turns/summary?hours=N` returns per-agent and team-wide
+  rollups including `input_tokens`, `output_tokens`,
+  `cache_read_tokens`, `cache_creation_tokens`, and a derived
+  `cache_hit_pct = cache_read / (input + cache_read +
+  cache_creation)`. Top-level fields mirror these as
+  `total_*_tokens` + `total_cache_hit_pct`.
+- EnvPane cost section renders the team-wide hit rate as a cap-bar
+  row and a `cache NN%` pill on each per-agent row, polled on the
+  same 60s cadence as the plan-included token meter.
+- `/spend [hours]` slash command prints the same rollup as plain
+  text into the pane info banner.
+
+Two non-trivial section reorders have shipped against this rule:
+
+- 2026-05-10 — moved the Coach coordination block from position #2
+  (right after identity) to its current position after CLAUDE.md +
+  brief. Coach's hit rate had been near zero because the
+  coordination block mutates on every turn and was sitting in front
+  of the heavy body.
+- 2026-05-10 — moved the prior-error suffix off the dynamic-tail
+  middle into its current single-shot slot at #9. Same rationale.
+
+If a future block needs to land between context_suffix and brief
+(e.g. a "current task" recap), measure cache hit rate before and
+after — if it mutates per turn, it belongs after brief, not before.
 
 ### 10.1 Identity
 
@@ -1801,6 +1873,31 @@ recorded on the latest turn for the active session.
 
 The pane renders this as a compact `ctx` bar: current footprint as a fraction
 of the model's max window.
+
+### 10.5 Prompt-size telemetry (offline analysis)
+
+`server/prompt_log.py` writes one JSONL row per non-compact agent
+spawn to `<HARNESS_DATA_ROOT>/prompt_log/<YYYY-MM-DD>.jsonl`. Each
+row carries timestamp, agent id, runtime, model, total chars, and a
+per-section char breakdown matching the assembly above
+(`identity`, `coordination`, `role_baseline`, `context_suffix`,
+`brief`, `coach_supplement`, `prior_error`, `handoff`, `lock`).
+
+Disable via `HARNESS_PROMPT_LOG=false`. Compact-mode spawns bypass
+the recording branch (their prompt is composed elsewhere and the
+section names don't apply).
+
+`scripts/analyze_prompt_log.py` prints three rollups: per-agent
+turn count + mean/p50/p95/max chars, per-section share-of-total,
+and the heaviest turns. The 2026-05-09 baseline run flagged
+`context_suffix` (global + project CLAUDE.md + playbook) at ~97%
+of total prompt size — the input that drove the 10.0 section
+reorder for cache stability.
+
+This is purely diagnostic. The `turns` table is the authoritative
+runtime cost surface (cost_usd, token columns, cache rollups);
+`prompt_log` measures what we _sent_ in chars, before tokenization
+or cache lookup.
 
 ---
 
@@ -2858,7 +2955,7 @@ HTTP wrappers.
 | --- | --- |
 | `GET /api/events` | Active-project event history with filters |
 | `GET /api/turns` | Active-project turn rows (full token + runtime detail) |
-| `GET /api/turns/summary?hours=24` | Per-agent spend/turn aggregate |
+| `GET /api/turns/summary?hours=24` | Per-agent + team spend/turn aggregate, including token columns and `cache_hit_pct` (see §10.0) |
 | `GET /api/turns/by-project` | Per-project today/total spend, plus team totals (sum of projects). Honors cost_reset_at and cost_reset_at_<project_id>. Used by the EnvPane Cost section's project dropdown. |
 | `POST /api/turns/reset` | Body `{scope: "all" \| "<project_id>"}`. Writes `cost_reset_at` (global) or `cost_reset_at_<project_id>` to `team_config` so today_usd zeroes for the affected scope. Caps re-enforce from this point — historical rows are not deleted. Emits `cost_reset` event with actor metadata. |
 

@@ -5532,10 +5532,7 @@ async def run_agent(
             ident_lines.append(ident["brief"].strip())
         identity_prefix = "\n".join(ident_lines) + "\n\n"
 
-    # Coach coordination block (PROJECTS_SPEC.md §10). Distinct from
-    # identity so the on-the-wire layout matches spec:
-    #   [identity] + [coordination block] + [role prompt + global CLAUDE.md]
-    # Phase 7: built fresh on every Coach turn from `projects`,
+    # Coach coordination block. Built fresh on every Coach turn from `projects`,
     # `agent_project_roles`, `agents.locked`, `tasks`, `messages`,
     # and the latest entry in `decisions/` so a project switch, a
     # `coord_set_player_role` update, a new task, or a fresh decision
@@ -5581,12 +5578,31 @@ async def run_agent(
             )
 
     role_baseline = _system_prompt_for(agent_id)
+    # Section order is tuned for Anthropic prompt-cache stability: the
+    # Claude CLI applies cache breakpoints automatically, but only the
+    # longest stable byte-prefix is reused across turns. So the rule is
+    # STABLE BLOCKS FIRST, DYNAMIC BLOCKS LAST. Reordering the dynamic
+    # tail (coordination/supplement/error/handoff) ahead of the heavy
+    # stable middle (context_suffix = global+project CLAUDE.md + playbook,
+    # ~97% of prompt size per the 2026-05-09 prompt-log analysis) busts
+    # the cache for the entire body on every Coach turn, since the
+    # coordination block changes whenever tasks/messages/health rollups
+    # do. Per-agent stability:
+    #   identity        — per (slot, project), changes on rare edits
+    #   role_baseline   — constant per slot
+    #   context_suffix  — per (global+project CLAUDE.md mtime + playbook)
+    #   brief           — per agents.brief edit
+    #   coordination    — per Coach turn (Coach only; "" for Players)
+    #   coach_supplement— per objectives/todos change (Coach only)
+    #   prior_error     — one-shot, present only after a failed turn
+    #   handoff         — present only on the first turn after /compact
+    #   lock_suffix     — currently always ""; kept for shape parity
     system_prompt = (
         identity_prefix
-        + coordination_block
         + role_baseline
         + context_suffix
         + brief_suffix
+        + coordination_block
         + coach_supplement
         + prior_error_suffix
         + handoff_suffix

@@ -5693,22 +5693,58 @@ async def turns_summary(hours: int = 24) -> dict[str, Any]:
     project_id = await resolve_active_project()
     c = await configured_conn()
     try:
+        # Cache columns rolled up so the UI / SQL consumers can compute
+        # hit_pct = cache_read / (input + cache_read + cache_creation).
+        # `input_tokens` here is the BILLED-fresh portion (already
+        # excludes cache_read + cache_creation per Anthropic's usage
+        # split; see `_extract_usage_claude` at agents.py:221).
+        # `cost_usd` already reflects the cache discount the SDK applied,
+        # so reorder-driven cache gains show up in BOTH cost_usd (lower)
+        # AND cache_hit_pct (higher) — they're not double-counted.
         cur = await c.execute(
             "SELECT agent_id, COUNT(*) AS count, "
             "COALESCE(SUM(cost_usd), 0) AS cost_usd, "
             "COALESCE(AVG(duration_ms), 0) AS avg_duration_ms, "
-            "SUM(is_error) AS error_count "
+            "SUM(is_error) AS error_count, "
+            "COALESCE(SUM(input_tokens), 0) AS input_tokens, "
+            "COALESCE(SUM(output_tokens), 0) AS output_tokens, "
+            "COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, "
+            "COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens "
             "FROM turns WHERE ended_at >= ? AND project_id = ? "
             "GROUP BY agent_id ORDER BY cost_usd DESC",
             (cutoff, project_id),
         )
         per_agent = [dict(r) for r in await cur.fetchall()]
+        for row in per_agent:
+            denom = (
+                int(row.get("input_tokens") or 0)
+                + int(row.get("cache_read_tokens") or 0)
+                + int(row.get("cache_creation_tokens") or 0)
+            )
+            row["cache_hit_pct"] = (
+                round(100.0 * int(row["cache_read_tokens"]) / denom, 1)
+                if denom > 0
+                else None
+            )
         cur = await c.execute(
-            "SELECT COUNT(*) AS count, COALESCE(SUM(cost_usd), 0) AS cost_usd "
+            "SELECT COUNT(*) AS count, COALESCE(SUM(cost_usd), 0) AS cost_usd, "
+            "COALESCE(SUM(input_tokens), 0) AS input_tokens, "
+            "COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, "
+            "COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens "
             "FROM turns WHERE ended_at >= ? AND project_id = ?",
             (cutoff, project_id),
         )
         total_row = dict(await cur.fetchone())
+        _denom_total = (
+            int(total_row.get("input_tokens") or 0)
+            + int(total_row.get("cache_read_tokens") or 0)
+            + int(total_row.get("cache_creation_tokens") or 0)
+        )
+        total_cache_hit_pct = (
+            round(100.0 * int(total_row["cache_read_tokens"]) / _denom_total, 1)
+            if _denom_total > 0
+            else None
+        )
 
         # Audit-item-22 (CODEX_RUNTIME_SPEC.md §G.3): split totals by
         # runtime + cost_basis so the EnvPane can render the
@@ -5752,6 +5788,10 @@ async def turns_summary(hours: int = 24) -> dict[str, Any]:
         "since": cutoff,
         "total_turns": int(total_row["count"] or 0),
         "total_cost_usd": float(total_row["cost_usd"] or 0),
+        "total_input_tokens": int(total_row.get("input_tokens") or 0),
+        "total_cache_read_tokens": int(total_row.get("cache_read_tokens") or 0),
+        "total_cache_creation_tokens": int(total_row.get("cache_creation_tokens") or 0),
+        "total_cache_hit_pct": total_cache_hit_pct,
         "per_agent": per_agent,
         "by_runtime": by_runtime,
         "by_cost_basis": by_cost_basis,

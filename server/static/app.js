@@ -8516,8 +8516,13 @@ function EnvCostSection({ agents, serverStatus }) {
   }, [byProject, scope]);
 
   // Plan-included token meter (ChatGPT-auth Codex turns where
-  // cost_usd is $0 by design). Same poll cadence as before.
+  // cost_usd is $0 by design) + Anthropic prompt-cache hit rate
+  // (system-prompt prefix stability — see agents.py system-prompt
+  // assembly). Both pulled from the same /api/turns/summary call;
+  // the cache rollup is per-agent so we can spot the laggard.
   const [planTokens, setPlanTokens] = useState(0);
+  const [cacheTotalPct, setCacheTotalPct] = useState(null);
+  const [cachePerAgent, setCachePerAgent] = useState({});
   useEffect(() => {
     let cancelled = false;
     const r = async () => {
@@ -8527,6 +8532,16 @@ function EnvCostSection({ agents, serverStatus }) {
         const d = await res.json();
         if (cancelled) return;
         setPlanTokens(Number(d.plan_included_token_total) || 0);
+        setCacheTotalPct(
+          d.total_cache_hit_pct == null ? null : Number(d.total_cache_hit_pct)
+        );
+        const map = {};
+        for (const row of (d.per_agent || [])) {
+          if (row.cache_hit_pct != null) {
+            map[row.agent_id] = Number(row.cache_hit_pct);
+          }
+        }
+        setCachePerAgent(map);
       } catch (_) {}
     };
     r();
@@ -8669,6 +8684,14 @@ function EnvCostSection({ agents, serverStatus }) {
             </div>
           </div>`
         : null}
+      ${cacheTotalPct != null
+        ? html`<div class="env-cap-bar" style="margin-top: 4px;">
+            <div class="env-cap-bar-label">
+              prompt cache hit (24h): <strong>${cacheTotalPct.toFixed(1)}%</strong>
+              <span class="muted"> · share of input tokens served from cache (higher is cheaper)</span>
+            </div>
+          </div>`
+        : null}
       ${scope === "all" && working > 0
         ? html`<div class="env-cost-sub">${working} agent${working === 1 ? "" : "s"} working now</div>`
         : null}
@@ -8692,16 +8715,22 @@ function EnvCostSection({ agents, serverStatus }) {
         ? html`
             <div class="env-cost-list">
               ${active.map(
-                (a) => html`
-                  <div class="env-cost-row" key=${a.id}>
-                    <span class=${"env-cost-dot " + (a.status || "stopped")}></span>
-                    <span class="env-cost-id">${a.id}</span>
-                    <span class="env-cost-name">
-                      ${a.name || (a.kind === "player" ? "unassigned" : a.id)}
-                    </span>
-                    <span class="env-cost-value">$${(a.cost_estimate_usd || 0).toFixed(3)}</span>
-                  </div>
-                `
+                (a) => {
+                  const pct = cachePerAgent[a.id];
+                  return html`
+                    <div class="env-cost-row" key=${a.id}>
+                      <span class=${"env-cost-dot " + (a.status || "stopped")}></span>
+                      <span class="env-cost-id">${a.id}</span>
+                      <span class="env-cost-name">
+                        ${a.name || (a.kind === "player" ? "unassigned" : a.id)}
+                      </span>
+                      ${pct != null
+                        ? html`<span class="env-cost-hint" title="prompt-cache hit rate over last 24h">cache ${pct.toFixed(0)}%</span>`
+                        : null}
+                      <span class="env-cost-value">$${(a.cost_estimate_usd || 0).toFixed(3)}</span>
+                    </div>
+                  `;
+                }
               )}
             </div>
           `
@@ -10823,14 +10852,22 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
               }
               const rows = d.per_agent.map((a) => {
                 const errs = a.error_count ? ` · ${a.error_count} err` : "";
+                const cache =
+                  a.cache_hit_pct == null
+                    ? ""
+                    : ` · cache ${Number(a.cache_hit_pct).toFixed(0)}%`;
                 return (
                   `${a.agent_id.padEnd(6)} ` +
                   `$${(a.cost_usd || 0).toFixed(3).padStart(8)} · ` +
-                  `${String(a.count).padStart(3)} turn${a.count === 1 ? "" : "s"}${errs}`
+                  `${String(a.count).padStart(3)} turn${a.count === 1 ? "" : "s"}${errs}${cache}`
                 );
               });
+              const teamCache =
+                d.total_cache_hit_pct == null
+                  ? ""
+                  : ` · cache ${Number(d.total_cache_hit_pct).toFixed(1)}%`;
               setInfoText(
-                `Spend last ${hours}h — total $${d.total_cost_usd.toFixed(3)} · ${d.total_turns} turns\n` +
+                `Spend last ${hours}h — total $${d.total_cost_usd.toFixed(3)} · ${d.total_turns} turns${teamCache}\n` +
                 rows.join("\n")
               );
             })
