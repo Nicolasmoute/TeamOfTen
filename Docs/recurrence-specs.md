@@ -633,10 +633,60 @@ loops. On every tick (every 30 seconds, configurable via
      pass treats the row as immediately due — and the only thing that
      keeps it from re-firing instantly is the busy/cost-cap defer
      check. Effectively: "fire as soon as Coach is idle, every time."
+     (See §11.1 — every Coach turn end overrides this with `now +
+     cadence_minutes` so the cadence is measured from the last
+     OUTBOUND Coach activity, not the last fire.)
    - repeat: `last_fired_at + cadence_minutes` (in UTC). Repeat
      cadence MUST be `>= 1`.
    - cron: parse DSL, compute next match in row's TZ, convert to UTC.
 4. Persist updated `last_fired_at` and `next_fire_at`.
+
+### 11.1 Tick cadence is measured from last Coach OUTBOUND activity
+
+The scheduler treats tick rows as "fire N minutes after Coach's last
+outbound activity," not "fire N minutes after the last fire." Every
+time Coach finishes a turn, the harness pushes every enabled tick row
+in the active project to `next_fire_at = now + cadence_minutes`.
+
+Implementation: [server/recurrences.py:reset_tick_next_fire_after_coach_activity](../server/recurrences.py)
+runs from [server/agents.py:run_agent](../server/agents.py) in the
+end-of-turn `finally` block, scoped to `agent_id == "coach"`. It hits
+both turn-end paths (the canonical successful/errored end and the
+pre-flight workspace_missing escape) so the invariant holds for every
+exit. Players + system + human turns leave tick rows untouched.
+
+**Why outbound, not inbound.** A Coach turn ending is an act of
+output: Coach reasoned, decided, possibly delegated. After that, give
+the operator a clean N-minute window before the next routine tick.
+Inbound events (Player message landing in Coach's inbox, human
+composer text, task assignment fan-out) do NOT reset the timer — by
+design. Inbound is the very thing tick is supposed to surface; if
+inbound resets the timer, the tick never fires while a busy team is
+chatting at Coach. The auto-wake path (see [server/agents.py:maybe_wake_agent](../server/agents.py))
+handles inbound separately: a discrete inbound event spawns a fresh
+Coach turn directly without going through the tick scheduler at all.
+
+**What it doesn't change.** Repeat and cron rows fire on their fixed
+wall-clock schedule and are never touched by this reset — their
+semantics are explicitly "every N minutes from the last fire" or
+"every N minutes from cron-schedule time." Tick is the only kind
+where the reset matters because tick is the only kind whose intent
+is "ambient, idle-window prompting."
+
+**Edge case — `/tick now`.** A manually-scheduled tick (operator sets
+`next_fire_at` directly via the `POST /api/coach/tick` endpoint or
+the `/tick` slash command) is respected the same way as before. The
+reset only fires on Coach turn ends, so a fresh manual schedule that
+arrives mid-idle is unaffected. If Coach is mid-turn when the manual
+schedule arrives, the manual `next_fire_at` is overwritten by the
+turn-end reset — correct: the operator's intent ("fire soon") is
+shaped by the principle ("after Coach is done with the current
+turn"), so the manual time gets aligned to the post-turn window.
+
+**Edge case — cadence=0.** "Fire as soon as Coach is idle" is
+preserved. The reset writes `next_fire_at = now + 0min = now`, so the
+next scheduler pass picks it up immediately and the busy/cost-cap
+defer is the only gate.
 
 The scheduler reads from the **active project** only. On project switch,
 the scheduler refreshes its row set (no restart needed). Inactive-project

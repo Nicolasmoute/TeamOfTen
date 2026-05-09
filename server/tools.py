@@ -1484,6 +1484,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"New message from {caller_id}{subj}: \"{preview_snippet}\"\n\n"
                     f"Call coord_read_inbox to mark it read and see any "
                     f"other queued messages, then respond as appropriate.",
+                    bypass_debounce=True,
                 )
             except Exception:
                 pass

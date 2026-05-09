@@ -1635,3 +1635,239 @@ async def test_coord_set_tick_interval_disable(fresh_db: str) -> None:
     assert result.get("isError") in (False, None)
     rows = await recmod.list_recurrences("misc")
     assert rows[0]["enabled"] is False
+
+
+# ----------------------------------------------------------------------
+# §11.1 — Tick cadence measured from last Coach OUTBOUND activity
+# ----------------------------------------------------------------------
+
+
+async def test_reset_tick_pushes_next_fire_to_now_plus_cadence(
+    fresh_db: str,
+) -> None:
+    """The helper sets next_fire_at = now + cadence_minutes for every
+    enabled tick row in the project. Mirrors the §11.1 invariant: tick
+    cadence is measured from last Coach outbound activity."""
+    await init_db()
+    c = await configured_conn()
+    try:
+        # Stale next_fire_at well in the past — simulates the row was
+        # deferred for ages while Coach was busy.
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, enabled, next_fire_at) "
+            "VALUES ('misc', 'tick', '5', 1, "
+            "'2020-01-01T00:00:00.000Z')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    before = datetime.now(timezone.utc)
+    updated = await recmod.reset_tick_next_fire_after_coach_activity("misc")
+    after = datetime.now(timezone.utc)
+    assert updated == 1
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute("SELECT next_fire_at FROM coach_recurrence")
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+
+    nxt = recmod._parse_iso(row["next_fire_at"])
+    assert nxt is not None
+    # Should be roughly now + 5min (allow a 10s window for clock drift +
+    # the time between the two `datetime.now()` calls in this test).
+    from datetime import timedelta
+    assert before + timedelta(minutes=5) - timedelta(seconds=10) <= nxt
+    assert nxt <= after + timedelta(minutes=5) + timedelta(seconds=10)
+
+
+async def test_reset_tick_skips_disabled_rows(fresh_db: str) -> None:
+    """Disabled tick rows should keep their stale next_fire_at — the
+    operator turned them off; we don't quietly re-arm them."""
+    await init_db()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, enabled, next_fire_at) "
+            "VALUES ('misc', 'tick', '5', 0, "
+            "'2020-01-01T00:00:00.000Z')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    updated = await recmod.reset_tick_next_fire_after_coach_activity("misc")
+    assert updated == 0
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute("SELECT next_fire_at FROM coach_recurrence")
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    # Stale value preserved — not overwritten.
+    assert row["next_fire_at"] == "2020-01-01T00:00:00.000Z"
+
+
+async def test_reset_tick_skips_repeat_and_cron_rows(fresh_db: str) -> None:
+    """Only `kind = 'tick'` rows are reset. Repeat / cron rows fire on
+    fixed wall-clock schedules — the principle is tick-specific."""
+    await init_db()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, enabled, next_fire_at) "
+            "VALUES ('misc', 'repeat', '60', 1, "
+            "'2020-01-01T00:00:00.000Z')"
+        )
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, tz, enabled, next_fire_at) "
+            "VALUES ('misc', 'cron', 'daily 09:00', 'UTC', 1, "
+            "'2020-01-01T00:00:00.000Z')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    updated = await recmod.reset_tick_next_fire_after_coach_activity("misc")
+    assert updated == 0
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT kind, next_fire_at FROM coach_recurrence "
+            "ORDER BY kind"
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+    finally:
+        await c.close()
+    # Both untouched.
+    assert all(r["next_fire_at"] == "2020-01-01T00:00:00.000Z" for r in rows)
+
+
+async def test_reset_tick_scoped_to_project(fresh_db: str) -> None:
+    """The reset is per-project. Other projects' tick rows are not
+    bumped — Coach was active on one project; only that one's idle
+    window restarts."""
+    await init_db()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO projects (id, name) VALUES ('alpha', 'Alpha')"
+        )
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, enabled, next_fire_at) "
+            "VALUES ('misc', 'tick', '5', 1, "
+            "'2020-01-01T00:00:00.000Z')"
+        )
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, enabled, next_fire_at) "
+            "VALUES ('alpha', 'tick', '5', 1, "
+            "'2020-01-01T00:00:00.000Z')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    updated = await recmod.reset_tick_next_fire_after_coach_activity("misc")
+    assert updated == 1
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT project_id, next_fire_at FROM coach_recurrence "
+            "ORDER BY project_id"
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+    finally:
+        await c.close()
+    by_proj = {r["project_id"]: r["next_fire_at"] for r in rows}
+    # alpha still stale (Coach didn't act on alpha).
+    assert by_proj["alpha"] == "2020-01-01T00:00:00.000Z"
+    # misc updated.
+    assert by_proj["misc"] != "2020-01-01T00:00:00.000Z"
+
+
+async def test_reset_tick_cadence_zero_writes_now(fresh_db: str) -> None:
+    """Cadence=0 ('fire as soon as Coach idle') writes next_fire_at = now
+    so the next scheduler pass picks it up immediately. The busy/cost-
+    cap defer is the only gate."""
+    await init_db()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, enabled, next_fire_at) "
+            "VALUES ('misc', 'tick', '0', 1, "
+            "'2099-01-01T00:00:00.000Z')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    before = datetime.now(timezone.utc)
+    updated = await recmod.reset_tick_next_fire_after_coach_activity("misc")
+    after = datetime.now(timezone.utc)
+    assert updated == 1
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute("SELECT next_fire_at FROM coach_recurrence")
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    nxt = recmod._parse_iso(row["next_fire_at"])
+    assert nxt is not None
+    from datetime import timedelta
+    # Now (within the test's wall-clock window).
+    assert before - timedelta(seconds=5) <= nxt <= after + timedelta(seconds=5)
+
+
+async def test_reset_tick_handles_invalid_cadence(fresh_db: str) -> None:
+    """A row with an unparseable cadence value is skipped, not crashed.
+    The schema has UNIQUE(project_id, kind) so we use two projects
+    rather than two same-project rows."""
+    await init_db()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO projects (id, name) VALUES ('beta', 'Beta')"
+        )
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, enabled, next_fire_at) "
+            "VALUES ('misc', 'tick', 'not-a-number', 1, "
+            "'2020-01-01T00:00:00.000Z')"
+        )
+        await c.execute(
+            "INSERT INTO coach_recurrence "
+            "(project_id, kind, cadence, enabled, next_fire_at) "
+            "VALUES ('beta', 'tick', '5', 1, "
+            "'2020-01-01T00:00:00.000Z')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    # Reset on misc (the bad-cadence project) — should swallow the
+    # ValueError and simply skip the row, returning 0.
+    updated_misc = await recmod.reset_tick_next_fire_after_coach_activity("misc")
+    assert updated_misc == 0
+    # Reset on beta (the well-formed project) — should bump.
+    updated_beta = await recmod.reset_tick_next_fire_after_coach_activity("beta")
+    assert updated_beta == 1
+
+
+async def test_reset_tick_no_rows_returns_zero(fresh_db: str) -> None:
+    """Empty case: no enabled tick rows for the project — no-op, returns 0."""
+    await init_db()
+    updated = await recmod.reset_tick_next_fire_after_coach_activity("misc")
+    assert updated == 0

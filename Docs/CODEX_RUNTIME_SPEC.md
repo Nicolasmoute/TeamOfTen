@@ -126,7 +126,8 @@ The dispatcher delegates **both** flows to the runtime:
   dispatcher proceeds to run the user's original prompt on the fresh
   session; if False, dispatcher runs the original prompt directly.
   Both runtimes share the `HARNESS_AUTO_COMPACT_THRESHOLD` env (default
-  0.7). ClaudeRuntime uses the Claude-shaped trip-wire (session JSONL
+  0.5 — lowered from 0.7 on 2026-05-09). ClaudeRuntime uses the
+  Claude-shaped trip-wire (session JSONL
   probe + threshold check, then a `COMPACT_PROMPT` turn).
   CodexRuntime reads `_codex_session_context_estimate(thread_id)` —
   the latest `turns` row for the resumed Codex thread, summed as
@@ -697,7 +698,7 @@ if tc.compact_mode:
 mirrors Claude's threshold semantics but takes a structurally
 different path through the dispatcher.
 `CodexRuntime.maybe_auto_compact` reads the shared
-`HARNESS_AUTO_COMPACT_THRESHOLD` env (default 0.7), short-circuits on
+`HARNESS_AUTO_COMPACT_THRESHOLD` env (default 0.5), short-circuits on
 `tc.compact_mode` / unparseable threshold / threshold ∉ (0.0, 1.0) /
 no `codex_thread_id` / `used / window < threshold`, and computes
 `used / window` from `_codex_session_context_estimate(thread_id)`

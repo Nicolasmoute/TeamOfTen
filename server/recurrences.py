@@ -509,6 +509,97 @@ async def _defer_tick_row(
     })
 
 
+async def reset_tick_next_fire_after_coach_activity(
+    project_id: str,
+) -> int:
+    """Push every enabled tick row's ``next_fire_at`` to ``now +
+    cadence_minutes`` for ``project_id``.
+
+    Called from ``run_agent``'s end-of-turn block (see
+    ``server.agents.run_agent``) whenever Coach finishes a turn —
+    successful, errored, or cancelled. The principle (recurrence-specs
+    §11): tick cadence is measured from Coach's last OUTBOUND activity
+    (turn end), not from the previous fire. This avoids tick firing
+    during Coach work AND gives the operator a clean N-minute idle
+    window after every Coach turn.
+
+    Inbound-to-Coach events (Player message, human composer, task
+    assignment landing in Coach's inbox) do NOT trigger this reset —
+    by design, the timer only resets on Coach acting, not on Coach
+    being pinged.
+
+    Repeat / cron rows are untouched (they fire on their fixed
+    wall-clock schedule by design — see §11).
+
+    Returns the number of tick rows whose ``next_fire_at`` was updated.
+    Best-effort: any DB read/write error is swallowed and the function
+    returns 0. The next scheduler pass will fall back to the row's
+    existing ``next_fire_at`` if this update didn't land.
+
+    Cadence=0 ("fire as soon as Coach idle"): ``next_fire_at`` is set to
+    ``now`` so the next scheduler pass picks it up immediately —
+    consistent with the "no quiet window" semantics the cadence already
+    encodes.
+    """
+    try:
+        c = await configured_conn()
+    except Exception:
+        logger.exception(
+            "reset_tick_next_fire: configured_conn failed for project=%r",
+            project_id,
+        )
+        return 0
+    updated = 0
+    now = _now_utc()
+    try:
+        try:
+            cur = await c.execute(
+                "SELECT id, cadence FROM coach_recurrence "
+                "WHERE kind = 'tick' AND enabled = 1 AND project_id = ?",
+                (project_id,),
+            )
+            rows = await cur.fetchall()
+        except Exception:
+            logger.exception(
+                "reset_tick_next_fire: SELECT failed for project=%r",
+                project_id,
+            )
+            return 0
+        for r in rows:
+            d = dict(r)
+            try:
+                minutes = max(0, int(d["cadence"]))
+            except (TypeError, ValueError):
+                continue
+            new_fire = now + timedelta(minutes=minutes)
+            try:
+                await c.execute(
+                    "UPDATE coach_recurrence SET next_fire_at = ? "
+                    "WHERE id = ?",
+                    (_format_iso(new_fire), d["id"]),
+                )
+                updated += 1
+            except Exception:
+                logger.exception(
+                    "reset_tick_next_fire: UPDATE failed for row id=%s",
+                    d["id"],
+                )
+        try:
+            await c.commit()
+        except Exception:
+            logger.exception(
+                "reset_tick_next_fire: commit failed for project=%r",
+                project_id,
+            )
+            return 0
+    finally:
+        try:
+            await c.close()
+        except Exception:
+            pass
+    return updated
+
+
 async def _skip_row(
     db: Any, row: dict[str, Any], reason: str, now: datetime,
 ) -> None:

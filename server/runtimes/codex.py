@@ -1858,7 +1858,7 @@ class CodexRuntime:
         `client.compact_thread(thread_id)` path (via
         `run_manual_compact`) instead of running a `COMPACT_PROMPT`
         turn. Reads the same `HARNESS_AUTO_COMPACT_THRESHOLD` env
-        (default 0.7) so behavior is symmetric across runtimes.
+        (default 0.5) so behavior is symmetric across runtimes.
 
         Context-pressure signal comes from
         `_codex_session_context_estimate(thread_id)` — reads the latest
@@ -1877,11 +1877,11 @@ class CodexRuntime:
         """
         if tc.compact_mode:
             return False
-        threshold_env = os.environ.get("HARNESS_AUTO_COMPACT_THRESHOLD", "0.7")
+        threshold_env = os.environ.get("HARNESS_AUTO_COMPACT_THRESHOLD", "0.5")
         try:
             threshold = float(threshold_env)
         except ValueError:
-            threshold = 0.7
+            threshold = 0.5
         if not (0.0 < threshold < 1.0):
             return False
 

@@ -1650,7 +1650,7 @@ Manual compact:
 
 Auto-compact:
 
-- Controlled by `HARNESS_AUTO_COMPACT_THRESHOLD`, default 0.7.
+- Controlled by `HARNESS_AUTO_COMPACT_THRESHOLD`, default 0.5 (lowered from 0.7 on 2026-05-09).
 - Estimates session context from Claude CLI JSONL files under
   `CLAUDE_CONFIG_DIR/projects/`.
 - If over threshold, runs a compact turn first.
@@ -1957,8 +1957,11 @@ Triggers:
 
 - Coach `coord_approve_stage`: wakes the named assignee with the
   `note` as the wake body, bypasses debounce.
-- Agent `coord_send_message` to direct recipient: wakes recipient, debounce
-  applies.
+- Agent `coord_send_message` to direct recipient: wakes recipient, bypasses
+  debounce. Tight Coach↔Player ping-pong is bounded by per-turn duration
+  (tens of seconds), not the wake-debounce window; the debounce was
+  silently dropping legitimate Player→Coach signals when Coach had just
+  finished a turn.
 - Human `POST /api/messages` to direct recipient: wakes recipient, bypasses
   debounce.
 - Telegram inbound to Coach: wakes Coach, bypasses debounce.
@@ -4163,7 +4166,7 @@ implementation):
 | `HARNESS_STALE_TASK_MINUTES` | `15` | Stale task threshold, 0 disables |
 | `HARNESS_STALE_TASK_NOTIFY_INTERVAL_MINUTES` | `30` | Re-notify cadence |
 | `HARNESS_STALE_TASK_CHECK_INTERVAL_SECONDS` | `60` | Watchdog loop cadence |
-| `HARNESS_AUTO_COMPACT_THRESHOLD` | `0.7` | Context fraction for auto-compact |
+| `HARNESS_AUTO_COMPACT_THRESHOLD` | `0.5` | Context fraction for auto-compact (lowered from 0.7 on 2026-05-09) |
 | `HARNESS_HANDOFF_TOKEN_BUDGET` | `20000` | Recent exchange budget |
 | `HARNESS_STREAM_TOKENS` | `true` | Token delta streaming. Set to `false`/`0`/`no`/`off` to disable (only needed for the rare CLI build that crashes on the underlying flag). |
 | `HARNESS_INTERACTION_TIMEOUT_SECONDS` | `1800` | Question/plan timeout |

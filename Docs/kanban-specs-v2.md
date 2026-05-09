@@ -388,7 +388,7 @@ Players keep their `session_id` across review-wait windows. A Player whose `coor
 
 #### 10.3.1 Auto-compact carryover
 
-`HARNESS_AUTO_COMPACT_THRESHOLD` (default 0.7) — when the prior session's estimated tokens cross 70% of the model's window, the harness runs a compact turn before the user's prompt. Carried unchanged from v1; it now runs more often because sessions stay live longer.
+`HARNESS_AUTO_COMPACT_THRESHOLD` (default 0.5, lowered from 0.7 on 2026-05-09) — when the prior session's estimated tokens cross 50% of the model's window, the harness runs a compact turn before the user's prompt. Live observation showed the 0.7 trip-wire fired too late: turns in the 60–70% band were already degrading on quality before compaction kicked in. The lower threshold trades extra compact-call cost for more reliable per-turn quality.
 
 ### 10.4 Board safety ring (NEW — #6)
 

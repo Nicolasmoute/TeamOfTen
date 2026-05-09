@@ -5753,6 +5753,20 @@ async def run_agent(
             )
         _running_tasks.pop(agent_id, None)
         _last_turn_ended_at[agent_id] = time.monotonic()
+        # Mirror the canonical end-of-turn block below: reset tick rows
+        # on Coach activity so the timer-from-last-outbound semantics
+        # holds for every turn-end path, including pre-flight errors.
+        if agent_id == "coach":
+            try:
+                from server.recurrences import (
+                    reset_tick_next_fire_after_coach_activity,
+                )
+                project_id = await resolve_active_project()
+                await reset_tick_next_fire_after_coach_activity(project_id)
+            except Exception:
+                logger.exception(
+                    "recurrence tick-reset failed after coach pre-flight error"
+                )
         await _emit(agent_id, "agent_stopped")
         return
     tc = TurnContext(
@@ -5908,6 +5922,23 @@ async def run_agent(
         # (`close_client`), bound to the cached subprocess lifetime
         # rather than the per-turn cycle. See the matching comment
         # at the top of run_agent.
+        # recurrence-specs §11: Coach's tick cadence is measured from
+        # last OUTBOUND activity (turn end), not from the last fire.
+        # Push every enabled tick row's next_fire_at to now+cadence so
+        # the operator gets a clean N-minute idle window after each
+        # Coach turn. Best-effort — failures are logged and swallowed
+        # by the helper. Skipped for Players + system/human turns.
+        if agent_id == "coach":
+            try:
+                from server.recurrences import (
+                    reset_tick_next_fire_after_coach_activity,
+                )
+                project_id = await resolve_active_project()
+                await reset_tick_next_fire_after_coach_activity(project_id)
+            except Exception:
+                logger.exception(
+                    "recurrence tick-reset failed after coach turn end"
+                )
 
     await _emit(agent_id, "agent_stopped")
 

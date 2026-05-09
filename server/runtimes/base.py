@@ -103,7 +103,7 @@ class AgentRuntime(Protocol):
         now-fresh session). Return False to skip compaction.
 
         Both runtimes honor `HARNESS_AUTO_COMPACT_THRESHOLD` (default
-        0.7). ClaudeRuntime probes the session JSONL for prompt-token
+        0.5). ClaudeRuntime probes the session JSONL for prompt-token
         usage and runs a `COMPACT_PROMPT` turn when the ratio trips.
         CodexRuntime reads `_codex_session_context_estimate` from the
         latest `turns` row for the thread and delegates to
