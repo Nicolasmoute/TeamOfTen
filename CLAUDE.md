@@ -2157,6 +2157,28 @@ Validation criteria: ≥80% deviations noticed at push-time vs
 audit-time, ≥50% reduction in Coach context-reconstruction turns,
 flat or decreased human pings on routine items.
 
+**Recent (2026-05-09) — Prompt-size telemetry:**
+
+To answer "what's actually eating tokens?" with data instead of guesses,
+every non-compact agent turn now records its system-prompt size to
+`<HARNESS_DATA_ROOT>/prompt_log/<YYYY-MM-DD>.jsonl`. One row per spawn
+with timestamp, agent, runtime, model, total chars, and a per-section
+breakdown matching the assembly in [server/agents.py](server/agents.py)
+around line 5570 (identity / coordination / role_baseline /
+context_suffix / brief / coach_supplement / prior_error / handoff /
+lock). New module [server/prompt_log.py](server/prompt_log.py) owns
+the JSONL writer (~80 lines, exception-swallowing — must never break
+a turn). Disable via `HARNESS_PROMPT_LOG=false`. Compact-mode spawns
+bypass this branch.
+
+Analyzer at [scripts/analyze_prompt_log.py](scripts/analyze_prompt_log.py)
+prints three rollups: per-agent turn count + mean/p50/p95/max chars,
+per-section average + share-of-total, and the heaviest turns. First
+real-world run confirms the earlier audit: `context_suffix`
+(global + project CLAUDE.md + playbook block) dominates at ~97% of
+prompt size — the CLAUDE.md history-rotation work tracked elsewhere
+is the highest-leverage cut.
+
 **Recent (2026-05-09) — Playbook statement brevity cap:**
 
 Lattice statements are injected into every agent's system prompt on

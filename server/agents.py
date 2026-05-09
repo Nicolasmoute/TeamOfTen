@@ -5567,10 +5567,11 @@ async def run_agent(
                 "coach supplement: system-prompt build failed"
             )
 
+    role_baseline = _system_prompt_for(agent_id)
     system_prompt = (
         identity_prefix
         + coordination_block
-        + _system_prompt_for(agent_id)
+        + role_baseline
         + context_suffix
         + brief_suffix
         + coach_supplement
@@ -5578,6 +5579,35 @@ async def run_agent(
         + handoff_suffix
         + lock_suffix
     )
+
+    # Prompt-size telemetry — JSONL log under <DATA_ROOT>/prompt_log/
+    # for offline analysis. Section names mirror the concatenation
+    # above. Disable via HARNESS_PROMPT_LOG=false. Compact-mode spawns
+    # don't reach this branch; their prompt is composed at the
+    # alt-path (see TurnContext at line 5322).
+    try:
+        from server.prompt_log import record as _prompt_log_record  # noqa: PLC0415
+
+        _prompt_log_record(
+            agent_id=agent_id,
+            runtime=_runtime_name,
+            model=model,
+            sections={
+                "identity": len(identity_prefix),
+                "coordination": len(coordination_block),
+                "role_baseline": len(role_baseline),
+                "context_suffix": len(context_suffix),
+                "brief": len(brief_suffix),
+                "coach_supplement": len(coach_supplement),
+                "prior_error": len(prior_error_suffix),
+                "handoff": len(handoff_suffix),
+                "lock": len(lock_suffix),
+                "total": len(system_prompt),
+            },
+        )
+    except Exception:
+        logger.exception("prompt_log: invocation failed (non-fatal)")
+
     context_applied_payload = None
     if context_suffix or brief_suffix or handoff_suffix or prior_error_suffix:
         # Emit sizes (not content) below, after agent_started, so the
