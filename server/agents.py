@@ -4528,11 +4528,13 @@ async def _wake_after_turn_for_plan_comments(
         # still want the comments surfaced on the next live turn.
         pass
     try:
+        from server.tools import _with_player_reminder
+        wake_body = "The operator left notes on the approved plan."
+        if agent_id != "coach":
+            wake_body = _with_player_reminder(wake_body)
         await maybe_wake_agent(
             agent_id,
-            "The operator left notes on the approved plan. Read your "
-            "inbox — the most recent message from 'human' carries "
-            "notes to keep in mind going forward.",
+            wake_body,
             bypass_debounce=True,
         )
     except Exception:
@@ -6152,16 +6154,20 @@ async def _maybe_schedule_auto_continue(
                 subtype=subtype,
                 stop_reason=stop_reason,
             )
+            from server.tools import _with_player_reminder
+            cutoff_body = (
+                f"Your previous turn was cut off by the SDK "
+                f"({reason_label} after {nturns} internal turns) "
+                "before you could finish. The harness did NOT "
+                "pause you. Continue from where you left off — "
+                "no need to re-explain context. If you actually "
+                "completed the work, just confirm so."
+            )
+            if agent_id != "coach":
+                cutoff_body = _with_player_reminder(cutoff_body)
             await maybe_wake_agent(
                 agent_id,
-                (
-                    f"Your previous turn was cut off by the SDK "
-                    f"({reason_label} after {nturns} internal turns) "
-                    "before you could finish. The harness did NOT "
-                    "pause you. Continue from where you left off — "
-                    "no need to re-explain context. If you actually "
-                    "completed the work, just confirm so."
-                ),
+                cutoff_body,
                 bypass_debounce=True,
             )
         except Exception:
@@ -6253,14 +6259,20 @@ async def _schedule_post_error_retry(agent_id: str) -> None:
                 max_attempts=ERROR_RETRY_MAX_CONSECUTIVE,
                 delay=ERROR_RETRY_DELAY_SECONDS,
             )
-            await maybe_wake_agent(
-                agent_id,
+            from server.tools import _with_player_reminder
+            error_body = (
                 "Your previous turn errored before completing. "
                 "If you had a task in progress, resume it. If the "
                 "error looks persistent, use coord_update_task(..., "
                 "status='blocked') to park the task, or "
                 "coord_request_human to escalate. Otherwise, carry on "
-                "where you left off.",
+                "where you left off."
+            )
+            if agent_id != "coach":
+                error_body = _with_player_reminder(error_body)
+            await maybe_wake_agent(
+                agent_id,
+                error_body,
                 bypass_debounce=True,
                 wake_source="system_recovery",
             )
