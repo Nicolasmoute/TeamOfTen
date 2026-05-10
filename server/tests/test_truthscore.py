@@ -881,7 +881,7 @@ def test_mcp_tool_no_active_project_returns_error(
 
     async def go() -> None:
         result = await handler({"commentary": None})
-        assert result.get("isError") is True
+        assert result.get("is_error") is True
         assert "no active project" in result["content"][0]["text"]
     asyncio.run(go())
 
@@ -915,7 +915,7 @@ def test_mcp_tool_passes_actor_with_caller_id(
 
     async def go() -> None:
         result = await handler({"commentary": "skip section 2"})
-        assert result.get("isError") is None or result.get("isError") is False
+        assert result.get("is_error") is None or result.get("is_error") is False
         text = result["content"][0]["text"]
         assert "Overall: 7.0" in text
         assert "Fidelity" in text
@@ -949,7 +949,7 @@ def test_mcp_tool_player_caller_id_threaded(
 
     async def go() -> None:
         result = await handler({"commentary": None})
-        assert result.get("isError") is None or result.get("isError") is False
+        assert result.get("is_error") is None or result.get("is_error") is False
         assert captured["actor"]["agent_id"] == "p3"
     asyncio.run(go())
 

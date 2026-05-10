@@ -289,7 +289,7 @@ async def test_mcp_add_todo_player_denied(fresh_db: str) -> None:
     srv = build_coord_server("p1", include_proxy_metadata=True)
     handler = srv["_handlers"]["coord_add_todo"]
     out = await handler({"title": "x"})
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
 
 
 async def test_mcp_add_then_complete_round_trip(fresh_db: str) -> None:

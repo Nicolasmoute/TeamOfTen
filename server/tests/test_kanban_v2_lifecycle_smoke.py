@@ -71,7 +71,7 @@ def _handler(server: Any, name: str):
 
 
 def _ok(result: dict[str, Any]) -> str:
-    assert not result.get("isError"), (
+    assert not result.get("is_error"), (
         f"tool returned error: {result.get('content')}"
     )
     return result["content"][0]["text"]
@@ -332,7 +332,7 @@ async def test_pool_first_stage_rejected_at_create(
         ),
     })
     # Pool first-stage → rejected with the v2.0.1 error.
-    assert res.get("isError"), f"expected rejection, got {res}"
+    assert res.get("is_error"), f"expected rejection, got {res}"
     text = res["content"][0]["text"]
     assert "trajectory[0].to" in text
     assert "exactly one Player" in text

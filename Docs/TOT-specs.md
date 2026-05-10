@@ -1587,8 +1587,9 @@ Prompt layers (order matches `agents.py:run_agent`):
 2. Baseline Coach or Player role prompt.
 3. Global rules from `/data/CLAUDE.md`.
 4. Active project rules from `/data/projects/<slug>/CLAUDE.md`.
-5. Orchestration playbook lattice (see `playbook-specs.md`), when
-   non-empty.
+5. **Coach-only**: orchestration playbook lattice (see
+   `playbook-specs.md`), when non-empty. Players don't see this block;
+   coordination cues reach them through Coach's per-stage wake notes.
 6. Per-agent `brief` from `agent_project_roles`.
 7. Coach-only coordination block from current
    project/team/tasks/inbox/wiki/decisions/health rollups.
@@ -1631,7 +1632,7 @@ last.** Per-agent stability:
 | role baseline | constant per slot                              |
 | global CLAUDE.md | per file mtime                              |
 | project CLAUDE.md | per file mtime                             |
-| playbook | per lattice edit                                    |
+| playbook | per lattice edit (Coach only; absent for Players)   |
 | brief    | per `agents.brief` edit                             |
 | coordination | per Coach turn (Coach only; empty for Players)  |
 | coach supplement | per objectives/todos change (Coach only)    |
@@ -1890,9 +1891,9 @@ section names don't apply).
 `scripts/analyze_prompt_log.py` prints three rollups: per-agent
 turn count + mean/p50/p95/max chars, per-section share-of-total,
 and the heaviest turns. The 2026-05-09 baseline run flagged
-`context_suffix` (global + project CLAUDE.md + playbook) at ~97%
-of total prompt size — the input that drove the 10.0 section
-reorder for cache stability.
+`context_suffix` (global + project CLAUDE.md, plus the playbook
+on Coach turns only) at ~97% of total prompt size — the input
+that drove the 10.0 section reorder for cache stability.
 
 This is purely diagnostic. The `turns` table is the authoritative
 runtime cost surface (cost_usd, token columns, cache rollups);

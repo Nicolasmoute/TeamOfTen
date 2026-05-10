@@ -631,7 +631,7 @@ async def test_stage_progression_resets_escalation_level(
         "next_stage": "ship",
         "assignee": "p3",
     })
-    assert not result.get("isError"), result
+    assert not result.get("is_error"), result
 
     c = await configured_conn()
     try:

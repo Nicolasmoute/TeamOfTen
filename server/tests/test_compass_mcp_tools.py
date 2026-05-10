@@ -97,7 +97,7 @@ async def test_player_rejected_from_all_four(fresh_db: str) -> None:
     for tool_name in ("compass_ask", "compass_audit", "compass_brief", "compass_status"):
         handler = _get_handler(server, tool_name)
         out = await handler({"query": "x", "artifact": "x"})
-        assert out.get("isError") is True
+        assert out.get("is_error") is True
         text = out["content"][0]["text"]
         assert "Coach-only" in text
 
@@ -111,7 +111,7 @@ async def test_coach_rejected_when_compass_disabled(fresh_db: str) -> None:
     server = build_coord_server("coach", include_proxy_metadata=True)
     handler = _get_handler(server, "compass_status")
     out = await handler({})
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     assert "disabled for this project" in out["content"][0]["text"]
 
 
@@ -139,7 +139,7 @@ async def test_compass_status_returns_counts(fresh_db: str) -> None:
     server = build_coord_server("coach", include_proxy_metadata=True)
     handler = _get_handler(server, "compass_status")
     out = await handler({})
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     text = out["content"][0]["text"]
     assert "active statements: 1" in text
     assert "pending questions: 1" in text
@@ -161,7 +161,7 @@ async def test_compass_brief_returns_latest(fresh_db: str) -> None:
     server = build_coord_server("coach", include_proxy_metadata=True)
     handler = _get_handler(server, "compass_brief")
     out = await handler({})
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     assert "Briefing 2" in out["content"][0]["text"]
 
 
@@ -175,7 +175,7 @@ async def test_compass_brief_placeholder_when_none(fresh_db: str) -> None:
     server = build_coord_server("coach", include_proxy_metadata=True)
     handler = _get_handler(server, "compass_brief")
     out = await handler({})
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     assert "No Compass briefing" in out["content"][0]["text"]
 
 
@@ -195,7 +195,7 @@ async def test_compass_ask_calls_llm_and_returns_text(
     server = build_coord_server("coach", include_proxy_metadata=True)
     handler = _get_handler(server, "compass_ask")
     out = await handler({"query": "what about pricing?"})
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     assert "s1" in out["content"][0]["text"]
 
 
@@ -209,7 +209,7 @@ async def test_compass_ask_requires_query(fresh_db: str) -> None:
     server = build_coord_server("coach", include_proxy_metadata=True)
     handler = _get_handler(server, "compass_ask")
     out = await handler({"query": ""})
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
 
 
 # --------------------------------------------------- compass_audit
@@ -234,7 +234,7 @@ async def test_compass_audit_writes_log_and_renders_verdict(
     server = build_coord_server("coach", include_proxy_metadata=True)
     handler = _get_handler(server, "compass_audit")
     out = await handler({"artifact": "worker-4 shipped per-second billing"})
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     text = out["content"][0]["text"]
     assert "confident_drift" in text
     assert "Halt the worker." in text
@@ -254,4 +254,4 @@ async def test_compass_audit_requires_artifact(fresh_db: str) -> None:
     server = build_coord_server("coach", include_proxy_metadata=True)
     handler = _get_handler(server, "compass_audit")
     out = await handler({"artifact": ""})
-    assert out.get("isError") is True
+    assert out.get("is_error") is True

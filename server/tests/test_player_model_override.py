@@ -53,24 +53,24 @@ async def _call(caller_id: str, **args):
 async def test_player_cannot_set_model(fresh_db) -> None:
     await init_db()
     out = await _call("p1", player_id="p2", model="claude-opus-4-7")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     assert "Coach" in out["content"][0]["text"]
 
 
 async def test_invalid_player_id_rejected(fresh_db) -> None:
     await init_db()
     out = await _call("coach", player_id="p11", model="claude-opus-4-7")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     assert "p1..p10" in out["content"][0]["text"]
 
     out = await _call("coach", player_id="coach", model="claude-opus-4-7")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
 
 
 async def test_unknown_model_rejected(fresh_db) -> None:
     await init_db()
     out = await _call("coach", player_id="p3", model="claude-opus-99")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     text = out["content"][0]["text"]
     assert "unknown" in text.lower()
 
@@ -80,7 +80,7 @@ async def test_codex_model_rejected_for_claude_player(fresh_db) -> None:
     Codex model id — would silently no-op at spawn time."""
     await init_db()
     out = await _call("coach", player_id="p4", model="gpt-5-codex")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     text = out["content"][0]["text"]
     # Either the whitelist branch or the family-fit branch can fire;
     # both produce a clearly-pointed error message.
@@ -97,7 +97,7 @@ async def test_wrong_runtime_error_suggests_runtime_flip(fresh_db) -> None:
     await init_db()
     # p4 is on Claude (default). gpt-5.5 is a real Codex concrete id.
     out = await _call("coach", player_id="p4", model="gpt-5.5")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     text = out["content"][0]["text"]
     assert "codex model" in text.lower()
     assert "claude runtime" in text.lower()
@@ -107,7 +107,7 @@ async def test_wrong_runtime_error_suggests_runtime_flip(fresh_db) -> None:
     assert "latest_sonnet" in text or "latest_opus" in text
     # Same shape on the alias case.
     out2 = await _call("coach", player_id="p4", model="latest_gpt")
-    assert out2.get("isError") is True
+    assert out2.get("is_error") is True
     text2 = out2["content"][0]["text"]
     assert "codex model" in text2.lower()
     assert "claude runtime" in text2.lower()
@@ -128,7 +128,7 @@ async def test_wrong_runtime_error_works_in_reverse(fresh_db) -> None:
         await c.close()
 
     out = await _call("coach", player_id="p5", model="latest_opus")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     text = out["content"][0]["text"]
     assert "claude model" in text.lower()
     assert "codex runtime" in text.lower()
@@ -142,7 +142,7 @@ async def test_set_and_clear_round_trip(fresh_db) -> None:
 
     # Set
     out = await _call("coach", player_id="p5", model="claude-opus-4-7")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     stored = await _get_agent_model_override("p5")
     assert stored == "claude-opus-4-7"
 
@@ -153,7 +153,7 @@ async def test_set_and_clear_round_trip(fresh_db) -> None:
 
     # Clear via empty string
     out = await _call("coach", player_id="p5", model="")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     cleared = await _get_agent_model_override("p5")
     assert cleared is None
 
@@ -246,7 +246,7 @@ async def test_codex_runtime_accepts_codex_model(fresh_db) -> None:
     # Codex feature gate: the runtime resolver returns 'codex' regardless
     # of HARNESS_CODEX_ENABLED because runtime_override on the row wins.
     out = await _call("coach", player_id="p8", model="gpt-5-codex")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
 
     from server.agents import _get_agent_model_override
     assert await _get_agent_model_override("p8") == "gpt-5-codex"
@@ -473,7 +473,7 @@ async def test_empty_clear_does_not_create_orphan_row(fresh_db) -> None:
         await c.close()
 
     out = await _call("coach", player_id="p5", model="")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
 
     # Still no row.
     c = await configured_conn()
@@ -639,7 +639,7 @@ async def test_tool_accepts_alias_for_claude_player(fresh_db) -> None:
     from server.agents import _get_agent_model_override
 
     out = await _call("coach", player_id="p1", model="latest_opus")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     stored = await _get_agent_model_override("p1")
     assert stored == "latest_opus"
 
@@ -659,7 +659,7 @@ async def test_tool_rejects_claude_alias_on_codex_player(fresh_db) -> None:
         await c.close()
 
     out = await _call("coach", player_id="p2", model="latest_opus")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
 
 
 async def test_tool_accepts_codex_alias_on_codex_player(fresh_db) -> None:
@@ -677,7 +677,7 @@ async def test_tool_accepts_codex_alias_on_codex_player(fresh_db) -> None:
     from server.agents import _get_agent_model_override
 
     out = await _call("coach", player_id="p3", model="latest_mini")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     stored = await _get_agent_model_override("p3")
     assert stored == "latest_mini"
 
@@ -730,25 +730,25 @@ def test_set_player_runtime_in_coord_allowlist() -> None:
 async def test_set_player_runtime_player_cannot_call(fresh_db) -> None:
     await init_db()
     out = await _call_runtime("p1", player_id="p2", runtime="codex")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     assert "Coach" in out["content"][0]["text"]
 
 
 async def test_set_player_runtime_invalid_player_id(fresh_db) -> None:
     await init_db()
     out = await _call_runtime("coach", player_id="p11", runtime="codex")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     text = out["content"][0]["text"]
     assert "p1..p10" in text
     # Coach itself can't be flipped via MCP — that's an HTTP-only path.
     out2 = await _call_runtime("coach", player_id="coach", runtime="codex")
-    assert out2.get("isError") is True
+    assert out2.get("is_error") is True
 
 
 async def test_set_player_runtime_invalid_runtime(fresh_db) -> None:
     await init_db()
     out = await _call_runtime("coach", player_id="p1", runtime="haiku")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     assert "claude" in out["content"][0]["text"].lower()
 
 
@@ -758,7 +758,7 @@ async def test_set_player_runtime_codex_gated(monkeypatch, fresh_db) -> None:
     monkeypatch.delenv("HARNESS_CODEX_ENABLED", raising=False)
     await init_db()
     out = await _call_runtime("coach", player_id="p1", runtime="codex")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     text = out["content"][0]["text"]
     assert "HARNESS_CODEX_ENABLED" in text
     assert "coord_request_human" in text
@@ -768,7 +768,7 @@ async def test_set_player_runtime_flips_to_codex(monkeypatch, fresh_db) -> None:
     monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
     await init_db()
     out = await _call_runtime("coach", player_id="p2", runtime="codex")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
 
     c = await configured_conn()
     try:
@@ -798,7 +798,7 @@ async def test_set_player_runtime_emits_event_against_target(
     q = bus.subscribe()
     try:
         out = await _call_runtime("coach", player_id="p7", runtime="codex")
-        assert out.get("isError") is not True
+        assert out.get("is_error") is not True
 
         runtime_events = []
         while not q.empty():
@@ -835,7 +835,7 @@ async def test_set_player_runtime_clear_reverts_to_role_default(
     # Set then clear.
     await _call_runtime("coach", player_id="p3", runtime="codex")
     out = await _call_runtime("coach", player_id="p3", runtime="")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
 
     c = await configured_conn()
     try:
@@ -864,7 +864,7 @@ async def test_set_player_runtime_rejects_mid_turn(monkeypatch, fresh_db) -> Non
         await c.close()
 
     out = await _call_runtime("coach", player_id="p4", runtime="codex")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     text = out["content"][0]["text"]
     assert "mid-turn" in text or "cancel" in text.lower()
 
@@ -889,12 +889,12 @@ async def test_set_player_runtime_evicts_cached_codex_client(
 
     # claude → codex: still calls evict (no-op, but call is unconditional).
     out1 = await _call_runtime("coach", player_id="p6", runtime="codex")
-    assert out1.get("isError") is not True
+    assert out1.get("is_error") is not True
     assert evicted == ["p6"]
 
     # codex → claude: this is the case that actually leaks without eviction.
     out2 = await _call_runtime("coach", player_id="p6", runtime="claude")
-    assert out2.get("isError") is not True
+    assert out2.get("is_error") is not True
     assert evicted == ["p6", "p6"]
 
     # Eviction failure is swallowed; the tool still succeeds.
@@ -902,7 +902,7 @@ async def test_set_player_runtime_evicts_cached_codex_client(
         raise RuntimeError("evict explosion")
     monkeypatch.setattr(codex_mod, "evict_client", boom)
     out3 = await _call_runtime("coach", player_id="p6", runtime="")
-    assert out3.get("isError") is not True
+    assert out3.get("is_error") is not True
 
 
 async def test_set_player_runtime_unblocks_cross_runtime_model_set(
@@ -915,15 +915,15 @@ async def test_set_player_runtime_unblocks_cross_runtime_model_set(
     await init_db()
     # Step 1: set the model directly — should fail (still Claude runtime).
     out1 = await _call("coach", player_id="p5", model="latest_gpt")
-    assert out1.get("isError") is True
+    assert out1.get("is_error") is True
 
     # Step 2: flip the runtime.
     out2 = await _call_runtime("coach", player_id="p5", runtime="codex")
-    assert out2.get("isError") is not True
+    assert out2.get("is_error") is not True
 
     # Step 3: now setting the codex model works.
     out3 = await _call("coach", player_id="p5", model="latest_gpt")
-    assert out3.get("isError") is not True
+    assert out3.get("is_error") is not True
 
     from server.agents import _get_agent_model_override
     stored = await _get_agent_model_override("p5")

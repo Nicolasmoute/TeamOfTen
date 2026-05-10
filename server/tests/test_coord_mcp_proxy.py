@@ -142,7 +142,7 @@ async def test_coord_mcp_stdio_subprocess_lists_and_calls_tool() -> None:
                                 "content": [
                                     {"type": "text", "text": "ERROR: task is not open"}
                                 ],
-                                "isError": True,
+                                "is_error": True,
                             },
                         },
                     )

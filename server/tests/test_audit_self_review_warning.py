@@ -32,7 +32,7 @@ def _handler(server: Any, name: str):
 
 
 def _ok(result: dict[str, Any]) -> str:
-    assert not result.get("isError"), (
+    assert not result.get("is_error"), (
         f"tool returned error: {result.get('content')}"
     )
     return result["content"][0]["text"]

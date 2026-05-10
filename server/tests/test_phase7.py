@@ -671,7 +671,7 @@ async def test_propose_truth_update_rejects_projects_prefix(fresh_db) -> None:
         content="rule body",
         summary="add zeabur scope rule",
     )
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     text = out["content"][0]["text"]
     assert "projects/" in text
     assert "switch" in text.lower() or "active project" in text.lower()
@@ -708,7 +708,7 @@ async def test_propose_truth_update_rejects_known_project_slug_prefix(
         content="rule body",
         summary="add zeabur scope rule",
     )
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     text = out["content"][0]["text"]
     assert "dynamichypergraph" in text
     assert "switch" in text.lower() or "active project" in text.lower()
@@ -730,7 +730,7 @@ async def test_propose_truth_update_accepts_bare_filename(fresh_db) -> None:
         content="rule body",
         summary="add zeabur scope rule",
     )
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     text = out["content"][0]["text"]
     assert "queued" in text or "proposal" in text.lower()
 
@@ -1442,7 +1442,7 @@ async def test_propose_file_write_project_claude_md_accepts_canonical_path(
         content="# Project: misc\n\n## Goal\nrebuilt body\n",
         summary="rebuild project CLAUDE.md",
     )
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     text = out["content"][0]["text"]
     assert "scope=project_claude_md" in text
 
@@ -1483,7 +1483,7 @@ async def test_propose_file_write_project_claude_md_rejects_other_path(
             content="x",
             summary="s",
         )
-        assert out.get("isError") is True, f"path {bad!r} should be rejected"
+        assert out.get("is_error") is True, f"path {bad!r} should be rejected"
 
 
 async def test_propose_file_write_rejects_unknown_scope(fresh_db) -> None:
@@ -1504,7 +1504,7 @@ async def test_propose_file_write_rejects_unknown_scope(fresh_db) -> None:
             content="x",
             summary="s",
         )
-        assert out.get("isError") is True, \
+        assert out.get("is_error") is True, \
             f"scope {bad_scope!r} should be rejected"
 
 
@@ -1529,7 +1529,7 @@ async def test_propose_file_write_supersede_isolated_by_scope(
         content="# Truth-side claude.md\n",
         summary="truth-side",
     )
-    assert out_truth.get("isError") is not True
+    assert out_truth.get("is_error") is not True
 
     # project_claude_md proposal at the canonical CLAUDE.md path.
     out_pcm = await _propose_truth(
@@ -1539,7 +1539,7 @@ async def test_propose_file_write_supersede_isolated_by_scope(
         content="# Project: misc\n",
         summary="pcm",
     )
-    assert out_pcm.get("isError") is not True
+    assert out_pcm.get("is_error") is not True
 
     # Both proposals should still be pending — neither superseded the
     # other since their scopes differ.
@@ -1733,7 +1733,7 @@ async def test_coord_read_file_coach_reads_truth(fresh_db) -> None:
     target.write_text("# Specs\nbody\n", encoding="utf-8")
 
     out = await _read_via_handler("coach", "truth/specs.md")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     text = out["content"][0]["text"]
     assert "# Specs" in text
     assert "body" in text
@@ -1750,7 +1750,7 @@ async def test_coord_read_file_player_reads_truth(fresh_db) -> None:
     target.write_text("brand\n", encoding="utf-8")
 
     out = await _read_via_handler("p1", "truth/brand.md")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     assert "brand" in out["content"][0]["text"]
 
 
@@ -1774,7 +1774,7 @@ async def test_coord_read_file_reads_decisions_knowledge_outputs(
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(body, encoding="utf-8")
         out = await _read_via_handler("coach", rel)
-        assert out.get("isError") is not True, f"failed for {rel}: {out}"
+        assert out.get("is_error") is not True, f"failed for {rel}: {out}"
         assert body.strip() in out["content"][0]["text"]
 
 
@@ -1788,7 +1788,7 @@ async def test_coord_read_file_rejects_traversal(fresh_db) -> None:
 
     for bad in ("../etc/passwd", "truth/../../../etc/passwd"):
         out = await _read_via_handler("coach", bad)
-        assert out.get("isError") is True, f"path {bad!r} should be rejected"
+        assert out.get("is_error") is True, f"path {bad!r} should be rejected"
 
 
 async def test_coord_read_file_rejects_absolute_path(fresh_db) -> None:
@@ -1798,7 +1798,7 @@ async def test_coord_read_file_rejects_absolute_path(fresh_db) -> None:
     from server.paths import ensure_project_scaffold
     ensure_project_scaffold(MISC_PROJECT_ID)
     out = await _read_via_handler("coach", "/data/CLAUDE.md")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     assert "leading slash" in out["content"][0]["text"].lower()
 
 
@@ -1809,7 +1809,7 @@ async def test_coord_read_file_missing_file(fresh_db) -> None:
     from server.paths import ensure_project_scaffold
     ensure_project_scaffold(MISC_PROJECT_ID)
     out = await _read_via_handler("coach", "truth/nonexistent.md")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     assert "not found" in out["content"][0]["text"].lower()
 
 
@@ -1824,7 +1824,7 @@ async def test_coord_read_file_oversize_rejected(fresh_db) -> None:
     big.parent.mkdir(parents=True, exist_ok=True)
     big.write_text("x" * 200_001, encoding="utf-8")
     out = await _read_via_handler("coach", "working/knowledge/big.md")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     assert "too large" in out["content"][0]["text"].lower()
 
 
@@ -1839,7 +1839,7 @@ async def test_coord_read_file_rejects_binary(fresh_db) -> None:
     binary.parent.mkdir(parents=True, exist_ok=True)
     binary.write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe\xfd")
     out = await _read_via_handler("coach", "outputs/logo.png")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     assert "utf-8" in out["content"][0]["text"].lower()
 
 
@@ -1850,7 +1850,7 @@ async def test_coord_read_file_directory_rejected(fresh_db) -> None:
     from server.paths import ensure_project_scaffold
     ensure_project_scaffold(MISC_PROJECT_ID)
     out = await _read_via_handler("coach", "truth")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     assert "not a regular file" in out["content"][0]["text"].lower() \
         or "not found" in out["content"][0]["text"].lower()
 

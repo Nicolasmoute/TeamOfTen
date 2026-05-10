@@ -311,7 +311,7 @@ async def _call_runtime_tool(caller_id: str, **args):
 async def test_mcp_tool_player_cannot_set_runtime(fresh_db) -> None:
     await init_db()
     out = await _call_runtime_tool("p1", player_id="p2", runtime="codex")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
 
 
 async def test_mcp_tool_empty_clears_blunt(fresh_db, monkeypatch) -> None:
@@ -340,7 +340,7 @@ async def test_mcp_tool_empty_clears_blunt(fresh_db, monkeypatch) -> None:
     finally:
         bus.unsubscribe(q)
 
-    assert out.get("isError") is not True, out
+    assert out.get("is_error") is not True, out
     captured = [ev for ev in events if ev.get("agent_id") == "p1"]
     types = [ev.get("type") for ev in captured]
     assert "runtime_updated" in types
@@ -363,7 +363,7 @@ async def test_mcp_tool_same_runtime_returns_ok_no_flip(fresh_db, monkeypatch) -
     out = await _call_runtime_tool("coach", player_id="p1", runtime="claude")
     # Default resolves to claude, so this should succeed without isError
     # and the message should signal no flip.
-    assert out.get("isError") is not True, out
+    assert out.get("is_error") is not True, out
     text = out["content"][0]["text"]
     assert "already" in text.lower() or "no flip" in text.lower()
 
@@ -385,7 +385,7 @@ async def test_mcp_tool_no_prior_session_flips_immediately(
     finally:
         bus.unsubscribe(q)
 
-    assert out.get("isError") is not True, out
+    assert out.get("is_error") is not True, out
     captured = [ev for ev in events if ev.get("agent_id") == "p5"]
     types = [ev.get("type") for ev in captured]
     assert "runtime_updated" in types
@@ -433,7 +433,7 @@ async def test_mcp_tool_with_prior_session_queues_transfer(
     finally:
         bus.unsubscribe(q)
 
-    assert out.get("isError") is not True, out
+    assert out.get("is_error") is not True, out
     captured = [ev for ev in events if ev.get("agent_id") == "p6"]
     types = [ev.get("type") for ev in captured]
     assert "session_transfer_requested" in types
@@ -474,7 +474,7 @@ async def test_mcp_tool_mid_turn_rejected(fresh_db, monkeypatch) -> None:
         await c.close()
 
     out = await _call_runtime_tool("coach", player_id="p7", runtime="codex")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     assert "mid-turn" in out["content"][0]["text"].lower()
 
 

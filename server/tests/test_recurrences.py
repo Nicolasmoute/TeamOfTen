@@ -1583,7 +1583,7 @@ async def test_coord_set_tick_interval_creates_row(fresh_db: str) -> None:
     srv = build_coord_server("coach", include_proxy_metadata=True)
     handler = srv["_handlers"]["coord_set_tick_interval"]
     result = await handler({"minutes": 30})
-    assert result.get("isError") is not True
+    assert result.get("is_error") is not True
     rows = await recmod.list_recurrences("misc")
     ticks = [r for r in rows if r["kind"] == "tick"]
     assert len(ticks) == 1
@@ -1596,7 +1596,7 @@ async def test_coord_set_tick_interval_rejects_player(fresh_db: str) -> None:
     srv = build_coord_server("p3", include_proxy_metadata=True)
     handler = srv["_handlers"]["coord_set_tick_interval"]
     result = await handler({"minutes": 30})
-    assert result["isError"] is True
+    assert result["is_error"] is True
     assert "Coach" in result["content"][0]["text"]
 
 
@@ -1608,7 +1608,7 @@ async def test_coord_set_tick_interval_zero_for_continuous(
     srv = build_coord_server("coach", include_proxy_metadata=True)
     handler = srv["_handlers"]["coord_set_tick_interval"]
     result = await handler({"minutes": 0})
-    assert result.get("isError") in (False, None)
+    assert result.get("is_error") in (False, None)
     rows = await recmod.list_recurrences("misc")
     ticks = [r for r in rows if r["kind"] == "tick"]
     assert ticks[0]["cadence"] == "0"
@@ -1622,7 +1622,7 @@ async def test_coord_set_tick_interval_negative_rejected(
     srv = build_coord_server("coach", include_proxy_metadata=True)
     handler = srv["_handlers"]["coord_set_tick_interval"]
     result = await handler({"minutes": -5})
-    assert result["isError"] is True
+    assert result["is_error"] is True
 
 
 async def test_coord_set_tick_interval_disable(fresh_db: str) -> None:
@@ -1632,7 +1632,7 @@ async def test_coord_set_tick_interval_disable(fresh_db: str) -> None:
     srv = build_coord_server("coach", include_proxy_metadata=True)
     handler = srv["_handlers"]["coord_set_tick_interval"]
     result = await handler({"enabled": "off"})
-    assert result.get("isError") in (False, None)
+    assert result.get("is_error") in (False, None)
     rows = await recmod.list_recurrences("misc")
     assert rows[0]["enabled"] is False
 

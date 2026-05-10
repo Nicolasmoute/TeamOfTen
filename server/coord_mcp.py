@@ -180,7 +180,7 @@ async def _serve(client: CoordProxyClient) -> int:
             )
 
         result = resp.get("result")
-        if isinstance(result, dict) and result.get("isError"):
+        if isinstance(result, dict) and result.get("is_error"):
             return types.CallToolResult(
                 content=_tool_result_content(result),
                 isError=True,

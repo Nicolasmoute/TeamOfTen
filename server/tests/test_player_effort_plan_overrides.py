@@ -59,21 +59,21 @@ async def _call_effort(caller_id: str, **args):
 async def test_player_cannot_set_effort(fresh_db) -> None:
     await init_db()
     out = await _call_effort("p1", player_id="p2", effort="high")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     assert "Coach" in out["content"][0]["text"]
 
 
 async def test_invalid_player_id_rejected_effort(fresh_db) -> None:
     await init_db()
     out = await _call_effort("coach", player_id="p11", effort="high")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     assert "p1..p10" in out["content"][0]["text"]
 
 
 async def test_invalid_effort_value_rejected(fresh_db) -> None:
     await init_db()
     out = await _call_effort("coach", player_id="p3", effort="ludicrous")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     assert "low" in out["content"][0]["text"].lower()
 
 
@@ -97,14 +97,14 @@ async def test_effort_set_and_clear_round_trip(fresh_db) -> None:
 
     await init_db()
     out = await _call_effort("coach", player_id="p5", effort="high")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     assert await _get_agent_effort_override("p5") == 3
 
     ident = await _get_agent_identity("p5")
     assert ident.get("effort_override") == 3
 
     out = await _call_effort("coach", player_id="p5", effort="")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     assert await _get_agent_effort_override("p5") is None
 
 
@@ -113,7 +113,7 @@ async def test_effort_clear_on_untouched_player_no_orphan(fresh_db) -> None:
     all-NULL orphan row — same shape as the model override path."""
     await init_db()
     out = await _call_effort("coach", player_id="p9", effort="")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     c = await configured_conn()
     try:
         cur = await c.execute(
@@ -167,14 +167,14 @@ async def _call_plan(caller_id: str, **args):
 async def test_player_cannot_set_plan_mode(fresh_db) -> None:
     await init_db()
     out = await _call_plan("p2", player_id="p3", plan_mode="on")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
     assert "Coach" in out["content"][0]["text"]
 
 
 async def test_invalid_plan_value_rejected(fresh_db) -> None:
     await init_db()
     out = await _call_plan("coach", player_id="p3", plan_mode="maybe")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
 
 
 async def test_plan_aliases_accepted(fresh_db) -> None:
@@ -197,13 +197,13 @@ async def test_plan_set_and_clear_round_trip(fresh_db) -> None:
 
     await init_db()
     out = await _call_plan("coach", player_id="p4", plan_mode="on")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     assert await _get_agent_plan_mode_override("p4") is True
     ident = await _get_agent_identity("p4")
     assert ident.get("plan_mode_override") == 1
 
     out = await _call_plan("coach", player_id="p4", plan_mode="")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     assert await _get_agent_plan_mode_override("p4") is None
 
 
@@ -247,7 +247,7 @@ async def test_get_settings_player_only(fresh_db) -> None:
     """Coach-only — Players get a clean error."""
     await init_db()
     out = await _call_get("p1")
-    assert out.get("isError") is True
+    assert out.get("is_error") is True
 
 
 async def test_get_settings_includes_overrides(fresh_db) -> None:
@@ -259,7 +259,7 @@ async def test_get_settings_includes_overrides(fresh_db) -> None:
     await _call_get_helper_set_model("p3", "claude-opus-4-7")
 
     out = await _call_get("coach", player_id="p3")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     text = out["content"][0]["text"]
     # The row for p3 contains all three override markers.
     assert "p3" in text
@@ -272,7 +272,7 @@ async def test_get_settings_full_roster(fresh_db) -> None:
     """No player_id → render coach + p1..p10 (11 rows + 2 header lines)."""
     await init_db()
     out = await _call_get("coach")
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
     text = out["content"][0]["text"]
     for slot in ["coach"] + [f"p{i}" for i in range(1, 11)]:
         assert slot in text
@@ -284,7 +284,7 @@ async def _call_get_helper_set_model(pid: str, model: str) -> None:
     srv = build_coord_server("coach", include_proxy_metadata=True)
     handler = srv["_handlers"]["coord_set_player_model"]
     out = await handler({"player_id": pid, "model": model})
-    assert out.get("isError") is not True
+    assert out.get("is_error") is not True
 
 
 # ---------- run_agent resolution chain -----------------------------
