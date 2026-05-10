@@ -5432,7 +5432,7 @@ async def run_agent(
     # Appended to the hardcoded role brief so context edits take effect on
     # the next turn with no restart required. Empty string when no
     # context is configured — agents behave as before.
-    context_suffix = await build_system_prompt_suffix(agent_id)
+    context_suffix = await build_system_prompt_suffix(agent_id, runtime=_runtime_name)
     # Per-agent brief — free-form context the human set via
     # PUT /api/agents/{id}/brief. Injected AFTER the governance layer so
     # it can narrow / specialize without being overwhelmed by team-wide

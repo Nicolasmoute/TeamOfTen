@@ -1,4 +1,4 @@
-"""System-prompt suffix — reads the global + per-project CLAUDE.md.
+"""System-prompt suffix — runtime-aware harness context block.
 
 Pre-refactor this module owned a `/data/context/` store with three
 buckets (root/skills/rules) and a write API. The projects refactor
@@ -14,9 +14,19 @@ buckets (root/skills/rules) and a write API. The projects refactor
   - `/data/.claude/skills/`        — Claude Code skills, loaded by the
                                      SDK directly (we don't inject).
 
-This module's only remaining job is to concatenate the two CLAUDE.md
-files into the per-turn system-prompt suffix so any edit takes effect
-on every agent's next turn without a restart.
+Runtime split (2026-05-10):
+  - **Claude runtime** — the Agent SDK auto-loads CLAUDE.md via
+    `setting_sources` (default `["user", "project", "local"]`). The
+    SDK walks up from `cwd` (the per-Player worktree) and finds both
+    `/data/projects/<active>/CLAUDE.md` and `/data/CLAUDE.md`. Manual
+    injection of those files here would double-count against the
+    token budget (verified 2026-05-10 via sentinel test, 2/2 hits per
+    turn). So for Claude we skip the CLAUDE.md reads — only the
+    Coach-only playbook block (which the SDK does NOT auto-load) goes
+    through this function.
+  - **Codex runtime** — no `setting_sources` equivalent. We must
+    manually inject CLAUDE.md or Codex Players have no project
+    context. Same shape as before for Codex.
 """
 
 from __future__ import annotations
@@ -55,47 +65,70 @@ def _read_text_safe(path) -> str:
     return text.strip()
 
 
-async def build_system_prompt_suffix(agent_id: str) -> str:
-    """Concatenate global + per-project CLAUDE.md into a system-prompt
-    suffix. Re-read on every turn so edits take effect without a
-    restart. Returns "" when both files are empty / missing.
+async def build_system_prompt_suffix(agent_id: str, runtime: str = "codex") -> str:
+    """Compose the runtime-aware harness context suffix.
 
-    Layout matches PROJECTS_SPEC.md §10:
+    For Claude turns the SDK auto-loads CLAUDE.md via `setting_sources`,
+    so this function returns ONLY the Coach-only playbook block (the
+    SDK has no equivalent for that). For Codex turns the SDK does not
+    auto-load CLAUDE.md, so this function manually injects the global
+    and per-project CLAUDE.md plus the Coach-only playbook.
+
+    The default runtime is `"codex"` (the conservative full-injection
+    path) so any future caller that forgets to pass the arg gets the
+    safer over-injection rather than silently dropping context.
+
+    Re-read on every turn so edits take effect without a restart.
+    Returns "" when nothing applies.
+
+    Layout (Codex):
       [identity]            ← prepended in agents.py
       [coordination block]  ← prepended in agents.py (Coach only)
       [role prompt]         ← role baseline in agents.py
-      [global CLAUDE.md]    ← from this function
-      [project CLAUDE.md]   ← from this function (active project)
-      [orchestration playbook] ← Coach only
+      [global CLAUDE.md]    ← from this function (Codex only)
+      [project CLAUDE.md]   ← from this function (Codex only)
+      [orchestration playbook] ← Coach only, both runtimes
+
+    Layout (Claude):
+      [identity]            ← prepended in agents.py
+      [coordination block]  ← prepended in agents.py (Coach only)
+      [role prompt]         ← role baseline in agents.py
+      [orchestration playbook] ← Coach only, this function
+      ↳ SDK then appends auto-loaded CLAUDE.md (global + project) via
+        `setting_sources` — the harness does not see this content.
 
     The orchestration playbook is Coach-only context: it is Coach's
     coordination memory (the lattice Coach mutates via
     `coord_propose_playbook_changes` and the daily reflection runner).
-    Players don't need it in their prompt — coordination discipline
-    flows to them through the wake prompts Coach composes per stage,
-    not through ambient prompt content.
+    Players don't need it — coordination discipline flows to them
+    through the wake prompts Coach composes per stage.
     """
     parts: list[str] = []
 
-    gp = global_paths()
-    global_body = _read_text_safe(gp.claude_md)
-    if global_body:
-        parts.append("## Global rules (CLAUDE.md)\n\n" + global_body)
+    # Codex has no setting_sources auto-load — manually inject CLAUDE.md
+    # to give Codex Players the same project context Claude Players get
+    # via the SDK. Skip for Claude to avoid double-counting (verified
+    # via sentinel test 2026-05-10).
+    if runtime != "claude":
+        gp = global_paths()
+        global_body = _read_text_safe(gp.claude_md)
+        if global_body:
+            parts.append("## Global rules (CLAUDE.md)\n\n" + global_body)
 
-    try:
-        active = await resolve_active_project()
-    except Exception:
-        active = None
-    if active:
         try:
-            pp = project_paths(active)
-            proj_body = _read_text_safe(pp.claude_md)
+            active = await resolve_active_project()
         except Exception:
-            proj_body = ""
-        if proj_body:
-            parts.append(
-                f"## Project rules ({active}/CLAUDE.md)\n\n" + proj_body
-            )
+            active = None
+        if active:
+            try:
+                pp = project_paths(active)
+                proj_body = _read_text_safe(pp.claude_md)
+            except Exception:
+                proj_body = ""
+            if proj_body:
+                parts.append(
+                    f"## Project rules ({active}/CLAUDE.md)\n\n" + proj_body
+                )
 
     # Playbook — Coach's coordination-strategy lattice. Injected only
     # when the caller is Coach; Players don't see it. Sync render

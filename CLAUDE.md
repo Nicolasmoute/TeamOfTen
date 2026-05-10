@@ -2159,6 +2159,34 @@ Validation criteria: ≥80% deviations noticed at push-time vs
 audit-time, ≥50% reduction in Coach context-reconstruction turns,
 flat or decreased human pings on routine items.
 
+**Recent (2026-05-10) — CLAUDE.md double-load fix:**
+
+Sentinel-tested 2026-05-10: every Claude turn was injecting global +
+project CLAUDE.md TWICE — once via the harness's manual concatenation
+in `build_system_prompt_suffix()`, and once via the SDK's auto-load
+through `setting_sources` (default `["user", "project", "local"]`,
+which the harness leaves unset). Two unique sentinels added — one to
+each file — Coach reported `GLOBAL: 2, PROJECT: 2`. Real per-Coach-
+turn cost was ~83K chars, not the ~52K the prompt-log showed; the
+~29.5K difference was the invisible second copy the SDK appended
+downstream of the harness.
+
+Fix: `build_system_prompt_suffix(agent_id, runtime)` now skips the
+CLAUDE.md reads when `runtime == "claude"` (SDK auto-load handles it
+via the `cwd` walk-up from the per-Player worktree). For Codex it
+keeps manually injecting both files — Codex has no `setting_sources`
+equivalent, so manual is the only path. Default arg `runtime="codex"`
+biases toward over-injection on any future caller that forgets to
+pass it.
+
+The Coach-only playbook block stays in the manual injection for both
+runtimes — the SDK has no equivalent for it. Estimated saving:
+~29.5K chars per Claude turn × 11 agents × every turn. The single
+biggest token cut in the optimization series.
+
+Files: [server/context.py](server/context.py),
+[server/agents.py](server/agents.py).
+
 **Recent (2026-05-09) — Prompt-size telemetry:**
 
 To answer "what's actually eating tokens?" with data instead of guesses,
