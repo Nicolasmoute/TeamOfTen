@@ -925,6 +925,17 @@ async def sweep_once() -> int:
     if not _flag_enabled():
         return 0
 
+    # Respect harness-wide pause: skip the tier-1 SQL scan + LLM call
+    # entirely when paused. Otherwise we'd keep spending Haiku tokens
+    # on findings whose Coach wakes are blocked by `maybe_wake_agent`
+    # anyway.
+    try:
+        from server.agents import is_paused  # noqa: PLC0415
+        if is_paused():
+            return 0
+    except Exception:
+        pass
+
     # Pin project_id at sweep start. Any switch during the sweep
     # leaves us emitting against the project the candidates actually
     # belong to.

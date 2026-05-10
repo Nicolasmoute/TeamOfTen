@@ -68,6 +68,15 @@ async def _scheduler_iteration() -> None:
     iteration (the next iteration picks up the next due project).
     Prevents the scheduler from spawning a storm if the loop slept
     long."""
+    # Respect harness-wide pause: skip the daily/bootstrap fire so
+    # Compass doesn't keep spending tokens while the team is held.
+    try:
+        from server.agents import is_paused  # noqa: PLC0415
+        if is_paused():
+            return
+    except Exception:
+        pass
+
     enabled = await _enabled_projects()
     if not enabled:
         return

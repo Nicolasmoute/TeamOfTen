@@ -610,8 +610,19 @@ async def _handle_event(ev: dict[str, Any]) -> None:
         # consume events from the queue (otherwise they'd back up and
         # trip the queue-full backpressure) but do nothing with them.
         return
+    # Respect harness-wide pause: skip new schedules so paused state
+    # doesn't ping the phone, but keep honoring resolutions so the
+    # user's in-UI dismissals still cancel any timers armed before
+    # the pause.
+    try:
+        from server.agents import is_paused  # noqa: PLC0415
+        paused = is_paused()
+    except Exception:
+        paused = False
     pkey = _key_for_pending(ev)
     if pkey is not None:
+        if paused:
+            return
         _schedule(pkey[0], pkey[1], ev)
         return
     rkey = _key_for_resolution(ev)

@@ -190,6 +190,16 @@ async def _handle_event(ev: dict[str, Any]) -> None:
     if etype not in WATCHED_EVENT_TYPES:
         return
 
+    # Respect harness-wide pause: drop the event without firing the
+    # audit LLM call. The kanban transition still landed; once
+    # unpaused, future transitions audit normally.
+    try:
+        from server.agents import is_paused  # noqa: PLC0415
+        if is_paused():
+            return
+    except Exception:
+        pass
+
     # Only the plan→execute transition is a Compass-relevant event.
     # Any other stage change is execution-side, handled by kanban's
     # own auditors / shipper.

@@ -281,6 +281,9 @@ async def sweep_once() -> int:
     (player-side; the stall sweeper's + reconciliation's emits aren't
     counted here). Exposed for tests so they can drive the loop
     deterministically instead of waiting for the asyncio sleep cycle."""
+    from server.agents import is_paused  # noqa: PLC0415
+    if is_paused():
+        return 0
     woken = 0
     for slot in PLAYER_SLOTS:
         try:
