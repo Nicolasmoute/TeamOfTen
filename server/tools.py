@@ -66,6 +66,33 @@ AUDIT_STAGES: frozenset[str] = frozenset({"audit_syntax", "audit_semantics"})
 # All valid kanban stages (used by validators that accept any of them).
 ALL_KANBAN_STAGES: frozenset[str] = frozenset(VALID_TRANSITIONS.keys())
 
+
+# Crystallized turn-end discipline reminder. Appended to every wake
+# body fired AT a Player from any harness path (Coach via
+# coord_approve_stage / coord_create_task / coord_request_plan_review
+# / coord_send_message; harness via kanban stall / idle poller /
+# watchdog; human via /api/tasks/{id}/approve_stage). Lives here in
+# code rather than in the per-project CLAUDE.md template — the
+# template can be edited / drift / get rewritten by the Coach
+# reconciliation flow, while this constant is part of the SDK-level
+# return surface and survives all of those. Token cost is a few
+# tokens × wakes-per-turn; in exchange the rule lands at exactly
+# the moment the Player is reasoning about "what next?".
+COACH_TO_PLAYER_TURN_END_REMINDER = (
+    "\n\n— Don't end work turn without a coord_* signal to Coach."
+)
+
+
+def _with_player_reminder(body: str) -> str:
+    """Append the canonical turn-end reminder to a Player wake body.
+    Idempotent — if the reminder is already present (e.g., a caller
+    composed it inline), return as-is."""
+    if not body:
+        return COACH_TO_PLAYER_TURN_END_REMINDER.lstrip("\n")
+    if COACH_TO_PLAYER_TURN_END_REMINDER.strip() in body:
+        return body
+    return body.rstrip() + COACH_TO_PLAYER_TURN_END_REMINDER
+
 # Workflow metadata. The DB stores these as text/JSON for migration
 # friendliness; these constants are the tool/API validation contract.
 WORKFLOW_TYPES: frozenset[str] = frozenset({
@@ -178,12 +205,7 @@ async def _wake_coach_for_completion(
         f"Player {caller_id} completed {role} on task "
         f"{task_id}{title_clause}.\n\n"
         f"message_to_coach: {msg}\n"
-        f"{artifact_clause}{hint}\n\n"
-        f"Read the matching project_events row, decide what's next "
-        f"(coord_approve_stage with the chosen next_stage + assignee + "
-        f"note, request rework, archive via coord_archive_task, or "
-        f"leave the role open if more work is expected), and reply to "
-        f"the Player if the message warrants a direct response."
+        f"{artifact_clause}{hint}"
     )
     try:
         from server.agents import maybe_wake_agent
@@ -867,12 +889,20 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "code path; Coach approves each later transition). Players "
             "inherit the parent's trajectory when subtasking; the rule "
             "still applies — name yourself or another Player as "
-            "trajectory[0].to."
+            "trajectory[0].to.\n"
+            "- note: optional brief that becomes the first-stage "
+            "  assignee's wake prompt verbatim. Use this to frame the "
+            "  work — what to look at, what changed, what you want "
+            "  them to do. If empty, the harness falls back to a "
+            "  short fact line ('Coach created task X and assigned "
+            "  you as <role>'); your note replaces that with real "
+            "  context."
         ),
         {
             "title": str, "description": str, "parent_id": str,
             "priority": str, "workflow": str,
             "tracking_reason": str, "trajectory": Any,
+            "note": str,
         },
     )
     async def create_task(args: dict[str, Any]) -> dict[str, Any]:
@@ -880,6 +910,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         if not title:
             return _err("title is required")
         description = args.get("description") or ""
+        coach_note = (args.get("note") or "").strip() or None
         parent_id_arg = args.get("parent_id")
         parent_id = parent_id_arg.strip() if isinstance(parent_id_arg, str) and parent_id_arg.strip() else None
         priority = (args.get("priority") or "normal").strip().lower()
@@ -1130,17 +1161,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             # the subscriber's _on_stage_changed handler; v2 has no
             # auto-advance so the wake fires from here.
             from server.agents import maybe_wake_agent
-            wake_body = (
+            wake_body = coach_note or (
                 f"Coach created task {task_id} ({title!r}) and assigned "
                 f"you as {role_for_stage[trajectory[0]['stage']]} for "
-                f"the {initial_status} stage. Read coord_my_assignments "
-                f"for the role context, do the work, then call the "
-                f"matching completion tool (coord_commit_push for code, "
-                f"coord_write_task_spec for planners, "
-                f"coord_role_complete for non-git executors / "
-                f"shippers). Coach reviews after you complete and "
-                f"approves the next stage."
+                f"the {initial_status} stage."
             )
+            wake_body = _with_player_reminder(wake_body)
             try:
                 await maybe_wake_agent(
                     initial_owner, wake_body,
@@ -1479,9 +1505,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 # keeps the conversation snappy. Full body + mark-read
                 # still requires coord_read_inbox for anything longer.
                 preview_snippet = body.strip().replace("\n", " ")[:240]
+                wake_body = (
+                    f"New message from {caller_id}{subj}: "
+                    f"\"{preview_snippet}\""
+                )
+                # Append the canonical turn-end reminder when the
+                # recipient is a Player. Coach has different discipline.
+                if to != "coach":
+                    wake_body = _with_player_reminder(wake_body)
                 await maybe_wake_agent(
                     to,
-                    f"New message from {caller_id}{subj}: \"{preview_snippet}\"",
+                    wake_body,
                     bypass_debounce=True,
                 )
             except Exception:
@@ -4910,10 +4944,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         if woken_now:
             try:
                 from server.agents import maybe_wake_agent
+                wake_body = _with_player_reminder(wake_prompt_for_role)
                 for slot in targets:
                     try:
                         await maybe_wake_agent(
-                            slot, wake_prompt_for_role,
+                            slot, wake_body,
                             bypass_debounce=True,
                             wake_source="kanban_role",
                         )
@@ -6387,17 +6422,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         # Wake the new assignee with `note` as the prompt body. Coach's
         # note is the verbatim brief — the lifecycle policy teaches
         # Coach to write it like a hand-off, not a status comment.
+        # The harness fallback is a v2-stripped fact line; the canonical
+        # turn-end reminder is appended in either case.
         if next_stage != "archive" and assignee:
             from server.agents import maybe_wake_agent
-            wake_body = note or (
+            wake_body = _with_player_reminder(note or (
                 f"Coach approved your move on task {task_id} to stage "
-                f"{next_stage!r} as {target_role}. Read coord_my_assignments "
-                f"for the role context, do the work, then call the "
-                f"matching completion tool (coord_commit_push for code, "
-                f"coord_submit_audit_report for audits, "
-                f"coord_role_complete for non-git executors / shippers, "
-                f"coord_write_task_spec for planners)."
-            )
+                f"{next_stage!r} as {target_role}."
+            ))
             try:
                 await maybe_wake_agent(
                     assignee, wake_body,
@@ -6810,9 +6842,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "\n"
             "Params:\n"
             "- task_id: required\n"
-            "- slot: target Player slot (p1..p10)"
+            "- slot: target Player slot (p1..p10)\n"
+            "- note: optional brief that becomes the Player's wake "
+            "  prompt verbatim (alongside the plan-mode framing). Use "
+            "  this to point them at what to focus on, what tradeoffs "
+            "  to surface, what's already been decided. If empty, "
+            "  the harness emits a short fact line referencing the "
+            "  task's current spec."
         ),
-        {"task_id": str, "slot": str},
+        {"task_id": str, "slot": str, "note": str},
     )
     async def request_plan_review(args: dict[str, Any]) -> dict[str, Any]:
         if not caller_is_coach:
@@ -6856,16 +6894,20 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             f" (spec at {t['spec_path']})"
             if t.get("spec_path") else " (no spec yet)"
         )
-        wake_body = (
-            f"Coach is requesting a plan review for task {task_id} "
-            f"({title!r}, currently in stage {stage!r}){spec_clause}.\n\n"
-            f"Plan-mode is enabled for this turn: produce an ExitPlanMode "
-            f"artifact describing what you'd do, in what order, with "
-            f"what risks. Do NOT touch tools yet — your plan goes to "
-            f"Coach for review first. Coach will then approve, request "
-            f"changes, or rewrite the plan and dispatch you to execute "
-            f"via coord_approve_stage."
+        coach_note = (args.get("note") or "").strip() or None
+        plan_mode_framing = (
+            f"Plan-mode is enabled: produce an ExitPlanMode artifact "
+            f"(plan only, no tool use). Coach reviews before dispatch."
         )
+        if coach_note:
+            wake_body = f"{coach_note}\n\n{plan_mode_framing}"
+        else:
+            wake_body = (
+                f"Coach is requesting a plan review for task {task_id} "
+                f"({title!r}, currently in stage {stage!r})"
+                f"{spec_clause}.\n\n{plan_mode_framing}"
+            )
+        wake_body = _with_player_reminder(wake_body)
 
         ts = _now_iso()
         await bus.publish({

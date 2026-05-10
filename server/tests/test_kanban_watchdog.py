@@ -623,13 +623,17 @@ async def test_finished_not_reported_self_nudge_to_assignee(
     user's recurring failure mode: Players write the deliverable to
     disk and return idle without messaging Coach.
 
-    The self-nudge must:
+    The self-nudge must (post-2026-05-10 wake-strip):
     - target the assignee (cand.slot), NOT Coach
-    - mention the four completion tools by name
-    - call out 'writing to disk is not enough' explicitly
+    - call out the disk-write misconception (load-bearing — the
+      recurring production failure pattern the watchdog exists
+      to catch; v2 strip kept this one corrective sentence)
+    - point at the completion tool generically (the four specific
+      tool names live in the system prompt now)
     - fire even when `HARNESS_WATCHDOG_WAKE_COACH_ON_HIGH=false`
       (the default) since this isn't a high-severity Coach wake
       — it's a Player self-correction nudge
+    - end with the canonical turn-end reminder
     """
     await _set_agent(slot="p1", status="working")
     old = _now() - timedelta(minutes=20)
@@ -655,18 +659,14 @@ async def test_finished_not_reported_self_nudge_to_assignee(
     p1_wakes = [(s, b) for s, b in wake_calls if s == "p1"]
     assert p1_wakes, f"expected p1 self-nudge wake; got {wake_calls}"
     body = p1_wakes[0][1]
-    # Names the four completion tools.
-    assert "coord_commit_push" in body
-    assert "coord_submit_audit_report" in body
-    assert "coord_write_task_spec" in body
-    assert "coord_role_complete" in body
-    # Calls out the disk-only failure mode.
-    assert (
-        "writing the deliverable to disk is not enough"
-        in body.lower()
-        or "writing to disk is not enough" in body.lower()
-        or "disk is not enough" in body.lower()
-    )
+    # Disk-write misconception correction stays.
+    assert "disk-write" in body.lower() or "disk write" in body.lower()
+    # Points at the completion tool (generic — names live in the
+    # system prompt now, not the wake).
+    assert "completion tool" in body.lower()
+    # Canonical turn-end reminder is appended.
+    from server.tools import COACH_TO_PLAYER_TURN_END_REMINDER
+    assert COACH_TO_PLAYER_TURN_END_REMINDER.strip() in body
 
 
 # ============================================================ gates

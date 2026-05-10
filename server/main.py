@@ -4403,12 +4403,11 @@ async def post_task_approve_stage(
 
     if next_stage != "archive" and assignee:
         from server.agents import maybe_wake_agent
-        wake_body = req.note or (
+        from server.tools import _with_player_reminder
+        wake_body = _with_player_reminder(req.note or (
             f"Human approved task {task_id} → stage "
-            f"{next_stage!r} ({target_role}). Read coord_my_assignments "
-            f"for the role context, do the work, then call the matching "
-            f"completion tool."
-        )
+            f"{next_stage!r} ({target_role})."
+        ))
         try:
             await maybe_wake_agent(
                 assignee, wake_body,
@@ -5179,9 +5178,13 @@ async def send_human_message(req: HumanMessageRequest) -> dict[str, Any]:
         # Human messages are not ping-pongy — the human isn't going to
         # auto-reply to the agent's reply, so skip the debounce and
         # wake even if the agent just finished a turn.
+        wake_body = f"New message from the human{subj}: \"{preview_snippet}\""
+        if to != "coach":
+            from server.tools import _with_player_reminder
+            wake_body = _with_player_reminder(wake_body)
         await maybe_wake_agent(
             to,
-            f"New message from the human{subj}: \"{preview_snippet}\"",
+            wake_body,
             bypass_debounce=True,
         )
     return {"ok": True, "message_id": msg_id}

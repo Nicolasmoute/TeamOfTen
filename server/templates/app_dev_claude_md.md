@@ -2,12 +2,12 @@
 
 > **Keep this file light.** Every line costs tokens on every
 > turn for every agent. Project-specific facts + TOT-specific
-> tool ergonomics belong here. General engineering discipline
-> belongs in the playbook (`## Orchestration playbook`) — propose
-> additions there via `coord_propose_playbook_changes`. When in
-> doubt: cut. If this file passes ~300 lines, factor sections
-> into `working/knowledge/<topic>.md` and reference by path —
-> default growth pattern, not an emergency.
+> tool ergonomics belong here. General coordination discipline
+> belongs in Coach's orchestration playbook (Coach-only context;
+> Coach proposes additions via `coord_propose_playbook_changes`).
+> When in doubt: cut. If this file passes ~300 lines, factor
+> sections into `working/knowledge/<topic>.md` and reference by
+> path — default growth pattern, not an emergency.
 
 ## Project type: app development
 
@@ -87,32 +87,29 @@ candidate slots). Coach drives advances explicitly via
 **No auto-routing, no auto-wake on stage change, no auto-revert
 on audit fail.**
 
+**Cross-role rule.** When using a coord_* tool that delivers
+a message to the other party, **always fill the dedicated
+field with a real message** — the receiver reads it verbatim.
+Don't leave it empty; the receiver has no other context.
+Coach side: `note` on `coord_approve_stage` /
+`coord_create_task` / `coord_request_plan_review`, `body` on
+`coord_send_message`. Player side: `message_to_coach` on
+`coord_commit_push` / `coord_role_complete` /
+`coord_write_task_spec` / `coord_submit_audit_report`,
+`note` on `coord_update_task`, `reason` on
+`coord_set_task_blocked`, `body` on `coord_send_message` /
+`coord_request_human`.
+
 **For Players:**
 
 - Take work only when Coach assigns via `coord_approve_stage`.
   Don't claim from pools — pools are FYI.
 - **You report to Coach, not to the kanban.** The completion
-  tools below ARE your message to Coach. Always include
-  `message_to_coach` (one line: what you noticed, caveats,
-  what the next person should know):
-    - planner → `coord_write_task_spec(task_id, body, message_to_coach)`
-    - executor (code) → `coord_commit_push(message, task_id, push?, message_to_coach)`
-    - executor (non-code) → `coord_role_complete(task_id, message_to_coach, artifact_path?)`
-    - auditor → `coord_submit_audit_report(task_id, kind, body, verdict, message_to_coach)`
-    - shipper → `coord_role_complete(task_id, message_to_coach)`
-- **NEVER finish a turn without a `coord_*` update message to
-  Coach.** Even if you called one earlier in the turn — if you
-  did anything since (file read, Bash, more reasoning), call
-  one more; Coach reads your LAST signal. If you have nothing
-  material to add, `coord_send_message(to='coach', body='ack
-  — <one line>')` is the right answer.
+  tools listed in the cross-role rule above ARE your message
+  to Coach.
 - **Audit FAIL does NOT auto-revert.** Auditor records; Coach
   decides next steps. Don't pre-emptively start fixing — wait
   for Coach's wake.
-- If a completion tool isn't visible in your runtime (Codex
-  stdio flake, MCP missing): fall back to `coord_send_message`
-  IMMEDIATELY. Do NOT route around with raw git/Bash. Never
-  end a turn unaddressed.
 
 **For Coach:**
 

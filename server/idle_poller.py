@@ -528,10 +528,11 @@ async def _fire_rung_1(
     if stall_owner:
         try:
             from server.agents import maybe_wake_agent
+            from server.tools import _with_player_reminder
             age_min = max(1, age_seconds // 60)
-            nudge = _stall_nudge_for_stage(
+            nudge = _with_player_reminder(_stall_nudge_for_stage(
                 task_id=task["id"], stage=stage, age_min=age_min,
-            )
+            ))
             await maybe_wake_agent(
                 stall_owner, nudge,
                 bypass_debounce=False,
@@ -572,11 +573,7 @@ async def _fire_rung_2(
             f"blocker {stall_owner or '(unassigned)'}). The Player "
             f"didn't move on the {rung1_min}-min nudge. Auto-"
             f"reassign fires in ~{next_reassign_min} min unless you "
-            f"intervene. Options: nudge them again "
-            f"(coord_send_message), reassign via "
-            f"coord_approve_stage(next_stage={stage!r}, "
-            f"assignee=<other-slot>, note=<brief>), or archive via "
-            f"coord_archive_task(task_id={task['id']!r}, summary=...)."
+            f"intervene."
         )
         # AUDIT FIX: bypass debounce so the escalation reaches Coach
         # even if Coach's wake debounce window is currently active
@@ -935,69 +932,16 @@ def _role_for_stage(stage: str) -> str | None:
 def _stall_nudge_for_stage(
     *, task_id: str, stage: str, age_min: int
 ) -> str:
-    """Stage-aware reminder text for the stall sweeper. The previous
-    version hardcoded the executor tools (`coord_commit_push` /
-    `coord_complete_execution`) which made no sense when a Player was
-    stuck in audit_semantics or ship — they'd be told to call the
-    wrong tool. v0.3.4: name the matching completion tool with the
-    `task_id` baked in, plus an explicit tool-not-visible escape."""
-    head = (
+    """Stage-aware reminder text for the stall sweeper. v2 strip:
+    the matching completion tool + blocked-clause + tool-not-visible
+    escape are all in the system prompt (project CLAUDE.md template
+    + role baseline) — the wake just delivers the fact. The canonical
+    turn-end reminder is appended by the caller via
+    `_with_player_reminder`."""
+    return (
         f"Reminder: task {task_id} has been in {stage} for "
         f"{age_min} minutes with no progress signal."
     )
-    blocked = (
-        f" If you're blocked, message Coach via "
-        f"coord_send_message(to='coach', body=...) or, for a hard "
-        f"stop, coord_request_human(subject=..., body=..., "
-        f"urgency='high'). If the named tool below is not visible "
-        f"in your runtime, message Coach IMMEDIATELY — do not write "
-        f"the artifact to disk and stop, the kanban will not see it."
-    )
-    if stage == "plan":
-        body = (
-            f"\n\nDraft the spec then call coord_write_task_spec("
-            f"task_id={task_id!r}, body=<spec>, "
-            f"message_to_coach=<your response>). Coach reviews "
-            f"on the next tick."
-        )
-    elif stage == "execute":
-        body = (
-            f"\n\nIf you finished the work, call "
-            f"coord_commit_push(task_id={task_id!r}, message=..., "
-            f"message_to_coach=<your response>) for code or "
-            f"coord_role_complete(task_id={task_id!r}, "
-            f"message_to_coach=..., artifact_path=<path?>) for "
-            f"non-code — Coach reviews and approves the next stage."
-        )
-    elif stage == "audit_syntax":
-        body = (
-            f"\n\nFinish the formal review then call "
-            f"coord_submit_audit_report(task_id={task_id!r}, "
-            f"kind='syntax', body=<review>, "
-            f"verdict='pass' or 'fail', "
-            f"message_to_coach=<your response>)."
-        )
-    elif stage == "audit_semantics":
-        body = (
-            f"\n\nFinish the semantic review then call "
-            f"coord_submit_audit_report(task_id={task_id!r}, "
-            f"kind='semantics', body=<review>, "
-            f"verdict='pass' or 'fail', "
-            f"message_to_coach=<your response>)."
-        )
-    elif stage == "ship":
-        body = (
-            f"\n\nMerge / publish / hand-off, then call "
-            f"coord_role_complete(task_id={task_id!r}, "
-            f"message_to_coach='shipped at <ref>'). Coach archives "
-            f"with a user-facing summary."
-        )
-    else:
-        body = (
-            f"\n\nCall coord_my_assignments() for the next "
-            f"actionable step."
-        )
-    return f"{head}{body}{blocked}"
 
 
 async def _maybe_wake_idle(slot: str) -> bool:
@@ -1042,21 +986,15 @@ async def _maybe_wake_idle(slot: str) -> bool:
 
     try:
         from server.agents import maybe_wake_agent
-        # v0.3.10: imperative wake. The previous "There MAY be tasks
-        # waiting" wording let Players treat the wake as a
-        # housekeeping prompt — they'd call coord_my_assignments,
-        # see "Pending planner: t-...", and stop without actually
-        # writing the spec (production trace 2026-05-06). The wake
-        # is now imperative + the response from coord_my_assignments
-        # carries an explicit Next-action footer naming the
-        # completion tool with the task_id baked in.
-        wake_text = (
-            "You have actionable work. Call coord_my_assignments "
-            "and read the '## Next action:' footer at the bottom — "
-            "it names the exact completion tool to call with the "
-            "task_id baked in. Then DO that work; the kanban does "
-            "not advance until you call the named tool. Do NOT "
-            "treat the response as a status report."
+        from server.tools import _with_player_reminder
+        # v2 strip: the wake had a long "call coord_my_assignments,
+        # read the Next-action footer, do the work, don't treat the
+        # response as a status report" trailer that's now in the
+        # system prompt + the canonical turn-end reminder. One
+        # short pointer is all the wake needs (no specific event
+        # triggered this — it's an idle catch-all).
+        wake_text = _with_player_reminder(
+            "You have actionable work pending — check coord_my_assignments."
         )
         did_wake = await maybe_wake_agent(
             slot, wake_text,
@@ -1510,10 +1448,8 @@ async def board_safety_ring_once(project_id: str | None = None) -> int:
     try:
         from server.agents import maybe_wake_agent
         body = (
-            f"The kanban hasn't moved in {age_min} min — review the "
-            f"board. Active tasks: {active_count}. Query "
-            f"`/api/tasks/flow_health` for the state, then advance, "
-            f"reassign, or archive as needed."
+            f"Kanban hasn't moved in {age_min} min. "
+            f"Active tasks: {active_count}."
         )
         await maybe_wake_agent(
             "coach", body,

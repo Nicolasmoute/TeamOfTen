@@ -2210,6 +2210,188 @@ would persist unchanged; the cap only fires on new inserts.
 A render-time warning surface for over-cap legacy rows is a
 follow-up if the lattice ever has them.
 
+**Recent (2026-05-10) — Wake-body sweep: facts + canonical reminder:**
+
+Round 2 of the wake-body cleanup. Earlier today's pass stripped the
+message-passthrough trailers + added queue-on-busy. This pass
+extends the same "facts only" discipline to every kanban-source
+wake (12 sites total) AND moves the "never end a turn unaddressed"
+rule from the project CLAUDE.md template (fragile — Coach
+reconciliation can rewrite it, humans can edit it) into a
+crystallized harness-side constant appended to every Player wake.
+
+- **Canonical reminder constant** in
+  [server/tools.py:COACH_TO_PLAYER_TURN_END_REMINDER](server/tools.py)
+  — `"\n\n— Don't end work turn without a coord_* signal to Coach."`.
+  Helper `_with_player_reminder(body)` appends idempotently. Wired
+  into every wake fired AT a Player from any harness path: Coach
+  via `coord_send_message` / `coord_approve_stage` /
+  `coord_create_task` / `coord_request_plan_review`; harness via
+  kanban stall (rung 1) / idle poller / watchdog
+  (finished_not_reported); human via
+  `POST /api/tasks/{id}/approve_stage`. Coach wakes don't get the
+  reminder — Coach has different turn-end discipline. Token cost
+  ~80 chars × wakes-per-turn; in exchange, the rule is robust
+  against template edits.
+
+- **v2 strip on 4 Player→Coach kanban wakes.** Each keeps the
+  observable fact and drops the procedural ladder Coach already
+  has from their tool catalog:
+  - `kanban_completion`: keeps `Player p3 completed planner on
+    t-42 ('refactor X'). message_to_coach: ... Artifact: ...` —
+    drops "Read the matching project_events row, decide what's
+    next (coord_approve_stage / request rework / archive...)..."
+  - `kanban_stall` rung 2: keeps the auto-reassign deadline,
+    drops the options menu (nudge / reassign / archive).
+  - `kanban_board_safety`: keeps `Kanban hasn't moved in N min.
+    Active tasks: K.`, drops the `/api/tasks/flow_health`
+    pointer + advance/reassign/archive ladder.
+  - `watchdog_high`: keeps the verdict + reason, drops the
+    on_behalf_of mechanics + reassign-within-stage / escalate
+    enumeration.
+
+- **v2 strip on 8 Coach→Player wakes.** Each keeps facts +
+  safety lockouts, drops procedural how-to (already in the
+  system prompt). The canonical reminder is appended to every
+  one. Notable preservations:
+  - `kanban_stand_down` keeps the "STOP — do not edit, commit,
+    push, or publish" lockout (the Player can be mid-edit and
+    has no other signal they were reassigned).
+  - `kanban_role` (FYI pool) keeps "Don't start work; wait for
+    an explicit assignment" (the wake itself could be misread as
+    an assignment).
+  - `watchdog_finished_not_reported_self` keeps the "Disk-write
+    alone doesn't advance the kanban" misconception correction
+    (recurring production failure mode, 6+ hits) — drops the
+    four-tool enumeration + tool-not-visible escape.
+  - `kanban_idle_poller` keeps a one-line "check
+    coord_my_assignments" pointer (no specific event triggered
+    this — it's an idle catch-all, the Player needs the hint).
+
+- **`note` parameter added to `coord_create_task` and
+  `coord_request_plan_review`.** Brings these two Coach→Player
+  tools in line with `coord_approve_stage` / `coord_send_message`
+  — Coach's note becomes the assignee's wake prompt verbatim,
+  with a v2-stripped fact line as fallback. Closes the gap where
+  Coach couldn't pre-attach context to a first-stage hand-off
+  or a plan-review request and had to follow up with a separate
+  `coord_send_message` (which the v2 strip would have rendered
+  duplicate).
+
+- **CLAUDE.md template restructured.** The 12-line "NEVER finish
+  a turn without a coord_* update message to Coach..." block is
+  gone — that rule lives in code now. In its place, a single
+  cross-role rule that applies symmetrically to both directions:
+  "When using a coord_* tool that delivers a message to the
+  other party, always fill the dedicated field with a real
+  message — the receiver reads it verbatim." Lists the exact
+  fields by tool name on each side. The "For Players" section
+  shrinks from 24 lines to 6.
+
+- **`_stall_nudge_for_stage`** simplified from a 65-line
+  per-stage dispatch into a single fact-line return. The
+  per-stage tool names + `coord_request_human` escape +
+  tool-not-visible discipline all moved to the system prompt
+  (project CLAUDE.md template + role baseline).
+
+Tests: 3 stall-sweeper tests inverted to assert the v2 fact-only
+shape; 1 watchdog test updated to expect the v2 disk-write line
++ canonical reminder; 1 stall-escalation test updated for the
+new "STOP — do not edit" lockout phrasing; 2 new helper tests
+in [server/tests/test_agents_helpers.py](server/tests/test_agents_helpers.py)
+cover `_with_player_reminder` (idempotent append, empty-body
+handling) + the constant's shape (mentions coord_*, < 100 chars).
+Suite green minus the 3 pre-existing template-text-drift
+failures from commit 3977946.
+
+**Recent (2026-05-10) — Auto-wake: stop interfering, queue when busy:**
+
+Two related fixes for a recurring failure mode where Coach would
+read a Player's "done" report inline in the pane and respond with
+"no action" instead of acknowledging / advancing the work.
+
+- **Stripped harness-as-backseat-driver trailers** at every
+  message-passthrough wake site. The auto-wake prompt for an
+  inbound message used to append "Call coord_read_inbox to mark
+  it read and see any other queued messages, then respond as
+  appropriate." That trailer was duplicating instructions Coach's
+  system prompt already covers AND letting Coach off the hook
+  ("respond as appropriate" → "decide nothing's needed"). Now the
+  wake just passes the message verbatim. Five sites cleaned:
+  [server/tools.py:1482](server/tools.py) (Player → Player/Coach
+  message), [server/agents.py:110](server/agents.py)
+  (`_deliver_system_message` system-routed messages, e.g. task-done
+  notifications), [server/main.py:5182](server/main.py)
+  (human UI → agent), [server/telegram.py:229](server/telegram.py)
+  (Telegram → Coach), and the Coach-todos meta-suffix in
+  [server/agents.py:maybe_wake_agent](server/agents.py) which used
+  to append "After handling this, scan your open coach-todos
+  (N open)…" to **every** reactive Coach wake. Coach's per-tick
+  coordination block already surfaces todos; piggybacking on every
+  wake was noise. Kanban / recovery / paused-question /
+  paused-plan / sdk-cutoff / post-error wakes carry harness-only
+  context (correlation_ids, system-state knowledge the agent
+  can't derive otherwise) — those stay.
+
+- **Queue-on-busy in `maybe_wake_agent`.** Previously a wake
+  landing while the target was mid-turn returned False and was
+  dropped — Coach finished its current turn with no replay, so
+  a Player completion that arrived during a Coach turn was
+  silently lost (visible in the pane via fan-out, but no fresh
+  turn ever fired to act on it). Now the args are stashed in a
+  new module-level `_pending_wakes: dict[slot, (reason,
+  wake_source, plan_mode)]`. The post-turn cleanup path in
+  `run_agent` (right after the `agent_stopped` emit) pops the
+  queued entry and re-calls `maybe_wake_agent` so the pause
+  + cost-cap guards still apply on the deferred fire.
+  Latest-wins coalescing — multiple wakes during a single busy
+  stretch fold into one follow-up turn. The inbox +
+  project_events tables retain the actual message / event
+  payloads, so coalescing the prompt doesn't lose information;
+  Coach reads inbox in the next turn and sees everything.
+
+  Three subtleties the audit caught:
+  1. **Deferred fire ALWAYS bypasses debounce.** The finally
+     stamps `_last_turn_ended_at[slot]` to "now" microseconds
+     before the deferred-fire reads it. A wake that queued
+     mid-turn isn't ping-pong (the agent isn't replying to its
+     own output), so the 10s debounce shouldn't apply. Without
+     bypass, every queued wake would be silently dropped at
+     deferred-fire time.
+  2. **Cost-capped early-exit clears the queue.** A wake that
+     landed in the brief slot-claim window between
+     `_running_tasks[slot] = this_task` and the cost-cap check
+     gets queued. We discard it on cap-hit because the cap is
+     still hit (re-firing would cap again) and holding the entry
+     could fire later under a stale trigger context.
+  3. **`auto_compact=True` skips the deferred fire.**
+     `maybe_auto_compact` recursively spawns a compact preamble
+     `run_agent` BEFORE the outer turn claims the slot. Letting
+     the inner preamble drain the queue would race the outer
+     slot-claim — either steal the slot from the user's actual
+     prompt or spawn-reject the deferred wake. The outer turn
+     drains the queue when it ends; manual `/compact` (no
+     `auto_compact` flag) still drains normally.
+
+  The pause-state guard is checked BEFORE the queue path, so a
+  wake landing while the harness is paused is dropped, not
+  queued (otherwise an unpause would unleash a flood of stale
+  wakes).
+
+The `_check_cost_caps` short-circuit, the `_paused` guard
+order, and the bypass-on-deferred-fire subtleties matter — see
+the inline comments. 10 new tests in
+[server/tests/test_agents_helpers.py](server/tests/test_agents_helpers.py)
+cover prompt passthrough (Coach with todos, Coach without
+todos, Player), queue-on-busy basics, latest-wins coalescing,
+no-queue when idle, pause-doesn't-queue, the deferred-fire
+bypass behavior, the auto-compact skip gate (asserted via
+source-inspection so a future refactor can't silently regress),
+and a regression-pin documenting what would break if the
+deferred fire passed `bypass_debounce=False`. The 3 prior
+Coach-todo-nudge tests were inverted into "prompt unmodified"
+assertions to lock the no-trailer behavior in.
+
 **Recent (2026-05-09) — TruthScore shipped:**
 
 On-demand project-fidelity evaluator. One-shot Sonnet call that

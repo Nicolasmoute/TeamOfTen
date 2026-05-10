@@ -629,9 +629,8 @@ async def test_maybe_wake_agent_queues_when_target_busy(
         assert result is True
         assert captured == []
         assert "coach" in agents_mod._pending_wakes
-        reason, source, plan, bypass = agents_mod._pending_wakes["coach"]
+        reason, source, plan = agents_mod._pending_wakes["coach"]
         assert reason == "p2 done on t-42"
-        assert bypass is True
     finally:
         fake_task.cancel()
         try:
@@ -667,7 +666,7 @@ async def test_maybe_wake_agent_queue_latest_wins(
             await asyncio.sleep(0)
 
         assert captured == []
-        reason, source, _plan, _bypass = agents_mod._pending_wakes["coach"]
+        reason, source, _plan = agents_mod._pending_wakes["coach"]
         assert reason == "third wake"
         assert source == "kanban_completion"
     finally:
@@ -698,6 +697,158 @@ async def test_maybe_wake_agent_no_queue_when_idle(
 
     assert captured == ["fresh wake"]
     assert "coach" not in agents_mod._pending_wakes
+
+
+async def test_deferred_fire_bypasses_debounce_after_turn_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The post-turn deferred fire MUST bypass debounce. Otherwise
+    `_last_turn_ended_at` (stamped microseconds before the deferred
+    fire) would drop the queued wake — losing exactly the wakes the
+    queue exists to preserve. This test simulates the run_agent
+    finally-block ordering: pop _running_tasks → stamp last-turn-end
+    → emit agent_stopped → pop _pending_wakes and re-fire."""
+    import asyncio
+    import time as time_mod
+
+    import server.agents as agents_mod
+
+    captured = await _capture_run_agent_prompt(monkeypatch)
+
+    # Stage 1: agent is mid-turn; a wake lands and queues.
+    loop = asyncio.get_running_loop()
+    fake_task = loop.create_task(asyncio.sleep(60))
+    agents_mod._running_tasks["coach"] = fake_task
+    try:
+        await agents_mod.maybe_wake_agent(
+            "coach", "queued during busy turn",
+        )
+        assert "coach" in agents_mod._pending_wakes
+    finally:
+        fake_task.cancel()
+        try:
+            await fake_task
+        except asyncio.CancelledError:
+            pass
+        agents_mod._running_tasks.pop("coach", None)
+
+    # Stage 2: simulate the finally-block: pop _running_tasks (already
+    # done above), stamp the just-ended timestamp, then run the
+    # post-turn deferred-fire block. The stamp is the booby trap we
+    # are checking for — without bypass on the deferred fire, this
+    # would drop the wake.
+    agents_mod._last_turn_ended_at["coach"] = time_mod.monotonic()
+
+    queued = agents_mod._pending_wakes.pop("coach", None)
+    assert queued is not None
+    q_reason, q_source, q_plan = queued
+    await agents_mod.maybe_wake_agent(
+        "coach",
+        q_reason,
+        bypass_debounce=True,
+        wake_source=q_source,
+        plan_mode=q_plan,
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    # The deferred fire must have spawned a real turn — captured by
+    # the run_agent stub.
+    assert captured == ["queued during busy turn"]
+
+
+async def test_auto_compact_preamble_skips_deferred_fire() -> None:
+    """The recursive compact preamble fired inside `maybe_auto_compact`
+    must NOT drain `_pending_wakes` on its own finally — the outer
+    turn (running the user's actual prompt right after) is about to
+    claim the slot and will handle the queue. If the inner preamble
+    drained the queue, its deferred fire would race the outer
+    slot-claim. Manual /compact (without `auto_compact=True`) still
+    drains, since there's no outer turn waiting.
+
+    The check lives in run_agent's post-turn block. We verify the
+    specific gate (`if not auto_compact:`) by inspecting the source
+    rather than spinning up a real run_agent — auto-compact requires
+    a live runtime + cost cap + token estimation, which is much more
+    machinery than a focused regression deserves."""
+    import inspect
+
+    import server.agents as agents_mod
+
+    src = inspect.getsource(agents_mod.run_agent)
+    # The skip MUST be present and gated on auto_compact, otherwise
+    # the race documented above fires every time auto-compact runs.
+    assert "if not auto_compact:" in src
+    assert "_pending_wakes.pop(agent_id, None)" in src
+    # Sanity: there is exactly one drain site (the post-turn block);
+    # any additional drain would defeat the gate.
+    drain_sites = src.count("_pending_wakes.pop(agent_id, None)")
+    # Two pops: one in cost-capped early-exit (always discards), one
+    # in the post-turn deferred-fire block (gated by auto_compact).
+    assert drain_sites == 2, (
+        f"unexpected number of _pending_wakes drain sites: {drain_sites}"
+    )
+
+
+async def test_deferred_fire_dropped_without_bypass_documents_bug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pin the exact failure mode the bypass guards against: if the
+    deferred fire passed `bypass_debounce=False` (the value some
+    callers might naturally use), the just-stamped end-of-turn time
+    would drop the wake. The production code path always passes
+    True; this test exists so a future refactor that switches that
+    flag visibly fails CI rather than silently regressing."""
+    import asyncio
+    import time as time_mod
+
+    import server.agents as agents_mod
+
+    captured = await _capture_run_agent_prompt(monkeypatch)
+    agents_mod._last_turn_ended_at["coach"] = time_mod.monotonic()
+
+    result = await agents_mod.maybe_wake_agent(
+        "coach", "would-be-dropped wake", bypass_debounce=False,
+    )
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert result is False
+    assert captured == []
+
+
+async def test_with_player_reminder_appends_canonical_text() -> None:
+    """The canonical turn-end reminder is appended verbatim to a
+    non-empty body. Idempotent: a body already carrying the
+    reminder is returned unchanged."""
+    from server.tools import (
+        COACH_TO_PLAYER_TURN_END_REMINDER,
+        _with_player_reminder,
+    )
+
+    out = _with_player_reminder("Task t-42 has entered execute.")
+    assert out.endswith(COACH_TO_PLAYER_TURN_END_REMINDER)
+    assert out.startswith("Task t-42 has entered execute.")
+
+    # Idempotent — passing the same body twice doesn't double-append.
+    twice = _with_player_reminder(out)
+    assert twice == out
+
+    # Empty body → reminder still lands (sans leading newlines).
+    empty = _with_player_reminder("")
+    assert "coord_*" in empty
+    assert "Don't end work turn" in empty
+
+
+async def test_with_player_reminder_constant_shape() -> None:
+    """The canonical reminder text exists, mentions coord_*, and is
+    short enough to be cheap on every Player wake."""
+    from server.tools import COACH_TO_PLAYER_TURN_END_REMINDER
+
+    assert "coord_*" in COACH_TO_PLAYER_TURN_END_REMINDER
+    assert "Coach" in COACH_TO_PLAYER_TURN_END_REMINDER
+    # ~80 chars cap as a sanity guardrail — token cost discipline.
+    assert len(COACH_TO_PLAYER_TURN_END_REMINDER) < 100
 
 
 async def test_maybe_wake_agent_paused_does_not_queue(

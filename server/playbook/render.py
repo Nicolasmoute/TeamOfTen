@@ -1,8 +1,10 @@
 """Render the active lattice into a system-prompt markdown block.
 
 Called from [server/context.py:build_system_prompt_suffix](../context.py)
-on every agent turn. Sync function (no I/O beyond the lattice file
-read) so the async caller can invoke it without ceremony — same pattern
+on every Coach turn (Coach-only — Players don't get the playbook in
+their prompt; their coordination cues come from Coach's per-stage
+wake notes). Sync function (no I/O beyond the lattice file read) so
+the async caller can invoke it without ceremony — same pattern
 `_read_text_safe()` uses for CLAUDE.md.
 
 Output shape per spec §6.2: full self-contained markdown including the
@@ -123,13 +125,15 @@ def _render_full(lattice: Lattice, *, drop_uncertain: bool = False) -> str:
     parts.append("## Orchestration playbook")
     parts.append("")
     parts.append(
-        "Learned patterns for orchestrating this team. Each entry has a "
-        "confidence weight in [0, 1] — high = validated discipline, low = "
-        "validated anti-pattern, ~0.5 = uncertain. Apply high-confidence "
-        "patterns by default; deviate with explicit reason. Coach updates "
-        "this lattice mid-turn via `coord_propose_playbook_changes` and "
-        "via a nightly reflection run; Players follow it as guidance and "
-        "cannot influence it."
+        "Your coordination memory. Each entry has a confidence weight in "
+        "[0, 1] — high = validated discipline, low = validated "
+        "anti-pattern, ~0.5 = uncertain. Apply high-confidence patterns "
+        "by default; deviate with explicit reason. Update this lattice "
+        "mid-turn via `coord_propose_playbook_changes`; a nightly "
+        "reflection run also evolves it from observed evidence. Coach-"
+        "only context — Players don't see this block, so coordination "
+        "discipline reaches them through the wake notes you compose at "
+        "each `coord_approve_stage`."
     )
     parts.append("")
 

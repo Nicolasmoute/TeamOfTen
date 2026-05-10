@@ -833,29 +833,20 @@ async def _emit_findings(
         if verdict == VERDICT_FINISHED_NOT_REPORTED and cand.slot:
             try:
                 from server.agents import maybe_wake_agent  # noqa: PLC0415
+                from server.tools import _with_player_reminder  # noqa: PLC0415
                 tid = cand.current_task_id or "(no task)"
-                self_nudge = (
+                # Keep the disk-write misconception correction — this
+                # is the recurring production failure mode the watchdog
+                # exists to catch (6+ hits as of 2026-05-08). The tool
+                # enumeration + runtime-fallback path are in the
+                # system prompt now; the canonical reminder appended
+                # by _with_player_reminder repeats the core rule.
+                self_nudge = _with_player_reminder(
                     f"You appear to have finished work on task {tid} "
-                    f"but didn't send Coach the wrap-up. Watchdog "
-                    f"noticed: {v['reason'] or '(no detail)'}.\n\n"
-                    f"Your turn isn't done until you've signalled Coach "
-                    f"with the matching completion tool — writing the "
-                    f"deliverable to disk is not enough on its own. "
-                    f"Coach reads the kanban event log; if you don't "
-                    f"call the tool, Coach has no idea your work "
-                    f"exists.\n\n"
-                    f"Call ONE of these now (whichever matches your "
-                    f"role — pass `task_id={tid!r}` and a one-line "
-                    f"`message_to_coach=...` describing what you "
-                    f"delivered + any caveats):\n"
-                    f"  - coord_commit_push (code changes)\n"
-                    f"  - coord_submit_audit_report (audits)\n"
-                    f"  - coord_write_task_spec (specs)\n"
-                    f"  - coord_role_complete (everything else: "
-                    f"non-code executors, shippers)\n\n"
-                    f"If the tool isn't visible in your runtime, "
-                    f"message Coach via coord_send_message instead — "
-                    f"don't write to disk and stop."
+                    f"but didn't signal Coach (Watchdog: "
+                    f"{v['reason'] or '(no detail)'}). Disk-write "
+                    f"alone doesn't advance the kanban — call the "
+                    f"matching completion tool."
                 )
                 await maybe_wake_agent(
                     cand.slot, self_nudge,
@@ -873,15 +864,7 @@ async def _emit_findings(
                 from server.agents import maybe_wake_agent  # noqa: PLC0415
                 body = (
                     f"Watchdog flagged {cand.slot} as {verdict}: "
-                    f"{v['reason'] or '(no detail)'}. Decide whether to "
-                    f"clarify (coord_send_message), submit the artifact "
-                    f"on their behalf via coord_write_task_spec(..., "
-                    f"on_behalf_of=<slot>) or coord_submit_audit_report"
-                    f"(..., on_behalf_of=<slot>) and then advance via "
-                    f"coord_approve_stage, reassign within the stage via "
-                    f"coord_approve_stage(next_stage=<same>, "
-                    f"assignee=<other-slot>), or escalate "
-                    f"(coord_request_human)."
+                    f"{v['reason'] or '(no detail)'}."
                 )
                 await maybe_wake_agent(
                     "coach", body,

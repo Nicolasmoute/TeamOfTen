@@ -55,7 +55,7 @@ def _read_text_safe(path) -> str:
     return text.strip()
 
 
-async def build_system_prompt_suffix() -> str:
+async def build_system_prompt_suffix(agent_id: str) -> str:
     """Concatenate global + per-project CLAUDE.md into a system-prompt
     suffix. Re-read on every turn so edits take effect without a
     restart. Returns "" when both files are empty / missing.
@@ -66,6 +66,14 @@ async def build_system_prompt_suffix() -> str:
       [role prompt]         ← role baseline in agents.py
       [global CLAUDE.md]    ← from this function
       [project CLAUDE.md]   ← from this function (active project)
+      [orchestration playbook] ← Coach only
+
+    The orchestration playbook is Coach-only context: it is Coach's
+    coordination memory (the lattice Coach mutates via
+    `coord_propose_playbook_changes` and the daily reflection runner).
+    Players don't need it in their prompt — coordination discipline
+    flows to them through the wake prompts Coach composes per stage,
+    not through ambient prompt content.
     """
     parts: list[str] = []
 
@@ -89,22 +97,24 @@ async def build_system_prompt_suffix() -> str:
                 f"## Project rules ({active}/CLAUDE.md)\n\n" + proj_body
             )
 
-    # Playbook — harness-wide AI orchestration-strategy lattice.
-    # Sync render returns a self-contained markdown block (already
-    # includes the `## Orchestration playbook` heading) or empty
-    # string when the lattice is empty / disabled / file missing.
-    # Sync I/O is acceptable from this async caller — same pattern
-    # as `_read_text_safe` above. See Docs/playbook-specs.md §6.
-    try:
-        from server.playbook.render import render_playbook_block  # noqa: PLC0415
+    # Playbook — Coach's coordination-strategy lattice. Injected only
+    # when the caller is Coach; Players don't see it. Sync render
+    # returns a self-contained markdown block (already includes the
+    # `## Orchestration playbook` heading) or empty string when the
+    # lattice is empty / disabled / file missing. Sync I/O is
+    # acceptable from this async caller — same pattern as
+    # `_read_text_safe` above. See Docs/playbook-specs.md §6.
+    if agent_id == "coach":
+        try:
+            from server.playbook.render import render_playbook_block  # noqa: PLC0415
 
-        playbook_body = render_playbook_block()
-        if playbook_body:
-            parts.append(playbook_body)
-    except Exception:
-        # Render failure is non-fatal — the playbook is read-only
-        # context for the agent. Log + continue without it.
-        logger.exception("playbook render failed (continuing without)")
+            playbook_body = render_playbook_block()
+            if playbook_body:
+                parts.append(playbook_body)
+        except Exception:
+            # Render failure is non-fatal — the playbook is read-only
+            # context for the agent. Log + continue without it.
+            logger.exception("playbook render failed (continuing without)")
 
     if not parts:
         return ""

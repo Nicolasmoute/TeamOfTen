@@ -97,7 +97,7 @@ The playbook is simpler than Compass by design:
 | Daily briefings | None | The lattice IS the briefing |
 | CLAUDE.md block injection (`<!-- compass:begin -->`) | Direct system-prompt injection via `build_system_prompt_suffix` | One read path, no marker dance |
 | Audit watcher (commit/decision/knowledge/output → audit) | None | No artifact-level scoring; daily reflection only |
-| MCP `compass_ask` / `compass_audit` / `compass_brief` / `compass_status` | One MCP tool: `coord_propose_playbook_changes` | Lattice already in every agent's prompt; no query tool needed |
+| MCP `compass_ask` / `compass_audit` / `compass_brief` / `compass_status` | One MCP tool: `coord_propose_playbook_changes` | Lattice already in Coach's prompt; no query tool needed |
 | Presence requirement (human heartbeat) | None | The reflection doesn't ask the human anything; runs autonomously |
 | Immutable bedrock seeds | None (latent capability only) | Hard rails live in code + lifecycle policy |
 
@@ -163,7 +163,7 @@ No `briefings/` subfolder — playbook doesn't generate daily summaries.
 Field notes:
 
 - `id` — stable string (`pb-NNN`, monotonic). Survives merges via `archived.json` cross-reference.
-- `text` — the statement body. **Hard cap `STATEMENT_MAX_CHARS` (default 160 chars, env-overridable via `HARNESS_PLAYBOOK_STATEMENT_MAX_CHARS`)** enforced on every insert path (Coach `coord_propose_playbook_changes`, daily reflection creations, bootstrap seeds). One line, imperative, no enumerated sub-items — the WEIGHT carries confidence; the text just needs to trigger recall. Detail and rationale belong in the prose corpus, not the lattice statement (lattice statements get injected into every agent's system prompt on every turn). Aim for ~120 chars typical.
+- `text` — the statement body. **Hard cap `STATEMENT_MAX_CHARS` (default 160 chars, env-overridable via `HARNESS_PLAYBOOK_STATEMENT_MAX_CHARS`)** enforced on every insert path (Coach `coord_propose_playbook_changes`, daily reflection creations, bootstrap seeds). One line, imperative, no enumerated sub-items — the WEIGHT carries confidence; the text just needs to trigger recall. Detail and rationale belong in the prose corpus, not the lattice statement (lattice statements get injected into Coach's system prompt on every Coach turn). Aim for ~120 chars typical.
 - `weight` — float in [0.0, 1.0].
 - `weight_history` — append-only list of weight transitions with reason. Cap at 50 most recent entries (older trimmed during write); `runs.jsonl` is the durable audit trail.
 - `applied_count` — integer; incremented by the daily reflection based on Coach's `relevant_ids` list (§5.5) — every statement Coach lists as "the day's events touched on this pattern" gets `+1`, whether or not weight was adjusted. Used by the dashboard to surface "frequently observed" via the sort key `weight × log(1 + applied_count)` (so a high-weight rule that fires often ranks above a high-weight rule that almost never fires). Monotonic — never decrements.
@@ -312,7 +312,7 @@ Single direct `claude_agent_sdk.query()` call with `model="latest_sonnet"`, `eff
 
 > Below is a prose playbook on coordinating a multi-agent team. Extract every distinct, actionable orchestration pattern as a single conceptual statement.
 >
-> Brevity (load-bearing — these statements are injected into every agent's system prompt on every turn):
+> Brevity (load-bearing — these statements are injected into Coach's system prompt on every Coach turn):
 > - Hard cap: 160 characters. Anything longer is rejected.
 > - One line, imperative form. "When X -> do Y" or "X needs Y." No enumerated sub-items, no parenthetical clauses listing what-goes-in.
 > - The WEIGHT carries confidence; the text just needs to trigger recall. Detail / rationale belongs in the prose corpus, not the lattice statement.
@@ -369,15 +369,15 @@ Distinct from §4.1-§4.4 (which describe the engine's first-run *content seedin
 
 6. **Canonical project CLAUDE.md template enrichment.** Extend [server/templates/app_dev_claude_md.md](../server/templates/app_dev_claude_md.md) with a short section (under a new heading, e.g. `### Team-wide orchestration playbook`):
 
-   > A harness-wide orchestration playbook is loaded into every agent's system prompt under `## Orchestration playbook`. It captures the team's evolving discipline as weighted statements (e.g. *"audit every code change except trivially mechanical edits"*) — each weight is the engine's current confidence that the pattern is the right play for this team. Treat high-weight statements as established discipline; deviate only with explicit reason. Coach can propose updates mid-turn via `coord_propose_playbook_changes`, and a daily reflection run evolves the lattice from observed events. Players follow the playbook as guidance and cannot influence it. The playbook is harness-wide — every project's Coach reads the same lattice, so improvements compound across projects.
+   > A harness-wide orchestration playbook is loaded into Coach's system prompt under `## Orchestration playbook`. It captures Coach's evolving coordination discipline as weighted statements (e.g. *"audit every code change except trivially mechanical edits"*) — each weight is the engine's current confidence that the pattern is the right play for this team. Coach treats high-weight statements as established discipline and deviates only with explicit reason. Coach can propose updates mid-turn via `coord_propose_playbook_changes`, and a daily reflection run evolves the lattice from observed events. The playbook is harness-wide — every project's Coach reads the same lattice, so coordination improvements compound across projects. Players don't see the playbook directly; coordination cues reach them through the wake notes Coach composes per stage.
 
    The Coach-driven reconciliation flow at [server/project_claude_md.py:update_claude_md_via_coach](../server/project_claude_md.py) propagates this template change to every existing project's CLAUDE.md on next activation (and once at boot for the active project) — no per-project manual edit needed. Per the harness convention (CLAUDE.md "Keep the canonical project CLAUDE.md template current"), updating the template is mandatory when shipping harness functionality projects need to know about.
 
-7. **Player role-prompt awareness.** Players' role prompts in [server/agents.py:_system_prompt_for](../server/agents.py) don't need a dedicated playbook section — the rendered playbook header (§6.2) carries the Players-follow-but-don't-influence framing inline.
+7. **Player role-prompt awareness.** Players' role prompts in [server/agents.py:_system_prompt_for](../server/agents.py) don't reference the playbook at all — Players don't see the lattice, and coordination patterns reach them through the per-stage wake notes Coach composes.
 
-8. **Migration on existing harness deployments.** No special handling required. First boot post-implementation adds the new `## Orchestration playbook` section to every agent's next system prompt (one cache-miss per agent on next turn). No session reset, no agent restart, no DB migration. Existing Compass installations are untouched. Boot order: shared/codex_llm.py refactor → playbook engine module load → scheduler task starts → first scheduler tick triggers bootstrap.
+8. **Migration on existing harness deployments.** No special handling required. First boot post-implementation adds the new `## Orchestration playbook` section to Coach's next system prompt (one cache-miss for Coach's next turn). Players' prompts are unchanged. No session reset, no agent restart, no DB migration. Existing Compass installations are untouched. Boot order: shared/codex_llm.py refactor → playbook engine module load → scheduler task starts → first scheduler tick triggers bootstrap.
 
-   **Cold-start window.** The scheduler ticks every 5 min by default (`HARNESS_PLAYBOOK_SCHEDULER_TICK_SECONDS`). On a fresh deploy, the first bootstrap fires up to 5 min after process start — during that window, agent system prompts have no `## Orchestration playbook` section. To eliminate the wait, the operator can hit `POST /api/playbook/bootstrap` (G7) immediately after deploy.
+   **Cold-start window.** The scheduler ticks every 5 min by default (`HARNESS_PLAYBOOK_SCHEDULER_TICK_SECONDS`). On a fresh deploy, the first bootstrap fires up to 5 min after process start — during that window, Coach's system prompt has no `## Orchestration playbook` section. To eliminate the wait, the operator can hit `POST /api/playbook/bootstrap` (G7) immediately after deploy.
 
 ---
 
@@ -551,7 +551,7 @@ This matches the precedent in Compass and the existing kDrive sync loop ([CLAUDE
 
 ## 6 · Read path — system-prompt injection
 
-The playbook is read into every agent's system prompt via [server/context.py:build_system_prompt_suffix](../server/context.py) — the same universal read path as CLAUDE.md. All agents see the same content. Only Coach can propose changes via the MCP tool (§7); Players read it as informational reference.
+The playbook is read into Coach's system prompt only via [server/context.py:build_system_prompt_suffix](../server/context.py). Players don't get the block — coordination discipline reaches Players through the per-stage wake notes Coach composes at each `coord_approve_stage` call, not through ambient prompt content. The lattice is Coach's coordination memory: the rules Coach proposes (via the MCP tool, §7) and the daily reflection runner refines.
 
 ### 6.1 Where in the prompt
 
@@ -567,14 +567,14 @@ Extends `build_system_prompt_suffix()` to append a third section after global + 
 [brief / coach_supplement / ...]    ← appended in agents.py
 ```
 
-Natural progression for Coach: lifecycle policy (in coord block — bedrock mechanics) → CLAUDE.md (global + project rules) → playbook (learned strategy). Bedrock → curated → evolved.
+Natural progression for Coach: lifecycle policy (in coord block — bedrock mechanics) → CLAUDE.md (global + project rules) → playbook (learned strategy). Bedrock → curated → evolved. Players' prompts stop after `[project CLAUDE.md]` — they don't get the playbook section.
 
 ### 6.2 Render format
 
 ```markdown
 ## Orchestration playbook
 
-Learned patterns for orchestrating this team. Each entry has a confidence weight in [0, 1] — high = validated discipline, low = validated anti-pattern, ~0.5 = uncertain. Apply high-confidence patterns by default; deviate with explicit reason. Coach updates this lattice mid-turn via `coord_propose_playbook_changes` and via a nightly reflection run; Players follow it as guidance and cannot influence it.
+Your coordination memory. Each entry has a confidence weight in [0, 1] — high = validated discipline, low = validated anti-pattern, ~0.5 = uncertain. Apply high-confidence patterns by default; deviate with explicit reason. Update this lattice mid-turn via `coord_propose_playbook_changes`; a nightly reflection run also evolves it from observed evidence. Coach-only context — Players don't see this block, so coordination discipline reaches them through the wake notes you compose at each `coord_approve_stage`.
 
 **Validated (weight ≥ 0.85):**
 - [0.92] Audit every code-touching task except trivially mechanical edits.
@@ -598,17 +598,19 @@ When `lattice.json` has zero active statements (cold-start before bootstrap, or 
 
 ### 6.3 Cost behavior
 
-Read every turn for every agent → cache-hits within the 5-min Anthropic prompt-cache window. Per-agent sessions each have their own cache; 8 KB × 11 agents ≈ 88 KB of cache-warm content distributed across agent sessions, but each individual turn pays only delta cost on cache hit. Lattice updates between turns invalidate cache for that agent's next turn → one full read, then back to cache hits. Net cost: trivial. Daily-run lattice updates invalidate the cache for every agent's next turn — amortized in practice because agents don't all turn simultaneously.
+Read every Coach turn → cache-hits within the 5-min Anthropic prompt-cache window. Coach's session has its own cache; ~8 KB of cache-warm content. Lattice updates between turns invalidate cache for Coach's next turn → one full read, then back to cache hits. Net cost: trivial. Players never read the lattice, so daily-run mutations cost nothing on the Player side.
 
-### 6.4 Why Players see it
+### 6.4 Why Players don't see it
 
-Players reading the same playbook content benefits team coherence: a Player who sees *"audit every code change"* in their system prompt internalizes the discipline directly without needing Coach to remind them every turn. Players cannot influence the lattice (the MCP tool is Coach-only), so visibility is read-only by construction. If a Player's behavior contradicts a high-weight playbook entry, that's signal for Coach's daily reflection — same as any other evidence.
+The playbook is Coach's coordination memory — patterns about *how to dispatch, audit, escalate, sequence work*, written in Coach's voice ("Update this lattice…"; "deviate with explicit reason"). Players don't dispatch, audit, escalate, or sequence — they execute the assignment in the wake note Coach hands them. Putting Coach's coordination memory in their prompt would be ambient noise they can't act on, and would dilute the per-task focus Coach already curates via `coord_approve_stage` notes. If a coordination pattern needs to influence Player behavior on a specific task, Coach lifts it into the wake note at dispatch time — that's the channel.
+
+The flip side: a high-weight playbook statement that *can't* be expressed as a per-task wake note is signal that the statement is mis-categorized — it's probably general engineering discipline (belongs in the project CLAUDE.md, which Players DO see) or a procedural plumbing rule (belongs in code, not the lattice).
 
 ---
 
 ## 7 · MCP tools
 
-One Coach-only tool. Players never see the propose surface (the lattice itself is visible to all via system-prompt injection per §6).
+One Coach-only tool. Players never see the propose surface — and they don't see the lattice itself either; it lives in Coach's system prompt only (per §6).
 
 ### 7.1 `coord_propose_playbook_changes(operations: list[dict]) → str`
 
@@ -910,7 +912,7 @@ Module guidelines:
 - **Briefing generation.** No daily summary file. The dashboard + the lattice itself ARE the surface.
 - **Per-artifact audit watcher.** No `commit_pushed → playbook audit` fan-out. Daily reflection only.
 - **Multi-statement embedding similarity for duplicate detection.** Token-overlap heuristic for v1 (cosine ≥ 0.85). Embedding-based dedup is a v2 feature when the lattice grows enough that token overlap misses real duplicates.
-- **Player ability to influence the playbook.** Players read but cannot propose changes (Coach-only MCP tool).
+- **Player ability to influence the playbook.** Players don't see the lattice and can't propose changes — the playbook is Coach's coordination memory.
 - **Cross-team / cross-harness federation.** Single harness instance. Sharing playbooks across deployments is a v2 idea.
 - **Reward function on top of the lattice.** Weight changes are the gradient analog; no scalar reward, no RL, no fine-tuning. The lattice itself IS the learning artifact.
 - **Immutable bedrock seeds in v1.** Schema supports the flag (latent capability); zero seeded.
@@ -1047,4 +1049,4 @@ All other prior open questions resolved during the audit:
 - Run-hour staggering: v1 single env var (`HARNESS_PLAYBOOK_RUN_HOUR_UTC`); revisit at 2nd harness instance.
 - Tool naming: `coord_propose_playbook_changes` (matches `coord_*` verb-first convention).
 - Prose template fate: keep `app_dev_playbook.md` as historical reference + re-bootstrap source.
-- Player visibility: Players read the lattice (universal system-prompt path); cannot influence (Coach-only MCP).
+- Player visibility: Players don't see the lattice — it is Coach's coordination memory and lands only in Coach's system prompt. Coordination patterns reach Players via the per-stage wake notes Coach composes at `coord_approve_stage`.

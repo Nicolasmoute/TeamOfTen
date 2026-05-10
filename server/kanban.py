@@ -526,15 +526,12 @@ async def send_role_stand_down(
         return []
     role_label = _role_label(role)
     new_label = ", ".join(new_owners) if new_owners else "(unassigned)"
-    body = (
+    from server.tools import _with_player_reminder
+    body = _with_player_reminder(
         f"Coach reassigned the {role_label} role on task {task_id} "
-        f"from you to {new_label}. STOP work on {task_id} now: do not "
-        f"edit, commit, push, or publish anything for this task. The "
-        f"kanban will not credit further work from you on it. If you "
-        f"have local uncommitted changes that may matter, message "
-        f"Coach via coord_send_message(to='coach', body='task "
-        f"{task_id} stand-down: I had local changes — keep / discard?') "
-        f"BEFORE discarding them."
+        f"from you to {new_label}. STOP — do not edit, commit, push, "
+        f"or publish for this task. If you have local uncommitted "
+        f"changes worth preserving, message Coach before discarding."
     )
     try:
         from datetime import datetime, timezone
@@ -1318,40 +1315,25 @@ async def _wake_role_or_emit_needed(*, task_id: str, role: str) -> None:
             task_id=task_id, role=role, focus=focus, is_pool=is_pool,
         )
     else:
-        completion_hint = await _completion_hint_for_role(task_id, role)
         if not is_pool:
             prompt = (
-                f"Task {task_id} has entered your active {role_label} stage. "
-                f"BEFORE editing, committing, or publishing anything: call "
-                f"coord_my_assignments and confirm task {task_id} appears "
-                f"under your active roles with role={role!r}. If you do NOT "
-                f"see it there, you have been reassigned or the task moved "
-                f"on — STOP and message Coach via coord_send_message(to="
-                f"'coach', body='clarify status of {task_id}'). Do not act "
-                f"on this wake message alone — it can be stale by the time "
-                f"you read it.\n\nIf you ARE the active assignee, do the "
-                f"role work, then call the completion tool below — the "
-                f"kanban does NOT advance until you do.\n\n{completion_hint}"
+                f"Task {task_id} has entered your active {role_label} stage."
             )
         else:
             prompt = (
-                f"Task {task_id} has entered {role_label}. You appear in "
-                f"its FYI pool list. In v2 pools do NOT auto-resolve — "
-                f"Coach picks the assignee explicitly via "
-                f"coord_approve_stage. Wait for Coach's wake naming "
-                f"you; do NOT start the role work without it (the "
-                f"kanban won't credit unauthorized work). If Coach has "
-                f"gone silent, message Coach to ask which Player should "
-                f"take it.\n\nIf you ARE woken with an explicit "
-                f"assignment later, the next step will be:"
-                f"\n{completion_hint}"
+                f"Task {task_id} has entered {role_label}. You're in "
+                f"its FYI pool — Coach hasn't picked an assignee. "
+                f"Don't start work; wait for an explicit assignment."
             )
 
     try:
         from server.agents import maybe_wake_agent
+        from server.tools import _with_player_reminder
         for slot in targets:
             try:
-                slot_prompt = prompt + await _executor_worktree_boundary(role, slot)
+                slot_prompt = _with_player_reminder(
+                    prompt + await _executor_worktree_boundary(role, slot)
+                )
                 await maybe_wake_agent(
                     slot, slot_prompt,
                     bypass_debounce=True,

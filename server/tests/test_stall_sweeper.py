@@ -159,50 +159,52 @@ async def test_stall_sweeper_falls_back_to_executor_when_no_role_row(
     assert stall_events[0]["owner"] == "p8"
 
 
-async def test_stall_nudge_for_audit_semantics_names_submit_audit_report(
+async def test_stall_nudge_is_v2_fact_only(fresh_db: str) -> None:
+    """v2 strip: `_stall_nudge_for_stage` returns the fact line and
+    nothing else — no per-stage tool enumeration, no
+    tool-not-visible escape clause, no procedural ladder. The
+    canonical turn-end reminder is appended by the caller via
+    `_with_player_reminder`; the per-stage tool names + Codex
+    fallback discipline live in the system prompt (project
+    CLAUDE.md template + role baseline). Wakes are facts the
+    Player can't derive otherwise; rules are loaded once per turn.
+    """
+    from server.idle_poller import _stall_nudge_for_stage
+    for stage in (
+        "plan", "execute", "audit_syntax", "audit_semantics", "ship",
+    ):
+        nudge = _stall_nudge_for_stage(
+            task_id="t-2026-05-04-aaaaaaaa",
+            stage=stage,
+            age_min=5,
+        )
+        # Fact MUST be there.
+        assert "t-2026-05-04-aaaaaaaa" in nudge
+        assert stage in nudge
+        assert "5 minutes" in nudge
+        # Tool enumeration MUST NOT be there.
+        assert "coord_commit_push" not in nudge
+        assert "coord_submit_audit_report" not in nudge
+        assert "coord_role_complete" not in nudge
+        assert "coord_write_task_spec" not in nudge
+        # Tool-not-visible escape MUST NOT be there (system prompt).
+        assert "not visible" not in nudge
+        assert "message Coach IMMEDIATELY" not in nudge
+
+
+async def test_stall_nudge_unknown_stage_still_returns_fact(
     fresh_db: str,
 ) -> None:
-    """The stall reminder text for an audit_semantics-stuck task must
-    name `coord_submit_audit_report`, not `coord_commit_push`. The
-    previous version hardcoded executor tools regardless of stage."""
+    """Defensive: any stage value (including unrecognized ones)
+    produces a fact-line nudge — no `else: ...` ladder branch
+    exists in v2 to add procedural fallback content."""
     from server.idle_poller import _stall_nudge_for_stage
     nudge = _stall_nudge_for_stage(
-        task_id="t-2026-05-04-aaaaaaaa",
-        stage="audit_semantics",
-        age_min=5,
+        task_id="t-1", stage="some_future_stage", age_min=10,
     )
-    assert "coord_submit_audit_report" in nudge
-    assert "kind='semantics'" in nudge
-    assert "coord_commit_push" not in nudge
-
-
-async def test_stall_nudge_for_ship_names_role_complete(
-    fresh_db: str,
-) -> None:
-    """v2: ship-stage stall nudge points at coord_role_complete (the
-    v2 collapsed completion tool); v1's coord_mark_shipped is gone."""
-    from server.idle_poller import _stall_nudge_for_stage
-    nudge = _stall_nudge_for_stage(
-        task_id="t-2026-05-04-aaaaaaaa",
-        stage="ship",
-        age_min=5,
-    )
-    assert "coord_role_complete" in nudge
-    assert "coord_mark_shipped" not in nudge
-    assert "coord_commit_push" not in nudge
-
-
-async def test_stall_nudge_includes_tool_not_visible_escape(
-    fresh_db: str,
-) -> None:
-    """Production trace: Player wrote audit to disk and stopped because
-    they couldn't see the named tool. The nudge must explicitly tell
-    them to message Coach in that case."""
-    from server.idle_poller import _stall_nudge_for_stage
-    nudge = _stall_nudge_for_stage(
-        task_id="t-2026-05-04-aaaaaaaa",
-        stage="audit_syntax",
-        age_min=5,
-    )
-    assert "not visible" in nudge
-    assert "message Coach IMMEDIATELY" in nudge
+    assert "t-1" in nudge
+    assert "some_future_stage" in nudge
+    assert "10 minutes" in nudge
+    # Even fallback is fact-only — no "Call coord_my_assignments"
+    # imperative as in the v1 ladder.
+    assert "coord_my_assignments" not in nudge

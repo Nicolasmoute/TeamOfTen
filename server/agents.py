@@ -107,10 +107,11 @@ async def _deliver_system_message(
         try:
             preview = body.strip().replace("\n", " ")[:240]
             subj = f" (subject: {subject})" if subject else ""
-            await maybe_wake_agent(
-                to_id,
-                f"New message from {from_id}{subj}: \"{preview}\"",
-            )
+            wake_body = f"New message from {from_id}{subj}: \"{preview}\""
+            if to_id != "coach":
+                from server.tools import _with_player_reminder
+                wake_body = _with_player_reminder(wake_body)
+            await maybe_wake_agent(to_id, wake_body)
         except Exception:
             logger.exception("_deliver_system_message wake failed")
 
@@ -1270,8 +1271,13 @@ _last_turn_ended_at: dict[str, float] = {}
 # single busy stretch fold into one follow-up turn (the inbox /
 # project_events tables retain the actual content; the prompt is
 # just the most recent trigger). Tuple shape:
-#   (reason, wake_source, plan_mode, bypass_debounce)
-_pending_wakes: dict[str, tuple[str, str | None, bool | None, bool]] = {}
+#   (reason, wake_source, plan_mode)
+# The deferred fire ALWAYS bypasses debounce: the wake was generated
+# by an event arriving during the turn, not in reaction to the turn's
+# own output, so the ping-pong guard doesn't apply. The just-stamped
+# `_last_turn_ended_at` value would otherwise drop the deferred fire
+# at microsecond age.
+_pending_wakes: dict[str, tuple[str, str | None, bool | None]] = {}
 
 # Post-error auto-retry tracking. After a hard error (not the
 # suppressed post-result teardown variety), we schedule a single wake
@@ -5424,7 +5430,7 @@ async def run_agent(
     # Appended to the hardcoded role brief so context edits take effect on
     # the next turn with no restart required. Empty string when no
     # context is configured — agents behave as before.
-    context_suffix = await build_system_prompt_suffix()
+    context_suffix = await build_system_prompt_suffix(agent_id)
     # Per-agent brief — free-form context the human set via
     # PUT /api/agents/{id}/brief. Injected AFTER the governance layer so
     # it can narrow / specialize without being overwhelmed by team-wide
@@ -5590,7 +5596,7 @@ async def run_agent(
     # do. Per-agent stability:
     #   identity        — per (slot, project), changes on rare edits
     #   role_baseline   — constant per slot
-    #   context_suffix  — per (global+project CLAUDE.md mtime + playbook)
+    #   context_suffix  — per (global+project CLAUDE.md mtime; +playbook for Coach)
     #   brief           — per agents.brief edit
     #   coordination    — per Coach turn (Coach only; "" for Players)
     #   coach_supplement— per objectives/todos change (Coach only)
@@ -5973,27 +5979,39 @@ async def run_agent(
 
     # Queue-on-busy: any wake that landed while this turn was running
     # was stashed in _pending_wakes. Fire it now — calls back into
-    # maybe_wake_agent so the standard guards (paused / debounce /
-    # cost cap) still apply. Latest-wins: only the most recent queued
-    # wake fires. The inbox + project_events tables retain the actual
-    # message / event payloads, so coalescing the prompt doesn't lose
-    # information — Coach reads inbox in the next turn and sees
-    # everything that arrived while it was busy.
-    queued = _pending_wakes.pop(agent_id, None)
-    if queued is not None:
-        q_reason, q_source, q_plan, q_bypass = queued
-        try:
-            await maybe_wake_agent(
-                agent_id,
-                q_reason,
-                bypass_debounce=q_bypass,
-                wake_source=q_source,
-                plan_mode=q_plan,
-            )
-        except Exception:
-            logger.exception(
-                "post-turn deferred wake failed for %s", agent_id
-            )
+    # maybe_wake_agent so the pause + cost-cap guards still apply.
+    # Always bypasses debounce: the wake came from an event during
+    # the turn, not in reaction to the turn's own output, so the
+    # just-stamped _last_turn_ended_at would wrongly drop it.
+    # Latest-wins: only the most recent queued wake fires. The inbox
+    # + project_events tables retain the actual message / event
+    # payloads, so coalescing the prompt doesn't lose information —
+    # Coach reads inbox in the next turn and sees everything that
+    # arrived while it was busy.
+    #
+    # Skip when auto_compact=True: this is the recursive compact
+    # preamble fired by `maybe_auto_compact` BEFORE the outer turn
+    # claims the slot, so the outer turn (running the user's actual
+    # prompt) is about to handle the queue itself. Firing here would
+    # race against the outer slot-claim and either steal the slot or
+    # spawn_reject. Manual /compact (no auto_compact flag) still
+    # drains the queue normally.
+    if not auto_compact:
+        queued = _pending_wakes.pop(agent_id, None)
+        if queued is not None:
+            q_reason, q_source, q_plan = queued
+            try:
+                await maybe_wake_agent(
+                    agent_id,
+                    q_reason,
+                    bypass_debounce=True,
+                    wake_source=q_source,
+                    plan_mode=q_plan,
+                )
+            except Exception:
+                logger.exception(
+                    "post-turn deferred wake failed for %s", agent_id
+                )
 
 
 async def _get_status_of(agent_id: str) -> str | None:
@@ -6304,10 +6322,10 @@ async def maybe_wake_agent(
     if agent_id in _running_tasks:
         # Queue-on-busy: stash the latest wake args so a fresh turn
         # fires once the current one ends. Replaces any prior queued
-        # entry for this slot — latest-wins.
-        _pending_wakes[agent_id] = (
-            reason, wake_source, plan_mode, bypass_debounce,
-        )
+        # entry for this slot — latest-wins. `bypass_debounce` is NOT
+        # recorded: the deferred fire always bypasses (see the
+        # _pending_wakes comment above).
+        _pending_wakes[agent_id] = (reason, wake_source, plan_mode)
         logger.info(
             "auto-wake queued (slot %s busy): %s", agent_id, reason[:80]
         )

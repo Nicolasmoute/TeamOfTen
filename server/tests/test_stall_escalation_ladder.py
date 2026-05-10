@@ -587,10 +587,13 @@ async def test_rung_4_archive_fires_stand_down_to_assignee(
     stand_down = [e for e in events if e.get("type") == "task_role_stand_down"]
     assert len(stand_down) == 1, events
     assert "p3" in stand_down[0].get("displaced", [])
-    # The stand-down wake itself goes to the displaced Player.
+    # The stand-down wake itself goes to the displaced Player. The v2
+    # wake-strip rephrased "STOP work on X now" → "STOP — do not edit,
+    # commit, push, ..." (preserves the safety lockout, drops the
+    # explainer).
     p3_wakes = [
         b for s, b in wake_stub.calls
-        if s == "p3" and "STOP work" in b
+        if s == "p3" and "STOP" in b and "do not edit" in b
     ]
     assert p3_wakes, wake_stub.calls
 
