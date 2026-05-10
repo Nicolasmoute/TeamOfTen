@@ -737,7 +737,7 @@ def _ok(text: str) -> dict[str, Any]:
 def _err(text: str) -> dict[str, Any]:
     return {
         "content": [{"type": "text", "text": f"ERROR: {text}"}],
-        "isError": True,
+        "is_error": True,
     }
 
 
