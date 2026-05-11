@@ -2047,6 +2047,52 @@ class CodexRuntime:
             # Drop the cached client — compact failures often correlate
             # with stale thread state on the subprocess side.
             await close_client(tc.agent_id)
+
+            # Stale-thread detection: Codex backend already dropped this
+            # thread (CodexProtocolError "thread not found"). Without
+            # clearing the stored id, every retry hits the same dead
+            # thread and loops. Mirror open_thread's auto-heal: null the
+            # id and, in transfer mode, complete the flip — the thread
+            # is gone server-side, there's nothing to salvage by staying.
+            sdk = _import_codex_sdk()
+            protocol_cls = getattr(sdk, "CodexProtocolError", None)
+            is_stale_thread = (
+                "thread not found" in str(exc).lower()
+                or (protocol_cls is not None and isinstance(exc, protocol_cls))
+            )
+            _xfer_to = (
+                (tc.turn_ctx.get("transfer_to_runtime") or "").strip().lower()
+            )
+            if is_stale_thread:
+                await _clear_codex_thread_id(tc.agent_id)
+                if _xfer_to in ("claude", "codex"):
+                    from server.agents import (
+                        _perform_runtime_transfer_flip, _resolve_runtime_for,
+                    )
+                    _xfer_from = await _resolve_runtime_for(tc.agent_id)
+                    await _perform_runtime_transfer_flip(tc.agent_id, _xfer_to)
+                    await _emit(
+                        tc.agent_id,
+                        "session_transferred",
+                        from_runtime=_xfer_from,
+                        to_runtime=_xfer_to,
+                        note=(
+                            "codex thread no longer existed; transferred "
+                            "without compact summary"
+                        ),
+                    )
+                else:
+                    await _emit(
+                        tc.agent_id,
+                        "session_compacted",
+                        note=(
+                            "codex thread no longer existed; reset to "
+                            "fresh session"
+                        ),
+                    )
+                tc.turn_ctx["got_result"] = True
+                return
+
             await _emit(tc.agent_id, "error", error=f"compact failed: {exc}")
             await _set_status(tc.agent_id, "error")
             return
