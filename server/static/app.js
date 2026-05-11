@@ -425,10 +425,12 @@ function pushPromptHistory(slot, text) {
 
 const PANE_SETTINGS_KEY = "harness_pane_settings_v1";
 
-// Default: let the server pick (will use claude-sonnet-4-6 or whatever
-// is set in Dockerfile env). Users can override per-pane.
+// Per-runtime model lists. No "default" entry — the UI pre-selects
+// the resolved model (pane override > Coach override > role default).
+// To revert to the role default the user clicks the "clear overrides"
+// button, which wipes pane state and re-renders against the next
+// fallback. Concrete ids only on the wire.
 const MODEL_OPTIONS = [
-  { value: "", label: "default" },
   { value: "claude-opus-4-7", label: "Opus 4.7" },
   { value: "claude-sonnet-4-6", label: "Sonnet 4.6" },
   { value: "claude-haiku-4-5-20251001", label: "Haiku 4.5" },
@@ -437,7 +439,6 @@ const MODEL_OPTIONS = [
 // Codex (OpenAI) model options for slots running on the codex
 // runtime. Pricing for these lives in `server/pricing.py`.
 const CODEX_MODEL_OPTIONS = [
-  { value: "", label: "default" },
   { value: "gpt-5.5", label: "GPT-5.5" },
   { value: "gpt-5.4", label: "GPT-5.4" },
   { value: "gpt-5.4-mini", label: "GPT-5.4 mini" },
@@ -500,7 +501,11 @@ function modelLabelFor(id, runtime) {
     opts.find((m) => m.value === resolved) ||
     CODEX_MODEL_OPTIONS.find((m) => m.value === resolved) ||
     MODEL_OPTIONS.find((m) => m.value === resolved);
-  return match ? match.label : (resolved || "default");
+  // Falls through to the raw id (e.g. an alias we don't know yet) only
+  // when no concrete catalog entry matches. Empty input shouldn't happen
+  // now that `effectiveModelId` always resolves through the role-default
+  // fallback, but degrade to the runtime tag rather than silent emptiness.
+  return match ? match.label : (resolved || (runtime === "codex" ? "Codex" : "Claude"));
 }
 
 // Effort: 1=low, 2=med, 3=high, 4=max. Mapped server-side to a
@@ -577,8 +582,22 @@ function savePaneSettings(slot, settings) {
   }
 }
 
-function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, initialName, initialRole, initialRuntime }) {
-  const effort = settings.effort || 0; // 0 = default (server decides)
+function PaneSettingsPopover({
+  settings, onChange, onClose, slot,
+  initialBrief, initialName, initialRole, initialRuntime,
+  effectiveModel, effectiveEffort, effectivePlanMode,
+}) {
+  // No more "0 = default" position — slider always reflects the
+  // concrete tier that the next spawn will use. When the pane has
+  // no effort override, fall through to the resolved value computed
+  // by AgentPane (pane > server override > role default → medium).
+  const effort = settings.effort || effectiveEffort || 2;
+  // Same shape for plan-mode: when the pane has no explicit toggle
+  // value, show the resolved state. The checkbox writing back to
+  // paneSettings keeps the existing per-pane override semantics.
+  const planChecked = settings.planMode !== undefined
+    ? !!settings.planMode
+    : !!effectivePlanMode;
   const rootRef = useRef(null);
   const [briefDraft, setBriefDraft] = useState(initialBrief || "");
   const [briefSaving, setBriefSaving] = useState(false);
@@ -650,11 +669,9 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
     })();
     return () => { cancelled = true; };
   }, [slot]);
-  // Resolve the team-wide default model so the "default" option in the
-  // dropdown can show what it'll actually fall through to (e.g.
-  // "default (Sonnet 4.6)"). Avoids the trap where users set a team
-  // default in the Settings drawer and then see "default" in the gear
-  // popover and assume the agent is running the SDK default.
+  // Fetched from /api/team/models. No longer used to decorate a
+  // "default" option (removed) — kept because future popover surfaces
+  // (e.g. role-default reset hints) may want the resolved suggestions.
   const [roleDefaultModels, setRoleDefaultModels] = useState(null);
   useEffect(() => {
     let cancelled = false;
@@ -671,41 +688,32 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
     })();
     return () => { cancelled = true; };
   }, [slot]);
-  // PR 6 / audit-item-18: model dropdown options depend on the
-  // currently-selected runtime. When the slot is on Codex, list
-  // CODEX_MODEL_OPTIONS; on Claude, list MODEL_OPTIONS. Falls back to
-  // Claude when the runtime isn't yet known (initial render). The
-  // suffix that decorates the "default" entry uses the role-default
-  // model resolved server-side — preferring the human-set
-  // team_config row, falling back to the hardcoded `suggested`
-  // role default so the popover always shows a concrete model name
-  // (no "default" with no parens) even on a fresh deploy.
+  // Model dropdown options depend on the currently-selected runtime.
+  // When the slot is on Codex, list CODEX_MODEL_OPTIONS; on Claude,
+  // list MODEL_OPTIONS. Falls back to Claude when the runtime isn't
+  // yet known (initial render). Concrete ids only — no "default"
+  // entry; the dropdown pre-selects the resolved model so the user
+  // sees what the next spawn will actually use.
   const modelOptions = useMemo(() => {
     const effectiveRuntime = runtimeDraft || roleDefaultRuntime || "claude";
-    const base = modelOptionsFor(effectiveRuntime);
-    const role = slot === "coach" ? "coach" : "players";
-    const key = effectiveRuntime === "codex" ? role + "_codex" : role;
-    let roleDefaultModel = roleDefaultModels ? (roleDefaultModels[key] || "") : "";
-    if (!roleDefaultModel && roleDefaultModels) {
-      const suggested = effectiveRuntime === "codex"
-        ? roleDefaultModels.suggested_codex
-        : roleDefaultModels.suggested;
-      if (suggested && suggested[role]) roleDefaultModel = suggested[role];
-    }
-    if (!roleDefaultModel) return base;
-    const match = base.find((m) => m.value === roleDefaultModel);
-    const suffix = match ? match.label : roleDefaultModel;
-    return base.map((m) =>
-      m.value === "" ? { ...m, label: `default (${suffix})` } : m
-    );
-  }, [roleDefaultModels, roleDefaultRuntime, runtimeDraft, slot]);
+    return modelOptionsFor(effectiveRuntime);
+  }, [roleDefaultRuntime, runtimeDraft]);
+  // If a stale pane override doesn't fit the current runtime, drop it
+  // so the dropdown can re-pin to the effective resolved model.
   useEffect(() => {
     if (!runtimeDraft && roleDefaultRuntime === null) return;
     const current = settings.model || "";
     if (!current) return;
     if (modelOptions.some((m) => m.value === current)) return;
-    onChange((s) => ({ ...s, model: "" }));
+    onChange((s) => ({ ...s, model: undefined }));
   }, [modelOptions, onChange, roleDefaultRuntime, runtimeDraft, settings.model]);
+  // Resolve the model id the dropdown should show as selected. When
+  // the pane has no override, fall through to the value computed by
+  // the parent AgentPane (same resolution chain as the chip).
+  const selectedModelId = (() => {
+    const raw = settings.model || effectiveModel || "";
+    return resolveModelAlias(raw);
+  })();
   const saveIdentity = useCallback(async () => {
     if (!slot) return;
     setIdentitySaving(true);
@@ -795,7 +803,7 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
         <label class="pane-settings-label">Model</label>
         <select
           class="pane-settings-select"
-          value=${settings.model || ""}
+          value=${selectedModelId}
           onChange=${(e) => onChange({ ...settings, model: e.target.value || undefined })}
         >
           ${modelOptions.map(
@@ -810,19 +818,8 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
             <input
               type="radio"
               name=${"pane-runtime-" + (slot || "x")}
-              value=""
-              checked=${runtimeDraft === ""}
-              disabled=${runtimeSaving}
-              onChange=${() => saveRuntime("")}
-            />
-            default
-          </label>
-          <label>
-            <input
-              type="radio"
-              name=${"pane-runtime-" + (slot || "x")}
               value="claude"
-              checked=${runtimeDraft === "claude"}
+              checked=${runtimeDraft === "claude" || (runtimeDraft === "" && (roleDefaultRuntime || "claude") === "claude")}
               disabled=${runtimeSaving}
               onChange=${() => saveRuntime("claude")}
             />
@@ -833,23 +830,31 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
               type="radio"
               name=${"pane-runtime-" + (slot || "x")}
               value="codex"
-              checked=${runtimeDraft === "codex"}
+              checked=${runtimeDraft === "codex" || (runtimeDraft === "" && roleDefaultRuntime === "codex")}
               disabled=${runtimeSaving}
               onChange=${() => saveRuntime("codex")}
             />
             Codex
           </label>
+          ${runtimeDraft
+            ? html`<button
+                class="pane-settings-runtime-reset"
+                disabled=${runtimeSaving}
+                onClick=${() => saveRuntime("")}
+                title="Clear the per-slot runtime override (blunt-clear, no session transfer). Future spawns fall through to the role default."
+              >reset</button>`
+            : null}
         </div>
         ${runtimeError
           ? html`<span class="pane-settings-runtime-err">${runtimeError}</span>`
-          : html`<span class="pane-settings-hint">Picking Claude/Codex runs a session transfer (compact + flip) so the new runtime inherits the conversation. "default" reverts blunt-clear. Mid-turn change rejected — cancel first.</span>`}
+          : html`<span class="pane-settings-hint">Picking Claude/Codex runs a session transfer (compact + flip) so the new runtime inherits the conversation. Reset reverts blunt-clear (no transfer). Mid-turn change rejected — cancel first.</span>`}
       </div>
       <div class="pane-settings-row">
         <label class="pane-settings-label">
           <input
             type="checkbox"
-            checked=${!!settings.planMode}
-            onChange=${(e) => onChange({ ...settings, planMode: e.target.checked || undefined })}
+            checked=${planChecked}
+            onChange=${(e) => onChange({ ...settings, planMode: e.target.checked })}
           />
           Plan mode
         </label>
@@ -859,17 +864,17 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
         <label class="pane-settings-label">Effort</label>
         <input
           type="range"
-          min="0"
+          min="1"
           max="4"
           value=${effort}
           class="pane-settings-slider"
           onInput=${(e) => {
             const v = parseInt(e.target.value, 10);
-            onChange({ ...settings, effort: v > 0 ? v : undefined });
+            onChange({ ...settings, effort: v });
           }}
         />
         <span class="pane-settings-effort-val">
-          ${effort === 0 ? "default" : EFFORT_LABELS[effort - 1]}
+          ${EFFORT_LABELS[effort - 1]}
         </span>
       </div>
       <div class="pane-settings-row pane-settings-brief">
@@ -896,9 +901,11 @@ function PaneSettingsPopover({ settings, onChange, onClose, slot, initialBrief, 
         </div>
       </div>
       <div class="pane-settings-actions">
-        <button class="pane-settings-reset" onClick=${() => onChange({})}>
-          reset
-        </button>
+        <button
+          class="pane-settings-reset"
+          onClick=${() => onChange({})}
+          title="Clear pane-local model/effort/plan overrides — future spawns fall through to Coach-set or role-default values."
+        >clear overrides</button>
         <button class="pane-settings-close" onClick=${onClose}>done</button>
       </div>
     </div>
@@ -1910,6 +1917,10 @@ function App() {
         ev.type === "session_cleared" ||
         ev.type === "player_assigned" ||
         ev.type === "runtime_updated" ||
+        ev.type === "session_transferred" ||
+        ev.type === "agent_model_set" ||
+        ev.type === "agent_effort_set" ||
+        ev.type === "agent_plan_mode_set" ||
         ev.type === "lock_updated" ||
         ev.type === "agent_cancelled"
       ) {
@@ -9819,19 +9830,26 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
   }, [paneSettings.model, agentModelOverride, roleDefaultModels, effectiveRuntime, slot, lastTurn]);
   // Resolve the effort tier shown on the chip. Precedence mirrors
   // server/agents.py:run_agent's spawn-time chain:
-  //   pane override (1..4) > latest turn's effort > role-level
-  //   default (`ROLE_DEFAULT_EFFORT`, mirror of `_ROLE_EFFORT_DEFAULTS`
-  //   in `server/models_catalog.py`).
-  // The role-level default is runtime-agnostic on the server (medium
-  // for everyone) — both Claude and Codex runtimes pick up the same
-  // value through the same dispatcher path. Without this fallback the
-  // chip would lie about cold-start effort (read "low" when the
-  // server is actually about to run medium).
+  //   pane override (1..4) > Coach-set agent.effort_override
+  //   > latest turn's effort > role-level default
+  //   (`ROLE_DEFAULT_EFFORT`, mirror of `_ROLE_EFFORT_DEFAULTS` in
+  //   `server/models_catalog.py`, medium for everyone).
   const effectiveEffort = paneSettings.effort
     ? paneSettings.effort
-    : (lastTurn && typeof lastTurn.effort === "number" && lastTurn.effort > 0
-        ? lastTurn.effort
-        : ROLE_DEFAULT_EFFORT[slot === "coach" ? "coach" : "players"]);
+    : (typeof agent?.effort_override === "number" && agent.effort_override > 0
+        ? agent.effort_override
+        : (lastTurn && typeof lastTurn.effort === "number" && lastTurn.effort > 0
+            ? lastTurn.effort
+            : ROLE_DEFAULT_EFFORT[slot === "coach" ? "coach" : "players"]));
+  // Plan-mode chip: pane override (boolean) > Coach-set
+  // agent.plan_mode_override (boolean) > role default (false).
+  // `lastTurn` doesn't carry plan_mode so the middle layer is the
+  // last source before the role default.
+  const effectivePlanMode = paneSettings.planMode !== undefined
+    ? !!paneSettings.planMode
+    : (agent?.plan_mode_override !== null && agent?.plan_mode_override !== undefined
+        ? !!agent.plan_mode_override
+        : false);
 
   const loadRoleDefaultRuntime = useCallback(async () => {
     try {
@@ -10455,10 +10473,12 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
     const cmd = first.toLowerCase();
     const arg = rest.join(" ");
     switch (cmd) {
-      case "/plan":
-        setPaneSettings((s) => ({ ...s, planMode: !s.planMode }));
-        setInfoText("Plan mode: " + (!paneSettings.planMode ? "ON" : "OFF"));
+      case "/plan": {
+        const next = !effectivePlanMode;
+        setPaneSettings((s) => ({ ...s, planMode: next }));
+        setInfoText("Plan mode: " + (next ? "ON" : "OFF"));
         return true;
+      }
       case "/model":
         setSettingsOpen(true);
         setInfoText(null);
@@ -10947,7 +10967,11 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
       if (effectiveRuntimeKnown && paneSettings.model && paneModelValidForRuntime) {
         reqBody.model = paneSettings.model;
       }
-      if (paneSettings.planMode) reqBody.plan_mode = true;
+      // Send the pane plan-mode override only when explicitly set
+      // (true OR false). undefined => no pane override, server falls
+      // through to its own chain (Coach override > role default).
+      // bool|None semantics on the server side (StartAgentRequest).
+      if (paneSettings.planMode !== undefined) reqBody.plan_mode = !!paneSettings.planMode;
       if (paneSettings.effort) reqBody.effort = paneSettings.effort;
 
       // Optimistic insert BEFORE the network roundtrip so the prompt is
@@ -11227,6 +11251,9 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
               initialName=${agent?.name || ""}
               initialRole=${agent?.role || ""}
               initialRuntime=${agent?.runtime_override || ""}
+              effectiveModel=${effectiveModelId}
+              effectiveEffort=${effectiveEffort}
+              effectivePlanMode=${effectivePlanMode}
               onClose=${() => setSettingsOpen(false)}
             />`
           : null}
@@ -11400,13 +11427,18 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
             ${modelLabelFor(effectiveModelId, effectiveRuntime)}
           </button>
           <button
-            class=${"pane-mode-chip" + (paneSettings.planMode ? " active" : "")}
-            onClick=${() => setPaneSettings((s) => ({ ...s, planMode: !s.planMode }))}
-            title=${paneSettings.planMode
-              ? "Plan mode ON — agent drafts a plan first (click to turn off)"
-              : "Plan mode OFF — agent acts directly (click to turn on)"}
+            class=${"pane-mode-chip" + (effectivePlanMode ? " active" : "")}
+            onClick=${() => setPaneSettings((s) => ({ ...s, planMode: !effectivePlanMode }))}
+            title=${(() => {
+              const src = paneSettings.planMode !== undefined
+                ? "per-pane override"
+                : (agent?.plan_mode_override !== null && agent?.plan_mode_override !== undefined
+                    ? "Coach-set override"
+                    : "role default");
+              return `Plan mode ${effectivePlanMode ? "ON" : "OFF"} (${src}) — click to toggle`;
+            })()}
           >
-            ${paneSettings.planMode ? "plan" : "no plan"}
+            ${effectivePlanMode ? "plan" : "no plan"}
           </button>
           <button
             class=${"pane-mode-chip" + (paneSettings.effort ? " active" : "")}

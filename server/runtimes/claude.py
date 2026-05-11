@@ -174,6 +174,37 @@ class ClaudeRuntime:
         # the real values. See server/agent_env.py for the policy.
         from server.agent_env import build_agent_env_overrides
         options_kwargs["env"] = build_agent_env_overrides()
+
+        # Tool Search — the SDK serves tool definitions on demand
+        # (via a built-in `tool_search_tool_bm25` / `_regex` retriever)
+        # instead of injecting every registered tool's schema into
+        # every turn. The coord MCP server alone is ~45.5K chars of
+        # tool schema for 45 tools (measured 2026-05-11 via
+        # `coord_schema_chars` in server/tools.py); auto:30 means
+        # "kick in once the registered count is at least 30," which
+        # the harness always satisfies. Returns 3–5 most relevant
+        # tools per agent search, plus the search tool itself stays
+        # registered. Disable per-deploy via
+        # `HARNESS_TOOL_SEARCH=false` if a CLI build regresses on
+        # this path. Override the threshold via
+        # `HARNESS_TOOL_SEARCH_AUTO_AT=<int>`.
+        #
+        # Gating: Haiku doesn't support tool search per the SDK docs
+        # (requires Sonnet 4 / Opus 4 or later). Skip when the
+        # resolved model is Haiku — otherwise the spawn would either
+        # crash or silently degrade. `tc.model` is the post-
+        # resolution concrete id (alias → concrete at spawn time);
+        # the substring check covers both alias and id forms.
+        _ts_enabled = os.environ.get("HARNESS_TOOL_SEARCH", "true").lower() not in (
+            "0", "false", "no", "off"
+        )
+        if _ts_enabled and "haiku" not in (tc.model or "").lower():
+            _ts_threshold = os.environ.get("HARNESS_TOOL_SEARCH_AUTO_AT", "30").strip()
+            try:
+                int(_ts_threshold)
+            except ValueError:
+                _ts_threshold = "30"
+            options_kwargs["env"]["ENABLE_TOOL_SEARCH"] = f"auto:{_ts_threshold}"
         if tc.model:
             options_kwargs["model"] = tc.model
         options_kwargs["permission_mode"] = "plan" if tc.plan_mode else "default"

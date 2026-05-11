@@ -50,8 +50,25 @@ if not logger.handlers:
 # runaway doc doesn't silently bloat costs.
 _MAX_CLAUDE_MD_CHARS = 200_000
 
+# Cache of `_read_text_safe` results, keyed by (resolved-path-string,
+# mtime_ns, size). On Codex turns this function is called twice per
+# turn × 11 agents; caching cuts the per-turn cost to a single stat()
+# when nothing has changed. The dict is small (only CLAUDE.md global +
+# per-project) and never needs eviction at expected scale, but cap at
+# 64 entries defensively in case a misuse calls with many paths.
+_CACHE: dict[tuple[str, int, int], str] = {}
+_CACHE_MAX = 64
+
 
 def _read_text_safe(path) -> str:
+    try:
+        st = path.stat()
+    except OSError:
+        return ""
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    cached = _CACHE.get(key)
+    if cached is not None:
+        return cached
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -62,7 +79,15 @@ def _read_text_safe(path) -> str:
             path, _MAX_CLAUDE_MD_CHARS,
         )
         text = text[:_MAX_CLAUDE_MD_CHARS] + "\n\n…[truncated]"
-    return text.strip()
+    result = text.strip()
+    # Cap-evict only when adding a NEW key — never drop an entry just
+    # to overwrite the same key (the working set is normally 2 files,
+    # so this almost never fires; the guard matters only on pathological
+    # cache churn).
+    if key not in _CACHE and len(_CACHE) >= _CACHE_MAX:
+        _CACHE.pop(next(iter(_CACHE)), None)
+    _CACHE[key] = result
+    return result
 
 
 async def build_system_prompt_suffix(agent_id: str, runtime: str = "codex") -> str:

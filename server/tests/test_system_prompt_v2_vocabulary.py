@@ -46,25 +46,34 @@ def test_player_prompt_omits_all_v1_tools() -> None:
 
 
 def test_coach_prompt_names_v2_tools() -> None:
+    """As of the 2026-05-11 role_baseline trim, the prose tool
+    catalogue is gone — the SDK injects per-tool descriptions via
+    the MCP schema, and the system prompt only mentions tools where
+    cross-tool precedence or harness-specific framing matters. So
+    only the load-bearing names (those referenced in the
+    cross-tool precedence section, the stage-transition rule,
+    or the archive rule) need to appear by name."""
     body = _system_prompt_for("coach")
     assert "coord_approve_stage" in body, (
-        "Coach prompt must name the single v2 transition tool"
+        "Coach prompt must name the single v2 transition tool — "
+        "cross-tool precedence rule references it"
     )
     assert "coord_archive_task" in body, (
-        "Coach prompt must name the deliberate-archive tool"
+        "Coach prompt must name coord_archive_task — the "
+        "'no auto-archive' rule references it"
     )
-    assert "coord_request_plan_review" in body, (
-        "Coach prompt must name the plan-review request tool"
+    assert "coord_update_task" in body, (
+        "Coach prompt must name coord_update_task — the "
+        "deprecation note references it"
     )
-    assert "coord_set_task_trajectory" in body
-    assert "coord_set_task_blocked" in body
 
 
 def test_player_prompt_names_v2_tools() -> None:
     body = _system_prompt_for("p3")
     assert "coord_role_complete" in body, (
         "Player prompt must name coord_role_complete (replaces "
-        "coord_complete_execution + coord_mark_shipped)"
+        "coord_complete_execution + coord_mark_shipped) — the "
+        "'you report to Coach' framing names it"
     )
     # message_to_coach must be teachable to Players.
     assert "message_to_coach" in body

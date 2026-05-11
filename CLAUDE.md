@@ -2159,6 +2159,151 @@ Validation criteria: ≥80% deviations noticed at push-time vs
 audit-time, ≥50% reduction in Coach context-reconstruction turns,
 flat or decreased human pings on routine items.
 
+**Recent (2026-05-11) — Tool Search enabled (deferred coord-schema loading):**
+
+The Claude Agent SDK supports a built-in "tool search" mechanism
+(`ENABLE_TOOL_SEARCH=auto:N` env var) where the SDK ships a tiny
+`tool_search_tool_bm25` / `_regex` retriever instead of every
+registered tool's schema. The model calls the retriever when it
+needs a tool; the SDK returns the 3–5 most relevant tools and
+their full schemas land in context dynamically. Limits: ≤10,000
+tools registered; requires Sonnet 4 / Opus 4 or later. **Haiku
+doesn't support it.**
+
+The harness was missing out on this — coord schema is 45,577
+chars/turn (24 Coach-only tools = 31,892 chars; 21 shared = 13,685
+chars; measured live via the new `coord_schema_chars` in
+[server/tools.py](server/tools.py)), and the SDK was injecting all
+of it every turn.
+
+Now wired in [server/runtimes/claude.py](server/runtimes/claude.py)
+right after the env-scrub block: every Claude spawn whose model
+isn't Haiku gets `ENABLE_TOOL_SEARCH=auto:30` injected into
+`options.env`. The 30 threshold is the "kick in when registered
+count ≥ 30" mode — the harness's 45 tools always meet it.
+Disable via `HARNESS_TOOL_SEARCH=false` for a deploy if a CLI
+build regresses on this path; override the threshold via
+`HARNESS_TOOL_SEARCH_AUTO_AT=<int>`.
+
+Compass / Playbook / TruthScore / Watchdog one-shots are
+unaffected — they use their own `ClaudeAgentOptions` builder
+([server/compass/llm.py](server/compass/llm.py) etc.) with
+`mcp_servers={}` so tool search wouldn't help them anyway.
+Watchdog (which uses Haiku) is explicitly safe.
+
+Observability: prompt_log gets two new fields per row:
+- `sdk_tool_search_active` (0/1) — whether the spawn injected
+  the env var.
+- `sdk_coord_schema_effective` — clamped estimate (~6 KB when
+  tool search is active vs the full ~45.5 KB when off). Trend
+  this to see the savings land.
+
+Expected impact: cold-spawn input tokens drop sharply (45.5K of
+tool schema → ~6K). Cache-hit turns drop less dramatically since
+the cached tool definitions were billed at 10% already, but the
+cache-miss cost (cold start, sporadic Player spawns) is most of
+where the savings show.
+
+Risk: behavioural shift. The model now has to call a tool to
+find tools instead of having them all pre-loaded. For 99% of
+turns where the agent already knows what tool to invoke this is
+free; for novel ad-hoc problems where the agent browses the
+catalogue it costs one extra search call. Net cost is much lower.
+Watch for "I don't see the tool I need" patterns in agent
+output — that would signal the retriever is missing relevant
+tools and the threshold should drop (auto:60 → auto:30 →
+always-on `"true"`).
+
+**Recent (2026-05-11) — Round 2 prompt cuts + cache reordering:**
+
+Follow-up to the coordination-block trim (see next entry). Four
+related changes targeting the still-significant ~24K Coach prompt
+floor and recurring cache misses:
+
+- **Section reorder for cache stability.** The concatenation in
+  [server/agents.py](server/agents.py) (around line 5418) used to
+  put `coordination_block` (volatile, changes every Coach turn)
+  BEFORE `coach_supplement` / `prior_error_suffix` / `handoff_suffix`
+  (all sub-hourly or rarer). Anthropic's prompt cache is
+  byte-prefix based: any difference busts everything after. So a
+  per-turn coordination delta of a few hundred bytes was throwing
+  away ~3.5K of otherwise-cacheable prefix every turn. Moved
+  coordination_block to LAST; all stable-ish sections now live in
+  the cached prefix. The section-order comment was rewritten to
+  reflect the new invariant.
+
+- **`role_baseline` prose tool catalogue → one-line index.** The
+  Coach `_system_prompt_for("coach")` body carried ~11.3K of prose
+  duplicating tool descriptions that the Agent SDK already injects
+  via the MCP tool schema (`@tool(name, description, args)` in
+  [server/tools.py](server/tools.py) — every tool's description
+  goes into the API's `tools` parameter automatically). Replaced
+  the catalogue with a one-line "Tools: a `coord_*` MCP catalogue
+  is available — read each tool's description for parameters and
+  semantics" plus a tight "Cross-tool precedence" section listing
+  ONLY the bits not in any individual tool's description (e.g.,
+  "coord_set_player_runtime BEFORE coord_set_player_model when
+  picking a model from the other family", "[deviation: ...] tag
+  on note when approving a stage with drift", coord_request_human
+  vs auto-forward routing). Player baseline got the same treatment.
+  Measured cut: Coach `role_baseline` 11,286 → 4,791 chars (-58%),
+  Player 6,828 → 3,089 chars (-55%). Across 11 agents this saves
+  ~50K chars per round of turns, in addition to the cache-stability
+  win above.
+
+  The test [server/tests/test_system_prompt_v2_vocabulary.py](server/tests/test_system_prompt_v2_vocabulary.py)
+  was updated to match: it used to enforce "v2 tools must be named
+  by name in the prompt" as a regression net against accidental
+  v1→v2 backslide; with the catalogue gone, only the load-bearing
+  names (those referenced in cross-tool precedence rules) need to
+  appear. v1 omission assertions are unchanged.
+
+- **prior_error fingerprint dedup.** The data showed
+  `prior_error=289` chars stuck on every Coach prompt for ~3.5
+  hours of identical 24,255-char turns. Root cause: every
+  recurrence-tick that produced an `is_error=True` ResultMessage
+  re-stuffed `_last_turn_error_info` with the same shape, and the
+  next tick re-consumed + re-displayed the same "Prior turn note"
+  indefinitely. Fix in [server/agents.py](server/agents.py): when
+  building the prior_error_suffix, record a `(subtype, stop_reason,
+  num_turns)` fingerprint into `turn_ctx["consumed_prior_error_fp"]`;
+  in the ResultMessage handler, skip re-arming
+  `_last_turn_error_info` when the new error fingerprint matches
+  what we just consumed. Agent sees the note once; further
+  identical errors don't recursively re-surface it. Compact-mode
+  turns still bypass the entire prior_error machinery.
+
+- **SDK-injected payload sizes in the prompt log.** The existing
+  `<DATA_ROOT>/prompt_log/<YYYY-MM-DD>.jsonl` only recorded
+  harness-built sections, hiding the bulk of the actual wire
+  payload (CLAUDE.md auto-loaded by SDK + MCP tool definitions).
+  Added three new section fields to every row:
+  - `sdk_global_claude_md` — bytes on disk of `/data/CLAUDE.md`,
+    populated only on Claude turns (Codex folds CLAUDE.md into
+    `context_suffix` manually so already counted there).
+  - `sdk_project_claude_md` — bytes on disk of the active project's
+    CLAUDE.md, same gating.
+  - `sdk_coord_schema` — approximate JSON size of the coord MCP
+    tool definitions the SDK injects on both runtimes
+    (`coord_schema_chars(caller_id)` in
+    [server/tools.py](server/tools.py) sums name + description +
+    args_schema + wrapper overhead per tool, cached per caller).
+  These fields are NOT summed into `total_chars` so the field
+  keeps its "harness-built only" semantics; sum them in
+  post-analysis to see the real wire payload. Existing rows in
+  prior dates remain valid (missing fields → omitted from sum).
+
+- **`scripts/analyze_playbook.py`** — new measurement utility for
+  playbook composition. Reports active statement count + buckets,
+  per-statement char distribution (min / avg / p50 / p95 / max),
+  rendered block bytes split into statement bodies / per-statement
+  overhead / scaffolding, and a list of statements over the
+  `STATEMENT_MAX_CHARS=160` brevity cap (legacy rows the cap
+  doesn't retroactively trim). Run with
+  `HARNESS_DATA_ROOT=/path/to/data python scripts/analyze_playbook.py
+  [project_id]` — walks every project under `<DATA_ROOT>/projects/`
+  by default.
+
 **Recent (2026-05-11) — Coach coordination block trim:**
 
 The per-Coach-turn coordination block (built by

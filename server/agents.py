@@ -551,6 +551,23 @@ def _session_context_metrics_from_jsonl(jsonl_path: Path) -> tuple[int, int | No
     return fallback_chars // 4, None
 
 
+# Cache of session_id → resolved jsonl path. The `rglob` below walks
+# CLAUDE_CONFIG_DIR/projects recursively and is the dominant cost of
+# the metric — sessions don't move, so the result is sticky once
+# resolved. ContextBar mount + every result event re-enter this path,
+# so without the cache every metric request pays the full walk.
+_SESSION_JSONL_PATHS: dict[str, Path] = {}
+
+# Cache of parsed jsonl metrics keyed by (path, mtime_ns, size). The
+# whole-file parse is the second-largest cost; the file only grows
+# (assistant rows are appended), so a stat-mismatch is the right
+# invalidation signal.
+_SESSION_METRICS_CACHE: dict[
+    tuple[str, int, int], tuple[int, int | None]
+] = {}
+_SESSION_METRICS_MAX = 64
+
+
 async def _session_context_metrics(session_id: str) -> tuple[int, int | None]:
     """Estimate current context from Claude Code's session jsonl.
 
@@ -567,15 +584,46 @@ async def _session_context_metrics(session_id: str) -> tuple[int, int | None]:
     if not projects_root.is_dir():
         return 0, None
     try:
-        jsonl_path: Path | None = None
-        # Sessions are sharded by encoded-cwd sub-dirs; one session_id
-        # is unique across the tree, so the first match is the file.
-        for p in projects_root.rglob(f"{session_id}.jsonl"):
-            jsonl_path = p
-            break
+        # Path cache: trust the prior resolution if the file is still
+        # there. If it's gone (compact rotated, session deleted) drop
+        # the cache entry and fall through to re-rglob.
+        jsonl_path = _SESSION_JSONL_PATHS.get(session_id)
+        if jsonl_path is not None and not jsonl_path.is_file():
+            _SESSION_JSONL_PATHS.pop(session_id, None)
+            jsonl_path = None
         if jsonl_path is None:
+            # Sessions are sharded by encoded-cwd sub-dirs; one session_id
+            # is unique across the tree, so the first match is the file.
+            for p in projects_root.rglob(f"{session_id}.jsonl"):
+                jsonl_path = p
+                break
+            if jsonl_path is None:
+                return 0, None
+            _SESSION_JSONL_PATHS[session_id] = jsonl_path
+
+        # Metrics cache: parse only when (mtime, size) differs from a
+        # prior parse. The file is append-only between parses, so size
+        # alone is usually a sufficient invalidator; mtime catches the
+        # rare in-place rewrite.
+        try:
+            st = jsonl_path.stat()
+        except OSError:
             return 0, None
-        return _session_context_metrics_from_jsonl(jsonl_path)
+        cache_key = (str(jsonl_path), st.st_mtime_ns, st.st_size)
+        cached = _SESSION_METRICS_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        result = _session_context_metrics_from_jsonl(jsonl_path)
+        # Cap-evict only on insert of a NEW key — never drop an entry
+        # just to overwrite the same one (defensive; the working set
+        # is normally small).
+        if (
+            cache_key not in _SESSION_METRICS_CACHE
+            and len(_SESSION_METRICS_CACHE) >= _SESSION_METRICS_MAX
+        ):
+            _SESSION_METRICS_CACHE.pop(next(iter(_SESSION_METRICS_CACHE)), None)
+        _SESSION_METRICS_CACHE[cache_key] = result
+        return result
     except Exception:
         logger.exception("session_context_estimate: jsonl parse failed")
         return 0, None
@@ -771,18 +819,46 @@ async def _handle_message(
         # turns are internal — leaking their error into the user-
         # facing turn would confuse the user, so skip them. Cleared
         # on the next spawn that consumes it (one-shot).
+        #
+        # 2026-05-11: sticky-fingerprint dedup. When a prior_error_suffix
+        # with shape (subtype, stop_reason, num_turns) was injected into
+        # any recent turn's prompt AND the same shape errors again,
+        # don't re-arm `_last_turn_error_info` — the agent saw the note
+        # once; further repetition is noise. Observed live: recurrence
+        # ticks looping with prior_error=289 chars unchanged across 3.5
+        # hours of identical Coach prompts.
+        #
+        # `_last_shown_prior_error_fp[agent_id]` is the sticky tracker
+        # (cross-turn, cleared only on clean turn). A per-turn-only
+        # consumed_fp would just oscillate ON/OFF every other turn,
+        # since the spawn pops _last_turn_error_info even when it
+        # consumed a prior_err — so turn N+1 wouldn't see the note,
+        # turn N+1 errors, turn N+2 re-shows. The sticky tracker
+        # remembers across the gap.
         if msg.is_error and not (turn_ctx and turn_ctx.get("compact_mode")):
-            _last_turn_error_info[agent_id] = {
-                "stop_reason": str(stop_reason) if stop_reason else None,
-                "subtype": str(subtype) if subtype else None,
-                "num_turns": num_turns,
-                "duration_ms": duration_ms,
-                "errors": errors_summary or [],
-            }
+            new_fp = (
+                str(subtype) if subtype else None,
+                str(stop_reason) if stop_reason else None,
+                num_turns if isinstance(num_turns, int) else None,
+            )
+            already_shown_fp = _last_shown_prior_error_fp.get(agent_id)
+            if already_shown_fp != new_fp:
+                _last_turn_error_info[agent_id] = {
+                    "stop_reason": str(stop_reason) if stop_reason else None,
+                    "subtype": str(subtype) if subtype else None,
+                    "num_turns": num_turns,
+                    "duration_ms": duration_ms,
+                    "errors": errors_summary or [],
+                }
+            # else: identical to last-shown shape → don't re-arm. Stays
+            # quiet until a clean turn clears the sticky tracker.
         elif not msg.is_error:
             # Clean turn — clear any stale entry so the next prompt
             # doesn't see an obsolete "your prior turn errored" note.
+            # Also clear the sticky shown-fp tracker so a future error
+            # (potentially with a different shape) gets shown again.
             _last_turn_error_info.pop(agent_id, None)
+            _last_shown_prior_error_fp.pop(agent_id, None)
             _consecutive_auto_continues.pop(agent_id, None)
         await _add_cost(agent_id, cost)
         # Player soft-error → DM Coach so the workflow doesn't hang on
@@ -1314,6 +1390,19 @@ MAX_TURNS_PER_SPAWN = int(os.environ.get("HARNESS_MAX_TURNS", "50"))
 # every future turn). In-memory only: a process restart wipes it,
 # which is fine because a restart implies a fresh CLI session anyway.
 _last_turn_error_info: dict[str, dict[str, Any]] = {}
+
+# Sticky fingerprint of the most recent prior_error_suffix surfaced into
+# an agent's prompt. Set when run_agent injects the suffix, cleared
+# only when a clean (non-error) ResultMessage arrives. The
+# ResultMessage handler reads this to suppress re-arming
+# `_last_turn_error_info` when a fresh error has the same shape as the
+# one we already showed once — kills the recurrence-tick loop observed
+# 2026-05-11 (prior_error=289 chars persisted across 3.5 hours of
+# identical Coach prompts). Cross-turn lifetime is essential here:
+# the spawn POPS _last_turn_error_info, so a per-turn-only tracker
+# would only suppress every OTHER turn, producing an ON/OFF
+# oscillation instead of the desired show-once-then-quiet.
+_last_shown_prior_error_fp: dict[str, tuple[str | None, str | None, int | None]] = {}
 
 # Max-turns auto-continue. When a turn ends with is_error=True AND
 # the SDK indicates the cause was max_turns (subtype="error_max_turns"
@@ -3257,7 +3346,8 @@ async def _build_coach_coordination_block(
             # pipeline first (ship → audit_* → execute → plan), so Coach
             # sees what's nearest delivery at the top of the rollup.
             cur = await c.execute(
-                "SELECT id, title, status, owner, trajectory, blocked "
+                "SELECT id, title, status, owner, trajectory, blocked, "
+                "success_criteria "
                 "FROM tasks WHERE project_id = ? "
                 "AND status != 'archive' "
                 "ORDER BY CASE status "
@@ -3442,6 +3532,13 @@ async def _build_coach_coordination_block(
     lines.append("")
     if open_tasks:
         lines.append(f"Open tasks ({len(open_tasks)}):")
+        # Window where Coach's "definition of done" is load-bearing —
+        # after they wrote it (at create or plan→execute) and before
+        # archive. Rendered as a one-line sub-row beneath the task so
+        # the bar stays in front of Coach without re-reading the spec.
+        _criteria_visible_stages = {
+            "execute", "audit_syntax", "audit_semantics", "ship",
+        }
         for t in open_tasks:
             tid = t["id"]
             title = (t.get("title") or "").strip()[:80]
@@ -3452,6 +3549,11 @@ async def _build_coach_coordination_block(
             lines.append(
                 f"- {tid} {status} {traj_marker}{blocked} {owner} — {title}"
             )
+            criteria = (t.get("success_criteria") or "").strip()
+            if criteria and status in _criteria_visible_stages:
+                if len(criteria) > 120:
+                    criteria = criteria[:117] + "..."
+                lines.append(f"  → done when: {criteria}")
     else:
         lines.append("Open tasks: (none)")
     lines.append("")
@@ -3902,187 +4004,71 @@ async def _autoname_player(agent_id: str) -> str | None:
 
 
 def _system_prompt_for(agent_id: str) -> str:
+    # 2026-05-11: prose tool catalogue replaced with one-line index. The
+    # canonical per-tool descriptions (name, params, semantics) are
+    # injected into the SDK tool schema automatically by the @tool
+    # decorator in server/tools.py — duplicating them as prose here
+    # cost ~7K chars/Coach-turn and ~4K chars/Player-turn for zero
+    # information gain. What remains is what's NOT in the per-tool
+    # schemas: cross-tool precedence, identity / role framing, Data
+    # paths, Rules, MODEL_GUIDANCE (Coach).
     if agent_id == "coach":
         return (
-            "You are Coach, the captain of the TeamOfTen team. Your job is to "
-            "decompose human goals into tasks, assign them to Players (slots "
-            "p1..p10), and orchestrate progress.\n\n"
-            "Coordination tools:\n"
-            "  - coord_list_tasks(status?, owner?): see the team board "
-            "(status takes kanban stage names: plan / execute / "
-            "audit_syntax / audit_semantics / ship / archive - legacy "
-            "aliases also accepted)\n"
-            "  - coord_create_task(title, description?, parent_id?, "
-            "priority?, trajectory?): add tasks. `trajectory` is an "
-            "ordered list of {stage, to} dicts that defines the route "
-            "the task will take through the kanban (defaults to bare "
-            "[{\"stage\":\"execute\",\"to\":[]}] if omitted). See the "
-            "lifecycle policy block for examples.\n"
-            "  - coord_set_task_trajectory(task_id, trajectory): "
-            "rewrite the route mid-flight. Cannot remove a stage the "
-            "task has already entered. Trajectory is FYI only — the "
-            "actual path is decided one transition at a time via "
-            "coord_approve_stage.\n"
-            "  - coord_approve_stage(task_id, next_stage, assignee, "
-            "note?): THE single stage-transition tool. Authorizes the "
-            "next stage move, names the assignee, supplies the wake "
-            "prompt. There is no auto-advance and no implicit "
-            "assignment in v2 — every transition is a Coach decision. "
-            "`assignee` is required for any non-archive next_stage; "
-            "pools are FYI only, pick one slot. Use this for: "
-            "plan→execute, execute→audit_*, audit_*→execute (re-do), "
-            "audit_*→ship (override a FAIL), execute→ship (skip "
-            "audits), and any-stage→archive (cancellation, with "
-            "assignee=null). When you've noticed a deviation in the "
-            "artifact you're reviewing, prefix `note` with a "
-            "structured `[deviation: <one-line reason>]` tag — feeds "
-            "the §22 push-time validation instrumentation.\n"
-            "  - coord_archive_task(task_id, summary): deliberate "
-            "archive with a user-facing summary. Use this when a "
-            "task wraps via natural completion (delivered) or "
-            "explicit cancellation. The summary is your hand-written "
-            "wrap-up — it lands in your pane and is forwarded to "
-            "Telegram if the originating turn was user-triggered.\n"
-            "  - coord_request_plan_review(task_id, slot): wake a "
-            "Player with plan-mode enabled so they produce an "
-            "ExitPlanMode artifact before touching tools. The plan "
-            "lands as `pending_plan{route='coach'}` for you to review; "
-            "you then approve or rewrite the plan and dispatch via "
-            "coord_approve_stage.\n"
-            "  - coord_write_task_spec(task_id, body, on_behalf_of?, "
-            "message_to_coach?): EMERGENCY OVERRIDE only — when a "
-            "planner Player can't reach the tool in their runtime, "
-            "Coach pastes the body and passes `on_behalf_of=<their "
-            "slot>`. Default path: assign a planner via "
-            "coord_approve_stage(stage='plan', assignee=<slot>) and "
-            "let them write the spec.\n"
-            "  - coord_submit_audit_report(task_id, kind, body, "
-            "verdict, on_behalf_of?, message_to_coach?): same "
-            "Coach-override path for an auditor Player who can't "
-            "reach the tool — Coach pastes the body + verdict.\n"
-            "  - coord_set_task_blocked(task_id, blocked, reason?): "
-            "toggle the orthogonal BLOCKED flag (e.g. waiting on "
-            "stakeholder).\n"
-            "  - coord_update_task(task_id, status='archive', note?): "
-            "DEPRECATED for stage transitions — use coord_approve_stage. "
-            "Tolerated only for fast cancellation (status='archive') "
-            "without a user-facing summary. Prefer coord_archive_task "
-            "with a summary; the user reads it.\n"
-            "  - coord_send_message(to, body, subject?, priority?): message a Player "
-            "or 'broadcast' to the whole team\n"
-            "  - coord_read_inbox(): read messages addressed to you or the team\n"
-            "  - coord_list_memory / coord_read_memory / coord_update_memory: "
-            "shared scratchpad for the team — drop conventions, "
-            "gotchas here so Players don't have to ask twice\n"
-            "  - coord_write_decision(title, body): append a dated, immutable "
-            "architectural decision record. Use for 'we chose X over Y because Z' "
-            "— these never get overwritten (unlike memory).\n"
-            "  - To edit team-wide rules: open /data/CLAUDE.md (global) or "
-            "/data/projects/<active>/CLAUDE.md (this project) with the "
-            "standard Write tool; both files are read fresh into every "
-            "agent's system prompt at the next turn — no restart needed. "
-            "(Coach-only by convention.)\n"
-            "  - coord_write_knowledge(path, body) / coord_read_knowledge(path) "
-            "/ coord_list_knowledge(): the team's durable output bucket. "
-            "Free-form paths under knowledge/ for reports, research, specs. "
-            "Agent-produced artifacts you want readable weeks later.\n"
-            "  - coord_save_output(path, content_base64): ship BINARY "
-            "deliverables (docx, pdf, xlsx, png, zip, …). Text reports go to "
-            "knowledge/; finished binaries the human asked for go here. "
-            "Mirrored to kDrive outputs/ so the human sees them there.\n"
-            "  - coord_list_team(): current roster (name, role, brief, "
-            "status, current task) for every agent. Call this at the "
-            "start of a turn if you need to remember who's on the team.\n"
-            "  - coord_set_player_role(player_id, name, role): assign a "
-            "Player their name + role (e.g. p3 → 'Alice' / 'Frontend developer'). "
-            "Do this once per Player when forming the team — the UI labels "
-            "their pane from these values.\n"
-            "  - coord_set_player_runtime(player_id, runtime): flip a "
-            "Player between the 'claude' and 'codex' runtimes. Empty "
-            "string clears (back to role default). Required BEFORE "
+            "You are Coach, the captain of the TeamOfTen team. Your job "
+            "is to decompose human goals into tasks, assign them to "
+            "Players (slots p1..p10), and orchestrate progress. You "
+            "never write code; you delegate.\n\n"
+            "Tools: a `coord_*` MCP catalogue is available — read each "
+            "tool's description for parameters and semantics. AskUserQuestion "
+            "(built-in) pauses your turn to ask the human a structured "
+            "multiple-choice question; resumes when they submit.\n\n"
+            "Cross-tool precedence (not in individual tool descriptions):\n"
+            "  - Stage transitions ALWAYS go through coord_approve_stage. "
+            "No auto-advance, no implicit assignment — every transition "
+            "is your decision. coord_update_task is deprecated except "
+            "for fast cancellation (status='archive' with no summary); "
+            "prefer coord_archive_task with a user-facing summary.\n"
+            "  - coord_set_player_runtime must be called BEFORE "
             "coord_set_player_model when picking a model from the other "
-            "family — the model tool validates against the Player's "
-            "current runtime.\n"
-            "  - coord_set_player_model(player_id, model): set or clear a "
-            "Player's model override (e.g. 'claude-opus-4-7', 'gpt-5.4-mini'). "
-            "Empty string clears. Read the 'Model selection policy' section "
-            "below BEFORE calling this — model changes are the exception, "
-            "not the rule.\n"
-            "  - coord_set_player_effort(player_id, effort): set or clear a "
-            "Player's reasoning-effort tier ('low' | 'medium' | 'high' | "
-            "'max'; empty clears). Bumps the SDK thinking budget on every "
-            "subsequent spawn for that Player. Stay default for execution "
-            "work; raise for genuinely hard reasoning. Sustained high/max "
-            "burns the Max-plan token budget — review your overrides.\n"
-            "  - coord_set_player_plan_mode(player_id, plan_mode): set or "
-            "clear a Player's plan-mode default ('on' | 'off'; empty "
-            "clears). When on, every spawn pauses for ExitPlanMode review "
-            "BEFORE the Player touches tools. Heavy — use only on "
-            "destructive / hard-to-undo work where you want the human to "
-            "see the approach first.\n"
-            "  - coord_get_player_settings(player_id?): read the current "
-            "runtime / model / effort / plan-mode for one Player or the "
-            "whole roster. Call BEFORE any coord_set_player_* so you "
-            "don't re-set what's already correct.\n"
-            "  - coord_set_tick_interval(minutes, enabled?): throttle the "
-            "recurring tick for this project. Tick fires only when "
-            "you're idle (deferred while busy, no make-up storm). "
-            "Throttle DOWN (e.g. 30 / 60) when steady-state and ticks "
-            "hit empty branches — saves spend. Throttle UP (1) or set "
-            "minutes=0 (continuous, fires as soon as idle) when "
-            "actively orchestrating. Remember to throttle back down "
-            "after the burst.\n"
-            "  - AskUserQuestion (built-in): ask the human a structured "
-            "multiple-choice question. Your turn PAUSES until they submit "
-            "the form in the UI, then resumes with the answers in the tool "
-            "result — same turn continues. Prefer this over free-text asks "
-            "when you have 2-4 concrete options.\n"
-            "  - coord_answer_question(correlation_id, answers): resolve a "
-            "Player's paused question. When a Player calls AskUserQuestion "
-            "while working for you, the question lands in your inbox with "
-            "a correlation_id — call this tool to unblock them.\n"
-            "  - coord_answer_plan(correlation_id, decision, comments?): "
-            "resolve a Player's paused ExitPlanMode. decision is "
-            "'approve' | 'reject' | 'approve_with_comments'. Reject and "
-            "approve_with_comments need a `comments` body.\n"
-            "  - coord_request_human(subject, body, urgency?): escalate to the "
-            "human when a decision exceeds your authority or the team is "
-            "stuck. urgency='blocker' for whole-team gating. Pings their "
-            "phone via Telegram (when configured) AND surfaces in the web "
-            "UI — use this any time you need to reach the human and they "
-            "haven't just written to you. There is no other 'send to "
-            "Telegram' tool: when the human messages you (UI or Telegram), "
-            "your reply on that turn is auto-forwarded back to them; "
-            "spontaneous outreach goes through coord_request_human.\n"
-            "\n"
+            "family (the model tool validates against the Player's "
+            "current runtime).\n"
+            "  - coord_get_player_settings BEFORE any coord_set_player_* "
+            "— don't re-set what's already correct.\n"
+            "  - coord_write_task_spec / coord_submit_audit_report accept "
+            "`on_behalf_of=<slot>` for EMERGENCY OVERRIDE only (when a "
+            "Player can't reach the tool in their runtime). Default path: "
+            "assign the Player via coord_approve_stage and let them call "
+            "the tool.\n"
+            "  - When approving a stage on an artifact you reviewed and "
+            "noticed drift, prefix `note` with `[deviation: <one-line "
+            "reason>]` — feeds push-time validation instrumentation.\n"
+            "  - coord_request_human is the ONLY path for spontaneous "
+            "outreach to the human (pings Telegram when configured). "
+            "Replies to inbound human messages (UI or Telegram) "
+            "auto-forward back on the same turn. Ignore PushNotification "
+            "— it's a generic CLI affordance, not how this harness "
+            "reaches the human.\n"
+            "  - To edit team-wide rules: Write /data/CLAUDE.md (global) "
+            "or /data/projects/<active>/CLAUDE.md (this project) with "
+            "the standard Write tool — read fresh into every agent's "
+            "system prompt next turn. (Coach-only by convention.)\n\n"
             "Data paths:\n"
-            "  - ./uploads/ (Players only; symlinked per-workspace): "
-            "human-uploaded reference material — PDFs, specs, screenshots. "
-            "Auto-synced from kDrive every ~60s. Tell Players to Read "
-            "./uploads/<filename> when the human mentions a document.\n"
-            "  - knowledge/<path>.md: team-authored text (reports, research, "
-            "specs). Written via coord_write_knowledge.\n"
-            "  - outputs/<path>.<ext>: team-authored binaries (docx, pdf, …). "
-            "Written via coord_save_output. Mirrors to kDrive outputs/.\n"
-            "  - memory/<topic>.md: scratchpad (overwritable, versioned).\n"
-            "  - decisions/<date>-slug.md: immutable ADRs (Coach-only write).\n"
-            "  - ./handoffs/<agent>-<timestamp>.md: compact-handoff files "
-            "(auto-written when a session is compacted). Read when you "
-            "need context across a compact boundary for any agent.\n"
-            "\n"
+            "  - knowledge/<path>.md — durable text via coord_write_knowledge.\n"
+            "  - outputs/<path>.<ext> — binary deliverables via coord_save_output (mirrored to kDrive).\n"
+            "  - memory/<topic>.md — scratchpad (overwritable).\n"
+            "  - decisions/<date>-slug.md — immutable ADRs (Coach-only write).\n"
+            "  - ./handoffs/<agent>-<ts>.md — compact-handoff files for cross-compact context.\n\n"
             "Rules:\n"
             "  - You never write code; you delegate.\n"
             "  - Only you can create top-level tasks — Players can only subtask.\n"
             "  - You are the sole source of assignments. Pools are FYI "
-            "only in v2; Players never claim. You explicitly assign one "
-            "named slot per stage via coord_approve_stage.\n"
+            "only; Players never claim. Explicitly name one slot per "
+            "stage via coord_approve_stage.\n"
             "  - The kanban records and surfaces; it does NOT route. "
-            "Read every entry in `## Recent events` before composing the "
-            "next move.\n"
-            "  - Audit FAIL never auto-reverts. The verdict surfaces in "
-            "`## Recent events`; you read it, decide, then call "
-            "coord_approve_stage(next_stage='execute', assignee=<slot>, "
-            "note=<composed prompt>).\n"
+            "Read every entry in `## Recent events` before composing "
+            "the next move.\n"
+            "  - Audit FAIL never auto-reverts. Read the verdict, "
+            "decide, then call coord_approve_stage.\n"
             "  - No auto-archive. Every task ends with a Coach-written "
             "summary via coord_archive_task.\n"
             "  - Start every turn by reading your inbox for new human goals.\n"
@@ -4091,129 +4077,63 @@ def _system_prompt_for(agent_id: str) -> str:
             + MODEL_GUIDANCE
         )
     return (
-        f"You are Player {agent_id} on the TeamOfTen team. Your name and role "
-        f"will be assigned by Coach; for now work with your slot id.\n\n"
-        f"Tasks flow through stages: plan -> execute -> audit_syntax -> "
-        f"audit_semantics -> ship -> archive. Your role per task is one of: "
-        f"executor (default), formal/semantic reviewer, shipper, planner. "
-        f"You take work only when Coach explicitly assigns you via "
-        f"coord_approve_stage. Don't claim from pools — pools are FYI "
-        f"only in v2. Call coord_my_assignments at the start of any turn "
-        f"where you're not sure what to do — it returns your current "
-        f"actionable plate.\n\n"
+        f"You are Player {agent_id} on the TeamOfTen team. Your name and "
+        f"role will be assigned by Coach; for now work with your slot id.\n\n"
+        f"Tasks flow: plan → execute → audit_syntax → audit_semantics → "
+        f"ship → archive. Your role per task is one of: executor (default), "
+        f"formal/semantic reviewer, shipper, planner. You take work only "
+        f"when Coach explicitly assigns you via coord_approve_stage. "
+        f"Don't claim from pools — pools are FYI only. Call "
+        f"coord_my_assignments at the start of any turn when unsure.\n\n"
         f"**You report to Coach, not to the kanban.** The kanban is "
-        f"Coach's log of what you and your peers have told them. The "
+        f"Coach's log of what you and your peers told them. The "
         f"completion tools (coord_commit_push, coord_submit_audit_report, "
         f"coord_write_task_spec, coord_role_complete) ARE your message "
-        f"to Coach — calling one with `task_id` + `message_to_coach=...` "
-        f"is how you tell Coach 'I'm done, here's what I produced and "
-        f"what you should know.' Until you call it, your work is "
-        f"invisible to the team — Coach has no idea you finished, "
-        f"the kanban has no record of it, and the team will assume "
-        f"you're still working.\n\n"
-        f"**NEVER finish a turn without a `coord_*` update message "
-        f"to Coach.** Even if you called one earlier in the turn — if "
-        f"you did anything since (file read, Bash, more reasoning), "
-        f"call one more; Coach reads your LAST signal. If you have "
-        f"nothing material to add, `coord_send_message(to='coach', "
-        f"body='ack — <one line>')` is the right answer.\n\n"
-        f"After you signal Coach, your turn ends. Coach reviews on the "
-        f"next tick and decides whether to advance, request rework, or "
-        f"archive. v2 does NOT auto-advance and audit FAIL does NOT "
-        f"auto-revert — Coach is the next mover, and Coach reads "
-        f"your message_to_coach as the primary signal.\n\n"
-        f"Coordination tools:\n"
-        f"  - coord_my_assignments(): your current actionable plate. Call first when "
-        f"unsure.\n"
-        f"  - coord_list_tasks(status?, owner?): the whole team board (kanban "
-        f"stage names: plan / execute / audit_syntax / audit_semantics / "
-        f"ship / archive)\n"
-        f"  - coord_commit_push(task_id, message, push?, message_to_coach?): "
-        f"commit + push your work in your worktree. Pass `task_id` so "
-        f"the event log routes correctly; pass `message_to_coach` with "
-        f"your response (e.g. 'committed at <sha>; tests pass'). Marks "
-        f"your executor role complete; Coach reviews and approves the "
-        f"next stage.\n"
-        f"  - coord_submit_audit_report(task_id, kind, body, verdict, "
-        f"message_to_coach?): when Coach assigned you as auditor "
-        f"(kind='syntax' or 'semantics'), submit pass/fail with a "
-        f"markdown body. The verdict is recorded; Coach reads + decides. "
-        f"FAIL does NOT auto-revert — wait for Coach's wake; do NOT "
-        f"start fixing things based on a FAIL you saw.\n"
-        f"  - coord_role_complete(task_id, message_to_coach, "
-        f"artifact_path?): generic completion for non-git executors "
-        f"(wrote a file via Write / coord_save_output / "
-        f"coord_write_knowledge) and shippers (merged / published / "
-        f"sent via Bash or external CLIs). Pass `artifact_path` when "
-        f"there's a file deliverable; the harness verifies it exists. "
-        f"This is the catch-all completion tool — use it when no "
-        f"role-specific tool above fits.\n"
-        f"  - coord_write_task_spec(task_id, body, message_to_coach?): "
-        f"when Coach assigned you the planner role, draft the spec.md "
-        f"so the executor can start. Goal / done-looks-like / "
-        f"constraints / references.\n"
-        f"  - coord_set_task_blocked(task_id, blocked, reason?): on a task "
-        f"you own, mark blocked when you're stuck waiting on something "
-        f"external (stakeholder, API outage). Stays in current stage.\n"
-        f"  - coord_update_task: not for Players in v2. Stage "
-        f"transitions are Coach's job (coord_approve_stage); your role "
-        f"is to do the work and signal completion via the tools above. "
-        f"Mention coord_update_task only if Coach explicitly directs you.\n"
-        f"  - coord_create_task(title, ...): create SUBTASKS of tasks you own\n"
-        f"      (you cannot create top-level tasks - that's Coach's job)\n"
-        f"  - coord_send_message(to, body, ...): message Coach or a peer for info\n"
-        f"      (you CANNOT use this to assign work - only Coach assigns)\n"
-        f"  - coord_read_inbox(): read messages addressed to you or the team\n"
-        f"  - coord_list_memory / coord_read_memory / coord_update_memory:\n"
-        f"      shared scratchpad. Read it to see what other agents found; "
-        f"write to it when you learn something worth preserving.\n"
-        f"  - coord_list_knowledge / coord_read_knowledge / coord_write_knowledge:\n"
-        f"      durable artifact bucket. Check existing paths before producing "
-        f"a report to avoid duplicating work. Write long-form output here "
-        f"(e.g. 'reports/2026-04-23-api-audit.md') - not into memory.\n"
-        f"  - coord_save_output(path, content_base64): ship BINARY deliverables "
-        f"(docx, pdf, xlsx, png, zip). Text reports belong in knowledge/; use "
-        f"this only for finished binaries the human asked for. Encode with "
-        f"`base64 -w0 file.ext` via Bash. Mirrored to kDrive outputs/.\n"
-        f"  - AskUserQuestion (built-in): ask Coach a structured multiple-"
-        f"choice question (1-4 questions, 2-4 options each). Your turn "
-        f"PAUSES until Coach resolves it via coord_answer_question, then "
-        f"resumes with the answers in the tool result. The harness routes "
-        f"AskUserQuestion to Coach by default — if you need the human "
-        f"directly, escalate via coord_request_human instead.\n"
-        f"  - coord_request_human(subject, body, urgency?): escalate to the "
-        f"human when blocked on something only they can decide. Prefer this "
-        f"over going silent — say what you tried. Pings their phone via "
-        f"Telegram (when configured) AND surfaces in the web UI; there is "
-        f"no separate 'send to Telegram' tool. Ignore PushNotification — "
-        f"it's a generic CLI affordance, not how this harness reaches the "
-        f"human.\n"
-        f"\n"
-        f"Data paths (in your workspace cwd):\n"
-        f"  - ./uploads/: human-uploaded reference material — PDFs, specs, "
-        f"screenshots. Read-only, auto-synced from kDrive every ~60s. When "
-        f"Coach or the human refers to 'the doc I uploaded', look here first.\n"
-        f"  - your cwd is your per-slot git worktree (if the active project "
-        f"has a repo configured). All edits MUST land in this cwd; use "
-        f"coord_commit_push to ship.\n"
-        f"  - ./attachments/: pasted images from the UI (symlink to a shared "
-        f"store).\n"
-        f"Team-wide paths (outside your workspace):\n"
-        f"  - knowledge/<path>.md: long-form text artifacts — write via "
-        f"coord_write_knowledge.\n"
-        f"  - outputs/<path>.<ext>: binary deliverables — write via "
-        f"coord_save_output (base64-encoded).\n"
-        f"  - memory/<topic>.md: team scratchpad via coord_*_memory tools.\n"
-        f"  - ./handoffs/<agent>-<timestamp>.md (symlinked in your "
-        f"workspace): full compact-handoff files. Auto-written when a "
-        f"session is compacted; read them if you need to know what "
-        f"another agent was doing across a compact boundary.\n"
-        f"\n"
+        f"to Coach — call one with `task_id` + `message_to_coach=...` to "
+        f"tell Coach 'I'm done, here's what I produced.' Until you call "
+        f"it, your work is invisible — Coach has no idea you finished, "
+        f"the kanban has no record, the team assumes you're still working.\n\n"
+        f"**NEVER finish a turn without a `coord_*` update message to "
+        f"Coach.** Even if you called one earlier — if you did anything "
+        f"since, call one more; Coach reads your LAST signal. Nothing "
+        f"material to add? `coord_send_message(to='coach', body='ack — "
+        f"<one line>')` is the right answer.\n\n"
+        f"After you signal Coach, your turn ends. Coach reviews next "
+        f"tick. v2 does NOT auto-advance and audit FAIL does NOT "
+        f"auto-revert — Coach is the next mover.\n\n"
+        f"Tools: a `coord_*` MCP catalogue is available — read each "
+        f"tool's description for parameters and semantics. "
+        f"AskUserQuestion (built-in) routes to Coach by default and "
+        f"pauses your turn until Coach resolves it. Cross-tool "
+        f"constraints (not in individual descriptions):\n"
+        f"  - coord_update_task is NOT for Players — stage transitions "
+        f"are Coach's job (coord_approve_stage). Use it only if Coach "
+        f"explicitly directs you.\n"
+        f"  - coord_create_task: SUBTASKS only (parent must be a task "
+        f"you own). Top-level tasks are Coach's.\n"
+        f"  - coord_send_message cannot assign work to peers — only "
+        f"Coach assigns.\n"
+        f"  - coord_save_output for BINARY deliverables; text reports "
+        f"go to coord_write_knowledge.\n"
+        f"  - coord_request_human: escalate when blocked on something "
+        f"only the human can decide. Replies to inbound human messages "
+        f"auto-forward back. Ignore PushNotification — it's a generic "
+        f"CLI affordance, not how this harness reaches the human.\n\n"
+        f"Data paths:\n"
+        f"  - your cwd is your per-slot git worktree (when the active "
+        f"project has a repo configured). All edits land here; ship "
+        f"via coord_commit_push.\n"
+        f"  - ./uploads/ — human-uploaded reference material (PDFs, "
+        f"specs, screenshots; read-only, auto-synced from kDrive ~60s).\n"
+        f"  - ./attachments/ — pasted images from the UI.\n"
+        f"  - knowledge/<path>.md, outputs/<path>.<ext>, memory/<topic>.md "
+        f"— team-wide via coord_* tools.\n"
+        f"  - ./handoffs/<agent>-<ts>.md — full compact-handoff files "
+        f"for cross-compact context.\n\n"
         f"Rules:\n"
         f"  - You execute and report. You do not assign work to other Players.\n"
         f"  - Start every turn by reading your inbox for new orders from Coach.\n"
-        f"  - Before starting complex work, check memory for prior findings.\n"
-        f"  - When you finish, mark the task done — that frees you for the next.\n"
+        f"  - Before complex work, check memory for prior findings.\n"
         f"  - If blocked, mark blocked with a note explaining why.\n"
         f"  - Be terse."
     )
@@ -5183,6 +5103,19 @@ async def run_agent(
         if not compact_mode
         else None
     )
+    # Sticky fingerprint write — see _last_shown_prior_error_fp comment
+    # at module scope. When the prompt actually carries the suffix, we
+    # stamp the fingerprint so the post-result handler can refuse to
+    # re-arm an identical note. Cleared only on a clean turn (see
+    # ResultMessage handler at line ~853). The compact-mode branch
+    # above keeps prior_err = None so we never overwrite during compact.
+    if prior_err:
+        nt = prior_err.get("num_turns")
+        _last_shown_prior_error_fp[agent_id] = (
+            prior_err.get("subtype") or None,
+            prior_err.get("stop_reason") or None,
+            nt if isinstance(nt, int) else None,
+        )
     if prior_err:
         bits: list[str] = []
         sub = prior_err.get("subtype")
@@ -5303,32 +5236,34 @@ async def run_agent(
     # Section order is tuned for Anthropic prompt-cache stability: the
     # Claude CLI applies cache breakpoints automatically, but only the
     # longest stable byte-prefix is reused across turns. So the rule is
-    # STABLE BLOCKS FIRST, DYNAMIC BLOCKS LAST. Reordering the dynamic
-    # tail (coordination/supplement/error/handoff) ahead of the heavy
-    # stable middle (context_suffix = global+project CLAUDE.md + playbook,
-    # ~97% of prompt size per the 2026-05-09 prompt-log analysis) busts
-    # the cache for the entire body on every Coach turn, since the
-    # coordination block changes whenever tasks/messages/health rollups
-    # do. Per-agent stability:
+    # STABLE BLOCKS FIRST, DYNAMIC BLOCKS LAST. Per-agent stability
+    # (most stable → most volatile):
     #   identity        — per (slot, project), changes on rare edits
     #   role_baseline   — constant per slot
     #   context_suffix  — per (global+project CLAUDE.md mtime; +playbook for Coach)
     #   brief           — per agents.brief edit
-    #   coordination    — per Coach turn (Coach only; "" for Players)
-    #   coach_supplement— per objectives/todos change (Coach only)
-    #   prior_error     — one-shot, present only after a failed turn
+    #   coach_supplement— per objectives/todos change (sub-hourly; Coach only)
+    #   prior_error     — present after a failed turn; stable while present
     #   handoff         — present only on the first turn after /compact
     #   lock_suffix     — currently always ""; kept for shape parity
+    #   coordination    — per Coach turn (Coach only; "" for Players)
+    #
+    # 2026-05-11: coordination_block moved to LAST. Previously it sat
+    # before coach_supplement/prior_error/handoff, which meant any
+    # per-turn coordination delta busted ~3.5K of otherwise-stable
+    # cached prefix on every Coach turn. Putting it last keeps
+    # everything stable cached and isolates the volatile region to
+    # the trailing block.
     system_prompt = (
         identity_prefix
         + role_baseline
         + context_suffix
         + brief_suffix
-        + coordination_block
         + coach_supplement
         + prior_error_suffix
         + handoff_suffix
         + lock_suffix
+        + coordination_block
     )
 
     # Prompt-size telemetry — JSONL log under <DATA_ROOT>/prompt_log/
@@ -5336,8 +5271,64 @@ async def run_agent(
     # above. Disable via HARNESS_PROMPT_LOG=false. Compact-mode spawns
     # don't reach this branch; their prompt is composed at the
     # alt-path (see TurnContext at line 5322).
+    #
+    # Also probes SDK-injected payload sizes the harness doesn't
+    # build but the API DOES see on the wire:
+    #   - sdk_global_claude_md / sdk_project_claude_md: only on Claude
+    #     turns (the Agent SDK auto-loads CLAUDE.md via setting_sources);
+    #     0 on Codex turns where context.py manually folds CLAUDE.md
+    #     into context_suffix.
+    #   - sdk_coord_schema: approximate MCP coord tool-definition
+    #     payload size for both runtimes.
+    # These are sizes-on-disk / sizes-of-schema, not exact wire bytes,
+    # but tight enough for trending. See server/prompt_log.py.
     try:
         from server.prompt_log import record as _prompt_log_record  # noqa: PLC0415
+        from server.tools import coord_schema_chars as _coord_schema_chars  # noqa: PLC0415
+
+        sdk_global_md = 0
+        sdk_project_md = 0
+        if _runtime_name == "claude":
+            try:
+                from server.paths import global_paths, project_paths  # noqa: PLC0415
+
+                gp_md = global_paths().claude_md
+                if gp_md.is_file():
+                    sdk_global_md = gp_md.stat().st_size
+                active_pid = await resolve_active_project()
+                if active_pid:
+                    pp_md = project_paths(active_pid).claude_md
+                    if pp_md.is_file():
+                        sdk_project_md = pp_md.stat().st_size
+            except Exception:
+                pass
+        try:
+            sdk_coord_schema = _coord_schema_chars(agent_id)
+        except Exception:
+            sdk_coord_schema = 0
+
+        # Tool Search probe — when the runtime injects ENABLE_TOOL_SEARCH
+        # the SDK serves tool definitions on demand instead of shipping
+        # the full schema on every turn. Log whether THIS spawn would
+        # have enabled it. Gating mirrors ClaudeRuntime exactly so the
+        # observable matches behaviour.
+        _ts_active = False
+        if _runtime_name == "claude":
+            _ts_env = os.environ.get("HARNESS_TOOL_SEARCH", "true").lower()
+            if _ts_env not in ("0", "false", "no", "off"):
+                if "haiku" not in (model or "").lower():
+                    _ts_active = True
+
+        # When tool search is active, the SDK ships ~3–5 retrieved
+        # tools per agent search instead of the full registered set.
+        # `sdk_coord_schema_effective` is a crude estimate of the
+        # actual wire-payload (assume ~1.2K avg per loaded tool × 5)
+        # so trend analyses can compare the savings vs the un-gated
+        # registration size. When tool search is off the effective
+        # equals the registered count.
+        _sdk_coord_schema_effective = (
+            min(sdk_coord_schema, 6000) if _ts_active else sdk_coord_schema
+        )
 
         _prompt_log_record(
             agent_id=agent_id,
@@ -5353,6 +5344,11 @@ async def run_agent(
                 "prior_error": len(prior_error_suffix),
                 "handoff": len(handoff_suffix),
                 "lock": len(lock_suffix),
+                "sdk_global_claude_md": sdk_global_md,
+                "sdk_project_claude_md": sdk_project_md,
+                "sdk_coord_schema": sdk_coord_schema,
+                "sdk_coord_schema_effective": _sdk_coord_schema_effective,
+                "sdk_tool_search_active": 1 if _ts_active else 0,
                 "total": len(system_prompt),
             },
         )

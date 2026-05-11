@@ -896,13 +896,23 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "  them to do. If empty, the harness falls back to a "
             "  short fact line ('Coach created task X and assigned "
             "  you as <role>'); your note replaces that with real "
-            "  context."
+            "  context.\n"
+            "- success_criteria: optional 1-3 line statement of what "
+            "  'done' looks like for this task — the bar you will "
+            "  evaluate the shipped work against. Stored on the "
+            "  task; surfaces in the auditor's wake context and is "
+            "  echoed back to you at coord_approve_stage(audit→ship) "
+            "  so the evaluation references your prior, not the "
+            "  auditor's interpretation. Skip when the goal is "
+            "  exploratory; you can also set/refine it later at "
+            "  coord_approve_stage(plan→execute) once the planner's "
+            "  spec is in hand."
         ),
         {
             "title": str, "description": str, "parent_id": str,
             "priority": str, "workflow": str,
             "tracking_reason": str, "trajectory": Any,
-            "note": str,
+            "note": str, "success_criteria": str,
         },
     )
     async def create_task(args: dict[str, Any]) -> dict[str, Any]:
@@ -911,6 +921,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             return _err("title is required")
         description = args.get("description") or ""
         coach_note = (args.get("note") or "").strip() or None
+        success_criteria = (args.get("success_criteria") or "").strip()
         parent_id_arg = args.get("parent_id")
         parent_id = parent_id_arg.strip() if isinstance(parent_id_arg, str) and parent_id_arg.strip() else None
         priority = (args.get("priority") or "normal").strip().lower()
@@ -1036,12 +1047,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             await c.execute(
                 "INSERT INTO tasks (id, project_id, title, description, parent_id, "
                 "priority, workflow, tracking_reason, trajectory, status, owner, "
-                "last_stage_change_at, created_by) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "last_stage_change_at, created_by, success_criteria) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (task_id, project_id, title, description, parent_id,
                  priority, workflow, tracking_reason or None,
                  trajectory_json, initial_status, initial_owner,
-                 now_iso, caller_id),
+                 now_iso, caller_id, success_criteria),
             )
             # v2 (Docs/kanban-specs-v2.md §7.1): first-stage-only
             # planting. The role row is created ONLY when the
@@ -6060,11 +6071,19 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- next_stage: target stage (kanban value)\n"
             "- assignee: single Player slot (required when next_stage "
             "is not 'archive')\n"
-            "- note: optional wake prompt; carried on `task_stage_changed`"
+            "- note: optional wake prompt; carried on `task_stage_changed`\n"
+            "- success_criteria: optional, only applied at plan→execute "
+            "transitions. Updates the task's stored definition of done "
+            "based on what you learned from reading the planner's spec. "
+            "Replaces any value set at coord_create_task time. Surfaces "
+            "in the auditor's wake context and is echoed back to you "
+            "when you advance audit→ship. Ignored on transitions other "
+            "than plan→execute."
         ),
         {
             "task_id": str, "next_stage": str,
             "assignee": str, "note": str,
+            "success_criteria": str,
         },
     )
     async def approve_stage(args: dict[str, Any]) -> dict[str, Any]:
@@ -6078,6 +6097,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         next_stage = (args.get("next_stage") or "").strip().lower()
         assignee_raw = (args.get("assignee") or "").strip().lower()
         note = (args.get("note") or "").strip()
+        success_criteria_in = (args.get("success_criteria") or "").strip()
         if not task_id:
             return _err("task_id is required")
         if next_stage not in ALL_KANBAN_STAGES:
@@ -6138,7 +6158,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         old_status: str | None = None
         try:
             cur = await c.execute(
-                "SELECT status, owner FROM tasks "
+                "SELECT status, owner, success_criteria FROM tasks "
                 "WHERE id = ? AND project_id = ?",
                 (task_id, project_id),
             )
@@ -6148,6 +6168,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             t = dict(row)
             old_status = t["status"]
             old_owner = t.get("owner")
+            stored_success_criteria = (t.get("success_criteria") or "").strip()
             if old_status == "archive":
                 return _err(
                     f"task {task_id} is already archived; archived "
@@ -6286,6 +6307,26 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     "WHERE id = ? AND project_id = ?",
                     (next_stage, tasks_owner, now, task_id, project_id),
                 )
+                # success_criteria is the Coach-authored "definition of
+                # done" for the task. Only updated at plan→execute —
+                # that's the moment Coach has read the planner's spec
+                # and is in the best position to crystallize the bar
+                # the work will be evaluated against. Updates at other
+                # transitions are silently ignored to keep the field
+                # stable across execute/audit/ship; if Coach realizes
+                # the criteria is wrong mid-flight they can revert to
+                # plan and re-approve to update it.
+                if (
+                    old_status == "plan"
+                    and next_stage == "execute"
+                    and success_criteria_in
+                ):
+                    await c.execute(
+                        "UPDATE tasks SET success_criteria = ? "
+                        "WHERE id = ? AND project_id = ?",
+                        (success_criteria_in, task_id, project_id),
+                    )
+                    stored_success_criteria = success_criteria_in
                 # Propagate current_task_id when entering execute with
                 # a hard-assigned executor (mirror coord_create_task).
                 if next_stage == "execute":
@@ -6457,12 +6498,23 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"Do NOT follow up with coord_send_message; the wake "
                 f"covers it."
             )
+        # Ship-stage echo: when Coach is approving audit→ship, surface
+        # the task's stored definition of done so Coach evaluates the
+        # final gate against their own prior, not from memory. Only
+        # rendered when criteria is set — silent when unset to preserve
+        # the optional-everywhere posture.
+        criteria_echo = ""
+        if next_stage == "ship" and stored_success_criteria:
+            criteria_echo = (
+                f" You defined done as: {stored_success_criteria}"
+            )
         return _ok(
             f"Approved {task_id}: {old_status} → {next_stage} "
             f"({target_role} → {assignee}){suffix_note}. "
             f"Planted {assignee}'s role row, woke them with your "
             f"note as the brief. Do NOT follow up with "
             f"coord_send_message; the wake covers it."
+            f"{criteria_echo}"
         )
 
     @tool(
@@ -7089,6 +7141,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     if include_proxy_metadata:
         server["_handlers"] = {t.name: t.handler for t in _tools}
         server["_tool_names"] = [t.name for t in _tools]
+        # Full SdkMcpTool list — kept for in-process introspection
+        # (e.g., coord_schema_chars below approximates the wire-side
+        # tool-definition payload size). Contains Python callables on
+        # `.handler`, so this must NEVER leak to the SDK options path
+        # (which JSON-serializes mcp_servers). The proxy metadata
+        # branch is opt-in via include_proxy_metadata; the default
+        # path returns a clean server.
+        server["_tool_specs"] = list(_tools)
     return server
 
 
@@ -7100,6 +7160,70 @@ def coord_tool_names() -> list[str]:
     """
     server = build_coord_server("coach", include_proxy_metadata=True)
     return list(server["_tool_names"])
+
+
+_COORD_SCHEMA_CHARS_CACHE: dict[str, int] = {}
+
+
+def coord_schema_chars(caller_id: str) -> int:
+    """Approximate the size of the MCP tool-schema payload the SDK
+    injects when this caller's coord server is wired up. Sums
+    `name + description + JSON(args_schema)` across registered tools
+    plus per-tool wrapper overhead. Real wire size differs slightly
+    (MCP framing varies by SDK version), but this is a close lower
+    bound and stable for trending.
+
+    Cached per `caller_id` because Coach and Players see different
+    tool subsets (hierarchy filtering inside `build_coord_server`).
+    The registry is static per process, so a one-shot probe is fine.
+    """
+    cached = _COORD_SCHEMA_CHARS_CACHE.get(caller_id)
+    if cached is not None:
+        return cached
+    try:
+        server = build_coord_server(caller_id, include_proxy_metadata=True)
+        specs = server.get("_tool_specs") or []
+        total = 0
+        for t in specs:
+            name = getattr(t, "name", "") or ""
+            desc = getattr(t, "description", "") or ""
+            schema = getattr(t, "input_schema", None)
+            try:
+                # `input_schema` for SdkMcpTool can be either a JSON-
+                # schema dict or a {arg_name: type-or-typing-construct}
+                # mapping. The latter isn't JSON-serializable as-is
+                # (types and PEP 604 unions like `str | None` aren't
+                # JSON values), so coerce every non-primitive to its
+                # string form first.
+                if isinstance(schema, dict):
+                    def _to_jsonable(v: Any) -> Any:
+                        if isinstance(v, (str, int, float, bool)) or v is None:
+                            return v
+                        if isinstance(v, type):
+                            return v.__name__
+                        return str(v)
+                    serializable = {k: _to_jsonable(v) for k, v in schema.items()}
+                    schema_bytes = len(json.dumps(serializable))
+                elif schema is not None:
+                    schema_bytes = len(json.dumps(schema, default=str))
+                else:
+                    schema_bytes = 0
+            except Exception:
+                schema_bytes = 0
+            # ~60 bytes for the per-tool JSON wrapper around the actual
+            # schema ({"name":..., "description":..., "inputSchema":...})
+            total += len(name) + len(desc) + schema_bytes + 60
+        # Fallback when introspection retains no specs (older proxy
+        # metadata path, or a future SDK refactor) — estimate at average
+        # ~600 chars per tool to avoid logging 0.
+        if total == 0:
+            names = list(server.get("_tool_names") or [])
+            if names:
+                total = len(names) * 600
+        _COORD_SCHEMA_CHARS_CACHE[caller_id] = total
+        return total
+    except Exception:
+        return 0
 
 
 # Reasoning-effort tier labels — keyed by the int stored on

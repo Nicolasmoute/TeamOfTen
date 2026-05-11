@@ -176,8 +176,8 @@ All registered in [server/tools.py](server/tools.py)'s `_tools` map and `ALLOWED
 
 | Tool | Params | Purpose |
 |---|---|---|
-| `coord_create_task` | `title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?` | Creates a top-level or child task. Sets `tasks.status` to the trajectory's first stage (or `plan` if no trajectory). **`trajectory[0].to` MUST name exactly one Player** (v2.0.1 tightening, 2026-05-08); pool/empty first-stage `to` is rejected at trajectory validation. The role row plants at create time with that slot as `owner` (Coach pre-picked via the trajectory itself — equivalent to `coord_approve_stage` for the first transition). Subsequent stages' `to` lists never auto-plant — they're FYI only until Coach approves into that stage via `coord_approve_stage`. Emits `task_created` + `task_role_assigned` + `task_stage_changed{from=null, to=<first_stage>}`. The first-stage role row is the only auto-plant; semantically this is "Coach-via-the-trajectory" picking, not the harness picking. |
-| `coord_approve_stage` (NEW — N2) | `task_id, next_stage, assignee, note?` | The single transition tool. Coach authorizes the next stage transition, names the assignee, and provides the wake prompt. `assignee` is required for any non-archive `next_stage`; pass a single slot. `note` is included verbatim in the assignee's wake prompt. Stamps `last_stage_change_at`, deactivates any prior active role row at the target stage (with `task_role_stand_down` wake to displaced Player if any), plants a fresh role row with the named assignee, emits `task_stage_changed` and `task_role_assigned`, fires the wake. The source-stage role row is normally already complete (Player called the appropriate completion tool, which is why Coach is now reviewing); when Coach overrides without source completion (e.g. abandoning a stuck executor), the source role row is also deactivated with stand-down. The same tool covers all transitions: plan→execute, execute→audit_syntax, audit_syntax→execute (re-do), audit_syntax→ship (Coach overrides a FAIL), execute→ship, ship→archive (delivery), and any-stage→archive (cancellation, with `assignee=null` since archive has no role). Replaces v1's `coord_advance_task_stage` and absorbs all `coord_assign_*` responsibility. |
+| `coord_create_task` | `title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?, success_criteria?` | Creates a top-level or child task. Sets `tasks.status` to the trajectory's first stage (or `plan` if no trajectory). **`trajectory[0].to` MUST name exactly one Player** (v2.0.1 tightening, 2026-05-08); pool/empty first-stage `to` is rejected at trajectory validation. The role row plants at create time with that slot as `owner` (Coach pre-picked via the trajectory itself — equivalent to `coord_approve_stage` for the first transition). Subsequent stages' `to` lists never auto-plant — they're FYI only until Coach approves into that stage via `coord_approve_stage`. Emits `task_created` + `task_role_assigned` + `task_stage_changed{from=null, to=<first_stage>}`. The first-stage role row is the only auto-plant; semantically this is "Coach-via-the-trajectory" picking, not the harness picking. **`success_criteria`** is the optional Coach-authored "definition of done" — see §17.3. |
+| `coord_approve_stage` (NEW — N2) | `task_id, next_stage, assignee, note?, success_criteria?` | The single transition tool. Coach authorizes the next stage transition, names the assignee, and provides the wake prompt. `assignee` is required for any non-archive `next_stage`; pass a single slot. `note` is included verbatim in the assignee's wake prompt. Stamps `last_stage_change_at`, deactivates any prior active role row at the target stage (with `task_role_stand_down` wake to displaced Player if any), plants a fresh role row with the named assignee, emits `task_stage_changed` and `task_role_assigned`, fires the wake. The source-stage role row is normally already complete (Player called the appropriate completion tool, which is why Coach is now reviewing); when Coach overrides without source completion (e.g. abandoning a stuck executor), the source role row is also deactivated with stand-down. The same tool covers all transitions: plan→execute, execute→audit_syntax, audit_syntax→execute (re-do), audit_syntax→ship (Coach overrides a FAIL), execute→ship, ship→archive (delivery), and any-stage→archive (cancellation, with `assignee=null` since archive has no role). Replaces v1's `coord_advance_task_stage` and absorbs all `coord_assign_*` responsibility. **`success_criteria`** is consumed only at plan→execute (refines/replaces the value set at `coord_create_task`); ignored on other transitions. The stored value is echoed back in the tool result on advance to ship. See §17.3. |
 | `coord_archive_task` (NEW — R3) | `task_id, summary` | Coach-only deliberate archive. Writes the user-facing summary, transitions to archive, marks any active role rows complete. The summary lands as a `.sys` row in Coach's pane and is forwarded to Telegram if the originating turn was user-triggered. Use this when a task wraps via natural completion (work delivered) or explicit cancellation (Coach decides not to ship); v1's auto-archive on trajectory-end is gone. |
 | `coord_set_task_trajectory` | `task_id, trajectory` | Mid-flight reroute. v2 semantics per §4.3 — loose constraints, normal Coach operation. |
 | `coord_request_plan_review` (NEW — N3) | `task_id, slot` | When Coach decides plan-mode is useful for a Player's turn, this wakes the Player with plan-mode enabled. The Player produces an ExitPlanMode artifact; on submission a `pending_plan{route='coach'}` event surfaces it to Coach for review before tools are touched. Coach approves (Player proceeds with the plan) or rewrites (Coach calls `coord_approve_stage` with a Coach-composed note instead). |
@@ -577,9 +577,11 @@ Carried from v1 §12 with two additions:
 - `project_events` (§9.1) — N1.
 - `deviations_log` (§22.1) — validation instrumentation.
 
-### 16.2 No new `tasks` columns
+### 16.2 New `tasks` columns
 
 v2 does NOT add an `auto_advance` column — every task is review-gated. v1's `complexity` / `required_reviews` / `ship_required` (already removed in v0.3) stay removed.
+
+The only column added in v2 is `success_criteria TEXT NOT NULL DEFAULT ''` — Coach's first-class definition of done (see §17.3 below). Optional advisory field; never blocks a transition.
 
 ### 16.3 Carried from v1
 
@@ -640,6 +642,23 @@ Every Coach delegation goes through the kanban. Stages: plan → execute → aud
 ```
 
 The Coach-driven reconciliation flow at [server/project_claude_md.py:update_claude_md_via_coach](server/project_claude_md.py) propagates this on activation, same as today.
+
+### 17.3 `success_criteria` — Coach's first-class definition of done
+
+`tasks.success_criteria TEXT NOT NULL DEFAULT ''` is an optional Coach-authored statement of "what done looks like" for the task. Captured at two moments and surfaced at three. **Fully optional** — system works identically when empty. **Never blocks a transition** — pure advisory context. No new tool, no new event type, no new validation gate.
+
+**Capture moments:**
+
+1. `coord_create_task(success_criteria?)` — Coach fills it when the bar is clear upfront (most useful for execute-only trajectories that skip the plan stage).
+2. `coord_approve_stage(plan→execute, success_criteria?)` — the most informative moment, since Coach has now read the planner's `spec.md`. Replaces any value set at creation. Updates at non-plan transitions are silently ignored to keep the field stable across execute/audit/ship; if Coach decides the criteria is wrong mid-flight, they revert to plan and re-approve.
+
+**Surface moments:**
+
+1. **Auditor wake** — [server/kanban.py:build_auditor_wake_body](server/kanban.py) injects a `## Coach's acceptance criteria` section right after `## Focus` (and before `## Contract` / `## Project context`) when the field is non-empty. The auditor evaluates against Coach's prior, not just their own interpretation of the spec.
+2. **Coach coordination block** — `## Current state` task rows in `execute` / `audit_syntax` / `audit_semantics` / `ship` get a `→ done when: <criteria>` sub-line (truncated at ~120 chars). Plan-stage tasks don't render the sub-line — Coach is still deciding the bar. Empty-criteria tasks render no sub-line at any stage.
+3. **`coord_approve_stage` tool result on advance to ship** — when criteria is set, the tool result echoes `You defined done as: <criteria>` so Coach evaluates the final ship gate against their own prior, not from memory.
+
+**Why a separate field instead of reusing `note`:** `note` is the wake prompt for the next assignee — consumed once and gone. `success_criteria` is a contract stored on the task that survives across all stage transitions. They serve different audiences (assignee vs auditor + future Coach).
 
 ---
 

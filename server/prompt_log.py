@@ -14,9 +14,32 @@ Schema per row:
       "agent_id": "coach" | "p1".."p10",
       "runtime": "claude" | "codex",
       "model": str,
-      "total_chars": int,
+      "total_chars": int,           # harness-built system prompt only
       "sections": { "<name>": int, ... }   # chars per section
     }
+
+`total_chars` covers the harness-built system_prompt only. The
+`sections` map also carries SDK-injected sizes the harness doesn't
+build but the API sees on the wire:
+  - sdk_global_claude_md: bytes on disk of /data/CLAUDE.md the Agent
+    SDK auto-loads (Claude runtime only; 0 on Codex turns where
+    context.py folds CLAUDE.md into context_suffix manually).
+  - sdk_project_claude_md: bytes on disk of the active project's
+    CLAUDE.md, same gating as above.
+  - sdk_coord_schema: approximate JSON size of the coord MCP tool
+    definitions the SDK injects on both runtimes (sum of name +
+    description + args_schema + per-tool wrapper, cached per
+    caller_id).
+  - sdk_coord_schema_effective: clamped to ~6 KB when
+    `sdk_tool_search_active=1` — the SDK then ships ~3–5 retrieved
+    tools per agent search instead of the full registered set.
+    Equals `sdk_coord_schema` when tool search is off.
+  - sdk_tool_search_active: 0/1 — whether ClaudeRuntime injected
+    `ENABLE_TOOL_SEARCH=auto:N` into the spawn env for this turn.
+    Gated off for Codex turns and Haiku Claude turns.
+These are not summed into `total_chars` so the field keeps its
+"harness-built only" semantics; sum them in post-analysis to see
+the real wire payload.
 
 Failures are swallowed — prompt logging must never break a turn.
 """
@@ -28,7 +51,6 @@ import logging
 import os
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from server.paths import DATA_ROOT

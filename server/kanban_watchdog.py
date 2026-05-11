@@ -303,6 +303,10 @@ async def _hydrate_candidate(cand: Candidate) -> None:
     """Fill `recent_events` and `task` for a candidate so tier 2 has
     enough context to classify. Read N most recent events for the
     slot + task row when applicable. Mutates the dataclass in place.
+
+    Kept for back-compat / single-candidate callers (tests). The hot
+    path uses `_hydrate_candidates` (plural) which batches the
+    per-slot fetches into one IN-clause query each.
     """
     n = _recent_events_per_candidate()
     c = await configured_conn()
@@ -326,6 +330,70 @@ async def _hydrate_candidate(cand: Candidate) -> None:
         await c.close()
     rows.reverse()  # chronological for prompt readability
     cand.recent_events = rows
+
+
+async def _hydrate_candidates(cands: list[Candidate]) -> None:
+    """Batched variant: one event query for all slots, one task query
+    for all current task ids. Replaces the per-candidate connection +
+    two-query round-trip in the watchdog hot path.
+
+    Per-slot event tail is computed via `ROW_NUMBER() OVER (PARTITION
+    BY agent_id ORDER BY id DESC)` then filtered to the top N — keeps
+    the work in one query. Mutates each Candidate in place; missing
+    rows leave the field empty.
+    """
+    if not cands:
+        return
+    n = _recent_events_per_candidate()
+    slots = [c.slot for c in cands]
+    task_ids = [c.current_task_id for c in cands if c.current_task_id]
+
+    by_slot: dict[str, list[dict[str, Any]]] = {s: [] for s in slots}
+    tasks_by_id: dict[str, dict[str, Any]] = {}
+
+    placeholders_slots = ",".join("?" * len(slots))
+    conn = await configured_conn()
+    try:
+        # Window function: per-slot id-DESC tail, capped at n. SQLite
+        # 3.25+ has ROW_NUMBER; modern containers ship 3.40+.
+        cur = await conn.execute(
+            f"""
+            SELECT id, ts, agent_id, type, payload FROM (
+                SELECT id, ts, agent_id, type, payload,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY agent_id ORDER BY id DESC
+                       ) AS rn
+                  FROM events
+                 WHERE agent_id IN ({placeholders_slots})
+            ) WHERE rn <= ?
+            ORDER BY agent_id, id ASC
+            """,
+            (*slots, n),
+        )
+        for raw in await cur.fetchall():
+            row = dict(raw)
+            slot = row.pop("agent_id")
+            by_slot.setdefault(slot, []).append(row)
+
+        if task_ids:
+            placeholders_tasks = ",".join("?" * len(task_ids))
+            cur = await conn.execute(
+                "SELECT id, title, status, owner, last_stage_change_at "
+                f"FROM tasks WHERE id IN ({placeholders_tasks})",
+                tuple(task_ids),
+            )
+            for raw in await cur.fetchall():
+                row = dict(raw)
+                tasks_by_id[row["id"]] = row
+    finally:
+        await conn.close()
+
+    for cand in cands:
+        cand.recent_events = by_slot.get(cand.slot, [])
+        if cand.current_task_id:
+            t = tasks_by_id.get(cand.current_task_id)
+            if t is not None:
+                cand.task = t
 
 
 # ---------------------------------------------------------------- tier 2 (Haiku)
@@ -958,17 +1026,25 @@ async def sweep_once() -> int:
     if not await _within_cost_cap():
         return 0
 
-    # Hydrate each candidate with recent events + task. Per-candidate
-    # exception isolation so one bad slot doesn't blank the rest.
+    # Batch-hydrate all candidates in one event query + one task query
+    # instead of opening a fresh connection per slot. On batch failure
+    # fall back to the per-candidate path so a single bad row doesn't
+    # blank the whole tier-2 fire (matches the original isolation
+    # contract).
     hydrated: list[Candidate] = []
-    for c in candidates:
-        try:
-            await _hydrate_candidate(c)
-            hydrated.append(c)
-        except Exception:
-            logger.exception(
-                "watchdog: hydrate failed (slot=%s)", c.slot
-            )
+    try:
+        await _hydrate_candidates(candidates)
+        hydrated = list(candidates)
+    except Exception:
+        logger.exception("watchdog: batch hydrate failed; falling back to per-candidate")
+        for c in candidates:
+            try:
+                await _hydrate_candidate(c)
+                hydrated.append(c)
+            except Exception:
+                logger.exception(
+                    "watchdog: hydrate failed (slot=%s)", c.slot
+                )
     if not hydrated:
         return 0
 

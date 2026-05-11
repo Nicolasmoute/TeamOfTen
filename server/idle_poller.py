@@ -295,36 +295,32 @@ async def sweep_once() -> int:
             )
     # Stall sweeper runs after the per-Player wakes so a freshly woken
     # Player doesn't simultaneously trigger a stale alert (tiny race
-    # but worth avoiding).
-    try:
-        await stall_sweep_once()
-    except Exception:
-        logger.exception("idle_poller: stall sweep crashed")
-    # Reconciliation sweep (v0.3.8): catch the "Player did the work
-    # but the kanban didn't notice" failure mode. Read-only — emits
-    # events to Coach but never mutates DB rows itself.
-    try:
-        await reconciliation_sweep_once()
-    except Exception:
-        logger.exception("idle_poller: reconciliation sweep crashed")
-    # Board safety ring (v2 §10.4): catch "Coach went to sleep on the
-    # entire kanban" — no task_stage_changed event in N minutes despite
-    # active tasks on the board.
-    try:
-        await board_safety_ring_once()
-    except Exception:
-        logger.exception("idle_poller: board safety ring crashed")
-    # Soft-stall watchdog (v0.3.9): tier 1 SQL filter + bundled Haiku
-    # call to catch agents stuck in ways the deterministic ladder
-    # misses (declared done but didn't advance the kanban; looping;
-    # erroring without recovery). Cost-capped + dedup-gated; most
-    # ticks short-circuit at tier 1 with zero candidates.
-    # See Docs/kanban-specs-v2.md §10.7.
-    try:
-        from server.kanban_watchdog import sweep_once as _watchdog_sweep
-        await _watchdog_sweep()
-    except Exception:
-        logger.exception("idle_poller: watchdog sweep crashed")
+    # but worth avoiding). The remaining four sweeps read disjoint
+    # data (stall: tasks+role_assignments; reconciliation: tasks+events;
+    # board safety: events; watchdog: agents+events) so we run them
+    # concurrently — the slowest one no longer blocks the others, and
+    # the tick wall-time approaches max(sweeps) instead of sum(sweeps).
+    # Each sweep already catches its own exceptions internally; the
+    # outer return_exceptions guard is a defense-in-depth backstop.
+    async def _safe(coro_factory, label):
+        try:
+            await coro_factory()
+        except Exception:
+            logger.exception("idle_poller: %s crashed", label)
+
+    from server.kanban_watchdog import sweep_once as _watchdog_sweep
+    await asyncio.gather(
+        _safe(stall_sweep_once, "stall sweep"),
+        _safe(reconciliation_sweep_once, "reconciliation sweep"),
+        _safe(board_safety_ring_once, "board safety ring"),
+        # Soft-stall watchdog (v0.3.9): tier 1 SQL filter + bundled
+        # Haiku call to catch agents stuck in ways the deterministic
+        # ladder misses (declared done but didn't advance the kanban;
+        # looping; erroring without recovery). Cost-capped + dedup-
+        # gated; most ticks short-circuit at tier 1 with zero candidates.
+        # See Docs/kanban-specs-v2.md §10.7.
+        _safe(_watchdog_sweep, "watchdog sweep"),
+    )
     return woken
 
 
@@ -387,6 +383,39 @@ async def stall_sweep_once() -> int:
     if not rows:
         return 0
 
+    # Batch-fetch the active role row for every stalled (task_id, role)
+    # pair in one query. The prior code opened a fresh connection per
+    # stalled task and ran a separate query, which is O(N) DB round-
+    # trips per sweep — unnecessary when one IN-clause query covers
+    # the whole working set. We over-fetch (all roles for these tasks,
+    # not just the per-task active role) and filter in Python below.
+    task_id_to_role: dict[str, str] = {}
+    for r in rows:
+        role = _role_for_stage(r["status"])
+        if role:
+            task_id_to_role[r["id"]] = role
+    role_rows_by_key: dict[tuple[str, str], dict] = {}
+    if task_id_to_role:
+        placeholders = ",".join("?" * len(task_id_to_role))
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT task_id, role, id, eligible_owners, owner "
+                "FROM task_role_assignments "
+                f"WHERE task_id IN ({placeholders}) "
+                "AND completed_at IS NULL AND superseded_by IS NULL "
+                "ORDER BY task_id, role, assigned_at DESC",
+                tuple(task_id_to_role.keys()),
+            )
+            # Collapse to the first (most recent) row per (task_id, role).
+            for raw in await cur.fetchall():
+                rrow = dict(raw)
+                key = (rrow["task_id"], rrow["role"])
+                if key not in role_rows_by_key:
+                    role_rows_by_key[key] = rrow
+        finally:
+            await c.close()
+
     now_dt = datetime.now(timezone.utc)
     now_iso = now_dt.isoformat()
     progressed = 0
@@ -403,32 +432,20 @@ async def stall_sweep_once() -> int:
 
             # Resolve the active role row for the CURRENT stage so
             # we ladder-fire against the actual blocker, not always
-            # tasks.owner (v0.3.4 bug-fix preserved).
+            # tasks.owner (v0.3.4 bug-fix preserved). Looked up from
+            # the batch-fetched map above (no per-task DB round-trip).
             stage = r["status"]
             role = _role_for_stage(stage)
             eligible: list[str] = []
             stage_owner: str | None = None
             role_row_id: int | None = None
             if role:
-                c = await configured_conn()
-                try:
-                    cur = await c.execute(
-                        "SELECT id, eligible_owners, owner FROM "
-                        "task_role_assignments WHERE task_id = ? "
-                        "AND role = ? AND completed_at IS NULL "
-                        "AND superseded_by IS NULL "
-                        "ORDER BY assigned_at DESC LIMIT 1",
-                        (r["id"], role),
-                    )
-                    rrow = await cur.fetchone()
-                finally:
-                    await c.close()
-                if rrow:
-                    rd = dict(rrow)
-                    role_row_id = rd.get("id")
-                    stage_owner = rd.get("owner")
+                rrow = role_rows_by_key.get((r["id"], role))
+                if rrow is not None:
+                    role_row_id = rrow.get("id")
+                    stage_owner = rrow.get("owner")
                     try:
-                        parsed = json.loads(rd.get("eligible_owners") or "[]")
+                        parsed = json.loads(rrow.get("eligible_owners") or "[]")
                         if isinstance(parsed, list):
                             eligible = [str(x) for x in parsed]
                     except Exception:

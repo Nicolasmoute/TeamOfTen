@@ -238,6 +238,19 @@ CREATE INDEX IF NOT EXISTS idx_events_type_id ON events(type, id);
 -- by type"). They sit alongside payload_to / payload_owner above.
 CREATE INDEX IF NOT EXISTS idx_events_to    ON events(type, payload_to, id);
 CREATE INDEX IF NOT EXISTS idx_events_owner ON events(type, payload_owner, id);
+-- Project-prefixed variants for /api/events. The endpoint always
+-- starts WHERE with `project_id = ?` so a project-leading index lets
+-- the planner narrow the scan before applying the OR-fanout. Without
+-- these the existing (type, payload_to, id) etc. force the planner
+-- to read across every project's tail of matching rows. The (project_id,
+-- agent_id, id) index covers the actor-of-any-type branch + the id
+-- ORDER BY tail in one structure.
+CREATE INDEX IF NOT EXISTS idx_events_project_agent ON events(project_id, agent_id, id);
+CREATE INDEX IF NOT EXISTS idx_events_project_to    ON events(project_id, type, payload_to, id);
+CREATE INDEX IF NOT EXISTS idx_events_project_owner ON events(project_id, type, payload_owner, id);
+-- Time-window scans by ts (sync.flush_day, retention DELETE). Without
+-- this every flush + every nightly trim full-scans the events table.
+CREATE INDEX IF NOT EXISTS idx_events_ts_id ON events(ts, id);
 
 -- Per-project event log (Docs/kanban-specs-v2.md §9). Coach reads the
 -- unread tail on every tick via the `## Recent events` prompt block.
@@ -266,6 +279,11 @@ CREATE INDEX IF NOT EXISTS idx_project_events_project_unread
     ON project_events(project_id, read_by_coach_at, ts);
 CREATE INDEX IF NOT EXISTS idx_project_events_task   ON project_events(task_id, ts);
 CREATE INDEX IF NOT EXISTS idx_project_events_actor  ON project_events(actor, ts);
+-- Playbook reflection runner scans by (type, ts) for the recent
+-- evidence window. Without this index every reflection cycle
+-- full-scans project_events.
+CREATE INDEX IF NOT EXISTS idx_project_events_type_ts
+    ON project_events(type, ts);
 
 -- Validation instrumentation for kanban v2 (Docs/kanban-specs-v2.md §22.1).
 -- A row is inserted when Coach's coord_approve_stage note flags a
@@ -859,6 +877,23 @@ async def init_db() -> None:
                     "stall_escalation_level INTEGER NOT NULL DEFAULT 0",
                 )],
             )
+            # Coach-authored "definition of done" for the task. Optional
+            # advisory field; never blocks a transition. Captured at
+            # coord_create_task time and/or at coord_approve_stage(plan→
+            # execute) time (the second moment is most informative
+            # because Coach has read the planner's spec). Surfaced in
+            # auditor wake context, in Coach's coordination block for
+            # tasks in execute/audit/ship, and echoed back to Coach in
+            # the coord_approve_stage tool result when advancing to
+            # ship. Empty string = unset = no injection anywhere.
+            await _ensure_columns(
+                db,
+                "tasks",
+                [(
+                    "success_criteria",
+                    "success_criteria TEXT NOT NULL DEFAULT ''",
+                )],
+            )
             # Indexes that reference kanban-new columns. Live outside
             # SCHEMA because their columns don't exist on legacy DBs
             # until the migration above runs.
@@ -1061,6 +1096,17 @@ async def _ensure_tasks_kanban_indexes(db: aiosqlite.Connection) -> None:
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_stage_change "
         "ON tasks(last_stage_change_at)"
+    )
+    # Composite for stall_sweep's WHERE shape:
+    #   status NOT IN ('archive') AND blocked = 0
+    #     AND last_stage_change_at IS NOT NULL AND last_stage_change_at < ?
+    # Leading status + blocked lets the planner skip archived/blocked rows
+    # entirely; the trailing last_stage_change_at narrows by stall age
+    # without a temp-sort. The plain idx_tasks_stage_change above stays
+    # because other queries hit only that column.
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_stall_gate "
+        "ON tasks(status, blocked, last_stage_change_at)"
     )
 
 

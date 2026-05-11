@@ -54,6 +54,17 @@ _BUCKETS = [
 ]
 
 
+# Cached `playbook_disabled` flag. The query is read by every Coach
+# turn during system-prompt assembly via the async caller in
+# build_system_prompt_suffix; the underlying sync sqlite3.connect()
+# blocks the event loop briefly each time. The flag itself is a rarely-
+# toggled operator setting (no runtime mutation API), so a short TTL
+# is the right shape — long enough to eliminate the per-turn cost,
+# short enough that a manual DB edit takes effect within seconds.
+_DISABLED_CACHE: dict[str, float | bool] = {"value": False, "expires_at": 0.0}
+_DISABLED_TTL_S = 10.0
+
+
 def _is_disabled() -> bool:
     """Read `team_config['playbook_disabled']` via direct sync sqlite3.
 
@@ -61,8 +72,16 @@ def _is_disabled() -> bool:
     without forcing async. Mirrors the pattern of `_read_text_safe()` for
     CLAUDE.md (sync file read inside an async caller). Errors → return
     False (fail-open: render the playbook rather than silently hide it).
+
+    Result cached for `_DISABLED_TTL_S` seconds to skip the SQLite open
+    on every Coach turn.
     """
     import sqlite3
+    import time
+
+    now = time.monotonic()
+    if now < float(_DISABLED_CACHE["expires_at"]):
+        return bool(_DISABLED_CACHE["value"])
 
     try:
         from server.db import DB_PATH  # noqa: PLC0415
@@ -76,11 +95,15 @@ def _is_disabled() -> bool:
                 (config.PLAYBOOK_DISABLED_KEY,),
             )
             row = cur.fetchone()
-            return bool(row and row[0] == "1")
+            value = bool(row and row[0] == "1")
         finally:
             conn.close()
     except Exception:
-        return False
+        value = False
+
+    _DISABLED_CACHE["value"] = value
+    _DISABLED_CACHE["expires_at"] = now + _DISABLED_TTL_S
+    return value
 
 
 def _sort_key(stmt: Statement) -> float:

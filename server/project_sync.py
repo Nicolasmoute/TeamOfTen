@@ -149,6 +149,10 @@ async def _sync_state_upsert(
     size_bytes: int,
     sha256: str,
 ) -> None:
+    # Commit immediately so the write transaction does NOT stay open
+    # across the next file's WebDAV upload — the harness runs a single
+    # SQLite write handle, and a held txn here would block every other
+    # writer (events, turns, messages) for the entire upload window.
     await db.execute(
         "INSERT INTO sync_state "
         "(project_id, tree, path, mtime, size_bytes, sha256, last_synced_at) "
@@ -160,15 +164,19 @@ async def _sync_state_upsert(
         "  last_synced_at = excluded.last_synced_at",
         (project_id, tree, path, mtime, size_bytes, sha256, _now_iso()),
     )
+    await db.commit()
 
 
 async def _sync_state_delete(
     db: aiosqlite.Connection, project_id: str, tree: str, path: str
 ) -> None:
+    # Commit immediately — see _sync_state_upsert for the rationale
+    # (no write txn held across the next file's network I/O).
     await db.execute(
         "DELETE FROM sync_state WHERE project_id = ? AND tree = ? AND path = ?",
         (project_id, tree, path),
     )
+    await db.commit()
 
 
 # ---------- local fs walk + hash ----------

@@ -2974,6 +2974,18 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   font-size: 11px;
   padding-left: 24px;
 }
+.pane-settings-runtime-reset {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+  margin-left: auto;
+}
+.pane-settings-runtime-reset:hover:not(:disabled) { color: var(--fg); }
+.pane-settings-runtime-reset:disabled { opacity: 0.5; cursor: default; }
 .pane-settings-input {
   background: var(--bg);
   color: var(--fg);

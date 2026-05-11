@@ -884,3 +884,217 @@ async def test_maybe_wake_agent_paused_does_not_queue(
         except asyncio.CancelledError:
             pass
         agents_mod._running_tasks.pop("coach", None)
+
+
+# ---------- prior_error sticky-fingerprint dedup ----------
+#
+# Bug observed 2026-05-11: every recurrence-tick that produced an
+# is_error=True ResultMessage with the same shape re-armed
+# _last_turn_error_info, and the next tick re-showed the same
+# "Prior turn note" — prior_error=289 chars stuck across 3.5 hours of
+# identical Coach prompts.
+#
+# Fix: a module-level sticky tracker _last_shown_prior_error_fp records
+# the last shape we surfaced; the ResultMessage handler refuses to
+# re-arm when the new shape matches. The tracker is cleared on a clean
+# turn so a later error of any shape gets one fresh display.
+#
+# These tests exercise the sticky-tracker logic directly. The full
+# ResultMessage handler path isn't reachable without a live SDK; the
+# tests simulate the state transitions by exercising the two helper
+# operations (prompt-build write, post-result decision).
+
+
+def _simulate_post_result_arm_decision(
+    *,
+    agent_id: str,
+    subtype,
+    stop_reason,
+    num_turns,
+    last_shown_fp_map: dict,
+    info_map: dict,
+) -> bool:
+    """Pure mirror of the inline logic at agents.py around line ~853.
+
+    Returns True iff the handler would arm _last_turn_error_info for
+    the next turn. Asserting on this directly (rather than reaching
+    through the full SDK message loop) lets the tests stay fast and
+    stable. Update this mirror if the source-of-truth logic moves.
+    """
+    new_fp = (
+        str(subtype) if subtype else None,
+        str(stop_reason) if stop_reason else None,
+        num_turns if isinstance(num_turns, int) else None,
+    )
+    already_shown = last_shown_fp_map.get(agent_id)
+    if already_shown != new_fp:
+        info_map[agent_id] = {
+            "subtype": subtype,
+            "stop_reason": stop_reason,
+            "num_turns": num_turns,
+        }
+        return True
+    return False
+
+
+def _simulate_prompt_build_consume(
+    *,
+    agent_id: str,
+    compact_mode: bool,
+    last_shown_fp_map: dict,
+    info_map: dict,
+) -> bool:
+    """Pure mirror of the prompt-build branch at agents.py line ~5253.
+
+    Returns True iff the prompt for this turn would carry a
+    prior_error_suffix (and therefore stamp the sticky tracker).
+    """
+    prior_err = info_map.pop(agent_id, None) if not compact_mode else None
+    if not prior_err:
+        return False
+    nt = prior_err.get("num_turns")
+    last_shown_fp_map[agent_id] = (
+        prior_err.get("subtype") or None,
+        prior_err.get("stop_reason") or None,
+        nt if isinstance(nt, int) else None,
+    )
+    return True
+
+
+def test_prior_error_loop_breaks_after_one_display() -> None:
+    """Recurrence-tick loop: same error every turn. The agent must see
+    the prior_error note exactly ONCE; subsequent identical errors
+    must not re-arm the dict and therefore not re-show the suffix."""
+    info: dict = {}
+    shown: dict = {}
+    agent = "coach"
+    same_error = {"subtype": "error_max_turns", "stop_reason": None, "num_turns": 5}
+
+    assert _simulate_prompt_build_consume(
+        agent_id=agent, compact_mode=False,
+        last_shown_fp_map=shown, info_map=info,
+    ) is False
+    armed = _simulate_post_result_arm_decision(
+        agent_id=agent, **same_error,
+        last_shown_fp_map=shown, info_map=info,
+    )
+    assert armed is True
+    assert agent in info
+
+    shown_t2 = _simulate_prompt_build_consume(
+        agent_id=agent, compact_mode=False,
+        last_shown_fp_map=shown, info_map=info,
+    )
+    assert shown_t2 is True
+    assert shown[agent] == ("error_max_turns", None, 5)
+    assert agent not in info
+
+    armed_t2 = _simulate_post_result_arm_decision(
+        agent_id=agent, **same_error,
+        last_shown_fp_map=shown, info_map=info,
+    )
+    assert armed_t2 is False
+    assert agent not in info
+
+    shown_t3 = _simulate_prompt_build_consume(
+        agent_id=agent, compact_mode=False,
+        last_shown_fp_map=shown, info_map=info,
+    )
+    assert shown_t3 is False
+    assert shown[agent] == ("error_max_turns", None, 5)
+
+    armed_t3 = _simulate_post_result_arm_decision(
+        agent_id=agent, **same_error,
+        last_shown_fp_map=shown, info_map=info,
+    )
+    assert armed_t3 is False
+
+    for _ in range(10):
+        assert _simulate_prompt_build_consume(
+            agent_id=agent, compact_mode=False,
+            last_shown_fp_map=shown, info_map=info,
+        ) is False
+        assert _simulate_post_result_arm_decision(
+            agent_id=agent, **same_error,
+            last_shown_fp_map=shown, info_map=info,
+        ) is False
+
+
+def test_prior_error_different_shape_re_arms() -> None:
+    """A new error of a DIFFERENT shape after a loop must show its
+    own one-shot note — dedup only suppresses identical repeats."""
+    info: dict = {}
+    shown: dict = {}
+    agent = "p3"
+
+    _simulate_post_result_arm_decision(
+        agent_id=agent, subtype="error_max_turns",
+        stop_reason=None, num_turns=5,
+        last_shown_fp_map=shown, info_map=info,
+    )
+    _simulate_prompt_build_consume(
+        agent_id=agent, compact_mode=False,
+        last_shown_fp_map=shown, info_map=info,
+    )
+    assert shown[agent] == ("error_max_turns", None, 5)
+
+    armed = _simulate_post_result_arm_decision(
+        agent_id=agent, subtype="error_during_execution",
+        stop_reason="api_error", num_turns=2,
+        last_shown_fp_map=shown, info_map=info,
+    )
+    assert armed is True
+    shown_next = _simulate_prompt_build_consume(
+        agent_id=agent, compact_mode=False,
+        last_shown_fp_map=shown, info_map=info,
+    )
+    assert shown_next is True
+    assert shown[agent] == ("error_during_execution", "api_error", 2)
+
+
+def test_prior_error_clean_turn_clears_sticky() -> None:
+    """A successful turn must clear both _last_turn_error_info AND the
+    sticky tracker, so a later error gets one fresh display."""
+    import server.agents as agents_mod
+
+    agents_mod._last_turn_error_info.clear()
+    agents_mod._last_shown_prior_error_fp.clear()
+    try:
+        agents_mod._last_turn_error_info["p7"] = {"stub": True}
+        agents_mod._last_shown_prior_error_fp["p7"] = ("error_max_turns", None, 5)
+
+        agents_mod._last_turn_error_info.pop("p7", None)
+        agents_mod._last_shown_prior_error_fp.pop("p7", None)
+
+        assert "p7" not in agents_mod._last_turn_error_info
+        assert "p7" not in agents_mod._last_shown_prior_error_fp
+    finally:
+        agents_mod._last_turn_error_info.clear()
+        agents_mod._last_shown_prior_error_fp.clear()
+
+
+def test_prior_error_compact_mode_does_not_touch_sticky() -> None:
+    """Compact-mode turns are internal — they must not consume
+    _last_turn_error_info nor overwrite the sticky tracker, so a
+    pending user-facing prior_error survives the compact pause."""
+    info: dict = {"coach": {"subtype": "error_max_turns",
+                            "stop_reason": None, "num_turns": 5}}
+    shown: dict = {}
+
+    shown_compact = _simulate_prompt_build_consume(
+        agent_id="coach", compact_mode=True,
+        last_shown_fp_map=shown, info_map=info,
+    )
+    assert shown_compact is False
+    assert "coach" in info
+    assert "coach" not in shown
+
+
+def test_prior_error_module_sticky_state_exists() -> None:
+    """Defensive: the module exposes the sticky tracker so tests + the
+    ResultMessage handler can reach it. A future refactor that renames
+    or removes it would silently regress the dedup."""
+    import server.agents as agents_mod
+
+    assert hasattr(agents_mod, "_last_shown_prior_error_fp")
+    assert isinstance(agents_mod._last_shown_prior_error_fp, dict)

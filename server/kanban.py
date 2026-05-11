@@ -1055,30 +1055,43 @@ async def build_auditor_wake_body(
     sections: list[str] = []
     sections.append(f"## Focus\n\n{effective_focus}")
 
+    # Coach's "definition of done" for this task — captured at
+    # coord_create_task and/or coord_approve_stage(plan→execute).
+    # Surfacing it here gives the auditor an explicit prior to
+    # evaluate against, on top of the spec / context blocks below.
+    # Empty string = unset = no injection.
+    success_criteria: str = ""
+    project_id: str | None = None
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT project_id, success_criteria FROM tasks WHERE id = ?",
+                (task_id,),
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+        if row:
+            d = dict(row)
+            project_id = d.get("project_id")
+            success_criteria = (d.get("success_criteria") or "").strip()
+    except Exception:
+        logger.exception(
+            "kanban: failed reading task row for auditor wake on %s",
+            task_id,
+        )
+
+    if success_criteria:
+        sections.append(
+            f"## Coach's acceptance criteria\n\n{success_criteria}"
+        )
+
     if role == "auditor_syntax":
         contract = await _build_audit_contract_block(task_id)
         if contract:
             sections.append(f"## Contract\n\n{contract}")
     else:
-        # Resolve project_id for the semantic context block.
-        project_id: str | None = None
-        try:
-            c = await configured_conn()
-            try:
-                cur = await c.execute(
-                    "SELECT project_id FROM tasks WHERE id = ?",
-                    (task_id,),
-                )
-                row = await cur.fetchone()
-            finally:
-                await c.close()
-            if row:
-                project_id = dict(row).get("project_id")
-        except Exception:
-            logger.exception(
-                "kanban: failed reading project_id for semantic wake on %s",
-                task_id,
-            )
         sections.append(
             f"## Project context\n\n"
             f"{_build_semantic_context_block(task_id, project_id)}"

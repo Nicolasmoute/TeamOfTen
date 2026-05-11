@@ -251,14 +251,23 @@ class EventBus:
         self._backlog: deque[dict[str, Any]] = deque(maxlen=backlog)
 
     async def publish(self, event: dict[str, Any]) -> None:
+        # Transient streaming events (text_delta / thinking_delta) fire
+        # hundreds-to-thousands of times per turn × 11 agents. They skip
+        # the SQLite mirror AND the in-memory backlog, so the active-project
+        # resolve below is dead work for them — short-circuit before paying
+        # for the DB read. The fan-out below still delivers them live to
+        # WS subscribers.
+        transient = event.get("type") in _TRANSIENT_EVENT_TYPES
         # Stamp project_id if the caller didn't. Tolerated DB error →
         # falls back to misc, matching resolve_active_project's contract.
-        if "project_id" not in event:
+        # Skipped for transient events (they're never persisted; the
+        # _row_for fallback to MISC_PROJECT_ID would only matter if they
+        # were).
+        if not transient and "project_id" not in event:
             try:
                 event["project_id"] = await resolve_active_project()
             except Exception:
                 event["project_id"] = MISC_PROJECT_ID
-        transient = event.get("type") in _TRANSIENT_EVENT_TYPES
         if not transient:
             self._backlog.append(event)
         for q in list(self._queues):
