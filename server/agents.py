@@ -3333,37 +3333,24 @@ async def _build_coach_coordination_block(
                 else:
                     date_str = ""
                 if date_str:
-                    last_decision_line = (
-                        f"{date_str} — {title}\n  ({latest})"
-                    )
+                    last_decision_line = f"{date_str} — {title}"
                 else:
-                    last_decision_line = f"{title}\n  ({latest})"
+                    last_decision_line = title
     except Exception:
         pass
 
     # ---- Render -----------------------------------------------------
     lines: list[str] = []
+    # §1 Project pointer (generic, one line — goals injected as a separate
+    # `## Project objectives` section below; team roster lives in the
+    # project CLAUDE.md auto-loaded by the SDK).
     lines.append(f"## Coordinating: {project_name}")
     lines.append("")
-    # Goals / objectives are NOT rendered here. They flow through
-    # `project-objectives.md`, injected as a separate `## Project
-    # objectives` section later in the system prompt (recurrence-specs
-    # §3.3 + §6). Coach reads / edits that file directly via Write;
-    # the EnvPane Objectives section is the human's surface. Rendering
-    # the DB description here as well produced two stale-prone copies
-    # of the same goal text in every Coach turn.
-    pp = project_paths(active)
-    lines.append(
-        f"(For full project context, read {pp.claude_md} and update "
-        "it as the project evolves. Goals / scope live in "
-        f"{pp.project_objectives} — see ## Project objectives below.)"
-    )
+    lines.append("Goals: see ## Project objectives below.")
     lines.append("")
 
-    # v2 §14 position 1: `## Roster availability`. Emitted only when at
-    # least one Player is locked — keeps the prompt quiet on the common
-    # all-available case. Rendered ahead of `## Team composition` so
-    # Coach reads availability before scanning the roster.
+    # §2 Roster availability — only when ≥1 Player is locked. Quiet on
+    # the common all-available case.
     locked_pre: list[str] = [
         prow["id"] for prow in player_rows if bool(prow.get("locked"))
     ]
@@ -3371,45 +3358,19 @@ async def _build_coach_coordination_block(
         lines.append("## Roster availability")
         lines.append("")
         lines.append(
-            "The human has LOCKED the following Player(s): "
-            + ", ".join(locked_pre)
-            + ". Do NOT assign tasks to them, do NOT direct-message "
-            "them, and remember broadcasts also skip them. Work "
-            "around this constraint — pick other Players or tell "
-            "the human if no suitable unlocked Player remains."
+            f"LOCKED: {', '.join(locked_pre)}. "
+            "Skip in task assignment, DMs, broadcasts."
         )
         lines.append("")
 
-    lines.append("## Team composition (this project)")
-    lines.append("")
-    lines.append("- coach   — you")
-    unassigned: list[str] = []
-    locked_named: list[str] = []
-    # Track Players that have at least one Coach-set override active so
-    # the renderer can fold them into a single "Active overrides" sub-
-    # block at the bottom of the team composition. We deliberately do
-    # NOT inline overrides on every roster line — only set Players have
-    # them, and inlining would clutter the common case where the team
-    # is all-defaults. Keys: 'runtime' (from agents row),
-    # 'model'/'effort'/'plan_mode' (from agent_project_roles).
+    # Override collection (formerly part of §3 team-composition rendering;
+    # the rendering itself was dropped 2026-05-11 since the project
+    # CLAUDE.md `## Team` table is the source of truth and auto-loads via
+    # the SDK). The override list is still consumed by §4 below.
     overridden: list[dict[str, Any]] = []
     for prow in player_rows:
         slot = prow["id"]
         rec = role_map.get(slot)
-        is_locked = bool(prow.get("locked"))
-        if rec and (rec.get("name") or rec.get("role")):
-            name = (rec.get("name") or "").strip() or "(unnamed)"
-            role = (rec.get("role") or "").strip() or "(no role)"
-            tag = " (LOCKED — unavailable)" if is_locked else ""
-            lines.append(f"- {slot:<7} — {name:<14} | role: {role}{tag}")
-            if is_locked:
-                locked_named.append(slot)
-        else:
-            unassigned.append(slot)
-            if is_locked:
-                locked_named.append(slot)
-        # Collect overrides regardless of name-assigned vs unassigned so
-        # Coach sees them even on auto-named Players.
         rt_o = (prow.get("runtime_override") or "").lower() or None
         if rec is None:
             mo = ef_o = pm_o = None
@@ -3425,34 +3386,6 @@ async def _build_coach_coordination_block(
                 "effort": ef_o,
                 "plan_mode": pm_o,
             })
-    if unassigned:
-        if len(unassigned) > 1:
-            label = f"{unassigned[0]}..{unassigned[-1]}"
-        else:
-            label = unassigned[0]
-        lines.append(
-            f"- {label:<7} — unassigned (auto-name on first activation; "
-            "assign via coord_set_player_role)"
-        )
-    lines.append("")
-
-    # The top-level `## Roster availability` block already handled the
-    # locked-Player notice ahead of this section per spec §14 position
-    # 1. The legacy in-section block is gone — single source of truth.
-    if False:
-        # Dead branch retained briefly to minimise diff surface for the
-        # surrounding f-string formatting; will be removed in a follow-up.
-        lines.append("### Roster availability (right now)")
-        lines.append("")
-        lines.append(
-            "The human has LOCKED the following Player(s): "
-            + ", ".join(locked_named)
-            + ". Do NOT assign tasks to them, do NOT direct-message "
-            "them, and remember broadcasts also skip them. Work "
-            "around this constraint — pick other Players or tell "
-            "the human if no suitable unlocked Player remains."
-        )
-        lines.append("")
 
     # Active per-Player overrides — only emit when at least one
     # override is set. Gives Coach a single line per Player for the
@@ -3461,7 +3394,7 @@ async def _build_coach_coordination_block(
     # doesn't have to call coord_get_player_settings to know what's
     # already in place. Defaults stay implicit (no line = no override).
     if overridden:
-        lines.append("### Active overrides (Coach-set)")
+        lines.append("### Active overrides")
         lines.append("")
         for o in overridden:
             parts: list[str] = []
@@ -3483,13 +3416,7 @@ async def _build_coach_coordination_block(
                     "plan_mode=on" if int(pm_o) == 1 else "plan_mode=off"
                 )
             if parts:
-                lines.append(f"- {o['slot']:<5} {' | '.join(parts)}")
-        lines.append("")
-        lines.append(
-            "Clear with the corresponding coord_set_player_* call passing "
-            "an empty string. Read the policy below before changing "
-            "model / effort / plan_mode."
-        )
+                lines.append(f"- {o['slot']}: {', '.join(parts)}")
         lines.append("")
 
     # PR 6: Roster runtimes — only emit when the team is mixed (any
@@ -3503,13 +3430,11 @@ async def _build_coach_coordination_block(
         if (p.get("runtime_override") or "").lower() == "codex"
     ]
     if codex_players:
-        lines.append("### Roster runtimes")
+        lines.append("### Codex Players")
         lines.append("")
         lines.append(
-            f"{', '.join(codex_players)} run on Codex (OpenAI) — their "
-            "tools differ: they have `shell`, `apply_patch`, "
-            "`web_search` instead of Bash, Edit, WebSearch. coord_* is "
-            "identical on both. Players not listed here run on Claude."
+            f"{', '.join(codex_players)} (use shell / apply_patch / "
+            "web_search instead of Bash / Edit / WebSearch)"
         )
         lines.append("")
 
@@ -3525,14 +3450,14 @@ async def _build_coach_coordination_block(
             traj_marker = _trajectory_marker(t.get("trajectory"), status)
             blocked = " BLOCKED" if t.get("blocked") else ""
             lines.append(
-                f"- {tid} ({status}) {traj_marker}{blocked} - {owner} - {title}"
+                f"- {tid} {status} {traj_marker}{blocked} {owner} — {title}"
             )
     else:
         lines.append("Open tasks: (none)")
     lines.append("")
-    lines.append(f"Inbox: {unread} unread message{'s' if unread != 1 else ''}")
-    lines.append("")
-    lines.append(f"Last decision: {last_decision_line}")
+    lines.append(
+        f"Inbox: {unread} unread.  Last decision: {last_decision_line}"
+    )
     lines.append("")
 
     # ---- Player health (§11.1, position 3 in v2 §14 ordering) -----
@@ -3555,15 +3480,6 @@ async def _build_coach_coordination_block(
                 f"{row['kind']} fail count {row['kind_fail_count']} "
                 f"(latest verdict: {row['latest_verdict']})"
             )
-        lines.append("")
-        lines.append(
-            "First fail of an audit kind is expected correction noise "
-            "— ignore. From the 2nd fail of the same kind, treat "
-            "quality as the bottleneck: bump the executor's effort "
-            "with coord_set_player_effort, then model tier with "
-            "coord_set_player_model. NEVER change runtime — that's a "
-            "human decision."
-        )
         lines.append("")
 
     # ---- Audit history (§11.2, position 5 in v2 §14 ordering) -----
@@ -3603,54 +3519,27 @@ async def _build_coach_coordination_block(
             )
         lines.append("")
         lines.append(
-            "The 'blocker' is the Player responsible for the next move "
-            "at the current stage (auditor, shipper, etc.) — NOT "
-            "necessarily the original executor. Send them a "
-            "coord_send_message nudge, reassign with "
-            "coord_approve_stage, or — if they reported the completion "
-            "tool is not visible in their runtime — submit on their "
-            "behalf via coord_write_task_spec(..., on_behalf_of=<slot>) "
-            "or coord_submit_audit_report(..., on_behalf_of=<slot>) "
-            "(after reading the artifact they wrote to disk), then "
-            "advance via coord_approve_stage. If no one is assigned to "
-            "this stage, fix the trajectory with "
-            "coord_set_task_trajectory. "
-            "ESCALATION LADDER (v0.3.8): rung 1 nudge at 30min, "
-            "rung 2 Coach call at 1h, rung 3 auto-reassign at 2h, "
-            "rung 4 auto-archive at 4h. Intervene before the next rung "
-            "fires — auto-actions are the safety net, not the plan."
+            "Ladder: 30m nudge / 1h Coach-notify / 2h auto-reassign / "
+            "4h auto-archive. Intervene before the next rung fires."
         )
         lines.append("")
 
     # ---- Soft stalls (watchdog findings, §10.7) -------------------
     soft_stall_rows = await _build_soft_stalls_rows(active)
     if soft_stall_rows:
-        lines.append("## Soft stalls (watchdog-detected)")
+        lines.append("## Soft stalls (watchdog)")
         lines.append("")
         for row in soft_stall_rows:
             tail = f" on {row['task_id']}" if row.get("task_id") else ""
             reason = row.get("reason") or "(no reason captured)"
             lines.append(
-                f"- {row['agent']} ({row['verdict']}){tail} — {reason}"
+                f"- {row['agent']} {row['verdict']}{tail} — {reason}"
             )
         lines.append("")
         lines.append(
-            "These are SOFT stalls: a Haiku watchdog read each agent's "
-            "last few messages and flagged a stuck-shape pattern that "
-            "the deterministic stall ladder can't see yet. Verdict "
-            "guide: `finished_not_reported` = Player declared done in "
-            "chat but didn't call the matching coord_* tool — read the "
-            "artifact and submit on their behalf via "
-            "coord_approve_stage / coord_write_task_spec / "
-            "coord_submit_audit_report (with on_behalf_of=...). "
-            "`blocked` = clarify via coord_send_message or unblock by "
-            "rewriting the trajectory. `erroring` = read the recent "
-            "tool_results, retry via coord_send_message, or escalate "
-            "to the human via coord_request_human. `looping` = the "
-            "Player is wasting tokens; bump effort with "
-            "coord_set_player_effort, or model tier with "
-            "coord_set_player_model. Findings auto-clear in 1h or "
-            "when the agent's current_task_id changes."
+            "Verdicts: finished_not_reported→submit on_behalf_of; "
+            "blocked→clarify; erroring→retry/escalate; looping→bump "
+            "effort. Auto-clears in 1h."
         )
         lines.append("")
 
@@ -3661,26 +3550,11 @@ async def _build_coach_coordination_block(
         lines.append("")
         for row in artifact_rows:
             lines.append(
-                f"- {row['task_id']} ({row['kind']}) — "
-                f"path {row['path']}, owner {row['owner']}"
+                f"- {row['task_id']} ({row['kind']}) {row['path']}, owner {row['owner']}"
             )
+            lines.append(f"  fix: {row['fix']}")
         lines.append("")
-        lines.append(
-            "These artifacts exist on disk but the kanban has no "
-            "record of them — typically a Player wrote the file but "
-            "couldn't reach the matching coord_* tool. Read the file, "
-            "verify it's the real deliverable, and submit on the "
-            "Player's behalf:"
-        )
-        lines.append("")
-        for row in artifact_rows:
-            lines.append(f"  - {row['fix']}")
-        lines.append("")
-        lines.append(
-            "If the file is junk / superseded, ignore it — the "
-            "reconciliation finding will re-emit in 1h until the "
-            "kanban records something or the file is removed."
-        )
+        lines.append("(Junk/superseded → ignore; finding re-emits in 1h.)")
         lines.append("")
 
     # ---- Recent patterns (§11.3, position 9 in v2 §14 ordering) ----
@@ -3701,172 +3575,12 @@ async def _build_coach_coordination_block(
             lines.append(recent_events_block.rstrip())
             lines.append("")
 
-    # ---- Trajectory examples (position 11 in v2 §14 ordering) -----
-    lines.append("## Trajectory examples")
-    lines.append("")
-    lines.append(
-        "Define the trajectory upfront. Pass `trajectory=[...]` to "
-        "coord_create_task — an ordered list of {stage, to, focus?} "
-        "dicts. `to` is a single named Player slot OR a candidate list "
-        "(advisory only — pools are FYI; you still assign one named "
-        "slot via coord_approve_stage at each transition). Examples:"
-    )
-    lines.append("")
-    lines.append(
-        "  - Quick mechanical: "
-        "[{\"stage\":\"execute\",\"to\":\"p2\"}]"
-    )
-    lines.append(
-        "  - Plan + execute: "
-        "[{\"stage\":\"plan\",\"to\":\"p5\"},"
-        "{\"stage\":\"execute\",\"to\":\"p2\"}]"
-    )
-    lines.append(
-        "  - Code change + formal review: "
-        "[{\"stage\":\"plan\",\"to\":\"p5\"},"
-        "{\"stage\":\"execute\",\"to\":\"p2\"},"
-        "{\"stage\":\"audit_syntax\",\"to\":\"p4\"},"
-        "{\"stage\":\"ship\",\"to\":\"p2\"}]"
-    )
-    lines.append(
-        "  - Marketing post + semantic review: "
-        "[{\"stage\":\"plan\",\"to\":\"p3\"},"
-        "{\"stage\":\"execute\",\"to\":\"p5\"},"
-        "{\"stage\":\"audit_semantics\",\"to\":\"p7\","
-        "\"focus\":\"check brand voice + claims\"},"
-        "{\"stage\":\"ship\",\"to\":\"p4\"}]"
-    )
-    lines.append("")
-
-    # ---- Lifecycle policy (v2 — Docs/kanban-specs-v2.md §14.1) -----
-    lines.append("## Lifecycle policy")
-    lines.append("")
-    lines.append(
-        "**Continuous reasoning.** You are the team's reasoning layer. "
-        "Read every entry in `## Recent events` before composing the "
-        "next move. The kanban records, you route."
-    )
-    lines.append("")
-    lines.append(
-        "**Tasks are work fired at one Player.** Every "
-        "`coord_create_task` puts a task on the kanban — and the kanban "
-        "is a log of work you have actually dispatched. So "
-        "`trajectory[0].to` MUST be a single named Player (e.g. "
-        "['p3']) — no pools, no empty list. If you don't know who yet, "
-        "you don't have a task yet, you have pre-task reasoning. Decide "
-        "first (read ## Player health, ## Recent events, "
-        "coord_get_player_settings), then create. Subsequent stages "
-        "remain FYI — fill them in or leave empty as you see fit; "
-        "you'll pick each later assignee via coord_approve_stage."
-    )
-    lines.append("")
-    lines.append(
-        "**Single transition tool.** Every stage transition is "
-        "`coord_approve_stage(task_id, next_stage, assignee, note?)`. "
-        "There is no auto-advance and no implicit assignment. Pick the "
-        "assignee deliberately from the trajectory pool (or override). "
-        "The note becomes the assignee's wake prompt verbatim — write "
-        "it like a brief."
-    )
-    lines.append("")
-    lines.append(
-        "**Audit-FAIL handling.** Read the report + the executor's "
-        "prior commit, decide (re-spec / bump effort / clarify the "
-        "audit / abandon), then call "
-        "`coord_approve_stage(next_stage='execute', assignee=<slot>, "
-        "note=<composed prompt>)`. The executor wakes ONLY with your "
-        "prompt, not the audit alone. Audit FAIL never auto-reverts in "
-        "v2 — it surfaces in `## Recent events` and waits for you."
-    )
-    lines.append("")
-    lines.append(
-        "**Pool discipline.** Pools are FYI only. There is no claim "
-        "path. You explicitly assign one named slot via "
-        "coord_approve_stage. The trajectory's `to` list is a hint "
-        "about who could do the work."
-    )
-    lines.append("")
-    lines.append(
-        "**Coherent assignment.** Player sessions stay live across "
-        "review-wait windows; accumulated context is real value. When "
-        "picking an executor for follow-up work on the same area / "
-        "module / domain, prefer the Player who already has context. "
-        "Random rotation through the pool wastes accumulated continuity."
-    )
-    lines.append("")
-    lines.append(
-        "**Pattern-action ladder.** When `## Player health` shows "
-        "`deviations >= 2` OR `## Recent patterns` flags repeat issues, "
-        "bump effort first via coord_set_player_effort, then model "
-        "tier via coord_set_player_model, never runtime (human "
-        "decision). Read coord_get_player_settings before bumping so "
-        "you don't re-set what's already correct."
-    )
-    lines.append("")
-    lines.append(
-        "**Plan-mode.** Default to Coach-reviews-plan-first via "
-        "`coord_request_plan_review(task_id, slot)` for non-trivial "
-        "work. The Player produces an ExitPlanMode artifact; on "
-        "submission a `pending_plan{route='coach'}` event surfaces it "
-        "to you for review before tools are touched. Approve (Player "
-        "proceeds with the plan) or rewrite (call coord_approve_stage "
-        "with a Coach-composed note instead). Trivial mechanical tasks "
-        "can skip plan-mode but you still review the commit."
-    )
-    lines.append("")
-    lines.append(
-        "**Archival.** `coord_archive_task(task_id, summary)` is your "
-        "deliberate user-facing wrap-up. No auto-archive in v2 — every "
-        "task ends with a Coach-written summary. The summary lands in "
-        "your pane and is forwarded to Telegram if the originating "
-        "turn was user-triggered."
-    )
-    lines.append("")
-    lines.append(
-        "**Compass verdicts.** Every Compass verdict (including "
-        "`aligned`) appears in `## Recent events`. Read WHY the lattice "
-        "signed off, not just THAT it did. A repeated `aligned` chain "
-        "on questionable work means the lattice may be drifting."
-    )
-    lines.append("")
-    lines.append(
-        "**Deviation tagging.** When you notice scope drift, off-spec "
-        "work, or unexpected changes in the artifact you're reviewing, "
-        "prefix your `coord_approve_stage` `note` with a structured "
-        "`[deviation: <one-line reason>]` tag. This both communicates "
-        "to the next Player and feeds the validation instrumentation "
-        "in §22 — your push-time deviation-noticing rate vs audit-time "
-        "is one of the key signals for whether v2 is delivering its "
-        "promise."
-    )
-    lines.append("")
-    lines.append(
-        "**Trajectory is FYI.** You can change it any time via "
-        "coord_set_task_trajectory, including inserting stages mid-"
-        "flight (e.g. add `audit_semantics` after seeing the commit "
-        "and deciding semantic review is now warranted). Cannot remove "
-        "stages already entered."
-    )
-    lines.append("")
-    lines.append(
-        "**Orchestration playbook (loaded after CLAUDE.md, see "
-        "`## Orchestration playbook`).** A harness-wide weighted "
-        "lattice of learned coordination patterns. High-confidence "
-        "statements (weight ≥ 0.85) are established discipline; "
-        "deviate only with explicit reason. You can propose updates "
-        "mid-turn via `coord_propose_playbook_changes` (adjust / "
-        "create / merge — up to 5 ops per call). A daily reflection "
-        "run also evolves the lattice from observed evidence — "
-        "duplication is fine, but for routine evolution let the "
-        "daily run handle it; use the mid-turn tool only for "
-        "load-bearing patterns you observe in real time."
-    )
-    lines.append("")
-    from server.paths import global_paths
-    gp = global_paths()
-    lines.append(
-        f"Wiki: {gp.wiki / active}/  (master index: {gp.wiki_index})"
-    )
+    # §15-§17 (trajectory examples / lifecycle policy / wiki line) dropped
+    # 2026-05-11 — content lives in the project CLAUDE.md (auto-loaded via
+    # SDK setting_sources for Claude turns; manually injected for Codex).
+    # The kanban v2 rules + trajectory shape + wiki paths are all in the
+    # canonical project template; injecting them here too was pure
+    # duplication. See git history for prior content.
 
     return "\n".join(lines) + "\n"
 

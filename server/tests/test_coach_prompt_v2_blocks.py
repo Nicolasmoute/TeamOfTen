@@ -393,44 +393,41 @@ async def test_stamp_events_empty_list_noop(fresh_db: str) -> None:
 
 
 # ---------------------------------------------------------------------
-# _build_coach_coordination_block — §14.1 lifecycle policy
+# _build_coach_coordination_block — trimmed structure (2026-05-11)
 # ---------------------------------------------------------------------
 
-async def test_coordination_block_includes_v2_lifecycle_policy(
+async def test_coordination_block_drops_lifecycle_policy(
     fresh_db: str,
 ) -> None:
+    """2026-05-11: `## Lifecycle policy` was dropped from the per-turn
+    coordination block. Its content (kanban v2 rules, deviation tagging,
+    plan-mode policy, archival, Compass-verdict guidance) now lives
+    exclusively in the project CLAUDE.md (auto-loaded via SDK
+    setting_sources for Claude turns; manually injected for Codex).
+    The block also drops `## Trajectory examples` for the same reason."""
     await init_db()
     surfaced: list[int] = []
     body = await _build_coach_coordination_block(surfaced_event_ids=surfaced)
-    # Section header
-    assert "## Lifecycle policy" in body
-    # v2-specific phrases that should appear
-    assert "coord_approve_stage" in body
-    assert "Pools are FYI only" in body
-    assert "[deviation:" in body
-    assert "coord_archive_task" in body
-    assert "coord_request_plan_review" in body
-    # Migration cutover event surfaces by default
+    assert "## Lifecycle policy" not in body
+    assert "## Trajectory examples" not in body
+    # Recent events still surfaces — most load-bearing section.
     assert "## Recent events" in body
     assert len(surfaced) >= 1
 
 
 async def test_coordination_block_section_ordering(fresh_db: str) -> None:
-    """The §14 ordering matters — Player health (3) before Active task
-    health (4); Audit history (5) before Stalled tasks (6); Recent
-    patterns (9) before Recent events (10); Trajectory examples (11)
-    before Lifecycle policy (12)."""
+    """Ordering of the remaining always-on sections post-2026-05-11
+    trim — Coordinating header → Current state → Recent events. Player
+    health / Active task health / Stalled tasks / Soft stalls /
+    Recent patterns are all conditional and order between themselves
+    when they fire, but those tests live separately."""
     await init_db()
     surfaced: list[int] = []
     body = await _build_coach_coordination_block(surfaced_event_ids=surfaced)
-    # Always-present headers in v2 ordering.
     headers_in_order = [
         "## Coordinating:",
-        "## Team composition",
         "## Current state",
         "## Recent events",  # cutover event always present
-        "## Trajectory examples",
-        "## Lifecycle policy",
     ]
     last_pos = -1
     for h in headers_in_order:
@@ -440,3 +437,7 @@ async def test_coordination_block_section_ordering(fresh_db: str) -> None:
             f"header {h!r} appears at {pos}, before previous (at {last_pos})"
         )
         last_pos = pos
+    # Dropped sections must NOT appear anywhere.
+    assert "## Team composition" not in body
+    assert "## Trajectory examples" not in body
+    assert "## Lifecycle policy" not in body

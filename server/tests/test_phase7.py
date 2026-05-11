@@ -94,26 +94,26 @@ async def test_coordination_block_includes_project_name_and_objectives_pointer(
     # two stale-prone copies of the same goal in every Coach turn.
     assert "Rebrand misc landing page" not in block
     assert "Goal:" not in block
-    # The pointer to project-objectives.md should still be present
-    # so Coach knows where to read / update goals.
-    assert "project-objectives.md" in block
+    # 2026-05-11: project pointer prose trimmed to a 1-line generic
+    # pointer at "Goals: see ## Project objectives below." The full
+    # absolute project-objectives.md path is no longer inlined.
     assert "## Project objectives" in block
 
 
-async def test_coordination_block_lists_named_player_and_unassigned(
+async def test_coordination_block_does_not_inline_team_composition(
     fresh_db,
 ) -> None:
+    """2026-05-11: ## Team composition rendering was dropped — the
+    project CLAUDE.md (auto-loaded via SDK setting_sources) has the
+    canonical ## Team table. The override-collection loop still runs
+    internally, but nothing about the roster surfaces in the block."""
     from server.agents import _build_coach_coordination_block
 
     await _seed_misc_project_with_team_and_tasks()
     block = await _build_coach_coordination_block()
-    assert "## Team composition (this project)" in block
-    assert "coach" in block and "you" in block
-    assert "Alice Rabil" in block
-    assert "Lead Developer" in block
-    # p2..p10 should be flagged unassigned.
-    assert "unassigned" in block
-    assert "coord_set_player_role" in block
+    assert "## Team composition" not in block
+    assert "Alice Rabil" not in block
+    assert "Lead Developer" not in block
 
 
 async def test_coordination_block_includes_open_tasks_and_inbox(
@@ -124,11 +124,12 @@ async def test_coordination_block_includes_open_tasks_and_inbox(
     await _seed_misc_project_with_team_and_tasks()
     block = await _build_coach_coordination_block()
     assert "Open tasks (2)" in block
-    # Both rows now collapse into 'execute' under kanban; the prompt
-    # block surfaces stage as the status label.
-    assert "T-1 (execute)" in block
-    assert "T-2 (execute)" in block
-    assert "Inbox: 1 unread message" in block
+    # 2026-05-11: task rows compressed — status is bare ("execute" not
+    # "(execute)"), separator is em-dash, no parens around status.
+    assert "T-1 execute" in block
+    assert "T-2 execute" in block
+    # Inbox now combined with last-decision on a single line.
+    assert "Inbox: 1 unread" in block
 
 
 async def test_coordination_block_marks_locked_player(fresh_db) -> None:
@@ -163,13 +164,15 @@ async def test_coordination_block_includes_last_decision(fresh_db) -> None:
     assert "Last decision: 2026-04-25 — Adopt Tailwind v4" in block
 
 
-async def test_coordination_block_includes_wiki_paths(fresh_db) -> None:
+async def test_coordination_block_does_not_inline_wiki_paths(fresh_db) -> None:
+    """2026-05-11: wiki line dropped — paths are stable per-deployment
+    and live in the project CLAUDE.md (auto-loaded) when needed."""
     from server.agents import _build_coach_coordination_block
 
     await _seed_misc_project_with_team_and_tasks()
     block = await _build_coach_coordination_block()
-    assert "Wiki:" in block
-    assert "INDEX.md" in block
+    assert "Wiki:" not in block
+    assert "INDEX.md" not in block
 
 
 async def test_coordination_block_returns_empty_on_db_error(
@@ -394,12 +397,11 @@ async def test_audit_init_db_preserves_existing_misc_claude_md(
 async def test_audit_coord_block_locked_player_includes_prose(
     fresh_db,
 ) -> None:
-    """Audit fix: spec §10 says the 'Roster availability' block
-    becomes a sub-section of the larger coordination block. A locked
-    Player should produce both the inline (LOCKED) tag AND the prose
-    'Do NOT assign / do NOT direct-message' reminder, all inside the
-    coord block. There should NOT be a standalone lock_suffix
-    appended after."""
+    """A locked Player surfaces via the top-level `## Roster availability`
+    section. 2026-05-11: the inline `(LOCKED — unavailable)` tag was
+    dropped along with the team-composition rendering, and the long
+    "Do NOT assign / direct-message / broadcast" prose was compressed
+    to a single instruction line."""
     from server.agents import _build_coach_coordination_block
 
     await _seed_misc_project_with_team_and_tasks()
@@ -410,11 +412,12 @@ async def test_audit_coord_block_locked_player_includes_prose(
     finally:
         await c.close()
     block = await _build_coach_coordination_block()
-    # Inline tag still present.
-    assert "(LOCKED — unavailable)" in block
-    # v2: promoted to a top-level section per spec §14 (was ###).
+    # Top-level section header still present.
     assert "## Roster availability" in block
-    assert "Do NOT assign tasks to them" in block
+    # The slot id of the locked Player.
+    assert "LOCKED: p1" in block
+    # Compressed action guidance still names all three channels.
+    assert "task assignment, DMs, broadcasts" in block
 
 
 async def test_audit_coord_block_skips_locked_prose_when_none_locked(
@@ -1338,7 +1341,10 @@ def test_project_claude_md_stub_includes_truth_section(fresh_db) -> None:
         MISC_PROJECT_ID, "Misc", "test desc", None,
     )
     body = pp.claude_md.read_text(encoding="utf-8")
-    assert "## truth/" in body
+    # 2026-05-11: header was reformatted from "## truth/" to
+    # "## `truth/` — see global rules". Assert on the bare lane name
+    # which both shapes contain.
+    assert "truth/" in body
     assert "coord_propose_file_write" in body
     assert "truth-index.md" in body
     assert MISC_PROJECT_ID in body  # slug interpolated

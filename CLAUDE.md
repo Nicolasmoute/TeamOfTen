@@ -2159,6 +2159,63 @@ Validation criteria: ≥80% deviations noticed at push-time vs
 audit-time, ≥50% reduction in Coach context-reconstruction turns,
 flat or decreased human pings on routine items.
 
+**Recent (2026-05-11) — Coach coordination block trim:**
+
+The per-Coach-turn coordination block (built by
+`_build_coach_coordination_block` in [server/agents.py](server/agents.py))
+was carrying ~9.5K chars of always-on content, ~4K of which duplicated
+text already in the project CLAUDE.md (auto-loaded via SDK
+`setting_sources` since 2026-05-10). A section-by-section audit cut
+13 of 17 sub-sections to their signal-only form.
+
+**Dropped entirely** (always-on duplication):
+- `## Team composition (this project)` — project CLAUDE.md `## Team`
+  table is the source of truth.
+- `## Trajectory examples` — shape lives in `coord_create_task`'s
+  tool description (SDK-exposed) and `Recent events` provides live
+  pattern-match material.
+- `## Lifecycle policy` — 13 paragraphs duplicating the project
+  CLAUDE.md's "For Coach:" section and the playbook lattice. Single
+  biggest cut: ~4K chars per turn.
+- `Wiki:` path line — stable per-deployment; lives in project
+  CLAUDE.md if load-bearing.
+
+**Compressed** (kept signal, dropped explainer prose):
+- `## Coordinating: <name>` — 300 chars → 50, with one generic
+  goal pointer line.
+- `## Roster availability` — long lock prose → one-liner.
+- `### Active overrides` — dropped the policy-pointer trailer.
+- `### Codex Players` (renamed from `### Roster runtimes`) — tool-
+  delta restatement compressed.
+- `## Current state` task rows — `(execute)` → `execute`, em-dash
+  separator, dropped the absolute path on the last-decision line.
+- `## Active task health` — dropped the "first fail is noise"
+  trailer (covered by playbook).
+- `## Stalled tasks` — long ladder + blocker-vs-executor prose →
+  one-line rung summary.
+- `## Soft stalls (watchdog)` — verdict-guide expanded prose →
+  one-line cheat-sheet.
+- `## Unrecorded artifacts on disk` — per-row fix string kept,
+  generic explainer dropped.
+
+**Kept as-is**: `## Player health`, audit aggregator,
+`## Recent patterns`, `## Recent events` — highest signal-per-byte
+sections.
+
+Net: ~9.5K → ~3.5K floor (Coach base coordination block). ~6K
+chars × every Coach turn = ~480K chars/day = ~120K tokens/day saved
+on Coach alone. Single biggest cut on the optimization series.
+
+The drops depend on the project CLAUDE.md being the source of truth
+for Team / Lifecycle content — that's enforced by the canonical
+app-dev template + the Coach-driven reconciliation flow.
+
+Tests at
+[server/tests/test_phase7.py](server/tests/test_phase7.py) and
+[server/tests/test_coach_prompt_v2_blocks.py](server/tests/test_coach_prompt_v2_blocks.py)
+updated to assert the new structure: dropped sections are asserted
+absent, compressed sections assert on the new shorter strings.
+
 **Recent (2026-05-10) — CLAUDE.md double-load fix:**
 
 Sentinel-tested 2026-05-10: every Claude turn was injecting global +
