@@ -3449,10 +3449,120 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         return _ok(f"{pid} plan-mode override → {'on' if plan_value else 'off'}")
 
     @tool(
+        "coord_set_player_thinking",
+        (
+            "Coach-only. Set or clear a Player's extended-thinking flag. "
+            "When on, every Claude-runtime spawn for the Player runs with "
+            "Anthropic's extended-thinking enabled — the model spends a "
+            "dedicated reasoning-budget phase (returning separate "
+            "`thinking` content blocks) before its visible response. "
+            "Stored on `agent_project_roles.thinking_override`.\n"
+            "\n"
+            "Bump-ladder position: this is the MIDDLE rung between "
+            "effort and model-tier. When a Player keeps misfiring on "
+            "the same kind of task (kind_fail_count >= 2): first bump "
+            "via coord_set_player_effort; if that's already at max or "
+            "doesn't help, flip thinking on here; only THEN bump the "
+            "model tier via coord_set_player_model. Don't combine bumps "
+            "in one step — you want to know which rung actually helped.\n"
+            "\n"
+            "Claude runtime only. Codex Players store the value but "
+            "silently ignore it at spawn time (Codex has its own "
+            "reasoning knob). The override survives a runtime flip, so "
+            "a Player flipped Codex→Claude later picks it up automatically.\n"
+            "\n"
+            "Resolution order at spawn time (highest first): per-pane "
+            "request value → this Coach override → off.\n"
+            "\n"
+            "Params:\n"
+            "- player_id: one of p1..p10 (required; Coach has no MCP "
+            "  surface for setting its own thinking — use the pane gear).\n"
+            "- thinking: 'on' | 'off' to set explicitly. Empty string "
+            "  clears (revert to no override → off unless the human "
+            "  toggled it per-pane). Aliases: 'true'/'1'/'yes' → on, "
+            "  'false'/'0'/'no' → off."
+        ),
+        {"player_id": str, "thinking": str},
+    )
+    async def set_player_thinking(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("Only Coach sets Player thinking defaults.")
+        pid = (args.get("player_id") or "").strip()
+        raw = str(args.get("thinking") or "").strip().lower()
+        if not re.fullmatch(r"p([1-9]|10)", pid):
+            return _err(f"invalid player_id '{pid}' — expected p1..p10")
+        thinking_value: int | None
+        if raw in ("", "default", "clear", "none"):
+            thinking_value = None
+        elif raw in ("on", "true", "1", "yes", "y"):
+            thinking_value = 1
+        elif raw in ("off", "false", "0", "no", "n"):
+            thinking_value = 0
+        else:
+            return _err(
+                f"invalid thinking '{args.get('thinking')}' — expected "
+                "'on' | 'off' (or empty to clear)"
+            )
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute("SELECT 1 FROM agents WHERE id = ?", (pid,))
+            if not await cur.fetchone():
+                return _err(f"player '{pid}' not found")
+            cur = await c.execute(
+                "SELECT 1 FROM agent_project_roles "
+                "WHERE slot = ? AND project_id = ?",
+                (pid, project_id),
+            )
+            row_exists = await cur.fetchone() is not None
+            if thinking_value is None and not row_exists:
+                pass
+            else:
+                await c.execute(
+                    "INSERT INTO agent_project_roles "
+                    "(slot, project_id, thinking_override) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(slot, project_id) DO UPDATE SET "
+                    "  thinking_override = excluded.thinking_override",
+                    (pid, project_id, thinking_value),
+                )
+                await c.commit()
+        finally:
+            await c.close()
+
+        # Surface a hint when the target is on Codex — value is stored
+        # but no-ops until/unless the Player flips back to Claude. Not
+        # an error: documented behavior, future-proof for flips.
+        from server.agents import _resolve_runtime_for
+        rt = await _resolve_runtime_for(pid)
+        runtime_note = (
+            " (note: stored but inert on Codex — Claude runtime only)"
+            if rt == "codex" else ""
+        )
+
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "agent_thinking_set",
+                "player_id": pid,
+                "to": pid,
+                "thinking": thinking_value,
+            }
+        )
+        if thinking_value is None:
+            return _ok(f"{pid} thinking override cleared{runtime_note}")
+        return _ok(
+            f"{pid} thinking override → "
+            f"{'on' if thinking_value else 'off'}{runtime_note}"
+        )
+
+    @tool(
         "coord_get_player_settings",
         (
             "Coach-only. Read the current per-Player overrides in one "
-            "call: runtime, model, effort, plan-mode. For each Player "
+            "call: runtime, model, effort, plan-mode, thinking. For each Player "
             "the response shows BOTH the override value (what you set "
             "via coord_set_player_*) AND the resolved value (what the "
             "Player will actually run with on next spawn, after "
@@ -3518,6 +3628,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             model_override = ident.get("model_override")
             effort_override = ident.get("effort_override")
             plan_override = ident.get("plan_mode_override")
+            thinking_override = ident.get("thinking_override")
 
             resolved_model = (
                 model_override
@@ -3560,14 +3671,27 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                         else role_default_plan_mode(sid)
                     ),
                 },
+                "thinking": {
+                    "override": (
+                        None if thinking_override is None
+                        else bool(int(thinking_override))
+                    ),
+                    # No role default — resolved == override or off.
+                    "resolved": (
+                        bool(int(thinking_override))
+                        if thinking_override is not None
+                        else False
+                    ),
+                    "runtime_active": resolved_runtime == "claude",
+                },
             })
 
         # Render a compact text table — easier for Coach to scan than
         # raw JSON, and keeps the response under the SDK's per-tool
         # text limit even at full roster (~11 rows).
         lines = [
-            "slot   name           runtime          model                          effort      plan",
-            "-----  -------------  ---------------  -----------------------------  ----------  -----",
+            "slot   name           runtime          model                          effort      plan   thinking",
+            "-----  -------------  ---------------  -----------------------------  ----------  -----  --------",
         ]
         for r in out_rows:
             slot = (r["slot"] or "").ljust(5)
@@ -3594,7 +3718,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 else "off" if r["plan_mode"]["override"] is False
                 else ("on (default)" if r["plan_mode"]["resolved"] else "off (default)")
             )
-            lines.append(f"{slot}  {name}  {rt_cell}  {md_cell}  {ef_cell}  {pm_cell}")
+            th_o = r["thinking"]["override"]
+            th_active = r["thinking"].get("runtime_active", True)
+            th_cell = (
+                ("on" if th_o else "off") + ("" if th_active else " *codex")
+                if th_o is not None
+                else "off (default)"
+            )
+            lines.append(
+                f"{slot}  {name}  {rt_cell}  {md_cell}  {ef_cell}  "
+                f"{pm_cell:<5}  {th_cell}"
+            )
         text = "\n".join(lines)
         return {"content": [{"type": "text", "text": text}]}
 
@@ -7342,6 +7476,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         set_player_model,
         set_player_effort,
         set_player_plan_mode,
+        set_player_thinking,
         get_player_settings,
         answer_question,
         answer_plan,
@@ -7487,6 +7622,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_set_player_model",
     "mcp__coord__coord_set_player_effort",
     "mcp__coord__coord_set_player_plan_mode",
+    "mcp__coord__coord_set_player_thinking",
     "mcp__coord__coord_get_player_settings",
     "mcp__coord__coord_answer_question",
     "mcp__coord__coord_answer_plan",

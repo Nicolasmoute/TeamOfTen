@@ -586,7 +586,7 @@ function savePaneSettings(slot, settings) {
 function PaneSettingsPopover({
   settings, onChange, onClose, slot,
   initialBrief, initialName, initialRole, initialRuntime,
-  effectiveModel, effectiveEffort, effectivePlanMode,
+  effectiveModel, effectiveEffort, effectivePlanMode, effectiveThinking,
 }) {
   // No more "0 = default" position — slider always reflects the
   // concrete tier that the next spawn will use. When the pane has
@@ -599,6 +599,9 @@ function PaneSettingsPopover({
   const planChecked = settings.planMode !== undefined
     ? !!settings.planMode
     : !!effectivePlanMode;
+  const thinkingChecked = settings.thinking !== undefined
+    ? !!settings.thinking
+    : !!effectiveThinking;
   const rootRef = useRef(null);
   const [briefDraft, setBriefDraft] = useState(initialBrief || "");
   const [briefSaving, setBriefSaving] = useState(false);
@@ -860,6 +863,17 @@ function PaneSettingsPopover({
           Plan mode
         </label>
         <span class="pane-settings-hint">Agent outlines an approach before touching code.</span>
+      </div>
+      <div class="pane-settings-row">
+        <label class="pane-settings-label">
+          <input
+            type="checkbox"
+            checked=${thinkingChecked}
+            onChange=${(e) => onChange({ ...settings, thinking: e.target.checked })}
+          />
+          Thinking
+        </label>
+        <span class="pane-settings-hint">Extended reasoning phase before the reply (Claude only — Codex stores but ignores).</span>
       </div>
       <div class="pane-settings-row">
         <label class="pane-settings-label">Effort</label>
@@ -1869,7 +1883,8 @@ function App() {
       } else if (
         ev.type === "agent_model_set" ||
         ev.type === "agent_effort_set" ||
-        ev.type === "agent_plan_mode_set"
+        ev.type === "agent_plan_mode_set" ||
+        ev.type === "agent_thinking_set"
       ) {
         // Coach changing my model / effort / plan-mode is context I
         // want to see in my own pane, not just buried in Coach's
@@ -1947,6 +1962,7 @@ function App() {
         ev.type === "agent_model_set" ||
         ev.type === "agent_effort_set" ||
         ev.type === "agent_plan_mode_set" ||
+        ev.type === "agent_thinking_set" ||
         ev.type === "lock_updated" ||
         ev.type === "agent_cancelled"
       ) {
@@ -6980,11 +6996,13 @@ function EnvOverridesSection({ agents }) {
         // any of the four is set.
         const ef = a.effort_override;
         const pm = a.plan_mode_override;
+        const th = a.thinking_override;
         return !!(
           a.model_override ||
           (a.runtime_override || "").toLowerCase() ||
           (ef !== null && ef !== undefined) ||
-          (pm !== null && pm !== undefined)
+          (pm !== null && pm !== undefined) ||
+          (th !== null && th !== undefined)
         );
       })
       .map((a) => ({
@@ -6999,6 +7017,10 @@ function EnvOverridesSection({ agents }) {
           a.plan_mode_override === null || a.plan_mode_override === undefined
             ? null
             : !!a.plan_mode_override,
+        thinking:
+          a.thinking_override === null || a.thinking_override === undefined
+            ? null
+            : !!a.thinking_override,
       }));
   }, [agents]);
 
@@ -7025,6 +7047,7 @@ function EnvOverridesSection({ agents }) {
             ${o.model ? html`<code>${o.model}</code>` : null}
             ${o.effort ? html`<span class="env-model-runtime">effort=${o.effort}</span>` : null}
             ${o.planMode !== null ? html`<span class="env-model-runtime">plan=${o.planMode ? "on" : "off"}</span>` : null}
+            ${o.thinking !== null ? html`<span class="env-model-runtime">thinking=${o.thinking ? "on" : "off"}</span>` : null}
           </li>
         `)}
       </ul>
@@ -8797,6 +8820,7 @@ const TIMELINE_TYPES = new Set([
   "agent_model_set",
   "agent_effort_set",
   "agent_plan_mode_set",
+  "agent_thinking_set",
   "agent_cancelled",
   "paused",
   "pause_toggled",
@@ -9000,6 +9024,16 @@ function EnvTimelineItem({ event }) {
     const summary = event.plan_mode == null
       ? `${event.player_id} plan-mode override cleared`
       : `${event.player_id} plan-mode → ${event.plan_mode ? "on" : "off"}`;
+    return html`<div class="env-tl-item env-tl-assigned">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">${summary}</span>
+    </div>`;
+  }
+  if (event.type === "agent_thinking_set") {
+    const summary = event.thinking == null
+      ? `${event.player_id} thinking override cleared`
+      : `${event.player_id} thinking → ${event.thinking ? "on" : "off"}`;
     return html`<div class="env-tl-item env-tl-assigned">
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
@@ -9875,6 +9909,15 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
     ? !!paneSettings.planMode
     : (agent?.plan_mode_override !== null && agent?.plan_mode_override !== undefined
         ? !!agent.plan_mode_override
+        : false);
+  // Thinking chip — same shape as plan-mode. No role default (off
+  // unless explicitly set). Claude runtime only; if the pane is
+  // currently on Codex, the chip surfaces a hint but the toggle
+  // still works (override stored, applied on a future Claude flip).
+  const effectiveThinking = paneSettings.thinking !== undefined
+    ? !!paneSettings.thinking
+    : (agent?.thinking_override !== null && agent?.thinking_override !== undefined
+        ? !!agent.thinking_override
         : false);
 
   const loadRoleDefaultRuntime = useCallback(async () => {
@@ -11024,6 +11067,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
       // bool|None semantics on the server side (StartAgentRequest).
       if (paneSettings.planMode !== undefined) reqBody.plan_mode = !!paneSettings.planMode;
       if (paneSettings.effort) reqBody.effort = paneSettings.effort;
+      if (paneSettings.thinking !== undefined) reqBody.thinking = !!paneSettings.thinking;
 
       // Optimistic insert BEFORE the network roundtrip so the prompt is
       // visible in the pane immediately (issue 1: lag before display).
@@ -11305,6 +11349,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
               effectiveModel=${effectiveModelId}
               effectiveEffort=${effectiveEffort}
               effectivePlanMode=${effectivePlanMode}
+              effectiveThinking=${effectiveThinking}
               onClose=${() => setSettingsOpen(false)}
             />`
           : null}
@@ -11947,6 +11992,15 @@ function EventItem({ event }) {
     const summary = event.plan_mode == null
       ? "plan-mode override cleared"
       : `plan-mode → ${event.plan_mode ? "on" : "off"}`;
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · ${event.player_id}: ${summary} (by ${event.agent_id})</div>
+    </div>`;
+  }
+
+  if (type === "agent_thinking_set") {
+    const summary = event.thinking == null
+      ? "thinking override cleared"
+      : `thinking → ${event.thinking ? "on" : "off"}`;
     return html`<div class="event sys">
       <div class="event-meta">${ts} · ${event.player_id}: ${summary} (by ${event.agent_id})</div>
     </div>`;

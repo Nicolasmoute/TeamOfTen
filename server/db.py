@@ -491,6 +491,12 @@ CREATE TABLE IF NOT EXISTS agent_project_roles (
     -- consulted only when the kwarg is None (UI omits it whenever the
     -- pane toggle is off, so "no per-pane override" is the common case).
     plan_mode_override  INTEGER,
+    -- Coach-set per-(slot, project) extended-thinking flag. NULL = no
+    -- override (off). 1 = thinking on, 0 = explicit off. Claude
+    -- runtime only — silently ignored on Codex spawn. Budget comes
+    -- from HARNESS_THINKING_BUDGET_TOKENS env at spawn time. No role
+    -- default — thinking stays off unless explicitly set.
+    thinking_override   INTEGER,
     PRIMARY KEY (slot, project_id)
 );
 
@@ -810,6 +816,7 @@ async def init_db() -> None:
                     # against the current pane / role default at spawn time).
                     ("effort_override", "effort_override INTEGER"),
                     ("plan_mode_override", "plan_mode_override INTEGER"),
+                    ("thinking_override", "thinking_override INTEGER"),
                 ],
             )
             await _ensure_columns(

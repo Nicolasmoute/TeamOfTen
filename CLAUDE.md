@@ -2159,6 +2159,79 @@ Validation criteria: ≥80% deviations noticed at push-time vs
 audit-time, ≥50% reduction in Coach context-reconstruction turns,
 flat or decreased human pings on routine items.
 
+**Recent (2026-05-12) — Per-agent thinking override (Claude only):**
+
+New fourth override on `agent_project_roles.thinking_override`
+(tri-state INTEGER) alongside `runtime` / `model` / `effort` /
+`plan_mode`. When set (or toggled via the new pane gear checkbox),
+the Claude runtime injects
+`thinking={"type":"enabled","budget_tokens":N}` into
+`ClaudeAgentOptions` where N is `HARNESS_THINKING_BUDGET_TOKENS`
+(default 8000, clamped ≥ 1024 — see
+[server/runtimes/claude.py:_thinking_budget_tokens](server/runtimes/claude.py)).
+Codex Players store the value but silently ignore it; the override
+survives a runtime flip so a Codex→Claude return picks it up
+automatically. **No role default** — thinking stays off unless
+explicitly set on at least one of (per-pane toggle, Coach override).
+
+Coach control via new Coach-only MCP tool
+`coord_set_player_thinking(player_id, thinking)`
+([server/tools.py](server/tools.py)) — same shape as
+`coord_set_player_plan_mode` (aliases `on`/`off`/`true`/`1`/empty,
+empty-clear no-orphan invariant, emits `agent_thinking_set` with
+`{player_id, to: pid, thinking: 0|1|null}` so the event fans out to
+both Coach's and the target Player's pane).
+`coord_get_player_settings` extended with a `thinking` column that
+also tags Codex Players with a `*codex` marker.
+
+Bump ladder rewired across **four surfaces** to keep Coach's
+guidance consistent: the Player health rollup footer
+([server/agents.py](server/agents.py)), the kanban audit-fail
+escalation body ([server/kanban.py](server/kanban.py)), the
+recurrence-tick coach prompt
+([server/recurrences.py](server/recurrences.py)), and `MODEL_GUIDANCE`
+in [server/models_catalog.py](server/models_catalog.py). All four
+now name the three rungs in order: **(1) bump effort via
+coord_set_player_effort, (2) flip thinking on via
+coord_set_player_thinking (Claude only), (3) bump model tier via
+coord_set_player_model. NEVER change runtime. Don't combine bumps.**
+Players don't see this policy — they can't call the tools.
+
+UI: new "Thinking" checkbox row in the pane gear popover
+([server/static/app.js](server/static/app.js)) right below Plan
+mode; `paneSettings.thinking` is forwarded as `req.thinking` only
+when explicitly set (same omit-when-unset semantics as plan_mode).
+`EnvOverridesSection` surfaces `thinking=on/off` alongside the
+other override pills; the EnvPane timeline and per-pane event
+rows render `agent_thinking_set` as a `.sys` row. The composer
+chip lattice (plan / effort / model) was NOT extended with a
+thinking chip — the gear is the single per-pane surface for v1.
+
+Codex tool contract version
+([server/runtimes/codex.py:_CODEX_TOOL_CONTRACT_VERSION](server/runtimes/codex.py))
+bumped to `2026-05-12.thinking-override` so existing Codex threads
+clear on next boot and pick up the new tool list.
+
+Tests: 17 new tests in
+[server/tests/test_player_thinking_override.py](server/tests/test_player_thinking_override.py)
+cover schema migration, Coach-only enforcement, alias normalization
+(on/off/true/1/yes), set/clear round-trip via `_get_agent_identity`,
+empty-clear no-orphan invariant, event emission shape, full
+resolution chain (pane → override → off; precedence at each layer),
+`coord_get_player_settings` integration, the env knob's default +
+override + clamp + invalid-input paths, `MODEL_GUIDANCE` mentions
+the three-rung ladder, kanban + recurrences source carries the new
+tool name, and the Codex runtime never reads `tc.thinking`
+(source-level regression net).
+
+**Migration when the Agent SDK ships its own thinking ergonomics:**
+the SDK exposes `thinking: ThinkingConfig` on `ClaudeAgentOptions`
+directly today (the path we're already using). If a future SDK
+adds a higher-level abstraction (e.g. `context_management` style),
+swap the kwarg-build in
+[server/runtimes/claude.py](server/runtimes/claude.py) — the
+schema column + Coach tool + UI surface stay valid.
+
 **Recent (2026-05-12) — UI timezone toggle covers all EnvPane surfaces:**
 
 The Display toggle (Options → Display, `harness_tz_pref` in

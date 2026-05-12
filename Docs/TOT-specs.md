@@ -650,6 +650,7 @@ CREATE TABLE agent_project_roles (
   model_override TEXT,
   effort_override INTEGER,       -- 1..4 → low/medium/high/max
   plan_mode_override INTEGER,    -- 0/1 → off/on
+  thinking_override INTEGER,     -- 0/1 → off/on (Claude runtime only)
   PRIMARY KEY (slot, project_id)
 );
 ```
@@ -676,6 +677,20 @@ Notes:
   is what makes auto-wake spawns (task assignments, direct messages —
   which call `run_agent` with the kwargs unset) honor the preference;
   per-pane settings only apply to direct human prompts.
+- `thinking_override` (0/1) is Coach-set via
+  `coord_set_player_thinking`. NULL when unset. Same precedence as
+  `effort_override` / `plan_mode_override` (per-pane request → this
+  column → off), but **no role default** — thinking stays off unless
+  explicitly set on at least one of the two layers. Claude runtime
+  only: when true, the runtime injects
+  `thinking={"type":"enabled","budget_tokens":N}` into
+  `ClaudeAgentOptions` (N from `HARNESS_THINKING_BUDGET_TOKENS`,
+  default 8000, clamped ≥ 1024). Codex Players store the value but
+  silently ignore it at spawn time — Codex has its own reasoning
+  knob; the override survives a runtime flip so a Codex→Claude
+  return picks it up automatically. The middle rung of the Coach
+  bump ladder: `coord_set_player_effort` → `coord_set_player_thinking`
+  (Claude only) → `coord_set_player_model`.
 
 ### 6.4 `agent_sessions`
 
@@ -2576,17 +2591,48 @@ different projects without cross-talk.
   should review the approach first.
 - Emits `agent_plan_mode_set` with `to: <player_id>`.
 
+`coord_set_player_thinking(player_id, thinking)`
+
+- Coach only.
+- `player_id`: `p1` to `p10` (cannot set Coach's thinking via MCP —
+  human uses the pane gear).
+- `thinking`: `on` | `off`. Empty string clears (revert to no
+  override → off). Aliases: `true`/`1`/`yes` → on, `false`/`0`/`no`
+  → off.
+- Stored on `agent_project_roles.thinking_override` (INTEGER 0/1).
+  Empty-clear no-orphan invariant matches the other override tools.
+- Resolution at spawn time: per-pane request value (highest) → this
+  Coach override → off. **No role default** — thinking stays off
+  unless explicitly set.
+- Claude runtime only. When true at spawn, the runtime passes
+  `thinking={"type":"enabled","budget_tokens":N}` to
+  `ClaudeAgentOptions` (N = `HARNESS_THINKING_BUDGET_TOKENS`,
+  default 8000, clamped ≥ 1024). On a Codex Player the value is
+  stored but silently ignored — survives a runtime flip and
+  applies on the next Claude turn.
+- Middle rung of the Coach bump ladder, intended for
+  `kind_fail_count >= 2` patterns: bump effort first
+  (`coord_set_player_effort`); if that's at max or unhelpful, flip
+  thinking on here (Claude only); only then bump the model tier
+  (`coord_set_player_model`). NEVER change runtime — that's a
+  human decision. Don't combine bumps in one step.
+- Emits `agent_thinking_set` with `to: <player_id>` so the event
+  renders in both Coach's pane and the target Player's pane.
+
 `coord_get_player_settings(player_id?)`
 
 - Coach only — read-only.
 - `player_id`: optional. One of `p1..p10` or `coach` to scope to a
   single agent; omit for the full roster (coach + p1..p10).
 - Returns a compact text table with one row per agent showing both
-  the override value (what Coach set via the four `coord_set_player_*`
-  tools) and the resolved value (what the agent will actually run
-  with on next spawn, after fall-through to role defaults). Coach is
-  expected to call this BEFORE any `coord_set_player_*` so the team
-  doesn't churn already-correct settings.
+  the override value (what Coach set via the five `coord_set_player_*`
+  tools — runtime / model / effort / plan-mode / thinking) and the
+  resolved value (what the agent will actually run with on next
+  spawn, after fall-through to role defaults). Coach is expected to
+  call this BEFORE any `coord_set_player_*` so the team doesn't
+  churn already-correct settings. The thinking column also tags
+  Codex Players with a `*codex` marker since the override is inert
+  on that runtime.
 
 ### 12.9 Interactive Question/Plan Tools
 
@@ -3211,6 +3257,7 @@ Task and coordination:
 - `agent_model_set` (Coach set/cleared a Player's model_override; carries `{player_id, to: pid, model}`. The empty-string `model` is the cleared marker.)
 - `agent_effort_set` (Coach set/cleared a Player's effort_override; carries `{player_id, to: pid, effort: int|null}`.)
 - `agent_plan_mode_set` (Coach set/cleared a Player's plan_mode_override; carries `{player_id, to: pid, plan_mode: 0|1|null}`.)
+- `agent_thinking_set` (Coach set/cleared a Player's thinking_override; carries `{player_id, to: pid, thinking: 0|1|null}`. Claude runtime only at spawn time; Codex Players store the value but ignore it.)
 - `runtime_updated` (Coach or human flipped a Player's runtime_override; carries `{player_id, runtime_override: 'claude'|'codex'|null}`.)
 - `brief_updated`
 - `lock_updated`
@@ -3510,6 +3557,18 @@ Input:
       Coach-set `agent_project_roles.effort_override` is honored at
       spawn time but not yet reflected in the chip; the EnvPane
       "Active overrides" section is the human's surface for those.
+    - **Thinking toggle** — checkbox in the pane gear popover (no
+      composer chip yet). When on, Anthropic's extended-thinking
+      phase runs before the visible response (Claude only). No role
+      default: off unless explicitly set on `paneSettings.thinking`
+      OR `agents[].thinking_override`. Resolution at spawn time:
+      paneSettings.thinking (when non-null) →
+      `agents[].thinking_override` → off. Override surfaces in the
+      EnvPane "Active overrides" section as `thinking=on/off` and in
+      the timeline as a `.sys` row on every `agent_thinking_set`.
+      Budget tokens are env-tuned harness-wide
+      (`HARNESS_THINKING_BUDGET_TOKENS`, default 8000); the UI does
+      not expose the budget knob.
   The Settings drawer's role-default save dispatches a
   `team-models-updated` window event so all open panes refresh their
   resolved model labels live.
@@ -4270,6 +4329,7 @@ implementation):
 | `HARNESS_STALE_TASK_NOTIFY_INTERVAL_MINUTES` | `30` | Re-notify cadence |
 | `HARNESS_STALE_TASK_CHECK_INTERVAL_SECONDS` | `60` | Watchdog loop cadence |
 | `HARNESS_AUTO_COMPACT_THRESHOLD` | `0.5` | Context fraction for auto-compact (lowered from 0.7 on 2026-05-09) |
+| `HARNESS_THINKING_BUDGET_TOKENS` | `8000` | Extended-thinking budget when a Player's `thinking_override` (or per-pane toggle) is on. Claude runtime only; clamped ≥ 1024. |
 | `HARNESS_HANDOFF_TOKEN_BUDGET` | `20000` | Recent exchange budget |
 | `HARNESS_STREAM_TOKENS` | `true` | Token delta streaming. Set to `false`/`0`/`no`/`off` to disable (only needed for the rare CLI build that crashes on the underlying flag). |
 | `HARNESS_INTERACTION_TIMEOUT_SECONDS` | `1800` | Question/plan timeout |

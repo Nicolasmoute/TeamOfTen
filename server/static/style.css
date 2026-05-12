@@ -5286,6 +5286,15 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   border-radius: 3px;
 }
 .kbn-textarea { resize: vertical; min-height: 88px; }
+.kbn-backlog-input {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  min-height: 96px;
+  max-height: 60vh;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
 .kbn-input:focus,
 .kbn-textarea:focus,
 .kbn-select:focus {

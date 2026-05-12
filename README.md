@@ -338,7 +338,7 @@ CLAUDE.md                     Rules for any agent editing this codebase
 
 ```bash
 uv sync --extra dev
-uv run pytest                          # Full test suite (~1300 tests)
+uv run pytest                          # Full test suite (~1600 tests)
 uv run uvicorn server.main:app --reload
 ```
 

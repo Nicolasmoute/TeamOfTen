@@ -561,15 +561,14 @@ function ComposerModal({ open, onClose, onCreate }) {
         <div class="kbn-modal-head">Add to backlog</div>
         <form onSubmit=${submit}>
           <label class="kbn-label">Idea / title</label>
-          <input
-            class="kbn-input"
-            type="text"
+          <textarea
+            class="kbn-input kbn-backlog-input"
             value=${title}
             onInput=${(e) => setTitle(e.target.value)}
             autoFocus
-            maxlength="300"
-            placeholder="One-line description of the idea"
-          />
+            rows="4"
+            placeholder="Describe the idea — a sentence or two is fine"
+          ></textarea>
           <div class="kbn-help">
             Coach will review this on the next tick and either promote it
             to a real task (with trajectory) or reject it with a reason.

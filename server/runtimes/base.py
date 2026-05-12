@@ -43,6 +43,11 @@ class TurnContext:
     model: str | None = None
     plan_mode: bool = False
     effort: int | None = None
+    # Extended-thinking toggle. True ⇒ Claude runtime injects
+    # thinking={"type":"enabled","budget_tokens":HARNESS_THINKING_BUDGET_TOKENS}
+    # into ClaudeAgentOptions. Codex ignores. No default — off unless
+    # explicitly set via pane override or coord_set_player_thinking.
+    thinking: bool = False
     compact_mode: bool = False
     auto_compact: bool = False
     # When set on a compact_mode turn, the dispatcher wraps the compact

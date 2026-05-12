@@ -651,6 +651,10 @@ class StartAgentRequest(BaseModel):
     # up with "no per-pane override."
     plan_mode: bool | None = None
     effort: int | None = Field(default=None, ge=1, le=4)
+    # Extended-thinking trigger. None = no per-pane override (consult
+    # thinking_override → default off). Claude runtime only; Codex
+    # ignores at spawn time.
+    thinking: bool | None = None
 
 
 class CreateTaskRequest(BaseModel):
@@ -1318,6 +1322,7 @@ async def list_agents() -> dict[str, list[dict[str, Any]]]:
             "       r.model_override AS model_override, "
             "       r.effort_override AS effort_override, "
             "       r.plan_mode_override AS plan_mode_override, "
+            "       r.thinking_override AS thinking_override, "
             "       a.status, a.current_task_id, a.model, a.workspace_path, "
             "       s.session_id AS session_id, "
             "       s.codex_thread_id AS codex_thread_id, "
@@ -1348,6 +1353,7 @@ async def start_agent(
         model=req.model,
         plan_mode=req.plan_mode,
         effort=req.effort,
+        thinking=req.thinking,
     )
     return {"ok": True, "agent_id": req.agent_id}
 
@@ -6139,6 +6145,7 @@ async def list_events(
             " OR (type = 'agent_model_set' AND payload_to = ?)"
             " OR (type = 'agent_effort_set' AND payload_to = ?)"
             " OR (type = 'agent_plan_mode_set' AND payload_to = ?)"
+            " OR (type = 'agent_thinking_set' AND payload_to = ?)"
             " OR (type IN ('truthscore_started','truthscore_completed',"
             "             'truthscore_failed') AND payload_to = ?)"
             " OR (type IN ('commit_pushed','task_spec_written',"
@@ -6151,7 +6158,7 @@ async def list_events(
         )
         params.extend([
             agent, agent, agent, agent, agent, agent, agent, agent, agent, agent,
-            agent, agent, agent,
+            agent, agent, agent, agent,
         ])
     if type:
         where_parts.append("type = ?")

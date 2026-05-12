@@ -660,7 +660,7 @@ async def _emit_audit_fail_notification(
     Coach's pane is actionable instead of a bare type. Branches on
     `escalate` so first-fail noise reads as "expected, watch round 2"
     while subsequent same-kind fails carry the explicit bump-effort/
-    bump-model ladder.
+    bump-thinking/bump-model ladder.
     """
     if escalate:
         body = (
@@ -674,12 +674,18 @@ async def _emit_audit_fail_notification(
                 f"(player_id={executor_id!r})"
                 if executor_id else "()"
             )
-            + " and consider bumping: coord_set_player_effort"
+            + " and walk the bump ladder one rung at a time: "
+            + "coord_set_player_effort"
             + (
                 f"({executor_id!r}, 'high'|'max')"
                 if executor_id else "(...)"
             )
-            + " or coord_set_player_model"
+            + ", then coord_set_player_thinking"
+            + (
+                f"({executor_id!r}, 'on')"
+                if executor_id else "(...)"
+            )
+            + " (Claude only), then coord_set_player_model"
             + (
                 f"({executor_id!r}, 'latest_opus')"
                 if executor_id else "(...)"

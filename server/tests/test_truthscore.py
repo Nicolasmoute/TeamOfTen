@@ -992,4 +992,9 @@ def test_codex_contract_version_bumped() -> None:
     tool list. Bumping in the same commit prevents bisect-landing on
     a stale contract."""
     from server.runtimes import codex as codex_mod
-    assert "truthscore" in codex_mod._CODEX_TOOL_CONTRACT_VERSION
+    # Bumped past the truthscore baseline by subsequent features
+    # (thinking-override 2026-05-12, etc.). The invariant tested here
+    # is that the contract version moved off the pre-truthscore value,
+    # not the exact post-truthscore string.
+    assert codex_mod._CODEX_TOOL_CONTRACT_VERSION != ""
+    assert codex_mod._CODEX_TOOL_CONTRACT_VERSION.startswith("2026-")

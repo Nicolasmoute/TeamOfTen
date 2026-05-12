@@ -25,6 +25,18 @@ from typing import Any
 
 from server.runtimes.base import TurnContext
 
+
+def _thinking_budget_tokens() -> int:
+    """Read HARNESS_THINKING_BUDGET_TOKENS at call time (env may be
+    rewritten between turns by tests / live config). Default 8000.
+    Clamped to a safe minimum (1024 — the SDK's documented floor)."""
+    raw = os.environ.get("HARNESS_THINKING_BUDGET_TOKENS", "").strip()
+    try:
+        v = int(raw) if raw else 8000
+    except ValueError:
+        v = 8000
+    return max(1024, v)
+
 logger = logging.getLogger(__name__)
 
 
@@ -210,6 +222,16 @@ class ClaudeRuntime:
         options_kwargs["permission_mode"] = "plan" if tc.plan_mode else "default"
         if tc.effort and tc.effort in _EFFORT_LEVELS:
             options_kwargs["effort"] = _EFFORT_LEVELS[tc.effort]
+        # Extended thinking — Claude runtime only. No default; off
+        # unless tc.thinking is True (set via per-pane request,
+        # thinking_override column, or coord_set_player_thinking).
+        # Budget is a single env-tuned value (boolean trigger by
+        # design — see CLAUDE.md "Thinking override" entry).
+        if tc.thinking:
+            options_kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": _thinking_budget_tokens(),
+            }
         if tc.prior_session:
             options_kwargs["resume"] = tc.prior_session
 

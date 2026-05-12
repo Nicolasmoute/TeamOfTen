@@ -1596,7 +1596,8 @@ async def _get_agent_identity(agent_id: str) -> dict[str, Any]:
     project. Returns {} for system. Missing row → all None.
 
     Returned keys: name, role, brief, model_override, effort_override
-    (int|None), plan_mode_override (int|None — 1/0/None tri-state).
+    (int|None), plan_mode_override (int|None — 1/0/None tri-state),
+    thinking_override (int|None — 1/0/None tri-state).
     """
     if agent_id == "system":
         return {}
@@ -1606,7 +1607,7 @@ async def _get_agent_identity(agent_id: str) -> dict[str, Any]:
         try:
             cur = await c.execute(
                 "SELECT name, role, brief, model_override, "
-                "effort_override, plan_mode_override "
+                "effort_override, plan_mode_override, thinking_override "
                 "FROM agent_project_roles "
                 "WHERE slot = ? AND project_id = ?",
                 (agent_id, project_id),
@@ -1621,7 +1622,7 @@ async def _get_agent_identity(agent_id: str) -> dict[str, Any]:
         return {
             "name": None, "role": None, "brief": None,
             "model_override": None, "effort_override": None,
-            "plan_mode_override": None,
+            "plan_mode_override": None, "thinking_override": None,
         }
     d = dict(row)
     return {
@@ -1631,6 +1632,7 @@ async def _get_agent_identity(agent_id: str) -> dict[str, Any]:
         "model_override": d.get("model_override"),
         "effort_override": d.get("effort_override"),
         "plan_mode_override": d.get("plan_mode_override"),
+        "thinking_override": d.get("thinking_override"),
     }
 
 
@@ -1821,6 +1823,42 @@ async def _get_agent_plan_mode_override(agent_id: str) -> bool | None:
     if not row:
         return None
     raw = dict(row).get("plan_mode_override")
+    if raw is None:
+        return None
+    return bool(int(raw)) if str(raw) in ("0", "1") else bool(raw)
+
+
+async def _get_agent_thinking_override(agent_id: str) -> bool | None:
+    """Read agent_project_roles.thinking_override for the active project.
+
+    Tri-state: True = extended thinking forced on, False = explicit off,
+    None = no override (default — thinking stays off). Claude runtime
+    only; Codex spawn ignores this value silently. Budget comes from
+    HARNESS_THINKING_BUDGET_TOKENS at runtime kwarg-build time.
+    """
+    if agent_id == "system":
+        return None
+    project_id = await resolve_active_project()
+    try:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT thinking_override FROM agent_project_roles "
+                "WHERE slot = ? AND project_id = ?",
+                (agent_id, project_id),
+            )
+            row = await cur.fetchone()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception(
+            "get_agent_thinking_override failed: agent=%s project=%s",
+            agent_id, project_id,
+        )
+        return None
+    if not row:
+        return None
+    raw = dict(row).get("thinking_override")
     if raw is None:
         return None
     return bool(int(raw)) if str(raw) in ("0", "1") else bool(raw)
@@ -2244,9 +2282,10 @@ async def _build_active_task_health_rows(
     project_id: str,
 ) -> list[dict[str, Any]]:
     """Surface tasks where the SAME audit kind has failed >= 2 times.
-    Coach reads this to decide whether to bump the executor's effort
-    or model tier. First fail = expected correction noise (per the
-    quality-feedback policy); 2nd+ fail = signal."""
+    Coach reads this to decide whether to bump the executor's effort,
+    flip extended thinking on, or bump the model tier. First fail =
+    expected correction noise (per the quality-feedback policy); 2nd+
+    fail = signal."""
     rows: list[dict[str, Any]] = []
     try:
         c = await configured_conn()
@@ -2873,10 +2912,13 @@ async def _build_player_health_block(project_id: str) -> str:
         out.append(f"| {slot:<4} | {d:<10} | {p:<19} | {o:<20} |")
     out.append("")
     out.append(
-        "Counters surface for proactive effort/model bumps. From "
-        "deviations >= 2 on a Player, treat quality as the bottleneck: "
-        "bump effort first via coord_set_player_effort, then model tier "
-        "via coord_set_player_model. NEVER change runtime."
+        "Counters surface for proactive effort/thinking/model bumps. "
+        "From deviations >= 2 on a Player, treat quality as the "
+        "bottleneck and walk the ladder one rung at a time: (1) bump "
+        "effort via coord_set_player_effort, (2) if at max or unhelpful, "
+        "flip extended thinking on via coord_set_player_thinking "
+        "(Claude runtime only), (3) only then bump model tier via "
+        "coord_set_player_model. NEVER change runtime."
     )
     out.append("")
     return "\n".join(out)
@@ -3334,7 +3376,7 @@ async def _build_coach_coordination_block(
             player_rows = [dict(r) for r in await cur.fetchall()]
             cur = await c.execute(
                 "SELECT slot, name, role, model_override, "
-                "effort_override, plan_mode_override "
+                "effort_override, plan_mode_override, thinking_override "
                 "FROM agent_project_roles "
                 "WHERE project_id = ?",
                 (active,),
@@ -3463,18 +3505,20 @@ async def _build_coach_coordination_block(
         rec = role_map.get(slot)
         rt_o = (prow.get("runtime_override") or "").lower() or None
         if rec is None:
-            mo = ef_o = pm_o = None
+            mo = ef_o = pm_o = th_o = None
         else:
             mo = rec.get("model_override") or None
             ef_o = rec.get("effort_override")
             pm_o = rec.get("plan_mode_override")
-        if rt_o or mo or ef_o is not None or pm_o is not None:
+            th_o = rec.get("thinking_override")
+        if rt_o or mo or ef_o is not None or pm_o is not None or th_o is not None:
             overridden.append({
                 "slot": slot,
                 "runtime": rt_o,
                 "model": mo,
                 "effort": ef_o,
                 "plan_mode": pm_o,
+                "thinking": th_o,
             })
 
     # Active per-Player overrides — only emit when at least one
@@ -3504,6 +3548,11 @@ async def _build_coach_coordination_block(
             if pm_o is not None:
                 parts.append(
                     "plan_mode=on" if int(pm_o) == 1 else "plan_mode=off"
+                )
+            th_o = o.get("thinking")
+            if th_o is not None:
+                parts.append(
+                    "thinking=on" if int(th_o) == 1 else "thinking=off"
                 )
             if parts:
                 lines.append(f"- {o['slot']}: {', '.join(parts)}")
@@ -4978,6 +5027,7 @@ async def run_agent(
     model: str | None = None,
     plan_mode: bool | None = None,
     effort: int | None = None,
+    thinking: bool | None = None,
     compact_mode: bool = False,
     auto_compact: bool = False,
     transfer_to_runtime: str | None = None,
@@ -4995,6 +5045,10 @@ async def run_agent(
       (consult `plan_mode_override`). True ⇒ permission_mode="plan".
     - effort: 1..4 → "low" | "medium" | "high" | "max" thinking budget.
       None = no per-pane override (consult `effort_override`).
+    - thinking: True/False explicit; None = no per-pane override
+      (consult `thinking_override`). True ⇒ Claude runtime passes
+      thinking={"type":"enabled","budget_tokens":HARNESS_THINKING_BUDGET_TOKENS}
+      to ClaudeAgentOptions. Codex ignores silently.
     - transfer_to_runtime: only meaningful with compact_mode=True. When
       set to 'claude' / 'codex', a successful compact triggers a
       runtime flip + `session_transferred` event in place of the
@@ -5475,6 +5529,11 @@ async def run_agent(
         effort = await _get_agent_effort_override(agent_id)
     if effort is None:
         effort = role_default_effort(agent_id)
+    # thinking has no role default — off unless explicitly set on the
+    # Coach-managed override column. Per-turn request can also force it.
+    if thinking is None:
+        thinking = await _get_agent_thinking_override(agent_id)
+    thinking = bool(thinking) if thinking is not None else False
 
     # Per-turn context the ResultMessage handler appends to the turns
     # ledger. The runtime stamps started_at on each iterate call so
@@ -5483,6 +5542,7 @@ async def run_agent(
         "model": model,
         "plan_mode": plan_mode,
         "effort": effort,
+        "thinking": thinking,
         "compact_mode": compact_mode,
         "auto_compact": auto_compact,
         "transfer_to_runtime": transfer_to_runtime,
@@ -5581,6 +5641,7 @@ async def run_agent(
         model=model,
         plan_mode=plan_mode,
         effort=effort,
+        thinking=thinking,
         compact_mode=compact_mode,
         auto_compact=auto_compact,
         transfer_to_runtime=transfer_to_runtime,

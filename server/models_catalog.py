@@ -285,4 +285,20 @@ runtime flip lands. Mirror the Claude tier ordering:
 
 When in doubt, leave the model unset (cleared override) and let the
 team default kick in.
+
+**Bump ladder (when a Player keeps misfiring, `kind_fail_count >= 2`)**
+
+Walk it one rung at a time so you can see which step actually helped:
+
+1. `coord_set_player_effort(p, 'high'|'max')` — cheapest, no
+   model/runtime change.
+2. `coord_set_player_thinking(p, 'on')` — flip extended thinking on.
+   Claude runtime only (Codex stores but ignores). Dedicated
+   reasoning-budget phase before the response; good for multi-step
+   logic, debugging, tricky constraints.
+3. `coord_set_player_model(p, 'latest_opus')` (or `latest_gpt` on
+   Codex) — last resort. Several × more expensive.
+
+NEVER change runtime — that's a human decision. Don't combine bumps
+in one step.
 """
