@@ -2159,6 +2159,24 @@ Validation criteria: ≥80% deviations noticed at push-time vs
 audit-time, ≥50% reduction in Coach context-reconstruction turns,
 flat or decreased human pings on routine items.
 
+**Recent (2026-05-12) — UI timezone toggle covers all EnvPane surfaces:**
+
+The Display toggle (Options → Display, `harness_tz_pref` in
+localStorage) was documented as switching every UI timestamp
+between local time and UTC, but five EnvPane spots were sliced
+directly out of the raw ISO string and so always rendered UTC
+regardless of the toggle — visibly off by the user's UTC offset.
+
+Fixed in [server/static/app.js](server/static/app.js): added two
+companion helpers next to `timeStr()` — `timeStrShort(iso)` for
+HH:MM and `dateTimeStr(iso)` for `YYYY-MM-DD HH:MM`, both honoring
+the same toggle. Routed the five offenders through them:
+`EnvAttentionSection` row clock, env Inbox `sent_at` chip, archived
+todos `completed` stamp, `EnvTimelineItem` ts, and Projects
+section `created_at` (was raw ISO). The countdown widget,
+`toLocaleString`-based chips (MCP last-tested / secrets updated),
+and pane headers were already correct.
+
 **Recent (2026-05-11) — Tool Search enabled (deferred coord-schema loading):**
 
 The Claude Agent SDK supports a built-in "tool search" mechanism

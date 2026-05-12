@@ -531,6 +531,7 @@ const SLASH_COMMANDS = [
   { cmd: "/status", desc: "show server runtime state (paused, running, spend)" },
   { cmd: "/spend",  desc: "per-agent spend over last 24h" },
   { cmd: "/help",   desc: "show available slash commands" },
+  { cmd: "/newtask", desc: "add a task idea to the backlog (no Coach turn)" },
 ];
 
 function SlashMenu({ query, selectedIdx, onPick, onHover }) {
@@ -953,6 +954,31 @@ function timeStr(iso) {
     minute: "2-digit",
     second: "2-digit",
   });
+}
+
+// HH:MM in the user's preferred tz (UTC or local). Used by the
+// compact env-pane rows (Attention / Inbox) where seconds add noise.
+function timeStrShort(iso) {
+  if (!iso) return "";
+  if (getTzPref() === "utc") return iso.slice(11, 16);
+  const d = new Date(iso);
+  if (!Number.isFinite(d.getTime())) return iso.slice(11, 16);
+  return d.toLocaleTimeString([], {
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+// "YYYY-MM-DD HH:MM" in the user's preferred tz. Used wherever the
+// raw ISO was being sliced to 16 chars (date+time, no seconds).
+function dateTimeStr(iso) {
+  if (!iso) return "";
+  if (getTzPref() === "utc") return (iso.slice(0, 16) || "").replace("T", " ");
+  const d = new Date(iso);
+  if (!Number.isFinite(d.getTime())) return (iso.slice(0, 16) || "").replace("T", " ");
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 
@@ -4757,7 +4783,7 @@ function ProjectsSection() {
                 : html`<div style="margin-top: 4px; font-size: 11px; color: var(--muted);">
                     ${p.description ? html`<div>${p.description}</div>` : null}
                     <div>repo: ${p.repo_url || html`<em>(unset)</em>`}</div>
-                    <div>created: ${p.created_at || "?"}</div>
+                    <div>created: ${p.created_at ? dateTimeStr(p.created_at) : "?"}</div>
                   </div>
                   <div style="margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap;">
                     <button disabled=${busy} onClick=${() => startEdit(p)} style="font-size: 11px;">edit</button>
@@ -7132,7 +7158,7 @@ function EnvAttentionSection({ open, onDismiss, onDismissAll }) {
                 ${ev.urgency === "blocker"
                   ? html`<span class="env-attention-pill">BLOCKER</span>`
                   : null}
-                <span class="env-attention-ts">${(ev.ts || "").slice(11, 16)}</span>
+                <span class="env-attention-ts">${timeStrShort(ev.ts)}</span>
                 <button class="env-attention-dismiss"
                   onClick=${() => dismiss(ev.__key)}
                   title="Dismiss">×</button>
@@ -7607,7 +7633,7 @@ function EnvInboxSection({ conversations }) {
                 <span class="env-decision-title">
                   ${m.from_id} → ${m.to_id}${urgent ? " ⚠" : ""}
                 </span>
-                <span class="env-decision-meta">${(m.sent_at || "").slice(11, 16)}</span>
+                <span class="env-decision-meta">${timeStrShort(m.sent_at)}</span>
               </button>
               ${isOpen
                 ? html`<div class="env-msg-body">
@@ -7986,7 +8012,7 @@ function EnvCoachTodosSection({ conversations, activeProjectId }) {
               : archive.map((t) => html`
                   <div key=${t.id} style="padding:2px 0;text-decoration:line-through">
                     ${t.title}
-                    ${t.completed ? html`<span style="margin-left:6px">${t.completed.slice(0, 16)}</span>` : null}
+                    ${t.completed ? html`<span style="margin-left:6px">${dateTimeStr(t.completed)}</span>` : null}
                   </div>`)}
           </div>`
         : null}
@@ -8824,7 +8850,7 @@ function EnvTimelineSection({ conversations }) {
 }
 
 function EnvTimelineItem({ event }) {
-  const ts = (event.ts || "").slice(11, 19);
+  const ts = timeStr(event.ts);
   const who = event.agent_id || "?";
   if (event.type === "agent_started") {
     const prompt = (event.prompt || "").replace(/\s+/g, " ").slice(0, 80);
@@ -10854,6 +10880,31 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
             }
           })
           .catch((e) => setInfoText("truthscore failed: " + String(e)));
+        return true;
+      }
+      case "/newtask": {
+        // Direct DB insert into the Backlog — no agent turn, no token burn.
+        // Coach will triage it on the next tick.
+        const taskTitle = arg.trim();
+        if (!taskTitle) {
+          setInfoText("/newtask <title> — title is required");
+          return true;
+        }
+        authFetch(“/api/backlog”, {
+          method: “POST”,
+          headers: { “Content-Type”: “application/json” },
+          body: JSON.stringify({ title: taskTitle }),
+        })
+          .then(async (r) => {
+            if (r.ok) {
+              const d = await r.json();
+              setInfoText(`Backlog #${d.id} added — Coach will triage on next tick.`);
+            } else {
+              const detail = await r.text().catch(() => “”);
+              setInfoText(“/newtask failed: HTTP “ + r.status + “ “ + detail.slice(0, 120));
+            }
+          })
+          .catch((e) => setInfoText(“/newtask failed: “ + String(e)));
         return true;
       }
       case "/spend":

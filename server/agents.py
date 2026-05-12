@@ -3684,6 +3684,60 @@ async def _build_coach_coordination_block(
     # canonical project template; injecting them here too was pure
     # duplication. See git history for prior content.
 
+    # ---- Backlog (§4.0.5): top-5 oldest pending ideas ---------------
+    # Omit entirely when empty — zero token cost in the common case.
+    try:
+        bl_conn = await configured_conn()
+        try:
+            bl_cur = await bl_conn.execute(
+                "SELECT id, title, proposed_by, proposed_at "
+                "FROM backlog_tasks WHERE status='pending' "
+                "ORDER BY proposed_at ASC LIMIT 5"
+            )
+            backlog_rows = [dict(r) for r in await bl_cur.fetchall()]
+        finally:
+            await bl_conn.close()
+        if backlog_rows:
+            lines.append("## Backlog")
+            lines.append("")
+            now_ts = datetime.now(timezone.utc)
+            for br in backlog_rows:
+                proposer = br.get("proposed_by") or "?"
+                # Render a short slot label: coach→C, p1→1, human→human
+                if proposer == "coach":
+                    proposer_label = "C"
+                elif proposer == "human":
+                    proposer_label = "human"
+                elif proposer.startswith("p") and proposer[1:].isdigit():
+                    proposer_label = proposer[1:]
+                else:
+                    proposer_label = proposer
+                try:
+                    proposed_ts = datetime.fromisoformat(
+                        br["proposed_at"].replace("Z", "+00:00")
+                    )
+                    age_s = int((now_ts - proposed_ts).total_seconds())
+                    if age_s < 3600:
+                        age = f"{age_s // 60}m"
+                    elif age_s < 86400:
+                        age = f"{age_s // 3600}h"
+                    else:
+                        age = f"{age_s // 86400}d"
+                except Exception:
+                    age = "?"
+                title_short = (br.get("title") or "").strip()[:80]
+                lines.append(
+                    f"[#{br['id']}] \"{title_short}\" — {proposer_label}, {age} ago"
+                )
+            lines.append("")
+            lines.append(
+                "Use coord_triage_backlog(id, action='promote', "
+                "trajectory=[...]) or action='reject'."
+            )
+            lines.append("")
+    except Exception:
+        pass  # Backlog section is best-effort; never block a Coach turn.
+
     return "\n".join(lines) + "\n"
 
 

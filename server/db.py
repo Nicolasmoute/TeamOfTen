@@ -151,6 +151,20 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status     ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_owner      ON tasks(owner);
 CREATE INDEX IF NOT EXISTS idx_tasks_parent     ON tasks(parent_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_project    ON tasks(project_id);
+
+-- Backlog (Docs/kanban-specs-v2.md §4.0): pre-plan holding area for task
+-- ideas. Any agent or human can propose; Coach triages via coord_triage_backlog.
+CREATE TABLE IF NOT EXISTS backlog_tasks (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    title               TEXT NOT NULL,
+    proposed_by         TEXT NOT NULL,
+    proposed_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    status              TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'promoted', 'rejected')),
+    reject_reason       TEXT,
+    promoted_task_id    TEXT REFERENCES tasks(id)
+);
+CREATE INDEX IF NOT EXISTS idx_backlog_status ON backlog_tasks(status, proposed_at);
 -- Note: indexes referencing kanban-new columns (`archived_at`,
 -- `last_stage_change_at`) live in `_ensure_tasks_kanban_indexes`, called
 -- from init_db AFTER the migrations run. SQLite validates column
@@ -709,7 +723,9 @@ async def init_db() -> None:
 
     # Verify we can actually write a file in the directory — on some
     # networked volume backends the dir appears to exist but writes hang.
-    probe = parent / ".write-probe"
+    # Use a unique probe name (keyed to the DB file) so parallel test
+    # workers don't race on the same shared path.
+    probe = parent / f".write-probe-{Path(DB_PATH).stem}"
     try:
         probe.write_bytes(b"ok")
         probe.unlink()

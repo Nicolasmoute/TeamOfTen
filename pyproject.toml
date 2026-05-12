@@ -37,6 +37,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    "pytest-xdist>=3.5",
 ]
 
 [build-system]
@@ -57,4 +58,4 @@ server = ["*.html", "static/*.html", "static/*.js", "static/*.css"]
 asyncio_mode = "auto"
 testpaths = ["server/tests"]
 # Harness tests may spin up a full app; keep output readable.
-addopts = "-ra --strict-markers"
+addopts = "-ra --strict-markers -n 4 --dist worksteal"

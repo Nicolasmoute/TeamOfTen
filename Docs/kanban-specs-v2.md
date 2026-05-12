@@ -93,7 +93,52 @@ The executor never wakes silently from a FAIL. Coach is the only mechanism that 
 
 ---
 
-## 4 · Trajectory (FYI contract)
+## 4 · Backlog (pre-plan holding area)
+
+The Backlog is a lightweight list of task *ideas* that precedes the kanban proper. Any agent or human can drop a title-only idea into the Backlog; Coach decides whether to promote it into an active task (with trajectory) or reject it (with reason).
+
+### 4.0.1 Entry shape
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | INTEGER PK | Auto-assigned |
+| `title` | TEXT | Free-form, long text OK |
+| `proposed_by` | TEXT | Slot id (`coach`, `p1`…`p10`) or `'human'` |
+| `proposed_at` | TEXT | ISO-8601 UTC |
+| `status` | TEXT | `pending` \| `promoted` \| `rejected` |
+| `reject_reason` | TEXT | Null unless rejected |
+| `promoted_task_id` | TEXT | Set on promote; FK into `tasks.id` |
+
+### 4.0.2 Propose paths
+
+- **MCP `coord_propose_task(title)`** — available to Coach and all Players. Inserts a `pending` row; emits `backlog_task_proposed {id, title, proposed_by}`.
+- **HTTP `POST /api/backlog {title}`** — human-facing. Same insert; `proposed_by='human'`; emits same event.
+- **Slash `/newtask <title>`** — UI convenience: calls `POST /api/backlog` directly, no agent turn, no token burn. Renders a `.sys` confirmation row in the pane.
+
+### 4.0.3 Triage: `coord_triage_backlog`
+
+Coach-only MCP tool. Players who call it receive a "Coach-only" error.
+
+```
+coord_triage_backlog(id, action, trajectory?, modified_title?, reason?)
+```
+
+| `action` | Effect |
+|---|---|
+| `promote` | Atomically: UPDATE `backlog_tasks.status='promoted'`, INSERT into `tasks` (title = `modified_title ?? title`, `trajectory` required). Emits `backlog_task_promoted {backlog_id, task_id, title}`. |
+| `reject` | UPDATE `backlog_tasks.status='rejected', reject_reason=reason`. Emits `backlog_task_rejected {id, title, reason}`. |
+
+### 4.0.4 Rejection notification (human-proposed)
+
+When `proposed_by='human'` and action is `reject`, the harness inserts a row into the `messages` table (`from_id='coach'`, `to_id='coach'`, `subject='Backlog rejected: <title>'`, `body=<reason>`) so the rejection surfaces in Coach's chat pane. No notification is sent for agent-proposed rejections — the `backlog_task_rejected` bus event is sufficient.
+
+### 4.0.5 Coordination block rule
+
+When the Backlog has pending items, `_build_coach_coordination_block` appends a `## Backlog` section listing the top 5 oldest `pending` entries (oldest-first). Format per line: `[{id}] "{title}" — {proposer}, {age}`. Section is omitted entirely when the Backlog is empty (zero token cost in the common case).
+
+---
+
+## 5 · Trajectory (FYI contract)
 
 `tasks.trajectory` is a JSON list of `{stage, to, focus?}` objects (same shape as v1 §3.1). In v2 the trajectory is treated as a **plan Coach signals up front** — it documents what stages this task is expected to pass through and who could do each step. **It does not constrain Coach's actual transitions.** Coach can advance off-trajectory, insert stages mid-flight, drop expected stages, or reassign at any moment.
 

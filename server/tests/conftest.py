@@ -118,8 +118,26 @@ def pytest_sessionfinish(session, exitstatus):
     and marks the build red even though every test passed.
     Hard-exiting once the summary line is written cuts the dead-time
     so CI sees the real exit status.
+
+    xdist runs tests in separate worker processes that each exit cleanly;
+    the controller process also exits cleanly after printing the summary.
+    Calling os._exit() in either context kills the process before xdist
+    can finish sending/printing results — causing "node down" spam from
+    workers and a missing failure summary from the controller.
+    Skip os._exit() entirely when xdist is active (worker OR controller).
+    The aiosqlite dangling-thread problem is specific to serial runs where
+    all tests share one process; xdist's per-process isolation avoids it.
     """
     import sys
     sys.stdout.flush()
     sys.stderr.flush()
-    os._exit(exitstatus)
+    xdist_active = (
+        os.environ.get("PYTEST_XDIST_WORKER")           # worker process
+        or getattr(session.config, "workerinput", None)  # worker alt check
+        or (
+            hasattr(session.config, "option")
+            and getattr(session.config.option, "dist", "no") != "no"
+        )
+    )
+    if not xdist_active:
+        os._exit(exitstatus)

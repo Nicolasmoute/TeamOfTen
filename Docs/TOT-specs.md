@@ -4464,6 +4464,43 @@ and the desired architecture are still not perfectly aligned.
 
 10. Mobile/touch drag behavior remains less mature than desktop layout.
 
+11. `coord_*` MCP "Stream closed" mid-turn — open investigation.
+    Observed 2026-05-12 on p2: every `mcp__coord__*` call in a turn
+    returned "Stream closed" until the turn ended; the next wake fired
+    a fresh turn with a freshly-built `coord_server`
+    ([server/runtimes/claude.py:123](../server/runtimes/claude.py))
+    and the calls succeeded. The string originates in the Claude
+    Agent SDK, not harness code (grep confirms it's absent from
+    `server/`). It indicates the in-process stdio bridge between the
+    `claude` CLI subprocess and our Python-side `coord` MCP server
+    died mid-turn; once dead, the rest of the turn cannot use any
+    coord tool and the player has no path to signal Coach until an
+    external wake spawns a new turn. No harness-side detection or
+    recovery today.
+    Suspected triggers (most-recent first):
+    - `ENABLE_TOOL_SEARCH=auto:30` (shipped 2026-05-11,
+      [runtimes/claude.py:198-207](../server/runtimes/claude.py)) —
+      tool-search retrieval shares the in-process MCP stdio pipe
+      with `mcp__coord__*` calls; a race or EOF in the retriever
+      task would kill the bridge.
+    - `include_partial_messages=True` — known to race with in-process
+      MCP in some CLI builds; that is why the `HARNESS_STREAM_TOKENS`
+      kill-switch exists.
+    - An unhandled exception inside a coord tool handler crashing
+      the MCP task.
+    Diagnostic plan when next reproduced:
+    1. Grep server logs around the failing turn for an
+       `claude_agent_sdk` stack trace — the SDK usually logs the
+       exception that killed the MCP task before silently turning
+       all subsequent calls into "Stream closed".
+    2. Test-deploy with `HARNESS_TOOL_SEARCH=false`; if the rate
+       drops to zero, that is the smoking gun.
+    3. Otherwise try `HARNESS_STREAM_TOKENS=false`.
+    Possible mitigation (not yet implemented): a `PostToolUse` hook
+    that pattern-matches `Stream closed` in a `mcp__coord__*`
+    tool_result, emits `human_attention`, and cancels the turn so
+    the next wake can fire a fresh turn cleanly.
+
 ---
 
 ## 24. Hard Invariants

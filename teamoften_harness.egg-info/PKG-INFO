@@ -24,4 +24,5 @@ Requires-Dist: pyte>=0.8
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0; extra == "dev"
 Requires-Dist: pytest-asyncio>=0.24; extra == "dev"
+Requires-Dist: pytest-xdist>=3.5; extra == "dev"
 Dynamic: license-file

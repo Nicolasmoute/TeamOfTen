@@ -11,8 +11,25 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from server.db import configured_conn, init_db
 from server.events import EventBus, _persist
+
+
+@pytest.fixture(autouse=True)
+async def _clean_event_writer():
+    """Reset the module-level writer state before each test.
+
+    xdist workers run tests sequentially; a prior test that spun up the
+    app lifespan (e.g. HTTP integration tests) may have left _write_queue
+    non-None. Stop any running writer cleanly before the test starts, and
+    clean up again after so the next test in this worker starts fresh.
+    """
+    from server import events as events_mod
+    await events_mod.stop_event_writer()
+    yield
+    await events_mod.stop_event_writer()
 
 
 async def test_subscriber_receives_published_events(fresh_db: str) -> None:

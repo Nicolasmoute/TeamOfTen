@@ -3697,6 +3697,80 @@ async def clear_sessions_batch(
 # ------------------------------------------------------------------
 
 
+class BacklogCreateRequest(BaseModel):
+    title: str
+
+
+@app.post("/api/backlog", dependencies=[Depends(require_token)])
+async def create_backlog_entry(req: BacklogCreateRequest) -> dict[str, Any]:
+    """Human-facing backlog propose (kanban-specs-v2.md §4.0.2).
+
+    Inserts a pending backlog entry attributed to 'human'.
+    Coach triages via coord_triage_backlog on the next tick.
+    """
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(400, detail="title is required")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "INSERT INTO backlog_tasks (title, proposed_by, proposed_at) "
+            "VALUES (?, 'human', ?)",
+            (title, now_iso),
+        )
+        backlog_id = cur.lastrowid
+        await c.commit()
+    finally:
+        await c.close()
+
+    await bus.publish({
+        "ts": now_iso,
+        "agent_id": "human",
+        "type": "backlog_task_proposed",
+        "id": backlog_id,
+        "title": title,
+        "proposed_by": "human",
+    })
+    return {"id": backlog_id, "title": title, "status": "pending"}
+
+
+@app.get("/api/backlog", dependencies=[Depends(require_token)])
+async def list_backlog(status: str | None = None) -> dict[str, Any]:
+    """List backlog entries. Default: pending only.
+
+    ?status=pending|promoted|rejected|all
+    """
+    valid_statuses = {"pending", "promoted", "rejected"}
+    if status and status != "all" and status not in valid_statuses:
+        raise HTTPException(
+            400,
+            detail=f"status must be one of: pending, promoted, rejected, all",
+        )
+    c = await configured_conn()
+    try:
+        if not status or status == "pending":
+            cur = await c.execute(
+                "SELECT * FROM backlog_tasks WHERE status='pending' "
+                "ORDER BY proposed_at ASC"
+            )
+        elif status == "all":
+            cur = await c.execute(
+                "SELECT * FROM backlog_tasks ORDER BY proposed_at ASC"
+            )
+        else:
+            cur = await c.execute(
+                "SELECT * FROM backlog_tasks WHERE status=? "
+                "ORDER BY proposed_at ASC",
+                (status,),
+            )
+        rows = await cur.fetchall()
+    finally:
+        await c.close()
+    return {"backlog": [dict(r) for r in rows]}
+
+
 @app.get("/api/tasks", dependencies=[Depends(require_token)])
 async def list_tasks(status: str | None = None, owner: str | None = None) -> dict[str, Any]:
     project_id = await resolve_active_project()

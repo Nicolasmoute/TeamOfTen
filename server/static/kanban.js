@@ -943,6 +943,47 @@ function FlowHealthFooter({ authedFetch, kanbanEvents }) {
 }
 
 
+// ---------------------------------------------------------------- BacklogColumn
+
+
+function BacklogCard({ entry }) {
+  const proposer = entry.proposed_by || "?";
+  let proposerLabel;
+  if (proposer === "coach") proposerLabel = "C";
+  else if (proposer === "human") proposerLabel = "human";
+  else if (proposer.startsWith("p") && /^\d+$/.test(proposer.slice(1)))
+    proposerLabel = proposer.slice(1);
+  else proposerLabel = proposer;
+
+  return html`
+    <div class="kbn-card kbn-backlog-card">
+      <div class="kbn-card-title">${entry.title}</div>
+      <div class="kbn-card-meta">
+        <span class="kbn-backlog-proposer">${proposerLabel}</span>
+        <span class="kbn-card-age">${timeAgo(entry.proposed_at)}</span>
+      </div>
+    </div>
+  `;
+}
+
+function BacklogColumn({ entries, onRefresh }) {
+  if (!entries) return null;
+  return html`
+    <div class="kbn-column kbn-backlog-column">
+      <div class="kbn-column-head">
+        <span>BACKLOG</span>
+        <span class="kbn-count">${entries.length}</span>
+      </div>
+      <div class="kbn-column-body">
+        ${entries.length === 0
+          ? html`<div class="kbn-empty">No pending ideas</div>`
+          : entries.map((e) => html`<${BacklogCard} key=${e.id} entry=${e} />`)}
+      </div>
+    </div>
+  `;
+}
+
+
 // ---------------------------------------------------------------- main
 
 
@@ -955,6 +996,7 @@ export function KanbanPane({
   const [board, setBoard] = useState({
     plan: [], execute: [], audit_syntax: [], audit_semantics: [], ship: [],
   });
+  const [backlogEntries, setBacklogEntries] = useState([]);
   const [composerOpen, setComposerOpen] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(Boolean(saved.open));
   const [expandedId, setExpandedId] = useState(null);
@@ -973,9 +1015,20 @@ export function KanbanPane({
     }
   }, [authedFetch]);
 
+  const refreshBacklog = useCallback(async () => {
+    try {
+      const r = await authedFetch("/api/backlog?status=pending");
+      if (r.ok) {
+        const d = await r.json();
+        setBacklogEntries(d.backlog || []);
+      }
+    } catch (_) {}
+  }, [authedFetch]);
+
   useEffect(() => {
     refresh();
-  }, [refresh, activeProjectId, projectEpoch, wsConnected]);
+    refreshBacklog();
+  }, [refresh, refreshBacklog, activeProjectId, projectEpoch, wsConnected]);
 
   useEffect(() => {
     const current = savedArchiveState();
@@ -995,8 +1048,13 @@ export function KanbanPane({
       "audit_fail_notification", "compass_audit_logged",
       "commit_pushed", "project_switched", "socket_connected",
     ]);
+    const backlogWatched = new Set([
+      "backlog_task_proposed", "backlog_task_promoted", "backlog_task_rejected",
+    ]);
     return kanbanEvents.subscribe((evt) => {
-      if (evt && watched.has(evt.type)) refresh();
+      if (!evt) return;
+      if (watched.has(evt.type)) refresh();
+      if (backlogWatched.has(evt.type)) refreshBacklog();
     });
   }, [kanbanEvents, refresh]);
 
@@ -1095,6 +1153,10 @@ export function KanbanPane({
       <div class="pane-body kbn-body">
         ${error ? html`<div class="kbn-error">${error}</div>` : null}
         <div class="kbn-columns">
+          <${BacklogColumn}
+            entries=${backlogEntries}
+            onRefresh=${refreshBacklog}
+          />
           <${Column}
             stage="plan"
             label="Plan"

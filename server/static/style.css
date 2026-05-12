@@ -4892,7 +4892,7 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 /* Columns */
 .kbn-columns {
   display: grid;
-  grid-template-columns: repeat(4, minmax(220px, 1fr));
+  grid-template-columns: minmax(180px, 0.8fr) repeat(4, minmax(220px, 1fr));
   gap: 10px;
   flex: 1;
   min-height: 0;
@@ -4941,6 +4941,18 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   font-style: italic;
   padding: 6px 4px;
 }
+
+/* Backlog column */
+.kbn-backlog-column { opacity: 0.9; }
+.kbn-backlog-card { cursor: default; border-left-color: var(--muted, #7e8694); }
+.kbn-backlog-card:hover { border-color: var(--border, #2c3340); }
+.kbn-card-meta { display: flex; gap: 8px; align-items: center; }
+.kbn-backlog-proposer {
+  font-size: 10px; font-weight: 600; letter-spacing: 0.04em;
+  color: var(--muted); background: rgba(255,255,255,0.06);
+  border-radius: 3px; padding: 0 5px;
+}
+.kbn-card-age { font-size: 10px; color: var(--muted); }
 
 /* Card */
 .kbn-card {

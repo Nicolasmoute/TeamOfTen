@@ -6994,6 +6994,233 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             f"pending_plan event for your review."
         )
 
+    # ------------------------------------------------------------------ Backlog
+    # (Docs/kanban-specs-v2.md §4.0) — lightweight pre-plan holding area.
+
+    @tool(
+        "coord_propose_task",
+        (
+            "Propose a task idea to the Backlog. Available to Coach and "
+            "all Players. The item lands in the Backlog as a `pending` "
+            "entry visible in the kanban Backlog column; Coach triages "
+            "it on the next tick via coord_triage_backlog.\n"
+            "\n"
+            "Use this instead of coord_create_task when the work isn't "
+            "ready to start yet — you want Coach to review and decide "
+            "whether it fits current priorities before a trajectory is "
+            "committed.\n"
+            "\n"
+            "Params:\n"
+            "- title: required. Free-form description of the idea."
+        ),
+        {"title": str},
+    )
+    async def propose_task(args: dict[str, Any]) -> dict[str, Any]:
+        title = (args.get("title") or "").strip()
+        if not title:
+            return _err("title is required")
+
+        now_iso = _now_iso()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "INSERT INTO backlog_tasks (title, proposed_by, proposed_at) "
+                "VALUES (?, ?, ?)",
+                (title, caller_id, now_iso),
+            )
+            backlog_id = cur.lastrowid
+            await c.commit()
+        finally:
+            await c.close()
+
+        await bus.publish({
+            "ts": now_iso,
+            "agent_id": caller_id,
+            "type": "backlog_task_proposed",
+            "id": backlog_id,
+            "title": title,
+            "proposed_by": caller_id,
+        })
+        return _ok(
+            f"Backlog entry #{backlog_id} created: \"{title}\". "
+            "Coach will triage it on the next tick."
+        )
+
+    @tool(
+        "coord_triage_backlog",
+        (
+            "Coach-only. Review a Backlog entry and either promote it "
+            "to an active task or reject it.\n"
+            "\n"
+            "Params:\n"
+            "- id: required. Backlog entry id (integer).\n"
+            "- action: 'promote' or 'reject'.\n"
+            "- trajectory: required when action='promote'. Same format "
+            "  as coord_create_task — ordered list of {stage, to} "
+            "  objects. 'to' must name exactly one Player slot per "
+            "  the v2 first-stage rule.\n"
+            "- modified_title: optional. Rename the idea on promote.\n"
+            "- reason: recommended when action='reject'. Short phrase "
+            "  explaining why (stored; surfaces to human if the idea "
+            "  was proposed by a human)."
+        ),
+        {"id": str, "action": str, "trajectory": Any,
+         "modified_title": str, "reason": str},
+    )
+    async def triage_backlog(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("coord_triage_backlog is Coach-only.")
+
+        raw_id = (args.get("id") or "").strip()
+        if not raw_id:
+            return _err("id is required")
+        try:
+            backlog_id = int(raw_id)
+        except ValueError:
+            return _err(f"id must be an integer, got {raw_id!r}")
+
+        action = (args.get("action") or "").strip().lower()
+        if action not in ("promote", "reject"):
+            return _err("action must be 'promote' or 'reject'")
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id, title, proposed_by, status "
+                "FROM backlog_tasks WHERE id = ?",
+                (backlog_id,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"Backlog entry #{backlog_id} not found")
+            entry = dict(row)
+            if entry["status"] != "pending":
+                return _err(
+                    f"Backlog entry #{backlog_id} is already "
+                    f"{entry['status']} — nothing to triage."
+                )
+
+            title = (args.get("modified_title") or "").strip() or entry["title"]
+            now_iso = _now_iso()
+
+            if action == "reject":
+                reason = (args.get("reason") or "").strip() or "(no reason given)"
+                await c.execute(
+                    "UPDATE backlog_tasks SET status='rejected', "
+                    "reject_reason=? WHERE id=?",
+                    (reason, backlog_id),
+                )
+                # Notify human proposers via the messages table so it
+                # surfaces in Coach's chat pane (§4.0.4).
+                if entry["proposed_by"] == "human":
+                    await c.execute(
+                        "INSERT INTO messages "
+                        "(from_id, to_id, project_id, subject, body, sent_at) "
+                        "VALUES ('coach', 'coach', ?, ?, ?, ?)",
+                        (
+                            project_id,
+                            f"Backlog rejected: {entry['title'][:80]}",
+                            f"Your backlog suggestion \"{entry['title']}\" was "
+                            f"rejected by Coach. Reason: {reason}",
+                            now_iso,
+                        ),
+                    )
+                await c.commit()
+        finally:
+            await c.close()
+
+        if action == "reject":
+            await bus.publish({
+                "ts": now_iso,
+                "agent_id": caller_id,
+                "type": "backlog_task_rejected",
+                "id": backlog_id,
+                "title": entry["title"],
+                "reason": reason,
+            })
+            return _ok(
+                f"Backlog entry #{backlog_id} (\"{entry['title']}\") rejected. "
+                f"Reason: {reason}"
+            )
+
+        # action == "promote"
+        trajectory = args.get("trajectory")
+        if not trajectory:
+            return _err(
+                "trajectory is required when action='promote'. "
+                "Provide an ordered list of {stage, to} objects — "
+                "same format as coord_create_task."
+            )
+        if isinstance(trajectory, str):
+            try:
+                import json as _json
+                trajectory = _json.loads(trajectory)
+            except Exception:
+                return _err("trajectory must be a JSON list of {stage, to} objects")
+
+        trajectory, traj_err = _validate_trajectory(trajectory)
+        if traj_err:
+            return _err(f"invalid trajectory: {traj_err}")
+
+        task_id = _new_task_id()
+        trajectory_json = json.dumps(trajectory, separators=(",", ":"))
+        initial_status = trajectory[0]["stage"]
+        first_to: list[str] = trajectory[0].get("to") or []
+        if isinstance(first_to, str):
+            first_to = [first_to] if first_to else []
+        initial_owner = first_to[0] if len(first_to) == 1 else None
+
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "INSERT INTO tasks (id, project_id, title, description, "
+                "priority, workflow, tracking_reason, trajectory, status, "
+                "owner, last_stage_change_at, created_by) "
+                "VALUES (?, ?, ?, '', 'normal', 'generic', 'backlog', "
+                "?, ?, ?, ?, ?)",
+                (task_id, project_id, title,
+                 trajectory_json, initial_status, initial_owner,
+                 now_iso, caller_id),
+            )
+            # Plant first-stage role row when single named assignee.
+            _role_for_stage_map = {
+                "plan": "planner", "execute": "executor",
+                "audit_syntax": "auditor_syntax",
+                "audit_semantics": "auditor_semantics", "ship": "shipper",
+            }
+            if len(first_to) == 1:
+                first_role = _role_for_stage_map[trajectory[0]["stage"]]
+                eligible_json = json.dumps(first_to, separators=(",", ":"))
+                await c.execute(
+                    "INSERT INTO task_role_assignments "
+                    "(task_id, role, eligible_owners, owner, "
+                    "assigned_at, claimed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (task_id, first_role, eligible_json, first_to[0],
+                     now_iso, now_iso),
+                )
+            await c.execute(
+                "UPDATE backlog_tasks SET status='promoted', "
+                "promoted_task_id=? WHERE id=?",
+                (task_id, backlog_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+
+        await bus.publish({
+            "ts": now_iso,
+            "agent_id": caller_id,
+            "type": "backlog_task_promoted",
+            "backlog_id": backlog_id,
+            "task_id": task_id,
+            "title": title,
+        })
+        return _ok(
+            f"Backlog entry #{backlog_id} promoted → task {task_id} "
+            f"(\"{title}\", initial stage: {initial_status})."
+        )
+
     @tool(
         "coord_set_task_blocked",
         (
@@ -7132,6 +7359,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         # proposal tool; readable surface lives in every system prompt
         # via build_system_prompt_suffix.
         propose_playbook_changes,
+        # Backlog (Docs/kanban-specs-v2.md §4.0). propose_task: Coach +
+        # Players. triage_backlog: Coach-only at runtime (body enforces).
+        propose_task,
+        triage_backlog,
     ]
     server = create_sdk_mcp_server(name="coord", version="0.8.0", tools=_tools)
     # Stash a name → handler map so the coord_mcp proxy endpoint
@@ -7293,6 +7524,10 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_archive_task",
     "mcp__coord__coord_role_complete",
     "mcp__coord__coord_request_plan_review",
+    # Backlog (Docs/kanban-specs-v2.md §4.0). coord_propose_task is open
+    # to Coach + Players; coord_triage_backlog is Coach-only at runtime.
+    "mcp__coord__coord_propose_task",
+    "mcp__coord__coord_triage_backlog",
 ]
 
 MEMORY_TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")
