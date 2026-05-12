@@ -10890,9 +10890,9 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
           setInfoText("/newtask <title> — title is required");
           return true;
         }
-        authFetch(“/api/backlog”, {
-          method: “POST”,
-          headers: { “Content-Type”: “application/json” },
+        authFetch("/api/backlog", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ title: taskTitle }),
         })
           .then(async (r) => {
@@ -10900,11 +10900,11 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
               const d = await r.json();
               setInfoText(`Backlog #${d.id} added — Coach will triage on next tick.`);
             } else {
-              const detail = await r.text().catch(() => “”);
-              setInfoText(“/newtask failed: HTTP “ + r.status + “ “ + detail.slice(0, 120));
+              const detail = await r.text().catch(() => "");
+              setInfoText("/newtask failed: HTTP " + r.status + " " + detail.slice(0, 120));
             }
           })
-          .catch((e) => setInfoText(“/newtask failed: “ + String(e)));
+          .catch((e) => setInfoText("/newtask failed: " + String(e)));
         return true;
       }
       case "/spend":
