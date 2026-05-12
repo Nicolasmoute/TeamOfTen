@@ -531,12 +531,6 @@ function AuditColumn(props) {
 
 function ComposerModal({ open, onClose, onCreate }) {
   const [title, setTitle] = useState("");
-  const [description, setDescription] = useState("");
-  const [priority, setPriority] = useState("normal");
-  const [presetId, setPresetId] = useState("code_formal");
-  const [workflow, setWorkflow] = useState("generic");
-  const [trackingReason, setTrackingReason] = useState("");
-  const [firstAssignee, setFirstAssignee] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
 
@@ -548,38 +542,11 @@ function ComposerModal({ open, onClose, onCreate }) {
       setErr("title is required");
       return;
     }
-    // v2.0.1: every task is fired AT a Player. trajectory[0].to must
-    // name exactly one Player; otherwise the API rejects the create.
-    const assignee = firstAssignee.trim();
-    if (!/^p([1-9]|10)$/.test(assignee)) {
-      setErr("assignee for the first stage is required (e.g. p3)");
-      return;
-    }
-    const preset = TRAJECTORY_PRESETS.find((p) => p.id === presetId)
-      || TRAJECTORY_PRESETS[0];
-    // Clone the preset trajectory and put the assignee on the first
-    // stage. Subsequent stages stay FYI/empty as the preset defines.
-    const trajectory = preset.trajectory.map((entry, idx) =>
-      idx === 0 ? { ...entry, to: [assignee] } : { ...entry }
-    );
     setBusy(true);
     setErr(null);
     try {
-      await onCreate({
-        title: title.trim(),
-        description: description.trim(),
-        priority,
-        trajectory,
-        workflow,
-        tracking_reason: trackingReason.trim() || null,
-      });
+      await onCreate({ title: title.trim() });
       setTitle("");
-      setDescription("");
-      setPriority("normal");
-      setPresetId("code_formal");
-      setWorkflow("generic");
-      setTrackingReason("");
-      setFirstAssignee("");
       onClose();
     } catch (e) {
       setErr(e.message || String(e));
@@ -591,9 +558,9 @@ function ComposerModal({ open, onClose, onCreate }) {
   return html`
     <div class="kbn-modal-backdrop" onClick=${onClose}>
       <div class="kbn-modal" onClick=${(e) => e.stopPropagation()}>
-        <div class="kbn-modal-head">New task</div>
+        <div class="kbn-modal-head">Add to backlog</div>
         <form onSubmit=${submit}>
-          <label class="kbn-label">Title</label>
+          <label class="kbn-label">Idea / title</label>
           <input
             class="kbn-input"
             type="text"
@@ -601,73 +568,17 @@ function ComposerModal({ open, onClose, onCreate }) {
             onInput=${(e) => setTitle(e.target.value)}
             autoFocus
             maxlength="300"
+            placeholder="One-line description of the idea"
           />
-          <label class="kbn-label">Description</label>
-          <textarea
-            class="kbn-textarea"
-            rows="6"
-            value=${description}
-            onInput=${(e) => setDescription(e.target.value)}
-            maxlength="10000"
-          ></textarea>
-          <div class="kbn-row">
-            <label class="kbn-label">Priority
-              <select class="kbn-select" value=${priority} onChange=${(e) => setPriority(e.target.value)}>
-                <option value="low">low</option>
-                <option value="normal">normal</option>
-                <option value="high">high</option>
-                <option value="urgent">urgent</option>
-              </select>
-            </label>
-            <label class="kbn-label">Trajectory
-              <select class="kbn-select" value=${presetId} onChange=${(e) => setPresetId(e.target.value)}>
-                ${TRAJECTORY_PRESETS.map((p) => html`<option value=${p.id}>${p.label}</option>`)}
-              </select>
-            </label>
-          </div>
-          <div class="kbn-row">
-            <label class="kbn-label">Workflow
-              <select class="kbn-select" value=${workflow} onChange=${(e) => setWorkflow(e.target.value)}>
-                <option value="generic">generic</option>
-                <option value="code">code</option>
-                <option value="research">research</option>
-                <option value="writing">writing</option>
-                <option value="marketing">marketing</option>
-                <option value="ops">ops</option>
-              </select>
-            </label>
-            <label class="kbn-label">First-stage assignee (required)
-              <input
-                class="kbn-input"
-                type="text"
-                value=${firstAssignee}
-                onInput=${(e) => setFirstAssignee(e.target.value)}
-                placeholder="p3"
-                maxlength="3"
-              />
-            </label>
-          </div>
-          <label class="kbn-label">Tracking reason (optional)
-            <input
-              class="kbn-input"
-              type="text"
-              value=${trackingReason}
-              onInput=${(e) => setTrackingReason(e.target.value)}
-              placeholder="(free text, optional)"
-              maxlength="80"
-            />
-          </label>
           <div class="kbn-help">
-            v2: every task is fired AT a Player. trajectory[0].to is
-            the named slot above (e.g. p3). Subsequent stages stay
-            FYI; Coach picks each later assignee at coord_approve_stage
-            time. Reroute mid-flight via POST /api/tasks/&lt;id&gt;/trajectory.
+            Coach will review this on the next tick and either promote it
+            to a real task (with trajectory) or reject it with a reason.
           </div>
           ${err ? html`<div class="kbn-error">${err}</div>` : null}
           <div class="kbn-modal-actions">
             <button type="button" class="kbn-btn" onClick=${onClose} disabled=${busy}>Cancel</button>
             <button type="submit" class="kbn-btn kbn-btn-primary" disabled=${busy}>
-              ${busy ? "Creating..." : "Create task"}
+              ${busy ? "Adding..." : "Add to backlog"}
             </button>
           </div>
         </form>
@@ -1080,8 +991,16 @@ export function KanbanPane({
   }, [loadHistory]);
 
   const onCreate = async (req) => {
-    await apiPost(authedFetch, "", req);
-    await refresh();
+    const r = await authedFetch("/api/backlog", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+    });
+    if (!r.ok) {
+      const msg = await r.text().catch(() => r.statusText);
+      throw new Error(msg);
+    }
+    await refreshBacklog();
   };
 
   // v2 §7.1: stage transitions and role assignment are one atomic
@@ -1128,7 +1047,7 @@ export function KanbanPane({
         </div>
         <div class="pane-head-actions kbn-head-actions">
           <button class="kbn-btn kbn-btn-primary" type="button" onClick=${() => setComposerOpen(true)}>
-            <${Icon} name="plus" /> New task
+            <${Icon} name="plus" /> New idea
           </button>
           <button class=${`kbn-btn kbn-archive-toggle ${archiveOpen ? "active" : ""}`} type="button"
             onClick=${() => setArchiveOpen((v) => !v)}>
