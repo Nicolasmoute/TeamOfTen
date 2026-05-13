@@ -5259,9 +5259,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 msg = (
                     f"Called {task_id} {role} pool: "
                     f"{', '.join(targets)}. All are auto-woken; "
-                    f"first to call coord_accept_role wins. Do NOT "
-                    f"follow up with coord_send_message; the wake "
-                    f"covers it."
+                    f"first to call coord_accept_role wins. Wake body "
+                    f"carries task context; add coord_send_message "
+                    f"only if extra background is needed."
                 )
             else:
                 msg = (
