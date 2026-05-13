@@ -111,7 +111,8 @@ async def _deliver_system_message(
             if to_id != "coach":
                 from server.tools import _with_player_reminder
                 wake_body = _with_player_reminder(wake_body)
-            await maybe_wake_agent(to_id, wake_body)
+            # bypass_debounce=True matches every other discrete-action wake site
+            await maybe_wake_agent(to_id, wake_body, bypass_debounce=True)
         except Exception:
             logger.exception("_deliver_system_message wake failed")
 

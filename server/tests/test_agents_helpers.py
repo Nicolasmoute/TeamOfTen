@@ -1181,3 +1181,55 @@ def test_soft_error_retry_policy_case_insensitive() -> None:
     assert _soft_error_retry_policy("STOP_SEQUENCE", None, 1000)["retry"] is True
     assert _soft_error_retry_policy("Stop_Sequence", None, 1000)["retry"] is True
     assert _soft_error_retry_policy("Tool_Use", None, 1000)["retry"] is True
+
+
+# ---------------------------------------------------------------------------
+# _deliver_system_message — wake reliability
+# ---------------------------------------------------------------------------
+
+
+async def test_deliver_system_message_wake_bypasses_debounce(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_deliver_system_message must pass bypass_debounce=True so the wake
+    fires even when the target just ended a turn within the debounce window.
+    Matches the guarantee already present on coord_send_message and every
+    other discrete-action wake site."""
+    import server.agents as agents_mod
+    from server.agents import _deliver_system_message
+
+    calls: list[bool] = []
+
+    async def fake_wake(agent_id: str, reason: str, *, bypass_debounce: bool = False, **kw: object) -> bool:
+        calls.append(bypass_debounce)
+        return True
+
+    monkeypatch.setattr(agents_mod, "maybe_wake_agent", fake_wake)
+    await _deliver_system_message(
+        from_id="coach", to_id="p3",
+        subject="test", body="hello", wake=True,
+    )
+    assert calls == [True], f"expected bypass_debounce=True, got: {calls}"
+
+
+async def test_deliver_system_message_wake_queues_when_busy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the target is mid-turn, _deliver_system_message's wake must
+    coalesce into _pending_wakes rather than be dropped."""
+    import asyncio
+    import server.agents as agents_mod
+    from server.agents import _deliver_system_message, _running_tasks, _pending_wakes
+
+    dummy_task = asyncio.create_task(asyncio.sleep(0))
+    _running_tasks["p3"] = dummy_task
+    try:
+        await _deliver_system_message(
+            from_id="coach", to_id="p3",
+            subject="test", body="queued", wake=True,
+        )
+        assert "p3" in _pending_wakes, "wake must be queued when target is busy"
+    finally:
+        _running_tasks.pop("p3", None)
+        _pending_wakes.pop("p3", None)
+        dummy_task.cancel()
