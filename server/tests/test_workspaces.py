@@ -437,7 +437,7 @@ async def test_url_unchanged_skips_set_url(
     )
 
 
-async def test_provision_resolves_var_placeholder_in_remote(
+async def test_ensure_base_clone_placeholder_resolves_in_set_url_args(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When repo_url contains a `${VAR}` placeholder (e.g.
@@ -446,9 +446,9 @@ async def test_provision_resolves_var_placeholder_in_remote(
     into the git remote — the raw `${GITHUB_TOKEN}` string must never
     reach `git remote set-url`.
 
-    This exercises the `_expand_placeholders` path in
-    `_ensure_base_clone` and ensures the RESOLVED URL (not the literal
-    `${VAR}` form) is what gets passed to git.
+    This is a fast unit-level check (mocked _run) that the right argv
+    is assembled.  The companion test below (same name without the
+    _args suffix) does the same assertion end-to-end against real git.
     """
     import server.workspaces as ws_mod
 
@@ -486,4 +486,89 @@ async def test_provision_resolves_var_placeholder_in_remote(
     )
     assert "${GITHUB_TOKEN}" not in " ".join(set_url_cmd), (
         f"placeholder must not reach git; got: {set_url_cmd}"
+    )
+
+
+# ------------------------------------------------------------------
+# End-to-end: real git, real .git/config on disk
+# ------------------------------------------------------------------
+
+
+async def test_provision_resolves_var_placeholder_in_remote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end test (real git subprocess, no mocked _run) that
+    `_ensure_base_clone` expands `${VAR}` placeholders via
+    `_expand_placeholders` before passing the URL to
+    `git remote set-url`, and that the RESOLVED URL is what actually
+    lands in `.git/config` on disk.
+
+    Regression: if `_expand_placeholders` is skipped or bypassed, the
+    raw placeholder string would be stored in .git/config, making
+    subsequent git operations fail with "Invalid URL" or similar.
+    """
+    import subprocess
+    import server.workspaces as ws_mod
+
+    # ---------- build two real upstream repos with one commit each --------
+    def _make_upstream(name: str) -> Path:
+        d = tmp_path / name
+        d.mkdir()
+        subprocess.run(["git", "init"], cwd=d, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=d, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=d, check=True, capture_output=True,
+        )
+        (d / "README.md").write_text("hi", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=d, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=d, check=True, capture_output=True,
+        )
+        return d
+
+    upstream_old = _make_upstream("upstream_old")
+    upstream_new = _make_upstream("upstream_new")
+    old_url = upstream_old.as_uri()   # file:///tmp/.../upstream_old
+    new_url = upstream_new.as_uri()   # file:///tmp/.../upstream_new
+
+    # ---------- initial clone against the old upstream --------------------
+    bare = tmp_path / "bare_clone"
+    result1 = await ws_mod._ensure_base_clone(bare, old_url)
+    assert bare.exists() and (bare / ".git").exists(), (
+        "initial clone must create the directory and .git"
+    )
+    assert result1 is False, "fresh clone must return False (no URL refresh yet)"
+
+    config_after_clone = (bare / ".git" / "config").read_text(encoding="utf-8")
+    assert old_url in config_after_clone, (
+        f"old URL expected in .git/config after clone; got:\n{config_after_clone}"
+    )
+
+    # ---------- URL refresh via ${VAR} placeholder ------------------------
+    # Store the new upstream URL in an env var; the placeholder
+    # `${NEW_REPO_URL}` expands to it via _expand_placeholders.
+    monkeypatch.setenv("NEW_REPO_URL", new_url)
+
+    result2 = await ws_mod._ensure_base_clone(bare, "${NEW_REPO_URL}")
+    assert result2 is True, (
+        "_ensure_base_clone must return True when the remote URL was refreshed"
+    )
+
+    # The resolved URL must be in .git/config; the placeholder must not.
+    config_after_refresh = (bare / ".git" / "config").read_text(encoding="utf-8")
+    assert new_url in config_after_refresh, (
+        f"resolved URL '{new_url}' must appear in .git/config after refresh; "
+        f"got:\n{config_after_refresh}"
+    )
+    assert "${NEW_REPO_URL}" not in config_after_refresh, (
+        f"raw placeholder must not appear in .git/config; "
+        f"got:\n{config_after_refresh}"
+    )
+    assert old_url not in config_after_refresh, (
+        f"old URL must be replaced by the new one; got:\n{config_after_refresh}"
     )
