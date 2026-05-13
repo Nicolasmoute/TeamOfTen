@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,10 @@ if not logger.handlers:
 
 
 SLOT_IDS: list[str] = ["coach"] + [f"p{i}" for i in range(1, 11)]
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 _ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -248,6 +253,8 @@ async def ensure_workspaces(project_id: str) -> dict[str, Any]:
         }
 
     from server.main import _mask_repo_url
+    from server.events import bus
+
     status: dict[str, Any] = {
         "configured": True,
         "project_id": project_id,
@@ -256,11 +263,34 @@ async def ensure_workspaces(project_id: str) -> dict[str, Any]:
     }
 
     try:
-        await _ensure_base_clone(pp.bare_clone, repo_url)
+        remote_refreshed = await _ensure_base_clone(pp.bare_clone, repo_url)
     except Exception as e:
         logger.exception("base clone failed for project %s", project_id)
         status["error"] = f"clone failed: {e}"
         return status
+
+    # Per-slot remote summary.  The bare clone is shared by all slots,
+    # so a single set-url propagates to every slot simultaneously.
+    if remote_refreshed:
+        status["remotes_updated"] = list(SLOT_IDS)
+        status["remotes_unchanged"] = []
+        # Emit a bus event so subscribers (Telegram, audit log, dashboards)
+        # know the remote URL was silently refreshed.
+        masked = _mask_repo_url(repo_url)
+        asyncio.ensure_future(
+            bus.publish(
+                {
+                    "ts": _now_iso(),
+                    "agent_id": "system",
+                    "type": "worktree_remote_updated",
+                    "project_id": project_id,
+                    "new_url_masked": masked,
+                }
+            )
+        )
+    else:
+        status["remotes_updated"] = []
+        status["remotes_unchanged"] = list(SLOT_IDS)
 
     slot_results: dict[str, Any] = {}
     for slot in SLOT_IDS:
@@ -316,7 +346,7 @@ def _lock_for(bare: Path) -> asyncio.Lock:
     return lock
 
 
-async def _ensure_base_clone(bare: Path, repo_url_raw: str) -> None:
+async def _ensure_base_clone(bare: Path, repo_url_raw: str) -> bool:
     """Idempotent clone of the project repo into its bare-clone path.
 
     When the bare clone already exists and the configured URL has
@@ -327,6 +357,10 @@ async def _ensure_base_clone(bare: Path, repo_url_raw: str) -> None:
     config, so a single set-url here propagates to every slot.
     The fetch is non-fatal — a transient network failure here doesn't
     block provisioning; the next agent push will surface the error.
+
+    Returns True if a remote URL refresh was performed (set-url ran),
+    False if the clone already had the correct URL or was freshly
+    cloned (in which case the URL is correct by definition).
     """
     expected = _expand_placeholders(repo_url_raw)
     async with _lock_for(bare):
@@ -372,9 +406,10 @@ async def _ensure_base_clone(bare: Path, repo_url_raw: str) -> None:
                         "workspaces: remote URL refreshed + fetch ok for %s",
                         bare,
                     )
+                return True  # URL was refreshed
             else:
                 logger.info("base repo already present at %s", bare)
-            return
+            return False  # already correct URL
         bare.parent.mkdir(parents=True, exist_ok=True)
         # Log the unexpanded form so PATs don't hit the logs.
         logger.info("cloning %s → %s", repo_url_raw, bare)
@@ -389,6 +424,7 @@ async def _ensure_base_clone(bare: Path, repo_url_raw: str) -> None:
                 f"{_mask_userinfo(msg, expected)}"
             )
         logger.info("clone ok: %s", bare)
+        return False  # fresh clone — URL correct by definition
 
 
 async def _read_remote_url(bare: Path) -> str:

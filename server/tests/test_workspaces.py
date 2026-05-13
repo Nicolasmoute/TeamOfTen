@@ -435,3 +435,55 @@ async def test_url_unchanged_skips_set_url(
     assert not any("set-url" in c for c in cmds), (
         f"set-url should not run when URL unchanged; got: {cmds}"
     )
+
+
+async def test_provision_resolves_var_placeholder_in_remote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When repo_url contains a `${VAR}` placeholder (e.g.
+    `https://${GITHUB_TOKEN}@github.com/owner/repo.git`), the
+    placeholder must be resolved before being compared to / written
+    into the git remote — the raw `${GITHUB_TOKEN}` string must never
+    reach `git remote set-url`.
+
+    This exercises the `_expand_placeholders` path in
+    `_ensure_base_clone` and ensures the RESOLVED URL (not the literal
+    `${VAR}` form) is what gets passed to git.
+    """
+    import server.workspaces as ws_mod
+
+    token = "ghp_TestTokenABCDEFGHIJKLMNOP"
+    resolved_url = f"https://{token}@github.com/owner/repo.git"
+    placeholder_url = "https://${GITHUB_TOKEN}@github.com/owner/repo.git"
+
+    # Simulate the bare clone existing with a *different* URL so that
+    # set-url will be triggered after placeholder expansion.
+    bare = tmp_path / ".project"
+    _FakeGitDir(bare, "https://old-token@github.com/owner/repo.git")
+
+    # Provide the token via os.environ so _expand_placeholders resolves it.
+    monkeypatch.setenv("GITHUB_TOKEN", token)
+
+    calls: list[list[str]] = []
+
+    async def _fake_run(cmd, cwd=None, timeout=120):
+        calls.append(cmd)
+        if "remote" in cmd and "get-url" in cmd:
+            return 0, "https://old-token@github.com/owner/repo.git", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(ws_mod, "_run", _fake_run)
+
+    await ws_mod._ensure_base_clone(bare, placeholder_url)
+
+    # The set-url call must have used the resolved URL, not the placeholder.
+    set_url_calls = [c for c in calls if "set-url" in c]
+    assert set_url_calls, "expected a git remote set-url call"
+    set_url_cmd = set_url_calls[0]
+    assert resolved_url in set_url_cmd, (
+        f"set-url should receive the resolved URL '{resolved_url}'; "
+        f"got command: {set_url_cmd}"
+    )
+    assert "${GITHUB_TOKEN}" not in " ".join(set_url_cmd), (
+        f"placeholder must not reach git; got: {set_url_cmd}"
+    )
