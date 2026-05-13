@@ -571,6 +571,117 @@ async def test_my_assignments_coach_rejected(fresh_db: str) -> None:
     assert "player" in err.lower() or "coach" in err.lower()
 
 
+async def _complete_role(
+    *,
+    task_id: str,
+    role: str,
+    verdict: str | None = None,
+) -> None:
+    """Direct-SQL: mark a role row as completed (with optional verdict).
+    Simulates the state coord_approve_stage / coord_submit_audit_report
+    would leave behind."""
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE task_role_assignments "
+            "SET completed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
+            "    verdict = ? "
+            "WHERE task_id = ? AND role = ? "
+            "  AND completed_at IS NULL AND superseded_by IS NULL",
+            (verdict, task_id, role),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+
+# ----------------------------------------------------------------
+# coord_list_tasks — stage_role field: 4-state transitions for audit
+# ----------------------------------------------------------------
+
+
+async def test_list_tasks_stage_role_four_state_transitions(
+    fresh_db: str,
+) -> None:
+    """stage_role should reflect four distinct states as a task
+    moves through audit_syntax:
+      (a) assigned:<slot>       — active executor is dispatched
+      (b) unassigned (-)        — role completed, awaiting Coach advance
+              Wait: this state occurs when role row is done but
+              active_owner is NULL (no new row yet). Represented as
+              `auditor:-` by the formatter.
+      (c) complete:<slot>:pass  — audit done with pass verdict
+      (d) complete:<slot>:fail  — audit done with fail verdict
+
+    The test walks through all four states using direct-SQL setup
+    helpers (no auto-routing wires needed — we just mirror the DB
+    state that coord_approve_stage / coord_submit_audit_report leave).
+    """
+    TASK_ID = "t-2026-05-13-aabbcc01"
+
+    async def _list_text(slot: str) -> str:
+        server = _server_for(slot)
+        return _ok_text(await _handler(server, "list_tasks")({}))
+
+    # ---- setup: task in audit_syntax stage (no role row yet) ----
+    await init_db()
+    await _seed_task(
+        task_id=TASK_ID,
+        status="audit_syntax",
+        owner="p2",
+    )
+
+    # (a) assigned:<slot> — active auditor_syntax role row owned by p5
+    await _plant_role(task_id=TASK_ID, role="auditor_syntax", owner="p5")
+    text = await _list_text("coach")
+    assert f"stage_role=auditor:p5" in text, (
+        f"(a) expected stage_role=auditor:p5; got:\n{text}"
+    )
+
+    # (b) unassigned — complete the role row, no new active row planted.
+    # This leaves role_done_owner='p5' but active_owner=NULL and no verdict.
+    await _complete_role(task_id=TASK_ID, role="auditor_syntax", verdict=None)
+    text = await _list_text("coach")
+    # With role_done_owner set but no verdict, falls through to <label>:done.
+    assert "stage_role=auditor:done" in text, (
+        f"(b) expected stage_role=auditor:done; got:\n{text}"
+    )
+
+    # Now test the verdict-bearing cases with a fresh task to avoid
+    # interference from the already-completed row.
+
+    # (c) complete:<slot>:pass — fresh task, plant role, submit pass verdict
+    TASK_PASS = "t-2026-05-13-aabbcc02"
+    await _seed_task(task_id=TASK_PASS, status="audit_syntax")
+    await _plant_role(task_id=TASK_PASS, role="auditor_syntax", owner="p5")
+    server_p5 = _server_for("p5")
+    _ok_text(await _handler(server_p5, "submit_audit_report")({
+        "task_id": TASK_PASS,
+        "kind": "syntax",
+        "body": "## Summary\nAll good.\n",
+        "verdict": "pass",
+    }))
+    text = await _list_text("coach")
+    assert "stage_role=complete:p5:pass" in text, (
+        f"(c) expected stage_role=complete:p5:pass; got:\n{text}"
+    )
+
+    # (d) complete:<slot>:fail — fresh task, plant role, submit fail verdict
+    TASK_FAIL = "t-2026-05-13-aabbcc03"
+    await _seed_task(task_id=TASK_FAIL, status="audit_syntax")
+    await _plant_role(task_id=TASK_FAIL, role="auditor_syntax", owner="p5")
+    _ok_text(await _handler(server_p5, "submit_audit_report")({
+        "task_id": TASK_FAIL,
+        "kind": "syntax",
+        "body": "## Summary\nBroken.\n",
+        "verdict": "fail",
+    }))
+    text = await _list_text("coach")
+    assert "stage_role=complete:p5:fail" in text, (
+        f"(d) expected stage_role=complete:p5:fail; got:\n{text}"
+    )
+
+
 async def test_update_task_cancel_stamps_last_stage_change_at(
     fresh_db: str,
 ) -> None:

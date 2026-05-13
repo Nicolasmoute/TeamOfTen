@@ -2181,9 +2181,16 @@ so permissions do not depend on the model truthfully passing its identity.
 - Each row for an active kanban stage (plan/execute/audit_syntax/
   audit_semantics/ship) includes a `stage_role=<role>:<state>` field:
   - `executor:p3` — live assignment with named owner
-  - `executor:done` — role row is completed (awaiting Coach advance)
+  - `executor:done` — non-audit role row completed (awaiting Coach advance)
+  - `complete:p5:pass` — audit stage completed with pass verdict
+  - `complete:p5:fail` — audit stage completed with fail verdict
   - `executor:-` — no active or completed assignment (unassigned)
   - Field is omitted for archive and other non-standard stages.
+  - For audit stages (`audit_syntax`, `audit_semantics`) with a completed
+    role row, the output uses `complete:<owner>:<verdict>` shape instead of
+    `<label>:done` so Coach can see pass/fail inline without querying the
+    audit report. When a completed audit row has no verdict (edge case),
+    falls back to `<label>:done`.
 
 `coord_create_task(title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?)`
 
