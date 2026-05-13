@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,10 @@ if not logger.handlers:
 
 
 SLOT_IDS: list[str] = ["coach"] + [f"p{i}" for i in range(1, 11)]
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 _ENV_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -95,20 +100,6 @@ def _mask_userinfo(text: str, *expanded_urls: str) -> str:
         if userinfo and userinfo not in ("***",):
             out = out.replace(userinfo, "***")
     return out
-
-
-def _strip_userinfo(url: str) -> str:
-    """Return the URL with any `user[:pass]@` userinfo segment removed.
-    Used to detect "same repo, different auth" — i.e. adding/rotating a
-    PAT on an already-cloned remote, which should rewrite the stored
-    origin URL instead of demanding an on-disk wipe."""
-    if not url:
-        return ""
-    return re.sub(
-        r"^([a-zA-Z][a-zA-Z0-9+.-]*://)[^@/\s]+@",
-        r"\1",
-        url,
-    )
 
 
 async def _read_project_repo_url(project_id: str) -> str:
@@ -262,6 +253,7 @@ async def ensure_workspaces(project_id: str) -> dict[str, Any]:
         }
 
     from server.main import _mask_repo_url
+    from server.events import bus
     status: dict[str, Any] = {
         "configured": True,
         "project_id": project_id,
@@ -270,11 +262,32 @@ async def ensure_workspaces(project_id: str) -> dict[str, Any]:
     }
 
     try:
-        await _ensure_base_clone(pp.bare_clone, repo_url)
+        remote_refreshed = await _ensure_base_clone(pp.bare_clone, repo_url)
     except Exception as e:
         logger.exception("base clone failed for project %s", project_id)
         status["error"] = f"clone failed: {e}"
         return status
+
+    # Per-slot remote summary. The bare clone is shared by all slots,
+    # so a single set-url propagates to every slot simultaneously.
+    if remote_refreshed:
+        status["remotes_updated"] = list(SLOT_IDS)
+        status["remotes_unchanged"] = []
+        masked = _mask_repo_url(repo_url)
+        asyncio.ensure_future(
+            bus.publish(
+                {
+                    "ts": _now_iso(),
+                    "agent_id": "system",
+                    "type": "worktree_remote_updated",
+                    "project_id": project_id,
+                    "new_url_masked": masked,
+                }
+            )
+        )
+    else:
+        status["remotes_updated"] = []
+        status["remotes_unchanged"] = list(SLOT_IDS)
 
     slot_results: dict[str, Any] = {}
     for slot in SLOT_IDS:
@@ -330,59 +343,70 @@ def _lock_for(bare: Path) -> asyncio.Lock:
     return lock
 
 
-async def _ensure_base_clone(bare: Path, repo_url_raw: str) -> None:
+async def _ensure_base_clone(bare: Path, repo_url_raw: str) -> bool:
     """Idempotent clone of the project repo into its bare-clone path.
 
-    When the bare clone already exists, verifies its `origin` remote
-    matches the configured URL — when they differ, raises so the
-    caller (`_provision_after_change`) emits an honest `ok=False`
-    event rather than silently ignoring the new URL while reporting
-    success. Operators changing remotes need to wipe
-    `<bare>` on disk and let the next provision re-clone.
+    When the bare clone already exists and the configured URL has
+    changed (e.g. PAT rotation, mirror migration), automatically
+    refreshes the remote with `git remote set-url origin <new_url>`
+    followed by a `git fetch --prune origin` to pull the latest
+    remote refs. All per-slot worktrees share the bare clone's remote
+    config, so a single set-url here propagates to every slot.
+    The fetch is non-fatal — a transient network failure here doesn't
+    block provisioning; the next agent push will surface the error.
+
+    Returns True if a remote URL refresh was performed (set-url ran),
+    False if the clone already had the correct URL or was freshly
+    cloned (in which case the URL is correct by definition).
     """
     expected = _expand_placeholders(repo_url_raw)
     async with _lock_for(bare):
         if bare.exists() and (bare / ".git").exists():
             current = await _read_remote_url(bare)
             if current and current != expected:
-                # Two flavors of mismatch:
-                #   1. Same repo (scheme+host+path match), different
-                #      userinfo → rotating or adding a PAT. Rewrite
-                #      origin in place; per-slot worktrees share .git
-                #      with the bare clone so they pick up the new URL
-                #      automatically. No disk wipe needed.
-                #   2. Different repo → real config change. Still
-                #      raise so the operator wipes <bare> deliberately,
-                #      otherwise we'd silently push agent work to a
-                #      different remote.
-                if _strip_userinfo(current) == _strip_userinfo(expected):
-                    logger.info(
-                        "base repo remote at %s: rewriting origin "
-                        "(userinfo change)", bare,
-                    )
-                    code, _, err = await _run(
-                        ["git", "-C", str(bare),
-                         "remote", "set-url", "origin", expected],
-                        timeout=10,
-                    )
-                    if code != 0:
-                        raise RuntimeError(
-                            f"git remote set-url exited {code}: "
-                            f"{_mask_userinfo(err.strip(), expected)}"
-                        )
-                    return
-                # Mask both URLs in the error so a PAT can't leak
-                # into logs / events. We compare the raw expanded
-                # values internally but report the masked forms.
-                raise RuntimeError(
-                    f"bare clone at {bare} has remote "
-                    f"{_mask_userinfo(current, current)} but config "
-                    f"says {_mask_userinfo(expected, expected)}. "
-                    f"Wipe {bare} on disk to let the next provision "
-                    f"re-clone with the new URL."
+                # URL changed — refresh in-place rather than requiring
+                # a manual disk wipe. Common trigger: PAT rotation or
+                # adding/removing a token in the ${VAR} placeholder.
+                logger.info(
+                    "workspaces: remote URL changed for %s — "
+                    "running git remote set-url + fetch",
+                    bare,
                 )
-            logger.info("base repo already present at %s", bare)
-            return
+                code, _, err = await _run(
+                    ["git", "-C", str(bare), "remote", "set-url", "origin", expected],
+                    timeout=10,
+                )
+                if code != 0:
+                    raise RuntimeError(
+                        f"git remote set-url failed (code {code}): "
+                        f"{_mask_userinfo(err.strip(), expected)}"
+                    )
+                # Fetch so remote branch refs (work/<slot>) are up to
+                # date with the new URL. Non-fatal: a network flap
+                # here mustn't block the whole provisioning run — the
+                # URL is now correct and the next agent push will
+                # expose any remaining connectivity issue.
+                fetch_code, _, fetch_err = await _run(
+                    ["git", "-C", str(bare), "fetch", "--prune", "origin"],
+                    timeout=120,
+                )
+                if fetch_code != 0:
+                    logger.warning(
+                        "workspaces: fetch after URL update failed for "
+                        "%s (code %d): %s",
+                        bare,
+                        fetch_code,
+                        _mask_userinfo(fetch_err.strip(), expected),
+                    )
+                else:
+                    logger.info(
+                        "workspaces: remote URL refreshed + fetch ok for %s",
+                        bare,
+                    )
+                return True  # URL was refreshed
+            else:
+                logger.info("base repo already present at %s", bare)
+            return False  # already correct URL
         bare.parent.mkdir(parents=True, exist_ok=True)
         # Log the unexpanded form so PATs don't hit the logs.
         logger.info("cloning %s → %s", repo_url_raw, bare)
@@ -397,6 +421,7 @@ async def _ensure_base_clone(bare: Path, repo_url_raw: str) -> None:
                 f"{_mask_userinfo(msg, expected)}"
             )
         logger.info("clone ok: %s", bare)
+        return False  # fresh clone — URL correct by definition
 
 
 async def _read_remote_url(bare: Path) -> str:

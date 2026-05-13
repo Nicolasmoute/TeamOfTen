@@ -16,35 +16,12 @@ pin the corrected behavior:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 from server.db import configured_conn, init_db, set_active_project
-from server.workspaces import _strip_userinfo
-
-
-def test_strip_userinfo_handles_pat_and_unauthenticated_urls() -> None:
-    """`_strip_userinfo` underpins the "same repo, different auth"
-    branch in `_ensure_base_clone`. Adding/rotating a PAT must rewrite
-    `origin` rather than demand a disk wipe — `_strip_userinfo` is
-    what lets us tell those cases apart from a real repo change."""
-    bare = "https://github.com/Nicolasmoute/TeamOfTen.git"
-    with_pat = "https://github_pat_xxxYYY@github.com/Nicolasmoute/TeamOfTen.git"
-    with_user_pw = "https://user:secret@github.com/Nicolasmoute/TeamOfTen.git"
-    different_repo = "https://github.com/Nicolasmoute/OtherRepo.git"
-
-    assert _strip_userinfo(bare) == bare
-    assert _strip_userinfo(with_pat) == bare
-    assert _strip_userinfo(with_user_pw) == bare
-    # Same-repo-different-auth detection: the two stripped forms match.
-    assert _strip_userinfo(bare) == _strip_userinfo(with_pat)
-    # Different repos must NOT collapse to the same stripped form.
-    assert _strip_userinfo(bare) != _strip_userinfo(different_repo)
-    # ssh / git protocol URLs have no userinfo segment — passthrough.
-    ssh = "git@github.com:Nicolasmoute/TeamOfTen.git"
-    assert _strip_userinfo(ssh) == ssh
-    assert _strip_userinfo("") == ""
 
 
 def _drain_provisioned_events(q) -> list[dict]:
@@ -242,6 +219,14 @@ async def test_create_project_endpoint_auto_fires_provisioning(
     """
     import server.paths as paths_mod
     monkeypatch.setattr(paths_mod, "DATA_ROOT", tmp_path)
+    # Guard against container environments where these env vars are set to '' —
+    # server/agents.py has module-level float() / int() calls that fail on ''.
+    for _var, _default in [
+        ("HARNESS_AGENT_DAILY_CAP", "5.0"),
+        ("HARNESS_TEAM_DAILY_CAP", "20.0"),
+    ]:
+        if not os.environ.get(_var):
+            monkeypatch.setenv(_var, _default)
 
     await init_db()
 
@@ -330,3 +315,394 @@ async def test_provision_after_change_swallows_exceptions_and_publishes_failure(
     assert ev["ok"] is False
     assert "simulated network failure" in ev["error"]
     assert ev["source"] == "project_updated"
+
+
+# ------------------------------------------------------------------
+# _ensure_base_clone: URL-refresh behaviour
+# ------------------------------------------------------------------
+
+
+class _FakeGitDir:
+    """Minimal stand-in for an already-cloned bare directory.
+
+    Creates `<root>/.git/` so the existence check in
+    `_ensure_base_clone` passes, and pre-seeds
+    `_clone_locks` / `_read_remote_url` so no real subprocess runs.
+    """
+
+    def __init__(self, root: Path, current_url: str) -> None:
+        self.root = root
+        self.current_url = current_url
+        root.mkdir(parents=True, exist_ok=True)
+        (root / ".git").mkdir(exist_ok=True)
+
+
+async def test_url_mismatch_runs_set_url_and_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the bare clone exists but the configured URL has changed,
+    _ensure_base_clone must call `git remote set-url` + `git fetch`
+    instead of raising."""
+    import server.workspaces as ws_mod
+
+    bare = tmp_path / ".project"
+    _FakeGitDir(bare, "https://old-url/repo.git")
+
+    calls: list[list[str]] = []
+
+    async def _fake_run(cmd, cwd=None, timeout=120):
+        calls.append(cmd)
+        if "remote" in cmd and "get-url" in cmd:
+            return 0, "https://old-url/repo.git", ""
+        # set-url and fetch both succeed
+        return 0, "", ""
+
+    monkeypatch.setattr(ws_mod, "_run", _fake_run)
+
+    await ws_mod._ensure_base_clone(bare, "https://new-url/repo.git")
+
+    cmds = [" ".join(c) for c in calls]
+    assert any("remote" in c and "set-url" in c for c in cmds), (
+        f"expected a set-url call; got: {cmds}"
+    )
+    assert any("fetch" in c for c in cmds), (
+        f"expected a fetch call after set-url; got: {cmds}"
+    )
+
+
+async def test_url_mismatch_set_url_failure_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-zero exit from `git remote set-url` must propagate as
+    RuntimeError so the caller emits an honest ok=False event."""
+    import server.workspaces as ws_mod
+
+    bare = tmp_path / ".project"
+    _FakeGitDir(bare, "https://old-url/repo.git")
+
+    async def _fake_run(cmd, cwd=None, timeout=120):
+        if "remote" in cmd and "get-url" in cmd:
+            return 0, "https://old-url/repo.git", ""
+        if "set-url" in cmd:
+            return 1, "", "authentication failed"
+        return 0, "", ""
+
+    monkeypatch.setattr(ws_mod, "_run", _fake_run)
+
+    with pytest.raises(RuntimeError, match="git remote set-url failed"):
+        await ws_mod._ensure_base_clone(bare, "https://new-url/repo.git")
+
+
+async def test_url_mismatch_fetch_failure_does_not_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing `git fetch` after a successful set-url must NOT raise
+    (non-fatal — the URL is now correct; push will surface the error)."""
+    import server.workspaces as ws_mod
+
+    bare = tmp_path / ".project"
+    _FakeGitDir(bare, "https://old-url/repo.git")
+
+    async def _fake_run(cmd, cwd=None, timeout=120):
+        if "remote" in cmd and "get-url" in cmd:
+            return 0, "https://old-url/repo.git", ""
+        if "set-url" in cmd:
+            return 0, "", ""
+        if "fetch" in cmd:
+            return 1, "", "network timeout"
+        return 0, "", ""
+
+    monkeypatch.setattr(ws_mod, "_run", _fake_run)
+
+    # Must complete without raising.
+    await ws_mod._ensure_base_clone(bare, "https://new-url/repo.git")
+
+
+async def test_url_unchanged_skips_set_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the existing remote matches the configured URL, no set-url
+    or fetch should be issued — the clone is already correct."""
+    import server.workspaces as ws_mod
+
+    bare = tmp_path / ".project"
+    _FakeGitDir(bare, "https://same-url/repo.git")
+
+    calls: list[list[str]] = []
+
+    async def _fake_run(cmd, cwd=None, timeout=120):
+        calls.append(cmd)
+        if "remote" in cmd and "get-url" in cmd:
+            return 0, "https://same-url/repo.git", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(ws_mod, "_run", _fake_run)
+
+    await ws_mod._ensure_base_clone(bare, "https://same-url/repo.git")
+
+    cmds = [" ".join(c) for c in calls]
+    assert not any("set-url" in c for c in cmds), (
+        f"set-url should not run when URL unchanged; got: {cmds}"
+    )
+
+
+async def test_ensure_base_clone_placeholder_resolves_in_set_url_args(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When repo_url contains a `${VAR}` placeholder (e.g.
+    `https://${GITHUB_TOKEN}@github.com/owner/repo.git`), the
+    placeholder must be resolved before being compared to / written
+    into the git remote — the raw `${GITHUB_TOKEN}` string must never
+    reach `git remote set-url`.
+
+    This is a fast unit-level check (mocked _run) that the right argv
+    is assembled.  The companion test below (same name without the
+    _args suffix) does the same assertion end-to-end against real git.
+    """
+    import server.workspaces as ws_mod
+
+    token = "ghp_TestTokenABCDEFGHIJKLMNOP"
+    resolved_url = f"https://{token}@github.com/owner/repo.git"
+    placeholder_url = "https://${GITHUB_TOKEN}@github.com/owner/repo.git"
+
+    # Simulate the bare clone existing with a *different* URL so that
+    # set-url will be triggered after placeholder expansion.
+    bare = tmp_path / ".project"
+    _FakeGitDir(bare, "https://old-token@github.com/owner/repo.git")
+
+    # Provide the token via os.environ so _expand_placeholders resolves it.
+    monkeypatch.setenv("GITHUB_TOKEN", token)
+
+    calls: list[list[str]] = []
+
+    async def _fake_run(cmd, cwd=None, timeout=120):
+        calls.append(cmd)
+        if "remote" in cmd and "get-url" in cmd:
+            return 0, "https://old-token@github.com/owner/repo.git", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(ws_mod, "_run", _fake_run)
+
+    await ws_mod._ensure_base_clone(bare, placeholder_url)
+
+    # The set-url call must have used the resolved URL, not the placeholder.
+    set_url_calls = [c for c in calls if "set-url" in c]
+    assert set_url_calls, "expected a git remote set-url call"
+    set_url_cmd = set_url_calls[0]
+    assert resolved_url in set_url_cmd, (
+        f"set-url should receive the resolved URL '{resolved_url}'; "
+        f"got command: {set_url_cmd}"
+    )
+    assert "${GITHUB_TOKEN}" not in " ".join(set_url_cmd), (
+        f"placeholder must not reach git; got: {set_url_cmd}"
+    )
+
+
+# ------------------------------------------------------------------
+# End-to-end: real git, real .git/config on disk
+# ------------------------------------------------------------------
+
+
+async def test_provision_resolves_var_placeholder_in_remote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end test (real git subprocess, no mocked _run) that
+    `_ensure_base_clone` expands `${VAR}` placeholders via
+    `_expand_placeholders` before passing the URL to
+    `git remote set-url`, and that the RESOLVED URL is what actually
+    lands in `.git/config` on disk.
+
+    Regression: if `_expand_placeholders` is skipped or bypassed, the
+    raw placeholder string would be stored in .git/config, making
+    subsequent git operations fail with "Invalid URL" or similar.
+    """
+    import subprocess
+    import server.workspaces as ws_mod
+
+    # ---------- build two real upstream repos with one commit each --------
+    def _make_upstream(name: str) -> Path:
+        d = tmp_path / name
+        d.mkdir()
+        subprocess.run(["git", "init"], cwd=d, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=d, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=d, check=True, capture_output=True,
+        )
+        (d / "README.md").write_text("hi", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=d, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=d, check=True, capture_output=True,
+        )
+        return d
+
+    upstream_old = _make_upstream("upstream_old")
+    upstream_new = _make_upstream("upstream_new")
+    old_url = upstream_old.as_uri()   # file:///tmp/.../upstream_old
+    new_url = upstream_new.as_uri()   # file:///tmp/.../upstream_new
+
+    # ---------- initial clone against the old upstream --------------------
+    bare = tmp_path / "bare_clone"
+    result1 = await ws_mod._ensure_base_clone(bare, old_url)
+    assert bare.exists() and (bare / ".git").exists(), (
+        "initial clone must create the directory and .git"
+    )
+    assert result1 is False, "fresh clone must return False (no URL refresh yet)"
+
+    config_after_clone = (bare / ".git" / "config").read_text(encoding="utf-8")
+    assert old_url in config_after_clone, (
+        f"old URL expected in .git/config after clone; got:\n{config_after_clone}"
+    )
+
+    # ---------- URL refresh via ${VAR} placeholder ------------------------
+    # Store the new upstream URL in an env var; the placeholder
+    # `${NEW_REPO_URL}` expands to it via _expand_placeholders.
+    monkeypatch.setenv("NEW_REPO_URL", new_url)
+
+    result2 = await ws_mod._ensure_base_clone(bare, "${NEW_REPO_URL}")
+    assert result2 is True, (
+        "_ensure_base_clone must return True when the remote URL was refreshed"
+    )
+
+    # The resolved URL must be in .git/config; the placeholder must not.
+    config_after_refresh = (bare / ".git" / "config").read_text(encoding="utf-8")
+    assert new_url in config_after_refresh, (
+        f"resolved URL '{new_url}' must appear in .git/config after refresh; "
+        f"got:\n{config_after_refresh}"
+    )
+    assert "${NEW_REPO_URL}" not in config_after_refresh, (
+        f"raw placeholder must not appear in .git/config; "
+        f"got:\n{config_after_refresh}"
+    )
+    assert old_url not in config_after_refresh, (
+        f"old URL must be replaced by the new one; got:\n{config_after_refresh}"
+    )
+
+
+# ------------------------------------------------------------------
+# Production-path secret-store test (Coach-required, p1)
+# ------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("fresh_db")
+async def test_provision_resolves_secret_placeholder_via_ensure_workspaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production-path: ensure_workspaces expands ${VAR} via the
+    encrypted secrets store (not os.environ).  Exercises the full
+    call chain:
+
+        project.repo_url = "${TEST_TOKEN}" in DB
+        secrets.set_secret("TEST_TOKEN", file://…new_url…)
+        ensure_workspaces(project_id)
+          → _expand_placeholders → lookup_sync (reads secrets table)
+          → git remote set-url <resolved>
+        .git/config must contain resolved URL, not the placeholder.
+
+    Regression: if _expand_placeholders consulted only os.environ,
+    a secrets-store rotation (UI-managed PAT, never in env) would
+    silently leave the raw placeholder in .git/config, breaking all
+    subsequent git operations for the project.
+    """
+    import subprocess
+    import server.paths as paths_mod
+    import server.secrets as secrets_mod
+    import server.workspaces as ws_mod
+    from server.workspaces import ensure_workspaces, SLOT_IDS
+    from server.paths import project_paths
+
+    monkeypatch.setattr(paths_mod, "DATA_ROOT", tmp_path)
+    # Guard against container environments where HARNESS_AGENT_DAILY_CAP and
+    # HARNESS_TEAM_DAILY_CAP are set to '' — agents.py module-level float()
+    # calls fail on empty string, blocking the server.main import chain.
+    for _var, _default in [
+        ("HARNESS_AGENT_DAILY_CAP", "5.0"),
+        ("HARNESS_TEAM_DAILY_CAP", "20.0"),
+    ]:
+        if not os.environ.get(_var):
+            monkeypatch.setenv(_var, _default)
+
+    # ---- set up Fernet key so set_secret / lookup_sync work -----------
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("HARNESS_SECRETS_KEY", key)
+    # Force the module to re-read the new key.
+    monkeypatch.setattr(secrets_mod, "_fernet", None)
+    monkeypatch.setattr(secrets_mod, "_cache", {})
+    monkeypatch.setattr(secrets_mod, "_loaded_version", -1)
+
+    # ---- helper: build a real upstream git repo -----------------------
+    def _make_upstream(name: str) -> Path:
+        d = tmp_path / name
+        d.mkdir()
+        subprocess.run(["git", "init"], cwd=d, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=d, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=d, check=True, capture_output=True,
+        )
+        (d / "README.md").write_text("hi", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=d, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=d, check=True, capture_output=True,
+        )
+        return d
+
+    upstream_old = _make_upstream("upstream_old")
+    upstream_new = _make_upstream("upstream_new")
+    old_url = upstream_old.as_uri()
+    new_url = upstream_new.as_uri()
+
+    # ---- project + initial provision ----------------------------------
+    await init_db()
+    await _create_project_no_repo("secrettest")
+    await _set_project_repo("secrettest", old_url)
+
+    result1 = await ensure_workspaces("secrettest")
+    assert result1["configured"] is True
+    bare = project_paths("secrettest").bare_clone
+    assert (bare / ".git").exists(), "initial clone must succeed"
+
+    # ---- store new URL in secrets; set repo_url to placeholder -------
+    ok = await secrets_mod.set_secret("TEST_TOKEN", new_url)
+    assert ok, "set_secret must succeed when HARNESS_SECRETS_KEY is set"
+    # Invalidate the sync-lookup cache so the next _expand_placeholders
+    # call re-reads from the DB rather than the now-stale in-memory dict.
+    secrets_mod._cache_version = getattr(secrets_mod, "_cache_version", 0) + 1
+
+    await _set_project_repo("secrettest", "${TEST_TOKEN}")
+
+    # ---- re-provision via production entry point ----------------------
+    result2 = await ensure_workspaces("secrettest")
+    assert result2["configured"] is True, f"ensure_workspaces returned: {result2}"
+    assert result2.get("remotes_updated") == list(SLOT_IDS), (
+        f"all slots should be in remotes_updated; got: {result2}"
+    )
+
+    # .git/config must carry the resolved URL, not the placeholder
+    config = (bare / ".git" / "config").read_text(encoding="utf-8")
+    assert new_url in config, (
+        f"resolved URL must be in .git/config; got:\n{config}"
+    )
+    assert "${TEST_TOKEN}" not in config, (
+        f"placeholder must not survive in .git/config; got:\n{config}"
+    )
+    assert old_url not in config, (
+        f"old URL must have been replaced; got:\n{config}"
+    )
+
+    # ---- idempotency: second run is a no-op ---------------------------
+    result3 = await ensure_workspaces("secrettest")
+    assert result3["configured"] is True
+    assert result3.get("remotes_updated") == [], (
+        f"no URL change expected on second run; got: {result3}"
+    )

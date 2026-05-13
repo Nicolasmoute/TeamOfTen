@@ -237,6 +237,8 @@ async def _provision_after_change(
             "ok": ok,
             "error": clone_error,
             "slot_failures": slot_failures or None,
+            "remotes_updated": result.get("remotes_updated") or [],
+            "remotes_unchanged": result.get("remotes_unchanged") or [],
             "source": source,
             "actor": actor,
         }
@@ -1015,6 +1017,8 @@ def build_router(*, require_token, audit_actor):
                 # not just the slot id with the detail buried in the
                 # HTTP response body.
                 "slot_failures": slot_failures or None,
+                "remotes_updated": result.get("remotes_updated") or [],
+                "remotes_unchanged": result.get("remotes_unchanged") or [],
                 "source": "manual",
                 "actor": actor,
             }

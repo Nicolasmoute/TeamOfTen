@@ -808,7 +808,28 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             params.append(normalized)
         if owner is not None and owner != "":
             if owner.lower() in ("null", "none", "unassigned"):
-                where_parts.append("owner IS NULL")
+                # Mirror the UI's "unassigned" classifier (kanban v2): a task
+                # is unassigned when the current stage's role has no active
+                # task_role_assignments row (completed_at IS NULL AND
+                # superseded_by IS NULL AND owner IS NOT NULL).  The legacy
+                # tasks.owner column alone is unreliable after v2 role-state
+                # migration — tasks can have tasks.owner set from an earlier
+                # stage while the current stage has no active assignment.
+                where_parts.append(
+                    "NOT EXISTS ("
+                    "SELECT 1 FROM task_role_assignments tra "
+                    "WHERE tra.task_id = tasks.id "
+                    "AND tra.role = CASE tasks.status "
+                    "  WHEN 'plan'             THEN 'planner' "
+                    "  WHEN 'execute'          THEN 'executor' "
+                    "  WHEN 'audit_syntax'     THEN 'auditor_syntax' "
+                    "  WHEN 'audit_semantics'  THEN 'auditor_semantics' "
+                    "  WHEN 'ship'             THEN 'shipper' "
+                    "  ELSE NULL END "
+                    "AND tra.completed_at IS NULL "
+                    "AND tra.superseded_by IS NULL "
+                    "AND tra.owner IS NOT NULL)"
+                )
             else:
                 where_parts.append("owner = ?")
                 params.append(owner)
@@ -817,13 +838,48 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         params.insert(0, project_id)
         clause = " WHERE " + " AND ".join(where_parts)
 
+        # SQL fragment that maps a task's current stage to its kanban v2 role.
+        _STAGE_TO_ROLE_SQL = (
+            "CASE t.status "
+            "  WHEN 'plan'            THEN 'planner' "
+            "  WHEN 'execute'         THEN 'executor' "
+            "  WHEN 'audit_syntax'    THEN 'auditor_syntax' "
+            "  WHEN 'audit_semantics' THEN 'auditor_semantics' "
+            "  WHEN 'ship'            THEN 'shipper' "
+            "  ELSE NULL END"
+        )
         c = await configured_conn()
         try:
             cur = await c.execute(
-                f"SELECT id, title, status, owner, created_by, parent_id, "
-                f"priority, trajectory, blocked, blocked_reason, created_at "
-                f"FROM tasks{clause} "
-                f"ORDER BY created_at DESC LIMIT 100",
+                f"SELECT t.id, t.title, t.status, t.owner, t.created_by, "
+                f"t.parent_id, t.priority, t.trajectory, t.blocked, "
+                f"t.blocked_reason, t.created_at, "
+                # active_owner: owner of the live (non-completed) role row
+                f"(SELECT tra.owner FROM task_role_assignments tra "
+                f" WHERE tra.task_id = t.id "
+                f" AND tra.role = {_STAGE_TO_ROLE_SQL} "
+                f" AND tra.completed_at IS NULL "
+                f" AND tra.superseded_by IS NULL "
+                f" AND tra.owner IS NOT NULL "
+                f" LIMIT 1) AS active_owner, "
+                # role_done_owner: owner of the completed role row (awaiting
+                # Coach advance), NULL if not yet done
+                f"(SELECT tra.owner FROM task_role_assignments tra "
+                f" WHERE tra.task_id = t.id "
+                f" AND tra.role = {_STAGE_TO_ROLE_SQL} "
+                f" AND tra.completed_at IS NOT NULL "
+                f" AND tra.superseded_by IS NULL "
+                f" LIMIT 1) AS role_done_owner, "
+                # role_done_verdict: verdict of the completed role row (pass/fail),
+                # NULL for non-audit stages or when not yet done
+                f"(SELECT tra.verdict FROM task_role_assignments tra "
+                f" WHERE tra.task_id = t.id "
+                f" AND tra.role = {_STAGE_TO_ROLE_SQL} "
+                f" AND tra.completed_at IS NOT NULL "
+                f" AND tra.superseded_by IS NULL "
+                f" LIMIT 1) AS role_done_verdict "
+                f"FROM tasks t{clause} "
+                f"ORDER BY t.created_at DESC LIMIT 100",
                 params,
             )
             rows = await cur.fetchall()
@@ -832,6 +888,16 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
 
         if not rows:
             return _ok("(no tasks match)")
+
+        # Map status → short role label used in stage_role display.
+        _STATUS_TO_ROLE_LABEL = {
+            "plan": "planner",
+            "execute": "executor",
+            "audit_syntax": "auditor",
+            "audit_semantics": "sem-auditor",
+            "ship": "shipper",
+        }
+
         lines = []
         for r in rows:
             d = dict(r)
@@ -844,9 +910,36 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 blocked = (
                     f" BLOCKED({reason})" if reason else " BLOCKED"
                 )
+            # Prefer active role-assignment owner (kanban v2 source of truth)
+            # over tasks.owner; fall back for archive/non-standard stages.
+            display_owner = d.get("active_owner") or d["owner"] or "-"
+            # stage_role field: shows role name + state for the current stage.
+            #   executor:p3             — active executor is p3
+            #   executor:done           — non-audit role completed, awaiting Coach
+            #   complete:p5:pass        — audit stage complete with pass verdict
+            #   complete:p5:fail        — audit stage complete with fail verdict
+            #   executor:-              — no active/completed assignment (unassigned)
+            #   (omitted for archive/null-role stages)
+            _AUDIT_STATUSES = {"audit_syntax", "audit_semantics"}
+            role_label = _STATUS_TO_ROLE_LABEL.get(d["status"])
+            if role_label:
+                if d.get("active_owner"):
+                    stage_role = f" stage_role={role_label}:{d['active_owner']}"
+                elif d.get("role_done_owner") is not None:
+                    if d["status"] in _AUDIT_STATUSES and d.get("role_done_verdict"):
+                        stage_role = (
+                            f" stage_role=complete:{d['role_done_owner']}:"
+                            f"{d['role_done_verdict']}"
+                        )
+                    else:
+                        stage_role = f" stage_role={role_label}:done"
+                else:
+                    stage_role = f" stage_role={role_label}:-"
+            else:
+                stage_role = ""
             lines.append(
-                f"{d['id']}  [{d['status']}]{traj}{blocked}  "
-                f"owner={d['owner'] or '-'}  pri={d['priority']}  "
+                f"{d['id']}  [{d['status']}]{traj}{blocked}{stage_role}  "
+                f"owner={display_owner}  pri={d['priority']}  "
                 f"{d['title']}{parent}"
             )
         return _ok("\n".join(lines))
@@ -1414,8 +1507,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             )
         return _ok(
             f"{head} The kanban auto-wakes the new-stage assignee "
-            f"if one is configured. Do NOT follow up with "
-            f"coord_send_message; the wake covers it."
+            f"if one is configured."
+            + (" Do NOT follow up with coord_send_message; the wake covers it." if note else
+               " No note was passed — use coord_send_message if the assignee needs context.")
         )
 
 
@@ -5165,9 +5259,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 msg = (
                     f"Called {task_id} {role} pool: "
                     f"{', '.join(targets)}. All are auto-woken; "
-                    f"first to call coord_accept_role wins. Do NOT "
-                    f"follow up with coord_send_message; the wake "
-                    f"covers it."
+                    f"first to call coord_accept_role wins. Wake body "
+                    f"carries task context; add coord_send_message "
+                    f"only if extra background is needed."
                 )
             else:
                 msg = (
@@ -5181,8 +5275,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             msg = (
                 f"Assigned {task_id} {role} → {targets[0]}. The "
                 f"kanban auto-wakes {targets[0]} with the task "
-                f"context + completion-tool hint. Do NOT follow up "
-                f"with coord_send_message; the wake covers it."
+                f"context + completion-tool hint. Wake body contains "
+                f"task context; add coord_send_message if extra "
+                f"background is needed."
             )
         else:
             msg = (
@@ -6134,8 +6229,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             f"inserted rows for added stages. Displaced Players "
             f"(if any) get a stand-down wake; new candidates get "
             f"role-call wakes if their stage is currently active. "
-            f"Do NOT follow up with coord_send_message; the wakes "
-            f"cover it."
+            f"Wakes carry task context; use coord_send_message only "
+            f"if the Players need additional background beyond the "
+            f"task description."
         )
 
     @tool(
@@ -6685,9 +6781,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             return _ok(
                 f"Planted {assignee} as {target_role} on {task_id} "
                 f"(stage {next_stage!r}, first plant after pool/empty "
-                f"create){suffix_note}. Role row planted, wake fired. "
-                f"Do NOT follow up with coord_send_message; the wake "
-                f"covers it."
+                f"create){suffix_note}. Role row planted, wake fired."
+                + (" Do NOT follow up with coord_send_message; the wake covers it." if note else
+                   " No note passed — use coord_send_message if the assignee needs context.")
             )
         # Ship-stage echo: when Coach is approving audit→ship, surface
         # the task's stored definition of done so Coach evaluates the
@@ -6702,10 +6798,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         return _ok(
             f"Approved {task_id}: {old_status} → {next_stage} "
             f"({target_role} → {assignee}){suffix_note}. "
-            f"Planted {assignee}'s role row, woke them with your "
-            f"note as the brief. Do NOT follow up with "
-            f"coord_send_message; the wake covers it."
-            f"{criteria_echo}"
+            + (
+                f"Planted {assignee}'s role row, woke them with your "
+                f"note as the brief. Do NOT follow up with "
+                f"coord_send_message; the wake covers it."
+                if note else
+                f"Planted {assignee}'s role row; woke them with a "
+                f"generic brief — use note= to pass context directly."
+            )
+            + f"{criteria_echo}"
         )
 
     @tool(
