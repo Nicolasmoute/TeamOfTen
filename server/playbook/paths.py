@@ -2,7 +2,10 @@
 
 Two locations matter:
   - **Local** at `${HARNESS_DATA_ROOT}/playbook/` — source of truth.
-  - **Remote** at `TOT/playbook/` on kDrive — durability mirror.
+  - **Remote** at `playbook/` relative to the WebDAV base URL (which
+    already points at whatever folder the operator chose on their
+    cloud drive), so the effective on-disk path is
+    `<webdav-base>/playbook/` — durability mirror.
 
 Layout (per spec §2):
 
@@ -70,23 +73,26 @@ def ensure_playbook_dir() -> PlaybookPaths:
 
 
 def remote_root() -> str:
-    """kDrive path for the Playbook tree.
+    """Cloud-drive path for the Playbook tree.
 
-    Matches the harness convention: kDrive root is `TOT/`, then
-    subsystem subfolder. Posix-style relative string (no leading
-    slash) — `webdav.write_text` treats paths as relative to the
-    configured WebDAV base URL.
+    Returns a posix-style path relative to the configured WebDAV base
+    URL, which already points at whatever folder the operator chose
+    on their cloud drive — so this returns just `"playbook"`, never
+    with a leading wrapper segment. Mirrors the convention used by
+    project_sync / compass / decisions / knowledge / outputs.
     """
-    return str(PurePosixPath("TOT") / "playbook")
+    return "playbook"
 
 
 def remote_path(*segments: str) -> str:
     """Join a relative path under the Playbook remote root.
 
     Use for state files: `remote_path("lattice.json")` →
-    `"TOT/playbook/lattice.json"`. Segments are normalized (backslashes
-    → forward slashes, leading slashes stripped) so callers can pass
-    raw filenames.
+    `"playbook/lattice.json"`. The effective on-disk path on the cloud
+    drive is `<webdav-base>/playbook/lattice.json` (everything above
+    `playbook/` comes from the WebDAV base URL, not from this string).
+    Segments are normalized (backslashes → forward slashes, leading
+    slashes stripped) so callers can pass raw filenames.
     """
     parts = [remote_root()]
     for seg in segments:

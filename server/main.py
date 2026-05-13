@@ -339,10 +339,11 @@ async def lifespan(app: FastAPI):
     # own one-off task that opened/closed a connection per event.
     from server.events import start_event_writer
     await start_event_writer()
-    # Background tasks: kDrive snapshot + project / global file sync
+    # Background tasks: cloud-drive snapshot + project / global file sync
     # (PROJECTS_SPEC.md §5). The legacy flush_loop / uploads_pull_loop /
     # outputs_push_loop are retired — per-project sync covers the same
-    # surface under the spec's TOT/projects/<slug>/ layout.
+    # surface under the spec's `projects/<slug>/` layout (relative to
+    # the WebDAV base URL).
     snapshot_task = asyncio.create_task(snapshot_loop())
     project_sync_task = asyncio.create_task(project_sync_loop())
     global_sync_task = asyncio.create_task(global_sync_loop())
@@ -5390,10 +5391,10 @@ async def get_memory(topic: str) -> dict[str, Any]:
 async def list_decisions() -> dict[str, Any]:
     """List local decision records (recent first, capped at 50).
 
-    Decisions live primarily on kDrive at
-    `TOT/projects/<active>/decisions/<file>.md` with a local fallback
-    under `/data/projects/<active>/decisions/`. This endpoint reads
-    the local store for the active project only.
+    Decisions live primarily on the configured cloud drive at
+    `<webdav-base>/projects/<active>/decisions/<file>.md` with a
+    local fallback under `/data/projects/<active>/decisions/`. This
+    endpoint reads the local store for the active project only.
     """
     project_id = await resolve_active_project()
     local_dir = project_paths(project_id).decisions

@@ -105,8 +105,10 @@ def audit_report_relative_path(
 
 
 def kdrive_spec_path(project_id: str, task_id: str) -> str:
-    """The path used for the kDrive mirror. Same shape as decisions /
-    knowledge — `projects/<id>/...` under the kDrive root."""
+    """The path used for the cloud-drive mirror. Same shape as decisions
+    / knowledge — `projects/<id>/...` relative to the WebDAV base URL.
+    (Function name kept for back-compat; the mirror works against any
+    WebDAV-compatible drive, not kDrive specifically.)"""
     return f"projects/{project_id}/tasks/{task_id}/spec.md"
 
 

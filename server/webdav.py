@@ -429,8 +429,8 @@ class WebDAVClient:
                 continue
             for entry in entries:
                 # webdav4 yields dicts with at least `name` (full path
-                # on the server, e.g. `/TOT/projects/misc/foo.md`) and
-                # `type` ('file' | 'directory'). Some servers return
+                # on the server, e.g. `/<your-folder>/projects/misc/foo.md`)
+                # and `type` ('file' | 'directory'). Some servers return
                 # the path with the host stripped already; either way
                 # the basename is the leaf.
                 if not isinstance(entry, dict):

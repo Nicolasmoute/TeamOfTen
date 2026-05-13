@@ -1,17 +1,19 @@
-"""Compass storage layer — JSON + JSONL files with synchronous kDrive mirror.
+"""Compass storage layer — JSON + JSONL files with synchronous cloud-drive mirror.
 
 Design choices:
 
 - **JSON, not SQLite.** Per spec §6 the lattice / truth / regions /
   questions / proposals are JSON files; runs and audits are JSONL.
-  This is deliberately readable-by-the-human on disk and on kDrive.
+  This is deliberately readable-by-the-human on disk and on the cloud
+  drive.
   The harness's hot path stays SQLite (events, turns); Compass state
   is a separate, smaller, slower-changing tier.
 - **Atomic writes.** Every JSON file write goes via tempfile +
   `os.replace` so a crash mid-write can't corrupt the canonical file.
   Mirrors the pattern in `paths.py:update_wiki_index`.
-- **Synchronous kDrive mirror.** Each write fans out to
-  `webdav.write_text()` immediately (best-effort, log-and-continue).
+- **Synchronous cloud-drive mirror.** Each write fans out to
+  `webdav.write_text()` immediately (best-effort, log-and-continue)
+  against whatever WebDAV-compatible drive the operator configured.
   No batching — the mirror is for human-readability and disaster
   recovery, not throughput. Compass writes are infrequent (a daily
   run produces O(10) writes total).
@@ -28,7 +30,7 @@ Public surface:
   - `bootstrap_state(project_id)` — first-run initialization. Idempotent.
   - `load_state(project_id) -> LatticeState` — read all state into one
     dataclass tree. Missing files become empty defaults.
-  - `save_lattice(project_id, statements)` — atomic write + kDrive.
+  - `save_lattice(project_id, statements)` — atomic write + cloud-drive mirror.
   - **Truth has no `save_*` here** — Compass reads truth from the
     project's `truth/` folder via `compass.truth.read_truth_facts`.
     Humans edit truth files via the Files pane; Coach proposes via
@@ -49,7 +51,7 @@ Public surface:
     last-rendered block, distinct from the actual CLAUDE.md injection.
   - `next_statement_id(state)`, `next_question_id(state)`,
     `next_audit_id()`, `next_run_id()` — id allocators.
-  - `wipe_project(project_id)` — reset; deletes local + kDrive copies.
+  - `wipe_project(project_id)` — reset; deletes local + cloud-drive copies.
 """
 
 from __future__ import annotations
@@ -340,15 +342,19 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 
 def _kdrive_mirror_text(remote_rel: str, content: str) -> None:
-    """Best-effort kDrive mirror. Runs synchronously inside the caller's
-    asyncio loop via the webdav client's sync helpers. Errors are
-    logged but never raised — the local file is the source of truth.
+    """Best-effort cloud-drive mirror. Runs synchronously inside the
+    caller's asyncio loop via the webdav client's sync helpers. Errors
+    are logged but never raised — the local file is the source of
+    truth.
 
     NOTE: this MUST be called from within an async function and
     awaited as needed; here it's a sync wrapper that schedules the
     upload via the existing async webdav client. Compass callers are
     async, so we expose the awaitable form `await
     _kdrive_mirror_text_async()` directly.
+
+    Function name kept for back-compat; the mirror works against any
+    WebDAV-compatible drive (kDrive, Nextcloud, ownCloud, etc.).
     """
     raise NotImplementedError(
         "use _kdrive_mirror_text_async (sync wrapper kept for symmetry)"
@@ -361,18 +367,18 @@ async def _kdrive_mirror_text_async(remote_rel: str, content: str) -> bool:
     try:
         return await webdav.write_text(remote_rel, content)
     except Exception:
-        logger.exception("compass kDrive mirror failed: %s", remote_rel)
+        logger.exception("compass cloud-drive mirror failed: %s", remote_rel)
         return False
 
 
 async def _kdrive_remove_async(remote_rel: str) -> bool:
-    """Best-effort kDrive delete. Used by `wipe_project`."""
+    """Best-effort cloud-drive delete. Used by `wipe_project`."""
     if not webdav.enabled:
         return False
     try:
         return await webdav.remove(remote_rel)
     except Exception:
-        logger.exception("compass kDrive remove failed: %s", remote_rel)
+        logger.exception("compass cloud-drive remove failed: %s", remote_rel)
         return False
 
 
@@ -734,7 +740,7 @@ async def save_proposals(
 
 
 async def append_audit(project_id: str, record: AuditRecord) -> None:
-    """Append one audit to audits.jsonl + mirror full file to kDrive.
+    """Append one audit to audits.jsonl + mirror full file to the cloud drive.
 
     JSONL append is fine locally (no rewrite). For the kDrive mirror
     we re-read the whole file and re-upload — append-only WebDAV is
@@ -1026,9 +1032,9 @@ def next_reconciliation_id(state: LatticeState) -> str:
 
 async def wipe_project(project_id: str) -> None:
     """Destructive: delete the project's local Compass tree AND the
-    kDrive mirror. Used by `POST /api/compass/reset`. Cannot be undone.
+    cloud-drive mirror. Used by `POST /api/compass/reset`. Cannot be undone.
 
-    The local rmtree is best-effort; missing dir is fine. The kDrive
+    The local rmtree is best-effort; missing dir is fine. The cloud-drive
     side iterates known files and removes them; the directory itself
     stays (some WebDAV servers don't support DELETE on collections).
     """

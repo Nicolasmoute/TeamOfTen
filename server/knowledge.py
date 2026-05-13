@@ -7,10 +7,10 @@ formality: reports, research notes, specs, design docs, references,
 anything an agent decides is worth keeping.
 
 **Project-scoped.** Per PROJECTS_SPEC.md §4, knowledge lives at
-`/data/projects/<active_project>/knowledge/` and mirrors to kDrive at
-`TOT/projects/<active_project>/knowledge/`. The active project is
-resolved at write/read time, so a project switch routes new entries
-to the new project automatically.
+`/data/projects/<active_project>/knowledge/` and mirrors to the
+configured cloud drive at `<webdav-base>/projects/<active_project>/knowledge/`.
+The active project is resolved at write/read time, so a project switch
+routes new entries to the new project automatically.
 
 Write is fan-in: both Coach and Players can call coord_write_knowledge.
 Read/list is anybody. The file explorer pane shows the tree under the

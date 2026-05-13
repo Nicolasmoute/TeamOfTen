@@ -1,8 +1,10 @@
-"""Per-project + global file sync to kDrive (PROJECTS_SPEC.md §5).
+"""Per-project + global file sync to the cloud drive (PROJECTS_SPEC.md §5).
 
 The Phase 1 destructive migration relocated every project-scoped file
 under `/data/projects/<slug>/`; this module is the Phase 2 push/pull
-loop that mirrors those trees to `TOT/projects/<slug>/` on kDrive.
+loop that mirrors those trees to `<webdav-base>/projects/<slug>/` on
+whatever WebDAV-compatible cloud drive the operator configured
+(kDrive, Nextcloud, ownCloud, etc.).
 
 Two loops, two cadences:
 - **Per-project file loop** runs on the *active* project every 5 min
@@ -282,11 +284,15 @@ async def _with_kdrive_retry(
 
 
 def _project_remote_for(project_id: str, tree: str, rel_path: str) -> str:
-    """Map (tree, rel_path) onto the kDrive layout (§4).
+    """Map (tree, rel_path) onto the cloud-drive layout (§4).
 
-    Project tree → `TOT/projects/<slug>/<rel>`.
-    Wiki tree    → `TOT/wiki/<slug>/<rel>`.
-    Global tree  → `TOT/<rel>` (rel includes the top-level dir, e.g.
+    Returned strings are relative to the configured WebDAV base URL
+    (which already points at whatever folder the operator chose on
+    their cloud drive — kDrive, Nextcloud, ownCloud, etc.):
+
+    Project tree → `projects/<slug>/<rel>`.
+    Wiki tree    → `wiki/<slug>/<rel>`.
+    Global tree  → `<rel>` (rel includes the top-level dir, e.g.
                   `skills/llm-wiki/SKILL.md` or `CLAUDE.md`).
     """
     if tree == _TREE_PROJECT:
@@ -623,9 +629,9 @@ async def _pull_one_file(
 
 
 async def pull_project_tree(project_id: str) -> dict[str, dict[str, int]]:
-    """Pull `TOT/projects/<slug>/` and `TOT/wiki/<slug>/` into the
-    local trees. Used by Phase 3 project-switch (pull on open) so the
-    next active-project query sees post-pull state.
+    """Pull `<webdav-base>/projects/<slug>/` and `<webdav-base>/wiki/<slug>/`
+    into the local trees. Used by Phase 3 project-switch (pull on open)
+    so the next active-project query sees post-pull state.
 
     The walk uses webdav.list_dir which is non-recursive — for v1 we
     pull only the top-level files of each tree plus one level of
