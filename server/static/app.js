@@ -5084,10 +5084,14 @@ function TeamTelegramSection() {
   </section>`;
 }
 
-// Codex auth (PR 5+). Two sources: ChatGPT session (file at
-// $CODEX_HOME/auth.json — set inside container by `codex login`) and
-// OPENAI_API_KEY fallback (encrypted in `secrets`, settable here).
+// Codex auth. Two sources: ChatGPT session (device-code OAuth flow,
+// $CODEX_HOME/auth.json) and OPENAI_API_KEY fallback (encrypted in
+// `secrets`). The in-app login mirrors ClaudeAuthSection but uses the
+// device-code flow — no submit step back to the harness; user enters the
+// code at OpenAI's site and we poll until auth.json lands.
+// Phases: "idle" | "awaiting" | "detected"
 function TeamCodexSection() {
+  // ---- existing API-key state ----
   const [data, setData] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [keyDraft, setKeyDraft] = useState("");
@@ -5095,6 +5099,23 @@ function TeamCodexSection() {
   const [clearing, setClearing] = useState(false);
   const [testing, setTesting] = useState(false);
   const [msg, setMsg] = useState(null);
+
+  // ---- device-code login phase machine ----
+  const [phase, setPhase] = useState("idle"); // idle | awaiting | detected
+  const [sessionId, setSessionId] = useState("");
+  const [loginUrl, setLoginUrl] = useState("");
+  const [deviceCode, setDeviceCode] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [copiedUrl, setCopiedUrl] = useState(false);
+
+  // ---- sign-out ----
+  const [confirmSignOut, setConfirmSignOut] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
+
+  // ---- paste fallback ----
+  const [pasteBlob, setPasteBlob] = useState("");
+  const [pasteStatus, setPasteStatus] = useState(null);
+  const [pasteSaving, setPasteSaving] = useState(false);
 
   const reload = useCallback(async () => {
     try {
@@ -5108,6 +5129,152 @@ function TeamCodexSection() {
   }, []);
   useEffect(() => { reload(); }, [reload]);
 
+  // Poll /api/team/codex every 3s while awaiting device-code completion.
+  useEffect(() => {
+    if (phase !== "awaiting") return;
+    const iv = setInterval(async () => {
+      try {
+        const res = await authFetch("/api/team/codex");
+        if (!res.ok) return;
+        const d = await res.json();
+        setData(d);
+        if (d.chatgpt_session_present) {
+          setPhase("detected");
+          setSessionId("");
+          setTimeout(() => setPhase("idle"), 2000);
+        }
+      } catch (_) {}
+    }, 3000);
+    return () => clearInterval(iv);
+  }, [phase]);
+
+  // Cleanup: cancel any in-flight session on unmount.
+  const sessionIdRef = useRef(sessionId);
+  sessionIdRef.current = sessionId;
+  useEffect(() => () => {
+    const sid = sessionIdRef.current;
+    if (!sid) return;
+    try {
+      authFetch("/api/auth/codex/login/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sid }),
+        keepalive: true,
+      }).catch(() => {});
+    } catch (_) {}
+  }, []);
+
+  // ---- in-app login callbacks ----
+  const onStart = useCallback(async () => {
+    setLoginError("");
+    setPhase("awaiting");
+    try {
+      const res = await authFetch("/api/auth/codex/login/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setLoginError(d.detail || `HTTP ${res.status}`);
+        setPhase("idle");
+        return;
+      }
+      setSessionId(d.session_id || "");
+      setLoginUrl(d.url || "");
+      setDeviceCode(d.device_code || "");
+    } catch (e) {
+      setLoginError(String(e));
+      setPhase("idle");
+    }
+  }, []);
+
+  const onCancel = useCallback(async () => {
+    const sid = sessionId;
+    setSessionId("");
+    setLoginUrl("");
+    setDeviceCode("");
+    setLoginError("");
+    setPhase("idle");
+    if (!sid) return;
+    try {
+      await authFetch("/api/auth/codex/login/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sid }),
+      });
+    } catch (_) {}
+  }, [sessionId]);
+
+  const onCopyUrl = useCallback(async () => {
+    if (!loginUrl) return;
+    try {
+      await navigator.clipboard.writeText(loginUrl);
+      setCopiedUrl(true);
+      setTimeout(() => setCopiedUrl(false), 2000);
+    } catch (_) {}
+  }, [loginUrl]);
+
+  const onOpenUrl = useCallback(() => {
+    if (!loginUrl) return;
+    window.open(loginUrl, "_blank", "noopener,noreferrer");
+  }, [loginUrl]);
+
+  const onSignOut = useCallback(async () => {
+    if (!confirmSignOut) {
+      setConfirmSignOut(true);
+      setTimeout(() => setConfirmSignOut(false), 4000);
+      return;
+    }
+    setSigningOut(true);
+    setLoginError("");
+    try {
+      const res = await authFetch("/api/auth/codex", { method: "DELETE" });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setLoginError(d.detail || `HTTP ${res.status}`);
+        setSigningOut(false);
+        return;
+      }
+      setConfirmSignOut(false);
+      await reload();
+    } catch (e) {
+      setLoginError(String(e));
+    } finally {
+      setSigningOut(false);
+    }
+  }, [confirmSignOut, reload]);
+
+  // ---- paste-fallback callback ----
+  const onSavePaste = useCallback(async () => {
+    if (!pasteBlob.trim()) {
+      setPasteStatus({ type: "err", msg: "Paste the auth.json content first." });
+      return;
+    }
+    setPasteSaving(true);
+    setPasteStatus(null);
+    try {
+      const res = await authFetch("/api/auth/codex", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ auth_json: pasteBlob }),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setPasteStatus({ type: "err", msg: d.detail || `HTTP ${res.status}` });
+        return;
+      }
+      setPasteStatus({ type: "ok", msg: "Saved. Agents will use this on next turn." });
+      setPasteBlob("");
+      await reload();
+    } catch (e) {
+      setPasteStatus({ type: "err", msg: String(e) });
+    } finally {
+      setPasteSaving(false);
+    }
+  }, [pasteBlob, reload]);
+
+  // ---- API-key callbacks (unchanged) ----
   const save = useCallback(async () => {
     if (!keyDraft.trim()) {
       setMsg({ kind: "err", text: "paste an API key first" });
@@ -5184,23 +5351,25 @@ function TeamCodexSection() {
 
   const keyOk = data && data.secrets_status && data.secrets_status.ok;
   const keyReason = data && data.secrets_status && data.secrets_status.reason;
+  const sessionPresent = loaded && data && data.chatgpt_session_present;
 
+  // Render
   return html`<section class="drawer-section">
     <h3>Codex auth</h3>
     <p class="muted" style="margin: 0 0 6px 0; font-size: 12px;">
-      OpenAI Codex runtime. Two auth paths: a ChatGPT session set inside
-      the container via <code>codex login</code> (preferred — uses your
-      Plus/Pro plan), or an OPENAI_API_KEY fallback saved here
-      (token-priced). Keys are encrypted with
-      <code>HARNESS_SECRETS_KEY</code>.
+      OpenAI Codex runtime. Two auth paths: sign in with ChatGPT (preferred —
+      uses your Plus/Pro plan, no API cost), or an
+      <code>OPENAI_API_KEY</code> fallback (token-priced) below.
     </p>
+
     ${loaded && data && !keyOk
       ? html`<div style="font-size: 11px; color: var(--err); border: 1px solid var(--err); background: rgba(248,81,73,0.08); padding: 4px 8px; border-radius: 3px; margin-bottom: 6px;">
           secrets store unavailable: ${keyReason || "unknown"}
         </div>`
       : null}
+
     ${loaded && data
-      ? html`<div style="font-size: 11px; color: var(--muted); margin-bottom: 6px;">
+      ? html`<div style="font-size: 11px; color: var(--muted); margin-bottom: 8px;">
           <div>
             runtime gate:
             ${data.enabled
@@ -5209,9 +5378,9 @@ function TeamCodexSection() {
           </div>
           <div>
             ChatGPT session:
-            ${data.chatgpt_session_present
+            ${sessionPresent
               ? html`<span style="color: var(--ok);">● present (${data.config_dir || "$CODEX_HOME"})</span>`
-              : html`<span style="color: var(--muted);">○ none — run <code>codex login</code> in the container, or use API key below</span>`}
+              : html`<span style="color: var(--muted);">○ none</span>`}
           </div>
           <div>
             API key fallback:
@@ -5222,6 +5391,77 @@ function TeamCodexSection() {
           </div>
         </div>`
       : null}
+
+    ${/* --- sign-in / phase machine --- */null}
+    ${phase === "idle" ? html`
+      <div class="drawer-row" style="gap: 6px; flex-wrap: wrap; align-items: center;">
+        ${!sessionPresent
+          ? html`<button onClick=${onStart} style="background: var(--accent-dim, #1a4a2e); color: var(--ok); border-color: var(--ok);">
+              Sign in with ChatGPT
+            </button>`
+          : html`<button
+              onClick=${onSignOut}
+              style=${confirmSignOut
+                ? "background: rgba(248,81,73,0.15); color: var(--err); border-color: var(--err);"
+                : ""}
+              disabled=${signingOut}
+            >
+              ${signingOut ? "signing out…" : confirmSignOut ? "confirm sign out?" : "Sign out / use different account"}
+            </button>`}
+      </div>
+    ` : null}
+
+    ${phase === "awaiting" ? html`
+      <div style="border: 1px solid var(--border); border-radius: 4px; padding: 10px; margin-bottom: 6px; background: var(--bg-alt, rgba(255,255,255,0.03));">
+        <p style="font-size: 12px; margin: 0 0 8px; color: var(--fg);">
+          Open the link below, then type the device code at the page.
+          You do <strong>not</strong> need to paste anything back here —
+          the harness detects completion automatically.
+        </p>
+        <div style="margin-bottom: 6px;">
+          <label style="font-size: 11px; color: var(--muted); display: block; margin-bottom: 3px;">Auth URL</label>
+          <input
+            type="text"
+            readonly
+            value=${loginUrl}
+            style="width: 100%; box-sizing: border-box; font-size: 11px; background: var(--bg2, #0d1117); border: 1px solid var(--border); border-radius: 3px; padding: 4px 6px; color: var(--fg);"
+          />
+          <div style="display: flex; gap: 6px; margin-top: 4px;">
+            <button onClick=${onCopyUrl} style="font-size: 11px;">
+              ${copiedUrl ? "copied!" : "copy URL"}
+            </button>
+            <button onClick=${onOpenUrl} style="font-size: 11px;">open in browser</button>
+          </div>
+        </div>
+        <div style="margin-bottom: 8px;">
+          <label style="font-size: 11px; color: var(--muted); display: block; margin-bottom: 3px;">Device code — type this at the page</label>
+          <div style="font-family: monospace; font-size: 20px; font-weight: bold; letter-spacing: 0.2em; border: 2px solid var(--accent, #58a6ff); border-radius: 4px; padding: 8px 12px; display: inline-block; color: var(--fg); background: var(--bg2, #0d1117);">
+            ${deviceCode || "—"}
+          </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span style="font-size: 11px; color: var(--muted);">
+            Waiting for you to complete the flow…
+          </span>
+          <button onClick=${onCancel} style="font-size: 11px; color: var(--err); border-color: var(--err);">cancel</button>
+        </div>
+      </div>
+    ` : null}
+
+    ${phase === "detected" ? html`
+      <div style="font-size: 12px; color: var(--ok); border: 1px solid var(--ok); background: rgba(63,185,80,0.08); padding: 6px 10px; border-radius: 4px; margin-bottom: 6px;">
+        Signed in! ChatGPT session detected. Returning to dashboard…
+      </div>
+    ` : null}
+
+    ${loginError
+      ? html`<div style="font-size: 11px; color: var(--err); border: 1px solid var(--err); background: rgba(248,81,73,0.08); padding: 4px 8px; border-radius: 3px; margin-bottom: 6px; white-space: pre-wrap;">
+          ${loginError}
+        </div>`
+      : null}
+
+    ${/* --- API key fallback section --- */null}
+    <hr style="border: none; border-top: 1px solid var(--border); margin: 10px 0;" />
     <div class="drawer-row">
       <label class="drawer-label">API key</label>
       <input
@@ -5250,6 +5490,36 @@ function TeamCodexSection() {
           ${msg.text}
         </div>`
       : null}
+
+    ${/* --- paste fallback --- */null}
+    <details style="margin-top: 10px;">
+      <summary style="font-size: 11px; color: var(--muted); cursor: pointer;">
+        Stuck? Paste an auth.json from another machine instead
+      </summary>
+      <div style="margin-top: 8px;">
+        <p style="font-size: 11px; color: var(--muted); margin: 0 0 4px;">
+          Run <code>codex login</code> on another machine, copy
+          <code>$CODEX_HOME/auth.json</code>, and paste it below.
+        </p>
+        <textarea
+          rows="4"
+          placeholder='{"token": "...", ...}'
+          value=${pasteBlob}
+          onInput=${(e) => setPasteBlob(e.target.value)}
+          style="width: 100%; box-sizing: border-box; font-size: 11px; font-family: monospace; resize: vertical; background: var(--bg2, #0d1117); border: 1px solid var(--border); border-radius: 3px; padding: 4px 6px; color: var(--fg);"
+        />
+        <div style="margin-top: 4px;">
+          <button onClick=${onSavePaste} disabled=${pasteSaving || !pasteBlob.trim()}>
+            ${pasteSaving ? "saving…" : "save"}
+          </button>
+        </div>
+        ${pasteStatus
+          ? html`<div style="font-size: 11px; color: ${pasteStatus.type === "ok" ? "var(--ok)" : "var(--err)"}; margin-top: 4px;">
+              ${pasteStatus.msg}
+            </div>`
+          : null}
+      </div>
+    </details>
   </section>`;
 }
 

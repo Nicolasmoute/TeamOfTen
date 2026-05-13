@@ -2905,6 +2905,50 @@ A reaper background task (60s tick, 600s TTL) drops orphaned sessions
 whose subprocess has exited or whose `started_at` exceeds the TTL —
 wired into `lifespan` next to the audit watcher and telegram bridge.
 
+### 14.2.2 In-app Codex OAuth login (device-code flow)
+
+Mirrors §14.2.1 for the Codex runtime. Because the Codex CLI uses the
+OAuth 2.0 **Device Authorization Grant** (not PKCE), the flow is
+simpler: the server spawns `codex login --device-auth` as a plain
+subprocess (no pty required — stdout is plain ASCII), extracts the
+verification URL and device code from stdout, and the user enters the
+device code at OpenAI's website in their browser. The harness polls
+`$CODEX_HOME/auth.json` every 2s via a background monitor task;
+completion is detected by the file's mtime advancing past what was
+recorded at session start. There is **no submit step** — the user
+never pastes anything back into the harness.
+
+Key divergences from the Claude flow (§14.2.1):
+
+| Dimension | Claude (§14.2.1) | Codex (this section) |
+| --- | --- | --- |
+| Subprocess I/O | pty (`pyte` for URL extraction) | plain stdout/stderr pipe |
+| Auth artifact | `$CLAUDE_CONFIG_DIR/.credentials.json` | `$CODEX_HOME/auth.json` |
+| Completion signal | success line in stdout OR `.credentials.json` mtime | `auth.json` mtime advance |
+| User action | paste OAuth code back to harness | enter device code at browser URL |
+| Submit endpoint | `POST /api/auth/claude/login/submit` | none |
+| UI device code | n/a | large monospace display + copy button |
+| POSIX guard | yes | yes |
+
+| Endpoint | Notes |
+| --- | --- |
+| `POST /api/auth/codex/login/start` | Spawns `codex login --device-auth`, reads stdout for the verification URL and device code (timeout 15s). Drops any prior in-flight session. Returns `{session_id, url, device_code}` or 502/400. Requires `CODEX_HOME` env var set. Emits `codex_login_started` (actor only). |
+| `POST /api/auth/codex/login/cancel` | Body `{session_id}`. SIGTERM → SIGKILL, cancels monitor task. No-op for unknown ids. Emits `codex_login_cancelled`. |
+| `DELETE /api/auth/codex` | Unlinks `$CODEX_HOME/auth.json`, cancels all sessions. `deleted=false` when file was already absent (not an error). Emits `codex_auth_cleared`. |
+| `POST /api/auth/codex` | Paste fallback: body `{auth_json: string}` or `{auth: object}`. Validates JSON, writes atomically to `$CODEX_HOME/auth.json`. Emits `codex_auth_pasted`. |
+
+A reaper (60s tick, 960s TTL) drops orphaned sessions. Wired into
+`lifespan` next to the Claude login reaper. Module: `server/codex_login.py`.
+
+UI: `TeamCodexSection` in `server/static/app.js` — three-phase state
+machine (`idle` → `awaiting` → `detected`). In `awaiting` phase,
+the URL (with copy/open buttons) and device code (large monospace, bordered)
+are shown. A `setInterval` (3s) polls `/api/team/codex` for
+`chatgpt_session_present`; on detection, transitions to `detected` for 2s
+then returns to `idle`. A `<details>` paste-fallback block (`POST /api/auth/codex`)
+remains available below a separator for operators who already have an
+`auth.json` from another machine.
+
 ### 14.3 Agents
 
 | Endpoint | Notes |
