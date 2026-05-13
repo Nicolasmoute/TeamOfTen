@@ -319,29 +319,61 @@ def _lock_for(bare: Path) -> asyncio.Lock:
 async def _ensure_base_clone(bare: Path, repo_url_raw: str) -> None:
     """Idempotent clone of the project repo into its bare-clone path.
 
-    When the bare clone already exists, verifies its `origin` remote
-    matches the configured URL — when they differ, raises so the
-    caller (`_provision_after_change`) emits an honest `ok=False`
-    event rather than silently ignoring the new URL while reporting
-    success. Operators changing remotes need to wipe
-    `<bare>` on disk and let the next provision re-clone.
+    When the bare clone already exists and the configured URL has
+    changed (e.g. PAT rotation, mirror migration), automatically
+    refreshes the remote with `git remote set-url origin <new_url>`
+    followed by a `git fetch --prune origin` to pull the latest
+    remote refs. All per-slot worktrees share the bare clone's remote
+    config, so a single set-url here propagates to every slot.
+    The fetch is non-fatal — a transient network failure here doesn't
+    block provisioning; the next agent push will surface the error.
     """
     expected = _expand_placeholders(repo_url_raw)
     async with _lock_for(bare):
         if bare.exists() and (bare / ".git").exists():
             current = await _read_remote_url(bare)
             if current and current != expected:
-                # Mask both URLs in the error so a PAT can't leak
-                # into logs / events. We compare the raw expanded
-                # values internally but report the masked forms.
-                raise RuntimeError(
-                    f"bare clone at {bare} has remote "
-                    f"{_mask_userinfo(current, current)} but config "
-                    f"says {_mask_userinfo(expected, expected)}. "
-                    f"Wipe {bare} on disk to let the next provision "
-                    f"re-clone with the new URL."
+                # URL changed — refresh in-place rather than requiring
+                # a manual disk wipe. Common trigger: PAT rotation or
+                # adding/removing a token in the ${VAR} placeholder.
+                logger.info(
+                    "workspaces: remote URL changed for %s — "
+                    "running git remote set-url + fetch",
+                    bare,
                 )
-            logger.info("base repo already present at %s", bare)
+                code, _, err = await _run(
+                    ["git", "-C", str(bare), "remote", "set-url", "origin", expected],
+                    timeout=10,
+                )
+                if code != 0:
+                    raise RuntimeError(
+                        f"git remote set-url failed (code {code}): "
+                        f"{_mask_userinfo(err.strip(), expected)}"
+                    )
+                # Fetch so remote branch refs (work/<slot>) are up to
+                # date with the new URL.  Non-fatal: a network flap
+                # here mustn't block the whole provisioning run — the
+                # URL is now correct and the next agent push will
+                # expose any remaining connectivity issue.
+                fetch_code, _, fetch_err = await _run(
+                    ["git", "-C", str(bare), "fetch", "--prune", "origin"],
+                    timeout=120,
+                )
+                if fetch_code != 0:
+                    logger.warning(
+                        "workspaces: fetch after URL update failed for "
+                        "%s (code %d): %s",
+                        bare,
+                        fetch_code,
+                        _mask_userinfo(fetch_err.strip(), expected),
+                    )
+                else:
+                    logger.info(
+                        "workspaces: remote URL refreshed + fetch ok for %s",
+                        bare,
+                    )
+            else:
+                logger.info("base repo already present at %s", bare)
             return
         bare.parent.mkdir(parents=True, exist_ok=True)
         # Log the unexpanded form so PATs don't hit the logs.

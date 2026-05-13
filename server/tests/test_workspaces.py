@@ -306,3 +306,132 @@ async def test_provision_after_change_swallows_exceptions_and_publishes_failure(
     assert ev["ok"] is False
     assert "simulated network failure" in ev["error"]
     assert ev["source"] == "project_updated"
+
+
+# ------------------------------------------------------------------
+# _ensure_base_clone: URL-refresh behaviour
+# ------------------------------------------------------------------
+
+
+class _FakeGitDir:
+    """Minimal stand-in for an already-cloned bare directory.
+
+    Creates `<root>/.git/` so the existence check in
+    `_ensure_base_clone` passes, and pre-seeds
+    `_clone_locks` / `_read_remote_url` so no real subprocess runs.
+    """
+
+    def __init__(self, root: Path, current_url: str) -> None:
+        self.root = root
+        self.current_url = current_url
+        root.mkdir(parents=True, exist_ok=True)
+        (root / ".git").mkdir(exist_ok=True)
+
+
+async def test_url_mismatch_runs_set_url_and_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the bare clone exists but the configured URL has changed,
+    _ensure_base_clone must call `git remote set-url` + `git fetch`
+    instead of raising."""
+    import server.workspaces as ws_mod
+
+    bare = tmp_path / ".project"
+    _FakeGitDir(bare, "https://old-url/repo.git")
+
+    calls: list[list[str]] = []
+
+    async def _fake_run(cmd, cwd=None, timeout=120):
+        calls.append(cmd)
+        if "remote" in cmd and "get-url" in cmd:
+            return 0, "https://old-url/repo.git", ""
+        # set-url and fetch both succeed
+        return 0, "", ""
+
+    monkeypatch.setattr(ws_mod, "_run", _fake_run)
+
+    await ws_mod._ensure_base_clone(bare, "https://new-url/repo.git")
+
+    cmds = [" ".join(c) for c in calls]
+    assert any("remote" in c and "set-url" in c for c in cmds), (
+        f"expected a set-url call; got: {cmds}"
+    )
+    assert any("fetch" in c for c in cmds), (
+        f"expected a fetch call after set-url; got: {cmds}"
+    )
+
+
+async def test_url_mismatch_set_url_failure_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-zero exit from `git remote set-url` must propagate as
+    RuntimeError so the caller emits an honest ok=False event."""
+    import server.workspaces as ws_mod
+
+    bare = tmp_path / ".project"
+    _FakeGitDir(bare, "https://old-url/repo.git")
+
+    async def _fake_run(cmd, cwd=None, timeout=120):
+        if "remote" in cmd and "get-url" in cmd:
+            return 0, "https://old-url/repo.git", ""
+        if "set-url" in cmd:
+            return 1, "", "authentication failed"
+        return 0, "", ""
+
+    monkeypatch.setattr(ws_mod, "_run", _fake_run)
+
+    with pytest.raises(RuntimeError, match="git remote set-url failed"):
+        await ws_mod._ensure_base_clone(bare, "https://new-url/repo.git")
+
+
+async def test_url_mismatch_fetch_failure_does_not_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing `git fetch` after a successful set-url must NOT raise
+    (non-fatal — the URL is now correct; push will surface the error)."""
+    import server.workspaces as ws_mod
+
+    bare = tmp_path / ".project"
+    _FakeGitDir(bare, "https://old-url/repo.git")
+
+    async def _fake_run(cmd, cwd=None, timeout=120):
+        if "remote" in cmd and "get-url" in cmd:
+            return 0, "https://old-url/repo.git", ""
+        if "set-url" in cmd:
+            return 0, "", ""
+        if "fetch" in cmd:
+            return 1, "", "network timeout"
+        return 0, "", ""
+
+    monkeypatch.setattr(ws_mod, "_run", _fake_run)
+
+    # Must complete without raising.
+    await ws_mod._ensure_base_clone(bare, "https://new-url/repo.git")
+
+
+async def test_url_unchanged_skips_set_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the existing remote matches the configured URL, no set-url
+    or fetch should be issued — the clone is already correct."""
+    import server.workspaces as ws_mod
+
+    bare = tmp_path / ".project"
+    _FakeGitDir(bare, "https://same-url/repo.git")
+
+    calls: list[list[str]] = []
+
+    async def _fake_run(cmd, cwd=None, timeout=120):
+        calls.append(cmd)
+        if "remote" in cmd and "get-url" in cmd:
+            return 0, "https://same-url/repo.git", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(ws_mod, "_run", _fake_run)
+
+    await ws_mod._ensure_base_clone(bare, "https://same-url/repo.git")
+
+    cmds = [" ".join(c) for c in calls]
+    assert not any("set-url" in c for c in cmds), (
+        f"set-url should not run when URL unchanged; got: {cmds}"
+    )

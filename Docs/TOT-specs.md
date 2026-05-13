@@ -4047,6 +4047,16 @@ a separate concern that `coord_commit_push` checks.
   exists → reuse; remote `origin/work/<slot>` exists → track new
   local from it; neither → fresh from upstream default branch
   (`main`).
+- **Remote URL refresh**: when the bare clone already exists but the
+  configured `repo_url` has changed (e.g. PAT rotation, mirror
+  migration), provision runs `git remote set-url origin <new_url>`
+  followed by `git fetch --prune origin` in place of the old raise-
+  and-require-wipe behaviour. All per-slot worktrees share the bare
+  clone's remote config, so one set-url propagates to every slot.
+  The fetch is non-fatal — a transient network failure here doesn't
+  block provisioning; the next agent push surfaces any remaining
+  connectivity issue. A non-zero exit from set-url itself still
+  raises so the caller emits an honest `ok=False` event.
 
 Provisioning fires at:
 
