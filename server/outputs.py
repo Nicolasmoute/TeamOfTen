@@ -6,7 +6,8 @@ Distinct from `knowledge` (text-only: .md / .txt, 100KB cap) and
 docx, pdf, png charts, zip bundles, anything the human asked for.
 
 Source of truth: local `/data/outputs/` (HARNESS_OUTPUTS_DIR).
-Mirror: kDrive `outputs/<path>`, synchronous on write.
+Mirror: cloud-drive `outputs/<path>` (`<webdav-base>/outputs/<path>`),
+synchronous on write.
 
 Write via coord_save_output (base64-encoded content, since MCP tool
 arguments are JSON strings). Read from the files pane (UI) or via
@@ -93,8 +94,8 @@ def _remote(relative_path: str) -> str:
 
 
 async def save(relative_path: str, data: bytes, author: str = "agent") -> bool:
-    """Write binary `data` to local + mirror to kDrive. Returns True
-    on local success. Raises ValueError on invalid path or oversize."""
+    """Write binary `data` to local + mirror to the cloud drive. Returns
+    True on local success. Raises ValueError on invalid path or oversize."""
     err = validate(relative_path)
     if err:
         raise ValueError(err)

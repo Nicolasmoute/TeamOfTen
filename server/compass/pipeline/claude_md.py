@@ -11,9 +11,10 @@ A copy of the rendered block is also persisted to
 `compass/claude_md_block.md` for traceability — the human dashboard
 reads this so it can show the exact text Compass would write.
 
-The injection is async because it also mirrors to kDrive — each
-project's CLAUDE.md lives at `/data/projects/<id>/CLAUDE.md` locally
-and `projects/<id>/CLAUDE.md` on kDrive (per `server.paths`).
+The injection is async because it also mirrors to the cloud drive —
+each project's CLAUDE.md lives at `/data/projects/<id>/CLAUDE.md`
+locally and at `<webdav-base>/projects/<id>/CLAUDE.md` on the cloud
+drive (per `server.paths`).
 """
 
 from __future__ import annotations
@@ -76,7 +77,7 @@ async def inject(project_id: str, block_body: str) -> bool:
     via `store.write_claude_md_block`.
 
     Returns True on success. False on local-write failure (logs and
-    moves on — kDrive mirror is best-effort).
+    moves on — cloud-drive mirror is best-effort).
     """
     pp = project_paths(project_id)
     target = pp.claude_md
@@ -133,12 +134,14 @@ async def inject(project_id: str, block_body: str) -> bool:
 
 
 async def _mirror_to_kdrive(project_id: str, content: str) -> None:
-    """Mirror the project CLAUDE.md to kDrive at `projects/<id>/CLAUDE.md`.
+    """Mirror the project CLAUDE.md to the cloud drive at
+    `projects/<id>/CLAUDE.md` (relative to the WebDAV base URL).
 
     Best-effort: failure logs but doesn't propagate. The local
     project_sync loop also covers this path; explicit mirror here
     keeps the post-injection view consistent without waiting for the
-    next sync tick.
+    next sync tick. Function name kept for back-compat — works against
+    any WebDAV-compatible drive, not kDrive specifically.
     """
     if not webdav.enabled:
         return
@@ -146,4 +149,4 @@ async def _mirror_to_kdrive(project_id: str, content: str) -> None:
     try:
         await webdav.write_text(remote, content)
     except Exception:
-        logger.exception("compass.claude_md.inject: kDrive mirror failed: %s", remote)
+        logger.exception("compass.claude_md.inject: cloud-drive mirror failed: %s", remote)

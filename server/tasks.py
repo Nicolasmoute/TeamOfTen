@@ -8,15 +8,15 @@ artifacts under each task's folder:
         audits/
             audit_<round>_<kind>.md                     # Player auditor reports
 
-These are mirrored to kDrive at the same relative path under
-`projects/<project_id>/tasks/...` so the human can browse them on
-their phone.
+These are mirrored to the configured cloud drive at the same relative
+path under `projects/<project_id>/tasks/...` so the human can browse
+them on their phone.
 
 Functions in this module are shared by the MCP-tool path
 (`coord_write_task_spec`, `coord_submit_audit_report`) and the
 HTTP endpoint path (`POST /api/tasks/{id}/spec`). They handle:
   - atomic local write (tempfile + os.replace)
-  - kDrive mirror (best-effort; failure is logged and swallowed)
+  - cloud-drive mirror (best-effort; failure is logged and swallowed)
   - the `tasks.spec_path` / `tasks.spec_written_at` / role-assignment
     `report_path` updates are NOT done here — they're caller
     responsibility (the MCP tool / HTTP handler does the SQL).
@@ -198,7 +198,7 @@ async def write_task_spec(
     created_at: str,
     priority: str,
 ) -> tuple[Path, str, str]:
-    """Write the task's spec.md atomically + mirror to kDrive.
+    """Write the task's spec.md atomically + mirror to the cloud drive.
 
     Returns `(local_path, relative_path, written_at_iso)`. The caller
     is responsible for updating `tasks.spec_path` /
@@ -228,8 +228,8 @@ async def write_task_spec(
     _atomic_write(target, content)
     rel = spec_relative_path(project_id, task_id)
 
-    # Best-effort kDrive mirror. WebDAV failures don't block the spec
-    # write — the local copy is the source of truth.
+    # Best-effort cloud-drive mirror. WebDAV failures don't block the
+    # spec write — the local copy is the source of truth.
     if webdav.enabled:
         asyncio.create_task(
             webdav.write_text(kdrive_spec_path(project_id, task_id), content)
@@ -248,7 +248,7 @@ async def write_audit_report(
     verdict: str,
 ) -> tuple[Path, str, str]:
     """Write a Player auditor's report to
-    `<task_dir>/audits/audit_<round>_<kind>.md` + kDrive mirror.
+    `<task_dir>/audits/audit_<round>_<kind>.md` + cloud-drive mirror.
 
     Returns `(local_path, relative_path, submitted_at_iso)`. Caller
     updates the role-assignment row and the `tasks.latest_audit_*`

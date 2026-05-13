@@ -1130,7 +1130,7 @@ async def test_write_text_accepts_editable_extensions(fresh_db) -> None:
 
 async def test_write_text_rejects_binary_extensions(fresh_db) -> None:
     """Binary formats stay out of the allowlist so a textarea write
-    can't corrupt them. Users drop binary via kDrive instead."""
+    can't corrupt them. Users drop binary via the cloud drive instead."""
     import pytest
 
     from server import files as filesmod

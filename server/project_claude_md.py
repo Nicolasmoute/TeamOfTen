@@ -202,11 +202,11 @@ def _validate_output(text: str) -> tuple[bool, str]:
     return True, ""
 
 
-# ---------------------------------------------------------------- kDrive mirror
+# ---------------------------------------------------------------- cloud-drive mirror
 
 
 async def _mirror_to_kdrive(project_id: str, content: str) -> None:
-    """Best-effort kDrive mirror — failure logs but doesn't propagate;
+    """Best-effort cloud-drive mirror — failure logs but doesn't propagate;
     the project-sync loop also covers this path."""
     if not webdav.enabled:
         return
@@ -214,7 +214,7 @@ async def _mirror_to_kdrive(project_id: str, content: str) -> None:
     try:
         await webdav.write_text(remote, content)
     except Exception:
-        logger.exception("project_claude_md: kDrive mirror failed: %s", remote)
+        logger.exception("project_claude_md: cloud-drive mirror failed: %s", remote)
 
 
 # ---------------------------------------------------------------- prompts

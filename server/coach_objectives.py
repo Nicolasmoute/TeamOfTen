@@ -3,7 +3,7 @@ like (`recurrence-specs.md` §3.3).
 
 Free-form markdown at ``/data/projects/<slug>/project-objectives.md``.
 No mandated sections — the operator describes goals however they like.
-The harness mirrors writes to kDrive but Coach edits the file via the
+The harness mirrors writes to the cloud drive but Coach edits the file via the
 standard Write tool (no MCP wrapper needed; see spec §7.5).
 
 This module provides:

@@ -376,7 +376,7 @@ def build_router(
         actor = audit_actor(request)
         project_id = await resolve_active_project()
         await _set_enabled(project_id, True)
-        # Bootstrap the local + kDrive state files so the dashboard
+        # Bootstrap the local + cloud-drive state files so the dashboard
         # has something to render immediately. The actual bootstrap
         # *run* (question generation + LLM) is separate and triggered
         # via /run.

@@ -74,8 +74,8 @@ def test_audit_relative_path_round_kind_in_filename() -> None:
 
 
 def test_kdrive_paths_omit_working_segment() -> None:
-    """kDrive mirror lives under projects/<id>/tasks/... — flatter than
-    the local layout so mobile browsing isn't bogged down by the
+    """Cloud-drive mirror lives under projects/<id>/tasks/... — flatter
+    than the local layout so mobile browsing isn't bogged down by the
     `working/` prefix."""
     assert kdrive_spec_path("misc", "t-2026-05-03-abc12345") == (
         "projects/misc/tasks/t-2026-05-03-abc12345/spec.md"

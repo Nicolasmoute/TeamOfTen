@@ -742,7 +742,7 @@ async def save_proposals(
 async def append_audit(project_id: str, record: AuditRecord) -> None:
     """Append one audit to audits.jsonl + mirror full file to the cloud drive.
 
-    JSONL append is fine locally (no rewrite). For the kDrive mirror
+    JSONL append is fine locally (no rewrite). For the cloud-drive mirror
     we re-read the whole file and re-upload — append-only WebDAV is
     rare, and audits are bounded (project-lifetime, single-digit
     thousands tops), so the cost is acceptable.
@@ -1042,7 +1042,7 @@ async def wipe_project(project_id: str) -> None:
     if cp.root.exists():
         shutil.rmtree(cp.root, ignore_errors=True)
 
-    # Best-effort kDrive cleanup: walk known files first, then the
+    # Best-effort cloud-drive cleanup: walk known files first, then the
     # whole subtree. We don't depend on remote delete-of-collection
     # support; per-file removes are universal.
     if webdav.enabled:

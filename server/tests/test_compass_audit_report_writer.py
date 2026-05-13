@@ -169,7 +169,7 @@ async def test_write_audit_report_md_writes_file(fresh_db: str) -> None:
     assert local_rel == (
         "projects/misc/working/compass/audit_reports/audit_1700000123456.md"
     )
-    # Remote path follows the kDrive convention (no `working/` segment).
+    # Remote path follows the cloud-drive convention (no `working/` segment).
     assert remote_rel == (
         "projects/misc/compass/audit_reports/audit_1700000123456.md"
     )

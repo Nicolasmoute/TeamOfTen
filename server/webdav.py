@@ -237,8 +237,9 @@ class WebDAVClient:
             logger.exception("WebDAV write_bytes_atomic failed: %s", full_path)
             # Best-effort fallback to a non-atomic write so a single bad
             # MOVE doesn't strand the file. The caller's retry wrapper
-            # still gates the call so a flaky kDrive eventually surfaces
-            # via kdrive_sync_failed.
+            # still gates the call so a flaky cloud drive eventually
+            # surfaces via the kdrive_sync_failed event (name kept for
+            # wire compat).
             try:
                 await asyncio.to_thread(self._write_bytes_sync, full_path, data)
                 return True

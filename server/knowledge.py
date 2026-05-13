@@ -45,7 +45,7 @@ COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 MAX_DEPTH = 4
 
 # Reports and research can legitimately be long; ceiling prevents UI
-# freezes / kDrive pain.
+# freezes / cloud-drive pain.
 MAX_BODY_CHARS = 100_000
 
 # Only text. Binaries (images, pdfs) should use the attachments
@@ -88,7 +88,7 @@ async def _local(relative_path: str) -> Path:
 
 
 async def _remote(relative_path: str) -> str:
-    """kDrive remote path under the active project's knowledge tree."""
+    """Cloud-drive remote path under the active project's knowledge tree."""
     project_id = await resolve_active_project()
     return str(
         PurePosixPath("projects") / project_id / "knowledge"
@@ -97,7 +97,7 @@ async def _remote(relative_path: str) -> str:
 
 
 async def write(relative_path: str, content: str, author: str = "agent") -> bool:
-    """Write to local + mirror to kDrive. Returns True on local success.
+    """Write to local + mirror to the cloud drive. Returns True on local success.
 
     Raises ValueError on invalid path, empty body, or oversize body.
     Routes to the active project's `knowledge/` (PROJECTS_SPEC.md §4).

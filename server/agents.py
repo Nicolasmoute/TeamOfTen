@@ -977,14 +977,14 @@ async def _handle_message(
                 # known here (captured off the ResultMessage above).
                 footer = _build_compact_footer(session_id)
                 summary_with_footer = summary.rstrip() + "\n\n" + footer
-                # Full long-form handoff lives on disk (kDrive-mirrored).
+                # Full long-form handoff lives on disk (cloud-drive-mirrored).
                 # The continuity_note stored in the DB is a short pointer
                 # that gets injected into the next system prompt.
                 handoff_file = await _write_handoff_file(
                     agent_id, summary_with_footer,
                 )
                 # The summary itself is what gets injected into fresh-you's
-                # system prompt. The file is a durable copy (kDrive-
+                # system prompt. The file is a durable copy (cloud-drive-
                 # mirrored) and lets other agents / the human reference
                 # this handoff later via ./handoffs/<file> from any
                 # workspace. No need to re-read it yourself — the text
@@ -1978,7 +1978,7 @@ def _build_compact_footer(session_id: str | None) -> str:
     strings / code / URLs the summary smoothed over.
 
     Paths:
-    - The handoff .md file itself (kDrive-mirrored when configured).
+    - The handoff .md file itself (cloud-drive-mirrored when configured).
     - The CLI session jsonl under CLAUDE_CONFIG_DIR/projects/, by
       session id. We name the id explicitly so the operator can find
       the file without having to replay any cwd-encoding logic.
@@ -2021,15 +2021,15 @@ def _build_compact_footer(session_id: str | None) -> str:
 
 async def _write_handoff_file(agent_id: str, summary: str) -> str | None:
     """Persist the full compact summary as a markdown file under
-    HANDOFFS_DIR (kDrive-mirrored when available) and return the
+    HANDOFFS_DIR (cloud-drive-mirrored when available) and return the
     relative filename. The continuity_note stored in the DB is only a
     pointer — this file is the authoritative, long-form handoff that
     fresh-you can Read() on demand.
 
     Filename: <agent_id>-<YYYYMMDD-HHMMSS>.md. Returns None if both
-    kDrive and the local write failed — we log but don't raise,
-    because an empty handoff doesn't justify losing the compact turn
-    itself."""
+    the cloud-drive and the local write failed — we log but don't
+    raise, because an empty handoff doesn't justify losing the compact
+    turn itself."""
     ts_utc = datetime.now(timezone.utc)
     stamp = ts_utc.strftime("%Y%m%d-%H%M%S")
     filename = f"{agent_id}-{stamp}.md"
@@ -2050,7 +2050,7 @@ async def _write_handoff_file(agent_id: str, summary: str) -> str | None:
                 f"projects/{project_id}/working/handoffs/{filename}", content
             ))
         except Exception:
-            logger.exception("handoff kDrive write failed: %s", filename)
+            logger.exception("handoff cloud-drive write failed: %s", filename)
             wrote_webdav = False
 
     from server.paths import project_paths
@@ -4201,7 +4201,7 @@ def _system_prompt_for(agent_id: str) -> str:
             "system prompt next turn. (Coach-only by convention.)\n\n"
             "Data paths:\n"
             "  - knowledge/<path>.md — durable text via coord_write_knowledge.\n"
-            "  - outputs/<path>.<ext> — binary deliverables via coord_save_output (mirrored to kDrive).\n"
+            "  - outputs/<path>.<ext> — binary deliverables via coord_save_output (mirrored to the cloud drive).\n"
             "  - memory/<topic>.md — scratchpad (overwritable).\n"
             "  - decisions/<date>-slug.md — immutable ADRs (Coach-only write).\n"
             "  - ./handoffs/<agent>-<ts>.md — compact-handoff files for cross-compact context.\n\n"
@@ -4271,7 +4271,7 @@ def _system_prompt_for(agent_id: str) -> str:
         f"project has a repo configured). All edits land here; ship "
         f"via coord_commit_push.\n"
         f"  - ./uploads/ — human-uploaded reference material (PDFs, "
-        f"specs, screenshots; read-only, auto-synced from kDrive ~60s).\n"
+        f"specs, screenshots; read-only, auto-synced from the cloud drive ~60s).\n"
         f"  - ./attachments/ — pasted images from the UI.\n"
         f"  - knowledge/<path>.md, outputs/<path>.<ext>, memory/<topic>.md "
         f"— team-wide via coord_* tools.\n"
@@ -5264,7 +5264,7 @@ async def run_agent(
     external_servers, external_tools = load_external_servers()
     allowed.extend(external_tools)
 
-    # Governance-layer docs (CLAUDE.md / skills / rules) from kDrive/disk.
+    # Governance-layer docs (CLAUDE.md / skills / rules) from cloud-drive / disk.
     # Appended to the hardcoded role brief so context edits take effect on
     # the next turn with no restart required. Empty string when no
     # context is configured — agents behave as before.

@@ -6,11 +6,12 @@ Three on-disk files (spec §2):
                                 / superseded / deleted
   /data/playbook/runs.jsonl     one line per reflection / bootstrap run
 
-Atomic writes via tempfile + os.replace. Synchronous kDrive mirror
-attempted after every successful local write (spec §5.9 + §N2):
-local-first, no rollback on kDrive failure, idempotent re-sync on the
-next write. kDrive write failure publishes
-`playbook_kdrive_mirror_failed` event for the dashboard banner.
+Atomic writes via tempfile + os.replace. Synchronous cloud-drive
+mirror attempted after every successful local write (spec §5.9 + §N2):
+local-first, no rollback on cloud-drive failure, idempotent re-sync on
+the next write. Cloud-drive write failure publishes
+`playbook_kdrive_mirror_failed` event (event name kept for wire
+compat) for the dashboard banner.
 
 Reads are tolerant: missing file → empty schema; corrupt file → raise
 (implementer must investigate; corruption shouldn't be silently
@@ -206,7 +207,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
         os.replace(tmp, path)
     except Exception:
         # Best-effort temp cleanup. We re-raise so the caller knows
-        # the write failed; the kDrive mirror won't run.
+        # the write failed; the cloud-drive mirror won't run.
         try:
             os.unlink(tmp)
         except Exception:
@@ -228,11 +229,14 @@ def _atomic_append_jsonl(path: Path, line_obj: dict[str, Any]) -> None:
 
 
 async def _kdrive_mirror_text(remote_rel: str, content: str, *, file_label: str) -> None:
-    """Mirror to kDrive. Local write must have already succeeded.
+    """Mirror to the configured cloud drive. Local write must have
+    already succeeded.
 
     On failure: log + emit `playbook_kdrive_mirror_failed` event with
     `error` + `files: [<file_label>]` (spec §5.9 + §N2). DO NOT re-raise
-    — local is the source of truth; kDrive is durability mirror only.
+    — local is the source of truth; the cloud drive is durability
+    mirror only. (Event name + function name kept for back-compat; the
+    mirror works against any WebDAV-compatible drive.)
     """
     from server.webdav import webdav
 
@@ -260,7 +264,7 @@ async def _emit_kdrive_failure(error: str, files: list[str]) -> None:
             "files": files,
         })
     except Exception:
-        logger.exception("playbook.store: kDrive failure event publish raised")
+        logger.exception("playbook.store: cloud-drive failure event publish raised")
 
 
 # ---------------------------------------------------------------- lattice
@@ -341,7 +345,7 @@ def _trim_weight_history(stmt: Statement, *, cap: int = 50) -> None:
 
 
 async def save_lattice(lattice: Lattice, *, paths: PlaybookPaths | None = None) -> None:
-    """Write `lattice.json` atomically + mirror to kDrive (best-effort).
+    """Write `lattice.json` atomically + mirror to the cloud drive (best-effort).
 
     Caller is expected to have already mutated `lattice.statements`
     via `mutate.py` primitives.
@@ -362,7 +366,7 @@ async def save_lattice(lattice: Lattice, *, paths: PlaybookPaths | None = None) 
     content = _dump_json(payload)
     _atomic_write_text(pp.lattice, content)
 
-    # kDrive mirror (best-effort, fire-and-publish-on-failure).
+    # Cloud-drive mirror (best-effort, fire-and-publish-on-failure).
     await _kdrive_mirror_text(
         remote_path("lattice.json"),
         content,
@@ -371,7 +375,7 @@ async def save_lattice(lattice: Lattice, *, paths: PlaybookPaths | None = None) 
 
 
 async def save_archive(archive: Archive, *, paths: PlaybookPaths | None = None) -> None:
-    """Write `archived.json` atomically + mirror to kDrive."""
+    """Write `archived.json` atomically + mirror to the cloud drive."""
     pp = paths or ensure_playbook_dir()
     archive.schema_version = config.PLAYBOOK_SCHEMA_VERSION
     payload = {
@@ -420,11 +424,11 @@ def read_runs(
 
 
 async def append_run(row: dict[str, Any], *, paths: PlaybookPaths | None = None) -> None:
-    """Append one run row to `runs.jsonl` + mirror to kDrive.
+    """Append one run row to `runs.jsonl` + mirror to the cloud drive.
 
     Trims to `RUNS_RETENTION_DEFAULT` lines on each write — older rows
     are dropped (the dashboard surfaces only recent runs anyway, and
-    the durable history is on kDrive's snapshot mirror).
+    the durable history is on the cloud drive's snapshot mirror).
     """
     pp = paths or ensure_playbook_dir()
 

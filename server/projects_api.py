@@ -15,7 +15,7 @@ Status codes per §6:
 - `404` unknown project.
 - `409` another switch already in progress.
 - `423` agent turn currently running.
-- `502` kDrive unreachable on pre-pull.
+- `502` cloud drive unreachable on pre-pull.
 
 The activate handler also pins the new active_project_id via the module's
 `active_project_lock` + ContextVar exposed in server.db so coord_* tools
@@ -329,8 +329,8 @@ def build_router(*, require_token, audit_actor):
 
         Reports counts the user will see before clicking "Switch":
           - files_to_push: number of pending changes in the current
-            project's tree that haven't been mirrored to kDrive yet
-            (read directly off `sync_state` vs the local tree).
+            project's tree that haven't been mirrored to the cloud drive
+            yet (read directly off `sync_state` vs the local tree).
           - live_conversations: count of conversation files modified
             within HARNESS_LIVE_CONVERSATION_S that will get
             `live: true` frontmatter on push.
@@ -342,7 +342,7 @@ def build_router(*, require_token, audit_actor):
             POSTing /activate.
 
         Best-effort: walking the local tree is single-digit ms even
-        for hundreds of files. kDrive isn't queried here — the modal
+        for hundreds of files. The cloud drive isn't queried here — the modal
         is a UI-side affordance, not authoritative.
         """
         ok, reason = validate_slug(to)
@@ -767,7 +767,7 @@ def build_router(*, require_token, audit_actor):
 
         if was_active:
             # Auto-switch to misc per §2 Delete semantics. We don't go
-            # through the full activate handler (with its kDrive sync
+            # through the full activate handler (with its cloud-drive sync
             # phases) because the active project just disappeared — its
             # files are gone. Just swap the pointer + emit an event.
             await set_active_project(MISC_PROJECT_ID)
@@ -1277,8 +1277,8 @@ def build_router(*, require_token, audit_actor):
         pp = project_paths(project_id)
         pp.project_objectives.parent.mkdir(parents=True, exist_ok=True)
         pp.project_objectives.write_text(text, encoding="utf-8")
-        # Spec §3.3 "kDrive mirror: yes". Mirror synchronously so the
-        # human-readable .md is durable the moment the PUT returns —
+        # Spec §3.3 "cloud-drive mirror: yes". Mirror synchronously so
+        # the human-readable .md is durable the moment the PUT returns —
         # same shape as coach_todos._write_with_mirror.
         from server.webdav import webdav
         if webdav.enabled:
@@ -1289,7 +1289,7 @@ def build_router(*, require_token, audit_actor):
                 )
             except Exception:
                 logger.exception(
-                    "objectives PUT: kDrive mirror failed for %s",
+                    "objectives PUT: cloud-drive mirror failed for %s",
                     project_id,
                 )
         await bus.publish({
@@ -1341,7 +1341,7 @@ async def _run_switch(
     """The activate flow per §6:
       1. Force-push current project's tree (push-on-close, with
          live: true tagging via tag_live_conversations).
-      2. Pull new project's tree from kDrive (pull-on-open).
+      2. Pull new project's tree from the cloud drive (pull-on-open).
       3. Swap active_project_id pointer.
       4. Reload context — emit project_switched event.
 
@@ -1353,8 +1353,8 @@ async def _run_switch(
     - #5: a hard step failure (push or pull raised, or pull returned
       `failed > 0` rows) aborts the switch BEFORE the pointer swap
       and emits a terminal `project_switched ok=False` event. The
-      pre-swap project's bytes are still authoritative on kDrive for
-      the next attempt.
+      pre-swap project's bytes are still authoritative on the cloud
+      drive for the next attempt.
     - #10: outer try/except so any unexpected error (e.g. lazy import
       failure, bus.publish exception) still publishes a terminal
       event so the UI's switchingProject flag clears.
@@ -1412,7 +1412,7 @@ async def _run_switch(
             # Hard abort — leaving the from_project's local edits
             # unsynced is preferable to half-swapping into a project
             # whose pre-swap state was never persisted. The user can
-            # retry once kDrive recovers.
+            # retry once the cloud drive recovers.
 
         if failed_step is None:
             # Step 2 — pull-on-open.

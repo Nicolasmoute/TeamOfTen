@@ -1,7 +1,7 @@
 """Compass scheduler — fires daily runs across enabled projects.
 
 Wired into `main.py:lifespan` alongside `recurrence_scheduler_loop`
-and the kDrive sync loops. Walks every project where Compass is
+and the cloud-drive sync loops. Walks every project where Compass is
 enabled and fires a run when:
 
   - The project has never been bootstrapped → fire `bootstrap`

@@ -19,7 +19,7 @@ wrong, not the work.
 
 **Audit reports as .md files** (Docs/kanban-specs-v2.md §5.3): every
 audit also writes a standalone markdown report to
-`<compass_root>/audit_reports/<audit_id>.md`, mirrored to kDrive at
+`<compass_root>/audit_reports/<audit_id>.md`, mirrored to the cloud drive at
 the same relative path. The .md is the human-readable surface
 (opens in the Files pane, attaches to messages, browses on phone);
 the jsonl drives the dashboard's audit-log filter pills + the
@@ -175,8 +175,8 @@ async def write_audit_report_md(
 
     Local-write failures are logged and swallowed — a report write
     issue must not block the audit's structured persistence (the
-    jsonl is the source of truth; the .md is a derived view). kDrive
-    mirror is fire-and-forget.
+    jsonl is the source of truth; the .md is a derived view).
+    Cloud-drive mirror is fire-and-forget.
     """
     try:
         ensure_compass_scaffold(project_id)
@@ -203,7 +203,7 @@ async def write_audit_report_md(
             asyncio.create_task(webdav.write_text(remote_rel, body))
         except Exception:
             logger.exception(
-                "compass.audit: kDrive mirror task creation failed"
+                "compass.audit: cloud-drive mirror task creation failed"
             )
 
     return local_rel, remote_rel

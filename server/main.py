@@ -216,7 +216,7 @@ async def lifespan(app: FastAPI):
         logger.exception("bootstrap_global_resources failed (non-fatal)")
     # Phase 7: rebuild wiki/INDEX.md from the current tree so any
     # out-of-band wiki edits since last boot (manual file copy, sync
-    # from kDrive) are reflected on the first /api/files/tree hit.
+    # from the cloud drive) are reflected on the first /api/files/tree hit.
     try:
         from server.paths import update_wiki_index
         update_wiki_index()
@@ -737,7 +737,7 @@ async def root() -> str:
     return INDEX_HTML
 
 
-# Health-check caches. Avoid hammering kDrive / spawning subprocesses on
+# Health-check caches. Avoid hammering the cloud drive / spawning subprocesses on
 # every probe (Zeabur or external monitors may poll every 30s).
 _CLAUDE_VERSION_CACHE: dict[str, object] = {}  # populated once per process
 _WEBDAV_PROBE_CACHE: dict[str, object] = {"ts": 0.0, "ok": None}
@@ -898,7 +898,7 @@ async def health_detail() -> JSONResponse:
             "reason": "CODEX_HOME not set — Codex runtime unavailable until set on a /data path",
         }
 
-    # 4. kDrive — only check if configured. Cached for 60s to avoid
+    # 4. Cloud drive — only check if configured. Cached for 60s to avoid
     # writing a probe file on every health hit. We cache the full
     # detail dict (not just a bool) so the UI can keep rendering the
     # error / URL / root between fresh probes.
@@ -5617,7 +5617,7 @@ async def file_write_proposal_diff(proposal_id: int) -> dict[str, Any]:
     diff and falls back to a plain proposed-content render in that
     case). `after` is the proposed content. The fresh read avoids
     DB-cached staleness if the file was edited (Files pane, manual
-    kDrive sync, etc.) between propose and approve.
+    cloud-drive sync, etc.) between propose and approve.
     """
     c = await configured_conn()
     try:
@@ -5710,7 +5710,7 @@ async def wiki_reindex() -> dict[str, Any]:
 
     The PostToolUse hook in [server/agents.py](server/agents.py) handles
     the agent-Write case and the file-write endpoint above handles the
-    UI case, but external writers (kDrive sync from another machine,
+    UI case, but external writers (cloud-drive sync from another machine,
     snapshot restore, manual `cp` into the wiki tree) bypass both.
     This endpoint is the catch-all 'fix it now' button for those, and
     a useful diagnostic when verifying the auto-rebuild itself.

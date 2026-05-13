@@ -3,7 +3,7 @@
 Phase 0 of the Compass build. Verifies that:
   - Per-project paths resolve under the harness's per-project layout
   - Scaffolding creates the expected directory structure
-  - The kDrive remote-path mapper produces the documented shape
+  - The cloud-drive remote-path mapper produces the documented shape
   - Test fixtures that sandbox `paths.DATA_ROOT` flow through
 """
 
@@ -75,7 +75,7 @@ def test_ensure_compass_scaffold_does_not_seed_state(fresh_db: str) -> None:
 
 
 def test_remote_root_drops_working_segment() -> None:
-    """kDrive remote tree mirrors the knowledge/ convention — flat
+    """Cloud-drive remote tree mirrors the knowledge/ convention — flat
     `projects/<id>/compass/` for the human-facing cloud view, not
     the local `working/compass/` lane."""
     assert cpaths.remote_root("alpha") == "projects/alpha/compass"

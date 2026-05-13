@@ -9,8 +9,8 @@ Verifies:
   - ID allocation is monotonic across active + archived
   - load_state on a corrupt file falls back to empty defaults
 
-WebDAV is disabled in tests (no env vars), so kDrive mirror calls are
-no-ops — exactly what we want for hermetic unit tests.
+WebDAV is disabled in tests (no env vars), so cloud-drive mirror
+calls are no-ops — exactly what we want for hermetic unit tests.
 """
 
 from __future__ import annotations

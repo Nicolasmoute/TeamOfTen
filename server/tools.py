@@ -1746,9 +1746,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             }
         )
 
-        # Fire-and-forget mirror to kDrive as a plain .md file under
-        # /harness/memory/<topic>.md. Failures are swallowed and logged
-        # inside WebDAVClient — they never block the tool call.
+        # Fire-and-forget mirror to the cloud drive as a plain .md file
+        # under /harness/memory/<topic>.md. Failures are swallowed and
+        # logged inside WebDAVClient — they never block the tool call.
         if webdav.enabled:
             header = (
                 f"<!-- auto-mirrored from the harness memory table\n"
@@ -1773,7 +1773,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         "coord_write_knowledge",
         (
             "Write a durable artifact to the team knowledge bucket at "
-            "kDrive knowledge/<path> (+ local /data/knowledge cache). "
+            "<cloud-drive>/knowledge/<path> (+ local /data/knowledge cache). "
             "Distinct from memory (overwritable scratchpad keyed by topic) "
             "and context (governance docs, Coach-only): knowledge is the "
             "free-form output bucket for reports, research, specs, and "
@@ -1819,7 +1819,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     @tool(
         "coord_read_knowledge",
         (
-            "Read a knowledge doc by path. Local cache first, kDrive "
+            "Read a knowledge doc by path. Local cache first, cloud-drive "
             "fallback. Returns the full body as text; caller should "
             "chunk or summarize for prompt brevity if needed.\n"
             "\n"
@@ -1861,7 +1861,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         "coord_save_output",
         (
             "Save a binary deliverable (docx / pdf / png / zip / …) to "
-            "the team outputs bucket at kDrive outputs/<path> (+ local "
+            "the team outputs bucket at <cloud-drive>/outputs/<path> (+ local "
             "/data/outputs cache). Use for final artifacts the human "
             "asked for — reports, charts, exports. Text deliverables "
             "usually belong in knowledge/ instead.\n"
@@ -2352,8 +2352,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         "coord_write_decision",
         (
             "Coach-only. Append a dated, immutable architectural decision "
-            "record to /harness/decisions/ on kDrive (or /data/decisions/ "
-            "if kDrive is disabled).\n"
+            "record to the cloud drive at <webdav-base>/projects/<active>/decisions/ "
+            "(or /data/decisions/ if the cloud-drive mirror is disabled).\n"
             "\n"
             "Unlike memory (which is overwritable scratch), decisions are "
             "the durable 'we chose X because Y' record. Filename format: "
@@ -2399,8 +2399,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         )
         content = frontmatter + body + ("\n" if not body.endswith("\n") else "")
 
-        # Prefer kDrive (the human-readable durable store). Fall back to the
-        # local /data volume so offline agents still get a record.
+        # Prefer the cloud drive (the human-readable durable store). Fall
+        # back to the local /data volume so offline agents still get a record.
         project_id = await resolve_active_project()
         from server.paths import project_paths
         location = None
@@ -2410,9 +2410,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"projects/{project_id}/decisions/{filename}", content
             )
             if ok:
-                location = f"kDrive:projects/{project_id}/decisions/{filename}"
+                location = f"clouddrive:projects/{project_id}/decisions/{filename}"
         if location is None:
-            # Local fallback when kDrive disabled or write failed.
+            # Local fallback when the cloud-drive mirror is disabled or write failed.
             local_dir = project_paths(project_id).decisions
             try:
                 local_dir.mkdir(parents=True, exist_ok=True)
