@@ -7643,6 +7643,12 @@ function EnvInboxSection({ conversations }) {
           const preview = (m.subject || m.body || "").replace(/\s+/g, " ").slice(0, 80);
           const isOpen = openId === m.id;
           const urgent = m.priority === "interrupt";
+          const onReplyClick = () => {
+            const sender = m.from_id === "broadcast" ? "coach" : m.from_id;
+            setComposing(true);
+            setTo(MESSAGE_RECIPIENTS.includes(sender) ? sender : "coach");
+            setBody(buildReplyQuote(m.subject, sender, m.body || m.body_preview || ""));
+          };
           return html`
             <div
               class=${"env-decision" + (urgent ? " env-msg-urgent" : "")}
@@ -7657,6 +7663,14 @@ function EnvInboxSection({ conversations }) {
                   ${m.from_id} → ${m.to_id}${urgent ? " ⚠" : ""}
                 </span>
                 <span class="env-decision-meta">${timeStrShort(m.sent_at)}</span>
+              </button>
+              <button class="env-reply-btn" title="Reply" onClick=${onReplyClick}>
+                <svg width="12" height="12" viewBox="0 0 13 13" fill="none"
+                     stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+                     stroke-linejoin="round">
+                  <polyline points="4,2 1,5 4,8" />
+                  <path d="M1 5 H8 Q12 5 12 9 V12" />
+                </svg>
               </button>
               ${isOpen
                 ? html`<div class="env-msg-body">
@@ -9808,6 +9822,9 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const bodyRef = useRef(null);
+  // textareaRef — used by the reply button to focus the input after
+  // pre-filling it with a quoted snippet.
+  const textareaRef = useRef(null);
 
   // Pending prompts: optimistic local list of prompts the user has
   // submitted but which haven't fully landed yet. Each entry has:
@@ -10531,6 +10548,15 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
 
   const removeAttachment = useCallback((id) => {
     setAttachments((prev) => prev.filter((a) => a.id !== id));
+  }, []);
+
+  // handleReply — pre-fills the pane's textarea with a quoted snippet
+  // and focuses it. Called by the reply button on message_sent rows.
+  const handleReply = useCallback((quoteText) => {
+    setInput((prev) => (prev ? prev + quoteText : quoteText));
+    setTimeout(() => {
+      if (textareaRef.current) textareaRef.current.focus();
+    }, 0);
   }, []);
 
   // Intercept slash commands locally before they ever reach an agent.
@@ -11400,7 +11426,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
         ${searchQuery.trim() && visibleEvents.length === 0 && allEvents.length > 0
           ? html`<div class="pane-empty-hint">No events match "${searchQuery}".</div>`
           : null}
-        <${EventList} events=${visibleEvents} />
+        <${EventList} events=${visibleEvents} onReply=${handleReply} />
         ${pending.length > 0
           ? html`<div class="pane-pending-list">
               ${pending.map(
@@ -11579,6 +11605,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
         </div>
         <div class="pane-input-wrap">
           <textarea
+            ref=${textareaRef}
             placeholder=${"Message " + (displayName || rawName) + "… (type / for commands)"}
             value=${input}
             onInput=${(e) => {
@@ -11756,10 +11783,13 @@ const _HIDDEN_EVENT_TYPES = new Set([
 
 class EventList extends Component {
   shouldComponentUpdate(nextProps) {
-    return nextProps.events !== this.props.events;
+    // Re-render when the event array reference changes OR when the
+    // onReply callback changes (e.g. on AgentPane first render).
+    return nextProps.events !== this.props.events ||
+           nextProps.onReply !== this.props.onReply;
   }
 
-  render({ events }) {
+  render({ events, onReply }) {
     // Group consecutive events into per-turn sections — each section
     // begins with an `agent_started` and runs until the next
     // `agent_started`. The wrapping `.turn-section` bounds the sticky
@@ -11784,14 +11814,26 @@ class EventList extends Component {
     return groups.map((g) =>
       html`<div class="turn-section" key=${g.key}>
         ${g.events.map((ev, i) =>
-          html`<${EventItem} key=${ev.__id ?? "live-" + i} event=${ev} />`
+          html`<${EventItem} key=${ev.__id ?? "live-" + i} event=${ev} onReply=${onReply} />`
         )}
       </div>`
     );
   }
 }
 
-function EventItem({ event }) {
+// buildReplyQuote — pure helper used by the message_sent reply button
+// (agent panes) and the EnvPane Inbox reply button. The function is
+// intentionally tiny (< 5 lines) and exercised visually; if the team
+// ever adds a JS test runner, extract it to reply.js and unit-test.
+function buildReplyQuote(subject, fromId, bodyPreview) {
+  const subj = subject || "(no subject)";
+  const raw = bodyPreview || "";
+  const preview = raw.slice(0, 80);
+  const ellipsis = raw.length > 80 ? "…" : "";
+  return `> Re: ${subj} (from ${fromId}): ${preview}${ellipsis}\n\n`;
+}
+
+function EventItem({ event, onReply }) {
   const type = event.type;
   const ts = timeStr(event.ts);
 
@@ -12288,7 +12330,29 @@ function EventItem({ event }) {
     const toHuman = event.to === "human";
     const isHumanThread = fromHuman || toHuman;
     const cls = "event message_sent" + (isHumanThread ? " human-thread" : " peer-thread");
+    // Reply button — only rendered when a callback is wired (agent panes
+    // pass onReply down; EnvPane Inbox has its own reply path).
+    // buildReplyQuote is a pure helper defined near this renderer.
+    const replyBtn = onReply
+      ? html`<button
+          class="msg-reply-btn"
+          title="Reply"
+          onClick=${(e) => {
+            e.stopPropagation();
+            const sender = event.agent_id === "broadcast" ? "coach" : event.agent_id;
+            onReply(buildReplyQuote(event.subject, sender, event.body_preview || ""));
+          }}
+        >
+          <svg width="13" height="13" viewBox="0 0 13 13" fill="none"
+               stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+               stroke-linejoin="round">
+            <polyline points="4,2 1,5 4,8" />
+            <path d="M1 5 H8 Q12 5 12 9 V12" />
+          </svg>
+        </button>`
+      : null;
     return html`<div class=${cls}>
+      ${replyBtn}
       <div class="event-meta">
         ${ts}  ${event.agent_id} → ${event.to}${urgent}${subj}
       </div>
