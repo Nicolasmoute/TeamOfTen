@@ -945,6 +945,32 @@ function slotShortLabel(slotId) {
   return slotId.slice(0, 2);
 }
 
+// Inline SVG arrow icons for message direction tags.
+// 10×10 viewBox, stroke="currentColor", no emoji.
+const _SVG_ARROW_OUT = html`<svg viewBox="0 0 10 10" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="1" y1="5" x2="8" y2="5"/><polyline points="5.5,2.5 8,5 5.5,7.5"/></svg>`;
+const _SVG_ARROW_IN  = html`<svg viewBox="0 0 10 10" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="9" y1="5" x2="2" y2="5"/><polyline points="4.5,2.5 2,5 4.5,7.5"/></svg>`;
+const _SVG_ARROW_BC  = html`<svg viewBox="0 0 10 10" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="1.5" y1="5" x2="8.5" y2="5"/><polyline points="6,2.5 8.5,5 6,7.5"/><polyline points="4,2.5 1.5,5 4,7.5"/></svg>`;
+
+// Compute direction tag for a message_sent event from the perspective
+// of the pane's viewer slot.
+// Returns { svg, label, cls, incoming } or null when viewerSlot is null.
+function msgDirTag(event, viewerSlot) {
+  if (!viewerSlot) return null;
+  const from = event.agent_id;
+  const to   = event.to;
+  if (to === "broadcast") {
+    return { svg: _SVG_ARROW_BC, label: "all", cls: "msg-dir-bc", incoming: false };
+  }
+  if (from === viewerSlot) {
+    return { svg: _SVG_ARROW_OUT, label: slotShortLabel(to), cls: "msg-dir-out", incoming: false };
+  }
+  if (to === viewerSlot) {
+    return { svg: _SVG_ARROW_IN, label: slotShortLabel(from), cls: "msg-dir-in", incoming: true };
+  }
+  // Third-party observer pane (fan-out to a pane that is neither sender nor recipient)
+  return { svg: _SVG_ARROW_BC, label: `${slotShortLabel(from)}${slotShortLabel(to)}`, cls: "msg-dir-bc", incoming: false };
+}
+
 // Timezone preference for timestamp rendering. Server stamps events
 // in UTC; reading the raw ISO is fine when many users collaborate, but
 // for a solo deploy the wall clock you actually live in is more
@@ -11696,7 +11722,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
         ${searchQuery.trim() && visibleEvents.length === 0 && allEvents.length > 0
           ? html`<div class="pane-empty-hint">No events match "${searchQuery}".</div>`
           : null}
-        <${EventList} events=${visibleEvents} onReply=${handleReply} />
+        <${EventList} events=${visibleEvents} onReply=${handleReply} viewerSlot=${slot} />
         ${pending.length > 0
           ? html`<div class="pane-pending-list">
               ${pending.map(
@@ -12053,13 +12079,14 @@ const _HIDDEN_EVENT_TYPES = new Set([
 
 class EventList extends Component {
   shouldComponentUpdate(nextProps) {
-    // Re-render when the event array reference changes OR when the
-    // onReply callback changes (e.g. on AgentPane first render).
+    // Re-render when the event array reference changes, when the
+    // onReply callback changes, or when the viewer slot changes.
     return nextProps.events !== this.props.events ||
-           nextProps.onReply !== this.props.onReply;
+           nextProps.onReply !== this.props.onReply ||
+           nextProps.viewerSlot !== this.props.viewerSlot;
   }
 
-  render({ events, onReply }) {
+  render({ events, onReply, viewerSlot }) {
     // Group consecutive events into per-turn sections — each section
     // begins with an `agent_started` and runs until the next
     // `agent_started`. The wrapping `.turn-section` bounds the sticky
@@ -12084,7 +12111,7 @@ class EventList extends Component {
     return groups.map((g) =>
       html`<div class="turn-section" key=${g.key}>
         ${g.events.map((ev, i) =>
-          html`<${EventItem} key=${ev.__id ?? "live-" + i} event=${ev} onReply=${onReply} />`
+          html`<${EventItem} key=${ev.__id ?? "live-" + i} event=${ev} onReply=${onReply} viewerSlot=${viewerSlot} />`
         )}
       </div>`
     );
@@ -12103,7 +12130,7 @@ function buildReplyQuote(subject, fromId, bodyPreview) {
   return `> Re: ${subj} (from ${fromId}): ${preview}${ellipsis}\n\n`;
 }
 
-function EventItem({ event, onReply }) {
+function EventItem({ event, onReply, viewerSlot = null }) {
   const type = event.type;
   const ts = timeStr(event.ts);
 
@@ -12599,7 +12626,11 @@ function EventItem({ event, onReply }) {
     const fromHuman = event.agent_id === "human";
     const toHuman = event.to === "human";
     const isHumanThread = fromHuman || toHuman;
-    const cls = "event message_sent" + (isHumanThread ? " human-thread" : " peer-thread");
+    // Direction tag: compute from viewer slot. null when viewerSlot not
+    // provided (backward compat — tag simply omitted).
+    const dirTag = !isHumanThread ? msgDirTag(event, viewerSlot) : null;
+    const incomingClass = dirTag && dirTag.incoming ? " msg-incoming" : "";
+    const cls = "event message_sent" + (isHumanThread ? " human-thread" : " peer-thread") + incomingClass;
     // Reply button — only rendered when a callback is wired (agent panes
     // pass onReply down; EnvPane Inbox has its own reply path).
     // buildReplyQuote is a pure helper defined near this renderer.
@@ -12624,7 +12655,7 @@ function EventItem({ event, onReply }) {
     return html`<div class=${cls}>
       ${replyBtn}
       <div class="event-meta">
-        ${ts}  ${event.agent_id} → ${event.to}${urgent}${subj}
+        ${dirTag ? html`<span class=${"msg-dir-tag " + dirTag.cls}>${dirTag.svg}${dirTag.label}</span>  ` : null}${ts}  ${event.agent_id}  ${event.to}${urgent}${subj}
       </div>
       <div class="event-body">${preview}${truncatedSuffix}</div>
     </div>`;

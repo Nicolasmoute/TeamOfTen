@@ -3592,6 +3592,32 @@ above peer chatter and tool narration):
   `coord_*` rendered as "Reading inbox" / "Listing tasks") dim. The
   left border + `summary::before` dot also stay colored.
 
+**Direction tags on `message_sent` rows.** Every Tier-2 `message_sent`
+(`.peer-thread`) row shows a compact direction tag chip at the start of
+the meta line, rendered as an inline SVG arrow (drawn with
+`currentColor`, no emoji). Tag semantics relative to the pane's viewer
+slot:
+- Outgoing (`event.agent_id === viewerSlot`): right-arrow SVG + short
+  recipient label (`slotShortLabel(to)`). CSS class `msg-dir-out`,
+  color `var(--accent)` (blue). `border-color` stays accent.
+- Incoming (`event.to === viewerSlot`): left-arrow SVG + short sender
+  label. CSS class `msg-dir-in`, color `var(--ok)` (green). The event
+  `div` also gets class `msg-incoming` which overrides the left-border
+  to `var(--ok)` — visually separates "arrived for me" from "I sent
+  this".
+- Broadcast (`event.to === "broadcast"`): bidirectional-arrow SVG +
+  label `"all"`. CSS class `msg-dir-bc`, color `var(--muted)`.
+- Third-party observer (fan-out to a pane that is neither sender nor
+  recipient): bidirectional-arrow SVG + `"AB"` label (short form of
+  both parties). `msg-dir-bc`.
+- Null viewer slot (prop not passed): tag omitted; rendering is
+  identical to the pre-feature behavior.
+Tier-1 (`.human-thread`) messages are unaffected — direction tag is
+peer-thread only. `viewerSlot` is threaded from `AgentPane(slot)` →
+`EventList(viewerSlot)` → `EventItem(viewerSlot)`. Pure helper
+`msgDirTag(event, viewerSlot)` is defined in `app.js` alongside
+`slotShortLabel`.
+
 Errors and asks ignore the tiering and stay loud regardless: `.event.error`
 red, `.event.tool_result.error` red, plus AskUserQuestion / plan-mode
 / file-write-proposal / human_attention escalations.

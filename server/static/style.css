@@ -3581,6 +3581,28 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 .event.message_sent:hover .msg-reply-btn { opacity: 1; }
 .msg-reply-btn:hover { color: var(--accent); }
 
+/* Direction tag chips on message_sent peer-thread rows.
+   SVG arrows drawn with currentColor, no emoji.
+   Outgoing: accent blue. Incoming: ok green. Broadcast/observer: muted. */
+.msg-dir-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 3px;
+  vertical-align: middle;
+  background: rgba(255,255,255,0.04);
+}
+.msg-dir-out { color: var(--accent); }
+.msg-dir-in  { color: var(--ok); }
+.msg-dir-bc  { color: var(--muted); }
+
+/* Incoming peer messages get a green left-border accent instead of blue
+   to visually distinguish "something arrived for me" from "I sent this". */
+.event.message_sent.peer-thread.msg-incoming { border-color: var(--ok); }
+
 /* `coord_request_human` escalations. Rendered as a prominent card
    (subject + full markdown body) so the message that just pinged the
    user on Telegram is readable inline in chat too. urgency=normal
