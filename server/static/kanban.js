@@ -531,6 +531,7 @@ function AuditColumn(props) {
 
 function ComposerModal({ open, onClose, onCreate }) {
   const [title, setTitle] = useState("");
+  const [desc, setDesc] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
 
@@ -545,8 +546,11 @@ function ComposerModal({ open, onClose, onCreate }) {
     setBusy(true);
     setErr(null);
     try {
-      await onCreate({ title: title.trim() });
+      const payload = { title: title.trim() };
+      if (desc.trim()) payload.description = desc.trim();
+      await onCreate(payload);
       setTitle("");
+      setDesc("");
       onClose();
     } catch (e) {
       setErr(e.message || String(e));
@@ -566,8 +570,16 @@ function ComposerModal({ open, onClose, onCreate }) {
             value=${title}
             onInput=${(e) => setTitle(e.target.value)}
             autoFocus
-            rows="4"
+            rows="3"
             placeholder="Describe the idea — a sentence or two is fine"
+          ></textarea>
+          <label class="kbn-label" style="margin-top:8px">Description (optional)</label>
+          <textarea
+            class="kbn-input kbn-backlog-desc-input"
+            value=${desc}
+            onInput=${(e) => setDesc(e.target.value)}
+            rows="3"
+            placeholder="More context for Coach — background, motivation, scope..."
           ></textarea>
           <div class="kbn-help">
             Coach will review this on the next tick and either promote it
@@ -861,6 +873,8 @@ const _PENCIL_SVG = html`<svg viewBox="0 0 24 24" width="11" height="11" fill="n
 const _TRASH_SVG = html`<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>`;
 
 
+const _BACKLOG_DESC_PREVIEW = 120;
+
 function BacklogCard({ entry, authedFetch, onRefresh }) {
   const proposer = entry.proposed_by || "?";
   let proposerLabel;
@@ -872,8 +886,10 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
 
   const [editing, setEditing] = useState(false);
   const [editTitle, setEditTitle] = useState(entry.title);
+  const [editDesc, setEditDesc] = useState(entry.description || "");
   const [editBusy, setEditBusy] = useState(false);
   const [editErr, setEditErr] = useState(null);
+  const [expanded, setExpanded] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [deleteErr, setDeleteErr] = useState(null);
@@ -881,6 +897,7 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
   const startEdit = (e) => {
     e.stopPropagation();
     setEditTitle(entry.title);
+    setEditDesc(entry.description || "");
     setEditErr(null);
     setEditing(true);
   };
@@ -891,10 +908,11 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
     setEditBusy(true);
     setEditErr(null);
     try {
+      const payload = { title: t, description: editDesc.trim() || null };
       const r = await authedFetch(`/api/backlog/${entry.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: t }),
+        body: JSON.stringify(payload),
       });
       if (!r.ok) {
         const msg = await r.text().catch(() => r.statusText);
@@ -910,7 +928,6 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
   };
 
   const onEditKeyDown = (e) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); saveEdit(); }
     if (e.key === "Escape") { setEditing(false); }
   };
 
@@ -932,6 +949,10 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
     }
   };
 
+  const desc = entry.description || "";
+  const descTruncated = desc.length > _BACKLOG_DESC_PREVIEW && !expanded;
+  const descVisible = descTruncated ? desc.slice(0, _BACKLOG_DESC_PREVIEW) + "…" : desc;
+
   return html`
     <div class="kbn-card kbn-backlog-card">
       ${editing
@@ -946,6 +967,16 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
               autoFocus
               disabled=${editBusy}
             ></textarea>
+            <label class="kbn-label" style="margin-top:6px;font-size:0.75rem">Description (optional)</label>
+            <textarea
+              class="kbn-input kbn-backlog-desc-input"
+              value=${editDesc}
+              onInput=${(e) => setEditDesc(e.target.value)}
+              onKeyDown=${onEditKeyDown}
+              rows="3"
+              placeholder="More context for Coach…"
+              disabled=${editBusy}
+            ></textarea>
             ${editErr ? html`<div class="kbn-error kbn-backlog-edit-err">${editErr}</div>` : null}
             <div class="kbn-backlog-edit-actions">
               <button class="kbn-btn kbn-btn-primary kbn-btn-sm" onClick=${saveEdit} disabled=${editBusy}>
@@ -956,12 +987,19 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
           </div>`
         : html`
           <div class="kbn-card-title">${entry.title}</div>
+          ${desc ? html`
+            <div class="kbn-backlog-desc">${descVisible}${descTruncated || (desc.length > _BACKLOG_DESC_PREVIEW && expanded)
+              ? html`<button class="kbn-backlog-expand-btn" onClick=${() => setExpanded(!expanded)}>
+                  ${expanded ? " less" : " more"}
+                </button>`
+              : null}
+            </div>` : null}
           <div class="kbn-card-meta">
             <span class="kbn-backlog-proposer">${proposerLabel}</span>
             <span class="kbn-card-age">${timeAgo(entry.proposed_at)}</span>
           </div>
           <div class="kbn-card-actions kbn-backlog-actions">
-            <button class="kbn-card-act-btn" title="Edit title" onClick=${startEdit}>${_PENCIL_SVG}</button>
+            <button class="kbn-card-act-btn" title="Edit" onClick=${startEdit}>${_PENCIL_SVG}</button>
             <button class="kbn-card-act-btn kbn-card-act-danger" title="Delete" onClick=${(e) => { e.stopPropagation(); setDeleteErr(null); setConfirmDelete(true); }}>${_TRASH_SVG}</button>
           </div>`}
       ${confirmDelete

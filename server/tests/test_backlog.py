@@ -151,7 +151,7 @@ async def test_backlog_table_columns() -> None:
     finally:
         await c.close()
     expected = {
-        "id", "title", "proposed_by", "proposed_at",
+        "id", "title", "description", "proposed_by", "proposed_at",
         "status", "reject_reason", "promoted_task_id",
     }
     assert expected <= cols, f"Missing columns: {expected - cols}"
@@ -726,3 +726,145 @@ def test_delete_backlog_auth_gate(
         headers={"Authorization": "Bearer wrongtoken"},
     )
     assert r.status_code == 403
+
+
+# ---------------------------------------------------------------- description field
+
+
+@pytest.mark.asyncio
+async def test_post_backlog_with_description(fresh_db: str) -> None:  # noqa: ARG001
+    """POST /api/backlog accepts description; GET returns it."""
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.post(
+            "/api/backlog",
+            json={"title": "Add OAuth", "description": "Use Google OAuth for SSO"},
+        )
+    assert r.status_code == 200
+    d = r.json()
+    assert d["description"] == "Use Google OAuth for SSO"
+    assert d["status"] == "pending"
+
+    # GET round-trip
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.get("/api/backlog")
+    items = {i["title"]: i for i in r.json()["backlog"]}
+    assert items["Add OAuth"]["description"] == "Use Google OAuth for SSO"
+
+
+@pytest.mark.asyncio
+async def test_patch_backlog_description_only(fresh_db: str) -> None:  # noqa: ARG001
+    """PATCH with description only (no title) updates the description field."""
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    row_id = await _insert_backlog("Idea without desc", proposed_by="p1")
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.patch(
+            f"/api/backlog/{row_id}",
+            json={"description": "Now it has context"},
+        )
+    assert r.status_code == 200
+    d = r.json()
+    assert d["title"] == "Idea without desc"  # title unchanged
+    assert d["description"] == "Now it has context"
+
+    row = await _get_backlog(row_id)
+    assert row is not None
+    assert row["description"] == "Now it has context"
+
+
+@pytest.mark.asyncio
+async def test_post_backlog_description_length_cap(fresh_db: str) -> None:  # noqa: ARG001
+    """POST with description > 8000 chars returns 400."""
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    long_desc = "x" * 8001
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.post(
+            "/api/backlog",
+            json={"title": "Big idea", "description": long_desc},
+        )
+    assert r.status_code == 400
+    assert "8000" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_patch_backlog_description_length_cap(fresh_db: str) -> None:  # noqa: ARG001
+    """PATCH with description > 8000 chars returns 400."""
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    row_id = await _insert_backlog("Idea for cap test", proposed_by="p1")
+    long_desc = "y" * 8001
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.patch(
+            f"/api/backlog/{row_id}",
+            json={"description": long_desc},
+        )
+    assert r.status_code == 400
+    assert "8000" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_get_backlog_returns_description(fresh_db: str) -> None:  # noqa: ARG001
+    """GET /api/backlog returns the description column for each entry."""
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    # insert via helper (no description)
+    row_id_no_desc = await _insert_backlog("No desc idea", proposed_by="p1")
+    # insert with description via POST
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post(
+            "/api/backlog",
+            json={"title": "With desc idea", "description": "details here"},
+        )
+        r = await client.get("/api/backlog")
+    items = {i["title"]: i for i in r.json()["backlog"]}
+    assert items["No desc idea"].get("description") is None
+    assert items["With desc idea"]["description"] == "details here"
+
+
+@pytest.mark.asyncio
+async def test_patch_backlog_clear_description(fresh_db: str) -> None:  # noqa: ARG001
+    """PATCH with description='' (empty string) clears description to NULL."""
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    row_id = await _insert_backlog("Idea with desc", proposed_by="p1")
+    # First add a description
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.patch(
+            f"/api/backlog/{row_id}",
+            json={"description": "Some context"},
+        )
+        # Now clear it
+        r = await client.patch(
+            f"/api/backlog/{row_id}",
+            json={"description": ""},
+        )
+    assert r.status_code == 200
+    assert r.json()["description"] is None
+
+    row = await _get_backlog(row_id)
+    assert row is not None
+    assert row["description"] is None

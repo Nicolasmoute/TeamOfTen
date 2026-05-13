@@ -754,6 +754,9 @@ async def root() -> str:
 
 # Health-check caches. Avoid hammering the cloud drive / spawning subprocesses on
 # every probe (Zeabur or external monitors may poll every 30s).
+# Sentinel for "field not supplied" (distinct from None = "clear/unset").
+_SENTINEL: Any = object()
+
 _CLAUDE_VERSION_CACHE: dict[str, object] = {}  # populated once per process
 _WEBDAV_PROBE_CACHE: dict[str, object] = {"ts": 0.0, "ok": None}
 _WEBDAV_PROBE_TTL_SECONDS = 60.0
@@ -3916,8 +3919,12 @@ async def clear_sessions_batch(
 # ------------------------------------------------------------------
 
 
+_BACKLOG_DESCRIPTION_MAX = 8000
+
+
 class BacklogCreateRequest(BaseModel):
     title: str
+    description: str | None = None
 
 
 @app.post("/api/backlog", dependencies=[Depends(require_token)])
@@ -3930,29 +3937,40 @@ async def create_backlog_entry(req: BacklogCreateRequest) -> dict[str, Any]:
     title = req.title.strip()
     if not title:
         raise HTTPException(400, detail="title is required")
+    description: str | None = req.description.strip() if req.description else None
+    description = description or None  # empty string → None
+    if description is not None and len(description) > _BACKLOG_DESCRIPTION_MAX:
+        raise HTTPException(
+            400,
+            detail=f"description exceeds {_BACKLOG_DESCRIPTION_MAX} char limit",
+        )
 
     now_iso = datetime.now(timezone.utc).isoformat()
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "INSERT INTO backlog_tasks (title, proposed_by, proposed_at) "
-            "VALUES (?, 'human', ?)",
-            (title, now_iso),
+            "INSERT INTO backlog_tasks (title, description, proposed_by, proposed_at) "
+            "VALUES (?, ?, 'human', ?)",
+            (title, description, now_iso),
         )
         backlog_id = cur.lastrowid
         await c.commit()
     finally:
         await c.close()
 
-    await bus.publish({
+    event: dict[str, Any] = {
         "ts": now_iso,
         "agent_id": "human",
         "type": "backlog_task_proposed",
         "id": backlog_id,
         "title": title,
         "proposed_by": "human",
-    })
-    return {"id": backlog_id, "title": title, "status": "pending"}
+        "description_present": description is not None,
+    }
+    if description is not None:
+        event["description"] = description
+    await bus.publish(event)
+    return {"id": backlog_id, "title": title, "description": description, "status": "pending"}
 
 
 @app.get("/api/backlog", dependencies=[Depends(require_token)])
@@ -3991,7 +4009,8 @@ async def list_backlog(status: str | None = None) -> dict[str, Any]:
 
 
 class BacklogUpdateRequest(BaseModel):
-    title: str
+    title: str | None = None
+    description: str | None = None
 
 
 @app.patch("/api/backlog/{backlog_id}", dependencies=[Depends(require_token)])
@@ -4000,16 +4019,31 @@ async def update_backlog_entry(
     req: BacklogUpdateRequest,
     actor: dict = Depends(audit_actor),
 ) -> dict[str, Any]:
-    """Edit the title of a pending backlog entry (kanban-specs-v2.md §4.0)."""
-    new_title = req.title.strip()
-    if not new_title:
-        raise HTTPException(400, detail="title is required")
+    """Edit the title and/or description of a pending backlog entry (kanban-specs-v2.md §4.0)."""
+    # At least one field must be supplied.
+    if req.title is None and req.description is None:
+        raise HTTPException(400, detail="at least one of title or description is required")
+
+    new_title: str | None = req.title.strip() if req.title is not None else None
+    if new_title is not None and not new_title:
+        raise HTTPException(400, detail="title must not be blank")
+
+    # description: None = unchanged; "" = clear (stored as NULL); non-empty = set.
+    new_description: Any = _SENTINEL
+    if req.description is not None:
+        stripped = req.description.strip()
+        if stripped and len(stripped) > _BACKLOG_DESCRIPTION_MAX:
+            raise HTTPException(
+                400,
+                detail=f"description exceeds {_BACKLOG_DESCRIPTION_MAX} char limit",
+            )
+        new_description = stripped or None  # empty string → NULL
 
     now_iso = datetime.now(timezone.utc).isoformat()
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT id, title, status FROM backlog_tasks WHERE id = ?",
+            "SELECT id, title, description, status FROM backlog_tasks WHERE id = ?",
             (backlog_id,),
         )
         row = await cur.fetchone()
@@ -4021,23 +4055,44 @@ async def update_backlog_entry(
                 409, detail=f"cannot edit backlog entry with status '{row['status']}'"
             )
         old_title = row["title"]
+
+        # Build SET clauses for only the fields being changed.
+        set_parts: list[str] = []
+        params: list[Any] = []
+        if new_title is not None:
+            set_parts.append("title = ?")
+            params.append(new_title)
+        if new_description is not _SENTINEL:
+            set_parts.append("description = ?")
+            params.append(new_description)
+        params.append(backlog_id)
         await c.execute(
-            "UPDATE backlog_tasks SET title = ? WHERE id = ?",
-            (new_title, backlog_id),
+            f"UPDATE backlog_tasks SET {', '.join(set_parts)} WHERE id = ?",
+            params,
         )
+        # Re-read the final row so we return consistent values.
+        cur2 = await c.execute(
+            "SELECT id, title, description FROM backlog_tasks WHERE id = ?",
+            (backlog_id,),
+        )
+        final = dict(await cur2.fetchone())
         await c.commit()
     finally:
         await c.close()
 
-    await bus.publish({
+    event: dict[str, Any] = {
         "ts": now_iso,
         "type": "backlog_entry_updated",
         "id": backlog_id,
         "old_title": old_title,
-        "new_title": new_title,
+        "new_title": final["title"],
         "actor": actor,
-    })
-    return {"id": backlog_id, "title": new_title}
+        "description_present": final["description"] is not None,
+    }
+    if new_description is not _SENTINEL:
+        event["new_description"] = new_description
+    await bus.publish(event)
+    return {"id": backlog_id, "title": final["title"], "description": final["description"]}
 
 
 @app.delete("/api/backlog/{backlog_id}", dependencies=[Depends(require_token)])

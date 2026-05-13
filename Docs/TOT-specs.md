@@ -3051,11 +3051,13 @@ Human task creation supports:
 The backlog is the pre-task inbox where agents and humans propose ideas
 before Coach triages them into tasks (see `kanban-specs-v2.md` §4.0).
 
+**Schema.** `backlog_tasks` table columns: `id`, `title`, `description` (TEXT, nullable), `proposed_by`, `proposed_at`, `status`, `reject_reason`, `promoted_task_id`. Existing rows on upgrade get `description = NULL` via `_ensure_columns`.
+
 | Endpoint | Notes |
 | --- | --- |
-| `POST /api/backlog` | Propose a backlog entry (any caller). Body `{title}`. Returns `{id, title, status, proposed_by, proposed_at}`. Emits `backlog_task_proposed`. |
-| `GET /api/backlog?status=` | List backlog entries. `status=pending` (default) / `all`. Returns `{backlog: [...]}`. 400 on unknown status. |
-| `PATCH /api/backlog/{id}` | Rename a **pending** backlog entry. Body `{title}`. Returns `{id, title}`. 400 if title is blank; 404 if not found; 409 if status ≠ `pending`. Emits `backlog_entry_updated{id, old_title, new_title, actor}`. Token-gated. |
+| `POST /api/backlog` | Propose a backlog entry (any caller). Body `{title, description?}`. Returns `{id, title, description, status}`. `description` max 8000 chars; omit or `null` for none. Emits `backlog_task_proposed{..., description_present: bool}`. |
+| `GET /api/backlog?status=` | List backlog entries. `status=pending` (default) / `all`. Returns `{backlog: [...]}` — each entry includes `description` (string or `null`). 400 on unknown status. |
+| `PATCH /api/backlog/{id}` | Edit a **pending** backlog entry. Body `{title?, description?}` (at least one required). `description: ""` clears to `null`. Returns `{id, title, description}`. 400 if title is blank or description exceeds 8000 chars; 404 if not found; 409 if status ≠ `pending`. Emits `backlog_entry_updated{id, old_title, new_title, actor, description_present: bool}`. Token-gated. |
 | `DELETE /api/backlog/{id}` | Delete a **pending** backlog entry. Returns `{id, deleted: true}`. 404 if not found; 409 if status ≠ `pending`. Emits `backlog_entry_deleted{id, title, actor}`. Token-gated. |
 
 **Status restriction.** Both mutating endpoints check `status = 'pending'`
@@ -3063,15 +3065,16 @@ before acting. Entries that have been promoted or rejected are immutable
 via these paths — the 409 response includes the actual status so the
 caller can display a useful message.
 
-**UI hover-reveal.** The `BacklogCard` component in `kanban.js` renders
-a pencil and trash icon group that appears on card hover (CSS `opacity`
-transition). Clicking the pencil opens an inline `<textarea>` for
-title-only editing (Enter saves, Escape cancels); clicking the trash
-opens a confirmation modal. Both actions call the corresponding HTTP
-endpoints above via `authedFetch`, then call `onRefresh()` to reload
-the column. The two new bus events (`backlog_entry_updated`,
-`backlog_entry_deleted`) are added to the `backlogWatched` set so the
-Kanban board auto-refreshes on remote changes too.
+**UI.** The `BacklogCard` component in `kanban.js` renders a pencil and
+trash icon group on card hover. Clicking the pencil opens an inline edit
+form with two textareas — title (required) and description (optional).
+Clicking the trash opens a confirmation modal. Both call the corresponding
+HTTP endpoints via `authedFetch`, then `onRefresh()`. Description text is
+shown as a preview (first 120 chars) below the card title, with a "more" /
+"less" expand toggle when the text is longer. The `ComposerModal` ("Add to
+backlog") also includes an optional description textarea. The two bus events
+(`backlog_entry_updated`, `backlog_entry_deleted`) are in the `backlogWatched`
+set so the board auto-refreshes on remote changes.
 
 ### 14.6 Messages
 

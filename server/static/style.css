@@ -4964,8 +4964,28 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 /* Inline edit area inside backlog card */
 .kbn-backlog-edit { display: flex; flex-direction: column; gap: 4px; }
 .kbn-backlog-edit-input { width: 100%; box-sizing: border-box; resize: vertical; font-size: 12px; }
+.kbn-backlog-desc-input { width: 100%; box-sizing: border-box; resize: vertical; font-size: 11px; }
 .kbn-backlog-edit-err { font-size: 11px; color: var(--err, #c44); }
 .kbn-backlog-edit-actions { display: flex; gap: 6px; }
+
+/* Description preview on backlog cards */
+.kbn-backlog-desc {
+  font-size: 11px;
+  color: var(--fg-muted, #9aa2af);
+  line-height: 1.4;
+  margin-top: 3px;
+  word-break: break-word;
+}
+.kbn-backlog-expand-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent, #5b9bd5);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.kbn-backlog-expand-btn:hover { text-decoration: underline; }
 .kbn-btn-sm { padding: 2px 8px; font-size: 11px; }
 .kbn-btn-danger { color: var(--err, #c44); border-color: var(--err, #c44); }
 .kbn-btn-danger:hover:not(:disabled) { background: rgba(200,68,68,0.12); }

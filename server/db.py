@@ -922,6 +922,13 @@ async def init_db() -> None:
             # until the migration above runs.
             await _ensure_tasks_kanban_indexes(db)
 
+            # Backlog description (nullable TEXT). Existing rows get NULL.
+            await _ensure_columns(
+                db,
+                "backlog_tasks",
+                [("description", "description TEXT")],
+            )
+
             logger.info("init_db: schema ok, ensuring misc project")
             # Ensure the fallback project + active-project pointer
             # exist on every fresh boot. INSERT OR IGNORE — never
