@@ -808,7 +808,28 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             params.append(normalized)
         if owner is not None and owner != "":
             if owner.lower() in ("null", "none", "unassigned"):
-                where_parts.append("owner IS NULL")
+                # Mirror the UI's "unassigned" classifier (kanban v2): a task
+                # is unassigned when the current stage's role has no active
+                # task_role_assignments row (completed_at IS NULL AND
+                # superseded_by IS NULL AND owner IS NOT NULL).  The legacy
+                # tasks.owner column alone is unreliable after v2 role-state
+                # migration — tasks can have tasks.owner set from an earlier
+                # stage while the current stage has no active assignment.
+                where_parts.append(
+                    "NOT EXISTS ("
+                    "SELECT 1 FROM task_role_assignments tra "
+                    "WHERE tra.task_id = tasks.id "
+                    "AND tra.role = CASE tasks.status "
+                    "  WHEN 'plan'             THEN 'planner' "
+                    "  WHEN 'execute'          THEN 'executor' "
+                    "  WHEN 'audit_syntax'     THEN 'auditor_syntax' "
+                    "  WHEN 'audit_semantics'  THEN 'auditor_semantics' "
+                    "  WHEN 'ship'             THEN 'shipper' "
+                    "  ELSE NULL END "
+                    "AND tra.completed_at IS NULL "
+                    "AND tra.superseded_by IS NULL "
+                    "AND tra.owner IS NOT NULL)"
+                )
             else:
                 where_parts.append("owner = ?")
                 params.append(owner)
@@ -817,13 +838,48 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         params.insert(0, project_id)
         clause = " WHERE " + " AND ".join(where_parts)
 
+        # SQL fragment that maps a task's current stage to its kanban v2 role.
+        _STAGE_TO_ROLE_SQL = (
+            "CASE t.status "
+            "  WHEN 'plan'            THEN 'planner' "
+            "  WHEN 'execute'         THEN 'executor' "
+            "  WHEN 'audit_syntax'    THEN 'auditor_syntax' "
+            "  WHEN 'audit_semantics' THEN 'auditor_semantics' "
+            "  WHEN 'ship'            THEN 'shipper' "
+            "  ELSE NULL END"
+        )
         c = await configured_conn()
         try:
             cur = await c.execute(
-                f"SELECT id, title, status, owner, created_by, parent_id, "
-                f"priority, trajectory, blocked, blocked_reason, created_at "
-                f"FROM tasks{clause} "
-                f"ORDER BY created_at DESC LIMIT 100",
+                f"SELECT t.id, t.title, t.status, t.owner, t.created_by, "
+                f"t.parent_id, t.priority, t.trajectory, t.blocked, "
+                f"t.blocked_reason, t.created_at, "
+                # active_owner: owner of the live (non-completed) role row
+                f"(SELECT tra.owner FROM task_role_assignments tra "
+                f" WHERE tra.task_id = t.id "
+                f" AND tra.role = {_STAGE_TO_ROLE_SQL} "
+                f" AND tra.completed_at IS NULL "
+                f" AND tra.superseded_by IS NULL "
+                f" AND tra.owner IS NOT NULL "
+                f" LIMIT 1) AS active_owner, "
+                # role_done_owner: owner of the completed role row (awaiting
+                # Coach advance), NULL if not yet done
+                f"(SELECT tra.owner FROM task_role_assignments tra "
+                f" WHERE tra.task_id = t.id "
+                f" AND tra.role = {_STAGE_TO_ROLE_SQL} "
+                f" AND tra.completed_at IS NOT NULL "
+                f" AND tra.superseded_by IS NULL "
+                f" LIMIT 1) AS role_done_owner, "
+                # role_done_verdict: verdict of the completed role row (pass/fail),
+                # NULL for non-audit stages or when not yet done
+                f"(SELECT tra.verdict FROM task_role_assignments tra "
+                f" WHERE tra.task_id = t.id "
+                f" AND tra.role = {_STAGE_TO_ROLE_SQL} "
+                f" AND tra.completed_at IS NOT NULL "
+                f" AND tra.superseded_by IS NULL "
+                f" LIMIT 1) AS role_done_verdict "
+                f"FROM tasks t{clause} "
+                f"ORDER BY t.created_at DESC LIMIT 100",
                 params,
             )
             rows = await cur.fetchall()
@@ -832,6 +888,16 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
 
         if not rows:
             return _ok("(no tasks match)")
+
+        # Map status → short role label used in stage_role display.
+        _STATUS_TO_ROLE_LABEL = {
+            "plan": "planner",
+            "execute": "executor",
+            "audit_syntax": "auditor",
+            "audit_semantics": "sem-auditor",
+            "ship": "shipper",
+        }
+
         lines = []
         for r in rows:
             d = dict(r)
@@ -844,9 +910,36 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 blocked = (
                     f" BLOCKED({reason})" if reason else " BLOCKED"
                 )
+            # Prefer active role-assignment owner (kanban v2 source of truth)
+            # over tasks.owner; fall back for archive/non-standard stages.
+            display_owner = d.get("active_owner") or d["owner"] or "-"
+            # stage_role field: shows role name + state for the current stage.
+            #   executor:p3             — active executor is p3
+            #   executor:done           — non-audit role completed, awaiting Coach
+            #   complete:p5:pass        — audit stage complete with pass verdict
+            #   complete:p5:fail        — audit stage complete with fail verdict
+            #   executor:-              — no active/completed assignment (unassigned)
+            #   (omitted for archive/null-role stages)
+            _AUDIT_STATUSES = {"audit_syntax", "audit_semantics"}
+            role_label = _STATUS_TO_ROLE_LABEL.get(d["status"])
+            if role_label:
+                if d.get("active_owner"):
+                    stage_role = f" stage_role={role_label}:{d['active_owner']}"
+                elif d.get("role_done_owner") is not None:
+                    if d["status"] in _AUDIT_STATUSES and d.get("role_done_verdict"):
+                        stage_role = (
+                            f" stage_role=complete:{d['role_done_owner']}:"
+                            f"{d['role_done_verdict']}"
+                        )
+                    else:
+                        stage_role = f" stage_role={role_label}:done"
+                else:
+                    stage_role = f" stage_role={role_label}:-"
+            else:
+                stage_role = ""
             lines.append(
-                f"{d['id']}  [{d['status']}]{traj}{blocked}  "
-                f"owner={d['owner'] or '-'}  pri={d['priority']}  "
+                f"{d['id']}  [{d['status']}]{traj}{blocked}{stage_role}  "
+                f"owner={display_owner}  pri={d['priority']}  "
                 f"{d['title']}{parent}"
             )
         return _ok("\n".join(lines))

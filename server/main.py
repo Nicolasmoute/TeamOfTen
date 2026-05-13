@@ -431,6 +431,17 @@ async def lifespan(app: FastAPI):
         await start_login_reaper()
     except Exception:
         logger.exception("claude_login reaper failed to start (non-fatal)")
+    # Codex in-app OAuth login reaper — drops orphaned login sessions
+    # (subprocess + monitor task) after SESSION_TTL. Mirrors the claude_login
+    # reaper immediately above. Non-POSIX guard lives inside start_login().
+    from server.codex_login import (
+        start_codex_login_reaper,
+        stop_codex_login_reaper,
+    )
+    try:
+        await start_codex_login_reaper()
+    except Exception:
+        logger.exception("codex_login reaper failed to start (non-fatal)")
     # Project CLAUDE.md reconciliation — fire a hidden Coach-driven
     # update for the currently-pinned active project so a redeploy
     # that changes the canonical template at
@@ -463,6 +474,10 @@ async def lifespan(app: FastAPI):
             await stop_login_reaper()
         except Exception:
             logger.exception("claude_login reaper shutdown failed")
+        try:
+            await stop_codex_login_reaper()
+        except Exception:
+            logger.exception("codex_login reaper shutdown failed")
         try:
             await stop_kanban_subscriber()
         except Exception:
@@ -1270,6 +1285,203 @@ async def claude_login_cancel(
         "actor": actor,
     })
     return {"ok": True}
+
+
+# ------------------------------------------------------------------
+# Codex in-app OAuth login. Drives `codex login --device-auth` as a
+# plain subprocess (no pty — Codex stdout is clean ASCII). Device-code
+# flow: UI shows URL + code, user opens URL and types code there, no
+# submit step back to the harness. Completion detected by polling
+# $CODEX_HOME/auth.json mtime in a background task.
+#   1. POST /api/auth/codex/login/start  → {session_id, url, device_code}
+#   2. (User opens URL, enters device code at OpenAI's page)
+#   3. Bus event codex_login_completed when auth.json lands
+#   4. POST /api/auth/codex/login/cancel  → {ok: true}
+# See server/codex_login.py.
+# ------------------------------------------------------------------
+
+@app.post("/api/auth/codex/login/start", dependencies=[Depends(require_token)])
+async def codex_login_start(
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    from server import codex_login as _cdl
+    if sys.platform == "win32":
+        raise HTTPException(
+            501,
+            detail=(
+                "Device-code login is POSIX-only — this harness is running on "
+                "a Windows host. Use the paste-auth.json fallback instead."
+            ),
+        )
+    codex_home = os.environ.get("CODEX_HOME", "").strip()
+    if not codex_home:
+        raise HTTPException(
+            400,
+            detail=(
+                "CODEX_HOME is not set, so the CLI's auth.json would have "
+                "nowhere durable to land. Set it to a persistent path "
+                "(e.g. /data/codex) and redeploy."
+            ),
+        )
+    if not Path(codex_home).is_dir():
+        raise HTTPException(
+            400,
+            detail=(
+                f"CODEX_HOME directory does not exist: {codex_home}. "
+                "Create it on the persistent volume and redeploy."
+            ),
+        )
+    try:
+        import shutil
+        if not shutil.which("codex"):
+            raise HTTPException(
+                502,
+                detail=(
+                    "codex binary not found on PATH inside the container. "
+                    "Verify the Dockerfile installs @openai/codex via npm."
+                ),
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+    try:
+        result = await _cdl.start_login()
+    except RuntimeError as e:
+        raise HTTPException(502, detail=str(e))
+    await bus.publish({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": "system",
+        "type": "codex_login_started",
+        "actor": actor,
+    })
+    return result  # {session_id, url, device_code}
+
+
+@app.post("/api/auth/codex/login/cancel", dependencies=[Depends(require_token)])
+async def codex_login_cancel(
+    payload: dict[str, Any] = Body(...),
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    from server import codex_login as _cdl
+    sid = str(payload.get("session_id") or "").strip()
+    await _cdl.cancel_login(sid)
+    await bus.publish({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": "system",
+        "type": "codex_login_cancelled",
+        "actor": actor,
+    })
+    return {"ok": True}
+
+
+@app.delete("/api/auth/codex", dependencies=[Depends(require_token)])
+async def delete_codex_auth(
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    """Wipe $CODEX_HOME/auth.json. Also cancels any in-flight login sessions.
+    deleted=False (not an error) when the file already didn't exist.
+    """
+    from server import codex_login as _cdl
+    codex_home = os.environ.get("CODEX_HOME", "").strip()
+    if not codex_home:
+        raise HTTPException(
+            400,
+            detail=(
+                "CODEX_HOME is not set, so there is no persisted auth file "
+                "to delete."
+            ),
+        )
+    auth_file = Path(codex_home) / "auth.json"
+    deleted = False
+    try:
+        auth_file.unlink()
+        deleted = True
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise HTTPException(500, detail=f"could not delete {auth_file}: {e}")
+    await _cdl.cancel_all_sessions()
+    await bus.publish({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": "system",
+        "type": "codex_auth_cleared",
+        "path": str(auth_file),
+        "actor": actor,
+    })
+    logger.info(
+        "codex auth cleared at %s (deleted=%s, actor=%s)",
+        auth_file, deleted, actor,
+    )
+    return {
+        "ok": True,
+        "path": str(auth_file),
+        "deleted": deleted,
+        "credentials_present": False,
+    }
+
+
+@app.post("/api/auth/codex", dependencies=[Depends(require_token)])
+async def set_codex_auth(
+    payload: dict[str, Any] = Body(...),
+    actor: dict = Depends(audit_actor),
+) -> dict[str, object]:
+    """Paste-fallback: accept a raw auth.json blob and write it to
+    $CODEX_HOME/auth.json. For operators who can't use the device-code
+    flow (e.g. running on Windows, or the UI flow failed).
+
+    Body: {"auth_json": "<raw JSON string>"} OR {"auth": {...object...}}.
+    """
+    codex_home = os.environ.get("CODEX_HOME", "").strip()
+    if not codex_home:
+        raise HTTPException(
+            400,
+            detail=(
+                "CODEX_HOME is not set, so auth.json has nowhere durable "
+                "to land."
+            ),
+        )
+    raw = payload.get("auth_json")
+    parsed_obj = payload.get("auth")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed_obj = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise HTTPException(400, detail=f"auth_json is not valid JSON: {e}")
+    if not isinstance(parsed_obj, dict):
+        raise HTTPException(
+            400,
+            detail="Provide either `auth_json` (string) or `auth` (object).",
+        )
+    target_dir = Path(codex_home)
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(500, detail=f"could not create {codex_home}: {e}")
+    target_file = target_dir / "auth.json"
+    try:
+        tmp = target_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(parsed_obj, indent=2), encoding="utf-8")
+        try:
+            tmp.chmod(0o600)
+        except OSError:
+            pass
+        tmp.replace(target_file)
+    except OSError as e:
+        raise HTTPException(500, detail=f"write failed: {e}")
+    await bus.publish({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": "system",
+        "type": "codex_auth_pasted",
+        "path": str(target_file),
+        "actor": actor,
+    })
+    logger.info("codex auth written to %s (actor=%s)", target_file, actor)
+    return {
+        "ok": True,
+        "path": str(target_file),
+        "credentials_present": True,
+    }
 
 
 @app.get("/api/status", dependencies=[Depends(require_token)])

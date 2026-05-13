@@ -590,6 +590,42 @@ async def open_thread(
                 break
 
         assert last_exc is not None
+
+        # Auth-failure guard (mirrors server/runtimes/claude.py §2026-05-05).
+        # If $CODEX_HOME/auth.json is absent, the resume failure is almost
+        # certainly an auth error, NOT a stale thread. Clearing codex_thread_id
+        # would nuke thread continuity that comes back the moment the operator
+        # signs in again. Bail without touching the thread id so the outer error
+        # path handles it; the operator can re-sign-in and the next spawn will
+        # resume cleanly.
+        try:
+            from server.codex_login import auth_present
+            if not auth_present():
+                logger.warning(
+                    "CodexRuntime: resume_thread failed for slot=%s "
+                    "thread_id=%s AND auth.json absent — treating as auth "
+                    "failure, NOT clearing thread id",
+                    agent_id, existing,
+                )
+                try:
+                    from server.agents import _emit
+                    await _emit(
+                        agent_id,
+                        "session_resume_blocked",
+                        reason="credentials_missing",
+                        session_id=existing,
+                        error=f"{type(last_exc).__name__}: {last_exc}",
+                        runtime="codex",
+                    )
+                except Exception:
+                    logger.exception(
+                        "CodexRuntime: session_resume_blocked emit failed for slot=%s",
+                        agent_id,
+                    )
+                raise last_exc
+        except ImportError:
+            pass  # codex_login module unavailable — proceed with normal heal
+
         logger.exception(
             "CodexRuntime: resume_thread failed for slot=%s "
             "thread_id=%s — clearing and retrying with start_thread",

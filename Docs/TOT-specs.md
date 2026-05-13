@@ -2168,7 +2168,29 @@ so permissions do not depend on the model truthfully passing its identity.
 
 - Lists up to 100 tasks in active project.
 - Optional `status`.
-- Optional `owner`, with `null`/`none`/`unassigned` matching `owner IS NULL`.
+- Optional `owner`, with `null`/`none`/`unassigned` matching tasks whose
+  current stage has no active `task_role_assignments` row (kanban v2
+  role-state model). Specifically: NOT EXISTS a row for the current
+  stage's role with `completed_at IS NULL AND superseded_by IS NULL AND
+  owner IS NOT NULL`. This mirrors the UI's "unassigned" badge classifier
+  exactly; the legacy `tasks.owner IS NULL` filter is no longer used for
+  the unassigned case.
+- The `owner=` field in each output row shows the active role assignee from
+  `task_role_assignments` (the kanban v2 source of truth), falling back to
+  `tasks.owner` for archive/non-standard stages where no role row exists.
+- Each row for an active kanban stage (plan/execute/audit_syntax/
+  audit_semantics/ship) includes a `stage_role=<role>:<state>` field:
+  - `executor:p3` — live assignment with named owner
+  - `executor:done` — non-audit role row completed (awaiting Coach advance)
+  - `complete:p5:pass` — audit stage completed with pass verdict
+  - `complete:p5:fail` — audit stage completed with fail verdict
+  - `executor:-` — no active or completed assignment (unassigned)
+  - Field is omitted for archive and other non-standard stages.
+  - For audit stages (`audit_syntax`, `audit_semantics`) with a completed
+    role row, the output uses `complete:<owner>:<verdict>` shape instead of
+    `<label>:done` so Coach can see pass/fail inline without querying the
+    audit report. When a completed audit row has no verdict (edge case),
+    falls back to `<label>:done`.
 
 `coord_create_task(title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?)`
 
@@ -2904,6 +2926,50 @@ pointer to the paste-fallback (§14.2).
 A reaper background task (60s tick, 600s TTL) drops orphaned sessions
 whose subprocess has exited or whose `started_at` exceeds the TTL —
 wired into `lifespan` next to the audit watcher and telegram bridge.
+
+### 14.2.2 In-app Codex OAuth login (device-code flow)
+
+Mirrors §14.2.1 for the Codex runtime. Because the Codex CLI uses the
+OAuth 2.0 **Device Authorization Grant** (not PKCE), the flow is
+simpler: the server spawns `codex login --device-auth` as a plain
+subprocess (no pty required — stdout is plain ASCII), extracts the
+verification URL and device code from stdout, and the user enters the
+device code at OpenAI's website in their browser. The harness polls
+`$CODEX_HOME/auth.json` every 2s via a background monitor task;
+completion is detected by the file's mtime advancing past what was
+recorded at session start. There is **no submit step** — the user
+never pastes anything back into the harness.
+
+Key divergences from the Claude flow (§14.2.1):
+
+| Dimension | Claude (§14.2.1) | Codex (this section) |
+| --- | --- | --- |
+| Subprocess I/O | pty (`pyte` for URL extraction) | plain stdout/stderr pipe |
+| Auth artifact | `$CLAUDE_CONFIG_DIR/.credentials.json` | `$CODEX_HOME/auth.json` |
+| Completion signal | success line in stdout OR `.credentials.json` mtime | `auth.json` mtime advance |
+| User action | paste OAuth code back to harness | enter device code at browser URL |
+| Submit endpoint | `POST /api/auth/claude/login/submit` | none |
+| UI device code | n/a | large monospace display + copy button |
+| POSIX guard | yes | yes |
+
+| Endpoint | Notes |
+| --- | --- |
+| `POST /api/auth/codex/login/start` | Spawns `codex login --device-auth`, reads stdout for the verification URL and device code (timeout 15s). Drops any prior in-flight session. Returns `{session_id, url, device_code}` or 502/400. Requires `CODEX_HOME` env var set. Emits `codex_login_started` (actor only). |
+| `POST /api/auth/codex/login/cancel` | Body `{session_id}`. SIGTERM → SIGKILL, cancels monitor task. No-op for unknown ids. Emits `codex_login_cancelled`. |
+| `DELETE /api/auth/codex` | Unlinks `$CODEX_HOME/auth.json`, cancels all sessions. `deleted=false` when file was already absent (not an error). Emits `codex_auth_cleared`. |
+| `POST /api/auth/codex` | Paste fallback: body `{auth_json: string}` or `{auth: object}`. Validates JSON, writes atomically to `$CODEX_HOME/auth.json`. Emits `codex_auth_pasted`. |
+
+A reaper (60s tick, 960s TTL) drops orphaned sessions. Wired into
+`lifespan` next to the Claude login reaper. Module: `server/codex_login.py`.
+
+UI: `TeamCodexSection` in `server/static/app.js` — three-phase state
+machine (`idle` → `awaiting` → `detected`). In `awaiting` phase,
+the URL (with copy/open buttons) and device code (large monospace, bordered)
+are shown. A `setInterval` (3s) polls `/api/team/codex` for
+`chatgpt_session_present`; on detection, transitions to `detected` for 2s
+then returns to `idle`. A `<details>` paste-fallback block (`POST /api/auth/codex`)
+remains available below a separator for operators who already have an
+`auth.json` from another machine.
 
 ### 14.3 Agents
 
