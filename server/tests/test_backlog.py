@@ -515,3 +515,170 @@ async def test_get_backlog_invalid_status(fresh_db: str) -> None:  # noqa: ARG00
     ) as client:
         r = await client.get("/api/backlog?status=bogus")
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------- PATCH /api/backlog/{id}
+
+
+@pytest.mark.asyncio
+async def test_patch_backlog_happy(fresh_db: str) -> None:  # noqa: ARG001
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    row_id = await _insert_backlog("Original title", proposed_by="p1")
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.patch(
+            f"/api/backlog/{row_id}",
+            json={"title": "Renamed title"},
+        )
+    assert r.status_code == 200
+    d = r.json()
+    assert d["id"] == row_id
+    assert d["title"] == "Renamed title"
+
+    row = await _get_backlog(row_id)
+    assert row is not None
+    assert row["title"] == "Renamed title"
+
+
+@pytest.mark.asyncio
+async def test_patch_backlog_404(fresh_db: str) -> None:  # noqa: ARG001
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.patch("/api/backlog/99999", json={"title": "X"})
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_patch_backlog_409_promoted(fresh_db: str) -> None:  # noqa: ARG001
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    row_id = await _insert_backlog("Promoted idea", proposed_by="p1", status="promoted")
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.patch(
+            f"/api/backlog/{row_id}",
+            json={"title": "New name"},
+        )
+    assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_patch_backlog_empty_title(fresh_db: str) -> None:  # noqa: ARG001
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    row_id = await _insert_backlog("Some idea", proposed_by="p1")
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.patch(f"/api/backlog/{row_id}", json={"title": "  "})
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_patch_backlog_emits_event(fresh_db: str) -> None:  # noqa: ARG001
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    row_id = await _insert_backlog("Event idea", proposed_by="p1")
+    q = bus.subscribe()
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            await client.patch(
+                f"/api/backlog/{row_id}",
+                json={"title": "Event idea renamed"},
+            )
+        events = _drain(q)
+    finally:
+        bus.unsubscribe(q)
+
+    updated = [e for e in events if e.get("type") == "backlog_entry_updated"]
+    assert len(updated) == 1
+    assert updated[0]["id"] == row_id
+    assert updated[0]["old_title"] == "Event idea"
+    assert updated[0]["new_title"] == "Event idea renamed"
+
+
+# ---------------------------------------------------------------- DELETE /api/backlog/{id}
+
+
+@pytest.mark.asyncio
+async def test_delete_backlog_happy(fresh_db: str) -> None:  # noqa: ARG001
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    row_id = await _insert_backlog("To be deleted", proposed_by="p1")
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.delete(f"/api/backlog/{row_id}")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["id"] == row_id
+    assert d["deleted"] is True
+
+    row = await _get_backlog(row_id)
+    assert row is None
+
+
+@pytest.mark.asyncio
+async def test_delete_backlog_404(fresh_db: str) -> None:  # noqa: ARG001
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.delete("/api/backlog/99999")
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_backlog_409_rejected(fresh_db: str) -> None:  # noqa: ARG001
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    row_id = await _insert_backlog("Rejected idea", proposed_by="p1", status="rejected")
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.delete(f"/api/backlog/{row_id}")
+    assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_delete_backlog_emits_event(fresh_db: str) -> None:  # noqa: ARG001
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    row_id = await _insert_backlog("Delete event idea", proposed_by="p1")
+    q = bus.subscribe()
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            await client.delete(f"/api/backlog/{row_id}")
+        events = _drain(q)
+    finally:
+        bus.unsubscribe(q)
+
+    deleted = [e for e in events if e.get("type") == "backlog_entry_deleted"]
+    assert len(deleted) == 1
+    assert deleted[0]["id"] == row_id
+    assert deleted[0]["title"] == "Delete event idea"

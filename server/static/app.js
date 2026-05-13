@@ -11926,6 +11926,18 @@ function EventItem({ event }) {
     </div>`;
   }
 
+  if (type === "backlog_entry_updated") {
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · backlog #${event.id} renamed: "${event.old_title}" → "${event.new_title}"</div>
+    </div>`;
+  }
+
+  if (type === "backlog_entry_deleted") {
+    return html`<div class="event sys">
+      <div class="event-meta">${ts} · backlog #${event.id} deleted: "${event.title}"</div>
+    </div>`;
+  }
+
   if (type === "truthscore_started") {
     return html`<div class="event sys">
       <div class="event-meta">${ts} · TruthScore running…</div>

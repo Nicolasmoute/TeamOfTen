@@ -4936,8 +4936,40 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 
 /* Backlog column */
 .kbn-backlog-column { opacity: 0.9; }
-.kbn-backlog-card { cursor: default; border-left-color: var(--muted, #7e8694); }
+.kbn-backlog-card { cursor: default; border-left-color: var(--muted, #7e8694); position: relative; }
 .kbn-backlog-card:hover { border-color: var(--border, #2c3340); }
+
+/* Hover-revealed edit/delete icon buttons on backlog cards */
+.kbn-card-actions.kbn-backlog-actions {
+  display: none;
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  gap: 4px;
+  align-items: center;
+}
+.kbn-backlog-card:hover .kbn-card-actions.kbn-backlog-actions { display: flex; }
+.kbn-card-act-btn {
+  width: 20px; height: 20px; padding: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--muted, #7e8694);
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer; line-height: 1;
+}
+.kbn-card-act-btn:hover { color: var(--fg); border-color: var(--accent, #6da3d4); background: rgba(255,255,255,0.05); }
+.kbn-card-act-btn.kbn-card-act-danger:hover { color: var(--err, #c44); border-color: var(--err, #c44); }
+
+/* Inline edit area inside backlog card */
+.kbn-backlog-edit { display: flex; flex-direction: column; gap: 4px; }
+.kbn-backlog-edit-input { width: 100%; box-sizing: border-box; resize: vertical; font-size: 12px; }
+.kbn-backlog-edit-err { font-size: 11px; color: var(--err, #c44); }
+.kbn-backlog-edit-actions { display: flex; gap: 6px; }
+.kbn-btn-sm { padding: 2px 8px; font-size: 11px; }
+.kbn-btn-danger { color: var(--err, #c44); border-color: var(--err, #c44); }
+.kbn-btn-danger:hover:not(:disabled) { background: rgba(200,68,68,0.12); }
+.kbn-modal-body-text { margin: 0 0 12px; font-size: 13px; line-height: 1.5; color: var(--fg); }
 .kbn-card-meta { display: flex; gap: 8px; align-items: center; }
 .kbn-backlog-proposer {
   font-size: 10px; font-weight: 600; letter-spacing: 0.04em;
