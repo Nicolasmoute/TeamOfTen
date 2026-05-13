@@ -682,3 +682,47 @@ async def test_delete_backlog_emits_event(fresh_db: str) -> None:  # noqa: ARG00
     assert len(deleted) == 1
     assert deleted[0]["id"] == row_id
     assert deleted[0]["title"] == "Delete event idea"
+
+
+# ---------------------------------------------------------------- Auth gate (token required)
+
+
+def test_patch_backlog_auth_gate(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PATCH /api/backlog/{id} requires a valid Bearer token when HARNESS_TOKEN is set."""
+    import asyncio
+    from fastapi.testclient import TestClient
+    asyncio.run(init_db())
+    row_id = asyncio.run(_insert_backlog("Auth test entry", proposed_by="p1"))
+    monkeypatch.setattr("server.main.HARNESS_TOKEN", "secret123")
+    from server.main import app
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.patch(f"/api/backlog/{row_id}", json={"title": "New"})
+    assert r.status_code == 401
+    r = client.patch(
+        f"/api/backlog/{row_id}",
+        json={"title": "New"},
+        headers={"Authorization": "Bearer wrongtoken"},
+    )
+    assert r.status_code == 403
+
+
+def test_delete_backlog_auth_gate(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DELETE /api/backlog/{id} requires a valid Bearer token when HARNESS_TOKEN is set."""
+    import asyncio
+    from fastapi.testclient import TestClient
+    asyncio.run(init_db())
+    row_id = asyncio.run(_insert_backlog("Auth delete entry", proposed_by="p1"))
+    monkeypatch.setattr("server.main.HARNESS_TOKEN", "secret123")
+    from server.main import app
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.delete(f"/api/backlog/{row_id}")
+    assert r.status_code == 401
+    r = client.delete(
+        f"/api/backlog/{row_id}",
+        headers={"Authorization": "Bearer wrongtoken"},
+    )
+    assert r.status_code == 403

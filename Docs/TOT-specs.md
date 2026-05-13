@@ -2980,6 +2980,33 @@ Human task creation supports:
 - optional parent id
 - priority `low`, `normal`, `high`, `urgent`
 
+### 14.5.5 Backlog
+
+The backlog is the pre-task inbox where agents and humans propose ideas
+before Coach triages them into tasks (see `kanban-specs-v2.md` §4.0).
+
+| Endpoint | Notes |
+| --- | --- |
+| `POST /api/backlog` | Propose a backlog entry (any caller). Body `{title}`. Returns `{id, title, status, proposed_by, proposed_at}`. Emits `backlog_task_proposed`. |
+| `GET /api/backlog?status=` | List backlog entries. `status=pending` (default) / `all`. Returns `{backlog: [...]}`. 400 on unknown status. |
+| `PATCH /api/backlog/{id}` | Rename a **pending** backlog entry. Body `{title}`. Returns `{id, title}`. 400 if title is blank; 404 if not found; 409 if status ≠ `pending`. Emits `backlog_entry_updated{id, old_title, new_title, actor}`. Token-gated. |
+| `DELETE /api/backlog/{id}` | Delete a **pending** backlog entry. Returns `{id, deleted: true}`. 404 if not found; 409 if status ≠ `pending`. Emits `backlog_entry_deleted{id, title, actor}`. Token-gated. |
+
+**Status restriction.** Both mutating endpoints check `status = 'pending'`
+before acting. Entries that have been promoted or rejected are immutable
+via these paths — the 409 response includes the actual status so the
+caller can display a useful message.
+
+**UI hover-reveal.** The `BacklogCard` component in `kanban.js` renders
+a pencil and trash icon group that appears on card hover (CSS `opacity`
+transition). Clicking the pencil opens an inline `<textarea>` for
+title-only editing (Enter saves, Escape cancels); clicking the trash
+opens a confirmation modal. Both actions call the corresponding HTTP
+endpoints above via `authedFetch`, then call `onRefresh()` to reload
+the column. The two new bus events (`backlog_entry_updated`,
+`backlog_entry_deleted`) are added to the `backlogWatched` set so the
+Kanban board auto-refreshes on remote changes too.
+
 ### 14.6 Messages
 
 | Endpoint | Notes |
