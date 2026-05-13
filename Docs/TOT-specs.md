@@ -2168,7 +2168,22 @@ so permissions do not depend on the model truthfully passing its identity.
 
 - Lists up to 100 tasks in active project.
 - Optional `status`.
-- Optional `owner`, with `null`/`none`/`unassigned` matching `owner IS NULL`.
+- Optional `owner`, with `null`/`none`/`unassigned` matching tasks whose
+  current stage has no active `task_role_assignments` row (kanban v2
+  role-state model). Specifically: NOT EXISTS a row for the current
+  stage's role with `completed_at IS NULL AND superseded_by IS NULL AND
+  owner IS NOT NULL`. This mirrors the UI's "unassigned" badge classifier
+  exactly; the legacy `tasks.owner IS NULL` filter is no longer used for
+  the unassigned case.
+- The `owner=` field in each output row shows the active role assignee from
+  `task_role_assignments` (the kanban v2 source of truth), falling back to
+  `tasks.owner` for archive/non-standard stages where no role row exists.
+- Each row for an active kanban stage (plan/execute/audit_syntax/
+  audit_semantics/ship) includes a `stage_role=<role>:<state>` field:
+  - `executor:p3` — live assignment with named owner
+  - `executor:done` — role row is completed (awaiting Coach advance)
+  - `executor:-` — no active or completed assignment (unassigned)
+  - Field is omitted for archive and other non-standard stages.
 
 `coord_create_task(title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?)`
 
