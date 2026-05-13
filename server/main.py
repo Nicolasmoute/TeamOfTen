@@ -3990,6 +3990,93 @@ async def list_backlog(status: str | None = None) -> dict[str, Any]:
     return {"backlog": [dict(r) for r in rows]}
 
 
+class BacklogUpdateRequest(BaseModel):
+    title: str
+
+
+@app.patch("/api/backlog/{backlog_id}", dependencies=[Depends(require_token)])
+async def update_backlog_entry(
+    backlog_id: int,
+    req: BacklogUpdateRequest,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, Any]:
+    """Edit the title of a pending backlog entry (kanban-specs-v2.md §4.0)."""
+    new_title = req.title.strip()
+    if not new_title:
+        raise HTTPException(400, detail="title is required")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT id, title, status FROM backlog_tasks WHERE id = ?",
+            (backlog_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(404, detail="backlog entry not found")
+        row = dict(row)
+        if row["status"] != "pending":
+            raise HTTPException(
+                409, detail=f"cannot edit backlog entry with status '{row['status']}'"
+            )
+        old_title = row["title"]
+        await c.execute(
+            "UPDATE backlog_tasks SET title = ? WHERE id = ?",
+            (new_title, backlog_id),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    await bus.publish({
+        "ts": now_iso,
+        "type": "backlog_entry_updated",
+        "id": backlog_id,
+        "old_title": old_title,
+        "new_title": new_title,
+        "actor": actor,
+    })
+    return {"id": backlog_id, "title": new_title}
+
+
+@app.delete("/api/backlog/{backlog_id}", dependencies=[Depends(require_token)])
+async def delete_backlog_entry(
+    backlog_id: int,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, Any]:
+    """Delete a pending backlog entry (kanban-specs-v2.md §4.0)."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT id, title, status FROM backlog_tasks WHERE id = ?",
+            (backlog_id,),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(404, detail="backlog entry not found")
+        row = dict(row)
+        if row["status"] != "pending":
+            raise HTTPException(
+                409, detail=f"cannot delete backlog entry with status '{row['status']}'"
+            )
+        entry_title = row["title"]
+        await c.execute("DELETE FROM backlog_tasks WHERE id = ?", (backlog_id,))
+        await c.commit()
+    finally:
+        await c.close()
+
+    await bus.publish({
+        "ts": now_iso,
+        "type": "backlog_entry_deleted",
+        "id": backlog_id,
+        "title": entry_title,
+        "actor": actor,
+    })
+    return {"id": backlog_id, "deleted": True}
+
+
 @app.get("/api/tasks", dependencies=[Depends(require_token)])
 async def list_tasks(status: str | None = None, owner: str | None = None) -> dict[str, Any]:
     project_id = await resolve_active_project()
