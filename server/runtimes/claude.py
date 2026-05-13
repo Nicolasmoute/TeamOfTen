@@ -217,6 +217,23 @@ class ClaudeRuntime:
             except ValueError:
                 _ts_threshold = "30"
             options_kwargs["env"]["ENABLE_TOOL_SEARCH"] = f"auto:{_ts_threshold}"
+        # File-read token ceiling — the Claude CLI's Read tool caps its
+        # output at CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS tokens.
+        # Set HARNESS_FILE_READ_MAX_OUTPUT_TOKENS to a positive integer
+        # to raise (or lower) the ceiling for all Claude agent turns.
+        # When unset the CLI's built-in default applies (2000 tokens as
+        # of Claude Code 2.x). Override only when agents routinely hit
+        # truncated reads on large source files.
+        _fr_raw = os.environ.get("HARNESS_FILE_READ_MAX_OUTPUT_TOKENS", "").strip()
+        if _fr_raw:
+            try:
+                _fr_val = int(_fr_raw)
+                if _fr_val > 0:
+                    options_kwargs["env"][
+                        "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS"
+                    ] = str(_fr_val)
+            except ValueError:
+                pass  # malformed — ignore, let the CLI default win
         if tc.model:
             options_kwargs["model"] = tc.model
         options_kwargs["permission_mode"] = "plan" if tc.plan_mode else "default"

@@ -4413,6 +4413,7 @@ implementation):
 | `HARNESS_STALE_TASK_CHECK_INTERVAL_SECONDS` | `60` | Watchdog loop cadence |
 | `HARNESS_AUTO_COMPACT_THRESHOLD` | `0.5` | Context fraction for auto-compact (lowered from 0.7 on 2026-05-09) |
 | `HARNESS_THINKING_BUDGET_TOKENS` | `8000` | Extended-thinking budget when a Player's `thinking_override` (or per-pane toggle) is on. Claude runtime only; clamped ≥ 1024. |
+| `HARNESS_FILE_READ_MAX_OUTPUT_TOKENS` | unset | When set to a positive integer, injects `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS=<value>` into each Claude agent's env, raising (or lowering) the Read-tool token ceiling above the CLI's built-in default (~2 000 tokens). Claude runtime only; ignored when unset. |
 | `HARNESS_HANDOFF_TOKEN_BUDGET` | `20000` | Recent exchange budget |
 | `HARNESS_STREAM_TOKENS` | `true` | Token delta streaming. Set to `false`/`0`/`no`/`off` to disable (only needed for the rare CLI build that crashes on the underlying flag). |
 | `HARNESS_INTERACTION_TIMEOUT_SECONDS` | `1800` | Question/plan timeout |
