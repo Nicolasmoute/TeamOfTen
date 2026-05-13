@@ -3,8 +3,9 @@
 Two paths matter:
   - **Local** under `<project>/working/compass/` — same lane as
     knowledge / memory (mutable working state). Source of truth.
-  - **Remote** under `projects/<id>/compass/` on kDrive — flatter
-    user-facing tree, mirrors the knowledge/decisions convention.
+  - **Remote** under `projects/<id>/compass/` on the configured cloud
+    drive — flatter user-facing tree, mirrors the knowledge/decisions
+    convention.
 
 Layout (per spec §6, adapted to the harness):
 
@@ -23,7 +24,7 @@ Layout (per spec §6, adapted to the harness):
         stale.json                  pending stale proposals
         duplicates.json             pending duplicate-merge proposals
 
-Functions are sync (no DB or kDrive lookup). The active project must
+Functions are sync (no DB or cloud-drive lookup). The active project must
 be passed in by the caller, which already resolves it via
 `server.db.resolve_active_project()`. Keeping these sync makes path
 helpers trivially testable.
@@ -64,7 +65,7 @@ class CompassPaths:
     reconciliation_proposals: Path
     # Per-audit markdown reports — one .md file per audit, alongside
     # the structured `audits.jsonl` index. The .md is the human-
-    # readable surface (Files pane, kDrive on phone, attachable to
+    # readable surface (Files pane, cloud drive on phone, attachable to
     # Coach decisions); the jsonl drives the dashboard. See
     # Docs/kanban-specs-v2.md §5.3.
     audit_reports_dir: Path
@@ -125,12 +126,12 @@ def ensure_compass_scaffold(project_id: str) -> CompassPaths:
 
 
 def remote_root(project_id: str) -> str:
-    """kDrive path for a project's Compass tree.
+    """Cloud-drive path for a project's Compass tree.
 
-    Note: drops the `working/` segment for the remote path — kDrive
-    is human-facing and a flatter tree is friendlier. Matches the
-    knowledge/ and memory/ conventions in `server.knowledge` /
-    `server.tools.coord_update_memory`.
+    Note: drops the `working/` segment for the remote path — the
+    cloud-drive view is human-facing and a flatter tree is friendlier.
+    Matches the knowledge/ and memory/ conventions in `server.knowledge`
+    / `server.tools.coord_update_memory`.
 
     Returns a posix-style relative string (no leading slash). The
     webdav client treats paths as relative to `HARNESS_WEBDAV_URL`.

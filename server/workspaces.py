@@ -97,6 +97,20 @@ def _mask_userinfo(text: str, *expanded_urls: str) -> str:
     return out
 
 
+def _strip_userinfo(url: str) -> str:
+    """Return the URL with any `user[:pass]@` userinfo segment removed.
+    Used to detect "same repo, different auth" — i.e. adding/rotating a
+    PAT on an already-cloned remote, which should rewrite the stored
+    origin URL instead of demanding an on-disk wipe."""
+    if not url:
+        return ""
+    return re.sub(
+        r"^([a-zA-Z][a-zA-Z0-9+.-]*://)[^@/\s]+@",
+        r"\1",
+        url,
+    )
+
+
 async def _read_project_repo_url(project_id: str) -> str:
     """Load `projects.repo_url` for the given project id. Returns ""
     on missing project or empty URL — callers treat both as "no repo
@@ -331,6 +345,32 @@ async def _ensure_base_clone(bare: Path, repo_url_raw: str) -> None:
         if bare.exists() and (bare / ".git").exists():
             current = await _read_remote_url(bare)
             if current and current != expected:
+                # Two flavors of mismatch:
+                #   1. Same repo (scheme+host+path match), different
+                #      userinfo → rotating or adding a PAT. Rewrite
+                #      origin in place; per-slot worktrees share .git
+                #      with the bare clone so they pick up the new URL
+                #      automatically. No disk wipe needed.
+                #   2. Different repo → real config change. Still
+                #      raise so the operator wipes <bare> deliberately,
+                #      otherwise we'd silently push agent work to a
+                #      different remote.
+                if _strip_userinfo(current) == _strip_userinfo(expected):
+                    logger.info(
+                        "base repo remote at %s: rewriting origin "
+                        "(userinfo change)", bare,
+                    )
+                    code, _, err = await _run(
+                        ["git", "-C", str(bare),
+                         "remote", "set-url", "origin", expected],
+                        timeout=10,
+                    )
+                    if code != 0:
+                        raise RuntimeError(
+                            f"git remote set-url exited {code}: "
+                            f"{_mask_userinfo(err.strip(), expected)}"
+                        )
+                    return
                 # Mask both URLs in the error so a PAT can't leak
                 # into logs / events. We compare the raw expanded
                 # values internally but report the masked forms.

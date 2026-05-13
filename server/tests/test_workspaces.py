@@ -21,6 +21,30 @@ from pathlib import Path
 import pytest
 
 from server.db import configured_conn, init_db, set_active_project
+from server.workspaces import _strip_userinfo
+
+
+def test_strip_userinfo_handles_pat_and_unauthenticated_urls() -> None:
+    """`_strip_userinfo` underpins the "same repo, different auth"
+    branch in `_ensure_base_clone`. Adding/rotating a PAT must rewrite
+    `origin` rather than demand a disk wipe — `_strip_userinfo` is
+    what lets us tell those cases apart from a real repo change."""
+    bare = "https://github.com/Nicolasmoute/TeamOfTen.git"
+    with_pat = "https://github_pat_xxxYYY@github.com/Nicolasmoute/TeamOfTen.git"
+    with_user_pw = "https://user:secret@github.com/Nicolasmoute/TeamOfTen.git"
+    different_repo = "https://github.com/Nicolasmoute/OtherRepo.git"
+
+    assert _strip_userinfo(bare) == bare
+    assert _strip_userinfo(with_pat) == bare
+    assert _strip_userinfo(with_user_pw) == bare
+    # Same-repo-different-auth detection: the two stripped forms match.
+    assert _strip_userinfo(bare) == _strip_userinfo(with_pat)
+    # Different repos must NOT collapse to the same stripped form.
+    assert _strip_userinfo(bare) != _strip_userinfo(different_repo)
+    # ssh / git protocol URLs have no userinfo segment — passthrough.
+    ssh = "git@github.com:Nicolasmoute/TeamOfTen.git"
+    assert _strip_userinfo(ssh) == ssh
+    assert _strip_userinfo("") == ""
 
 
 def _drain_provisioned_events(q) -> list[dict]:

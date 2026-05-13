@@ -22,7 +22,7 @@ Two loops, two cadences:
 Both loops:
 - track each pushed file in `sync_state(project_id, tree, path,
   mtime, size, sha256, last_synced_at)`,
-- detect deletions (file gone locally → DELETE on kDrive +
+- detect deletions (file gone locally → DELETE on the cloud drive +
   `sync_state` row),
 - retry transient failures up to `HARNESS_KDRIVE_RETRY_MAX` (default 3)
   with 1s→2s→4s exponential backoff capped at 30s,
@@ -233,7 +233,7 @@ async def _with_kdrive_retry(
     tree: str,
     path: str,
 ) -> bool:
-    """Run an async kDrive op with 1s→2s→4s … exponential backoff,
+    """Run an async cloud-drive op with 1s→2s→4s … exponential backoff,
     capped at HARNESS_KDRIVE_RETRY_CAP_S, up to HARNESS_KDRIVE_RETRY_MAX
     attempts.
 
@@ -423,11 +423,11 @@ async def _push_tree(
 
 async def push_project_tree(project_id: str) -> dict[str, dict[str, int]]:
     """Push one project's tree (`projects/<slug>/` minus excludes) and
-    its wiki sub-folder (`wiki/<slug>/`) to kDrive.
+    its wiki sub-folder (`wiki/<slug>/`) to the cloud drive.
 
     Returns `{'project': counts, 'wiki': counts}`. Both keys present
     even on no-op so callers can render symmetric counters. No-op when
-    kDrive is disabled.
+    the cloud-drive mirror is disabled.
     """
     out: dict[str, dict[str, int]] = {
         "project": {"pushed": 0, "unchanged": 0, "failed": 0, "deleted": 0},
@@ -711,7 +711,7 @@ async def push_global_tree() -> dict[str, int]:
     point at an existing project row, and misc is always present).
     The path column carries the global-tree-relative path verbatim
     (e.g. `CLAUDE.md`, `skills/llm-wiki/SKILL.md`, `wiki/INDEX.md`,
-    `wiki/<concept>.md`); the kDrive remote path is identical, so
+    `wiki/<concept>.md`); the cloud-drive remote path is identical, so
     `_project_remote_for` maps `tree=global` → `<rel>` directly.
     """
     if not webdav.enabled:
@@ -830,9 +830,10 @@ async def push_global_tree() -> dict[str, int]:
 async def project_sync_loop() -> None:
     """Active-project file sync. Re-resolves the active project at the
     start of every cycle so a project switch (Phase 3) takes effect on
-    the next tick without restarting the loop. Skips when kDrive is
-    disabled — the loop stays alive so a runtime-enabled mirror
-    (UI-managed creds) is picked up on the next cycle."""
+    the next tick without restarting the loop. Skips when the
+    cloud-drive mirror is disabled — the loop stays alive so a
+    runtime-enabled mirror (UI-managed creds) is picked up on the
+    next cycle."""
     logger.info(
         "project sync loop starting: every %ds (active project only)",
         PROJECT_SYNC_INTERVAL,

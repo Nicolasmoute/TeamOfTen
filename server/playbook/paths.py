@@ -15,7 +15,7 @@ Layout (per spec §2):
                       / superseded / deleted
       runs.jsonl      one line per reflection / bootstrap run
 
-Functions are sync (no DB lookup, no kDrive I/O). Lazy `mkdir` on
+Functions are sync (no DB lookup, no cloud-drive I/O). Lazy `mkdir` on
 access so a fresh deploy works without an explicit init step (spec
 §4.5 step 1).
 

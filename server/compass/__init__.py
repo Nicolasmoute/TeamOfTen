@@ -9,14 +9,14 @@ human approval, never blocks Players.
 Spec: Docs/compass-specs.md (read it before touching anything here).
 Implementation plan: per-project, opt-in, Coach-only at the MCP
 surface, harness-styled UI in v1. State lives in JSON under
-`/data/projects/<id>/working/compass/` with a synchronous kDrive
+`/data/projects/<id>/working/compass/` with a synchronous cloud-drive
 mirror at `projects/<id>/compass/` (working/ prefix dropped on remote
 for a flatter human-facing tree, matching the knowledge/ convention).
 
 The package is layered:
   - `config` — caps, thresholds, schema version, env knobs
   - `paths` — per-project compass directory resolver (local + remote)
-  - `store` — JSON read/write, atomic save, kDrive mirror
+  - `store` — JSON read/write, atomic save, cloud-drive mirror
   - `llm` — `call()` wrapper around `claude_agent_sdk.query()` +
     `parse_json_safe()` helper. Uses Max-OAuth via the SDK; cost
     feeds the existing `turns` ledger under agent_id="compass".

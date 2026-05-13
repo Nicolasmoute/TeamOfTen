@@ -232,10 +232,10 @@ def _utc_now_iso() -> str:
 async def _write_with_mirror(
     local_path: Path, content: str, kdrive_rel: str,
 ) -> None:
-    """Write `content` to `local_path` and synchronously mirror to
-    kDrive when enabled. Mirrors the pattern in
-    `coord_update_memory` / `coord_write_decision`. The kDrive write
-    is best-effort — local is the source of truth."""
+    """Write `content` to `local_path` and synchronously mirror to the
+    cloud drive when enabled. Mirrors the pattern in
+    `coord_update_memory` / `coord_write_decision`. The cloud-drive
+    write is best-effort — local is the source of truth."""
     local_path.parent.mkdir(parents=True, exist_ok=True)
     local_path.write_text(content, encoding="utf-8")
     if webdav.enabled:
@@ -243,7 +243,7 @@ async def _write_with_mirror(
             await webdav.write_text(kdrive_rel, content)
         except Exception:
             logger.exception(
-                "coach todos: kDrive mirror failed for %s", kdrive_rel,
+                "coach todos: cloud-drive mirror failed for %s", kdrive_rel,
             )
 
 

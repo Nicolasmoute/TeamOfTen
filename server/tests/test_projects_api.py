@@ -200,7 +200,7 @@ async def test_run_switch_emits_full_step_sequence(
 ) -> None:
     """The switch flow per §6 emits steps in order:
     started → push_current → pull_new → swap_pointer → reload →
-    project_switched. Stub the kDrive primitives so the test runs
+    project_switched. Stub the cloud-drive primitives so the test runs
     without WebDAV."""
     await init_db()
     c = await configured_conn()

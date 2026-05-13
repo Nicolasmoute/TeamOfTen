@@ -129,7 +129,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     blocked_reason              TEXT,
     -- Spec markdown path, written by Coach (or delegated planner) before
     -- the task can transition plan→execute (standard tasks only). Mirrors
-    -- to kDrive at the same relative path. Required gate; see
+    -- to the cloud drive at the same relative path. Required gate; see
     -- `_assert_spec_present` in tools.py.
     spec_path                   TEXT,
     spec_written_at             TEXT,

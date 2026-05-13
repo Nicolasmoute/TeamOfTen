@@ -3,7 +3,7 @@
 Whitelists a small set of named roots on disk (context, knowledge,
 decisions) and exposes three operations: walk the tree, read a file,
 write a file. Writes are routed through the owning module so side
-effects — cache invalidation, kDrive mirror, event emission — fire
+effects — cache invalidation, cloud-drive mirror, event emission — fire
 the same way they would if the edit came from an MCP tool.
 
 Every path goes through _resolve() which:
@@ -444,7 +444,7 @@ async def write_text(
     """Save `content` to the target file under `root_key`.
 
     Plain disk write — the two roots (`global`, `project`) cover every
-    editable path; per-project sync handles the kDrive mirror.
+    editable path; per-project sync handles the cloud-drive mirror.
 
     `create_only=True` makes the call refuse to overwrite an existing
     file (raises `FileAlreadyExists` → HTTP 409). The Files-pane

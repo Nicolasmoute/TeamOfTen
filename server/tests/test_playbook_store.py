@@ -1,7 +1,7 @@
 """Playbook store tests — spec §18.1 §test_playbook_store.
 
 Covers atomic JSON I/O, missing-file tolerance, weight_history cap,
-schema_version mismatch handling, and kDrive failure event emission.
+schema_version mismatch handling, and cloud-drive failure event emission.
 """
 
 from __future__ import annotations
