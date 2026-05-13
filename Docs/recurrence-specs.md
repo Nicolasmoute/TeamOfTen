@@ -169,10 +169,21 @@ prompt from project state, with priority:
    coordination message, capture a new coach-todo, audit Player
    work, propose-and-execute a next step). Don't end idle when
    objectives exist.
-5. **Empty state — objectives absent or empty** — only when no
-   `## Project objectives` section appears in the system prompt
-   (file missing, empty, or fully whitespace) does Coach end the
-   turn without acting. Nothing else licenses an idle end.
+5. **Empty state — two idle-exit licences:**
+   - **(a)** No `## Project objectives` section appears in the system prompt
+     (file missing, empty, or fully whitespace). Coach ends the turn without acting.
+   - **(b)** Rungs (1)–(3) all yielded nothing AND nothing has changed in
+     kanban / inbox / coach-todos / Player health since Coach's last turn.
+     This is the **steady-state idle** licence — Coach acknowledges the
+     observation explicitly with a brief text note ("steady-state idle —
+     nothing changed since <prior-turn-ts>; no action this tick") so the
+     timeline records that Coach saw the steady state rather than silently
+     skipping. This closes the failure mode observed in Coach's 2026-05-12
+     report where the rule forced performative micro-action during genuine
+     steady state, and Coach's only workaround was to throttle the tick
+     to disable.
+
+   Nothing else licenses an idle end.
 
 The composed prompt is sent as a normal user-role message. The system prompt
 already contains the project objectives + open todos (see §6), so the user
@@ -206,9 +217,15 @@ prompt is short — it just orients Coach to the priority order:
 > work, propose-and-execute a next step). Don't end idle when
 > objectives exist.
 >
-> End the turn without acting only when no "## Project objectives"
-> section appears in your system prompt above (file absent or
-> whitespace-only). Nothing else licenses an idle end.
+> End the turn without acting in one of two cases: (a) no "## Project
+> objectives" section appears in your system prompt above (file
+> absent or whitespace-only); (b) rungs (1)-(3) are all empty AND
+> nothing has changed in kanban / inbox / coach-todos / Player
+> health since your last turn. In case (b), acknowledge explicitly
+> with a brief text note ("steady-state idle — nothing changed since
+> <prior-turn-ts>; no action this tick") so the timeline shows you
+> observed the steady state rather than silently skipping. Nothing
+> else licenses an idle end.
 
 Each branch is intentionally directive. The end-quietly clause is
 gated strictly on objectives being absent — nothing else licenses

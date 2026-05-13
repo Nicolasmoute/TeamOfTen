@@ -135,9 +135,13 @@ def _format_bucket(label: str, statements: Iterable[Statement]) -> str:
     items.sort(key=_sort_key)
     lines = [f"**{label}:**"]
     for stmt in items:
-        # Spec §6.2 example: `- [0.92] Audit every code-touching task ...`
-        # Two-decimal weight with leading bracket.
-        lines.append(f"- [{stmt.weight:.2f}] {stmt.text}")
+        # Spec §6.2: include the pb-id alongside the weight so Coach
+        # can target an existing row via `coord_propose_playbook_changes`
+        # (adjust / merge / archive ops require the id). Without it
+        # Coach can only `create`, producing near-duplicate rows that
+        # the dedup proposer eventually merges — wasteful churn.
+        # 2026-05-12 report (pb-065/pb-066 collision).
+        lines.append(f"- [{stmt.id} / {stmt.weight:.2f}] {stmt.text}")
     return "\n".join(lines)
 
 

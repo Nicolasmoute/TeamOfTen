@@ -159,7 +159,7 @@ def test_canonical_template_includes_kanban_lifecycle_section() -> None:
     lifecycle paragraph so Coach + Players see the explicit-review
     model every turn."""
     body = canonical_project_claude_md_template(name="Misc", slug="misc")
-    assert "Task lifecycle (kanban)" in body
+    assert "Task lifecycle (kanban v2)" in body
     # v2 stage order in the template's prose (wrap-tolerant).
     flat = " ".join(body.split())
     assert "plan → execute → audit_syntax" in flat
@@ -170,8 +170,8 @@ def test_canonical_template_includes_kanban_lifecycle_section() -> None:
     # The for-Players / for-Coach block headings.
     assert "**For Players:**" in body
     assert "**For Coach:**" in body
-    # Pools-are-FYI-only language (the load-bearing v2 distinction).
-    assert "pools are FYI only" in body
+    # Pools-are-FYI language (the load-bearing v2 distinction).
+    assert "pools are FYI" in body
 
 
 def test_canonical_template_missing_falls_back(
@@ -483,7 +483,7 @@ def test_write_project_claude_md_stub_uses_canonical_template(
     assert "# Project: Misc" in text
     assert "https://example.com/misc" in text
     # Canonical template fold — kanban paragraph must land too.
-    assert "Task lifecycle (kanban)" in text
+    assert "Task lifecycle (kanban v2)" in text
 
 
 def test_write_project_claude_md_stub_first_write_only(

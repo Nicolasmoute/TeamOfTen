@@ -767,6 +767,14 @@ def test_tick_base_prompt_constant_matches_spec() -> None:
     # inbox/todos being empty.
     assert "absent" in p or "empty" in p
     assert "Project objectives" in p
+    # 2026-05-12 relaxation (Fix 11): a second idle-exit licence
+    # exists for steady-state where rungs (1)-(3) are empty AND
+    # nothing has changed since the prior turn. The "explicit
+    # acknowledge with a brief text note" requirement keeps the
+    # exit observable. Pin the tokens, not the wording, so the
+    # licence can't be silently rewritten away.
+    assert "steady-state idle" in p.lower()
+    assert "nothing has changed" in p.lower()
 
 
 async def test_scheduler_uses_compose_tick_prompt(

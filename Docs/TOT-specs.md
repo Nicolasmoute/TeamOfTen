@@ -1334,9 +1334,12 @@ proposer, resolver, optional note) are the audit trail.
 Actual current caveats:
 
 - Knowledge writes use `working/knowledge/`.
-- Memory DB mirror path in `coord_update_memory` currently writes to
-  `projects/<slug>/memory/<topic>.md` on WebDAV, while canonical v2 local
-  memory path is `working/memory/`. That WebDAV path should be reconciled.
+- Memory has **no on-disk file** by design (resolved 2026-05-13). The
+  store is the SQLite `memory_docs` table; the WebDAV mirror at
+  `projects/<id>/memory/<topic>.md` is for human readability only.
+  `working/memory/` is intentionally absent from the project scaffold
+  (`_PROJECT_SUBDIRS` in `server/paths.py`). Agents access exclusively
+  via `coord_update_memory` / `coord_read_memory` / `coord_list_memory`.
 - Outputs module still defaults to global `/data/outputs`, not
   `/data/projects/<slug>/outputs`.
 
@@ -2241,7 +2244,17 @@ The v1 tools `coord_claim_task` / `coord_accept_role` /
 - Max 20,000 chars.
 - Upserts and increments version.
 - Emits `memory_updated`.
-- Fire-and-forget mirrors a markdown file to WebDAV when enabled.
+- Fire-and-forget mirrors a markdown file to WebDAV when enabled (`projects/<id>/memory/<topic>.md`).
+
+**Important access contract:** the memory store is SQLite + kDrive
+WebDAV mirror only. There is **no** local on-disk file under
+`/data/projects/<id>/working/memory/` — and that subdirectory is
+intentionally not part of the project scaffold (see §4.6). Agents
+reading via the `Read` tool will find nothing. Always use the MCP
+tools (`coord_*_memory`). The kDrive mirror is for the human's
+benefit (browse on disk / in the kDrive web UI), not the agents'.
+Coach's 2026-05-12 report flagged the prior confusion when the
+template implied a path-style store.
 
 ### 12.4 Knowledge
 
@@ -4489,9 +4502,10 @@ and the desired architecture are still not perfectly aligned.
    - Docker symlink points to `/data/attachments`, not active project
      attachments.
 
-4. Memory WebDAV mirror path is inconsistent with v2 local layout.
-   - Local project memory path is `working/memory`.
-   - `coord_update_memory` mirrors to `projects/<slug>/memory/<topic>.md`.
+4. (Resolved 2026-05-13.) Memory has no on-disk local copy by design.
+   The store is `memory_docs` (SQLite) + WebDAV mirror at
+   `projects/<slug>/memory/<topic>.md`. `working/memory/` is intentionally
+   absent from `_PROJECT_SUBDIRS`; agents use `coord_*_memory` exclusively.
 
 5. UI `/tools` help still mentions `coord_write_context`, which was removed.
 

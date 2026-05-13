@@ -357,6 +357,18 @@ def build_router(
             audits = [a for a in audits if a.verdict == verdict]
         return JSONResponse({"audits": [_audit_dict(a) for a in audits[-limit:]]})
 
+    @router.get("/audit-watcher/health", dependencies=deps)
+    async def audit_watcher_health() -> JSONResponse:
+        """Snapshot of the auto-audit watcher's runtime state.
+
+        Answers: "is the watcher subscribed? when did it last fire
+        per project? when did it last skip and why?" Closes the
+        observability gap where Coach saw no audit verdicts and
+        couldn't tell whether the watcher was healthy-and-quiet or
+        sick-and-silent (Coach 2026-05-12 report, bug #13)."""
+        from server.compass import audit_watcher as cmp_audit_watcher  # noqa: PLC0415
+        return JSONResponse(cmp_audit_watcher.snapshot_health())
+
     # ---------------------------------------- enable / disable
 
     @router.post("/enable", dependencies=deps)

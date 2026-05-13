@@ -59,7 +59,10 @@ def test_format_bucket_renders_lines() -> None:
     items = [_stmt("pb-001", 0.92, text="audit code")]
     body = _format_bucket("Validated (≥ 0.85)", items)
     assert "**Validated" in body
-    assert "[0.92]" in body
+    # Statement rows carry the pb-id alongside the weight (spec §6.2)
+    # so Coach can target an existing row via coord_propose_playbook_changes
+    # adjust/merge/archive ops without creating near-duplicates.
+    assert "[pb-001 / 0.92]" in body
     assert "audit code" in body
 
 
@@ -77,7 +80,7 @@ def test_render_with_statements_includes_heading(monkeypatch: pytest.MonkeyPatch
     ])
     out = _render_full(lat)
     assert "## Orchestration playbook" in out
-    assert "[0.92]" in out
+    assert "[pb-001 / 0.92]" in out
     assert "audit code changes" in out
 
 

@@ -19,7 +19,7 @@ project's `agent_project_roles` rows.
 - `working/conversations/` — agent conversation snapshots; `live: true` when persisted mid-session
 - `working/handoffs/`      — inter-agent context handoffs
 - `working/knowledge/`     — text artifacts written via `coord_write_knowledge` (specs, research, design drafts that evolve)
-- `working/memory/`        — shared scratchpad via `coord_*_memory` (overwrite-on-update by topic; event log keeps history)
+- **Memory (no on-disk file)** — `coord_update_memory` / `coord_read_memory` / `coord_list_memory`. Topic-keyed scratchpad, overwrite-on-write, version history in the event log. Lives in the harness DB; mirrored to kDrive at `projects/<id>/memory/<topic>.md` for human readability. **Not readable via `Read`** — use the MCP tools.
 - `working/plans/`         — task breakdowns, drafts
 - `working/workspace/`     — generic scratch
 - `outputs/`               — binary deliverables; prefer `coord_save_output` for canonical writes

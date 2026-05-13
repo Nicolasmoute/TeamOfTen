@@ -367,9 +367,16 @@ TICK_BASE_PROMPT = (
     "Player work, propose-and-execute a next step). Don't end idle "
     "when objectives exist.\n"
     "\n"
-    "End the turn without acting only when no \"## Project "
-    "objectives\" section appears in your system prompt above (file "
-    "absent or whitespace-only). Nothing else licenses an idle end."
+    "End the turn without acting in one of two cases: (a) no \"## "
+    "Project objectives\" section appears in your system prompt "
+    "above (file absent or whitespace-only); (b) rungs (1)-(3) are "
+    "all empty AND nothing has changed in kanban / inbox / coach-"
+    "todos / Player health since your last turn. In case (b), "
+    "acknowledge explicitly with a brief text note (\"steady-state "
+    "idle — nothing changed since <prior-turn-ts>; no action this "
+    "tick\") so the timeline shows you observed the steady state "
+    "rather than silently skipping. Nothing else licenses an idle "
+    "end."
 )
 
 

@@ -134,7 +134,13 @@ _PROJECT_SUBDIRS = (
     "working/conversations",
     "working/handoffs",
     "working/knowledge",
-    "working/memory",
+    # Note: `working/memory` is intentionally absent. The memory
+    # subsystem (`coord_update_memory` / `coord_read_memory` /
+    # `coord_list_memory`) lives in the SQLite `memory_docs` table
+    # and mirrors to kDrive at `projects/<id>/memory/<topic>.md`.
+    # There is no local-disk file — agents reading via Read would
+    # find an empty dir, which previously caused recurring confusion
+    # (Coach 2026-05-12 report). Use the MCP tools.
     "working/plans",
     "working/workspace",
     "outputs",

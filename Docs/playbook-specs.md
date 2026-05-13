@@ -577,22 +577,24 @@ Natural progression for Coach: lifecycle policy (in coord block — bedrock mech
 Your coordination memory. Each entry has a confidence weight in [0, 1] — high = validated discipline, low = validated anti-pattern, ~0.5 = uncertain. Apply high-confidence patterns by default; deviate with explicit reason. Update this lattice mid-turn via `coord_propose_playbook_changes`; a nightly reflection run also evolves it from observed evidence. Coach-only context — Players don't see this block, so coordination discipline reaches them through the wake notes you compose at each `coord_approve_stage`.
 
 **Validated (weight ≥ 0.85):**
-- [0.92] Audit every code-touching task except trivially mechanical edits.
-- [0.88] Two-axis audit (formal + semantic) catches different bug classes; use both for non-trivial changes.
+- [pb-001 / 0.92] Audit every code-touching task except trivially mechanical edits.
+- [pb-014 / 0.88] Two-axis audit (formal + semantic) catches different bug classes; use both for non-trivial changes.
 
 **Working hypotheses (0.65 ≤ weight < 0.85):**
-- [0.78] For coding work, medium effort with Sonnet handles ~80% of tasks adequately — bump only on repeated audit fail.
+- [pb-027 / 0.78] For coding work, medium effort with Sonnet handles ~80% of tasks adequately — bump only on repeated audit fail.
 
 **Uncertain (0.35 ≤ weight < 0.65):**
-- [0.55] Plan-mode adds value when the task spans more than 2 files or touches contracts.
+- [pb-038 / 0.55] Plan-mode adds value when the task spans more than 2 files or touches contracts.
 
 **Anti-patterns (weight < 0.35):**
-- [0.18] Bumping model tier on first audit fail — usually a process problem, not a model problem.
+- [pb-019 / 0.18] Bumping model tier on first audit fail — usually a process problem, not a model problem.
 
 — End playbook (N statements active, last reflected: 2026-05-07 04:01 UTC)
 ```
 
-Rendered size budget: ≤ 8 KB. With 100 statements at ~80 chars each plus headers ≈ 8.5 KB worst-case. If over budget, drop the "Uncertain" bucket from the rendered prompt (Coach can still see those in the dashboard); the rendered playbook is for actionable patterns.
+The `pb-XXX` id alongside the weight is load-bearing — Coach uses it to target an existing statement for `adjust` / `merge` / `archive` ops via `coord_propose_playbook_changes`. Earlier shape (`[0.92] ...` without the id) forced Coach into `create`-only operations, producing near-duplicate rows that the dedup proposer eventually merged — wasteful churn observed in Coach's 2026-05-12 report (pb-065/pb-066 collision).
+
+Rendered size budget: ≤ 8 KB. With 100 statements at ~90 chars each (incl. pb-id prefix) plus headers ≈ 9 KB worst-case. If over budget, drop the "Uncertain" bucket from the rendered prompt (Coach can still see those in the dashboard); the rendered playbook is for actionable patterns.
 
 When `lattice.json` has zero active statements (cold-start before bootstrap, or post-reset), render produces empty string — concatenates to nothing in the system prompt. No special-case needed.
 

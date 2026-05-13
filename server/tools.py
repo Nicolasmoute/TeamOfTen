@@ -1326,13 +1326,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                         "WHERE id = ? AND project_id = ?",
                         (now, now, now, task_id, project_id),
                     )
-                # Free the executor.
-                if current_owner is not None:
-                    await c.execute(
-                        "UPDATE agents SET current_task_id = NULL "
-                        "WHERE id = ? AND current_task_id = ?",
-                        (current_owner, task_id),
-                    )
+                # Free any agent pointing at this task — broader than
+                # `tasks.owner` alone to catch role assignees (shipper,
+                # auditor) whose `current_task_id` was set during a role
+                # swap. A narrow owner clear leaves them with a stale
+                # ptr that feeds the watchdog phantom stall alerts on
+                # the archived task.
+                await c.execute(
+                    "UPDATE agents SET current_task_id = NULL "
+                    "WHERE current_task_id = ?",
+                    (task_id,),
+                )
             else:
                 await c.execute(
                     "UPDATE tasks SET status = ?, "
@@ -4450,6 +4454,54 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         ]
         return _ok("\n".join(lines))
 
+    @tool(
+        "coord_check_compass_audit",
+        (
+            "Coach-only. Snapshot of the Compass auto-audit watcher's "
+            "runtime state. Answers \"is the watcher subscribed? when "
+            "did it last fire per project? when did it last skip and "
+            "why?\". Use when no audit verdicts have surfaced after "
+            "plan→execute transitions and you need to tell "
+            "healthy-and-quiet from sick-and-silent. Read-only."
+        ),
+        {},
+    )
+    async def coord_check_compass_audit(args: dict[str, Any]) -> dict[str, Any]:
+        del args  # no-arg tool
+        if not caller_is_coach:
+            return _err(
+                "coord_check_compass_audit is Coach-only. Compass "
+                "audit telemetry isn't surfaced to Players."
+            )
+        from server.compass import audit_watcher as cmp_audit_watcher  # noqa: PLC0415
+        snap = cmp_audit_watcher.snapshot_health()
+        lines = [
+            "**Compass auto-audit watcher**",
+            f"- enabled (config): {snap.get('enabled')}",
+            f"- running (live):   {snap.get('running')}",
+            f"- watched events:   {', '.join(snap.get('watched_event_types') or [])}",
+            f"- debounce window:  {snap.get('debounce_seconds')}s",
+            f"- debounce keys:    {snap.get('debounce_keys_active')}",
+        ]
+        last_fire = snap.get("last_fire_by_project") or {}
+        if last_fire:
+            lines.append("- last fire per project:")
+            for pid, ts in sorted(last_fire.items()):
+                lines.append(f"    {pid}: {ts}")
+        else:
+            lines.append("- last fire per project: (none yet this process)")
+        last_skip = snap.get("last_skip_by_project") or {}
+        if last_skip:
+            lines.append("- last skip per project:")
+            for pid, info in sorted(last_skip.items()):
+                lines.append(
+                    f"    {pid}: {info.get('reason')} at {info.get('ts')} "
+                    f"(task={info.get('task_id')})"
+                )
+        else:
+            lines.append("- last skip per project: (none)")
+        return _ok("\n".join(lines))
+
     # ====================================================================
     # Playbook (Docs/playbook-specs.md §7.1) — Coach-only mid-turn
     # proposal tool. Players read the lattice via system-prompt
@@ -4482,7 +4534,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "  Adjust delta is capped at ±0.25 per single proposal. "
             "Create weight defaults to 0.60 (mid-cycle creation) if "
             "omitted. Merge drops the second id into the first; "
-            "kept weight = max of the two."
+            "kept weight = max of the two.\n"
+            "  Create `text` is capped at 160 chars — one line, "
+            "imperative, no enumerated sub-items. Rationale goes in "
+            "the prose corpus, not the lattice."
         ),
         {"operations": list},
     )
@@ -6372,12 +6427,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     "WHERE id = ? AND project_id = ?",
                     (now, now, now, task_id, project_id),
                 )
-                if old_owner:
-                    await c.execute(
-                        "UPDATE agents SET current_task_id = NULL "
-                        "WHERE id = ? AND current_task_id = ?",
-                        (old_owner, task_id),
-                    )
+                # Free any agent pointing at this task. See the
+                # matching comment in the coord_approve_stage archive
+                # path above — broader than `old_owner` alone.
+                await c.execute(
+                    "UPDATE agents SET current_task_id = NULL "
+                    "WHERE current_task_id = ?",
+                    (task_id,),
+                )
             else:
                 # Source-stage role row: deactivate when Coach is
                 # overriding without source completion (still active).
@@ -6737,12 +6794,16 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "WHERE id = ? AND project_id = ?",
                 (now, now, now, task_id, project_id),
             )
-            if old_owner:
-                await c.execute(
-                    "UPDATE agents SET current_task_id = NULL "
-                    "WHERE id = ? AND current_task_id = ?",
-                    (old_owner, task_id),
-                )
+            # Free any agent pointing at this task. See the matching
+            # comment in the coord_approve_stage archive path above —
+            # broader than `old_owner` alone so role assignees (shipper,
+            # auditor) without ownership of the planner row also get
+            # cleared.
+            await c.execute(
+                "UPDATE agents SET current_task_id = NULL "
+                "WHERE current_task_id = ?",
+                (task_id,),
+            )
             await c.commit()
         finally:
             await c.close()
@@ -6905,39 +6966,92 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 )
             t = dict(row)
             current_stage = t.get("status")
-            if current_stage == "archive":
-                return _err(
-                    f"task {task_id} is archived; cannot complete a "
-                    f"role on it."
-                )
+            # 2026-05-12 graceful post-archive completion: a Player who
+            # polls a long-running deploy (ship stage on Zeabur takes
+            # 30-35 min) can finish verification AFTER Coach (or the
+            # rung-4 stall sweeper) has archived the task. The prior
+            # behaviour hard-rejected, silently losing the Player's
+            # verification report. New shape: detect archive, look up
+            # the role the Player most recently held (regardless of
+            # completed_at — the archive paths auto-close all open
+            # roles), and accept the completion as a post-archive
+            # report. Coach still gets the message + artifact via the
+            # event fan-out + wake below.
+            is_archived = current_stage == "archive"
             target_role = _kanban_role_for_stage(current_stage)
-            if not target_role:
-                return _err(
-                    f"task {task_id} stage {current_stage!r} has no "
-                    f"role — nothing to complete."
+            if is_archived:
+                # Find the caller's most recently-active role on this
+                # task. `superseded_by IS NULL` keeps us from accepting
+                # completion from a Player whom Coach had explicitly
+                # reassigned away. We pull `completed_at` too so we can
+                # tell whether the archive path already auto-closed
+                # this role (the canonical case) vs. a defensive edge
+                # where it didn't.
+                cur = await c.execute(
+                    "SELECT id, role, completed_at "
+                    "FROM task_role_assignments "
+                    "WHERE task_id = ? AND owner = ? "
+                    "AND superseded_by IS NULL "
+                    "ORDER BY assigned_at DESC LIMIT 1",
+                    (task_id, caller_id),
                 )
-            cur = await c.execute(
-                "SELECT id FROM task_role_assignments "
-                "WHERE task_id = ? AND role = ? AND owner = ? "
-                "AND completed_at IS NULL AND superseded_by IS NULL "
-                "ORDER BY assigned_at DESC LIMIT 1",
-                (task_id, target_role, caller_id),
-            )
-            role_row = await cur.fetchone()
-            if not role_row:
-                return _err(
-                    f"you have no active {target_role} role on task "
-                    f"{task_id} — Coach hasn't assigned you, or your "
-                    f"role was already completed/superseded. Check "
-                    f"coord_my_assignments for what's actionable."
+                role_row = await cur.fetchone()
+                if not role_row:
+                    return _err(
+                        f"task {task_id} is archived and you held no "
+                        f"active role on it — nothing to complete. "
+                        f"(If you had a role and it was superseded by "
+                        f"another Player, Coach handled the reassign; "
+                        f"no further action needed.)"
+                    )
+                role_data = dict(role_row)
+                role_id = role_data["id"]
+                target_role = role_data["role"]
+                # Canonical case: the archive path already stamped
+                # `completed_at = <archive ts>` on this row when it
+                # closed all open roles. Leave that timestamp alone so
+                # the audit trail preserves the archive boundary.
+                #
+                # Defensive case: if `completed_at` is somehow still
+                # NULL (a future archive path forgets to close roles,
+                # or schema drift), stamp it now. Without this, the
+                # role row leaks as "active" forever even though the
+                # task is archived — breaks any downstream "open roles
+                # by Player" rollup.
+                if not role_data.get("completed_at"):
+                    await c.execute(
+                        "UPDATE task_role_assignments "
+                        "SET completed_at = ? WHERE id = ?",
+                        (_now_iso(), role_id),
+                    )
+            else:
+                if not target_role:
+                    return _err(
+                        f"task {task_id} stage {current_stage!r} has no "
+                        f"role — nothing to complete."
+                    )
+                cur = await c.execute(
+                    "SELECT id FROM task_role_assignments "
+                    "WHERE task_id = ? AND role = ? AND owner = ? "
+                    "AND completed_at IS NULL AND superseded_by IS NULL "
+                    "ORDER BY assigned_at DESC LIMIT 1",
+                    (task_id, target_role, caller_id),
                 )
-            role_id = dict(role_row)["id"]
-            now = _now_iso()
-            await c.execute(
-                "UPDATE task_role_assignments SET completed_at = ? "
-                "WHERE id = ?",
-                (now, role_id),
-            )
+                role_row = await cur.fetchone()
+                if not role_row:
+                    return _err(
+                        f"you have no active {target_role} role on task "
+                        f"{task_id} — Coach hasn't assigned you, or your "
+                        f"role was already completed/superseded. Check "
+                        f"coord_my_assignments for what's actionable."
+                    )
+                role_id = dict(role_row)["id"]
+                now = _now_iso()
+                await c.execute(
+                    "UPDATE task_role_assignments SET completed_at = ? "
+                    "WHERE id = ?",
+                    (now, role_id),
+                )
             if artifact_path:
                 cur = await c.execute(
                     "SELECT artifacts FROM tasks "
@@ -6978,6 +7092,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "owner": caller_id,
             "artifact_path": artifact_path or None,
             "message_to_coach": message_to_coach or None,
+            # Flag a post-archive completion so subscribers (Coach
+            # rollup, dashboard, telegram bridge) can distinguish a
+            # normal in-stage completion from a "task was archived
+            # while I finished verifying" report. Coach treats the
+            # latter as informational — no stage advance possible.
+            "post_archive": is_archived,
             # v2 §7.2.1: route to Coach. The actor's pane already gets
             # the row via the WS-side actor fan-out (`aid`); setting
             # `to: 'coach'` makes the row also land in Coach's pane
@@ -7001,6 +7121,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             f" → {artifact_path} (verified at {artifact_resolved})"
             if artifact_resolved else ""
         )
+        if is_archived:
+            return _ok(
+                f"Completed {target_role} role on {task_id}"
+                f"{artifact_clause} (task was already archived; your "
+                f"report is logged for Coach's awareness — no stage "
+                f"advance possible). Coach was woken with your "
+                f"message_to_coach as context."
+            )
         return _ok(
             f"Completed {target_role} role on {task_id}{artifact_clause}. "
             f"Your message reached Coach in real time (Coach was woken "
@@ -7490,6 +7618,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         compass_audit,
         compass_brief,
         compass_status,
+        coord_check_compass_audit,
         # Playbook (Docs/playbook-specs.md §7.1) — Coach-only mid-turn
         # proposal tool; readable surface lives in every system prompt
         # via build_system_prompt_suffix.
@@ -7643,6 +7772,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__compass_audit",
     "mcp__coord__compass_brief",
     "mcp__coord__compass_status",
+    "mcp__coord__coord_check_compass_audit",
     # Playbook (Docs/playbook-specs.md §7.1) — Coach-only at runtime;
     # listed here so the SDK accepts the call. The body's caller_is_coach
     # gate enforces the Coach-only invariant.

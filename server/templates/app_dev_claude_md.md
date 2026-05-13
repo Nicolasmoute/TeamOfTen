@@ -183,13 +183,46 @@ pre-authorized it. Hook text is not self-service authorization.
 
 ### TOT artifact paths
 
-- `working/memory/` — `coord_*_memory` (overwrite, topic-keyed).
+- **Memory (no on-disk file)** — `coord_update_memory` /
+  `coord_read_memory` / `coord_list_memory`. Topic-keyed scratchpad,
+  overwrite-on-write. Lives in the harness DB; mirrored to kDrive
+  at `projects/<id>/memory/<topic>.md` for human readability. **Not
+  readable via Read** — use the MCP tools. Agents looking at the
+  project tree won't see a `working/memory/` directory.
 - `working/knowledge/` — `coord_write_knowledge` (path-keyed,
-  durable).
+  durable, on-disk).
 - `decisions/` — `coord_write_decision` (Coach-only, append-
   only ADRs).
 - `coach-todos.md` at project root — Coach's strikeable backlog
   for items to act on later. Distinct from the team task board.
+
+### Picking a durable-text store
+
+Five stores cover overlapping use cases. Use this heuristic when
+the destination isn't obvious:
+
+| If you're asking… | Use |
+| --- | --- |
+| "Will I overwrite this next week?" | `memory/` (MCP, not on disk) |
+| "Why did we choose X?" — append-only ADR | `decisions/` |
+| "How does this part work?" — durable how-to | `knowledge/` |
+| Domain concept the team references repeatedly | wiki entry |
+| Project-wide rule for every turn to read | `CLAUDE.md` (Coach proposes via `coord_propose_file_write`) |
+
+When in doubt, knowledge is the safest default — it's durable,
+on-disk, and path-keyed so multiple entries on the same topic
+coexist.
+
+### Recurrence (the harness's, not the SDK's)
+
+Coach's tick cadence is managed via the harness's own
+`coach_recurrence` table — set it via `/tick N` (or the
+`/api/coach/tick` HTTP endpoint), disable via `/tick off`. The
+Claude Code SDK may surface deferred `CronCreate` /
+`ScheduleWakeup` tools at session start; **do not reach for them**
+for team-level scheduling. They're per-conversation and not a
+stable harness feature. The recurrence specs live at
+`Docs/recurrence-specs.md`.
 
 ### Self-check: TruthScore
 

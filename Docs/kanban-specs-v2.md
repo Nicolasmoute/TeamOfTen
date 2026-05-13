@@ -331,7 +331,7 @@ Every type below produces exactly one row in `project_events` (in addition to th
 
 - `commit_pushed` — Player commit. `payload_pointer = <git sha>`. Includes `task_id`, `message`, `task_id_auto_bound: bool`, the diff'd file list, `message_to_coach?`.
 - `task_spec_written` — Planner wrote `spec.md`. `payload_pointer = spec_path`. Includes `message_to_coach?`, `on_behalf_of?`.
-- `task_role_completed` — Player called `coord_role_complete` (non-git executor / shipper / etc.). `payload_pointer = artifact_path?`. Includes `role`, `message_to_coach?`.
+- `task_role_completed` — Player called `coord_role_complete` (non-git executor / shipper / etc.). `payload_pointer = artifact_path?`. Includes `role`, `message_to_coach?`, `post_archive: bool` (true when the task was archived before the Player's completion landed — preserves the verification narrative; no stage advance possible).
 - `audit_report_submitted` — Player submitted an audit. `payload_pointer = report_path`. Includes `verdict ∈ {'pass', 'fail'}`, `kind ∈ {'syntax', 'semantics'}`, `kind_round`, `message_to_coach?`, `on_behalf_of?`.
 - `audit_fail_notification` — sibling event when audit verdict was fail. Carries `kind_round` + `escalate` (true when same-kind fails ≥ 2). Routes `to: 'coach'`.
 - `task_stage_changed` — emitted by `coord_approve_stage`. Payload includes `from`, `to`, `assignee`, `note?`.
@@ -459,6 +459,12 @@ Read-only pass: walks every non-archive task's working dir on disk and emits str
 ### 10.6 Soft-stall watchdog (carried from v1.3.9)
 
 Haiku-tiered detection of agents that finished work but didn't transition the kanban (forgotten transitions / looping in chat / acknowledged-error-without-retry). Tier 1 SQL filter, Tier 2 bundled Haiku call, Tier 3 routes findings to Coach via `watchdog_finding`. Cost cap gate + dedup. Carried unchanged.
+
+The tier-2 task hydration query filters `AND status != 'archive'` (both the single-candidate and batched paths) so a stale `agents.current_task_id` pointing at an archived task never feeds an archived row into the Haiku call. Pairs with the broadened archive-time clear in `coord_archive_task` / `coord_approve_stage` / rung-4 auto-archive: every archive path issues `UPDATE agents SET current_task_id = NULL WHERE current_task_id = ?` (unfiltered by `owner`) so role-assignees without ownership of the planner row also get cleared. Together these eliminate the "phantom stall alerts on archived tasks" failure mode (Coach 2026-05-12 report).
+
+### 10.7 Post-archive role completion
+
+`coord_role_complete` accepts completion against an archived task when the caller still has a non-superseded `task_role_assignments` row on it. The event emits with `post_archive: true` so subscribers (Coach rollup, Telegram bridge) can distinguish a routine in-stage completion from a "verification landed after archive" report. No stage advance is possible — the task stays archived — but Coach receives the message + artifact via the normal `task_role_completed` event fan-out and wake path. This closes the race observed in Coach's 2026-05-12 report where Players polling a long-running Zeabur deploy (30–35 min) would find the task auto-archived under them and silently lose their verification work.
 
 ---
 

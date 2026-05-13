@@ -162,6 +162,12 @@ async def _isolate_watcher(
     # Defensive: ensure no leftover watcher / debounce state.
     await watcher.stop_audit_watcher()
     watcher._last_fire.clear()
+    # Observability state (Fix 12) — clear so cross-test mutation
+    # doesn't leak. `start_audit_watcher` also clears these, but the
+    # fixture must bring the test to a known state even when the test
+    # doesn't (re)start the watcher.
+    watcher._last_fire_iso.clear()
+    watcher._last_skip.clear()
 
     monkeypatch.setattr(cmp_config, "AUTO_AUDIT_ENABLED", True)
     monkeypatch.setattr(cmp_config, "AUTO_AUDIT_DEBOUNCE_SECONDS", 30)
@@ -175,6 +181,8 @@ async def _isolate_watcher(
     yield
     await watcher.stop_audit_watcher()
     watcher._last_fire.clear()
+    watcher._last_fire_iso.clear()
+    watcher._last_skip.clear()
 
 
 # ----------------------------------------------------- tests
@@ -672,3 +680,159 @@ async def test_unknown_task_id_dropped(
     })
     await asyncio.sleep(0.05)
     assert calls == []
+
+
+
+# ----------------------------------------------------- observability (Fix 12)
+
+
+def _drain(q: asyncio.Queue, into: list) -> bool:
+    """Drain everything pending on q into `into`. Returns False so the
+    `_wait_for` predicate keeps polling until the actual condition matches."""
+    while True:
+        try:
+            into.append(q.get_nowait())
+        except asyncio.QueueEmpty:
+            return False
+
+
+@pytest.mark.asyncio
+async def test_emit_skip_publishes_event_and_records_state() -> None:
+    """`_emit_skip` writes both a bus event and module state."""
+    watcher._last_skip.clear()
+    q = bus.subscribe()
+    captured: list[dict[str, Any]] = []
+    try:
+        await watcher._emit_skip(
+            project_id="misc",
+            task_id="t-2026-05-12-aaaa1111",
+            reason="project_disabled",
+        )
+        await asyncio.sleep(0)
+        while True:
+            try:
+                captured.append(q.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+    finally:
+        bus.unsubscribe(q)
+
+    matching = [e for e in captured if e.get("type") == "compass_audit_skipped"]
+    assert len(matching) == 1
+    ev = matching[0]
+    assert ev["project_id"] == "misc"
+    assert ev["task_id"] == "t-2026-05-12-aaaa1111"
+    assert ev["reason"] == "project_disabled"
+    assert ev["agent_id"] == "system"
+    assert "ts" in ev
+
+    rec = watcher._last_skip.get("misc")
+    assert rec is not None
+    assert rec["reason"] == "project_disabled"
+    assert rec["task_id"] == "t-2026-05-12-aaaa1111"
+    assert "ts" in rec
+
+
+@pytest.mark.asyncio
+async def test_snapshot_health_returns_expected_shape() -> None:
+    """`snapshot_health()` returns the read-only view. Verify shape +
+    defensive copies prevent external mutation of internal state."""
+    watcher._last_fire.clear()
+    watcher._last_fire_iso.clear()
+    watcher._last_skip.clear()
+    watcher._last_fire_iso["misc"] = "2026-05-13T00:00:00+00:00"
+    watcher._last_skip["alpha"] = {
+        "ts": "2026-05-13T00:01:00+00:00",
+        "reason": "debounced",
+        "task_id": "t-x",
+    }
+    snap = watcher.snapshot_health()
+    assert set(snap.keys()) == {
+        "enabled", "running", "watched_event_types",
+        "debounce_seconds", "last_fire_by_project",
+        "last_skip_by_project", "debounce_keys_active",
+    }
+    assert "task_stage_changed" in snap["watched_event_types"]
+    assert snap["last_fire_by_project"] == {"misc": "2026-05-13T00:00:00+00:00"}
+    assert snap["last_skip_by_project"]["alpha"]["reason"] == "debounced"
+
+    # Defensive copy — caller mutation must not leak back.
+    snap["last_fire_by_project"]["misc"] = "TAMPERED"
+    snap["last_skip_by_project"]["alpha"]["reason"] = "TAMPERED"
+    assert watcher._last_fire_iso["misc"] == "2026-05-13T00:00:00+00:00"
+    assert watcher._last_skip["alpha"]["reason"] == "debounced"
+
+
+@pytest.mark.asyncio
+async def test_project_disabled_emits_skip_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plan→execute on a disabled project doesn't fire audit AND
+    emits a `compass_audit_skipped{reason='project_disabled'}` event."""
+    await _disable_compass("misc")
+    task_id = _valid_task_id()
+    await _create_task(task_id=task_id, project_id="misc")
+    _spec_for("misc", task_id, "x")
+
+    calls = _stub_audit_work(monkeypatch)
+    await watcher.start_audit_watcher()
+
+    q = bus.subscribe()
+    captured: list[dict[str, Any]] = []
+    try:
+        await bus.publish({
+            "ts": "2026-05-13T12:00:00+00:00",
+            "agent_id": "system",
+            "type": "task_stage_changed",
+            "task_id": task_id,
+            "from": "plan",
+            "to": "execute",
+            "owner": "p1",
+            "project_id": "misc",
+        })
+        await _wait_for(lambda: _drain(q, captured) or any(
+            e.get("type") == "compass_audit_skipped" for e in captured
+        ), timeout=1.0)
+    finally:
+        bus.unsubscribe(q)
+
+    assert calls == []
+    skips = [e for e in captured if e.get("type") == "compass_audit_skipped"]
+    assert any(s.get("reason") == "project_disabled" for s in skips)
+    assert watcher._last_skip.get("misc", {}).get("reason") == "project_disabled"
+
+
+@pytest.mark.asyncio
+async def test_coord_check_compass_audit_rejects_non_coach() -> None:
+    """`coord_check_compass_audit` is Coach-only — Players get an error."""
+    from server.tools import build_coord_server
+
+    server = build_coord_server("p3", include_proxy_metadata=True)
+    handler = server["_handlers"]["coord_check_compass_audit"]
+    result = await handler({})
+    assert result.get("is_error") is True
+    text = result["content"][0]["text"]
+    assert "Coach-only" in text
+
+
+@pytest.mark.asyncio
+async def test_coord_check_compass_audit_renders_snapshot() -> None:
+    """Coach sees a markdown table with all the snapshot fields."""
+    from server.tools import build_coord_server
+
+    watcher._last_fire_iso["misc"] = "2026-05-13T00:00:00+00:00"
+    watcher._last_skip["alpha"] = {
+        "ts": "2026-05-13T00:01:00+00:00",
+        "reason": "debounced",
+        "task_id": "t-y",
+    }
+
+    server = build_coord_server("coach", include_proxy_metadata=True)
+    handler = server["_handlers"]["coord_check_compass_audit"]
+    result = await handler({})
+    assert not result.get("is_error")
+    text = result["content"][0]["text"]
+    assert "Compass auto-audit watcher" in text
+    assert "enabled" in text and "running" in text
+    assert "misc" in text
+    assert "alpha" in text and "debounced" in text

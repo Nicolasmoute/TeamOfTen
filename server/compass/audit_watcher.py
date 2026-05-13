@@ -63,6 +63,7 @@ import json
 import logging
 import sys
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from server.events import bus
@@ -101,14 +102,104 @@ _ARTIFACT_TRUNCATE = 18_000
 # Module-level lifecycle handles, mirroring the telegram bridge pattern.
 _current_task: asyncio.Task[None] | None = None
 _stopping = False
-# Per-(project, task_id) timestamp of the last audit fired. Read +
-# written from the bus-consumer task only, so no lock needed.
+# Per-(project, task_id) monotonic timestamp of the last audit fired.
+# Used by the debounce window. Read + written from the bus-consumer
+# task only, so no lock needed.
 _last_fire: dict[tuple[str, str], float] = {}
+# Per-project ISO timestamp of the most recent audit fire. Distinct
+# from `_last_fire` (which is keyed by (project, task_id) and uses
+# monotonic time, not wall-clock). Surfaces via the health endpoint
+# so operators can answer "is the watcher actually firing for this
+# project?" without trawling event logs.
+_last_fire_iso: dict[str, str] = {}
+# Per-project most recent skip — {reason, ts, task_id}. Operators ask
+# "why isn't the watcher firing?" — this answers it directly.
+_last_skip: dict[str, dict[str, Any]] = {}
 
 
 def is_running() -> bool:
     """True iff the watcher background task is alive."""
     return _current_task is not None and not _current_task.done()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def _emit_skip(
+    *,
+    project_id: str,
+    task_id: str,
+    reason: str,
+    **extras: Any,
+) -> None:
+    """Record + publish a `compass_audit_skipped` event for a gate-close.
+
+    Three observers consume this:
+      - module state (`_last_skip`) → health endpoint + MCP tool.
+      - bus event → dashboard live counter + audit log.
+      - logs (debug level) → post-mortem during an outage.
+
+    Silent gate-closes (wrong event type, missing project_id from a
+    malformed event) are NOT routed here — only legitimate "we
+    considered firing but a gate stopped us" reasons surface, so the
+    skip log stays signal-rich.
+    """
+    ts = _now_iso()
+    payload: dict[str, Any] = {
+        "ts": ts,
+        "agent_id": "system",
+        "type": "compass_audit_skipped",
+        "project_id": project_id,
+        "task_id": task_id,
+        "reason": reason,
+    }
+    payload.update(extras)
+    _last_skip[project_id] = {
+        "ts": ts,
+        "reason": reason,
+        "task_id": task_id,
+        **extras,
+    }
+    try:
+        await bus.publish(payload)
+    except Exception:
+        logger.exception(
+            "compass.audit_watcher: failed to publish skip event "
+            "(project=%s, task=%s, reason=%s)",
+            project_id, task_id, reason,
+        )
+    logger.debug(
+        "compass.audit_watcher: skipped (project=%s, task=%s, reason=%s)",
+        project_id, task_id, reason,
+    )
+
+
+def snapshot_health() -> dict[str, Any]:
+    """Return the watcher's current health state as a JSON-safe dict.
+
+    Read-only view for the HTTP endpoint + Coach MCP tool. Includes:
+      - enabled: bool — config.AUTO_AUDIT_ENABLED.
+      - running: bool — background task alive.
+      - watched_event_types: sorted list — the bus filter.
+      - debounce_seconds: int — current window.
+      - last_fire_by_project: dict[project_id, iso] — most recent fire.
+      - last_skip_by_project: dict[project_id, {reason, ts, task_id}] —
+        most recent gate-close per project.
+      - debounce_keys_active: int — entries in _last_fire (rough
+        in-flight indicator).
+    """
+    return {
+        "enabled": bool(config.AUTO_AUDIT_ENABLED),
+        "running": is_running(),
+        "watched_event_types": sorted(WATCHED_EVENT_TYPES),
+        "debounce_seconds": int(config.AUTO_AUDIT_DEBOUNCE_SECONDS),
+        "last_fire_by_project": dict(_last_fire_iso),
+        "last_skip_by_project": {
+            k: dict(v) for k, v in _last_skip.items()
+        },
+        "debounce_keys_active": len(_last_fire),
+    }
 
 
 # ---------------------------------------------------------------- lifecycle
@@ -132,6 +223,8 @@ async def start_audit_watcher() -> None:
         return
     _stopping = False
     _last_fire.clear()
+    _last_fire_iso.clear()
+    _last_skip.clear()
     queue = bus.subscribe()
     loop = asyncio.get_running_loop()
     _current_task = loop.create_task(
@@ -227,6 +320,11 @@ async def _handle_event(ev: dict[str, Any]) -> None:
             return
 
     if not await _is_compass_enabled(project_id):
+        await _emit_skip(
+            project_id=project_id,
+            task_id=task_id,
+            reason="project_disabled",
+        )
         return
 
     # Trajectory gate: only audit when the task's trajectory actually
@@ -234,9 +332,19 @@ async def _handle_event(ev: dict[str, Any]) -> None:
     # from='plan' transition, but the guard is cheap and future-proofs
     # against trajectory-shape changes.
     if "plan" not in _trajectory_stages(task):
+        await _emit_skip(
+            project_id=project_id,
+            task_id=task_id,
+            reason="trajectory_no_plan",
+        )
         return
 
     if not _debounce_ok(project_id, task_id):
+        await _emit_skip(
+            project_id=project_id,
+            task_id=task_id,
+            reason="debounced",
+        )
         return
 
     # Cost gate — read live so a deploy bumping the cap mid-day takes
@@ -244,12 +352,26 @@ async def _handle_event(ev: dict[str, Any]) -> None:
     # fails for any reason, we DON'T fire (better to skip an audit
     # than to blow past the cap when the bookkeeping is broken).
     if not await _within_cost_cap():
+        await _emit_skip(
+            project_id=project_id,
+            task_id=task_id,
+            reason="cost_capped",
+        )
         return
 
     artifact = _compose_plan_artifact(task)
     if not artifact:
+        await _emit_skip(
+            project_id=project_id,
+            task_id=task_id,
+            reason="artifact_empty",
+        )
         return
 
+    # Stamp the wall-clock fire timestamp for the health endpoint
+    # (monotonic timestamp in `_last_fire` is debounce-only and not
+    # human-readable).
+    _last_fire_iso[project_id] = _now_iso()
     asyncio.create_task(
         _safe_audit(project_id, artifact, task_id),
         name=f"compass.audit_watcher.fire:plan:{project_id}:{task_id}",
@@ -485,6 +607,7 @@ def _truncate(s: str) -> str:
 __all__ = [
     "WATCHED_EVENT_TYPES",
     "is_running",
+    "snapshot_health",
     "start_audit_watcher",
     "stop_audit_watcher",
 ]

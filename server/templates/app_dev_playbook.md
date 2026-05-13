@@ -263,7 +263,7 @@ Overwrite-on-update. Keys are topics, not dates. Use for:
   implementation").
 - Domain reference lists ("the seven perf levers we have identified").
 
-In the harness: `working/memory/` via `coord_*_memory`.
+In the harness: `coord_update_memory` / `coord_read_memory` / `coord_list_memory`. SQLite-backed, kDrive-mirrored at `projects/<id>/memory/<topic>.md` for human readability — no on-disk file under `working/memory/` (use MCP only).
 
 ### Knowledge — durable artifacts
 

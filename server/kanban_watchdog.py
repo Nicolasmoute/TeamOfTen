@@ -318,9 +318,15 @@ async def _hydrate_candidate(cand: Candidate) -> None:
         )
         rows = [dict(r) for r in await cur.fetchall()]
         if cand.current_task_id:
+            # Filter archived rows: an agent's `current_task_id` can
+            # outlive an auto/manual archive (the post-archive clear
+            # below covers the canonical paths, but a stale pointer
+            # would otherwise feed an archived task into tier 2 and
+            # generate phantom stall alerts — Coach's 2026-05-11 report
+            # observed 6 fires over 3h on a single archived task).
             cur = await c.execute(
                 "SELECT id, title, status, owner, last_stage_change_at "
-                "FROM tasks WHERE id = ?",
+                "FROM tasks WHERE id = ? AND status != 'archive'",
                 (cand.current_task_id,),
             )
             t = await cur.fetchone()
@@ -377,9 +383,12 @@ async def _hydrate_candidates(cands: list[Candidate]) -> None:
 
         if task_ids:
             placeholders_tasks = ",".join("?" * len(task_ids))
+            # See _hydrate_candidate above for the archived-task
+            # rationale — same filter applied to the batched path.
             cur = await conn.execute(
                 "SELECT id, title, status, owner, last_stage_change_at "
-                f"FROM tasks WHERE id IN ({placeholders_tasks})",
+                f"FROM tasks WHERE id IN ({placeholders_tasks}) "
+                "AND status != 'archive'",
                 tuple(task_ids),
             )
             for raw in await cur.fetchall():
@@ -1047,6 +1056,33 @@ async def sweep_once() -> int:
                 )
     if not hydrated:
         return 0
+
+    # Drop `idle_with_task` candidates whose `current_task_id` points
+    # at an archived (or deleted) task — `_hydrate_candidates` filters
+    # those rows out, so `cand.task` is None even though tier 1
+    # surfaced them. They were the phantom-stall candidates Coach's
+    # 2026-05-11 report flagged (6 fires over 3h on a single archived
+    # task). `working_no_tool_use` candidates are kept regardless:
+    # their stall signal is the absence of `tool_use` events, not the
+    # task state. Dropping them would mask a legitimate "agent is
+    # looping" finding.
+    pruned: list[Candidate] = []
+    for c in hydrated:
+        if (
+            c.signal == "idle_with_task"
+            and c.current_task_id
+            and c.task is None
+        ):
+            logger.debug(
+                "watchdog: dropping idle_with_task candidate %s "
+                "(current_task_id=%s is archived or missing)",
+                c.slot, c.current_task_id,
+            )
+            continue
+        pruned.append(c)
+    if not pruned:
+        return 0
+    hydrated = pruned
 
     user_prompt = _compose_user_prompt(hydrated)
 

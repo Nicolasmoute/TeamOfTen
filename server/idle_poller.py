@@ -858,14 +858,19 @@ async def _fire_rung_4(
             "AND completed_at IS NULL AND superseded_by IS NULL",
             (now_iso, task["id"]),
         )
-        # Release any agent that was holding it.
-        owner = task.get("owner")
-        if owner:
-            await c.execute(
-                "UPDATE agents SET current_task_id = NULL "
-                "WHERE id = ? AND current_task_id = ?",
-                (owner, task["id"]),
-            )
+        # Release any agent whose `current_task_id` pointed at this
+        # task. Broader than `tasks.owner` alone: a shipper / auditor
+        # assigned via `task_role_assignments` (without being the
+        # original planner-owner) can also hold the pointer, and a
+        # narrow owner-filtered clear leaves them with a stale ptr
+        # — feeding the watchdog phantom stall alerts on the archived
+        # task (Coach's 2026-05-11 report, repeat fires on archived
+        # rows).
+        await c.execute(
+            "UPDATE agents SET current_task_id = NULL "
+            "WHERE current_task_id = ?",
+            (task["id"],),
+        )
         await c.commit()
     finally:
         await c.close()

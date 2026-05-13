@@ -447,6 +447,17 @@ The `output_extractor` module + the office-format dependencies (pypdf / python-d
 
 The dashboard's manual paste UI (the textarea + "Audit" button in the Audits section) was removed when auto-audit shipped; that's still the case. Audits are auto-fired by the watcher; humans read the log when curious (§5.3). The audit log + filter pills remain, with explanatory copy noting the new "fires on kanban plan→execute" trigger. The `POST /api/compass/audit` HTTP endpoint is kept as a debug backstop (curl-able for testing) but not surfaced in the UI.
 
+#### 5.5.5 Watcher observability
+
+Every gate-close emits a structured `compass_audit_skipped{reason, project_id, task_id, ts}` bus event so the watcher's quiet branches are observable instead of silent. Reasons currently emitted: `project_disabled`, `trajectory_no_plan`, `debounced`, `cost_capped`, `artifact_empty`. Silent gate-closes (wrong event type, wrong stage transition, missing task_id) are NOT routed through the skip channel — the skip log would otherwise carry millions of irrelevant rows per day and the signal would be lost. Module state records the most recent fire timestamp per project (`_last_fire_iso`) and the most recent skip per project (`_last_skip`, including reason + task_id + ts).
+
+Two surface paths expose the state:
+
+- **HTTP**: `GET /api/compass/audit-watcher/health` returns `{enabled, running, watched_event_types, debounce_seconds, last_fire_by_project, last_skip_by_project, debounce_keys_active}`. Standard `require_token` auth. The data is in-memory only — a process restart clears the snapshot (the event log preserves the long history).
+- **MCP**: `coord_check_compass_audit()` (Coach-only) wraps `snapshot_health()` and renders the result as a compact markdown table. Coach uses it to answer "is the watcher subscribed? has it fired for this project recently? if not, why did it skip?" without leaving the agent surface.
+
+This closes the observability gap in Coach's 2026-05-12 report: Coach saw no audit verdicts on plan→execute transitions and had no way to tell healthy-and-quiet from sick-and-silent. The watcher's design didn't change; only the gate-close paths are now visible.
+
 ---
 
 ## 6 · File layout
