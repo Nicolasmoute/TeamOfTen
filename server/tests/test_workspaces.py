@@ -16,6 +16,7 @@ pin the corrected behavior:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -218,6 +219,17 @@ async def test_create_project_endpoint_auto_fires_provisioning(
     """
     import server.paths as paths_mod
     monkeypatch.setattr(paths_mod, "DATA_ROOT", tmp_path)
+    # Guard against container environments where these env vars are set to '' —
+    # agents.py module-level float() / int() calls fail on empty string,
+    # blocking the server.main import chain.
+    for _var, _default in [
+        ("HARNESS_AGENT_DAILY_CAP", "5.0"),
+        ("HARNESS_TEAM_DAILY_CAP", "20.0"),
+        ("HARNESS_ERROR_RETRY_DELAY", "45"),
+        ("HARNESS_ERROR_RETRY_MAX_CONSECUTIVE", "3"),
+    ]:
+        if not os.environ.get(_var):
+            monkeypatch.setenv(_var, _default)
 
     await init_db()
 
@@ -571,4 +583,126 @@ async def test_provision_resolves_var_placeholder_in_remote(
     )
     assert old_url not in config_after_refresh, (
         f"old URL must be replaced by the new one; got:\n{config_after_refresh}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_provision_resolves_secret_placeholder_via_ensure_workspaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production-path: ensure_workspaces expands ${VAR} via the
+    encrypted secrets store (not os.environ).  Exercises the full
+    call chain:
+
+        project.repo_url = "${TEST_TOKEN}" in DB
+        secrets.set_secret("TEST_TOKEN", file://…new_url…)
+        ensure_workspaces(project_id)
+          → _expand_placeholders → lookup_sync (reads secrets table)
+          → git remote set-url <resolved>
+        .git/config must contain resolved URL, not the placeholder.
+
+    Regression: if _expand_placeholders consulted only os.environ,
+    a secrets-store rotation (UI-managed PAT, never in env) would
+    silently leave the raw placeholder in .git/config, breaking all
+    subsequent git operations for the project.
+    """
+    import subprocess
+    import server.paths as paths_mod
+    import server.secrets as secrets_mod
+    import server.workspaces as ws_mod
+    from server.workspaces import ensure_workspaces, SLOT_IDS
+    from server.paths import project_paths
+
+    monkeypatch.setattr(paths_mod, "DATA_ROOT", tmp_path)
+    # Guard against container environments where these env vars are set to '' —
+    # agents.py module-level float() / int() calls fail on empty string,
+    # blocking the server.main import chain.
+    for _var, _default in [
+        ("HARNESS_AGENT_DAILY_CAP", "5.0"),
+        ("HARNESS_TEAM_DAILY_CAP", "20.0"),
+        ("HARNESS_ERROR_RETRY_DELAY", "45"),
+        ("HARNESS_ERROR_RETRY_MAX_CONSECUTIVE", "3"),
+    ]:
+        if not os.environ.get(_var):
+            monkeypatch.setenv(_var, _default)
+
+    # ---- set up Fernet key so set_secret / lookup_sync work -----------
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("HARNESS_SECRETS_KEY", key)
+    # Force the module to re-read the new key.
+    monkeypatch.setattr(secrets_mod, "_fernet", None)
+    monkeypatch.setattr(secrets_mod, "_cache", {})
+    monkeypatch.setattr(secrets_mod, "_loaded_version", -1)
+
+    # ---- helper: build a real upstream git repo -----------------------
+    def _make_upstream(name: str) -> Path:
+        d = tmp_path / name
+        d.mkdir()
+        subprocess.run(["git", "init"], cwd=d, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.com"],
+            cwd=d, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=d, check=True, capture_output=True,
+        )
+        (d / "README.md").write_text("hi", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=d, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=d, check=True, capture_output=True,
+        )
+        return d
+
+    upstream_old = _make_upstream("upstream_old")
+    upstream_new = _make_upstream("upstream_new")
+    old_url = upstream_old.as_uri()
+    new_url = upstream_new.as_uri()
+
+    # ---- project + initial provision ----------------------------------
+    await init_db()
+    await _create_project_no_repo("secrettest")
+    await _set_project_repo("secrettest", old_url)
+
+    result1 = await ensure_workspaces("secrettest")
+    assert result1["configured"] is True
+    bare = project_paths("secrettest").bare_clone
+    assert (bare / ".git").exists(), "initial clone must succeed"
+
+    # ---- store new URL in secrets; set repo_url to placeholder -------
+    ok = await secrets_mod.set_secret("TEST_TOKEN", new_url)
+    assert ok, "set_secret must succeed when HARNESS_SECRETS_KEY is set"
+    # Invalidate the sync-lookup cache so the next _expand_placeholders
+    # call re-reads from the DB rather than the now-stale in-memory dict.
+    secrets_mod._cache_version = getattr(secrets_mod, "_cache_version", 0) + 1
+
+    await _set_project_repo("secrettest", "${TEST_TOKEN}")
+
+    # ---- re-provision via production entry point ----------------------
+    result2 = await ensure_workspaces("secrettest")
+    assert result2["configured"] is True, f"ensure_workspaces returned: {result2}"
+    assert result2.get("remotes_updated") == list(SLOT_IDS), (
+        f"all slots should be in remotes_updated; got: {result2}"
+    )
+
+    # .git/config must carry the resolved URL, not the placeholder
+    config = (bare / ".git" / "config").read_text(encoding="utf-8")
+    assert new_url in config, (
+        f"resolved URL must be in .git/config; got:\n{config}"
+    )
+    assert "${TEST_TOKEN}" not in config, (
+        f"placeholder must not survive in .git/config; got:\n{config}"
+    )
+    assert old_url not in config, (
+        f"old URL must have been replaced; got:\n{config}"
+    )
+
+    # ---- idempotency: second run is a no-op ---------------------------
+    result3 = await ensure_workspaces("secrettest")
+    assert result3["configured"] is True
+    assert result3.get("remotes_updated") == [], (
+        f"no URL change expected on second run; got: {result3}"
     )
