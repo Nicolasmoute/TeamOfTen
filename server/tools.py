@@ -1507,8 +1507,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             )
         return _ok(
             f"{head} The kanban auto-wakes the new-stage assignee "
-            f"if one is configured. Do NOT follow up with "
-            f"coord_send_message; the wake covers it."
+            f"if one is configured."
+            + (" Do NOT follow up with coord_send_message; the wake covers it." if note else
+               " No note was passed — use coord_send_message if the assignee needs context.")
         )
 
 
@@ -5274,8 +5275,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             msg = (
                 f"Assigned {task_id} {role} → {targets[0]}. The "
                 f"kanban auto-wakes {targets[0]} with the task "
-                f"context + completion-tool hint. Do NOT follow up "
-                f"with coord_send_message; the wake covers it."
+                f"context + completion-tool hint. Wake body contains "
+                f"task context; add coord_send_message if extra "
+                f"background is needed."
             )
         else:
             msg = (
@@ -6227,8 +6229,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             f"inserted rows for added stages. Displaced Players "
             f"(if any) get a stand-down wake; new candidates get "
             f"role-call wakes if their stage is currently active. "
-            f"Do NOT follow up with coord_send_message; the wakes "
-            f"cover it."
+            f"Wakes carry task context; use coord_send_message only "
+            f"if the Players need additional background beyond the "
+            f"task description."
         )
 
     @tool(
@@ -6778,9 +6781,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             return _ok(
                 f"Planted {assignee} as {target_role} on {task_id} "
                 f"(stage {next_stage!r}, first plant after pool/empty "
-                f"create){suffix_note}. Role row planted, wake fired. "
-                f"Do NOT follow up with coord_send_message; the wake "
-                f"covers it."
+                f"create){suffix_note}. Role row planted, wake fired."
+                + (" Do NOT follow up with coord_send_message; the wake covers it." if note else
+                   " No note passed — use coord_send_message if the assignee needs context.")
             )
         # Ship-stage echo: when Coach is approving audit→ship, surface
         # the task's stored definition of done so Coach evaluates the
@@ -6795,10 +6798,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         return _ok(
             f"Approved {task_id}: {old_status} → {next_stage} "
             f"({target_role} → {assignee}){suffix_note}. "
-            f"Planted {assignee}'s role row, woke them with your "
-            f"note as the brief. Do NOT follow up with "
-            f"coord_send_message; the wake covers it."
-            f"{criteria_echo}"
+            + (
+                f"Planted {assignee}'s role row, woke them with your "
+                f"note as the brief. Do NOT follow up with "
+                f"coord_send_message; the wake covers it."
+                if note else
+                f"Planted {assignee}'s role row; woke them with a "
+                f"generic brief — use note= to pass context directly."
+            )
+            + f"{criteria_echo}"
         )
 
     @tool(

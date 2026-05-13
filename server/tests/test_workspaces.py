@@ -224,8 +224,6 @@ async def test_create_project_endpoint_auto_fires_provisioning(
     for _var, _default in [
         ("HARNESS_AGENT_DAILY_CAP", "5.0"),
         ("HARNESS_TEAM_DAILY_CAP", "20.0"),
-        ("HARNESS_ERROR_RETRY_DELAY", "45"),
-        ("HARNESS_ERROR_RETRY_MAX_CONSECUTIVE", "3"),
     ]:
         if not os.environ.get(_var):
             monkeypatch.setenv(_var, _default)
@@ -618,14 +616,12 @@ async def test_provision_resolves_secret_placeholder_via_ensure_workspaces(
     from server.paths import project_paths
 
     monkeypatch.setattr(paths_mod, "DATA_ROOT", tmp_path)
-    # Guard against container environments where these env vars are set to '' —
-    # agents.py module-level float() / int() calls fail on empty string,
-    # blocking the server.main import chain.
+    # Guard against container environments where HARNESS_AGENT_DAILY_CAP and
+    # HARNESS_TEAM_DAILY_CAP are set to '' — agents.py module-level float()
+    # calls fail on empty string, blocking the server.main import chain.
     for _var, _default in [
         ("HARNESS_AGENT_DAILY_CAP", "5.0"),
         ("HARNESS_TEAM_DAILY_CAP", "20.0"),
-        ("HARNESS_ERROR_RETRY_DELAY", "45"),
-        ("HARNESS_ERROR_RETRY_MAX_CONSECUTIVE", "3"),
     ]:
         if not os.environ.get(_var):
             monkeypatch.setenv(_var, _default)
