@@ -265,3 +265,92 @@ def test_hook_fails_open_on_exception(monkeypatch: pytest.MonkeyPatch) -> None:
     ))
     # No deny decision; fail-open returns empty.
     assert out == {} or out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny"
+
+
+# ---------- /data/claude/plans/ carveout (PR-3 Fix 8) ----------
+
+
+def test_path_is_secret_allows_plans_subdir_of_claude_root(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plan-mode workspace at $CLAUDE_CONFIG_DIR/plans/ must be writable.
+    Other paths under the Claude root stay blocked."""
+    import server.agents as agents_mod
+
+    # Point CLAUDE_CONFIG_DIR at a tmp dir so we can create real files.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    spec = plans / "my-plan.md"
+    spec.write_text("plan body", encoding="utf-8")
+
+    creds = tmp_path / ".credentials.json"
+    creds.write_text("{}", encoding="utf-8")
+
+    # plans/ subdir is allowed.
+    assert agents_mod._path_is_secret(str(spec)) is False
+    assert agents_mod._path_is_secret(str(plans)) is False
+
+    # The root itself, and other files at the root, stay blocked.
+    assert agents_mod._path_is_secret(str(creds)) is True
+    assert agents_mod._path_is_secret(str(tmp_path)) is True
+
+
+def test_path_is_secret_blocks_credential_via_dotdot_escape(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`/data/claude/plans/../.credentials.json` resolves to
+    `/data/claude/.credentials.json` — the carveout only applies
+    when the resolved relative path actually starts with `plans/`."""
+    import server.agents as agents_mod
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    creds = tmp_path / ".credentials.json"
+    creds.write_text("{}", encoding="utf-8")
+
+    escape = plans / ".." / ".credentials.json"
+    assert agents_mod._path_is_secret(str(escape)) is True
+
+
+def test_path_is_secret_carveout_does_not_apply_to_codex_root(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex doesn't have a plan-mode analog. `$CODEX_HOME/plans/`
+    (if it ever existed) should stay blocked since Coach won't write
+    Codex plans anyway — keeping the carveout tightly scoped to
+    Claude reduces blast radius."""
+    import server.agents as agents_mod
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    codex_plans = tmp_path / "plans"
+    codex_plans.mkdir()
+    spec = codex_plans / "x.md"
+    spec.write_text("x", encoding="utf-8")
+
+    assert agents_mod._path_is_secret(str(spec)) is True
+
+
+def test_bash_pattern_allows_plans_subdir() -> None:
+    """The bash heuristic mirrors the path carveout — `ls
+    /data/claude/plans/` and `cat /data/claude/plans/x.md` must
+    pass, while `cat /data/claude/.credentials.json` still trips."""
+    import server.agents as agents_mod
+
+    def matches(cmd: str) -> bool:
+        return any(p.search(cmd) for p in agents_mod._BASH_SECRET_PATTERNS)
+
+    # plans/ subdir — allowed.
+    assert matches("ls /data/claude/plans/") is False
+    assert matches("cat /data/claude/plans/my-plan.md") is False
+    assert matches("write /data/claude/plans/new.md") is False
+
+    # Sibling paths — blocked.
+    assert matches("cat /data/claude/.credentials.json") is True
+    assert matches("ls /data/claude/") is True
+    assert matches("rm /data/claude/settings.json") is True
+
+    # Codex root — no carveout, fully blocked.
+    assert matches("ls /data/codex/plans/") is True
+    assert matches("cat /data/codex/auth.json") is True
+
+    # DB + /proc — unaffected.
+    assert matches("sqlite3 /data/harness.db") is True
+    assert matches("cat /proc/1/environ") is True

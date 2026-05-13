@@ -181,6 +181,25 @@ If the repo has a pre-commit hook, treat `--no-verify` as
 **off-limits** unless Coach (or the human) has explicitly
 pre-authorized it. Hook text is not self-service authorization.
 
+### Long-running waits (deploy polling, etc.)
+
+The Bash tool blocks single `sleep` commands of ~60s+ to keep
+turn status fresh. If you need to poll something that takes
+longer than that (Zeabur deploy takes 30-35 min, CI builds,
+etc.):
+
+- **Chain shorter sleeps**: `sleep 30; sleep 30; <check>` works
+  around the block while still leaving the harness able to see
+  your turn is alive.
+- **Better**: structure the work as one "kick off + check
+  status" turn, then end the turn. The harness recurrence tick
+  or a manual Coach wake brings you back to re-check. Don't burn
+  a whole turn on a single long poll.
+- **For shipper-stage deploy verification specifically**: commit,
+  push, report `deploy_pending` via `coord_send_message`, end
+  the turn. Coach pings you ~5 min later to verify. Saves
+  your turn budget for actual work.
+
 ### TOT artifact paths
 
 - **Memory (no on-disk file)** — `coord_update_memory` /

@@ -2092,16 +2092,44 @@ HARNESS_AUTOWAKE_DEBOUNCE=10
 
 ### 11.5 Error Retry
 
-On turn error:
+Two distinct retry paths depending on where the failure surfaces:
 
-- Error event is emitted.
-- Agent status becomes error.
-- A post-error retry can be scheduled after
+**Hard errors** (turn threw before `ResultMessage`):
+
+- Error event is emitted; agent status becomes `error`.
+- A post-error retry is scheduled after
   `HARNESS_ERROR_RETRY_DELAY`, default 45 seconds.
+- Retry only fires if status is still `error` when the delay
+  elapses (a manual recovery wake during the window pre-empts).
 - Consecutive retry limit:
   `HARNESS_ERROR_RETRY_MAX_CONSECUTIVE`, default 3.
-- Coach DM debounce for Player errors:
-  `HARNESS_ERROR_DM_DEBOUNCE`, default 300 seconds.
+
+**Soft errors** (`ResultMessage(is_error=True)` — turn returned
+cleanly but the model's stop_reason / subtype indicate failure):
+
+- Policy decides per-shape (`_soft_error_retry_policy` in
+  `server/agents.py`):
+  - `stop_reason == "stop_sequence"` → retry, 0s delay (almost
+    always a model-side truncation, not a real failure).
+  - `stop_reason == "tool_use"` AND `duration_ms < 5 min` →
+    retry, 30s delay (likely transient tool / shell flake).
+  - `stop_reason == "tool_use"` AND `duration_ms ≥ 5 min` →
+    no retry (probable tool loop or stuck shell; needs Coach).
+  - `max_turns` / `max_tokens` → no retry (auto-continue path
+    handles them separately).
+  - Unrecognized shapes → no retry; Coach gets a DM with
+    `last_tool` context for triage.
+- Cap accounting reuses `_consecutive_errors`, so a repeatedly
+  failing retriable shape eventually escalates to `human_attention`
+  via the gave-up path.
+- Soft retries reuse `_schedule_post_error_retry` with
+  `accept_idle_status=True` and `delay_s_override=<policy>`.
+
+**Coach DM for non-retriable soft errors**:
+
+- Debounce: `HARNESS_ERROR_DM_DEBOUNCE`, default 300 seconds.
+- Body includes `last_tool` from the turn context so Coach
+  knows which tool the agent was on when it errored.
 
 ### 11.6 Stale Task Watchdog
 
@@ -4236,6 +4264,36 @@ They are not exposed through API beyond enabled/reason/url status.
 UI-managed secrets are encrypted in SQLite. API never returns plaintext. The
 runtime interpolator can read them for MCP/Telegram use.
 
+### 19.4.1 Secret-path agent guard
+
+A PreToolUse hook (`_pretool_secret_guard_hook` in
+`server/agents.py`) blocks agent writes / reads against
+harness-managed locations:
+
+- Claude CLI config: `$CLAUDE_CONFIG_DIR` (default `/data/claude`)
+  + `~/.claude` fallback.
+- Codex CLI config: `$CODEX_HOME` (default `/data/codex`)
+  + `~/.codex` fallback.
+- SQLite DB: `$HARNESS_DB_PATH` (default `/data/harness.db`).
+- `/proc/<pid>/environ` and `/proc/self/environ` (env exfil).
+
+Two parallel checks:
+
+- **Path-based** (`_path_is_secret`): for `Write` / `Edit` /
+  `Read` / `Bash` arguments that are filesystem paths. Resolves
+  symlinks before comparing so symlink-based escapes
+  (`/workspaces/p1/foo → /data/claude/.credentials.json`) trip.
+- **Bash pattern-based** (`_BASH_SECRET_PATTERNS`): regex over
+  the command string. Catches reads that wouldn't surface as
+  a path argument (e.g., `awk '...' /data/claude/...`).
+
+**Carveout**: `$CLAUDE_CONFIG_DIR/plans/` is allowed (the Claude
+CLI's plan-mode workspace lives there; without an exception the
+guard breaks plan mode). Scoped to Claude roots only — Codex root
+and the DB path have no analogous carveout. Symlink-based escapes
+like `/data/claude/plans/../.credentials.json` collapse via
+`resolve()` to the canonical sibling path and still trip.
+
 ### 19.5 Per-agent runtime selection
 
 Two runtimes ship: **ClaudeRuntime** (default; described inline
@@ -4293,6 +4351,18 @@ Token lifetime, MCP cache invalidation on config change,
 `default_tools_approval_mode` injection, and the stdio error-shape
 contract are CodexRuntime concerns — see
 `Docs/CODEX_RUNTIME_SPEC.md` §C.4 and §E.1.
+
+**Transient-error retry (2026-05-13)**: `CoordProxyClient.call_tool`
+retries on transport errors (`httpx.ConnectError`, `ReadTimeout`,
+`WriteTimeout`, `PoolTimeout`, `RemoteProtocolError`, `ReadError`,
+`WriteError`) and HTTP 5xx responses. Backoff schedule: 100ms,
+400ms, 1500ms (total ~2s worst case for 4 attempts). 4xx responses
+are NOT retried — they're caller-side validation / auth issues.
+After exhaustion the surfaced error message names the actual
+exception type and attempt count so callers can distinguish
+transient vs permanent. Closes Coach's 2026-05-12 "stream error on
+coord_* call, no signal reached Coach until next wake" failure
+mode.
 
 ---
 

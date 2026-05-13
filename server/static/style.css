@@ -297,8 +297,7 @@ body {
     padding: 1px 6px;
     border-radius: 9px;
   }
-  .pane-mode-chip.context-bar .context-bar-label,
-  .pane-mode-chip.context-bar .context-bar-pct {
+  .pane-mode-chip.context-bar .context-bar-label {
     min-width: 0;
     font-size: 9px;
   }
@@ -4122,7 +4121,7 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   gap: 6px;
   padding: 2px 8px;
   cursor: default;
-  min-width: 110px;
+  min-width: 72px;
 }
 .context-bar-label {
   color: var(--muted);
@@ -4145,13 +4144,6 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   display: block;
   height: 100%;
   transition: width 250ms ease-out, background 250ms ease-out;
-}
-.context-bar-pct {
-  color: var(--muted);
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-  min-width: 32px;
-  text-align: right;
 }
 
 /* Dismissable info banner — used by /tools and /help to show output

@@ -861,39 +861,83 @@ async def _handle_message(
             _last_shown_prior_error_fp.pop(agent_id, None)
             _consecutive_auto_continues.pop(agent_id, None)
         await _add_cost(agent_id, cost)
-        # Player soft-error → DM Coach so the workflow doesn't hang on
-        # a silent failure. A ResultMessage with is_error=True came
-        # back fine from the SDK but the turn itself reports failure
-        # (max_turns, max_budget, error_during_execution, etc.) — this
-        # does NOT trigger auto-retry (that path is for hard errors
-        # before ResultMessage), so Coach is the only one who can
-        # react. Skip Coach's own errors (nothing to notify) and
-        # compact turns (internal). Debounced per-agent.
+        # Player soft-error: either auto-retry (transient shapes like
+        # `stop_sequence` or short `tool_use` timeouts) or DM Coach
+        # with an actionable summary (longer timeouts, unknown shapes).
+        # A `ResultMessage(is_error=True)` returned cleanly from the
+        # SDK but the model's turn reported failure. Skip Coach's own
+        # errors (nothing to notify) and compact turns (internal).
         if (
             msg.is_error
             and agent_id != "coach"
             and agent_id != "system"
             and (turn_ctx is None or not turn_ctx.get("compact_mode"))
+            # max_turns / max_tokens has its own auto-continue path
+            # below; don't double-handle.
+            and not _looks_like_max_turns(subtype, stop_reason)
         ):
-            now_m = time.monotonic()
-            last = _last_error_dm_to_coach.get(agent_id, 0.0)
-            if now_m - last >= ERROR_DM_DEBOUNCE_SECONDS:
-                _last_error_dm_to_coach[agent_id] = now_m
-                reason = str(stop_reason or "error")
-                await _deliver_system_message(
-                    from_id=agent_id,
-                    to_id="coach",
-                    subject=f"{agent_id} turn errored ({reason})",
-                    body=(
-                        f"My last turn ended with is_error=True "
-                        f"(stop_reason={reason}, duration="
-                        f"{int((duration_ms or 0) / 1000)}s). I won't "
-                        f"auto-retry — soft errors don't trigger the "
-                        f"retry loop. Decide whether to re-prompt me, "
-                        f"reassign, or investigate via /api/events."
-                    ),
-                    priority="normal",
+            policy = _soft_error_retry_policy(
+                stop_reason, subtype, duration_ms,
+            )
+            if policy["retry"]:
+                # Auto-retry path: bump the consecutive-error counter
+                # for cap accounting, schedule a delayed wake. Mark
+                # turn_ctx so the post-result suppress block (line
+                # ~5717) doesn't reset the counter while a retry is
+                # in flight.
+                _consecutive_errors[agent_id] = (
+                    _consecutive_errors.get(agent_id, 0) + 1
                 )
+                if turn_ctx is not None:
+                    turn_ctx["soft_error_retry_scheduled"] = True
+                last_tool = (
+                    turn_ctx.get("last_tool") if turn_ctx else None
+                )
+                await _emit(
+                    agent_id,
+                    "soft_error_retry_scheduled",
+                    stop_reason=str(stop_reason or ""),
+                    subtype=str(subtype or ""),
+                    duration_ms=duration_ms,
+                    delay_s=policy["delay_s"],
+                    attempt=_consecutive_errors[agent_id],
+                    last_tool=last_tool,
+                )
+                await _schedule_post_error_retry(
+                    agent_id,
+                    delay_s_override=policy["delay_s"],
+                    accept_idle_status=True,
+                )
+            else:
+                # No-retry path: send the enriched DM so Coach has
+                # enough context to decide. Debounced per-agent.
+                now_m = time.monotonic()
+                last = _last_error_dm_to_coach.get(agent_id, 0.0)
+                if now_m - last >= ERROR_DM_DEBOUNCE_SECONDS:
+                    _last_error_dm_to_coach[agent_id] = now_m
+                    reason = str(stop_reason or "error")
+                    last_tool = (
+                        turn_ctx.get("last_tool") if turn_ctx else None
+                    )
+                    tool_hint = (
+                        f" Last tool: `{last_tool}`."
+                        if last_tool else ""
+                    )
+                    await _deliver_system_message(
+                        from_id=agent_id,
+                        to_id="coach",
+                        subject=f"{agent_id} turn errored ({reason})",
+                        body=(
+                            f"My last turn ended with is_error=True "
+                            f"(stop_reason={reason}, duration="
+                            f"{int((duration_ms or 0) / 1000)}s). The "
+                            f"harness didn't classify this shape as "
+                            f"transient — no auto-retry.{tool_hint} "
+                            f"Decide whether to re-prompt me, reassign, "
+                            f"or investigate via /api/events."
+                        ),
+                        priority="normal",
+                    )
         # Auto-continue on max-turns hit. Distinct from the soft-error
         # DM-to-Coach above (which routes a Player's hard failure
         # through Coach) — this fires for *any* agent (Coach included)
@@ -4488,10 +4532,48 @@ def _denied_secret_paths() -> tuple[Path, ...]:
     return tuple(out)
 
 
+def _claude_root_paths() -> tuple[Path, ...]:
+    """Subset of `_denied_secret_paths()` that represents Claude CLI
+    config roots specifically. Used to scope the `plans/` carveout —
+    we only want to allow plan-mode writes under a Claude root, not
+    under the Codex root or the DB path.
+    """
+    from server.paths import DATA_ROOT
+    paths: list[Path] = []
+    claude_env = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if claude_env:
+        paths.append(Path(claude_env).resolve())
+    paths.append((DATA_ROOT / "claude").resolve())
+    try:
+        home = Path.home()
+        paths.append((home / ".claude").resolve())
+    except (RuntimeError, OSError):
+        pass
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return tuple(out)
+
+
 def _path_is_secret(path_str: str) -> bool:
     """True if `path_str` refers to a denied secret path. Resolves to
     follow symlinks before comparing, so a symlink at
-    /workspaces/p1/foo → /data/claude won't slip past."""
+    /workspaces/p1/foo → /data/claude won't slip past.
+
+    Carveout: the Claude CLI's plan-mode workspace lives under
+    `$CLAUDE_CONFIG_DIR/plans/` (resolves to `/data/claude/plans/`
+    in production). Plan mode tells agents to write spec files
+    there; without an exception the guard hard-blocks the agent's
+    own plan workflow. Codex doesn't have an equivalent plan-mode
+    path, so the carveout is Claude-only — scoped to roots returned
+    by `_claude_root_paths()`. The resolve() pass above means a
+    symlink-based escape like `/data/claude/plans/../.credentials.json`
+    collapses to `/data/claude/.credentials.json`, which is still
+    rejected.
+    """
     if not path_str:
         return False
     # /proc/<pid>/environ — match before the resolve() call because the
@@ -4503,22 +4585,34 @@ def _path_is_secret(path_str: str) -> bool:
         target = Path(path_str).resolve()
     except OSError:
         return False
+    claude_roots = set(_claude_root_paths())
     for denied in _denied_secret_paths():
         if target == denied:
             return True
         try:
-            target.relative_to(denied)
-            return True
+            relative = target.relative_to(denied)
         except ValueError:
             continue
+        # Carveout: `<claude_root>/plans/...` is the Claude CLI
+        # plan-mode scratchpad. Allow reads/writes there. Codex root
+        # and DB path have no equivalent carveout.
+        parts = relative.parts
+        if denied in claude_roots and parts and parts[0] == "plans":
+            return False
+        return True
     return False
 
 
 # Bash heuristics — same conservative philosophy as the file-guard
 # hook above. Match path components anywhere in the command string.
+# The `plans/` carveout in `_path_is_secret` is mirrored here via a
+# negative lookahead: `/data/claude` matches UNLESS immediately
+# followed by `/plans` and a boundary (so `plans/` or `plans` at
+# end-of-arg are exempt, but a sibling file named `plansomething`
+# would still trip).
 _BASH_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Default-deploy paths.
-    re.compile(r"/data/claude(?:/|$|\b)"),
+    re.compile(r"/data/claude(?!/plans(?:/|$))(?:/|$|\b)"),
     re.compile(r"/data/codex(?:/|$|\b)"),
     re.compile(r"/data/harness\.db\b"),
     # Anywhere agents try to grab a process's env.
@@ -5879,6 +5973,54 @@ def _looks_like_max_turns(subtype: Any, stop_reason: Any) -> bool:
     return False
 
 
+def _soft_error_retry_policy(
+    stop_reason: Any, subtype: Any, duration_ms: Any,
+) -> dict[str, Any]:
+    """Decide whether to auto-retry a soft error.
+
+    A soft error is a `ResultMessage(is_error=True)` — the SDK returned
+    cleanly but the model's turn reported failure (`stop_reason` /
+    `subtype` indicate why). Distinct from hard errors which throw
+    before any `ResultMessage` lands and are always retried.
+
+    Coach's 2026-05-12 report flagged real production cost: every
+    `stop_sequence` (sometimes 7s into a turn) and `tool_use` timeout
+    routed silently to a Coach DM, requiring manual recovery. Most are
+    transient and recover on a single retry.
+
+    Returns `{"retry": bool, "delay_s": int}`.
+
+    Policy:
+      - `stop_sequence` → retry, 0s delay (model-side truncation; usually
+        not a real failure).
+      - `tool_use` with duration < 5 min → retry, 30s delay (likely a
+        transient tool error or shell flake).
+      - `tool_use` with duration ≥ 5 min → no retry (probable tool loop
+        or stuck shell; needs Coach attention).
+      - `max_turns` / `max_tokens` → no retry (handled by the separate
+        auto-continue path).
+      - anything else → no retry; Coach handles via DM.
+
+    Cap accounting reuses `_consecutive_errors` so repeated retriable
+    shapes escalate via the gave-up path after `ERROR_RETRY_MAX_CONSECUTIVE`
+    consecutive failures — eventually a misbehaving agent still trips
+    `human_attention`.
+    """
+    if _looks_like_max_turns(subtype, stop_reason):
+        return {"retry": False, "delay_s": 0}
+    sr = str(stop_reason or "").strip().lower()
+    if sr == "stop_sequence":
+        return {"retry": True, "delay_s": 0}
+    if sr == "tool_use":
+        try:
+            ms = int(duration_ms) if duration_ms is not None else None
+        except (TypeError, ValueError):
+            ms = None
+        if ms is not None and ms < 300_000:  # < 5 min
+            return {"retry": True, "delay_s": 30}
+    return {"retry": False, "delay_s": 0}
+
+
 async def _maybe_schedule_auto_continue(
     *,
     agent_id: str,
@@ -6003,15 +6145,28 @@ async def _maybe_schedule_auto_continue(
     asyncio.create_task(_delayed_continue())
 
 
-async def _schedule_post_error_retry(agent_id: str) -> None:
-    """Schedule a single auto-wake after a hard error so the agent
-    doesn't sit idle indefinitely. Caps consecutive retries and
-    escalates to the human when the cap trips.
+async def _schedule_post_error_retry(
+    agent_id: str,
+    *,
+    delay_s_override: int | None = None,
+    accept_idle_status: bool = False,
+) -> None:
+    """Schedule a single auto-wake after an error so the agent doesn't
+    sit idle indefinitely. Caps consecutive retries and escalates to
+    the human when the cap trips.
 
-    The retry is cancelled (logically — the task still runs but no-ops)
-    if the agent has recovered to idle/working by the time the delay
-    elapses, so user/other-event wakes during the window don't double-
-    fire.
+    Two callers:
+      - Hard errors (default): turn threw before `ResultMessage`. Status
+        is `"error"`; the retry only fires if status remains `"error"`
+        when the delay elapses.
+      - Soft errors (`accept_idle_status=True`): `ResultMessage(is_error=True)`
+        landed but the post-result handler reset status to `"idle"`.
+        We retry as long as the slot isn't actively `"working"` (a
+        user/peer wake during the window takes precedence).
+
+    `delay_s_override` lets the soft-error policy pick a delay that
+    differs from `ERROR_RETRY_DELAY_SECONDS` (default 45s for hard
+    errors). Stop-sequence retries use 0s; tool-use timeouts use 30s.
     """
     if agent_id in _retry_pending:
         return
@@ -6066,15 +6221,29 @@ async def _schedule_post_error_retry(agent_id: str) -> None:
         return
     _retry_pending.add(agent_id)
 
+    actual_delay = (
+        delay_s_override if delay_s_override is not None
+        else ERROR_RETRY_DELAY_SECONDS
+    )
+
     async def _delayed_retry() -> None:
         try:
-            await asyncio.sleep(ERROR_RETRY_DELAY_SECONDS)
+            await asyncio.sleep(actual_delay)
             # If the agent self-recovered (human intervened, new wake
             # fired, etc.) skip — we don't want to poke a healthy
             # agent with a stale "your turn errored" prompt.
             status = await _get_status_of(agent_id)
-            if status != "error":
-                return
+            if accept_idle_status:
+                # Soft-error path: status was reset to `"idle"` by the
+                # post-result handler; only bail if the slot has since
+                # started a different turn.
+                if status == "working":
+                    return
+            else:
+                # Hard-error path: status stays `"error"` until either
+                # a recovery wake fires or the user manually clears.
+                if status != "error":
+                    return
             if agent_id in _running_tasks:
                 return
             await _emit(
@@ -6082,7 +6251,8 @@ async def _schedule_post_error_retry(agent_id: str) -> None:
                 "auto_retry_scheduled",
                 attempt=attempt + 1,
                 max_attempts=ERROR_RETRY_MAX_CONSECUTIVE,
-                delay=ERROR_RETRY_DELAY_SECONDS,
+                delay=actual_delay,
+                soft=bool(accept_idle_status),
             )
             from server.tools import _with_player_reminder
             error_body = (

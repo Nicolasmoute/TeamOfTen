@@ -534,3 +534,147 @@ async def test_proxy_endpoint_missing_or_invalid_token(
             json={"args": {}},
         )
         assert r3.status_code == 401
+
+
+# ---------- CoordProxyClient.call_tool retry behavior (PR-2 Fix 7) ----------
+
+
+import asyncio
+import httpx
+import pytest
+
+from server.coord_mcp import CoordProxyClient
+
+
+class _StubTransport(httpx.AsyncBaseTransport):
+    """Programmable httpx transport that returns a queue of responses
+    (one per request). When the next item is an Exception, it's raised
+    instead of being returned — letting us simulate transient
+    transport failures without a real socket."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = 0
+
+    async def handle_async_request(self, request):
+        self.calls += 1
+        if not self._responses:
+            raise AssertionError("StubTransport exhausted")
+        item = self._responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        status_code, body = item
+        return httpx.Response(
+            status_code,
+            json=body,
+            request=request,
+        )
+
+
+def _client_with(responses):
+    transport = _StubTransport(responses)
+    c = CoordProxyClient("http://stub", "tok", "p3")
+    c._client = httpx.AsyncClient(transport=transport, timeout=5.0)
+    return c, transport
+
+
+def test_proxy_call_succeeds_on_first_attempt():
+    """No retries needed when the first response is a 2xx with a dict body."""
+    async def run():
+        c, t = _client_with([(200, {"ok": True, "content": [{"type": "text", "text": "hi"}]})])
+        try:
+            result = await c.call_tool("coord_list_team", {})
+            assert result == {"ok": True, "content": [{"type": "text", "text": "hi"}]}
+            assert t.calls == 1
+        finally:
+            await c.aclose()
+    asyncio.run(run())
+
+
+def test_proxy_call_retries_on_transport_error_then_succeeds():
+    """ConnectError on attempt 1 should be retried; success on attempt 2 returns the dict."""
+    async def run():
+        c, t = _client_with([
+            httpx.ConnectError("connection refused"),
+            (200, {"ok": True, "content": [{"type": "text", "text": "ok"}]}),
+        ])
+        try:
+            result = await c.call_tool("coord_list_team", {})
+            assert result == {"ok": True, "content": [{"type": "text", "text": "ok"}]}
+            assert t.calls == 2
+        finally:
+            await c.aclose()
+    asyncio.run(run())
+
+
+def test_proxy_call_retries_on_5xx_then_succeeds():
+    """5xx is retried (server-side issue, possibly transient)."""
+    async def run():
+        c, t = _client_with([
+            (503, {"error": "temporarily unavailable"}),
+            (502, {"error": "bad gateway"}),
+            (200, {"ok": True, "content": [{"type": "text", "text": "ok"}]}),
+        ])
+        try:
+            result = await c.call_tool("coord_list_team", {})
+            assert result["ok"] is True
+            assert t.calls == 3
+        finally:
+            await c.aclose()
+    asyncio.run(run())
+
+
+def test_proxy_call_does_not_retry_on_4xx():
+    """4xx is a caller-side issue (validation / auth) — no retry, fail fast."""
+    async def run():
+        c, t = _client_with([(400, {"error": "bad arg"})])
+        try:
+            result = await c.call_tool("coord_list_team", {})
+            assert result["ok"] is False
+            assert "400" in result["error"]
+            assert t.calls == 1  # No retry
+        finally:
+            await c.aclose()
+    asyncio.run(run())
+
+
+def test_proxy_call_gives_up_after_max_attempts_on_transport_error():
+    """After 4 total attempts (initial + 3 retries) we surface the
+    most recent transport exception. The actual exception type
+    appears in the error string so callers can distinguish transient
+    vs permanent."""
+    async def run():
+        c, t = _client_with([
+            httpx.ConnectError("attempt 1"),
+            httpx.ConnectError("attempt 2"),
+            httpx.ConnectError("attempt 3"),
+            httpx.ConnectError("attempt 4"),
+        ])
+        try:
+            result = await c.call_tool("coord_list_team", {})
+            assert result["ok"] is False
+            assert "ConnectError" in result["error"]
+            assert "4 attempts" in result["error"]
+            assert t.calls == 4
+        finally:
+            await c.aclose()
+    asyncio.run(run())
+
+
+def test_proxy_call_gives_up_after_max_attempts_on_5xx():
+    """Persistent 5xx exhausts retries and surfaces the last status."""
+    async def run():
+        c, t = _client_with([
+            (500, {"error": "internal 1"}),
+            (500, {"error": "internal 2"}),
+            (500, {"error": "internal 3"}),
+            (500, {"error": "internal 4"}),
+        ])
+        try:
+            result = await c.call_tool("coord_list_team", {})
+            assert result["ok"] is False
+            assert "500" in result["error"]
+            assert t.calls == 4
+        finally:
+            await c.aclose()
+    asyncio.run(run())

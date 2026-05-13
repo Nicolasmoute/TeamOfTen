@@ -88,6 +88,15 @@ def _tool_result_content(result: Any) -> list[types.TextContent]:
 class CoordProxyClient:
     """Forward tool calls to `${proxy_url}/api/_coord/{tool}`."""
 
+    # Per-attempt backoff schedule for transient transport failures.
+    # Sums to ~2s worst case — well under the 120s outer timeout, low
+    # enough to be invisible to the agent on a single recovered call.
+    # Coach's 2026-05-12 report flagged a real production case where a
+    # transient `coord_*` stream error left a Player unable to signal
+    # work-done; the harness learned about the failure only on the
+    # next scheduled wake. One transparent retry closes that gap.
+    _RETRY_BACKOFF_S: tuple[float, ...] = (0.1, 0.4, 1.5)
+
     def __init__(self, proxy_url: str, token: str, caller_id: str) -> None:
         self.base = proxy_url.rstrip("/")
         self.token = token
@@ -101,23 +110,85 @@ class CoordProxyClient:
         return list(data.get("tools", []))
 
     async def call_tool(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
-        resp = await self._client.post(
-            f"{self.base}/api/_coord/{tool_name}",
-            headers={"Authorization": f"Bearer {self.token}"},
-            json={"caller_id": self.caller_id, "args": args},
-        )
-        payload = _response_payload(resp)
-        if resp.status_code >= 400:
+        """POST the tool call, retrying transient transport errors
+        and 5xx responses with bounded backoff. 4xx responses are
+        not retried — they're caller-side validation / auth issues
+        and looping wouldn't help.
+        """
+        url = f"{self.base}/api/_coord/{tool_name}"
+        body = {"caller_id": self.caller_id, "args": args}
+        headers = {"Authorization": f"Bearer {self.token}"}
+
+        last_exc: Exception | None = None
+        last_status: int | None = None
+        last_payload: Any = None
+
+        # Total attempts = retries + 1 initial. With 3 backoff slots,
+        # 4 total attempts; final wait is taken from the schedule but
+        # only delays before the LAST retry — there is no sleep AFTER
+        # the final failure.
+        for attempt in range(len(self._RETRY_BACKOFF_S) + 1):
+            try:
+                resp = await self._client.post(url, headers=headers, json=body)
+            except (
+                httpx.ConnectError,
+                httpx.ReadTimeout,
+                httpx.WriteTimeout,
+                httpx.PoolTimeout,
+                httpx.RemoteProtocolError,
+                httpx.ReadError,
+                httpx.WriteError,
+            ) as exc:
+                last_exc = exc
+                last_status = None
+                last_payload = None
+                # Fall through to backoff / final-failure handling below.
+            else:
+                last_status = resp.status_code
+                last_payload = _response_payload(resp)
+                last_exc = None
+                # Success path — return without retry.
+                if resp.status_code < 400:
+                    if not isinstance(last_payload, dict):
+                        return {
+                            "ok": False,
+                            "error": (
+                                f"unexpected proxy response: "
+                                f"{_stringify(last_payload)}"
+                            ),
+                        }
+                    return last_payload
+                # 4xx is a caller-side issue (validation / auth) —
+                # no point retrying; return immediately.
+                if 400 <= resp.status_code < 500:
+                    return {
+                        "ok": False,
+                        "error": _http_error_text(
+                            resp.status_code, last_payload,
+                        ),
+                    }
+                # 5xx — fall through to retry.
+
+            # Decide whether to sleep + retry, or fail terminally.
+            if attempt < len(self._RETRY_BACKOFF_S):
+                await asyncio.sleep(self._RETRY_BACKOFF_S[attempt])
+                continue
+            break
+
+        # Retries exhausted — surface the most recent failure shape.
+        if last_exc is not None:
             return {
                 "ok": False,
-                "error": _http_error_text(resp.status_code, payload),
+                "error": (
+                    f"coord proxy transport failed after "
+                    f"{len(self._RETRY_BACKOFF_S) + 1} attempts: "
+                    f"{type(last_exc).__name__}: {last_exc}"
+                ),
             }
-        if not isinstance(payload, dict):
-            return {
-                "ok": False,
-                "error": f"unexpected proxy response: {_stringify(payload)}",
-            }
-        return payload
+        return {
+            "ok": False,
+            "error": _http_error_text(last_status or 0, last_payload),
+        }
 
     async def aclose(self) -> None:
         await self._client.aclose()

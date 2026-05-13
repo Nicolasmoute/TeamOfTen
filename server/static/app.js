@@ -9771,7 +9771,6 @@ function ContextBar({ slot, liveEvents, model }) {
         style=${`width: ${pct}%; background: ${color};`}
       ></span>
     </span>
-    <span class="context-bar-pct">${pct}%</span>
   </div>`;
 }
 
@@ -11535,6 +11534,23 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
             })()}
           >
             ${effectivePlanMode ? "plan" : "no plan"}
+          </button>
+          <button
+            class=${"pane-mode-chip" + (effectiveThinking ? " active" : "")}
+            onClick=${() => setPaneSettings((s) => ({ ...s, thinking: !effectiveThinking }))}
+            title=${(() => {
+              const src = paneSettings.thinking !== undefined
+                ? "per-pane override"
+                : (agent?.thinking_override !== null && agent?.thinking_override !== undefined
+                    ? "Coach-set override"
+                    : "default off");
+              const rtNote = effectiveRuntime === "codex"
+                ? " — inert on Codex (Claude runtime only)"
+                : "";
+              return `Thinking ${effectiveThinking ? "ON" : "OFF"} (${src})${rtNote} — click to toggle`;
+            })()}
+          >
+            ${effectiveThinking ? "think" : "no think"}
           </button>
           <button
             class=${"pane-mode-chip" + (paneSettings.effort ? " active" : "")}

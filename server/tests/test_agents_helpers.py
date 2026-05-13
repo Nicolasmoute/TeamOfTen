@@ -1098,3 +1098,86 @@ def test_prior_error_module_sticky_state_exists() -> None:
 
     assert hasattr(agents_mod, "_last_shown_prior_error_fp")
     assert isinstance(agents_mod._last_shown_prior_error_fp, dict)
+
+
+# ---------- _soft_error_retry_policy (PR-2 Fix 6) ----------
+
+
+def test_soft_error_retry_policy_stop_sequence_retries_immediately() -> None:
+    """stop_sequence is almost always a model-side truncation —
+    cheapest retry shape, fires with no delay."""
+    from server.agents import _soft_error_retry_policy
+
+    p = _soft_error_retry_policy("stop_sequence", None, 7000)
+    assert p == {"retry": True, "delay_s": 0}
+
+
+def test_soft_error_retry_policy_short_tool_use_retries_with_delay() -> None:
+    """tool_use under 5 min is treated as a transient tool error;
+    retry with a 30s delay so a flaky shell has a beat to recover."""
+    from server.agents import _soft_error_retry_policy
+
+    # 1 second
+    assert _soft_error_retry_policy("tool_use", None, 1000) == {
+        "retry": True, "delay_s": 30,
+    }
+    # Just under 5 min
+    assert _soft_error_retry_policy("tool_use", None, 299_999) == {
+        "retry": True, "delay_s": 30,
+    }
+
+
+def test_soft_error_retry_policy_long_tool_use_does_not_retry() -> None:
+    """tool_use ≥ 5 min is probably a tool loop / stuck shell —
+    Coach should investigate, not auto-retry."""
+    from server.agents import _soft_error_retry_policy
+
+    assert _soft_error_retry_policy("tool_use", None, 300_000) == {
+        "retry": False, "delay_s": 0,
+    }
+    assert _soft_error_retry_policy("tool_use", None, 1_197_000) == {
+        "retry": False, "delay_s": 0,
+    }
+
+
+def test_soft_error_retry_policy_max_turns_does_not_retry() -> None:
+    """max_turns / max_tokens have their own auto-continue path —
+    don't double-handle."""
+    from server.agents import _soft_error_retry_policy
+
+    assert _soft_error_retry_policy("max_turns", None, 5000)["retry"] is False
+    assert _soft_error_retry_policy("max_tokens", None, 5000)["retry"] is False
+    assert _soft_error_retry_policy(
+        None, "error_max_turns", 5000,
+    )["retry"] is False
+
+
+def test_soft_error_retry_policy_unknown_shapes_do_not_retry() -> None:
+    """Unrecognized stop_reason shapes route to Coach DM, not retry."""
+    from server.agents import _soft_error_retry_policy
+
+    for sr in ("end_turn", "refusal", "pause_turn", None, "", "weird_new"):
+        assert _soft_error_retry_policy(sr, None, 5000)["retry"] is False
+
+
+def test_soft_error_retry_policy_tolerates_missing_duration() -> None:
+    """duration_ms can be None / non-numeric; the policy must not
+    crash — defensive against SDK shape drift."""
+    from server.agents import _soft_error_retry_policy
+
+    # tool_use without duration → no retry (we can't tell if it's
+    # short or long, fall back to safer no-retry default).
+    assert _soft_error_retry_policy("tool_use", None, None)["retry"] is False
+    assert _soft_error_retry_policy("tool_use", None, "abc")["retry"] is False
+    # stop_sequence doesn't depend on duration, retries regardless.
+    assert _soft_error_retry_policy("stop_sequence", None, None)["retry"] is True
+
+
+def test_soft_error_retry_policy_case_insensitive() -> None:
+    """SDK has shipped both lowercase and TitleCase stop_reasons
+    historically. Policy should be tolerant."""
+    from server.agents import _soft_error_retry_policy
+
+    assert _soft_error_retry_policy("STOP_SEQUENCE", None, 1000)["retry"] is True
+    assert _soft_error_retry_policy("Stop_Sequence", None, 1000)["retry"] is True
+    assert _soft_error_retry_policy("Tool_Use", None, 1000)["retry"] is True
