@@ -929,6 +929,28 @@ body {
   flex-direction: column;
   gap: 2px;
 }
+/* Reply button for inbox message rows — same hover-reveal shape as
+   .msg-reply-btn on agent-pane message_sent rows. */
+.env-decision { position: relative; }
+.env-reply-btn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 20px;
+  height: 20px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+  color: var(--fg2, #7e8694);
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.env-decision:hover .env-reply-btn { opacity: 1; }
+.env-reply-btn:hover { color: var(--accent); }
 .env-decision-head {
   display: flex;
   align-items: center;
@@ -3533,9 +3555,31 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 .event.tool_use .tool-card.comm-tool .tool-summary {
   color: var(--accent) !important;
 }
-/* `.event.message_sent` styling lives in the tiering block above —
-   modifier classes `.human-thread` (Tier 1) and `.peer-thread`
-   (Tier 2) are added by the renderer based on from/to ids. */
+/* `.event.message_sent` hover-reveal reply button. position:relative
+   anchors the absolute-positioned button inside the card; the button
+   is hidden by default and revealed on hover via opacity transition.
+   Modifier classes `.human-thread` / `.peer-thread` live in the
+   tiering block above. */
+.event.message_sent { position: relative; }
+.msg-reply-btn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+  color: var(--fg2, #7e8694);
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.event.message_sent:hover .msg-reply-btn { opacity: 1; }
+.msg-reply-btn:hover { color: var(--accent); }
 
 /* `coord_request_human` escalations. Rendered as a prominent card
    (subject + full markdown body) so the message that just pinged the
