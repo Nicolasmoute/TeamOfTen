@@ -381,6 +381,12 @@ mcp_servers = {"coord": coord_server, **external_servers}
 }
 ```
 
+CodexRuntime also applies a turn-level sandbox policy for Player turns:
+the active slot's worktree stays writable, while the shared `.project`
+seed checkout and sibling slot worktrees are listed in `blockedPaths`.
+This mirrors the Claude file-guard boundary at the sandbox layer. Coach
+still runs read-only.
+
 **External MCP servers inherit the same approval policy.** Servers added
 through the Options drawer are merged into `mcp_servers` with
 `default_tools_approval_mode = "approve"` injected when not already
