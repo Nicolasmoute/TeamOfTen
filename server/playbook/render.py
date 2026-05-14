@@ -35,7 +35,7 @@ import sys
 from typing import Iterable
 
 from server.playbook import config
-from server.playbook.store import Lattice, Statement, load_lattice
+from server.playbook.store import Lattice, Statement, load_lattice, read_runs
 
 logger = logging.getLogger("harness.playbook.render")
 if not logger.handlers:
@@ -190,6 +190,44 @@ def _render_full(lattice: Lattice, *, drop_uncertain: bool = False) -> str:
     return "\n".join(parts).strip() + "\n"
 
 
+_HYGIENE_THRESHOLD = 40  # only surface the hygiene rollup when lattice is large
+
+
+def _render_hygiene_rollup(n_active: int) -> str:
+    """Return a short `## Playbook hygiene` markdown block for Coach when
+    the lattice has grown past `_HYGIENE_THRESHOLD` statements.
+
+    Reads the most-recent runs.jsonl row to surface last-sweep info.
+    Sync + best-effort: any read failure → omit the sweep line.
+    """
+    lines = ["## Playbook hygiene", ""]
+    lines.append(
+        f"Active: {n_active} / {config.SOFT_STATEMENT_CAP} soft cap "
+        f"/ {config.HARD_STATEMENT_CAP} hard cap"
+        + (
+            f"  ← PRESSURE (>{config.PRESSURE_CAP})"
+            if n_active > config.PRESSURE_CAP
+            else ""
+        )
+    )
+    # Best-effort last-sweep summary
+    try:
+        runs = read_runs(limit=1)
+        if runs:
+            last = runs[0]
+            engine_actions = last.get("engine_actions") or []
+            n_archived = len(engine_actions)
+            outcome = last.get("outcome", "?")
+            started = (last.get("started_at") or "")[:10]
+            lines.append(
+                f"Last sweep: {started} — outcome={outcome}, archived={n_archived}"
+            )
+    except Exception:
+        pass
+    lines.append("")
+    return "\n".join(lines)
+
+
 def render_playbook_block() -> str:
     """Return the rendered `## Orchestration playbook` markdown block,
     or empty string when there's nothing to render.
@@ -203,6 +241,11 @@ def render_playbook_block() -> str:
     "Uncertain" bucket dropped. If still over budget, accept overage —
     the system-prompt cap (200 KB CLAUDE.md, plenty of headroom) won't
     be hit by Playbook alone.
+
+    When the lattice grows past `_HYGIENE_THRESHOLD`, a short
+    `## Playbook hygiene` block is prepended so Coach sees cap status
+    without having to open the dashboard (Coach-only — context.py gates
+    the caller by agent_id == "coach").
     """
     if _is_disabled():
         return ""
@@ -218,23 +261,27 @@ def render_playbook_block() -> str:
     if not lattice.statements:
         return ""
 
+    n_active = len(lattice.statements)
+
     rendered = _render_full(lattice)
     if len(rendered.encode("utf-8")) <= config.RENDER_MAX_BYTES:
-        return rendered
+        pass
+    else:
+        # Over budget — try without the Uncertain bucket.
+        rendered = _render_full(lattice, drop_uncertain=True)
+        if len(rendered.encode("utf-8")) <= config.RENDER_MAX_BYTES:
+            logger.info("playbook.render: dropped Uncertain bucket to fit size budget")
+        else:
+            # Still over budget — accept overage.
+            logger.warning(
+                "playbook.render: %d active statements exceed RENDER_MAX_BYTES "
+                "(%d) even with Uncertain dropped; emitting full block",
+                n_active, config.RENDER_MAX_BYTES,
+            )
 
-    # Over budget — try without the Uncertain bucket.
-    rendered = _render_full(lattice, drop_uncertain=True)
-    if len(rendered.encode("utf-8")) <= config.RENDER_MAX_BYTES:
-        logger.info("playbook.render: dropped Uncertain bucket to fit size budget")
-        return rendered
-
-    # Still over budget — accept overage. Logging once per process is
-    # enough; the dashboard's capacity bar already shows the count.
-    logger.warning(
-        "playbook.render: %d active statements exceed RENDER_MAX_BYTES "
-        "(%d) even with Uncertain dropped; emitting full block",
-        len(lattice.statements), config.RENDER_MAX_BYTES,
-    )
+    # Prepend hygiene rollup when lattice is large (Coach-only context).
+    if n_active > _HYGIENE_THRESHOLD:
+        return _render_hygiene_rollup(n_active) + rendered
     return rendered
 
 

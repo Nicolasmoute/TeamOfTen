@@ -63,9 +63,13 @@ ADJUST_DELTA_CAP = _env_float("HARNESS_PLAYBOOK_ADJUST_DELTA_CAP", 0.25)
 
 # ----------------------------------------------------------- caps
 # Statement-count caps. Soft cap is the working ceiling; hard cap is
-# the operator-review trigger (spec §5.7).
-SOFT_STATEMENT_CAP = _env_int("HARNESS_PLAYBOOK_SOFT_CAP", 100)
-HARD_STATEMENT_CAP = _env_int("HARNESS_PLAYBOOK_HARD_CAP", 110)
+# the operator-review trigger (spec §5.7). Pressure cap is the
+# sweep-engine auto-archive trigger — when active > PRESSURE_CAP at the
+# end of sweep_engine_actions, lowest-weight non-immutable statements
+# are archived until active <= SOFT_STATEMENT_CAP (spec §5.7.1).
+SOFT_STATEMENT_CAP = _env_int("HARNESS_PLAYBOOK_SOFT_CAP", 60)
+HARD_STATEMENT_CAP = _env_int("HARNESS_PLAYBOOK_HARD_CAP", 80)
+PRESSURE_CAP = _env_int("HARNESS_PLAYBOOK_PRESSURE_CAP", 60)
 
 # Per-statement character cap. Lattice statements are injected into
 # every agent's system prompt on every turn — verbose phrasing
@@ -76,13 +80,13 @@ STATEMENT_MAX_CHARS = _env_int("HARNESS_PLAYBOOK_STATEMENT_MAX_CHARS", 160)
 # ----------------------------------------------- settle / stale thresholds
 # A statement settles or stales after WEIGHT crosses the threshold AND
 # remains there for STABLE_DAYS without an excursion (spec §5.8).
-SETTLE_THRESHOLD = _env_float("HARNESS_PLAYBOOK_SETTLE_THRESHOLD", 0.95)
-STALE_THRESHOLD = _env_float("HARNESS_PLAYBOOK_STALE_THRESHOLD", 0.15)
-SETTLE_STABLE_DAYS = _env_int("HARNESS_PLAYBOOK_SETTLE_STABLE_DAYS", 7)
-STALE_STABLE_DAYS = _env_int("HARNESS_PLAYBOOK_STALE_STABLE_DAYS", 7)
+SETTLE_THRESHOLD = _env_float("HARNESS_PLAYBOOK_SETTLE_THRESHOLD", 0.90)
+STALE_THRESHOLD = _env_float("HARNESS_PLAYBOOK_STALE_THRESHOLD", 0.30)
+SETTLE_STABLE_DAYS = _env_int("HARNESS_PLAYBOOK_SETTLE_STABLE_DAYS", 5)
+STALE_STABLE_DAYS = _env_int("HARNESS_PLAYBOOK_STALE_STABLE_DAYS", 5)
 
 # Stale-unused: never-fired statements past N days get archived (spec §5.8).
-STALE_UNUSED_DAYS = _env_int("HARNESS_PLAYBOOK_STALE_UNUSED_DAYS", 30)
+STALE_UNUSED_DAYS = _env_int("HARNESS_PLAYBOOK_STALE_UNUSED_DAYS", 14)
 
 # ------------------------------------------------------- evidence bundle
 # Total bundle target (soft) and hard cap; runner truncates sections
@@ -169,6 +173,7 @@ __all__ = [
     "ADJUST_DELTA_CAP",
     "SOFT_STATEMENT_CAP",
     "HARD_STATEMENT_CAP",
+    "PRESSURE_CAP",
     "STATEMENT_MAX_CHARS",
     "SETTLE_THRESHOLD",
     "STALE_THRESHOLD",

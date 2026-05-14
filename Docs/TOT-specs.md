@@ -1727,6 +1727,26 @@ Built in `agents.py` for Coach turns. It includes:
 - Wiki paths.
 - Reminder to assign roles and coordinate.
 
+**Active task health rollup** (`## Active task health` sub-section,
+`_build_active_task_health_rows` in `server/agents.py`):
+Surfaces tasks where the same audit kind has failed ≥ 2 times —
+the first fail is expected correction noise; the second is signal.
+The rollup is capped at the top **3** tasks sorted by
+`kind_fail_count` descending, with tiebreaker on
+`last_stage_change_at` descending (most recently active first).
+Fewer than 3 qualifying tasks → only those with a signal are shown.
+More than 3 qualifying tasks → the three highest-fail-count tasks
+are shown and a `(+N more)` footer line counts the remainder.
+The cap is enforced by the constant `ACTIVE_TASK_HEALTH_CAP = 3`
+in `server/agents.py`.
+
+**Title rendering — no truncation.** Every sub-section in this block
+(current-state tasks, stalled tasks, audit aggregator, recent patterns,
+and backlog) renders task/entry titles in full — no character cap is
+applied. Task titles are short summaries by convention (§14.5 limits
+them to 300 chars on input), so truncation in the prompt is never
+needed and would silently hide the title from Coach.
+
 ### 10.3 Compact and Continuity
 
 Manual compact:
@@ -2154,6 +2174,60 @@ without recent owner activity and notifies Coach by system message and events.
 This is global across projects for tasks, but harmless because all stale
 in-progress work should be reclaimed after an unclean shutdown.
 
+### 11.8 Idle-Poller and Runtime Transfers
+
+`server/idle_poller.py:_maybe_wake_idle` fires wake prompts at idle
+Players who have pending non-executor role assignments.  It applies two
+independent suppression checks after a runtime transfer:
+
+**(Option A — debounce reset)** `_perform_runtime_transfer_flip`
+(agents.py) updates `agents.last_idle_wake_at = now()` at flip time.
+This extends the per-Player debounce window from the transfer, giving the
+queued assign-time wake (queued by queue-on-busy while the compact turn
+was running) time to fire and close its role row before the idle poller
+ticks again.  If no assign-time wake was queued, the agent still receives
+a delayed idle-poller wake once `HARNESS_IDLE_POLL_DEBOUNCE_SECONDS`
+(default 1800s) has elapsed from the flip.
+
+**(Option B — transfer cooldown)** `_perform_runtime_transfer_flip` also
+stamps `agents.last_runtime_transfer_at = now()`.  `_maybe_wake_idle`
+reads this column and returns `False` if fewer than
+`HARNESS_IDLE_POLL_TRANSFER_COOLDOWN_SECONDS` (default 60s) have elapsed
+since the transfer.  Set to 0 to disable this cooldown.
+
+Both checks fire independently; either one suppresses the false wake.
+Together they cover the case where the debounce window was already
+expired at flip time (Option B catches it) AND the case where the window
+is still fresh but the cooldown has passed (Option A catches it via the
+normal debounce logic).
+
+### 11.9 Execute/Ship Stage Boundary in Wake Notes
+
+**Root cause (2026-05-14 audit)**: Ambiguous wake notes — "commit + push,
+then coord_role_complete" in execute-stage wakes, "cherry-pick to dev and
+push" in ship-stage notes — led Players to generalise ship-stage patterns
+onto execute turns, bypassing the `audit_syntax → audit_semantics` gate.
+
+**Fix**: two constants in `server/kanban.py` are appended to the
+stage-specific body returned by `_completion_hint_for_role`:
+
+- `_EXECUTE_STAGE_BOUNDARY` — appended to every executor wake hint.
+  States explicitly: push ONLY to `origin/work/<slot>` via
+  `coord_commit_push`; do NOT cherry-pick to dev; do NOT push to dev
+  directly; do NOT create `ship-*` branches.  Audit and ship stages are
+  separate and Coach-driven.
+
+- `_SHIP_STAGE_BOUNDARY` — appended to every shipper wake hint.
+  States: use `coord_ship_to_dev(task_id=<id>)` (enforces the
+  audit-pass gate); do NOT run raw `git push origin <anything>:dev`.
+  If the tool is not yet visible, open a PR via GitHub MCP and wait
+  for explicit Coach approval.
+
+The same wording appears in the canonical project CLAUDE.md template at
+`server/templates/app_dev_claude_md.md` under the `#### Worktree boundary`
+section, propagating to every project via the Coach-driven reconciliation
+flow in `server/project_claude_md.py`.
+
 ---
 
 ## 12. Coordination Tools
@@ -2372,6 +2446,48 @@ Current implementation gap:
 - `push` defaults true; false values: `false`, `0`, `no`, `off`.
 - Clean tree returns soft OK.
 - Emits `commit_pushed`.
+
+### 12.6.1 Ship to Dev
+
+`coord_ship_to_dev(task_id)`
+
+- **Players only** (Coach ships via `coord_approve_stage`).
+- Ships an audited task to the `dev` integration branch via cherry-pick
+  + GitHub PR (squash merge).
+- **Gate checks (fail-fast, in order):**
+  1. Task must be in `ship` stage.
+  2. Caller must not be Coach.
+  3. Caller must have an active (uncompleted, not-superseded) `shipper`
+     role row on the task.
+  4. A `commit_pushed` project event must exist for the task (executor
+     must have called `coord_commit_push` first); the event's
+     `payload_pointer` holds the executor commit SHA.
+  5. Every audit stage in the task's trajectory must have an
+     un-superseded `PASS` verdict from the matching auditor role
+     (`audit_syntax` → `auditor_syntax`,
+     `audit_semantics` → `auditor_semantics`).
+- **Git operations** (in caller's worktree):
+  1. `git fetch origin`
+  2. `git checkout -b ship-<task_id> origin/dev`
+  3. `git cherry-pick <executor_sha>`
+  4. `git push origin ship-<task_id>:ship-<task_id>`
+  - Cherry-pick conflict → returns error with the conflicted SHA and
+    instructs the Player to resolve manually or run
+    `git cherry-pick --abort` to clean up.
+- **GitHub API** (PAT extracted from `projects.repo_url`):
+  1. `POST /repos/{owner}/{repo}/pulls` → create PR titled
+     `[ship] <task_id>: <title>`
+  2. `PUT /repos/{owner}/{repo}/pulls/{n}/merge` (squash merge)
+  3. `DELETE /repos/{owner}/{repo}/git/refs/heads/ship-<task_id>`
+     (non-fatal on failure)
+- **Post-success:**
+  - Closes shipper role row (`completed_at` stamped).
+  - Emits `task_shipped_to_dev` event with `task_id`, `ship_sha`,
+    `pr_number`, `pr_url`, `executor_sha`.
+  - Wakes Coach via `_wake_coach_for_completion`.
+- **Return:** `ok=True` text with `pr_url`, `pr_number`, dev HEAD SHA.
+- Raw `git push origin ...:dev` bypasses this gate and is a pb-005
+  violation; use `coord_ship_to_dev` instead.
 
 ### 12.7 Decisions
 
@@ -3805,7 +3921,13 @@ Pane settings:
 - Model override.
 - Plan mode toggle.
 - Effort selector 1 to 4.
+- Thinking toggle (Claude only).
 - Agent brief editor.
+- Three action buttons: **Cancel** (discards model/plan/effort/thinking changes
+  made since the popover opened, via snapshot-restore; does NOT undo runtime
+  changes which fire API immediately), **clear overrides** (resets all
+  pane-local overrides to empty), **done** (closes the popover keeping all
+  staged changes).
 
 ### 16.4 Slash Commands
 
@@ -4046,6 +4168,21 @@ app for phones:
   maximize button are hidden — they don't fit single-pane navigation and
   HTML5 drag-and-drop doesn't work on touch.
 - `EnvPane` becomes a full-screen overlay when toggled open.
+- **Kanban card titles** — `.kbn-card-title` switches from `display: -webkit-box`
+  / `-webkit-line-clamp: 2` to `display: block` + `max-height: calc(1.32em * 3)`.
+  The webkit-box approach collapses to 0px height on some Android Chrome builds,
+  making titles invisible; the max-height approach is reliable and allows 3 lines.
+  Expanded cards (`kbn-card.expanded`) remove the cap so the full title shows.
+- **Touch-inaccessible hover-reveal buttons** — two classes of buttons are hidden
+  via CSS hover and never reachable on touch screens; both get always-visible
+  overrides at the mobile breakpoint:
+  - Kanban backlog edit/delete icons (`.kbn-card-actions.kbn-backlog-actions`):
+    desktop uses `:hover { display: flex }` on the parent card; mobile forces
+    `display: flex` unconditionally. The buttons are `position: absolute` so they
+    don't shift card layout.
+  - Inbox reply button (`.env-reply-btn`) and agent-pane message reply button
+    (`.msg-reply-btn`): both use `opacity: 0` with `:hover { opacity: 1 }`;
+    mobile forces `opacity: 1` so the tap target is always present.
 
 Pane ordering on phones is canonical, not history-based. `useIsPhone()`
 in `app.js` listens to the `(max-width: 700px)` media query; when active,

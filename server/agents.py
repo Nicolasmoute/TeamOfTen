@@ -2323,6 +2323,11 @@ def _trajectory_marker(trajectory_json: Any, current_stage: str | None) -> str:
     return "→".join(tokens)
 
 
+# Maximum number of tasks shown in the `## Active task health` Coach block.
+# Caps O(N_tasks) growth to O(1) — H1 efficiency fix (2026-05-14).
+ACTIVE_TASK_HEALTH_CAP = 3
+
+
 async def _build_active_task_health_rows(
     project_id: str,
 ) -> list[dict[str, Any]]:
@@ -2339,6 +2344,7 @@ async def _build_active_task_health_rows(
             cur = await c.execute(
                 """
                 SELECT t.id AS task_id, t.title, t.owner AS executor,
+                       t.last_stage_change_at,
                        SUM(CASE WHEN tra.role = 'auditor_syntax'
                                 AND tra.verdict = 'fail'
                            THEN 1 ELSE 0 END) AS syntax_fails,
@@ -2382,18 +2388,24 @@ async def _build_active_task_health_rows(
                 )
                 rows.append({
                     "task_id": r["task_id"],
-                    "title": (r.get("title") or "").strip()[:80],
+                    "title": (r.get("title") or "").strip(),
                     "executor": executor,
                     "kind": kind,
                     "kind_fail_count": fail_count,
                     "latest_verdict": r.get("latest_verdict") or "?",
                     "executor_effort": effort,
                     "executor_model": model,
+                    "last_stage_change_at": r.get("last_stage_change_at") or "",
                 })
         finally:
             await c.close()
     except Exception:
         return []
+    # Sort by fail_count DESC, tiebreak by last_stage_change_at DESC.
+    rows.sort(
+        key=lambda r: (r["kind_fail_count"], r.get("last_stage_change_at") or ""),
+        reverse=True,
+    )
     return rows
 
 
@@ -2473,7 +2485,7 @@ async def _build_stalled_tasks_rows(
         stage_owner = stage_owner_map.get(r["id"])
         rows.append({
             "task_id": r["id"],
-            "title": (r.get("title") or "").strip()[:80],
+            "title": (r.get("title") or "").strip(),
             "stage": r.get("status") or "?",
             # The Player actually responsible for the next move at
             # this stage. Falls back to tasks.owner when no role row
@@ -3029,7 +3041,7 @@ async def _build_audit_aggregator_rows(project_id: str) -> str:
             continue
         rendered_any = True
         out.append(
-            f"- {t['id']} \"{(t.get('title') or '').strip()[:60]}\" "
+            f"- {t['id']} \"{(t.get('title') or '').strip()}\" "
             f"(executor {t.get('owner') or '—'}):"
         )
         round_counter: dict[str, int] = {"auditor_syntax": 0, "auditor_semantics": 0}
@@ -3127,7 +3139,7 @@ async def _build_recent_patterns_block(project_id: str) -> str:
             for r in await cur.fetchall():
                 d = dict(r)
                 kind = "syntax" if d["role"] == "auditor_syntax" else "semantic"
-                title = (d.get("title") or "").strip()[:50]
+                title = (d.get("title") or "").strip()
                 findings.append(
                     f"- {d['task_id']} \"{title}\" — {d['n']} {kind} fails; "
                     f"escalate via effort bump or re-spec."
@@ -3635,7 +3647,7 @@ async def _build_coach_coordination_block(
         }
         for t in open_tasks:
             tid = t["id"]
-            title = (t.get("title") or "").strip()[:80]
+            title = (t.get("title") or "").strip()
             status = t.get("status") or "?"
             owner = t.get("owner") or "—"
             traj_marker = _trajectory_marker(t.get("trajectory"), status)
@@ -3663,11 +3675,16 @@ async def _build_coach_coordination_block(
         lines.append("")
 
     # ---- Active task health (kind_fail_count >= 2) -----------------
+    # Rows already sorted by fail_count DESC, tiebreak recency DESC.
+    # Cap to top-3 to keep Coach's coordination block O(1) regardless
+    # of how many active tasks exist (H1 efficiency fix, 2026-05-14).
     health_rows = await _build_active_task_health_rows(active)
     if health_rows:
+        shown = health_rows[:ACTIVE_TASK_HEALTH_CAP]
+        overflow = len(health_rows) - len(shown)
         lines.append("## Active task health")
         lines.append("")
-        for row in health_rows:
+        for row in shown:
             effort = row.get("executor_effort") or "default"
             model = row.get("executor_model") or "default"
             lines.append(
@@ -3676,6 +3693,8 @@ async def _build_coach_coordination_block(
                 f"{row['kind']} fail count {row['kind_fail_count']} "
                 f"(latest verdict: {row['latest_verdict']})"
             )
+        if overflow:
+            lines.append(f"(+{overflow} more)")
         lines.append("")
 
     # ---- Audit history (§11.2, position 5 in v2 §14 ordering) -----
@@ -3819,9 +3838,9 @@ async def _build_coach_coordination_block(
                         age = f"{age_s // 86400}d"
                 except Exception:
                     age = "?"
-                title_short = (br.get("title") or "").strip()[:80]
+                title = (br.get("title") or "").strip()
                 lines.append(
-                    f"[#{br['id']}] \"{title_short}\" — {proposer_label}, {age} ago"
+                    f"[#{br['id']}] \"{title}\" — {proposer_label}, {age} ago"
                 )
             lines.append("")
             lines.append(
@@ -4046,6 +4065,34 @@ async def _perform_runtime_transfer_flip(
     except Exception:
         logger.exception(
             "runtime_transfer: clear codex_thread_id failed agent=%s", agent_id,
+        )
+    # Reset the idle-poller debounce clock (Option A) AND stamp a
+    # transfer timestamp for the per-transfer cooldown check (Option B).
+    # Together these suppress the idle-poller false wake that fires when
+    # the compact/transfer turn completes and status returns to 'idle'
+    # while a queued assign-time wake hasn't fired yet.
+    #   • last_idle_wake_at = now  →  extends the debounce window from
+    #     now, giving the queued assign-time wake ~DEBOUNCE_SECONDS to
+    #     fire and close its role row before the poller ticks again.
+    #   • last_runtime_transfer_at = now  →  independent 60s cooldown
+    #     in _maybe_wake_idle (belt-and-suspenders for the case where the
+    #     debounce window has already expired but the transfer just fired).
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE agents"
+                " SET last_idle_wake_at = ?, last_runtime_transfer_at = ?"
+                " WHERE id = ?",
+                (now_iso, now_iso, agent_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception(
+            "runtime_transfer: stamp idle debounce failed agent=%s", agent_id,
         )
     await _emit(
         agent_id,
