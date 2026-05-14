@@ -1647,13 +1647,21 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
     get_client_calls: list[dict] = []
     open_thread_calls: list[dict] = []
 
-    async def fake_get_client(slot, *, cwd, env_overrides=None, external_mcp_servers=None):
+    async def fake_get_client(
+        slot,
+        *,
+        cwd,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
+    ):
         get_client_calls.append(
             {
                 "slot": slot,
                 "cwd": cwd,
                 "env_overrides": dict(env_overrides or {}),
                 "external_mcp_servers": external_mcp_servers,
+                "allowed_tools": allowed_tools,
             }
         )
         return client
@@ -1712,6 +1720,12 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
             "cwd": "C:/work/p1/project",
             "env_overrides": {"OPENAI_API_KEY": "sk-test"},
             "external_mcp_servers": {"extra": {"command": "extra-mcp"}},
+            "allowed_tools": [
+                "Bash",
+                "Edit",
+                "mcp__coord__coord_read_inbox",
+                "mcp__extra__ping",
+            ],
         }
     ]
     config = open_thread_calls[0]["config"]
@@ -1803,7 +1817,8 @@ async def test_codex_run_turn_updates_continuity_bookkeeping(
     monkeypatch.setattr(
         codex_mod,
         "get_client",
-        lambda slot, *, cwd, env_overrides=None: _async_value(client),
+        lambda slot, *, cwd, env_overrides=None, external_mcp_servers=None,
+        allowed_tools=None: _async_value(client),
     )
     monkeypatch.setattr(
         codex_mod,
@@ -1854,9 +1869,21 @@ async def test_codex_run_turn_consumes_prepared_turn_state(
     get_client_calls: list[dict] = []
     open_thread_calls: list[dict] = []
 
-    async def fake_get_client(slot, *, cwd, env_overrides=None, external_mcp_servers=None):
+    async def fake_get_client(
+        slot,
+        *,
+        cwd,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
+    ):
         get_client_calls.append(
-            {"slot": slot, "cwd": cwd, "env_overrides": dict(env_overrides or {})}
+            {
+                "slot": slot,
+                "cwd": cwd,
+                "env_overrides": dict(env_overrides or {}),
+                "allowed_tools": allowed_tools,
+            }
         )
         return client
 
@@ -1944,7 +1971,14 @@ async def test_codex_run_manual_compact_uses_native_compact(
     cleared: list[str] = []
     client = _CompactFakeClient()
 
-    async def fake_get_client(slot, *, cwd, env_overrides=None, external_mcp_servers=None):
+    async def fake_get_client(
+        slot,
+        *,
+        cwd,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
+    ):
         return client
 
     async def fake_set_note(agent_id, note):
@@ -2070,7 +2104,14 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
     notes: list[tuple[str, str | None]] = []
     cleared: list[str] = []
 
-    async def fake_get_client(slot, *, cwd, env_overrides=None, external_mcp_servers=None):
+    async def fake_get_client(
+        slot,
+        *,
+        cwd,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
+    ):
         return client
 
     async def fake_set_note(agent_id, note):
@@ -2151,7 +2192,14 @@ async def test_codex_maybe_auto_compact_emits_failed_on_compact_error(
     monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
     monkeypatch.setenv("HARNESS_AUTO_COMPACT_THRESHOLD", "0.7")
 
-    async def fake_get_client(slot, *, cwd, env_overrides=None, external_mcp_servers=None):
+    async def fake_get_client(
+        slot,
+        *,
+        cwd,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
+    ):
         return _RaisingCompactClient()
 
     async def fake_close_client(slot):
