@@ -307,6 +307,14 @@ body {
     font-size: 11px;
     border-radius: 9px;
   }
+
+  /* Reply buttons (inbox + agent-pane message_sent rows) use
+     opacity:0 / :hover opacity:1 — hover never fires on touch.
+     Always show them on mobile so the action is reachable. */
+  .env-reply-btn,
+  .msg-reply-btn {
+    opacity: 1;
+  }
 }
 
 /* ---- left rail ---- */
@@ -5514,4 +5522,24 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   .kbn-column { min-height: 160px; }
   .kbn-archive-drawer { max-height: 60vh; }
   .kbn-modal { width: 96vw; max-height: 92vh; }
+
+  /* Card title: -webkit-box / -webkit-line-clamp collapses to 0px
+     height on some Android Chrome builds, making titles invisible.
+     Switch to a plain block + max-height approach on mobile; allow
+     3 lines (taller card = more readable on phone). */
+  .kbn-card-title {
+    display: block;
+    max-height: calc(1.32em * 3);
+    overflow: hidden;
+  }
+  .kbn-card.expanded .kbn-card-title {
+    max-height: none;
+  }
+
+  /* Backlog edit/delete actions: display:none / :hover display:flex
+     never fires on touch — always show the icon buttons so the user
+     can tap them. They are absolutely positioned so no layout shift. */
+  .kbn-card-actions.kbn-backlog-actions {
+    display: flex;
+  }
 }
