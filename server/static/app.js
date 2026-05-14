@@ -7867,6 +7867,7 @@ function EnvInboxSection({ conversations }) {
   const [to, setTo] = useState("coach");
   const [subject, setSubject] = useState("");
   const [body, setBody] = useState("");
+  const bodyRef = useRef(null);
   const [priority, setPriority] = useState("normal");
   const [sending, setSending] = useState(false);
 
@@ -7955,10 +7956,12 @@ function EnvInboxSection({ conversations }) {
               onInput=${(e) => setSubject(e.target.value)}
             />
             <textarea
+              ref=${bodyRef}
               class="env-msg-composer-body"
               placeholder="body…"
               value=${body}
               onInput=${(e) => setBody(e.target.value)}
+              onKeyDown=${(e) => { if (e.key === "Escape") { e.preventDefault(); setComposing(false); } }}
               rows=${3}
             ></textarea>
             <div class="env-msg-composer-row">
@@ -7980,7 +7983,10 @@ function EnvInboxSection({ conversations }) {
             const sender = m.from_id === "broadcast" ? "coach" : m.from_id;
             setComposing(true);
             setTo(MESSAGE_RECIPIENTS.includes(sender) ? sender : "coach");
-            setBody(buildReplyQuote(m.subject, sender, m.body || m.body_preview || ""));
+            setSubject(replySubject(m.subject));
+            setBody("");
+            // Focus body textarea after Preact flushes the composer into the DOM.
+            requestAnimationFrame(() => { if (bodyRef.current) bodyRef.current.focus(); });
           };
           return html`
             <div
@@ -12155,10 +12161,15 @@ class EventList extends Component {
   }
 }
 
+// replySubject — pure helper that prefixes a subject with "Re: " exactly once.
+// Used by EnvPane Inbox reply to pre-fill the subject field.
+function replySubject(subject) {
+  const s = (subject || "").trim();
+  return /^re:/i.test(s) ? s : "Re: " + s;
+}
+
 // buildReplyQuote — pure helper used by the message_sent reply button
-// (agent panes) and the EnvPane Inbox reply button. The function is
-// intentionally tiny (< 5 lines) and exercised visually; if the team
-// ever adds a JS test runner, extract it to reply.js and unit-test.
+// (agent panes). The function is intentionally tiny (< 5 lines).
 function buildReplyQuote(subject, fromId, bodyPreview) {
   const subj = subject || "(no subject)";
   const raw = bodyPreview || "";
