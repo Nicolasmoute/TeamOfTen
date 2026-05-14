@@ -149,6 +149,18 @@ is the primary concurrency control — global CLAUDE.md invariant
 #2). Editing `.project/` strands work on a tree the kanban can't
 see.
 
+**Execute-stage push rule**: `coord_commit_push` pushes to
+`origin/work/<your_slot>` only — that is your ONLY push path during
+execute. Do NOT cherry-pick to dev, do NOT push to dev directly, do
+NOT create `ship-*` branches. The audit_syntax and ship stages are
+separate and Coach-driven via `coord_approve_stage`.
+
+**Ship-stage push rule**: use `coord_ship_to_dev(task_id=<id>)` to
+merge to dev — it enforces the audit-pass gate. Do NOT run raw
+`git push origin <anything>:dev`. If the tool is not yet visible,
+open a PR via the GitHub MCP and wait for explicit Coach approval
+before any raw push to dev.
+
 ### `coord_propose_file_write` mechanics
 
 Coach-only (Players ask to relay). Gates writes to `truth/`,
