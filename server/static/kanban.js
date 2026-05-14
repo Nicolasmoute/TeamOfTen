@@ -891,6 +891,109 @@ const _TRASH_SVG = html`<svg viewBox="0 0 24 24" width="11" height="11" fill="no
 
 const _BACKLOG_DESC_PREVIEW = 120;
 
+// BacklogEditModal — opened by the pencil icon on a BacklogCard.
+// Mirrors ComposerModal structure; dirty-check uses an inline confirm modal
+// (same pattern as the delete-confirm) instead of window.confirm.
+function BacklogEditModal({ entry, authedFetch, onClose, onSave }) {
+  const [title, setTitle] = useState(entry.title);
+  const [desc, setDesc] = useState(entry.description || "");
+  const [priority, setPriority] = useState(entry.priority || "normal");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+
+  const isDirty = () =>
+    title !== entry.title ||
+    desc !== (entry.description || "") ||
+    priority !== (entry.priority || "normal");
+
+  const tryClose = () => { if (isDirty()) setConfirmDiscard(true); else onClose(); };
+
+  const submit = async (ev) => {
+    ev.preventDefault();
+    const t = title.trim();
+    if (!t) { setErr("title is required"); return; }
+    setBusy(true); setErr(null);
+    try {
+      const payload = { title: t, description: desc.trim() || null, priority };
+      const r = await authedFetch(`/api/backlog/${entry.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) { const msg = await r.text().catch(() => r.statusText); throw new Error(msg); }
+      onSave();
+      onClose();
+    } catch (e) {
+      setErr(e.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return html`
+    <div class="kbn-modal-backdrop" onClick=${(e) => { e.stopPropagation(); tryClose(); }}>
+      <div class="kbn-modal" onClick=${(e) => e.stopPropagation()}
+           onKeyDown=${(e) => { if (e.key === "Escape") { e.stopPropagation(); if (!confirmDiscard) tryClose(); } }}>
+        <div class="kbn-modal-head">Edit backlog entry</div>
+        <form onSubmit=${submit}>
+          <label class="kbn-label">Idea / title</label>
+          <textarea
+            class="kbn-input kbn-backlog-input"
+            value=${title}
+            onInput=${(e) => setTitle(e.target.value)}
+            autoFocus
+            rows="3"
+            disabled=${busy}
+          ></textarea>
+          <label class="kbn-label" style="margin-top:8px">Description (optional)</label>
+          <textarea
+            class="kbn-input kbn-backlog-desc-input"
+            value=${desc}
+            onInput=${(e) => setDesc(e.target.value)}
+            rows="3"
+            placeholder="More context for Coach…"
+            disabled=${busy}
+          ></textarea>
+          <div class="kbn-modal-priority-row">
+            <label class="kbn-label kbn-priority-label">Priority</label>
+            <select
+              class="kbn-priority-select"
+              value=${priority}
+              onChange=${(e) => setPriority(e.target.value)}
+              disabled=${busy}
+            >
+              <option value="low">low</option>
+              <option value="normal">normal</option>
+              <option value="high">high</option>
+              <option value="urgent">urgent</option>
+            </select>
+          </div>
+          ${err ? html`<div class="kbn-error">${err}</div>` : null}
+          <div class="kbn-modal-actions">
+            <button type="button" class="kbn-btn" onClick=${tryClose} disabled=${busy}>Cancel</button>
+            <button type="submit" class="kbn-btn kbn-btn-primary" disabled=${busy || !title.trim()}>
+              ${busy ? "Saving…" : "Save"}
+            </button>
+          </div>
+        </form>
+        ${confirmDiscard ? html`
+          <div class="kbn-modal-backdrop" onClick=${(e) => { e.stopPropagation(); setConfirmDiscard(false); }}>
+            <div class="kbn-modal" onClick=${(e) => e.stopPropagation()}
+                 onKeyDown=${(e) => { if (e.key === "Escape") { e.stopPropagation(); setConfirmDiscard(false); } }}>
+              <div class="kbn-modal-head">Discard changes?</div>
+              <p class="kbn-modal-body-text">You have unsaved changes. Discard them?</p>
+              <div class="kbn-modal-actions">
+                <button class="kbn-btn" autoFocus onClick=${(e) => { e.stopPropagation(); setConfirmDiscard(false); }}>Keep editing</button>
+                <button class="kbn-btn kbn-btn-danger" onClick=${(e) => { e.stopPropagation(); onClose(); }}>Discard</button>
+              </div>
+            </div>
+          </div>` : null}
+      </div>
+    </div>
+  `;
+}
+
 function BacklogCard({ entry, authedFetch, onRefresh }) {
   const proposer = entry.proposed_by || "?";
   let proposerLabel;
@@ -900,54 +1003,11 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
     proposerLabel = proposer.slice(1);
   else proposerLabel = proposer;
 
-  const [editing, setEditing] = useState(false);
-  const [editTitle, setEditTitle] = useState(entry.title);
-  const [editDesc, setEditDesc] = useState(entry.description || "");
-  const [editPriority, setEditPriority] = useState(entry.priority || "normal");
-  const [editBusy, setEditBusy] = useState(false);
-  const [editErr, setEditErr] = useState(null);
   const [expanded, setExpanded] = useState(false);
+  const [showEdit, setShowEdit] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [deleteErr, setDeleteErr] = useState(null);
-
-  const startEdit = (e) => {
-    e.stopPropagation();
-    setEditTitle(entry.title);
-    setEditDesc(entry.description || "");
-    setEditPriority(entry.priority || "normal");
-    setEditErr(null);
-    setEditing(true);
-  };
-
-  const saveEdit = async () => {
-    const t = editTitle.trim();
-    if (!t) { setEditErr("title is required"); return; }
-    setEditBusy(true);
-    setEditErr(null);
-    try {
-      const payload = { title: t, description: editDesc.trim() || null, priority: editPriority };
-      const r = await authedFetch(`/api/backlog/${entry.id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (!r.ok) {
-        const msg = await r.text().catch(() => r.statusText);
-        throw new Error(msg);
-      }
-      setEditing(false);
-      onRefresh();
-    } catch (err) {
-      setEditErr(err.message || String(err));
-    } finally {
-      setEditBusy(false);
-    }
-  };
-
-  const onEditKeyDown = (e) => {
-    if (e.key === "Escape") { setEditing(false); }
-  };
 
   const confirmAndDelete = async (e) => {
     e.stopPropagation();
@@ -968,91 +1028,47 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
   };
 
   const desc = entry.description || "";
-  const descTruncated = desc.length > _BACKLOG_DESC_PREVIEW && !expanded;
-  const descVisible = descTruncated ? desc.slice(0, _BACKLOG_DESC_PREVIEW) + "…" : desc;
-
   const pri = entry.priority || "normal";
 
   return html`
     <div
       class="kbn-card kbn-backlog-card kbn-backlog-pri-${pri}${expanded ? " expanded" : ""}"
-      onClick=${!editing ? () => setExpanded(!expanded) : undefined}
+      onClick=${() => setExpanded(!expanded)}
     >
-      ${editing
-        ? html`
-          <div class="kbn-backlog-edit">
-            <textarea
-              class="kbn-input kbn-backlog-edit-input"
-              value=${editTitle}
-              onInput=${(e) => setEditTitle(e.target.value)}
-              onKeyDown=${onEditKeyDown}
-              rows="2"
-              autoFocus
-              disabled=${editBusy}
-            ></textarea>
-            <label class="kbn-label" style="margin-top:6px;font-size:0.75rem">Description (optional)</label>
-            <textarea
-              class="kbn-input kbn-backlog-desc-input"
-              value=${editDesc}
-              onInput=${(e) => setEditDesc(e.target.value)}
-              onKeyDown=${onEditKeyDown}
-              rows="3"
-              placeholder="More context for Coach…"
-              disabled=${editBusy}
-            ></textarea>
-            <div class="kbn-modal-priority-row" style="margin-top:6px">
-              <label class="kbn-label kbn-priority-label" for="kbn-edit-priority-${entry.id}">Priority</label>
-              <select
-                id="kbn-edit-priority-${entry.id}"
-                class="kbn-priority-select"
-                value=${editPriority}
-                onChange=${(e) => setEditPriority(e.target.value)}
-                disabled=${editBusy}
-              >
-                <option value="low">low</option>
-                <option value="normal">normal</option>
-                <option value="high">high</option>
-                <option value="urgent">urgent</option>
-              </select>
-            </div>
-            ${editErr ? html`<div class="kbn-error kbn-backlog-edit-err">${editErr}</div>` : null}
-            <div class="kbn-backlog-edit-actions">
-              <button class="kbn-btn kbn-btn-primary kbn-btn-sm" onClick=${saveEdit} disabled=${editBusy}>
-                ${editBusy ? "Saving…" : "Save"}
+      <div class="kbn-card-title">${entry.title}</div>
+      ${expanded && desc ? html`<div class="kbn-backlog-desc">${desc}</div>` : null}
+      <div class="kbn-card-meta">
+        <span class="kbn-backlog-priority-chip kbn-backlog-pri-${pri}">${pri.toUpperCase()}</span>
+        <span class="kbn-backlog-proposer">${proposerLabel}</span>
+        <span class="kbn-card-age">${timeAgo(entry.proposed_at)}</span>
+        ${desc && !expanded ? html`<span class="kbn-backlog-has-desc" title="Has description">…</span>` : null}
+      </div>
+      <div class="kbn-card-actions kbn-backlog-actions">
+        <button class="kbn-card-act-btn" title="Edit"
+          onClick=${(e) => { e.stopPropagation(); setShowEdit(true); }}>${_PENCIL_SVG}</button>
+        <button class="kbn-card-act-btn kbn-card-act-danger" title="Delete"
+          onClick=${(e) => { e.stopPropagation(); setDeleteErr(null); setConfirmDelete(true); }}>${_TRASH_SVG}</button>
+      </div>
+      ${showEdit ? html`<${BacklogEditModal}
+        entry=${entry}
+        authedFetch=${authedFetch}
+        onClose=${() => setShowEdit(false)}
+        onSave=${onRefresh}
+      />` : null}
+      ${confirmDelete ? html`
+        <div class="kbn-modal-backdrop" onClick=${(e) => { e.stopPropagation(); setConfirmDelete(false); }}>
+          <div class="kbn-modal" onClick=${(e) => e.stopPropagation()}>
+            <div class="kbn-modal-head">Delete idea?</div>
+            <p class="kbn-modal-body-text">Delete "<strong>${entry.title}</strong>"? This cannot be undone.</p>
+            ${deleteErr ? html`<div class="kbn-error">${deleteErr}</div>` : null}
+            <div class="kbn-modal-actions">
+              <button class="kbn-btn" onClick=${() => setConfirmDelete(false)} disabled=${deleteBusy}>Cancel</button>
+              <button class="kbn-btn kbn-btn-danger" onClick=${confirmAndDelete} disabled=${deleteBusy}>
+                ${deleteBusy ? "Deleting…" : "Delete"}
               </button>
-              <button class="kbn-btn kbn-btn-sm" onClick=${() => setEditing(false)} disabled=${editBusy}>Cancel</button>
             </div>
-          </div>`
-        : html`
-          <div class="kbn-card-title">${entry.title}</div>
-          ${expanded && desc ? html`
-            <div class="kbn-backlog-desc">${desc}</div>` : null}
-          <div class="kbn-card-meta">
-            <span class="kbn-backlog-priority-chip kbn-backlog-pri-${pri}">${pri.toUpperCase()}</span>
-            <span class="kbn-backlog-proposer">${proposerLabel}</span>
-            <span class="kbn-card-age">${timeAgo(entry.proposed_at)}</span>
-            ${desc && !expanded ? html`<span class="kbn-backlog-has-desc" title="Has description">…</span>` : null}
           </div>
-          <div class="kbn-card-actions kbn-backlog-actions">
-            <button class="kbn-card-act-btn" title="Edit" onClick=${startEdit}>${_PENCIL_SVG}</button>
-            <button class="kbn-card-act-btn kbn-card-act-danger" title="Delete" onClick=${(e) => { e.stopPropagation(); setDeleteErr(null); setConfirmDelete(true); }}>${_TRASH_SVG}</button>
-          </div>`}
-      ${confirmDelete
-        ? html`
-          <div class="kbn-modal-backdrop" onClick=${(e) => { e.stopPropagation(); setConfirmDelete(false); }}>
-            <div class="kbn-modal" onClick=${(e) => e.stopPropagation()}>
-              <div class="kbn-modal-head">Delete idea?</div>
-              <p class="kbn-modal-body-text">Delete "<strong>${entry.title}</strong>"? This cannot be undone.</p>
-              ${deleteErr ? html`<div class="kbn-error">${deleteErr}</div>` : null}
-              <div class="kbn-modal-actions">
-                <button class="kbn-btn" onClick=${() => setConfirmDelete(false)} disabled=${deleteBusy}>Cancel</button>
-                <button class="kbn-btn kbn-btn-danger" onClick=${confirmAndDelete} disabled=${deleteBusy}>
-                  ${deleteBusy ? "Deleting…" : "Delete"}
-                </button>
-              </div>
-            </div>
-          </div>`
-        : null}
+        </div>` : null}
     </div>
   `;
 }
