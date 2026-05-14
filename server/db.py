@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS agents (
     started_at            TEXT,
     last_heartbeat        TEXT,
     allowed_extra_tools   TEXT,
+    -- JSON array of SDK-facing tool names for the slot's current
+    -- kanban role. NULL falls back to role defaults in the dispatcher.
+    allowed_tools         TEXT,
     locked                INTEGER NOT NULL DEFAULT 0,
     -- Slot-level runtime preference. Nullable so role defaults can
     -- apply (resolution: agents.runtime_override → team_config role
@@ -793,6 +796,7 @@ async def init_db() -> None:
                     ("runtime_override", "runtime_override TEXT"),
                     # Idle-poller debounce timestamp; see Docs/kanban-specs-v2.md §10.
                     ("last_idle_wake_at", "last_idle_wake_at TEXT"),
+                    ("allowed_tools", "allowed_tools TEXT"),
                 ],
             )
             await _ensure_columns(

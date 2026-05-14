@@ -233,6 +233,17 @@ async def test_role_complete_artifact_missing_on_disk_rejected(fresh_db: str) ->
 async def test_role_complete_happy_path_no_artifact(fresh_db: str) -> None:
     await init_db()
     await _seed_with_role()
+    from server.role_tool_allowlists import tools_json_for_role
+
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE agents SET allowed_tools = ? WHERE id = 'p2'",
+            (tools_json_for_role("executor"),),
+        )
+        await c.commit()
+    finally:
+        await c.close()
 
     q = bus.subscribe()
     captured: list[dict[str, Any]] = []
@@ -263,12 +274,16 @@ async def test_role_complete_happy_path_no_artifact(fresh_db: str) -> None:
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT completed_at FROM task_role_assignments "
-            "WHERE task_id = ? AND role = 'executor'",
+            "SELECT r.completed_at, a.allowed_tools "
+            "FROM task_role_assignments r JOIN agents a ON a.id = r.owner "
+            "WHERE r.task_id = ? AND r.role = 'executor'",
             ("t-2026-05-07-cccc3333",),
         )
         r = dict(await cur.fetchone())
         assert r["completed_at"]
+        tools = set(json.loads(r["allowed_tools"]))
+        assert "mcp__coord__coord_commit_push" not in tools
+        assert "mcp__coord__coord_my_assignments" in tools
     finally:
         await c.close()
 

@@ -173,6 +173,7 @@ On `agents` (slot-level preference — **nullable so role defaults can apply**):
 runtime_override  TEXT NULL
                   CHECK (runtime_override IS NULL
                          OR runtime_override IN ('claude','codex')),
+allowed_tools     TEXT NULL   -- JSON array of SDK-facing tool names
 ```
 
 Resolution order at spawn time: `agents.runtime_override` (if set) →
@@ -181,6 +182,13 @@ role default from `team_config` (`coach_default_runtime` /
 fields already use. NOT NULL with a default would make every row carry
 an override at insert time and silently ignore role defaults — fixed
 by keeping the column nullable.
+
+`allowed_tools` is a role-scoped per-slot allowlist planted by
+kanban routing. `coord_approve_stage` writes the named assignee's
+current role list from `server/role_tool_allowlists.py`; Player
+completion paths reset the slot to the idle list. NULL or malformed
+JSON falls back to the dispatcher defaults so a bad row cannot brick
+a spawn.
 
 On `agent_sessions` (per-project per-slot session state) — **separate
 columns per runtime, not a generic field**:
@@ -366,7 +374,8 @@ mcp_servers = {"coord": coord_server, **external_servers}
     "command": sys.executable,
     "args": ["-m", "server.coord_mcp",
              "--caller-id", agent_id,
-             "--proxy-url", "http://127.0.0.1:8000"],
+             "--proxy-url", "http://127.0.0.1:8000",
+             "--allowed-tools", "[\"coord_my_assignments\", ...]"],
     "env": {"HARNESS_COORD_PROXY_TOKEN": <runtime-owned token>},
     # Pre-approve every coord_* tool. Without this, Codex routes
     # MCP calls through the elicitation/approval path under
@@ -391,6 +400,16 @@ authorization signal; an explicit `default_tools_approval_mode` value
 in the saved config is preserved (opt-out for users who want
 approval-on-use). Implementation in `_build_mcp_servers`
 ([server/runtimes/codex.py](../server/runtimes/codex.py)).
+
+**Codex role allowlist filtering.** `CodexRuntime._build_mcp_servers`
+derives the bare coord names from `TurnContext.allowed_tools` and
+passes them to `server.coord_mcp --allowed-tools`. The proxy exposes
+only those tools in `tools/list` and rejects calls to any other coord
+tool. External MCP servers are included only when the active allowlist
+contains at least one `mcp__<server>__...` tool. This is the Codex
+substitute for Claude's tool-search savings: role-specific Player
+turns carry a smaller coord schema instead of the full board-control
+surface.
 
 > **Don't pass `config.plugins`.** Codex's TOML schema treats
 > `plugins` as a map keyed by plugin *name* with `PluginConfig`
@@ -491,8 +510,9 @@ the current MCP tool surface. This is necessary because the
 codex-app-server can preserve thread-local tool state across resumes
 — old threads can keep telling the model that a coord_* tool is
 "unavailable in this session" even after the harness adds it. Bump
-the constant whenever a coord_* tool is added, removed, or renamed,
-or when a tool's exposed description changes meaningfully.
+the constant whenever a coord_* tool is added, removed, renamed, when
+a tool's exposed description changes meaningfully, or when the role
+allowlist/MCP exposure contract changes.
 
 ### E.2 Thread start vs resume
 

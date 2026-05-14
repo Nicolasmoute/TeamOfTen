@@ -7,6 +7,8 @@ flag is unset.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from server.runtimes import CodexRuntime, get_runtime, is_codex_enabled
@@ -531,6 +533,38 @@ async def test_build_mcp_servers_pre_approves_external_servers() -> None:
     assert servers["explicit_off"]["default_tools_approval_mode"] == "request"
     # Original cfg dict in tc must not be mutated in place.
     assert "default_tools_approval_mode" not in tc.external_mcp_servers["zeabur"]
+
+
+async def test_build_mcp_servers_filters_coord_and_external_by_allowed_tools() -> None:
+    from server.runtimes.codex import _build_mcp_servers
+    from server.runtimes.base import TurnContext
+
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="hi",
+        system_prompt="",
+        workspace_cwd="",
+        allowed_tools=[
+            "mcp__coord__coord_my_assignments",
+            "mcp__coord__coord_commit_push",
+            "mcp__github__list_issues",
+        ],
+        external_mcp_servers={
+            "github": {"type": "stdio", "command": "github-mcp"},
+            "slack": {"type": "stdio", "command": "slack-mcp"},
+        },
+    )
+
+    servers = _build_mcp_servers(tc)
+    args = servers["coord"]["args"]
+    allowed_arg = args[args.index("--allowed-tools") + 1]
+    assert json.loads(allowed_arg) == [
+        "coord_my_assignments",
+        "coord_commit_push",
+    ]
+    assert "github" in servers
+    assert "slack" not in servers
 
 
 async def test_failed_handshake_does_not_poison_cache(
@@ -1543,7 +1577,12 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
         prompt="say hello",
         system_prompt="system rules",
         workspace_cwd="C:/work/p1/project",
-        allowed_tools=["Bash", "Edit"],
+        allowed_tools=[
+            "Bash",
+            "Edit",
+            "mcp__coord__coord_read_inbox",
+            "mcp__extra__ping",
+        ],
         external_mcp_servers={"extra": {"command": "extra-mcp"}},
         model="gpt-5.4-mini",
         effort=4,

@@ -57,7 +57,7 @@ _client_locks: dict[str, asyncio.Lock] = {}
 
 # Bump when the Codex-visible coord tool contract changes in a way that
 # old persisted Codex threads might not pick up on resume.
-_CODEX_TOOL_CONTRACT_VERSION = "2026-05-13.compass-audit-health"
+_CODEX_TOOL_CONTRACT_VERSION = "2026-05-14.role-tool-allowlists"
 
 
 class _CapturedStdioTransport:
@@ -966,9 +966,25 @@ def _coord_mcp_env(tc: TurnContext) -> dict[str, str]:
     }
 
 
+def _coord_allowed_tool_names(tc: TurnContext) -> list[str]:
+    prefix = "mcp__coord__"
+    names = [
+        tool[len(prefix):]
+        for tool in (tc.allowed_tools or [])
+        if isinstance(tool, str) and tool.startswith(prefix)
+    ]
+    return list(dict.fromkeys(names))
+
+
+def _mcp_server_allowed_by_tools(server_name: str, allowed_tools: set[str]) -> bool:
+    prefix = f"mcp__{server_name}__"
+    return any(tool.startswith(prefix) for tool in allowed_tools)
+
+
 def _build_mcp_servers(tc: TurnContext) -> dict[str, Any]:
     servers: dict[str, Any] = {}
     root = _harness_root()
+    coord_allowed = _coord_allowed_tool_names(tc)
     servers["coord"] = {
         "type": "stdio",
         "command": sys.executable,
@@ -980,6 +996,8 @@ def _build_mcp_servers(tc: TurnContext) -> dict[str, Any]:
             tc.agent_id,
             "--proxy-url",
             _coord_proxy_url(),
+            "--allowed-tools",
+            json.dumps(coord_allowed, separators=(",", ":")),
         ],
         "env": _coord_mcp_env(tc),
         # Pre-approve every coord_* tool. Without this, Codex routes
@@ -992,8 +1010,11 @@ def _build_mcp_servers(tc: TurnContext) -> dict[str, Any]:
         # and PR #16632 for the upstream context.
         "default_tools_approval_mode": "approve",
     }
+    allowed = set(tc.allowed_tools or [])
     for name, cfg in (tc.external_mcp_servers or {}).items():
         if name == "coord":
+            continue
+        if allowed and not _mcp_server_allowed_by_tools(name, allowed):
             continue
         # Mirror the approval policy applied to `coord`: external MCP
         # servers added through the Options drawer are user-authorized
@@ -1025,12 +1046,15 @@ directories because they use Claude naming.
 """
 
 
-def _codex_developer_instructions(system_prompt: str | None) -> str:
+def _codex_developer_instructions(
+    system_prompt: str | None,
+    allowed_tools: list[str] | None = None,
+) -> str:
     body = (system_prompt or "").strip()
     compat = (
         _CODEX_CLAUDE_COMPAT_INSTRUCTIONS
         + "\n\n"
-        + _codex_coord_tool_instructions()
+        + _codex_coord_tool_instructions(allowed_tools)
         + "\n\n"
         + _codex_web_tool_instructions()
     )
@@ -1059,10 +1083,18 @@ def _codex_web_tool_instructions() -> str:
     )
 
 
-def _codex_coord_tool_instructions() -> str:
+def _codex_coord_tool_instructions(allowed_tools: list[str] | None) -> str:
     try:
-        from server.tools import coord_tool_names
-        names = coord_tool_names()
+        if allowed_tools is None:
+            from server.tools import coord_tool_names
+            names = coord_tool_names()
+        else:
+            prefix = "mcp__coord__"
+            names = [
+                tool[len(prefix):]
+                for tool in allowed_tools
+                if isinstance(tool, str) and tool.startswith(prefix)
+            ]
     except Exception:
         logger.exception("CodexRuntime: failed to build coord tool instruction list")
         names = []
@@ -1120,7 +1152,10 @@ def _build_thread_config(sdk: Any, tc: TurnContext) -> Any:
     """Build the SDK ThreadConfig while tolerating fake SDKs in tests."""
     kwargs: dict[str, Any] = {
         "cwd": tc.workspace_cwd or None,
-        "developer_instructions": _codex_developer_instructions(tc.system_prompt),
+        "developer_instructions": _codex_developer_instructions(
+            tc.system_prompt,
+            tc.allowed_tools,
+        ),
         "approval_policy": "never",
         "sandbox": _codex_sandbox_for(tc.agent_id),
         "config": _codex_config_overrides(tc),
