@@ -7961,7 +7961,6 @@ function EnvInboxSection({ conversations }) {
               placeholder="body…"
               value=${body}
               onInput=${(e) => setBody(e.target.value)}
-              onKeyDown=${(e) => { if (e.key === "Escape") { e.preventDefault(); setComposing(false); } }}
               rows=${3}
             ></textarea>
             <div class="env-msg-composer-row">
