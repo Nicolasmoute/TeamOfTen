@@ -911,6 +911,14 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
         )
         result_text = _extract_step_tool_result(item_payload)
         if result_text:
+            await _emit_codex_safety_suspected(
+                agent_id,
+                item_id=item_id,
+                item_type=item_type,
+                tool_name=tool_name,
+                item_payload=item_payload,
+                result_text=result_text,
+            )
             await _emit(
                 agent_id,
                 "tool_result",
@@ -977,6 +985,14 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
         )
         result_text = _extract_step_tool_result(item_payload)
         if result_text:
+            await _emit_codex_safety_suspected(
+                agent_id,
+                item_id=item_id,
+                item_type=item_type,
+                tool_name=tool_name,
+                item_payload=item_payload,
+                result_text=result_text,
+            )
             await _emit(
                 agent_id,
                 "tool_result",
@@ -1284,6 +1300,36 @@ def _step_payload_is_error(item_payload: Mapping[str, Any]) -> bool:
         return int(exit_code) != 0
     except (TypeError, ValueError):
         return False
+
+
+def _step_payload_safety_suspected(item_payload: Mapping[str, Any]) -> bool:
+    status = str(item_payload.get("status") or item_payload.get("state") or "").lower()
+    return "cancel" in status or "reject" in status
+
+
+async def _emit_codex_safety_suspected(
+    agent_id: str,
+    *,
+    item_id: str | None,
+    item_type: str,
+    tool_name: str,
+    item_payload: Mapping[str, Any],
+    result_text: str,
+) -> None:
+    if not _step_payload_safety_suspected(item_payload):
+        return
+    from server.agents import _emit
+
+    status = str(item_payload.get("status") or item_payload.get("state") or "")
+    await _emit(
+        agent_id,
+        "codex_safety_suspected",
+        tool_use_id=item_id,
+        item_type=item_type,
+        tool=tool_name,
+        status=status,
+        content=result_text[:12000],
+    )
 
 
 def _to_mapping(value: Any) -> Mapping[str, Any] | None:
