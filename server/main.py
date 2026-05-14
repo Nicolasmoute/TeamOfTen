@@ -5557,6 +5557,62 @@ async def extend_pending_interaction(
     return {"ok": True, **result, "kind": kind}
 
 
+@app.post(
+    "/api/questions/{correlation_id}/cancel",
+    dependencies=[Depends(require_token)],
+)
+async def cancel_pending_question(
+    correlation_id: str,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, Any]:
+    """Human explicitly cancels a pending AskUserQuestion without answering.
+    Resolves the agent's paused Future with an InteractionRejected so the
+    agent gets a PermissionResultDeny and can proceed (reformulate or
+    escalate). Emits question_cancelled via the existing reject path."""
+    from server import interactions as interactions_registry
+    entry = interactions_registry.get(correlation_id)
+    if entry is None or entry.kind != "question":
+        raise HTTPException(
+            404,
+            detail=f"question {correlation_id!r} not found or already resolved",
+        )
+    ok = interactions_registry.reject(correlation_id, "cancelled by human operator")
+    if not ok:
+        raise HTTPException(
+            404,
+            detail=f"question {correlation_id!r} already resolved",
+        )
+    return {"ok": True, "correlation_id": correlation_id}
+
+
+@app.post(
+    "/api/plans/{correlation_id}/cancel",
+    dependencies=[Depends(require_token)],
+)
+async def cancel_pending_plan(
+    correlation_id: str,
+    actor: dict = Depends(audit_actor),
+) -> dict[str, Any]:
+    """Human explicitly cancels a pending ExitPlanMode plan review without
+    deciding. Resolves the agent's paused Future with InteractionRejected so
+    the agent gets a PermissionResultDeny and can revise or escalate.
+    Emits plan_cancelled via the existing reject path."""
+    from server import interactions as interactions_registry
+    entry = interactions_registry.get(correlation_id)
+    if entry is None or entry.kind != "plan":
+        raise HTTPException(
+            404,
+            detail=f"plan {correlation_id!r} not found or already resolved",
+        )
+    ok = interactions_registry.reject(correlation_id, "cancelled by human operator")
+    if not ok:
+        raise HTTPException(
+            404,
+            detail=f"plan {correlation_id!r} already resolved",
+        )
+    return {"ok": True, "correlation_id": correlation_id}
+
+
 class HumanMessageRequest(BaseModel):
     to: str
     body: str = Field(min_length=1, max_length=5000)

@@ -4079,6 +4079,23 @@ Shows (top-to-bottom):
        reloads. ISO ts has microsecond precision so `ts + agent_id`
        is unique enough; correlation ids are server-assigned and
        stable across both ingestion paths.
+       **Non-dismissable interactive items.** `pending_question` and
+       `pending_plan` attention rows do NOT have a silent dismiss (×)
+       button. An agent is paused on its `pending_question` /
+       `pending_plan` Future; silently hiding the UI card leaves the
+       agent blocked indefinitely. Instead, these rows show a **"skip"
+       button** (`.env-attention-cancel`, amber border) that POSTs to
+       `POST /api/questions/{correlation_id}/cancel` or
+       `POST /api/plans/{correlation_id}/cancel`. The cancel endpoint
+       calls `interactions.reject(correlation_id, "cancelled by human
+       operator")` which resolves the Future with `InteractionRejected`;
+       the agent receives a `PermissionResultDeny` and can reformulate
+       or escalate. The `question_cancelled` / `plan_cancelled` bus
+       event is then published (existing path in `agents.py`), which
+       removes the item from the attention strip naturally. Other
+       attention item types (`human_attention`, `file_write_proposal`)
+       retain the plain dismiss (×) behaviour because they do not have
+       a waiting agent Future.
     4. **`EnvFileWriteProposalsSection` auto-expand.** When there's
        at least one pending row AND the user has never explicitly
        collapsed it (no localStorage entry), the section opens.
