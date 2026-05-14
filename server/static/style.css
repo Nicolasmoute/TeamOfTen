@@ -5126,24 +5126,6 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 .kbn-backlog-edit-err { font-size: 11px; color: var(--err, #c44); }
 .kbn-backlog-edit-actions { display: flex; gap: 6px; }
 
-/* Description preview on backlog cards */
-.kbn-backlog-desc {
-  font-size: 11px;
-  color: var(--fg-muted, #9aa2af);
-  line-height: 1.4;
-  margin-top: 3px;
-  word-break: break-word;
-}
-.kbn-backlog-expand-btn {
-  background: none;
-  border: none;
-  padding: 0;
-  color: var(--accent, #5b9bd5);
-  font-size: 11px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-.kbn-backlog-expand-btn:hover { text-decoration: underline; }
 .kbn-btn-sm { padding: 2px 8px; font-size: 11px; }
 .kbn-btn-danger { color: var(--err, #c44); border-color: var(--err, #c44); }
 .kbn-btn-danger:hover:not(:disabled) { background: rgba(200,68,68,0.12); }
@@ -5621,9 +5603,14 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 
   /* Backlog edit/delete actions: display:none / :hover display:flex
      never fires on touch — always show the icon buttons so the user
-     can tap them. They are absolutely positioned so no layout shift. */
+     can tap them. They are absolutely positioned so no layout shift.
+     Add right-padding to the card so the title text doesn't slide
+     under the always-visible buttons (2×20px + 4px gap + 6px right). */
   .kbn-card-actions.kbn-backlog-actions {
     display: flex;
+  }
+  .kbn-backlog-card {
+    padding-right: 52px;
   }
 
   /* Kanban card sizing — more breathing room on phone screens.

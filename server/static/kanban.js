@@ -1039,7 +1039,7 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
           </div>`}
       ${confirmDelete
         ? html`
-          <div class="kbn-modal-backdrop" onClick=${() => setConfirmDelete(false)}>
+          <div class="kbn-modal-backdrop" onClick=${(e) => { e.stopPropagation(); setConfirmDelete(false); }}>
             <div class="kbn-modal" onClick=${(e) => e.stopPropagation()}>
               <div class="kbn-modal-head">Delete idea?</div>
               <p class="kbn-modal-body-text">Delete "<strong>${entry.title}</strong>"? This cannot be undone.</p>
