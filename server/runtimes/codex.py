@@ -931,6 +931,7 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
         )
         result_text = _extract_step_tool_result(item_payload)
         if result_text:
+            is_err = bool(_step_payload_is_error(item_payload))
             await _emit_codex_safety_suspected(
                 agent_id,
                 item_id=item_id,
@@ -944,8 +945,13 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
                 "tool_result",
                 tool_use_id=item_id,
                 content=result_text,
-                is_error=bool(_step_payload_is_error(item_payload)),
+                is_error=is_err,
             )
+            # Auto-evict the stale cached client on the first MCP error
+            # so the NEXT turn starts with a fresh subprocess.  The
+            # current turn is not aborted (cache-pop-only for in-flight).
+            if is_err:
+                await _maybe_evict_on_mcp_error(agent_id, item_payload, turn_ctx)
         return
 
     mapping = _ITEM_TYPE_TO_HARNESS.get(item_type)
@@ -1446,6 +1452,46 @@ async def _emit_codex_safety_suspected(
         tool=tool_name,
         status=status,
         content=result_text[:12000],
+    )
+
+
+async def _maybe_evict_on_mcp_error(
+    agent_id: str,
+    item_payload: Mapping[str, Any],
+    turn_ctx: dict[str, Any],
+) -> None:
+    """Evict the stale Codex client on the FIRST MCP error of a turn.
+
+    When the coord_mcp stdio child crashes mid-turn (pipe break, OOM,
+    version mismatch) the outer ``except Exception: close_client()``
+    boundary in ``run_turn`` never fires because the turn has not
+    raised yet — the error surfaces only as a tool-result payload with
+    ``is_error=True``.  Without this, the next turn reuses the same
+    dead client and fails the same way (the p10 cascade pattern).
+
+    Self-heal semantics:
+    - Current turn is NOT aborted.  ``evict_client`` with an in-flight
+      turn pops the cache entry only; the subprocess stays alive so the
+      current turn can finish (partial result > nothing).
+    - Next turn gets a fresh client via the normal ``get_client`` path.
+    - At most one eviction per turn (``_mcp_transport_evicted`` flag).
+    - Emits ``codex_mcp_evict`` so the timeline shows the boundary.
+    """
+    if turn_ctx.get("_mcp_transport_evicted"):
+        return
+    turn_ctx["_mcp_transport_evicted"] = True
+    await evict_client(agent_id)
+    tool_name = _resolve_mcp_tool_name(item_payload)
+    from server.agents import _emit
+    await _emit(
+        agent_id,
+        "codex_mcp_evict",
+        reason="mcp_transport_error",
+        tool_name=tool_name,
+    )
+    logger.warning(
+        "CodexRuntime: MCP error on slot=%s tool=%s — evicted stale "
+        "client (next turn will start fresh)", agent_id, tool_name,
     )
 
 
