@@ -407,6 +407,12 @@ is auto-cancelled and the model sees "user rejected MCP tool call".
 `coord_*` is harness-trusted by the single-write-handle invariant, so
 blanket approval is correct. See openai/codex issue #16685 and PR
 #16632 for upstream context.
+CodexRuntime also applies a turn-level sandbox policy for Player turns:
+the active slot's worktree stays writable, while the shared `.project`
+seed checkout and sibling slot worktrees are listed in `blockedPaths`.
+This mirrors the Claude file-guard boundary at the sandbox layer. Coach
+still runs read-only.
+
 
 **External MCP servers inherit the same approval policy.** Servers added
 through the Options drawer are included in `.mcp.json` with

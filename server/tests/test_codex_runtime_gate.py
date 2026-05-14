@@ -1782,6 +1782,58 @@ def test_codex_thread_config_makes_coach_read_only() -> None:
     assert "plugins" not in config.kwargs["config"]
 
 
+def test_codex_turn_overrides_block_sibling_worktrees() -> None:
+    from server.runtimes.base import TurnContext
+    from server.runtimes.codex import _build_turn_overrides
+
+    tc = TurnContext(
+        agent_id="p6",
+        project_id="teamoften",
+        prompt="fix it",
+        system_prompt="system rules",
+        workspace_cwd="/data/projects/teamoften/repo/p6",
+        allowed_tools=[],
+        external_mcp_servers={},
+        model="gpt-5.4-mini",
+        effort=4,
+    )
+
+    overrides = _build_turn_overrides(_FakeCodexSdk, tc)
+    assert overrides.kwargs["cwd"] == "/data/projects/teamoften/repo/p6"
+    assert overrides.kwargs["model"] == "gpt-5.4-mini"
+    assert overrides.kwargs["effort"] == "xhigh"
+    sandbox = overrides.kwargs["sandbox_policy"]
+    assert sandbox["type"] == "workspaceWrite"
+    assert sandbox["networkAccess"] is True
+    assert sandbox["writableRoots"] == ["/data/projects/teamoften/repo/p6"]
+    assert sandbox["excludeSlashTmp"] is True
+    assert sandbox["excludeTmpdirEnvVar"] is True
+    assert "/data/projects/teamoften/repo/.project" in sandbox["blockedPaths"]
+    assert "/data/projects/teamoften/repo/p1" in sandbox["blockedPaths"]
+    assert "/data/projects/teamoften/repo/p10" in sandbox["blockedPaths"]
+    assert "/data/projects/teamoften/repo/p6" not in sandbox["blockedPaths"]
+    assert "/data/projects/teamoften/repo/coach" not in sandbox["blockedPaths"]
+
+
+def test_codex_turn_overrides_omit_sandbox_policy_for_coach() -> None:
+    from server.runtimes.base import TurnContext
+    from server.runtimes.codex import _build_turn_overrides
+
+    tc = TurnContext(
+        agent_id="coach",
+        project_id="teamoften",
+        prompt="check board",
+        system_prompt="system rules",
+        workspace_cwd="/data/projects/teamoften/repo/coach",
+        allowed_tools=[],
+        external_mcp_servers={},
+    )
+
+    overrides = _build_turn_overrides(_FakeCodexSdk, tc)
+    assert overrides.kwargs["cwd"] == "/data/projects/teamoften/repo/coach"
+    assert "sandbox_policy" not in overrides.kwargs
+
+
 async def test_codex_run_turn_updates_continuity_bookkeeping(
     monkeypatch,
 ) -> None:

@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from server.runtimes.base import TurnContext
+from server.workspaces import SLOT_IDS
 
 logger = logging.getLogger(__name__)
 
@@ -1306,6 +1307,40 @@ def _codex_config_overrides(tc: TurnContext) -> dict[str, Any]:
     return overrides
 
 
+def _codex_sandbox_policy(tc: TurnContext) -> dict[str, Any] | None:
+    """Best-effort sandbox policy for Codex Player turns.
+
+    The Codex SDK exposes `sandboxPolicy` on turn overrides. We use it
+    to keep the active slot's worktree writable while explicitly
+    blocking the shared seed checkout and sibling slot worktrees.
+    That mirrors the Claude file-guard boundary at the sandbox layer
+    instead of relying on prompt text alone.
+
+    Returns None when the cwd doesn't look like a per-slot worktree or
+    when the caller is Coach (Coach is read-only).
+    """
+    if tc.agent_id == "coach" or not tc.workspace_cwd:
+        return None
+    cwd = Path(tc.workspace_cwd)
+    repo_root = cwd.parent
+    if repo_root.name != "repo":
+        return None
+    blocked = [str(repo_root / ".project")]
+    for slot in SLOT_IDS:
+        if slot in ("coach", cwd.name):
+            continue
+        blocked.append(str(repo_root / slot))
+    return {
+        "type": "workspaceWrite",
+        "networkAccess": True,
+        "readOnlyAccess": {"type": "fullAccess"},
+        "writableRoots": [str(cwd)],
+        "excludeSlashTmp": True,
+        "excludeTmpdirEnvVar": True,
+        "blockedPaths": blocked,
+    }
+
+
 def _build_thread_config(sdk: Any, tc: TurnContext) -> Any:
     """Build the SDK ThreadConfig while tolerating fake SDKs in tests."""
     kwargs: dict[str, Any] = {
@@ -1343,6 +1378,9 @@ def _build_turn_overrides(sdk: Any, tc: TurnContext) -> Any | None:
     effort = _CODEX_EFFORT_LEVELS.get(tc.effort or 0)
     if effort:
         kwargs["effort"] = effort
+    sandbox_policy = _codex_sandbox_policy(tc)
+    if sandbox_policy is not None:
+        kwargs["sandbox_policy"] = sandbox_policy
     if not kwargs:
         return None
     cls = getattr(sdk, "TurnOverrides", None)
