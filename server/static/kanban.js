@@ -903,6 +903,7 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
   const [editing, setEditing] = useState(false);
   const [editTitle, setEditTitle] = useState(entry.title);
   const [editDesc, setEditDesc] = useState(entry.description || "");
+  const [editPriority, setEditPriority] = useState(entry.priority || "normal");
   const [editBusy, setEditBusy] = useState(false);
   const [editErr, setEditErr] = useState(null);
   const [expanded, setExpanded] = useState(false);
@@ -914,6 +915,7 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
     e.stopPropagation();
     setEditTitle(entry.title);
     setEditDesc(entry.description || "");
+    setEditPriority(entry.priority || "normal");
     setEditErr(null);
     setEditing(true);
   };
@@ -924,7 +926,7 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
     setEditBusy(true);
     setEditErr(null);
     try {
-      const payload = { title: t, description: editDesc.trim() || null };
+      const payload = { title: t, description: editDesc.trim() || null, priority: editPriority };
       const r = await authedFetch(`/api/backlog/${entry.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -969,8 +971,13 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
   const descTruncated = desc.length > _BACKLOG_DESC_PREVIEW && !expanded;
   const descVisible = descTruncated ? desc.slice(0, _BACKLOG_DESC_PREVIEW) + "…" : desc;
 
+  const pri = entry.priority || "normal";
+
   return html`
-    <div class="kbn-card kbn-backlog-card">
+    <div
+      class="kbn-card kbn-backlog-card kbn-backlog-pri-${pri}${expanded ? " expanded" : ""}"
+      onClick=${!editing ? () => setExpanded(!expanded) : undefined}
+    >
       ${editing
         ? html`
           <div class="kbn-backlog-edit">
@@ -993,6 +1000,21 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
               placeholder="More context for Coach…"
               disabled=${editBusy}
             ></textarea>
+            <div class="kbn-modal-priority-row" style="margin-top:6px">
+              <label class="kbn-label kbn-priority-label" for="kbn-edit-priority-${entry.id}">Priority</label>
+              <select
+                id="kbn-edit-priority-${entry.id}"
+                class="kbn-priority-select"
+                value=${editPriority}
+                onChange=${(e) => setEditPriority(e.target.value)}
+                disabled=${editBusy}
+              >
+                <option value="low">low</option>
+                <option value="normal">normal</option>
+                <option value="high">high</option>
+                <option value="urgent">urgent</option>
+              </select>
+            </div>
             ${editErr ? html`<div class="kbn-error kbn-backlog-edit-err">${editErr}</div>` : null}
             <div class="kbn-backlog-edit-actions">
               <button class="kbn-btn kbn-btn-primary kbn-btn-sm" onClick=${saveEdit} disabled=${editBusy}>
@@ -1003,16 +1025,13 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
           </div>`
         : html`
           <div class="kbn-card-title">${entry.title}</div>
-          ${desc ? html`
-            <div class="kbn-backlog-desc">${descVisible}${descTruncated || (desc.length > _BACKLOG_DESC_PREVIEW && expanded)
-              ? html`<button class="kbn-backlog-expand-btn" onClick=${() => setExpanded(!expanded)}>
-                  ${expanded ? " less" : " more"}
-                </button>`
-              : null}
-            </div>` : null}
+          ${expanded && desc ? html`
+            <div class="kbn-backlog-desc">${desc}</div>` : null}
           <div class="kbn-card-meta">
+            <span class="kbn-backlog-priority-chip kbn-backlog-pri-${pri}">${pri.toUpperCase()}</span>
             <span class="kbn-backlog-proposer">${proposerLabel}</span>
             <span class="kbn-card-age">${timeAgo(entry.proposed_at)}</span>
+            ${desc && !expanded ? html`<span class="kbn-backlog-has-desc" title="Has description">…</span>` : null}
           </div>
           <div class="kbn-card-actions kbn-backlog-actions">
             <button class="kbn-card-act-btn" title="Edit" onClick=${startEdit}>${_PENCIL_SVG}</button>
@@ -1038,8 +1057,21 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
   `;
 }
 
+const _PRI_ORDER = { urgent: 0, high: 1, normal: 2, low: 3 };
+
+function _sortByPriority(entries) {
+  return [...entries].sort((a, b) => {
+    const pa = _PRI_ORDER[a.priority] ?? 2;
+    const pb = _PRI_ORDER[b.priority] ?? 2;
+    if (pa !== pb) return pa - pb;
+    // same priority: older first (stable insert order)
+    return (a.proposed_at || "") < (b.proposed_at || "") ? -1 : 1;
+  });
+}
+
 function BacklogColumn({ entries, onRefresh, authedFetch }) {
   if (!entries) return null;
+  const sorted = _sortByPriority(entries);
   return html`
     <div class="kbn-column kbn-backlog-column">
       <div class="kbn-column-head">
@@ -1047,9 +1079,9 @@ function BacklogColumn({ entries, onRefresh, authedFetch }) {
         <span class="kbn-count">${entries.length}</span>
       </div>
       <div class="kbn-column-body">
-        ${entries.length === 0
+        ${sorted.length === 0
           ? html`<div class="kbn-empty">No pending ideas</div>`
-          : entries.map((e) => html`<${BacklogCard} key=${e.id} entry=${e} authedFetch=${authedFetch} onRefresh=${onRefresh} />`)}
+          : sorted.map((e) => html`<${BacklogCard} key=${e.id} entry=${e} authedFetch=${authedFetch} onRefresh=${onRefresh} />`)}
       </div>
     </div>
   `;
@@ -1111,11 +1143,11 @@ export function KanbanPane({
     if (!kanbanEvents) return;
     const watched = new Set([
       "task_created", "task_claimed", "task_assigned",
-      "task_updated", "task_stage_changed",
+      "task_updated", "task_stage_changed", "task_archived",
       "task_trajectory_changed", "task_blocked_changed",
       "task_spec_written", "task_role_assigned", "task_role_claimed",
-      "task_role_called", "task_role_completed", "task_execution_completed",
-      "task_workflow_set", "task_drift_detected", "task_shipped",
+      "task_role_called", "task_role_stand_down", "task_role_completed",
+      "task_workflow_set", "task_drift_detected",
       "task_stage_stale", "audit_report_submitted",
       "audit_fail_notification", "compass_audit_logged",
       "commit_pushed", "project_switched", "socket_connected",

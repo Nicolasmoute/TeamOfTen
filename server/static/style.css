@@ -5025,8 +5025,53 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 
 /* Backlog column */
 .kbn-backlog-column { opacity: 0.9; }
-.kbn-backlog-card { cursor: default; border-left-color: var(--muted, #7e8694); position: relative; }
+.kbn-backlog-card {
+  cursor: pointer;
+  border-left-color: var(--muted, #7e8694);
+  position: relative;
+  min-height: 52px;
+}
 .kbn-backlog-card:hover { border-color: var(--border, #2c3340); }
+.kbn-backlog-card.expanded { border-left-width: 3px; }
+
+/* Priority-keyed left-border color on backlog cards */
+.kbn-backlog-pri-urgent { border-left-color: var(--err, #c44) !important; }
+.kbn-backlog-pri-high   { border-left-color: var(--warn, #d4a547) !important; }
+.kbn-backlog-pri-normal { border-left-color: var(--accent, #6da3d4) !important; }
+.kbn-backlog-pri-low    { border-left-color: var(--muted, #7e8694) !important; }
+
+/* Priority chip in the card meta row */
+.kbn-backlog-priority-chip {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  line-height: 1.5;
+  vertical-align: middle;
+}
+.kbn-backlog-priority-chip.kbn-backlog-pri-urgent { background: rgba(204,68,68,0.18); color: var(--err, #c44); }
+.kbn-backlog-priority-chip.kbn-backlog-pri-high   { background: rgba(212,165,71,0.18); color: var(--warn, #d4a547); }
+.kbn-backlog-priority-chip.kbn-backlog-pri-normal { background: rgba(109,163,212,0.12); color: var(--accent, #6da3d4); }
+.kbn-backlog-priority-chip.kbn-backlog-pri-low    { background: rgba(126,134,148,0.12); color: var(--muted, #7e8694); }
+
+/* "…" indicator when card has a description but is collapsed */
+.kbn-backlog-has-desc {
+  color: var(--muted, #7e8694);
+  font-size: 11px;
+  cursor: pointer;
+  margin-left: 2px;
+}
+
+/* Expanded description block */
+.kbn-backlog-desc {
+  font-size: 11px;
+  color: var(--fg-dim, #aab0ba);
+  margin: 4px 0 2px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 
 /* Hover-revealed edit/delete icon buttons on backlog cards */
 .kbn-card-actions.kbn-backlog-actions {

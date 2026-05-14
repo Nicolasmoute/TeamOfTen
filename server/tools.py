@@ -2633,6 +2633,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "GitHub PR. Set it under Options → Projects."
             )
 
+        # Expand ${VAR} placeholders (e.g. ${GITHUB_TOKEN}) before extracting
+        # the token.  Without this, a URL stored as
+        # "https://${GITHUB_TOKEN}@github.com/..." sends the literal string
+        # "${GITHUB_TOKEN}" as the Bearer token → GitHub 401.
+        from server.workspaces import _expand_placeholders
+        repo_url = _expand_placeholders(repo_url)
+
         # Parse PAT + owner/repo from repo_url
         # Expected pattern: https://<token>@github.com/<owner>/<repo>
         m = re.match(
@@ -2646,6 +2653,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "cannot extract PAT for GitHub API"
             )
         gh_token, gh_owner, gh_repo = m.group(1), m.group(2), m.group(3)
+        if not gh_token:
+            return _err(
+                "repo_url PAT expanded to empty string — "
+                "check that GITHUB_TOKEN (or equivalent) is set in env or "
+                "the harness secrets store"
+            )
 
         # --- Git operations in caller's worktree ---
         cwd = await workspace_dir(caller_id)
