@@ -2388,7 +2388,7 @@ async def _build_active_task_health_rows(
                 )
                 rows.append({
                     "task_id": r["task_id"],
-                    "title": (r.get("title") or "").strip()[:80],
+                    "title": (r.get("title") or "").strip(),
                     "executor": executor,
                     "kind": kind,
                     "kind_fail_count": fail_count,
@@ -2485,7 +2485,7 @@ async def _build_stalled_tasks_rows(
         stage_owner = stage_owner_map.get(r["id"])
         rows.append({
             "task_id": r["id"],
-            "title": (r.get("title") or "").strip()[:80],
+            "title": (r.get("title") or "").strip(),
             "stage": r.get("status") or "?",
             # The Player actually responsible for the next move at
             # this stage. Falls back to tasks.owner when no role row
@@ -3041,7 +3041,7 @@ async def _build_audit_aggregator_rows(project_id: str) -> str:
             continue
         rendered_any = True
         out.append(
-            f"- {t['id']} \"{(t.get('title') or '').strip()[:60]}\" "
+            f"- {t['id']} \"{(t.get('title') or '').strip()}\" "
             f"(executor {t.get('owner') or '—'}):"
         )
         round_counter: dict[str, int] = {"auditor_syntax": 0, "auditor_semantics": 0}
@@ -3139,7 +3139,7 @@ async def _build_recent_patterns_block(project_id: str) -> str:
             for r in await cur.fetchall():
                 d = dict(r)
                 kind = "syntax" if d["role"] == "auditor_syntax" else "semantic"
-                title = (d.get("title") or "").strip()[:50]
+                title = (d.get("title") or "").strip()
                 findings.append(
                     f"- {d['task_id']} \"{title}\" — {d['n']} {kind} fails; "
                     f"escalate via effort bump or re-spec."
@@ -3647,7 +3647,7 @@ async def _build_coach_coordination_block(
         }
         for t in open_tasks:
             tid = t["id"]
-            title = (t.get("title") or "").strip()[:80]
+            title = (t.get("title") or "").strip()
             status = t.get("status") or "?"
             owner = t.get("owner") or "—"
             traj_marker = _trajectory_marker(t.get("trajectory"), status)
@@ -3838,9 +3838,9 @@ async def _build_coach_coordination_block(
                         age = f"{age_s // 86400}d"
                 except Exception:
                     age = "?"
-                title_short = (br.get("title") or "").strip()[:80]
+                title = (br.get("title") or "").strip()
                 lines.append(
-                    f"[#{br['id']}] \"{title_short}\" — {proposer_label}, {age} ago"
+                    f"[#{br['id']}] \"{title}\" — {proposer_label}, {age} ago"
                 )
             lines.append("")
             lines.append(
