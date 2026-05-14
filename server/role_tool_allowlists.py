@@ -126,4 +126,3 @@ def tools_for_role(role: str | None) -> list[str]:
 
 def tools_json_for_role(role: str | None) -> str:
     return json.dumps(tools_for_role(role), separators=(",", ":"))
-

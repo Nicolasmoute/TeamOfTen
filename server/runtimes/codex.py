@@ -999,6 +999,10 @@ def _build_mcp_servers(tc: TurnContext) -> dict[str, Any]:
             "--allowed-tools",
             json.dumps(coord_allowed, separators=(",", ":")),
         ],
+        # Codex understands per-server enabled_tools in MCP config. This
+        # keeps the app-server's schema/tool-registration path role-scoped
+        # instead of relying only on the coord proxy rejecting calls later.
+        "enabled_tools": coord_allowed,
         "env": _coord_mcp_env(tc),
         # Pre-approve every coord_* tool. Without this, Codex routes
         # MCP calls through the elicitation/approval path under

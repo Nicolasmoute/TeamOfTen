@@ -25,4 +25,3 @@ def test_idle_allowlist_keeps_read_and_coord_status_surface_only() -> None:
 
 def test_singular_semantic_alias_matches_real_role() -> None:
     assert tools_for_role("auditor_semantic") == tools_for_role("auditor_semantics")
-

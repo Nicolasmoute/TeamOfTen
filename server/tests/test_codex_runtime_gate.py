@@ -563,6 +563,10 @@ async def test_build_mcp_servers_filters_coord_and_external_by_allowed_tools() -
         "coord_my_assignments",
         "coord_commit_push",
     ]
+    assert servers["coord"]["enabled_tools"] == [
+        "coord_my_assignments",
+        "coord_commit_push",
+    ]
     assert "github" in servers
     assert "slack" not in servers
 

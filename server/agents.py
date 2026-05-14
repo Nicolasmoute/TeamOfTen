@@ -3887,13 +3887,20 @@ async def _get_role_default_model(agent_id: str, runtime_name: str = "claude") -
     return fallback or None
 
 
-async def _get_agent_allowed_tools_override(agent_id: str) -> list[str] | None:
-    """Return a per-slot tool allowlist planted by kanban role routing.
+async def _get_agent_allowed_tools_override(
+    agent_id: str,
+    runtime_name: str,
+) -> list[str] | None:
+    """Return a Codex Player tool allowlist planted by kanban routing.
 
     `agents.allowed_tools` is a JSON array of SDK-facing tool names.
     NULL, empty, or malformed values fall back to the dispatcher role
-    defaults so a bad row cannot brick spawning.
+    defaults so a bad row cannot brick spawning. The override is Codex
+    Player-only: Claude keeps its broader legacy tool surface until it
+    has an equivalent schema-cost problem and migration plan.
     """
+    if runtime_name != "codex" or agent_id == "coach":
+        return None
     try:
         c = await configured_conn()
         try:
@@ -5289,7 +5296,10 @@ async def run_agent(
     # The runtime then merges with its runtime-specific MCP servers
     # (Claude attaches a coord SDK MCP; Codex would attach the stdio
     # coord proxy).
-    allowed_override = await _get_agent_allowed_tools_override(agent_id)
+    allowed_override = await _get_agent_allowed_tools_override(
+        agent_id,
+        _runtime_name,
+    )
     allowed = list(
         allowed_override
         or (ALLOWED_COACH_TOOLS if agent_id == "coach" else ALLOWED_PLAYER_TOOLS)
