@@ -4190,6 +4190,15 @@ app for phones:
   The webkit-box approach collapses to 0px height on some Android Chrome builds,
   making titles invisible; the max-height approach is reliable and allows 3 lines.
   Expanded cards (`kbn-card.expanded`) remove the cap so the full title shows.
+- **Kanban card sizing on mobile** — cards felt cramped on smartphone screens
+  even after the title-visibility fix above. A second mobile pass (2026-05-14)
+  bumps card padding to `12px 13px` (from `8px 9px`), sets `min-height: 72px`,
+  increases the gap between card sub-rows to `8px`, and bumps `.kbn-card-title`
+  `font-size` from `13px` to `14.5px`. Stage labels (`kbn-stage-label`) step up
+  from `9px` to `10px`. Interactive icon buttons inside cards (`kbn-card-act-btn`)
+  get `min-height: 44px` + `min-width: 44px` with flex centering to meet the
+  ≥44px touch target guideline. All rules are scoped to `@media (max-width: 700px)`
+  and do not affect desktop layout.
 - **Touch-inaccessible hover-reveal buttons** — two classes of buttons are hidden
   via CSS hover and never reachable on touch screens; both get always-visible
   overrides at the mobile breakpoint:
