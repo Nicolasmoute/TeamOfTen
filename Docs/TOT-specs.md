@@ -1740,6 +1740,13 @@ are shown and a `(+N more)` footer line counts the remainder.
 The cap is enforced by the constant `ACTIVE_TASK_HEALTH_CAP = 3`
 in `server/agents.py`.
 
+**Title rendering — no truncation.** Every sub-section in this block
+(current-state tasks, stalled tasks, audit aggregator, recent patterns,
+and backlog) renders task/entry titles in full — no character cap is
+applied. Task titles are short summaries by convention (§14.5 limits
+them to 300 chars on input), so truncation in the prompt is never
+needed and would silently hide the title from Coach.
+
 ### 10.3 Compact and Continuity
 
 Manual compact:

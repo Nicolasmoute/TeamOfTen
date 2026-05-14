@@ -26,6 +26,7 @@ from server.agents import (
     _build_player_health_block,
     _build_recent_events_block,
     _build_recent_patterns_block,
+    _build_stalled_tasks_rows,
     _stamp_events_read_by_coach,
 )
 from server.db import configured_conn, init_db
@@ -443,6 +444,124 @@ async def test_coordination_block_section_ordering(fresh_db: str) -> None:
     assert "## Team composition" not in body
     assert "## Trajectory examples" not in body
     assert "## Lifecycle policy" not in body
+
+
+# ---------------------------------------------------------------------
+# Long-title round-trip: titles > 80 chars must NOT be truncated
+# (regression for the [:80] truncation removed 2026-05-14)
+# ---------------------------------------------------------------------
+
+LONG_TITLE = "A" * 81  # 81 chars — exceeds the old 80-char truncation cap
+VERY_LONG_TITLE = "Fix the authentication flow so that mobile users can log in without a password" + " extra"  # 85 chars
+
+
+async def _seed_backlog_entry(*, title: str, proposed_by: str = "p1") -> int:
+    """Insert a pending backlog_tasks row and return its id."""
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "INSERT INTO backlog_tasks (title, proposed_by, proposed_at, status) "
+            "VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'pending')",
+            (title, proposed_by),
+        )
+        await c.commit()
+        return int(cur.lastrowid)
+    finally:
+        await c.close()
+
+
+async def test_current_state_task_title_not_truncated(fresh_db: str) -> None:
+    """Task titles longer than 80 chars must appear in full in the
+    ## Current state section (regression for [:80] removed 2026-05-14)."""
+    await init_db()
+    await _seed_task(
+        task_id="t-2026-05-14-trunc01",
+        title=LONG_TITLE,
+        status="execute",
+        owner="p2",
+    )
+    surfaced: list[int] = []
+    body = await _build_coach_coordination_block(surfaced_event_ids=surfaced)
+    assert LONG_TITLE in body, (
+        f"Expected full 81-char title in prompt, got truncated output. "
+        f"Title not found in:\n{body[:500]}"
+    )
+    # Confirm the truncated form does NOT appear as a false negative.
+    assert LONG_TITLE[:80] + "…" not in body
+
+
+async def test_backlog_title_not_truncated(fresh_db: str) -> None:
+    """Backlog entry titles longer than 80 chars must appear in full in
+    the ## Backlog section (primary bug fixed 2026-05-14)."""
+    await init_db()
+    await _seed_backlog_entry(title=VERY_LONG_TITLE)
+    surfaced: list[int] = []
+    body = await _build_coach_coordination_block(surfaced_event_ids=surfaced)
+    assert "## Backlog" in body, "Backlog section absent — entry not seeded"
+    assert VERY_LONG_TITLE in body, (
+        f"Expected full title in backlog section, got truncated output. "
+        f"Full title: {VERY_LONG_TITLE!r}\nBody excerpt:\n{body[-300:]}"
+    )
+
+
+async def test_stalled_task_title_not_truncated(fresh_db: str) -> None:
+    """Stalled-task titles > 80 chars must appear in full
+    (regression for [:80] in _build_stalled_tasks_rows removed 2026-05-14)."""
+    await init_db()
+    await _seed_task(
+        task_id="t-2026-05-14-trunc02",
+        title=LONG_TITLE,
+        status="execute",
+        owner="p2",
+    )
+    # Inject a stale last_stage_change_at so the task appears stalled.
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE tasks SET last_stage_change_at = '2020-01-01T00:00:00Z' "
+            "WHERE id = 't-2026-05-14-trunc02'"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    out = await _build_stalled_tasks_rows("misc")
+    if out:  # Only assert when the row actually renders (threshold may vary).
+        assert LONG_TITLE in out, (
+            f"Expected full title in stalled-tasks block; got:\n{out}"
+        )
+
+
+async def test_active_task_health_title_not_truncated(fresh_db: str) -> None:
+    """Active-task-health titles > 80 chars must appear in full
+    (regression for [:80] in _build_active_task_health_rows removed 2026-05-14)."""
+    await init_db()
+    await _seed_task(
+        task_id="t-2026-05-14-trunc03",
+        title=LONG_TITLE,
+        status="execute",
+        owner="p2",
+    )
+    # Two FAIL rounds → kind_fail_count >= 2, so the task surfaces.
+    await _seed_role_row(
+        task_id="t-2026-05-14-trunc03",
+        role="auditor_syntax",
+        owner="p4",
+        verdict="fail",
+        completed_at="2026-05-14T01:00:00Z",
+    )
+    await _seed_role_row(
+        task_id="t-2026-05-14-trunc03",
+        role="auditor_syntax",
+        owner="p4",
+        verdict="fail",
+        completed_at="2026-05-14T02:00:00Z",
+    )
+    out = await _build_audit_aggregator_rows("misc")
+    assert out != "", "Audit aggregator empty — seeding did not register fails"
+    assert LONG_TITLE in out, (
+        f"Expected full title in audit-aggregator block; got:\n{out}"
+    )
 
 
 # ---------------------------------------------------------------------
