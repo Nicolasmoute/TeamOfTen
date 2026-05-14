@@ -136,6 +136,27 @@ When `proposed_by='human'` and action is `reject`, the harness inserts a row int
 
 When the Backlog has pending items, `_build_coach_coordination_block` appends a `## Backlog` section listing the top 5 oldest `pending` entries (oldest-first). Format per line: `[{id}] "{title}" — {proposer}, {age}`. Section is omitted entirely when the Backlog is empty (zero token cost in the common case).
 
+### 4.0.6 Mid-turn view: `coord_list_backlog`
+
+The coordination block is assembled at turn start and does not update mid-turn after `coord_propose_task` or `coord_triage_backlog` calls. `coord_list_backlog` provides a fresh mid-turn snapshot.
+
+```
+coord_list_backlog(status?, limit?)
+```
+
+| Param | Default | Notes |
+|---|---|---|
+| `status` | `'pending'` | `'pending'` / `'promoted'` / `'rejected'` / `'all'` |
+| `limit` | 50 | Max rows (1–200) |
+
+Available to **Coach and all Players** (read-only, no side effects). Returns entries newest-first. One line per entry:
+
+```
+#<id>  [<status>]  "<title>"  by <proposed_by>, <age> ago
+```
+
+Rejected entries append `  reason: <reject_reason>`; promoted entries append `  → task <promoted_task_id>`. Titles are never truncated.
+
 ---
 
 ## 5 · Trajectory (FYI contract)
