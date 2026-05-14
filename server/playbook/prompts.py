@@ -106,9 +106,21 @@ Rules:
 - **Creation text is hard-capped at 160 chars; longer creations are rejected.** One line, imperative ("When X -> do Y" or "X needs Y"), no enumerated sub-items, no parenthetical lists. The WEIGHT carries confidence; the text just triggers recall. Aim for ~120 chars typical.
 - Skip statements that are runtime-specific, project-specific, procedural-plumbing, or unobservable.
 - Empty lists are valid — return all four as `[]` if no real signal.
-
+{pressure_note}
 Return ONLY the JSON object. The first character must be `{{`.
 """
+
+
+# ---------------------------------------------------------------- pressure directive
+
+
+REFLECTION_PRESSURE_DIRECTIVE = (
+    "\nIMPORTANT — the lattice has {active} active statements, above the "
+    "{cap}-statement soft cap. Before proposing any new creations, you MUST "
+    "propose at least 2 merges (duplicates or near-duplicates) and at least 2 "
+    "downward adjustments (patterns not observed in this evidence bundle). "
+    "Creations are only allowed after the merge + adjustment quota is met."
+)
 
 
 __all__ = [
@@ -116,4 +128,5 @@ __all__ = [
     "BOOTSTRAP_USER_TEMPLATE",
     "REFLECTION_SYSTEM",
     "REFLECTION_USER_TEMPLATE",
+    "REFLECTION_PRESSURE_DIRECTIVE",
 ]

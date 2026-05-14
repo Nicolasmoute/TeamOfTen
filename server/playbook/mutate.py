@@ -618,7 +618,7 @@ def sweep_engine_actions(
     lattice: Lattice,
     archive: Archive,
 ) -> list[dict[str, Any]]:
-    """Run all three engine-driven archive predicates (§5.8).
+    """Run all four engine-driven archive predicates (§5.8 + §5.7.1).
     Returns a list of action records for the runs.jsonl `engine_actions`
     field. Mutates lattice + archive in place.
     """
@@ -650,6 +650,30 @@ def sweep_engine_actions(
     if stale_unused:
         kept_ids = {s.id for s in stale_unused}
         lattice.statements = [s for s in lattice.statements if s.id not in kept_ids]
+
+    # Pressure sweep (§5.7.1): when active count exceeds HARD_STATEMENT_CAP,
+    # archive lowest-weight non-immutable statements until active count
+    # reaches SOFT_STATEMENT_CAP. Lowest-weight-first keeps the most
+    # confident patterns in play. Fires AFTER the normal three passes so
+    # natural settle/stale exits run first.
+    active_count = len(lattice.statements)
+    if active_count > config.HARD_STATEMENT_CAP:
+        eligible = sorted(
+            [s for s in lattice.statements if not s.immutable],
+            key=lambda s: s.weight,  # ascending — lowest weight first
+        )
+        active_before = active_count
+        for s in eligible:
+            if len(lattice.statements) <= config.SOFT_STATEMENT_CAP:
+                break
+            _archive(archive, s, reason="pressure_cap")
+            actions.append({
+                "action": "pressure_cap",
+                "id": s.id,
+                "weight_at_archive": s.weight,
+                "active_before": active_before,
+            })
+            lattice.statements = [x for x in lattice.statements if x.id != s.id]
 
     return actions
 
