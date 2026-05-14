@@ -952,54 +952,48 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "Players can only create SUBTASKS of tasks they own — pass the "
             "parent_id explicitly (must match a task you own), or leave it "
             "blank to auto-nest under your current task.\n"
+            "\n"
+            "**Coach top-level tasks land in the Backlog first (FIFO "
+            "discipline).** When Coach calls this tool WITHOUT a parent_id, "
+            "the task is inserted into the Backlog as a `pending` entry "
+            "(same table as coord_propose_task). No kanban row is created "
+            "yet, no Player is woken. Coach must then call "
+            "coord_triage_backlog(id, action='promote', trajectory=[...]) "
+            "to promote it to the kanban and fire it at a Player. This "
+            "enforces FIFO priority ordering: items are triaged in the "
+            "order they arrived, not in the order Coach happened to type "
+            "them (LIFO). Use the `priority` param to flag urgency at "
+            "creation time — the Backlog column shows it. "
+            "Player SUBTASKS (with parent_id) are unaffected — they still "
+            "plant directly on the kanban under their parent.\n"
+            "\n"
             "Params:\n"
             "- title: short summary (required)\n"
             "- description: longer explanation (optional)\n"
             "- parent_id: parent task id (optional; Players: required unless you have a current task)\n"
-            "- priority: 'low', 'normal', 'high', 'urgent' (default 'normal')\n"
+            "- priority: 'low', 'normal', 'high', 'urgent' (default 'normal'). "
+            "Stored on the Backlog entry for Coach top-level tasks; stored "
+            "on the task row for Player subtasks.\n"
             "- workflow: code | research | writing | marketing | ops | generic (default generic). "
             "Shapes prompt wording; does not drive routing — the trajectory does.\n"
             "- tracking_reason: optional informational tag.\n"
-            "- trajectory: REQUIRED for Coach. Ordered list of {stage, to, "
-            "focus?} objects documenting the planned path and the candidate "
-            "slots. `stage` ∈ {plan, execute, audit_syntax, audit_semantics, "
-            "ship}; canonical order; execute is mandatory. **trajectory[0].to "
-            "MUST name exactly one Player** (single-element list like "
-            "['p3']). The kanban is a log of work Coach has fired AT a "
-            "specific Player — pool/empty first-stage `to` is rejected, "
-            "because an undispatched task isn't on the kanban yet, it's "
-            "pre-task reasoning. If you haven't decided who, decide now "
-            "(look at coord_get_player_settings / ## Player health / "
-            "## Recent events) and name them. Subsequent stages' `to` "
-            "may be a single name, a list (['p1','p2']), or empty — they "
-            "are FYI only; Coach picks each later stage's assignee at "
+            "- trajectory: REQUIRED for Coach top-level tasks. Stored on the "
+            "Backlog entry so coord_triage_backlog promote can read it. "
+            "Ordered list of {stage, to, focus?} objects. `stage` ∈ "
+            "{plan, execute, audit_syntax, audit_semantics, ship}; canonical "
+            "order; execute is mandatory. **trajectory[0].to MUST name "
+            "exactly one Player** (single-element list like ['p3']). "
+            "Subsequent stages' `to` may be a single name, list, or empty "
+            "— FYI only; Coach picks each later stage's assignee at "
             "coord_approve_stage time. `focus` is required on every "
-            "audit_semantics entry. Examples: [{stage:'execute',to:'p2'}] "
-            "(fired at p2; Coach reviews after the commit, archives via "
-            "coord_archive_task); [{stage:'plan',to:'p5'},"
-            "{stage:'execute',to:['p2']},"
-            "{stage:'audit_syntax',to:'p4'},{stage:'ship',to:'p2'}] (full "
-            "code path; Coach approves each later transition). Players "
-            "inherit the parent's trajectory when subtasking; the rule "
-            "still applies — name yourself or another Player as "
-            "trajectory[0].to.\n"
-            "- note: optional brief that becomes the first-stage "
-            "  assignee's wake prompt verbatim. Use this to frame the "
-            "  work — what to look at, what changed, what you want "
-            "  them to do. If empty, the harness falls back to a "
-            "  short fact line ('Coach created task X and assigned "
-            "  you as <role>'); your note replaces that with real "
-            "  context.\n"
+            "audit_semantics entry. Players inherit the parent's trajectory "
+            "when subtasking.\n"
+            "- note: optional brief — stored with the Backlog entry for "
+            "  Coach top-level tasks; becomes the first-stage assignee's "
+            "  wake prompt at promote time.\n"
             "- success_criteria: optional 1-3 line statement of what "
-            "  'done' looks like for this task — the bar you will "
-            "  evaluate the shipped work against. Stored on the "
-            "  task; surfaces in the auditor's wake context and is "
-            "  echoed back to you at coord_approve_stage(audit→ship) "
-            "  so the evaluation references your prior, not the "
-            "  auditor's interpretation. Skip when the goal is "
-            "  exploratory; you can also set/refine it later at "
-            "  coord_approve_stage(plan→execute) once the planner's "
-            "  spec is in hand."
+            "  'done' looks like. Stored on the Backlog entry; promoted "
+            "  to the task row at triage time."
         ),
         {
             "title": str, "description": str, "parent_id": str,
@@ -1054,6 +1048,55 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             )
 
         project_id = await resolve_active_project()
+
+        # ----------------------------------------------------------------
+        # Coach top-level task → Backlog first (FIFO discipline).
+        # Player subtasks (parent_id set) always go directly to kanban.
+        # ----------------------------------------------------------------
+        if caller_is_coach and parent_id is None:
+            # Store trajectory + note + success_criteria on the backlog
+            # entry so coord_triage_backlog promote can read them later.
+            trajectory_json = json.dumps(
+                trajectory, separators=(",", ":")
+            ) if trajectory else None
+            now_iso = _now_iso()
+            c = await configured_conn()
+            try:
+                cur = await c.execute(
+                    "INSERT INTO backlog_tasks "
+                    "(title, proposed_by, proposed_at, priority, description, "
+                    "trajectory_json, note, success_criteria) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (title, caller_id, now_iso, priority,
+                     description or None,
+                     trajectory_json,
+                     coach_note or None,
+                     success_criteria or None),
+                )
+                backlog_id = cur.lastrowid
+                await c.commit()
+            finally:
+                await c.close()
+
+            await bus.publish({
+                "ts": now_iso,
+                "agent_id": caller_id,
+                "type": "backlog_task_proposed",
+                "id": backlog_id,
+                "title": title,
+                "proposed_by": caller_id,
+                "priority": priority,
+            })
+            return _ok(
+                f"Backlog entry #{backlog_id} created: \"{title}\" "
+                f"(priority={priority}). "
+                "Task is NOT yet on the kanban — call "
+                f"coord_triage_backlog(id={backlog_id}, "
+                "action='promote', trajectory=[...]) when you're ready "
+                "to fire it at a Player. This enforces FIFO ordering: "
+                "triage from oldest to newest, not by creation recency."
+            )
+
         c = await configured_conn()
         try:
             if not caller_is_coach:
@@ -7798,7 +7841,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT id, title, proposed_by, status "
+                "SELECT id, title, proposed_by, status, priority, "
+                "trajectory_json, note, success_criteria "
                 "FROM backlog_tasks WHERE id = ?",
                 (backlog_id,),
             )
@@ -7856,13 +7900,24 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             )
 
         # action == "promote"
-        trajectory = args.get("trajectory")
-        if not trajectory:
+        # Trajectory: args wins; fall back to stored trajectory_json from
+        # Coach's coord_create_task call (backlog-first flow).
+        trajectory_arg = args.get("trajectory")
+        stored_traj_json = entry.get("trajectory_json")
+        if not trajectory_arg and stored_traj_json:
+            try:
+                import json as _json
+                trajectory_arg = _json.loads(stored_traj_json)
+            except Exception:
+                pass
+        if not trajectory_arg:
             return _err(
                 "trajectory is required when action='promote'. "
                 "Provide an ordered list of {stage, to} objects — "
-                "same format as coord_create_task."
+                "same format as coord_create_task. (This entry has "
+                "no stored trajectory from creation time.)"
             )
+        trajectory = trajectory_arg
         if isinstance(trajectory, str):
             try:
                 import json as _json
@@ -7873,6 +7928,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         trajectory, traj_err = _validate_trajectory(trajectory)
         if traj_err:
             return _err(f"invalid trajectory: {traj_err}")
+
+        # Priority and metadata: inherit from backlog entry when available.
+        promote_priority = entry.get("priority") or "normal"
+        promote_note = (args.get("note") or "").strip() or entry.get("note") or None
+        promote_sc = entry.get("success_criteria") or ""
 
         task_id = _new_task_id()
         trajectory_json = json.dumps(trajectory, separators=(",", ":"))
@@ -7887,12 +7947,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             await c.execute(
                 "INSERT INTO tasks (id, project_id, title, description, "
                 "priority, workflow, tracking_reason, trajectory, status, "
-                "owner, last_stage_change_at, created_by) "
-                "VALUES (?, ?, ?, '', 'normal', 'generic', 'backlog', "
-                "?, ?, ?, ?, ?)",
+                "owner, last_stage_change_at, created_by, success_criteria) "
+                "VALUES (?, ?, ?, '', ?, 'generic', 'backlog', "
+                "?, ?, ?, ?, ?, ?)",
                 (task_id, project_id, title,
+                 promote_priority,
                  trajectory_json, initial_status, initial_owner,
-                 now_iso, caller_id),
+                 now_iso, caller_id, promote_sc),
             )
             # Plant first-stage role row when single named assignee.
             _role_for_stage_map = {
@@ -7919,6 +7980,24 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         finally:
             await c.close()
 
+        # Wake the first-stage assignee when a single named slot was planted.
+        if initial_owner and len(first_to) == 1:
+            from server.agents import maybe_wake_agent
+            wake_body = promote_note or (
+                f"Coach promoted backlog #{backlog_id} ({title!r}) and "
+                f"assigned you as {_role_for_stage_map[trajectory[0]['stage']]} "
+                f"for the {initial_status} stage."
+            )
+            wake_body = _with_player_reminder(wake_body)
+            try:
+                await maybe_wake_agent(
+                    initial_owner, wake_body,
+                    bypass_debounce=True,
+                    wake_source="kanban_promote",
+                )
+            except Exception:
+                pass
+
         await bus.publish({
             "ts": now_iso,
             "agent_id": caller_id,
@@ -7926,10 +8005,16 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "backlog_id": backlog_id,
             "task_id": task_id,
             "title": title,
+            "priority": promote_priority,
         })
         return _ok(
             f"Backlog entry #{backlog_id} promoted → task {task_id} "
-            f"(\"{title}\", initial stage: {initial_status})."
+            f"(\"{title}\", priority={promote_priority}, "
+            f"initial stage: {initial_status})."
+            + (f" Player {initial_owner} woken." if initial_owner else
+               f" No auto-wake (pool/empty first-stage `to`); "
+               f"drive via coord_approve_stage(task_id={task_id!r}, "
+               f"next_stage={initial_status!r}, assignee=<slot>).")
         )
 
     @tool(

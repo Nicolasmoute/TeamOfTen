@@ -934,6 +934,23 @@ async def init_db() -> None:
                 [("description", "description TEXT")],
             )
 
+            # Backlog priority — Coach-created entries carry the priority
+            # flag set at coord_create_task time. Existing rows default
+            # to 'normal' (no backlog disturbance on upgrade).
+            # trajectory_json, note, success_criteria — stored so
+            # coord_triage_backlog promote can read them without Coach
+            # repeating the details at triage time.
+            await _ensure_columns(
+                db,
+                "backlog_tasks",
+                [
+                    ("priority", "priority TEXT NOT NULL DEFAULT 'normal'"),
+                    ("trajectory_json", "trajectory_json TEXT"),
+                    ("note", "note TEXT"),
+                    ("success_criteria", "success_criteria TEXT"),
+                ],
+            )
+
             logger.info("init_db: schema ok, ensuring misc project")
             # Ensure the fallback project + active-project pointer
             # exist on every fresh boot. INSERT OR IGNORE — never

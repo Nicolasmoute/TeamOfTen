@@ -2266,19 +2266,30 @@ so permissions do not depend on the model truthfully passing its identity.
     audit report. When a completed audit row has no verdict (edge case),
     falls back to `<label>:done`.
 
-`coord_create_task(title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?)`
+`coord_create_task(title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?, note?, success_criteria?)`
 
-- Coach can create top-level tasks; Players can only create subtasks
-  under tasks they own. If a Player omits `parent_id`, their
-  `current_task_id` is used.
-- Priority: `low`, `normal`, `high`, `urgent`.
-- `trajectory` is REQUIRED for Coach: ordered list of `{stage, to,
-  focus?}` documenting the planned path. Pools are FYI only — the
-  first-stage entry is the only auto-plant (when `to` is a single
-  named slot). Subsequent stages never auto-plant; Coach drives them
-  via `coord_approve_stage`.
-- Emits `task_created` and (only when the first stage planted)
-  `task_role_assigned` + `task_stage_changed{from=null}`.
+- **Coach top-level tasks land in the Backlog first (FIFO discipline).**
+  When Coach calls this tool WITHOUT `parent_id`, the item is inserted
+  into `backlog_tasks` (same table as `coord_propose_task`). No kanban
+  row is created yet; no Player is woken. Coach must then call
+  `coord_triage_backlog(id, action='promote', trajectory=[...])` to
+  promote it to the kanban. This enforces FIFO priority ordering —
+  items are triaged in the order they arrived, not by recency of
+  creation (which was LIFO). The `priority`, `trajectory`, `note`, and
+  `success_criteria` params are stored on the backlog entry so Coach
+  does not need to repeat them at triage time.
+- **Player subtasks** (with `parent_id`) are unaffected — they still
+  plant directly on the kanban under their parent task.
+- Priority: `low`, `normal`, `high`, `urgent` (default `normal`).
+  Stored on the backlog entry for Coach top-level tasks; stored on the
+  task row for Player subtasks.
+- `trajectory` is REQUIRED for Coach top-level tasks. Stored on the
+  backlog entry; `coord_triage_backlog promote` reads it automatically
+  so Coach can omit it at triage time when it was already set at
+  creation time.
+- Emits `backlog_task_proposed` for Coach top-level tasks; emits
+  `task_created` + (when first stage planted) `task_role_assigned` +
+  `task_stage_changed{from=null}` for Player subtasks.
 - See `Docs/kanban-specs-v2.md` §7.1 for the canonical contract.
 
 `coord_approve_stage(task_id, next_stage, assignee, note?)`
