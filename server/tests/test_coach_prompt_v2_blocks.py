@@ -19,6 +19,8 @@ import json
 from typing import Any
 
 from server.agents import (
+    ACTIVE_TASK_HEALTH_CAP,
+    _build_active_task_health_rows,
     _build_audit_aggregator_rows,
     _build_coach_coordination_block,
     _build_player_health_block,
@@ -441,3 +443,124 @@ async def test_coordination_block_section_ordering(fresh_db: str) -> None:
     assert "## Team composition" not in body
     assert "## Trajectory examples" not in body
     assert "## Lifecycle policy" not in body
+
+
+# ---------------------------------------------------------------------
+# _build_active_task_health_rows — top-N cap (2026-05-14 H1 fix)
+# ---------------------------------------------------------------------
+
+async def _seed_task_with_fails(
+    *,
+    task_id: str,
+    title: str = "demo",
+    syntax_fails: int = 0,
+    semantics_fails: int = 0,
+    last_stage_change_at: str = "2026-05-14T10:00:00Z",
+    project: str = "misc",
+) -> None:
+    """Seed a task + role-assignment fail rows to exercise the health rollup."""
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO tasks (id, project_id, title, status, owner, "
+            "created_by, trajectory, last_stage_change_at) "
+            "VALUES (?, ?, ?, 'execute', 'p2', 'coach', '[]', ?)",
+            (task_id, project, title, last_stage_change_at),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    for _ in range(syntax_fails):
+        await _seed_role_row(
+            task_id=task_id,
+            role="auditor_syntax",
+            owner="p4",
+            verdict="fail",
+            completed_at="2026-05-14T10:00:00Z",
+        )
+    for _ in range(semantics_fails):
+        await _seed_role_row(
+            task_id=task_id,
+            role="auditor_semantics",
+            owner="p5",
+            verdict="fail",
+            completed_at="2026-05-14T10:00:00Z",
+        )
+
+
+async def test_active_task_health_empty_no_signal(fresh_db: str) -> None:
+    """No tasks → empty list."""
+    await init_db()
+    rows = await _build_active_task_health_rows("misc")
+    assert rows == []
+
+
+async def test_active_task_health_caps_at_three(fresh_db: str) -> None:
+    """With 5 qualifying tasks, the coordination block shows ≤ ACTIVE_TASK_HEALTH_CAP entries."""
+    await init_db()
+    for i in range(5):
+        await _seed_task_with_fails(
+            task_id=f"t-cap-{i:04d}",
+            title=f"task {i}",
+            syntax_fails=2 + i,  # fail counts 2..6, all qualify
+        )
+    surfaced: list[int] = []
+    body = await _build_coach_coordination_block(surfaced_event_ids=surfaced)
+    # Isolate the ## Active task health section, then count bullet lines.
+    health_section = ""
+    if "## Active task health" in body:
+        start = body.index("## Active task health")
+        # Find next ## header after the section start, or end of string.
+        next_header = body.find("\n## ", start + 1)
+        health_section = body[start:] if next_header == -1 else body[start:next_header]
+    bullet_lines = [ln for ln in health_section.splitlines() if ln.startswith("- ")]
+    assert len(bullet_lines) <= ACTIVE_TASK_HEALTH_CAP
+
+
+async def test_active_task_health_overflow_footer_in_coordination_block(
+    fresh_db: str,
+) -> None:
+    """When >3 tasks qualify, the coordination block includes a (+N more) line."""
+    await init_db()
+    for i in range(5):
+        await _seed_task_with_fails(
+            task_id=f"t-overflow-{i:04d}",
+            title=f"overflow task {i}",
+            syntax_fails=2,
+        )
+    surfaced: list[int] = []
+    body = await _build_coach_coordination_block(surfaced_event_ids=surfaced)
+    # Should show the cap footer for 2 overflow tasks.
+    assert "(+2 more)" in body
+
+
+async def test_active_task_health_ranked_by_fail_count(fresh_db: str) -> None:
+    """Rows are returned in descending fail-count order."""
+    await init_db()
+    # Three tasks with fail_counts 2, 4, 3 → expected order: 4, 3, 2.
+    await _seed_task_with_fails(task_id="t-rank-a", title="low", syntax_fails=2)
+    await _seed_task_with_fails(task_id="t-rank-b", title="high", syntax_fails=4)
+    await _seed_task_with_fails(task_id="t-rank-c", title="mid", syntax_fails=3)
+    rows = await _build_active_task_health_rows("misc")
+    counts = [r["kind_fail_count"] for r in rows]
+    assert counts == sorted(counts, reverse=True)
+
+
+async def test_active_task_health_tiebreak_by_recency(fresh_db: str) -> None:
+    """When fail counts are equal, the more recently changed task appears first."""
+    await init_db()
+    await _seed_task_with_fails(
+        task_id="t-older",
+        title="older",
+        syntax_fails=3,
+        last_stage_change_at="2026-05-10T08:00:00Z",
+    )
+    await _seed_task_with_fails(
+        task_id="t-newer",
+        title="newer",
+        syntax_fails=3,
+        last_stage_change_at="2026-05-14T12:00:00Z",
+    )
+    rows = await _build_active_task_health_rows("misc")
+    assert rows[0]["task_id"] == "t-newer"
