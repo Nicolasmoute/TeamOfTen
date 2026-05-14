@@ -4026,6 +4026,7 @@ async def list_backlog(status: str | None = None) -> dict[str, Any]:
 class BacklogUpdateRequest(BaseModel):
     title: str | None = None
     description: str | None = None
+    priority: str | None = None
 
 
 @app.patch("/api/backlog/{backlog_id}", dependencies=[Depends(require_token)])
@@ -4034,10 +4035,16 @@ async def update_backlog_entry(
     req: BacklogUpdateRequest,
     actor: dict = Depends(audit_actor),
 ) -> dict[str, Any]:
-    """Edit the title and/or description of a pending backlog entry (kanban-specs-v2.md §4.0)."""
+    """Edit the title, description, and/or priority of a pending backlog entry (kanban-specs-v2.md §4.0)."""
     # At least one field must be supplied.
-    if req.title is None and req.description is None:
-        raise HTTPException(400, detail="at least one of title or description is required")
+    if req.title is None and req.description is None and req.priority is None:
+        raise HTTPException(400, detail="at least one of title, description, or priority is required")
+
+    if req.priority is not None and req.priority not in _BACKLOG_PRIORITIES:
+        raise HTTPException(
+            400,
+            detail=f"priority must be one of {sorted(_BACKLOG_PRIORITIES)}",
+        )
 
     new_title: str | None = req.title.strip() if req.title is not None else None
     if new_title is not None and not new_title:
@@ -4058,7 +4065,7 @@ async def update_backlog_entry(
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT id, title, description, status FROM backlog_tasks WHERE id = ?",
+            "SELECT id, title, description, priority, status FROM backlog_tasks WHERE id = ?",
             (backlog_id,),
         )
         row = await cur.fetchone()
@@ -4080,6 +4087,9 @@ async def update_backlog_entry(
         if new_description is not _SENTINEL:
             set_parts.append("description = ?")
             params.append(new_description)
+        if req.priority is not None:
+            set_parts.append("priority = ?")
+            params.append(req.priority)
         params.append(backlog_id)
         await c.execute(
             f"UPDATE backlog_tasks SET {', '.join(set_parts)} WHERE id = ?",
@@ -4087,7 +4097,7 @@ async def update_backlog_entry(
         )
         # Re-read the final row so we return consistent values.
         cur2 = await c.execute(
-            "SELECT id, title, description FROM backlog_tasks WHERE id = ?",
+            "SELECT id, title, description, priority FROM backlog_tasks WHERE id = ?",
             (backlog_id,),
         )
         final = dict(await cur2.fetchone())
@@ -4106,8 +4116,15 @@ async def update_backlog_entry(
     }
     if new_description is not _SENTINEL:
         event["new_description"] = new_description
+    if req.priority is not None:
+        event["new_priority"] = req.priority
     await bus.publish(event)
-    return {"id": backlog_id, "title": final["title"], "description": final["description"]}
+    return {
+        "id": backlog_id,
+        "title": final["title"],
+        "description": final["description"],
+        "priority": final["priority"],
+    }
 
 
 @app.delete("/api/backlog/{backlog_id}", dependencies=[Depends(require_token)])
