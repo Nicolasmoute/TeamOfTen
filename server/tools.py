@@ -7933,6 +7933,95 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         )
 
     @tool(
+        "coord_list_backlog",
+        (
+            "List entries in the Backlog. Available to Coach and all Players. "
+            "Read-only — no side effects.\n"
+            "\n"
+            "Params:\n"
+            "- status: filter on 'pending' (default) / 'promoted' / "
+            "'rejected' / 'all' for every status.\n"
+            "- limit: max rows to return (default 50, max 200).\n"
+            "\n"
+            "Returns one line per entry:\n"
+            "  #<id>  [<status>]  \"<title>\"  by <proposed_by>, <age> ago\n"
+            "  (description indented on a second line when non-empty)\n"
+            "\n"
+            "Use this to get a mid-turn view of the backlog after "
+            "coord_propose_task or coord_triage_backlog — the system-prompt "
+            "snapshot at turn start doesn't refresh."
+        ),
+        {"status": str, "limit": str},
+    )
+    async def list_backlog(args: dict[str, Any]) -> dict[str, Any]:
+        _VALID_STATUSES = ("pending", "promoted", "rejected", "all")
+        status_arg = (args.get("status") or "pending").strip().lower()
+        if status_arg not in _VALID_STATUSES:
+            return _err(
+                f"status must be one of: {', '.join(_VALID_STATUSES)}"
+            )
+
+        limit_raw = args.get("limit") or ""
+        try:
+            limit = max(1, min(200, int(limit_raw))) if limit_raw else 50
+        except (ValueError, TypeError):
+            return _err("limit must be an integer (1–200)")
+
+        where = "" if status_arg == "all" else " WHERE status = ?"
+        params: list[Any] = [] if status_arg == "all" else [status_arg]
+
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                f"SELECT id, title, proposed_by, proposed_at, status, "
+                f"reject_reason, promoted_task_id "
+                f"FROM backlog_tasks{where} "
+                f"ORDER BY proposed_at DESC LIMIT ?",
+                [*params, limit],
+            )
+            rows = await cur.fetchall()
+        finally:
+            await c.close()
+
+        if not rows:
+            return _ok("(backlog is empty)")
+
+        from datetime import datetime, timezone
+
+        now_ts = datetime.now(timezone.utc)
+        lines: list[str] = []
+        for r in rows:
+            d = dict(r)
+            # Relative age
+            try:
+                proposed_ts = datetime.fromisoformat(
+                    d["proposed_at"].replace("Z", "+00:00")
+                )
+                age_s = int((now_ts - proposed_ts).total_seconds())
+                if age_s < 3600:
+                    age = f"{age_s // 60}m"
+                elif age_s < 86400:
+                    age = f"{age_s // 3600}h"
+                else:
+                    age = f"{age_s // 86400}d"
+            except Exception:
+                age = "?"
+
+            status_tag = d["status"]
+            title = (d.get("title") or "").strip()
+            proposer = d.get("proposed_by") or "?"
+            line = (
+                f"#{d['id']}  [{status_tag}]  \"{title}\"  "
+                f"by {proposer}, {age} ago"
+            )
+            if status_tag == "rejected" and d.get("reject_reason"):
+                line += f"  reason: {d['reject_reason']}"
+            elif status_tag == "promoted" and d.get("promoted_task_id"):
+                line += f"  → task {d['promoted_task_id']}"
+            lines.append(line)
+        return _ok("\n".join(lines))
+
+    @tool(
         "coord_set_task_blocked",
         (
             "Toggle the orthogonal blocked flag on a task. Owner + Coach "
@@ -8075,8 +8164,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         propose_playbook_changes,
         # Backlog (Docs/kanban-specs-v2.md §4.0). propose_task: Coach +
         # Players. triage_backlog: Coach-only at runtime (body enforces).
+        # list_backlog: read-only, Coach + Players.
         propose_task,
         triage_backlog,
+        list_backlog,
     ]
     server = create_sdk_mcp_server(name="coord", version="0.8.0", tools=_tools)
     # Stash a name → handler map so the coord_mcp proxy endpoint
@@ -8241,10 +8332,12 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_archive_task",
     "mcp__coord__coord_role_complete",
     "mcp__coord__coord_request_plan_review",
-    # Backlog (Docs/kanban-specs-v2.md §4.0). coord_propose_task is open
-    # to Coach + Players; coord_triage_backlog is Coach-only at runtime.
+    # Backlog (Docs/kanban-specs-v2.md §4.0). coord_propose_task and
+    # coord_list_backlog are open to Coach + Players; coord_triage_backlog
+    # is Coach-only at runtime.
     "mcp__coord__coord_propose_task",
     "mcp__coord__coord_triage_backlog",
+    "mcp__coord__coord_list_backlog",
 ]
 
 MEMORY_TOPIC_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,63}$")
