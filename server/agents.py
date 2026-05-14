@@ -4047,6 +4047,34 @@ async def _perform_runtime_transfer_flip(
         logger.exception(
             "runtime_transfer: clear codex_thread_id failed agent=%s", agent_id,
         )
+    # Reset the idle-poller debounce clock (Option A) AND stamp a
+    # transfer timestamp for the per-transfer cooldown check (Option B).
+    # Together these suppress the idle-poller false wake that fires when
+    # the compact/transfer turn completes and status returns to 'idle'
+    # while a queued assign-time wake hasn't fired yet.
+    #   • last_idle_wake_at = now  →  extends the debounce window from
+    #     now, giving the queued assign-time wake ~DEBOUNCE_SECONDS to
+    #     fire and close its role row before the poller ticks again.
+    #   • last_runtime_transfer_at = now  →  independent 60s cooldown
+    #     in _maybe_wake_idle (belt-and-suspenders for the case where the
+    #     debounce window has already expired but the transfer just fired).
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE agents"
+                " SET last_idle_wake_at = ?, last_runtime_transfer_at = ?"
+                " WHERE id = ?",
+                (now_iso, now_iso, agent_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception(
+            "runtime_transfer: stamp idle debounce failed agent=%s", agent_id,
+        )
     await _emit(
         agent_id,
         "runtime_updated",

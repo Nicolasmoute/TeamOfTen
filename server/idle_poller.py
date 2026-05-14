@@ -96,6 +96,20 @@ def _debounce_seconds() -> int:
         return 1800
 
 
+def _transfer_cooldown_seconds() -> int:
+    """How long after a runtime transfer to suppress idle-poller wakes.
+    Default 60s — long enough for the queued assign-time wake from
+    `_pending_wakes` to fire and (if the agent responds quickly) for
+    the role row to close before the next idle-poller tick.
+    Set to 0 to disable the cooldown (Option A debounce-reset still fires).
+    """
+    raw = os.environ.get("HARNESS_IDLE_POLL_TRANSFER_COOLDOWN_SECONDS", "60").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 60
+
+
 def _flag_enabled() -> bool:
     raw = os.environ.get("HARNESS_IDLE_POLL_ENABLED", "true").strip().lower()
     return raw not in ("0", "false", "no", "off")
@@ -975,7 +989,8 @@ async def _maybe_wake_idle(slot: str) -> bool:
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT locked, current_task_id, status, last_idle_wake_at "
+            "SELECT locked, current_task_id, status, last_idle_wake_at,"
+            " last_runtime_transfer_at "
             "FROM agents WHERE id = ?",
             (slot,),
         )
@@ -991,6 +1006,23 @@ async def _maybe_wake_idle(slot: str) -> bool:
         return False
     if a.get("status") in ("working", "waiting"):
         return False
+
+    # Post-transfer cooldown (Option B). After a runtime transfer the
+    # compact turn resets status to 'idle' and drains _pending_wakes,
+    # but the idle poller may tick before the queued assign-time wake
+    # has fired (or before the agent's role row closes after responding).
+    # Suppress idle-poller wakes for TRANSFER_COOLDOWN_SECONDS after
+    # the flip so the assign-time wake gets the first shot.
+    xfer_at = a.get("last_runtime_transfer_at")
+    cooldown = _transfer_cooldown_seconds()
+    if xfer_at and cooldown > 0:
+        try:
+            xfer_dt = datetime.fromisoformat(xfer_at.replace("Z", "+00:00"))
+            now = datetime.now(timezone.utc)
+            if (now - xfer_dt).total_seconds() < cooldown:
+                return False
+        except Exception:
+            pass  # Unparseable timestamp — proceed normally.
 
     # Per-Player debounce.
     last_at = a.get("last_idle_wake_at")

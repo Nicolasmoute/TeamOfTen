@@ -793,6 +793,11 @@ async def init_db() -> None:
                     ("runtime_override", "runtime_override TEXT"),
                     # Idle-poller debounce timestamp; see Docs/kanban-specs-v2.md §10.
                     ("last_idle_wake_at", "last_idle_wake_at TEXT"),
+                    # Stamped by _perform_runtime_transfer_flip. The idle-poller
+                    # applies a short cooldown after a runtime transfer to avoid
+                    # firing before the queued assign-time wake has a chance to
+                    # run (idle-poller false-wake fix, 2026-05-14).
+                    ("last_runtime_transfer_at", "last_runtime_transfer_at TEXT"),
                 ],
             )
             await _ensure_columns(

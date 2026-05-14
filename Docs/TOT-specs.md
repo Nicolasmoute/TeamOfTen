@@ -2154,6 +2154,33 @@ without recent owner activity and notifies Coach by system message and events.
 This is global across projects for tasks, but harmless because all stale
 in-progress work should be reclaimed after an unclean shutdown.
 
+### 11.8 Idle-Poller and Runtime Transfers
+
+`server/idle_poller.py:_maybe_wake_idle` fires wake prompts at idle
+Players who have pending non-executor role assignments.  It applies two
+independent suppression checks after a runtime transfer:
+
+**(Option A — debounce reset)** `_perform_runtime_transfer_flip`
+(agents.py) updates `agents.last_idle_wake_at = now()` at flip time.
+This extends the per-Player debounce window from the transfer, giving the
+queued assign-time wake (queued by queue-on-busy while the compact turn
+was running) time to fire and close its role row before the idle poller
+ticks again.  If no assign-time wake was queued, the agent still receives
+a delayed idle-poller wake once `HARNESS_IDLE_POLL_DEBOUNCE_SECONDS`
+(default 1800s) has elapsed from the flip.
+
+**(Option B — transfer cooldown)** `_perform_runtime_transfer_flip` also
+stamps `agents.last_runtime_transfer_at = now()`.  `_maybe_wake_idle`
+reads this column and returns `False` if fewer than
+`HARNESS_IDLE_POLL_TRANSFER_COOLDOWN_SECONDS` (default 60s) have elapsed
+since the transfer.  Set to 0 to disable this cooldown.
+
+Both checks fire independently; either one suppresses the false wake.
+Together they cover the case where the debounce window was already
+expired at flip time (Option B catches it) AND the case where the window
+is still fresh but the cooldown has passed (Option A catches it via the
+normal debounce logic).
+
 ---
 
 ## 12. Coordination Tools
