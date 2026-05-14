@@ -1468,6 +1468,20 @@ body {
   padding: 0 3px;
 }
 .env-attention-dismiss:hover { color: var(--err); }
+/* Cancel button for pending_question / pending_plan — fires a server-side
+   rejection so the agent is unblocked, rather than silently hiding the row. */
+.env-attention-cancel {
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid var(--warn);
+  border-radius: 3px;
+  color: var(--warn);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  padding: 1px 5px;
+}
+.env-attention-cancel:hover { background: rgba(227, 160, 58, 0.12); }
 .env-attention-subject {
   margin-top: 3px;
   font-weight: 600;
