@@ -116,7 +116,7 @@ What **carries over** from Compass:
 
 ```
 /data/playbook/
-  lattice.json           # active statements (cap soft 100, hard 110)
+  lattice.json           # active statements (cap soft 60, hard 80)
   archived.json          # settled / stale_low / stale_unused / merged / superseded / deleted
   runs.jsonl             # one line per reflection run
 
@@ -191,9 +191,9 @@ Field notes:
 
 `archive_reason ∈ {"settled", "stale_low", "stale_unused", "merged", "superseded", "deleted"}`.
 
-- `settled` — weight ≥ 0.95 stable for ≥ 7 days (§5.8). Statement is team consensus; no longer needs surfacing in the active lattice but readable for history.
-- `stale_low` — weight ≤ 0.15 stable for ≥ 7 days. Pattern was tried and didn't pan out.
-- `stale_unused` — `applied_count = 0` AND `created_at` ≥ 30 days ago. Pattern never fires; not worth carrying.
+- `settled` — weight ≥ 0.90 stable for ≥ 5 days (§5.8). Statement is team consensus; no longer needs surfacing in the active lattice but readable for history.
+- `stale_low` — weight ≤ 0.30 stable for ≥ 5 days. Pattern was tried and didn't pan out.
+- `stale_unused` — `applied_count = 0` AND `created_at` ≥ 14 days ago. Pattern never fires; not worth carrying.
 - `merged` — collapsed into another statement; `merged_into` carries the target id.
 - `superseded` — replaced by a reformulated statement (e.g. Coach proposes a clearer wording).
 - `deleted` — human deletion via dashboard.
@@ -337,7 +337,7 @@ Single direct `claude_agent_sdk.query()` call with `model="latest_sonnet"`, `eff
 
 The LLM returns ~30-40 statements. Engine validates each (length, character cap, no duplicates among the returned list), assigns ids `pb-001..pb-NNN`, persists to `lattice.json` with `created_by="bootstrap-playbook"`, sets `playbook_bootstrap_done = "1"`, clears `playbook_bootstrap_retries`, clears `playbook_reset_at`.
 
-**Soft cap at bootstrap:** apply §5.7's three-branch cap to the LLM output (active count is 0 at bootstrap, so `pressure = seed_count`). If the LLM returned > 100 candidate seeds, drop from the **end of the LLM-returned list** (deterministic — the prose extraction is order-stable) until count ≤ 100. If > 110 (hard cap), drop down to 100 and additionally fire `playbook_soft_cap_exceeded{count: returned, dropped: returned - 100}` event. Bootstrap does NOT fail on over-cap — partial seeding is preferable to no seeding. The `seeds_inserted` field in the runs.jsonl row reflects the post-cap count.
+**Soft cap at bootstrap:** apply §5.7's three-branch cap to the LLM output (active count is 0 at bootstrap, so `pressure = seed_count`). If the LLM returned > 60 candidate seeds, drop from the **end of the LLM-returned list** (deterministic — the prose extraction is order-stable) until count ≤ 60. If > 80 (hard cap), drop down to 60 and additionally fire `playbook_soft_cap_exceeded{count: returned, dropped: returned - 60}` event. Bootstrap does NOT fail on over-cap — partial seeding is preferable to no seeding. The `seeds_inserted` field in the runs.jsonl row reflects the post-cap count.
 
 No bedrock / immutable seeding step (§1.4).
 
@@ -478,9 +478,15 @@ Rules:
 - **Creation text is hard-capped at 160 chars; longer creations are rejected.** One line, imperative ("When X -> do Y" or "X needs Y"), no enumerated sub-items, no parenthetical lists. The WEIGHT carries confidence; the text just triggers recall. Aim for ~120 chars typical.
 - Skip statements that are runtime-specific, project-specific, procedural-plumbing, or unobservable.
 - Empty lists are valid — return all four as `[]` if no real signal.
-
+{pressure_note}
 Return ONLY the JSON object. No prose.
 ```
+
+**Pressure directive (`{pressure_note}`):** when the active statement count exceeds `PRESSURE_CAP` (default 60, equal to `SOFT_STATEMENT_CAP`), the runner injects `REFLECTION_PRESSURE_DIRECTIVE` in place of the `{pressure_note}` placeholder; otherwise the placeholder is replaced with an empty string. The directive reads:
+
+> IMPORTANT — the lattice has {active} active statements, above the {cap}-statement soft cap. Before proposing any new creations, you MUST propose at least 2 merges (duplicates or near-duplicates) and at least 2 downward adjustments (patterns not observed in this evidence bundle). Creations are only allowed after the merge + adjustment quota is met.
+
+This is a "carrot-and-stick" mechanism: the LLM is still allowed to create, but only after it has contributed net-reduction ops. The merge quota is not validated by the engine — the constraint is advisory, not enforced in code. The engine's §5.7 cap enforcement and §5.7.1 pressure sweep provide the hard backstop.
 
 ### 5.6 Validation + apply
 
@@ -500,40 +506,56 @@ Op apply order is **fixed**:
 
 Before applying creations (step 2), count active statements (post-merge). Apply pending engine-driven settle/stale (§5.8) actions FIRST so any creation-budget freed by archives is available. Then branch on `pressure = active + new_creations`:
 
-- **Branch A — `pressure ≤ 100` (soft cap):** apply all creations.
-- **Branch B — `100 < pressure ≤ 110`:** drop creations from the **end of the input list** (deterministic — Coach can prioritize by ordering its `creations` array) until `active + survivors == 100`. Survivors apply. Log dropped creations in `proposals_rejected` with reason `"soft_cap_pressure"`.
-- **Branch C — `pressure > 110` (hard cap):** drop **ALL** creations from the run atomically. Apply only adjusts and merges. Log every creation in `proposals_rejected` with reason `"hard_cap_pressure"`. Fire `playbook_soft_cap_exceeded{count: pressure, dropped: len(creations)}` event AND `human_attention`. Hitting the hard cap means soft-cap discipline is failing — needs operator review of the lattice.
+- **Branch A — `pressure ≤ 60` (soft cap):** apply all creations.
+- **Branch B — `60 < pressure ≤ 80`:** drop creations from the **end of the input list** (deterministic — Coach can prioritize by ordering its `creations` array) until `active + survivors == 60`. Survivors apply. Log dropped creations in `proposals_rejected` with reason `"soft_cap_pressure"`.
+- **Branch C — `pressure > 80` (hard cap):** drop **ALL** creations from the run atomically. Apply only adjusts and merges. Log every creation in `proposals_rejected` with reason `"hard_cap_pressure"`. Fire `playbook_soft_cap_exceeded{count: pressure, dropped: len(creations)}` event AND `human_attention`. Hitting the hard cap means soft-cap discipline is failing — needs operator review of the lattice.
 
 The same cap logic applies to the `coord_propose_playbook_changes` MCP tool path (§7.1).
 
+### 5.7.1 Pressure sweep (auto-archive at hard cap)
+
+After Coach's proposals and §5.8 sweeps are applied (`sweep_engine_actions` is the combined four-pass function in `mutate.py`), a fourth pass fires when `active > HARD_STATEMENT_CAP` (default 80):
+
+- Walk active (non-immutable) statements sorted by weight ascending (lowest weight first — the weakest evidence gets archived first).
+- Archive each as `archive_reason="pressure_cap"` until `active ≤ SOFT_STATEMENT_CAP` (default 60) or the eligible list is exhausted.
+- Each archived statement logs `{"action": "pressure_cap", "id": ..., "weight_at_archive": ..., "active_before": ...}` in the run's `engine_actions` list.
+
+**Immutable statements are never touched.** If immutables outnumber the active cap, the sweep stops early and the count stays above the cap — the hard cap is a target, not an absolute guarantee when immutables are present.
+
+This pass is the engine's **last resort** — it fires only when §5.7's Branch C dropped all creations AND the lattice is still above the hard cap (e.g. due to prior Coach mid-turn proposals that bypassed the creation gate). In steady state the §5.7 branches and §5.8 settle/stale sweeps keep the count below 60; the pressure sweep is a safety net.
+
+The `PRESSURE_CAP` constant (`HARNESS_PLAYBOOK_PRESSURE_CAP`, default 60 = `SOFT_STATEMENT_CAP`) also governs the §5.5 pressure directive threshold — they share the value so both mechanisms activate at the same count.
+
 ### 5.8 Engine-driven actions (settle / stale)
 
-After Coach's proposals are applied, the runner sweeps for engine-driven archives. Three semantically-tight predicates. **All three predicates also require `immutable = false`** — immutable statements are never archived by the engine.
+After Coach's proposals are applied, the runner sweeps for engine-driven archives. Three semantically-tight predicates (the fourth — pressure sweep — is in §5.7.1). **All four predicates also require `immutable = false`** — immutable statements are never archived by the engine.
 
 - **Settle:** an active statement is settle-eligible iff:
   - `immutable = false`, AND
-  - current `weight ≥ 0.95`, AND
-  - at least one `weight_history` entry has `ts ≤ now - 7 days`, AND
-  - no `weight_history` entry within the last 7 days recorded a `to` value below 0.95.
+  - current `weight ≥ 0.90`, AND
+  - at least one `weight_history` entry has `ts ≤ now - 5 days`, AND
+  - no `weight_history` entry within the last 5 days recorded a `to` value below 0.90.
   
   Eligible statements move to `archived.json` with `archive_reason="settled"`.
 
 - **Stale-low:** an active statement is stale-low-eligible iff:
   - `immutable = false`, AND
-  - current `weight ≤ 0.15`, AND
-  - at least one `weight_history` entry has `ts ≤ now - 7 days`, AND
-  - no `weight_history` entry within the last 7 days recorded a `to` value above 0.15.
+  - current `weight ≤ 0.30`, AND
+  - at least one `weight_history` entry has `ts ≤ now - 5 days`, AND
+  - no `weight_history` entry within the last 5 days recorded a `to` value above 0.30.
   
   Eligible statements move to `archived.json` with `archive_reason="stale_low"`.
 
 - **Stale-unused:** an active statement is stale-unused-eligible iff:
   - `immutable = false`, AND
   - `applied_count == 0`, AND
-  - `created_at ≤ now - 30 days`.
+  - `created_at ≤ now - 14 days`.
   
   Eligible statements move to `archived.json` with `archive_reason="stale_unused"`.
 
-The "≥ 7 days old history entry" requirement prevents brand-new high-confidence statements from immediately settling (e.g. Coach creates a new pattern at 0.6 then bumps to 0.95 the next day — that's not 7 days of stable confidence).
+The "≥ 5 days old history entry" requirement prevents brand-new high-confidence statements from immediately settling (e.g. Coach creates a new pattern at 0.6 then bumps to 0.90 the next day — that's not 5 days of stable confidence).
+
+**Threshold rationale (2026-05-14):** The original thresholds (settle ≥ 0.95, stale ≤ 0.15, stale-unused ≥ 30 days, stable ≥ 7 days) were unreachable given the live lattice: max weight 0.93, min weight 0.60, lattice age 6 days, 58 active statements (no cap pressure at old 100/110). Tuned to reachable values: settle ≥ 0.90 (current max 0.93 → first statement settles within ~5 days of hitting this threshold), stale ≤ 0.30 (0.15 was below any statement in the wild), stale-unused 14 days (30 would never fire for a 6-day-old lattice; 14 prunes genuinely dormant patterns), stable days 7 → 5 (faster discipline cycle while retaining the protection against single-run spikes).
 
 ### 5.9 Run finalization
 
@@ -594,7 +616,7 @@ Your coordination memory. Each entry has a confidence weight in [0, 1] — high 
 
 The `pb-XXX` id alongside the weight is load-bearing — Coach uses it to target an existing statement for `adjust` / `merge` / `archive` ops via `coord_propose_playbook_changes`. Earlier shape (`[0.92] ...` without the id) forced Coach into `create`-only operations, producing near-duplicate rows that the dedup proposer eventually merged — wasteful churn observed in Coach's 2026-05-12 report (pb-065/pb-066 collision).
 
-Rendered size budget: ≤ 8 KB. With 100 statements at ~90 chars each (incl. pb-id prefix) plus headers ≈ 9 KB worst-case. If over budget, drop the "Uncertain" bucket from the rendered prompt (Coach can still see those in the dashboard); the rendered playbook is for actionable patterns.
+Rendered size budget: ≤ 8 KB. With 60 statements at ~90 chars each (incl. pb-id prefix) plus headers ≈ 5.5 KB worst-case — well within budget. If over budget (e.g. from legacy pre-cap rows), drop the "Uncertain" bucket from the rendered prompt (Coach can still see those in the dashboard); the rendered playbook is for actionable patterns.
 
 When `lattice.json` has zero active statements (cold-start before bootstrap, or post-reset), render produces empty string — concatenates to nothing in the system prompt. No special-case needed.
 
@@ -650,7 +672,7 @@ Applied 2 of 3 proposed changes:
   - create pb-031: weight 0.60 — "Don't pair an executor with the same auditor twice in a row"
   - REJECTED adjust pb-008: delta 0.40 exceeds ±0.25 cap
 
-Active statement count: 47 / 100 soft cap.
+Active statement count: 47 / 60 soft cap.
 ```
 
 Lock-contention path (G8 — daily reflection / bootstrap / reset / another MCP call in flight):
@@ -741,14 +763,15 @@ LLM_FALLBACK_ENABLED = True
 BOOTSTRAP_WEIGHT = 0.75
 COACH_CREATION_WEIGHT = 0.60
 ADJUST_DELTA_CAP = 0.25
-SOFT_STATEMENT_CAP = 100
-HARD_STATEMENT_CAP = 110
+SOFT_STATEMENT_CAP = 60       # was 100; tuned 2026-05-14 (live lattice had 58 active, old cap unreachable)
+HARD_STATEMENT_CAP = 80       # was 110
+PRESSURE_CAP = 60             # triggers §5.5 pressure directive + §5.7.1 pressure sweep; env: HARNESS_PLAYBOOK_PRESSURE_CAP
 STATEMENT_MAX_CHARS = 160     # per-statement char cap; env: HARNESS_PLAYBOOK_STATEMENT_MAX_CHARS
-SETTLE_THRESHOLD = 0.95
-STALE_THRESHOLD = 0.15
-SETTLE_STABLE_DAYS = 7
-STALE_STABLE_DAYS = 7
-STALE_UNUSED_DAYS = 30
+SETTLE_THRESHOLD = 0.90       # was 0.95; tuned 2026-05-14 (live max weight 0.93 — 0.95 was unreachable)
+STALE_THRESHOLD = 0.30        # was 0.15; tuned 2026-05-14 (live min weight 0.60 — 0.15 was unreachable)
+SETTLE_STABLE_DAYS = 5        # was 7; faster discipline cycle
+STALE_STABLE_DAYS = 5         # was 7
+STALE_UNUSED_DAYS = 14        # was 30; tuned 2026-05-14 (lattice 6 days old — 30 would never fire)
 EVIDENCE_BUNDLE_MAX_BYTES = 10_000
 EVIDENCE_MEDIAN_WINDOW_DAYS = 30
 EVIDENCE_MEDIAN_MIN_SAMPLES = 5
@@ -758,6 +781,8 @@ RUNS_RETENTION_DEFAULT = 90
 BOOTSTRAP_MAX_RETRIES = 3
 COACH_PROPOSAL_OPS_CAP = 5
 ```
+
+All tuned thresholds are env-overridable via the corresponding `HARNESS_PLAYBOOK_*` env vars (see `config.py`).
 
 ### 11.1 Cost ledger
 
@@ -811,7 +836,7 @@ A new `__playbook` slot in the LeftRail (CSS-drawn icon — distinct from Compas
 
 ### 13.1 Sections
 
-1. **Header bar** — capacity (`47 / 100`), last run timestamp (rendered in UTC; the dashboard's existing timezone toggle from the Display section applies if set), "Run now" button (calls `POST /api/playbook/run` with a confirm-modal that surfaces the activity-gate-bypass option).
+1. **Header bar** — capacity (`47 / 60`), last run timestamp (rendered in UTC; the dashboard's existing timezone toggle from the Display section applies if set), "Run now" button (calls `POST /api/playbook/run` with a confirm-modal that surfaces the activity-gate-bypass option).
 2. **Active statements** — grouped by weight bucket (Validated / Working / Uncertain / Anti-pattern). Within each bucket, sorted by `weight × log(1 + applied_count)` descending (so frequently-observed validated rules surface above rarely-observed ones). Each row:
    - Weight bar (visual: 0 left, 1 right, current weight as fill).
    - NO / ½ / YES override buttons (call `POST /api/playbook/statements/{id}/weight` with 0.0 / 0.5 / 1.0). Routed through a confirmation modal mirroring Compass's `OverrideModal`.

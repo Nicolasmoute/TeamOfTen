@@ -164,11 +164,11 @@ def test_resolve_cap_pressure_branch_a_within_soft() -> None:
 
 
 def test_resolve_cap_pressure_branch_b_soft_to_hard() -> None:
-    survivors, dropped, hard = resolve_cap_pressure(active_count=99, creation_count=8)
-    # active=99, creation=8 → pressure=107 (between soft 100 and hard 110)
-    # survivors = 100 - 99 = 1
-    assert survivors == 1
-    assert dropped == 7
+    survivors, dropped, hard = resolve_cap_pressure(active_count=55, creation_count=8)
+    # active=55, creation=8 → pressure=63 (between soft 60 and hard 80)
+    # survivors = 60 - 55 = 5
+    assert survivors == 5
+    assert dropped == 3
     assert not hard
 
 

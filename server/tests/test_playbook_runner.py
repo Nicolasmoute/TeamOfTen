@@ -183,7 +183,7 @@ def test_cap_pressure_drops_creations_from_end(runner_env: Path, monkeypatch: py
     from the END of the input list per spec §5.7."""
     _seed_activity(runner_env / "harness.db", config.MIN_ACTIVITY_DEFAULT)
 
-    # Pre-populate the lattice up to 99 statements via store helpers.
+    # Pre-populate the lattice to 55 statements via store helpers.
     from server.playbook import mutate as pb_mutate
     from server.playbook.store import (
         Lattice, Statement, WeightHistoryEntry, save_lattice
@@ -198,12 +198,12 @@ def test_cap_pressure_drops_creations_from_end(runner_env: Path, monkeypatch: py
             last_validated_at="2026-04-01T00:00:00Z",
             applied_count=0, immutable=False,
         )
-        for i in range(99)
+        for i in range(55)
     ]
     asyncio.run(save_lattice(Lattice(schema_version=1, updated_at="now", statements=seed_stmts)))
 
-    # Coach proposes 8 creations → pressure = 99+8 = 107 → soft branch:
-    # survivors = 100 - 99 = 1, dropped = 7.
+    # Coach proposes 8 creations → pressure = 55+8 = 63 → soft branch:
+    # survivors = 60 - 55 = 5, dropped = 3.
     creations = [
         {"text": f"new_unique_pattern_alpha_beta_{i}", "weight": 0.6, "reason": "x"}
         for i in range(8)
@@ -214,10 +214,10 @@ def test_cap_pressure_drops_creations_from_end(runner_env: Path, monkeypatch: py
     }))
 
     row = asyncio.run(runner_mod.run_daily_reflection(manual=False))
-    # Exactly one creation should apply
+    # Five creations should apply (survivors = 60 - 55 = 5)
     applied_creates = [op for op in row["proposals_applied"] if op.get("op") == "create"]
-    assert len(applied_creates) == 1
-    # Seven creations should be rejected with reason soft_cap_pressure
+    assert len(applied_creates) == 5
+    # Three creations should be rejected with reason soft_cap_pressure
     rejected_caps = [op for op in row["proposals_rejected"]
                      if op.get("reason") == "soft_cap_pressure"]
-    assert len(rejected_caps) == 7
+    assert len(rejected_caps) == 3

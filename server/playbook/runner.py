@@ -760,9 +760,20 @@ async def run_daily_reflection(*, manual: bool = False, force_through_no_activit
     archive = load_archive()
     rendered_lattice = _render_lattice_for_prompt(lattice)
 
+    # Inject pressure directive when lattice exceeds the soft cap (§5.7.1).
+    active_count = len(lattice.statements)
+    if active_count > config.PRESSURE_CAP:
+        pressure_note = prompts.REFLECTION_PRESSURE_DIRECTIVE.format(
+            active=active_count,
+            cap=config.PRESSURE_CAP,
+        )
+    else:
+        pressure_note = ""
+
     user_prompt = prompts.REFLECTION_USER_TEMPLATE.format(
         rendered_lattice=rendered_lattice,
         evidence_bundle=evidence_str,
+        pressure_note=pressure_note,
     )
 
     await _publish({
