@@ -2181,6 +2181,33 @@ expired at flip time (Option B catches it) AND the case where the window
 is still fresh but the cooldown has passed (Option A catches it via the
 normal debounce logic).
 
+### 11.9 Execute/Ship Stage Boundary in Wake Notes
+
+**Root cause (2026-05-14 audit)**: Ambiguous wake notes — "commit + push,
+then coord_role_complete" in execute-stage wakes, "cherry-pick to dev and
+push" in ship-stage notes — led Players to generalise ship-stage patterns
+onto execute turns, bypassing the `audit_syntax → audit_semantics` gate.
+
+**Fix**: two constants in `server/kanban.py` are appended to the
+stage-specific body returned by `_completion_hint_for_role`:
+
+- `_EXECUTE_STAGE_BOUNDARY` — appended to every executor wake hint.
+  States explicitly: push ONLY to `origin/work/<slot>` via
+  `coord_commit_push`; do NOT cherry-pick to dev; do NOT push to dev
+  directly; do NOT create `ship-*` branches.  Audit and ship stages are
+  separate and Coach-driven.
+
+- `_SHIP_STAGE_BOUNDARY` — appended to every shipper wake hint.
+  States: use `coord_ship_to_dev(task_id=<id>)` (enforces the
+  audit-pass gate); do NOT run raw `git push origin <anything>:dev`.
+  If the tool is not yet visible, open a PR via GitHub MCP and wait
+  for explicit Coach approval.
+
+The same wording appears in the canonical project CLAUDE.md template at
+`server/templates/app_dev_claude_md.md` under the `#### Worktree boundary`
+section, propagating to every project via the Coach-driven reconciliation
+flow in `server/project_claude_md.py`.
+
 ---
 
 ## 12. Coordination Tools

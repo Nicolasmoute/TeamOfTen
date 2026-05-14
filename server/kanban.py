@@ -774,6 +774,33 @@ _DEFAULT_SYNTAX_FOCUS = (
     "(no bugs, no inconsistencies, no broken interfaces)."
 )
 
+# --------------------------------------------------------------------------
+# Stage-boundary reminders injected into executor / shipper wake notes.
+# These are the load-bearing wording changes for the audit-gate-bypass
+# root-cause fix (RC-3a: ambiguous wake notes led executors to generalise
+# ship-stage patterns onto execute turns).
+# --------------------------------------------------------------------------
+
+_EXECUTE_STAGE_BOUNDARY = (
+    "\n\n[execute-stage rules] Push ONLY to origin/work/<your_slot> "
+    "(coord_commit_push does this automatically — it runs "
+    "`git push origin HEAD` from your worktree). "
+    "Do NOT cherry-pick to dev, do NOT push to dev, do NOT create "
+    "ship-* branches. The audit_syntax and ship stages are separate "
+    "and Coach-driven via coord_approve_stage. "
+    "coord_commit_push is your ONLY committing path."
+)
+
+_SHIP_STAGE_BOUNDARY = (
+    "\n\n[ship-stage rules] Use coord_ship_to_dev(task_id=<id>) to "
+    "merge your work to dev — the tool enforces the audit-pass gate "
+    "and calls coord_role_complete on success. "
+    "Do NOT run raw `git push origin <anything>:dev`. "
+    "If coord_ship_to_dev is not yet visible in your runtime, "
+    "open a PR via the GitHub MCP and wait for explicit Coach approval "
+    "before any raw push to dev."
+)
+
 
 async def _load_active_role_focus(task_id: str, role: str) -> str | None:
     """Read the `focus` from the most-recent active task_role_assignments
@@ -1216,7 +1243,9 @@ async def _completion_hint_for_role(task_id: str, role: str) -> str:
             f"Coach in real time with your message_to_coach as context, "
             f"and the event surfaces in Coach's pane immediately — "
             f"expect Coach to read, decide the next stage, and possibly "
-            f"reply to you directly.{_TOOL_NOT_VISIBLE_ESCAPE}"
+            f"reply to you directly."
+            f"{_EXECUTE_STAGE_BOUNDARY}"
+            f"{_TOOL_NOT_VISIBLE_ESCAPE}"
         )
     if role in ("auditor_syntax", "auditor_semantics"):
         kind = "syntax" if role == "auditor_syntax" else "semantics"
@@ -1243,8 +1272,9 @@ async def _completion_hint_for_role(task_id: str, role: str) -> str:
             f"your message to Coach — without it Coach has no idea "
             f"the ship landed and won't archive the task. The call "
             f"wakes Coach in real time; Coach archives with a "
-            f"user-facing summary via "
-            f"coord_archive_task.{_TOOL_NOT_VISIBLE_ESCAPE}"
+            f"user-facing summary via coord_archive_task."
+            f"{_SHIP_STAGE_BOUNDARY}"
+            f"{_TOOL_NOT_VISIBLE_ESCAPE}"
         )
     return (
         f"Call coord_my_assignments(); it will print the next "
