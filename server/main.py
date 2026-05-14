@@ -1638,6 +1638,8 @@ class RecurrenceCreateRequest(BaseModel):
     cadence: str
     prompt: str
     tz: str | None = None
+    end_date: str | None = None   # ISO UTC datetime; must be in the future
+    max_fires: int | None = None  # >= 1; auto-disables after this many fires
 
 
 class RecurrencePatchRequest(BaseModel):
@@ -1645,6 +1647,8 @@ class RecurrencePatchRequest(BaseModel):
     prompt: str | None = None
     tz: str | None = None
     enabled: bool | None = None
+    end_date: str | None = None   # ISO UTC datetime; must be in the future
+    max_fires: int | None = None  # >= 1
 
 
 class CoachTickPutRequest(BaseModel):
@@ -1652,6 +1656,8 @@ class CoachTickPutRequest(BaseModel):
     # introduced in recurrence-specs.md §2.
     minutes: int | None = Field(default=None, ge=0, le=525_600)
     enabled: bool | None = None
+    end_date: str | None = None   # ISO UTC datetime; must be in the future
+    max_fires: int | None = None  # >= 1
 
 
 @app.get("/api/recurrences", dependencies=[Depends(require_token)])
@@ -1680,6 +1686,8 @@ async def create_recurrence_endpoint(
             cadence=req.cadence,
             prompt=req.prompt,
             tz=req.tz,
+            end_date=req.end_date,
+            max_fires=req.max_fires,
             created_by=actor.get("source", "human"),
             actor=actor,
         )
@@ -1731,6 +1739,8 @@ async def patch_recurrence_endpoint(
             prompt=req.prompt,
             tz=req.tz,
             enabled=req.enabled,
+            end_date=req.end_date,
+            max_fires=req.max_fires,
             actor=actor,
         )
     except ValueError as exc:
@@ -1772,6 +1782,8 @@ async def put_coach_tick(
             project_id=project_id,
             minutes=req.minutes,
             enabled=req.enabled,
+            end_date=req.end_date,
+            max_fires=req.max_fires,
             created_by=actor.get("source", "human"),
             actor=actor,
         )

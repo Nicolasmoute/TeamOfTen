@@ -4605,9 +4605,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- enabled: 'on' | 'off' to toggle without changing "
             "  cadence. Aliases: 'true'/'1'/'yes' → on, "
             "  'false'/'0'/'no' → off. Empty string or omitted = "
-            "  no change to enabled state."
+            "  no change to enabled state.\n"
+            "- end_date: optional ISO 8601 UTC datetime string. When "
+            "  the wall-clock reaches end_date the tick auto-disables "
+            "  and emits recurrence_expired. Must be in the future.\n"
+            "- max_fires: optional int >= 1. Auto-disables the tick "
+            "  after this many successful fires and emits "
+            "  recurrence_expired."
         ),
-        {"minutes": int, "enabled": str},
+        {"minutes": int, "enabled": str, "end_date": str, "max_fires": int},
     )
     async def set_tick_interval(args: dict[str, Any]) -> dict[str, Any]:
         if not caller_is_coach:
@@ -4619,6 +4625,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
 
         minutes_raw = args.get("minutes", None)
         enabled_raw = args.get("enabled", None)
+        end_date_raw = args.get("end_date", None)
+        max_fires_raw = args.get("max_fires", None)
 
         minutes_value: int | None = None
         if minutes_raw is not None and str(minutes_raw).strip() != "":
@@ -4645,6 +4653,22 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     "'on' | 'off'"
                 )
 
+        end_date_value: str | None = None
+        if end_date_raw is not None and str(end_date_raw).strip():
+            end_date_value = str(end_date_raw).strip()
+
+        max_fires_value: int | None = None
+        if max_fires_raw is not None and str(max_fires_raw).strip() != "":
+            try:
+                max_fires_value = int(max_fires_raw)
+            except (TypeError, ValueError):
+                return _err(
+                    f"invalid max_fires {max_fires_raw!r} — expected "
+                    "positive integer >= 1"
+                )
+            if max_fires_value < 1:
+                return _err("max_fires must be >= 1")
+
         if minutes_value is None and enabled_value is None:
             return _err("pass at least one of: minutes, enabled")
 
@@ -4655,6 +4679,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 project_id=project_id,
                 minutes=minutes_value,
                 enabled=enabled_value,
+                end_date=end_date_value,
+                max_fires=max_fires_value,
                 created_by="coach",
             )
         except ValueError as exc:
@@ -4665,9 +4691,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         cadence = row["cadence"]
         if not row["enabled"]:
             return _ok(f"tick disabled (cadence preserved: every {cadence} min)")
+        suffix = ""
+        if row.get("end_date"):
+            suffix += f"; expires at {row['end_date']}"
+        if row.get("max_fires"):
+            suffix += f"; max {row['max_fires']} fires"
         if str(cadence) == "0":
-            return _ok("tick set: continuous (fires as soon as Coach is idle)")
-        return _ok(f"tick set: every {cadence} min")
+            return _ok(f"tick set: continuous (fires as soon as Coach is idle){suffix}")
+        return _ok(f"tick set: every {cadence} min{suffix}")
 
     # ============================================================
     # Compass tools — Coach-only strategy-engine surface.
