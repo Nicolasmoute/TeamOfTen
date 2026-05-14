@@ -30,17 +30,21 @@ const compassEvents = createCompassEventRouter();
 // harness-wide orchestration playbook (Docs/playbook-specs.md).
 const playbookEvents = createPlaybookEventRouter();
 // Same shape for the kanban dashboard. Subscribers are open KanbanPane
-// instances; the WS dispatch publishes task_* / commit_pushed /
-// compass_audit_logged events here so the board refreshes live.
+// instances; the WS dispatch forwards task_* / audit_* / backlog_* /
+// commit_pushed / compass_audit_logged events here so the board refreshes live.
 const kanbanEvents = createKanbanEventRouter();
 const KANBAN_FORWARD_TYPES = new Set([
   "task_created", "task_claimed", "task_assigned",
-  "task_updated", "task_stage_changed",
-  "task_complexity_set", "task_blocked_changed",
+  "task_updated", "task_stage_changed", "task_archived",
+  "task_trajectory_changed", "task_blocked_changed",
   "task_spec_written", "task_role_assigned", "task_role_claimed",
-  "task_role_completed", "task_drift_detected", "task_shipped",
-  "audit_report_submitted", "compass_audit_logged",
+  "task_role_called", "task_role_stand_down",
+  "task_role_completed", "task_drift_detected",
+  "task_stage_stale", "task_workflow_set",
+  "audit_report_submitted", "audit_fail_notification",
+  "compass_audit_logged",
   "commit_pushed", "project_switched", "socket_connected",
+  "backlog_task_proposed", "backlog_task_promoted", "backlog_task_rejected",
 ]);
 // Short labels for the pane-header current-task chip. Keeps the
 // chip from blowing up when a task is in audit_*; archive isn't
@@ -1849,10 +1853,9 @@ function App() {
       if (ev.type && typeof ev.type === "string" && ev.type.startsWith("compass_")) {
         try { compassEvents.publish(ev); } catch (_) {}
       }
-      // Kanban dashboard live updates. Forward task lifecycle events
-      // and the audit/commit triggers it watches. Includes
-      // compass_audit_logged because the kanban surfaces an
-      // informational Compass pip on cards.
+      // Kanban dashboard live updates. Forward task lifecycle events,
+      // backlog events, audit/commit triggers, and compass verdicts.
+      // See KANBAN_FORWARD_TYPES for the full event list.
       if (ev.type && KANBAN_FORWARD_TYPES.has(ev.type)) {
         try { kanbanEvents.publish(ev); } catch (_) {}
       }
