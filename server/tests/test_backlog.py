@@ -868,3 +868,59 @@ async def test_patch_backlog_clear_description(fresh_db: str) -> None:  # noqa: 
     row = await _get_backlog(row_id)
     assert row is not None
     assert row["description"] is None
+
+
+# ---------------------------------------------------------------- priority field
+
+
+@pytest.mark.asyncio
+async def test_post_backlog_with_priority(fresh_db: str) -> None:
+    """POST /api/backlog accepts priority; response and DB row carry it."""
+    await init_db()
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.post(
+            "/api/backlog",
+            json={"title": "Urgent thing", "priority": "urgent"},
+        )
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["priority"] == "urgent"
+    row = await _get_backlog(d["id"])
+    assert row is not None
+    assert row["priority"] == "urgent"
+
+
+@pytest.mark.asyncio
+async def test_post_backlog_default_priority(fresh_db: str) -> None:
+    """POST /api/backlog defaults to normal when priority is omitted."""
+    await init_db()
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.post("/api/backlog", json={"title": "Some idea"})
+    assert r.status_code == 200, r.text
+    assert r.json()["priority"] == "normal"
+
+
+@pytest.mark.asyncio
+async def test_post_backlog_invalid_priority(fresh_db: str) -> None:
+    """POST /api/backlog rejects unknown priority values with 400."""
+    await init_db()
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.post(
+            "/api/backlog", json={"title": "x", "priority": "critical"}
+        )
+    assert r.status_code == 400

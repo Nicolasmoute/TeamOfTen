@@ -3922,9 +3922,13 @@ async def clear_sessions_batch(
 _BACKLOG_DESCRIPTION_MAX = 8000
 
 
+_BACKLOG_PRIORITIES = {"low", "normal", "high", "urgent"}
+
+
 class BacklogCreateRequest(BaseModel):
     title: str
     description: str | None = None
+    priority: str = "normal"
 
 
 @app.post("/api/backlog", dependencies=[Depends(require_token)])
@@ -3944,14 +3948,21 @@ async def create_backlog_entry(req: BacklogCreateRequest) -> dict[str, Any]:
             400,
             detail=f"description exceeds {_BACKLOG_DESCRIPTION_MAX} char limit",
         )
+    priority = (req.priority or "normal").strip().lower()
+    if priority not in _BACKLOG_PRIORITIES:
+        raise HTTPException(
+            400,
+            detail=f"priority must be one of {sorted(_BACKLOG_PRIORITIES)}",
+        )
 
     now_iso = datetime.now(timezone.utc).isoformat()
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "INSERT INTO backlog_tasks (title, description, proposed_by, proposed_at) "
-            "VALUES (?, ?, 'human', ?)",
-            (title, description, now_iso),
+            "INSERT INTO backlog_tasks "
+            "(title, description, proposed_by, proposed_at, priority) "
+            "VALUES (?, ?, 'human', ?, ?)",
+            (title, description, now_iso, priority),
         )
         backlog_id = cur.lastrowid
         await c.commit()
@@ -3965,12 +3976,16 @@ async def create_backlog_entry(req: BacklogCreateRequest) -> dict[str, Any]:
         "id": backlog_id,
         "title": title,
         "proposed_by": "human",
+        "priority": priority,
         "description_present": description is not None,
     }
     if description is not None:
         event["description"] = description
     await bus.publish(event)
-    return {"id": backlog_id, "title": title, "description": description, "status": "pending"}
+    return {
+        "id": backlog_id, "title": title, "description": description,
+        "priority": priority, "status": "pending",
+    }
 
 
 @app.get("/api/backlog", dependencies=[Depends(require_token)])
