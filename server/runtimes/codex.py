@@ -57,7 +57,7 @@ _client_locks: dict[str, asyncio.Lock] = {}
 
 # Bump when the Codex-visible coord tool contract changes in a way that
 # old persisted Codex threads might not pick up on resume.
-_CODEX_TOOL_CONTRACT_VERSION = "2026-05-14.coord-list-backlog"
+_CODEX_TOOL_CONTRACT_VERSION = "2026-05-14.codex-memory-salvage"
 
 
 class _CapturedStdioTransport:
@@ -645,6 +645,40 @@ async def open_thread(
             logger.exception(
                 "CodexRuntime: session_resume_failed emit failed for slot=%s",
                 agent_id,
+            )
+        # R4: memory salvage — mirror ClaudeRuntime's auto-heal path.
+        # Before nuking the thread id, read the rolling exchange log and
+        # write a synthetic continuity_note. The NEXT run_agent call will
+        # compose a handoff suffix from it (had_handoff_on_entry=True),
+        # so the agent starts that turn with memory of its prior work.
+        # The note is cleared by run_turn's post-result handler when
+        # had_handoff_on_entry is True (line ~1841 in this file).
+        salvaged = 0
+        try:
+            from server.agents import (
+                _emit as _salvage_emit,
+                _get_recent_exchanges,
+                _set_continuity_note,
+            )
+            recent = await _get_recent_exchanges(agent_id)
+            salvaged = len([e for e in recent if isinstance(e, dict)])
+            if salvaged > 0:
+                await _set_continuity_note(
+                    agent_id,
+                    "Your prior Codex thread was reset by the harness "
+                    "because resume failed. The verbatim exchanges below "
+                    "are your only memory of the prior conversation; pick "
+                    "up from there.",
+                )
+            await _salvage_emit(
+                agent_id,
+                "session_auto_recovered",
+                salvaged_exchanges=salvaged,
+                runtime="codex",
+            )
+        except Exception:
+            logger.exception(
+                "CodexRuntime: memory salvage/event failed for slot=%s", agent_id
             )
         await _clear_codex_thread_id(agent_id)
 
@@ -1874,8 +1908,16 @@ class CodexRuntime:
         except Exception:
             # Transport/protocol failures often poison the app-server
             # stdio session. Drop the cached client so the dispatcher
-            # retry gets a fresh subprocess.
-            await close_client(tc.agent_id)
+            # retry gets a fresh subprocess. Wrapped in its own
+            # try/except so a close_client failure doesn't shadow the
+            # original exception that caused this handler to fire.
+            try:
+                await close_client(tc.agent_id)
+            except Exception:
+                logger.exception(
+                    "CodexRuntime: close_client failed on error-path for slot=%s",
+                    tc.agent_id,
+                )
             raise
         finally:
             if hasattr(client, "set_approval_handler"):
