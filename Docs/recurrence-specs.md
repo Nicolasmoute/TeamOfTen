@@ -1021,7 +1021,6 @@ schedule; an audit watcher is an event subscription.
 ## 16. Out of scope (for v2)
 
 - Player-targetable recurrences. Still Coach-only.
-- Stop conditions / max-iterations. Recurrences run until disabled.
 - Loop backoff or jitter. Fixed cadence only.
 - Cron expressions (raw 5-field). Friendly DSL only.
 - Conditional recurrences ("fire only if X"). Operator can express that
@@ -1032,7 +1031,76 @@ schedule; an audit watcher is an event subscription.
 
 ---
 
-## 17. Implementation order (suggested)
+## 17. End-date & max-fires expiry
+
+Recurrences now support two optional, orthogonal stop conditions.
+Neither is required — omitting both means "run until disabled" (the
+prior behaviour, preserved).
+
+### Schema additions (idempotent via `_ensure_columns`)
+
+| Column | Type | Default | Meaning |
+|---|---|---|---|
+| `end_date` | TEXT (ISO UTC) | NULL | Wall-clock cutoff. Row disables when `now >= end_date`. |
+| `max_fires` | INTEGER | NULL | Fire-count limit. Row disables after this many successful fires. |
+| `fire_count` | INTEGER | 0 | Cumulative successful fires. Skips (coach_busy / cost_capped) do NOT increment this. |
+
+### Expiry checks — two trigger points
+
+1. **At compute-next-fire time** (`_compute_next_for_row`): if the
+   computed `next_dt > end_date`, return `None` (terminal signal —
+   same path as one-shot cron). The scheduler then treats the row as
+   if it has no future fire.
+
+2. **After a successful fire** (`_handle_due_row`): increment
+   `fire_count`, then call `_row_is_expired()`. If expired, call
+   `_expire_row()` and return without recomputing `next_fire_at`.
+   One-shot cron rows are handled before this check (existing path,
+   untouched).
+
+3. **Between-tick sweep** (`_scheduler_iteration`): before the main
+   due-row loop, query all enabled rows whose `end_date <= now` and
+   expire them. Catches rows whose `end_date` passed while they were
+   not yet due to fire (e.g. `next_fire_at` was 5 min away but
+   `end_date` crossed during the gap).
+
+### `_expire_row(db, row, reason, now_utc)`
+
+Sets `enabled=0`, `next_fire_at=NULL`, commits, discards the row
+from `_DEFER_LATCH`, and emits `recurrence_expired`.
+
+### `recurrence_expired` event
+
+```json
+{
+  "type": "recurrence_expired",
+  "id": <int>,
+  "project_id": "<str>",
+  "kind": "tick|repeat|cron",
+  "cadence": "<str>",
+  "reason": "end_date_reached | max_fires_reached"
+}
+```
+
+### Validation (API layer)
+
+- `end_date` must be parseable as ISO 8601 and must be > now. A past
+  `end_date` on POST or PUT returns HTTP 400:
+  `"end_date must be in the future"`.
+- `max_fires` must be an integer >= 1. `0` and negative values return
+  HTTP 400: `"max_fires must be >= 1"`.
+- Both fields are optional on all write paths:
+  `POST /api/recurrences`, `PATCH /api/recurrences/{id}`,
+  `PUT /api/coach/tick`, and `coord_set_tick_interval`.
+
+### `GET /api/recurrences` response
+
+Each row now includes `end_date`, `max_fires`, and `fire_count`
+alongside the existing fields.
+
+---
+
+## 18. Implementation order (suggested)
 
 1. Migration + table + scheduler (no UI). Tick rows seeded from env var. **completed and audited**
 2. Slash commands + HTTP API for recurrences. **completed and audited**

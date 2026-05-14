@@ -951,6 +951,20 @@ async def init_db() -> None:
                 ],
             )
 
+            # Recurrence §17: end-date / max-fires expiry signals.
+            # All three columns are nullable (NULL = unlimited) so
+            # existing rows are unaffected. fire_count tracks successful
+            # fires only (skips do not increment).
+            await _ensure_columns(
+                db,
+                "coach_recurrence",
+                [
+                    ("end_date",   "end_date TEXT"),
+                    ("max_fires",  "max_fires INTEGER"),
+                    ("fire_count", "fire_count INTEGER NOT NULL DEFAULT 0"),
+                ],
+            )
+
             logger.info("init_db: schema ok, ensuring misc project")
             # Ensure the fallback project + active-project pointer
             # exist on every fresh boot. INSERT OR IGNORE — never

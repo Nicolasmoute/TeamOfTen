@@ -286,11 +286,58 @@ def _format_iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _row_is_expired(row: dict[str, Any], now_utc: datetime) -> tuple[bool, str]:
+    """Return (True, reason) if a row has hit an expiry condition.
+
+    Checks max_fires first, then end_date. Returns (False, '') when neither
+    condition is met or when the row has no expiry configured.
+    Spec §17.
+    """
+    max_fires = row.get("max_fires")
+    fire_count = row.get("fire_count") or 0
+    if max_fires is not None and fire_count >= max_fires:
+        return True, "max_fires_reached"
+    end_date = row.get("end_date")
+    if end_date:
+        try:
+            ed = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            if now_utc >= ed:
+                return True, "end_date_reached"
+        except ValueError:
+            pass  # malformed end_date — treat as unset
+    return False, ""
+
+
+async def _expire_row(
+    db: Any, row: dict[str, Any], reason: str, now_utc: datetime,
+) -> None:
+    """Disable a row and emit ``recurrence_expired``. Spec §17."""
+    await db.execute(
+        "UPDATE coach_recurrence SET enabled = 0, next_fire_at = NULL "
+        "WHERE id = ?",
+        (row["id"],),
+    )
+    await db.commit()
+    _DEFER_LATCH.discard(row["id"])
+    await _emit({
+        "type": "recurrence_expired",
+        "id": row["id"],
+        "project_id": row["project_id"],
+        "kind": row["kind"],
+        "cadence": row["cadence"],
+        "reason": reason,
+    })
+
+
 async def _compute_next_for_row(
     row: dict[str, Any], after_utc: datetime
 ) -> datetime | None:
     """Resolve the next-fire UTC for any row kind. Returns None to
-    signal the row must be disabled (one-shot complete or unparsable)."""
+    signal the row must be disabled (one-shot complete or unparsable).
+
+    Also returns None when the computed next fire would be past end_date —
+    the caller treats None as the terminal signal (spec §17).
+    """
     kind = row["kind"]
     cadence = row["cadence"]
     if kind == "tick":
@@ -302,14 +349,14 @@ async def _compute_next_for_row(
             minutes = max(0, int(cadence))
         except (TypeError, ValueError):
             return None
-        return after_utc + timedelta(minutes=minutes)
-    if kind == "repeat":
+        next_dt: datetime | None = after_utc + timedelta(minutes=minutes)
+    elif kind == "repeat":
         try:
             minutes = max(1, int(cadence))
         except (TypeError, ValueError):
             return None
-        return after_utc + timedelta(minutes=minutes)
-    if kind == "cron":
+        next_dt = after_utc + timedelta(minutes=minutes)
+    elif kind == "cron":
         tz = row.get("tz") or "UTC"
         try:
             parsed = parse_cron(cadence)
@@ -319,8 +366,20 @@ async def _compute_next_for_row(
                 row.get("id"), cadence,
             )
             return None
-        return compute_next_fire_at(parsed, tz, after_utc)
-    return None
+        next_dt = compute_next_fire_at(parsed, tz, after_utc)
+    else:
+        return None
+
+    # §17: if next fire would land after end_date, treat as terminal.
+    end_date = row.get("end_date")
+    if end_date and next_dt is not None:
+        try:
+            ed = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            if next_dt > ed:
+                return None
+        except ValueError:
+            pass
+    return next_dt
 
 
 async def _emit(event: dict[str, Any]) -> None:
@@ -737,6 +796,26 @@ async def _handle_due_row(
             "reason": "one_shot_complete",
             "project_id": project_id,
         })
+        return True
+
+    # §17: increment fire_count (successful fires only — skips don't
+    # count). Then check expiry so max_fires rows auto-disable immediately
+    # after their last permitted fire.
+    await db.execute(
+        "UPDATE coach_recurrence SET fire_count = fire_count + 1 WHERE id = ?",
+        (rid,),
+    )
+    await db.commit()
+    updated = await db.execute(
+        "SELECT fire_count FROM coach_recurrence WHERE id = ?", (rid,)
+    )
+    updated_row = await updated.fetchone()
+    fire_count_now = (dict(updated_row) if updated_row else {}).get("fire_count", 1)
+    expiry_row = {**row, "fire_count": fire_count_now}
+    expired, exp_reason = _row_is_expired(expiry_row, fired_at)
+    if expired:
+        await _expire_row(db, row, exp_reason, fired_at)
+
     return True
 
 
@@ -755,9 +834,25 @@ async def _scheduler_iteration() -> None:
 
     db = await configured_conn()
     try:
+        # §17: Expiry sweep — expire rows whose end_date has passed even
+        # if next_fire_at hasn't come due yet (end_date may have been
+        # crossed between scheduler ticks).
+        exp_cur = await db.execute(
+            "SELECT id, project_id, kind, cadence, tz, prompt, enabled, "
+            "next_fire_at, last_fired_at, end_date, max_fires, fire_count "
+            "FROM coach_recurrence "
+            "WHERE project_id = ? AND enabled = 1 "
+            "AND end_date IS NOT NULL AND end_date <= ?",
+            (project_id, now_iso),
+        )
+        sweep_rows = [dict(r) for r in await exp_cur.fetchall()]
+        for srow in sweep_rows:
+            await _expire_row(db, srow, "end_date_reached", now)
+
         cur = await db.execute(
             "SELECT id, project_id, kind, cadence, tz, prompt, enabled, "
-            "next_fire_at, last_fired_at FROM coach_recurrence "
+            "next_fire_at, last_fired_at, end_date, max_fires, fire_count "
+            "FROM coach_recurrence "
             "WHERE project_id = ? AND enabled = 1 "
             "AND (next_fire_at IS NULL OR next_fire_at <= ?) "
             "ORDER BY id",
@@ -792,6 +887,13 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
     return dict(row) if row is not None else {}
 
 
+_RECURRENCE_COLS = (
+    "id, project_id, kind, cadence, tz, prompt, enabled, "
+    "next_fire_at, last_fired_at, created_at, created_by, "
+    "end_date, max_fires, fire_count"
+)
+
+
 async def list_recurrences(project_id: str) -> list[dict[str, Any]]:
     """Return all recurrence rows for a project, ordered by kind then id.
 
@@ -801,8 +903,7 @@ async def list_recurrences(project_id: str) -> list[dict[str, Any]]:
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT id, project_id, kind, cadence, tz, prompt, enabled, "
-            "next_fire_at, last_fired_at, created_at, created_by "
+            f"SELECT {_RECURRENCE_COLS} "
             "FROM coach_recurrence WHERE project_id = ? "
             "ORDER BY CASE kind WHEN 'tick' THEN 0 WHEN 'repeat' THEN 1 "
             "ELSE 2 END, id",
@@ -820,8 +921,7 @@ async def get_recurrence(rec_id: int) -> dict[str, Any] | None:
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT id, project_id, kind, cadence, tz, prompt, enabled, "
-            "next_fire_at, last_fired_at, created_at, created_by "
+            f"SELECT {_RECURRENCE_COLS} "
             "FROM coach_recurrence WHERE id = ?",
             (rec_id,),
         )
@@ -847,6 +947,45 @@ async def _count_enabled(project_id: str) -> int:
     finally:
         await c.close()
     return int(_row_to_dict(row).get("n", 0))
+
+
+def _validate_end_date(end_date: str | None) -> str | None:
+    """Validate and normalise an end_date value (spec §17).
+
+    Accepts an ISO 8601 string (with or without timezone). Must be in
+    the future relative to now. Returns the normalised UTC ISO string,
+    or None when ``end_date`` is None / empty.
+
+    Raises ValueError with an actionable message on bad input.
+    """
+    if not end_date:
+        return None
+    try:
+        ed = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            f"end_date {end_date!r} is not a valid ISO 8601 datetime"
+        ) from exc
+    # Make timezone-aware (assume UTC if naive)
+    if ed.tzinfo is None:
+        ed = ed.replace(tzinfo=timezone.utc)
+    if ed <= _now_utc():
+        raise ValueError("end_date must be in the future")
+    return _format_iso(ed)
+
+
+def _validate_max_fires(max_fires: int | None) -> int | None:
+    """Validate max_fires (spec §17). Must be >= 1 or None."""
+    if max_fires is None:
+        return None
+    if not isinstance(max_fires, int) or isinstance(max_fires, bool):
+        try:
+            max_fires = int(max_fires)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_fires must be an integer") from exc
+    if max_fires < 1:
+        raise ValueError("max_fires must be >= 1")
+    return max_fires
 
 
 def _validate_minutes(cadence: str | int) -> int:
@@ -906,6 +1045,8 @@ async def create_recurrence(
     cadence: str | int,
     prompt: str | None = None,
     tz: str | None = None,
+    end_date: str | None = None,
+    max_fires: int | None = None,
     created_by: str = "human",
     actor: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -947,6 +1088,9 @@ async def create_recurrence(
             raise ValueError("schedule is in the past")
         cadence_str = cadence.strip()
 
+    end_date_iso = _validate_end_date(end_date)
+    max_fires_val = _validate_max_fires(max_fires)
+
     if await _count_enabled(project_id) >= MAX_RECURRENCES_PER_PROJECT:
         raise PermissionError(
             f"per-project recurrence cap reached "
@@ -958,11 +1102,12 @@ async def create_recurrence(
         cur = await c.execute(
             "INSERT INTO coach_recurrence "
             "(project_id, kind, cadence, tz, prompt, enabled, "
-            "next_fire_at, created_by) "
-            "VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+            "next_fire_at, created_by, end_date, max_fires) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
             (
                 project_id, kind, cadence_str, tz_resolved, prompt,
                 _format_iso(next_fire), created_by,
+                end_date_iso, max_fires_val,
             ),
         )
         rec_id = cur.lastrowid
@@ -992,6 +1137,8 @@ async def upsert_tick(
     project_id: str,
     minutes: int | None = None,
     enabled: bool | None = None,
+    end_date: str | None = None,
+    max_fires: int | None = None,
     created_by: str = "human",
     actor: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
@@ -1009,6 +1156,9 @@ async def upsert_tick(
         raise ValueError("must pass minutes or enabled")
     if minutes is not None:
         minutes = _validate_tick_minutes(minutes)
+    # Validate expiry params upfront so we fail fast before any DB writes.
+    end_date_iso = _validate_end_date(end_date)
+    max_fires_val = _validate_max_fires(max_fires)
 
     c = await configured_conn()
     try:
@@ -1048,7 +1198,7 @@ async def upsert_tick(
                 new_next_fire = _format_iso(
                     _now_utc() + timedelta(minutes=int(new_cadence))
                 )
-            params = [new_enabled, new_cadence]
+            params: list[Any] = [new_enabled, new_cadence]
             sql = (
                 "UPDATE coach_recurrence "
                 "SET enabled = ?, cadence = ?"
@@ -1058,6 +1208,13 @@ async def upsert_tick(
                 params.append(new_next_fire)
             elif new_enabled == 0:
                 sql += ", next_fire_at = NULL"
+            # Update expiry fields when explicitly provided.
+            if end_date_iso is not None:
+                sql += ", end_date = ?"
+                params.append(end_date_iso)
+            if max_fires_val is not None:
+                sql += ", max_fires = ?"
+                params.append(max_fires_val)
             sql += " WHERE id = ?"
             params.append(existing_d["id"])
             await c.execute(sql, tuple(params))
@@ -1077,9 +1234,10 @@ async def upsert_tick(
             cur = await c.execute(
                 "INSERT INTO coach_recurrence "
                 "(project_id, kind, cadence, prompt, enabled, "
-                "next_fire_at, created_by) "
-                "VALUES (?, 'tick', ?, NULL, 1, ?, ?)",
-                (project_id, str(minutes), next_fire, created_by),
+                "next_fire_at, created_by, end_date, max_fires) "
+                "VALUES (?, 'tick', ?, NULL, 1, ?, ?, ?, ?)",
+                (project_id, str(minutes), next_fire, created_by,
+                 end_date_iso, max_fires_val),
             )
             rec_id = cur.lastrowid
             await c.commit()
@@ -1139,6 +1297,8 @@ async def update_recurrence(
     prompt: str | None = None,
     tz: str | None = None,
     enabled: bool | None = None,
+    end_date: str | None = None,
+    max_fires: int | None = None,
     actor: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Patch an existing recurrence row. Only the passed fields are
@@ -1192,6 +1352,18 @@ async def update_recurrence(
         if not new_prompt:
             raise ValueError("prompt cannot be empty")
 
+    # Validate expiry fields upfront. Caller passes the string "clear" or
+    # empty string to clear end_date; None means "leave column unchanged".
+    # For max_fires, None means "leave column unchanged"; 0 is rejected.
+    update_end_date = end_date is not None
+    update_max_fires = max_fires is not None
+    end_date_new: str | None = None
+    max_fires_new: int | None = None
+    if update_end_date:
+        end_date_new = _validate_end_date(end_date)
+    if update_max_fires:
+        max_fires_new = _validate_max_fires(max_fires)
+
     c = await configured_conn()
     try:
         sql = (
@@ -1204,6 +1376,12 @@ async def update_recurrence(
             params.append(new_next_fire)
         elif new_enabled == 0:
             sql += ", next_fire_at = NULL"
+        if update_end_date:
+            sql += ", end_date = ?"
+            params.append(end_date_new)
+        if update_max_fires:
+            sql += ", max_fires = ?"
+            params.append(max_fires_new)
         sql += " WHERE id = ?"
         params.append(rec_id)
         await c.execute(sql, tuple(params))
