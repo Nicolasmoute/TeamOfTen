@@ -57,7 +57,7 @@ _client_locks: dict[str, asyncio.Lock] = {}
 
 # Bump when the Codex-visible coord tool contract changes in a way that
 # old persisted Codex threads might not pick up on resume.
-_CODEX_TOOL_CONTRACT_VERSION = "2026-05-14.coord-list-backlog"
+_CODEX_TOOL_CONTRACT_VERSION = "2026-05-14.codex-memory-salvage"
 
 
 class _CapturedStdioTransport:
@@ -247,6 +247,7 @@ async def get_client(
     *,
     cwd: str,
     env_overrides: dict[str, str] | None = None,
+    external_mcp_servers: dict[str, Any] | None = None,
 ) -> Any:
     """Return a started, initialized `CodexClient` for `slot`.
 
@@ -254,6 +255,12 @@ async def get_client(
     client thereafter. Callers who hit a `CodexTransportError` /
     `CodexProtocolError` should call `close_client(slot)` and retry —
     that drops the cached client so the next `get_client` rebuilds it.
+
+    `external_mcp_servers` is written into `.mcp.json` in `cwd` alongside
+    the built-in `coord` server.  The Codex binary discovers `.mcp.json`
+    at startup — this is the ONLY supported path for configuring MCP
+    servers at the app-server level.  Passing `mcp_servers` inside the
+    `config` dict of `thread/start` is silently ignored by the binary.
 
     Confirmed against live SDK 0.3.2 on 2026-04-28; see
     Docs/CODEX_PROBE_OUTPUT.md for the surface this calls into.
@@ -282,6 +289,12 @@ async def get_client(
         token = _mint_proxy_token(slot)
         _codex_client_tokens[slot] = token
         env["HARNESS_COORD_PROXY_TOKEN"] = token
+
+        # Write .mcp.json to the app-server's CWD BEFORE spawning.
+        # The Codex binary discovers MCP servers via this file at startup.
+        # Passing mcp_servers inside the thread/start config dict is a
+        # no-op — the binary's thread/start handler does not read that key.
+        _write_codex_mcp_json(slot, token, cwd, external_mcp_servers)
 
         _install_captured_stdio_transport(sdk)
         client = sdk.CodexClient.connect_stdio(
@@ -646,6 +659,40 @@ async def open_thread(
                 "CodexRuntime: session_resume_failed emit failed for slot=%s",
                 agent_id,
             )
+        # R4: memory salvage — mirror ClaudeRuntime's auto-heal path.
+        # Before nuking the thread id, read the rolling exchange log and
+        # write a synthetic continuity_note. The NEXT run_agent call will
+        # compose a handoff suffix from it (had_handoff_on_entry=True),
+        # so the agent starts that turn with memory of its prior work.
+        # The note is cleared by run_turn's post-result handler when
+        # had_handoff_on_entry is True (line ~1841 in this file).
+        salvaged = 0
+        try:
+            from server.agents import (
+                _emit as _salvage_emit,
+                _get_recent_exchanges,
+                _set_continuity_note,
+            )
+            recent = await _get_recent_exchanges(agent_id)
+            salvaged = len([e for e in recent if isinstance(e, dict)])
+            if salvaged > 0:
+                await _set_continuity_note(
+                    agent_id,
+                    "Your prior Codex thread was reset by the harness "
+                    "because resume failed. The verbatim exchanges below "
+                    "are your only memory of the prior conversation; pick "
+                    "up from there.",
+                )
+            await _salvage_emit(
+                agent_id,
+                "session_auto_recovered",
+                salvaged_exchanges=salvaged,
+                runtime="codex",
+            )
+        except Exception:
+            logger.exception(
+                "CodexRuntime: memory salvage/event failed for slot=%s", agent_id
+            )
         await _clear_codex_thread_id(agent_id)
 
     r = client.start_thread(config)
@@ -877,6 +924,14 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
         )
         result_text = _extract_step_tool_result(item_payload)
         if result_text:
+            await _emit_codex_safety_suspected(
+                agent_id,
+                item_id=item_id,
+                item_type=item_type,
+                tool_name=tool_name,
+                item_payload=item_payload,
+                result_text=result_text,
+            )
             await _emit(
                 agent_id,
                 "tool_result",
@@ -943,6 +998,14 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
         )
         result_text = _extract_step_tool_result(item_payload)
         if result_text:
+            await _emit_codex_safety_suspected(
+                agent_id,
+                item_id=item_id,
+                item_type=item_type,
+                tool_name=tool_name,
+                item_payload=item_payload,
+                result_text=result_text,
+            )
             await _emit(
                 agent_id,
                 "tool_result",
@@ -984,6 +1047,88 @@ def _coord_mcp_env(tc: TurnContext) -> dict[str, str]:
         "HARNESS_COORD_PROXY_TOKEN": token,
         "PYTHONPATH": root if not pythonpath else os.pathsep.join([root, pythonpath]),
     }
+
+
+def _coord_mcp_env_for_slot(agent_id: str, token: str) -> dict[str, str]:
+    """Build the coord-mcp subprocess env from an explicit token (spawn-time
+    variant that doesn't depend on TurnContext or turn_ctx)."""
+    root = _harness_root()
+    pythonpath = os.environ.get("PYTHONPATH", "").strip()
+    return {
+        "HARNESS_COORD_PROXY_TOKEN": token,
+        "PYTHONPATH": root if not pythonpath else os.pathsep.join([root, pythonpath]),
+    }
+
+
+def _build_mcp_servers_for_slot(
+    agent_id: str,
+    token: str,
+    external_mcp_servers: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the MCP server config dict keyed by server name.
+
+    Unlike `_build_mcp_servers` (which requires a full TurnContext), this
+    variant only needs the slot identity + the coord-proxy token.  Used by
+    `_write_codex_mcp_json` which runs at subprocess-spawn time, before any
+    thread (and therefore before any TurnContext) exists.
+    """
+    servers: dict[str, Any] = {}
+    root = _harness_root()
+    servers["coord"] = {
+        "type": "stdio",
+        "command": sys.executable,
+        "cwd": root,
+        "args": [
+            "-m",
+            "server.coord_mcp",
+            "--caller-id",
+            agent_id,
+            "--proxy-url",
+            _coord_proxy_url(),
+        ],
+        "env": _coord_mcp_env_for_slot(agent_id, token),
+        "default_tools_approval_mode": "approve",
+    }
+    for name, cfg in (external_mcp_servers or {}).items():
+        if name == "coord":
+            continue
+        if isinstance(cfg, dict) and "default_tools_approval_mode" not in cfg:
+            cfg = {**cfg, "default_tools_approval_mode": "approve"}
+        servers[name] = cfg
+    return servers
+
+
+def _write_codex_mcp_json(
+    agent_id: str,
+    token: str,
+    cwd: str,
+    external_mcp_servers: dict[str, Any] | None = None,
+) -> None:
+    """Write `.mcp.json` to the Codex app-server's working directory.
+
+    The Codex binary (`codex app-server`) discovers MCP servers at startup
+    by reading `.mcp.json` from its CWD.  The `mcp_servers` key inside
+    `config` passed to `thread/start` is NOT read by the binary — that was
+    the root cause of coord_* tools being invisible to Codex Players.
+
+    This function must be called before `CodexClient.connect_stdio` so the
+    file is present when the subprocess starts.  It is re-written on every
+    fresh spawn (after `close_client`) so the token is always current.
+
+    File format (camelCase key per Codex convention):
+        {"mcpServers": {"coord": {...}, ...}}
+    """
+    servers = _build_mcp_servers_for_slot(agent_id, token, external_mcp_servers)
+    mcp_json = {"mcpServers": servers}
+    dest = Path(cwd) / ".mcp.json"
+    try:
+        dest.write_text(json.dumps(mcp_json, indent=2), encoding="utf-8")
+    except Exception:
+        logger.exception(
+            "CodexRuntime: failed to write .mcp.json for slot=%s cwd=%s",
+            agent_id,
+            cwd,
+        )
 
 
 def _build_mcp_servers(tc: TurnContext) -> dict[str, Any]:
@@ -1116,9 +1261,12 @@ def _codex_sandbox_for(agent_id: str) -> str:
 
 
 def _codex_config_overrides(tc: TurnContext) -> dict[str, Any]:
-    overrides: dict[str, Any] = {
-        "mcp_servers": _build_mcp_servers(tc),
-    }
+    # NOTE: `mcp_servers` is intentionally NOT included here.
+    # The Codex binary reads MCP server config from `.mcp.json` at startup,
+    # not from the `config` dict passed to `thread/start`.  We write
+    # `.mcp.json` in `get_client()` before spawning the subprocess.
+    # See Docs/CODEX_RUNTIME_SPEC.md §C.5 for the full design.
+    overrides: dict[str, Any] = {}
     # Translate the team-wide web-access toggle into Codex's native
     # switch. The Settings drawer toggle is stored under the legacy
     # Claude SDK tool names ("WebSearch" / "WebFetch") for backwards
@@ -1250,6 +1398,36 @@ def _step_payload_is_error(item_payload: Mapping[str, Any]) -> bool:
         return int(exit_code) != 0
     except (TypeError, ValueError):
         return False
+
+
+def _step_payload_safety_suspected(item_payload: Mapping[str, Any]) -> bool:
+    status = str(item_payload.get("status") or item_payload.get("state") or "").lower()
+    return "cancel" in status or "reject" in status
+
+
+async def _emit_codex_safety_suspected(
+    agent_id: str,
+    *,
+    item_id: str | None,
+    item_type: str,
+    tool_name: str,
+    item_payload: Mapping[str, Any],
+    result_text: str,
+) -> None:
+    if not _step_payload_safety_suspected(item_payload):
+        return
+    from server.agents import _emit
+
+    status = str(item_payload.get("status") or item_payload.get("state") or "")
+    await _emit(
+        agent_id,
+        "codex_safety_suspected",
+        tool_use_id=item_id,
+        item_type=item_type,
+        tool=tool_name,
+        status=status,
+        content=result_text[:12000],
+    )
 
 
 def _to_mapping(value: Any) -> Mapping[str, Any] | None:
@@ -1592,6 +1770,7 @@ class CodexRuntime:
                 tc.agent_id,
                 cwd=tc.workspace_cwd,
                 env_overrides=env_overrides,
+                external_mcp_servers=tc.external_mcp_servers,
             )
             config = _build_thread_config(sdk, tc)
             turn_overrides = _build_turn_overrides(sdk, tc)
@@ -1719,6 +1898,7 @@ class CodexRuntime:
                 tc.agent_id,
                 cwd=tc.workspace_cwd,
                 env_overrides=env_overrides,
+                external_mcp_servers=tc.external_mcp_servers,
             )
             config = _build_thread_config(sdk, tc)
             turn_overrides = _build_turn_overrides(sdk, tc)
@@ -1874,8 +2054,16 @@ class CodexRuntime:
         except Exception:
             # Transport/protocol failures often poison the app-server
             # stdio session. Drop the cached client so the dispatcher
-            # retry gets a fresh subprocess.
-            await close_client(tc.agent_id)
+            # retry gets a fresh subprocess. Wrapped in its own
+            # try/except so a close_client failure doesn't shadow the
+            # original exception that caused this handler to fire.
+            try:
+                await close_client(tc.agent_id)
+            except Exception:
+                logger.exception(
+                    "CodexRuntime: close_client failed on error-path for slot=%s",
+                    tc.agent_id,
+                )
             raise
         finally:
             if hasattr(client, "set_approval_handler"):
@@ -2058,6 +2246,7 @@ class CodexRuntime:
                 tc.agent_id,
                 cwd=str(await workspace_dir(tc.agent_id)),
                 env_overrides=env_overrides,
+                external_mcp_servers=tc.external_mcp_servers,
             )
         except ImportError as exc:
             await _emit(

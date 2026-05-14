@@ -788,7 +788,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- owner: agent id ('coach', 'p1'..'p10'), or 'null' for unassigned\n"
             "Returns up to 100 most recent tasks. Each row shows stage, "
             "trajectory ([P,E,AY,AE,S] tokens), blocked flag, owner, "
-            "priority, and title."
+            "priority, and title. "
+            "For a full board view including the pre-plan holding area, "
+            "also call coord_list_backlog."
         ),
         {"status": str, "owner": str},
     )
@@ -3970,8 +3972,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "\n"
             "Claude runtime only. Codex Players store the value but "
             "silently ignore it at spawn time (Codex has its own "
-            "reasoning knob). The override survives a runtime flip, so "
-            "a Player flipped Codex→Claude later picks it up automatically.\n"
+            "reasoning knob); for Codex Players, skip this rung and go "
+            "directly to the model bump rung. The override survives a "
+            "runtime flip, so a Player flipped Codex→Claude later picks "
+            "it up automatically.\n"
             "\n"
             "Resolution order at spawn time (highest first): per-pane "
             "request value → this Coach override → off.\n"
@@ -7814,6 +7818,93 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         )
 
     @tool(
+        "coord_list_backlog",
+        (
+            "List entries in the Backlog. Available to Coach and all Players. "
+            "Read-only — no side effects.\n"
+            "\n"
+            "Params:\n"
+            "- status: filter on 'pending' (default) / 'promoted' / "
+            "'rejected' / 'all' for every status.\n"
+            "- limit: max rows to return (default 50, max 200).\n"
+            "\n"
+            "Returns one line per entry:\n"
+            "  #<id>  [<status>]  \"<title>\"  by <proposed_by>, <age> ago\n"
+            "  (description indented on a second line when non-empty)\n"
+            "\n"
+            "Use this to get a mid-turn view of the backlog after "
+            "coord_propose_task or coord_triage_backlog — the system-prompt "
+            "snapshot at turn start doesn't refresh."
+        ),
+        {"status": str, "limit": str},
+    )
+    async def list_backlog(args: dict[str, Any]) -> dict[str, Any]:
+        raw_status = (args.get("status") or "").strip().lower() or "pending"
+        valid_statuses = {"pending", "promoted", "rejected", "all"}
+        if raw_status not in valid_statuses:
+            return _err(
+                f"status must be one of {sorted(valid_statuses)!r}, "
+                f"got {raw_status!r}"
+            )
+
+        try:
+            limit = max(1, min(200, int(args.get("limit") or 50)))
+        except (TypeError, ValueError):
+            limit = 50
+
+        where = "" if raw_status == "all" else "WHERE status = ?"
+        params: list[Any] = [] if raw_status == "all" else [raw_status]
+
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                f"SELECT id, title, proposed_by, proposed_at, status, "
+                f"promoted_task_id "
+                f"FROM backlog_tasks {where} "
+                f"ORDER BY proposed_at DESC LIMIT ?",
+                params + [limit],
+            )
+            rows = await cur.fetchall()
+        finally:
+            await c.close()
+
+        if not rows:
+            return _ok("(no backlog entries)")
+
+        now = datetime.now(timezone.utc)
+        lines = []
+        for r in rows:
+            d = dict(r)
+            # Compute human-readable age from proposed_at ISO timestamp.
+            age = "?"
+            try:
+                ts_str = d["proposed_at"]
+                if ts_str:
+                    ts = datetime.fromisoformat(
+                        ts_str.replace("Z", "+00:00")
+                    )
+                    secs = int((now - ts).total_seconds())
+                    if secs < 60:
+                        age = f"{secs}s"
+                    elif secs < 3600:
+                        age = f"{secs // 60}m"
+                    elif secs < 86400:
+                        age = f"{secs // 3600}h"
+                    else:
+                        age = f"{secs // 86400}d"
+            except Exception:
+                pass
+
+            extra = ""
+            if d.get("promoted_task_id"):
+                extra = f"  → {d['promoted_task_id']}"
+            lines.append(
+                f"#{d['id']}  [{d['status']}]  \"{d['title']}\"  "
+                f"by {d['proposed_by']}, {age} ago{extra}"
+            )
+        return _ok("\n".join(lines))
+
+    @tool(
         "coord_triage_backlog",
         (
             "Coach-only. Review a Backlog entry and either promote it "
@@ -8434,6 +8525,7 @@ ALLOWED_COORD_TOOLS = [
     # coord_list_backlog are open to Coach + Players; coord_triage_backlog
     # is Coach-only at runtime.
     "mcp__coord__coord_propose_task",
+    "mcp__coord__coord_list_backlog",
     "mcp__coord__coord_triage_backlog",
     "mcp__coord__coord_list_backlog",
 ]

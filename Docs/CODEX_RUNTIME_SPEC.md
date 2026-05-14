@@ -354,43 +354,68 @@ ClaudeRuntime keeps the in-process `create_sdk_mcp_server` wrapper
 it. Two paths, same handlers.
 
 ```python
-# ClaudeRuntime mcp_servers:
+# ClaudeRuntime mcp_servers (in-process, passed as SDK MCP servers):
 mcp_servers = {"coord": coord_server, **external_servers}
 ```
 
-```python
-# CodexRuntime mcp_servers config (TOML/JSON via start_thread):
+**CodexRuntime: `.mcp.json` at workspace CWD (NOT `thread/start` config).**
+
+The Codex binary's `thread/start` handler does NOT read
+`config["mcp_servers"]` — it supports only `persistFullHistory`,
+`experimentalRawEvents`, `dynamicTools`, `environments`, and
+`permissions`. MCP servers are app-server–level config read once at
+subprocess startup. Passing `mcp_servers` in the config dict is
+silently ignored; `coord_*` tools never appear.
+
+**Fix:** `get_client` calls `_write_codex_mcp_json(slot, token, cwd,
+external_mcp_servers)` to write `<workspace_cwd>/.mcp.json` immediately
+before `connect_stdio` spawns the subprocess. The Codex binary
+auto-discovers `.mcp.json` in its CWD at startup.
+
+```json
+// .mcp.json written to workspace_cwd before every fresh subprocess spawn
 {
-  "coord": {
-    "type": "stdio",
-    "command": sys.executable,
-    "args": ["-m", "server.coord_mcp",
-             "--caller-id", agent_id,
-             "--proxy-url", "http://127.0.0.1:8000"],
-    "env": {"HARNESS_COORD_PROXY_TOKEN": <runtime-owned token>},
-    # Pre-approve every coord_* tool. Without this, Codex routes
-    # MCP calls through the elicitation/approval path under
-    # restrictive sandboxes (Coach is read-only) and the embedded
-    # client has no user-input handler — the call is auto-cancelled
-    # and the model sees "user rejected MCP tool call". coord_* is
-    # harness-trusted by the single-write-handle invariant, so
-    # blanket approval is correct. See openai/codex issue #16685
-    # and PR #16632 for upstream context.
-    "default_tools_approval_mode": "approve"
+  "mcpServers": {
+    "coord": {
+      "type": "stdio",
+      "command": "<sys.executable>",
+      "args": ["-m", "server.coord_mcp", "--caller-id", "<slot>",
+               "--proxy-url", "http://127.0.0.1:8000"],
+      "env": {"HARNESS_COORD_PROXY_TOKEN": "<runtime-owned token>"},
+      "default_tools_approval_mode": "approve"
+    },
+    "<external-server>": { "...", "default_tools_approval_mode": "approve" }
   }
 }
 ```
 
+The `default_tools_approval_mode = "approve"` on `coord` pre-approves
+every `coord_*` tool. Without this, Codex routes MCP calls through the
+elicitation/approval path under restrictive sandboxes (Coach is
+read-only) and the embedded client has no user-input handler — the call
+is auto-cancelled and the model sees "user rejected MCP tool call".
+`coord_*` is harness-trusted by the single-write-handle invariant, so
+blanket approval is correct. See openai/codex issue #16685 and PR
+#16632 for upstream context.
+
 **External MCP servers inherit the same approval policy.** Servers added
-through the Options drawer are merged into `mcp_servers` with
+through the Options drawer are included in `.mcp.json` with
 `default_tools_approval_mode = "approve"` injected when not already
-set. Without this, Coach (read-only sandbox) can't call any external
-tool — every call hits the same auto-cancellation path that broke
-`coord`. The act of adding a server via the UI is the user's
-authorization signal; an explicit `default_tools_approval_mode` value
-in the saved config is preserved (opt-out for users who want
-approval-on-use). Implementation in `_build_mcp_servers`
+set. An explicit value in the saved config is preserved (opt-out for
+users who want approval-on-use). Implementation in
+`_write_codex_mcp_json` / `_build_mcp_servers_for_slot`
 ([server/runtimes/codex.py](../server/runtimes/codex.py)).
+
+**`.mcp.json` is gitignored.** The file is written fresh on every
+subprocess spawn and must not be committed (it contains a live
+`HARNESS_COORD_PROXY_TOKEN` secret). See `.gitignore` root entry
+`# Codex runtime — MCP server config written by the harness...`.
+
+**`_codex_config_overrides` does NOT include `mcp_servers`.** That
+function builds the dict passed to `thread/start` — only keys the
+Codex binary's thread handler actually reads belong there (currently
+`web_search` only). Adding `mcp_servers` here has no effect and would
+mislead future readers.
 
 > **Don't pass `config.plugins`.** Codex's TOML schema treats
 > `plugins` as a map keyed by plugin *name* with `PluginConfig`
@@ -463,10 +488,10 @@ satisfying the SDK's "one active turn consumer per client" constraint.
 Close (`await client.close()`) and re-open on auth-error / transport
 error.
 
-**Cache invalidation on config change.** `mcp_servers` is captured at
-subprocess spawn time via `_codex_config_overrides` → `_build_mcp_servers`,
-so a UI-side MCP server add / patch / delete won't propagate into the
-running subprocess. Two helpers handle this:
+**Cache invalidation on config change.** `.mcp.json` is written at
+subprocess spawn time (inside `get_client`), so a UI-side MCP server
+add / patch / delete won't propagate into the running subprocess. Two
+helpers handle this:
 
 - `evict_client(slot)` — full close on idle slots; cache-pop only when
   a turn is in flight (lets the live turn finish on its own client
@@ -561,6 +586,7 @@ Observed and implemented item_type mapping:
 | `codex` / `apply_patch`                            | `tool_use` (`name=Edit`, `tool=Edit`)   | draft compatibility; unified diff feeds diff@7 |
 | `codex` / `web_search` or `webSearch`              | `tool_use` (`name=WebSearch`, `tool=WebSearch`) | reuse WebSearch card |
 | `tool` / `mcpToolCall` or `mcp_tool_call`          | `tool_use` (`name=mcp__...`, `tool=mcp__...`) + optional `tool_result` | coord_* + external MCPs; unwrap `args`/`arguments`/`input` into renderer input |
+| safety-monitor cancelled/rejected tool result      | `codex_safety_suspected` + `tool_result(is_error=True)` | emitted when a Codex tool payload status/state contains `cancel` or `reject`; keeps monitor refusals queryable separately from ordinary tool failures |
 | stream exhaustion                                  | `result`                   | usage is read from the rollout JSONL pointed to by `thread.read().thread.path` (see §E.5); thread.read fields are unused by SDK 0.3.2 |
 | `CodexTurnInactiveError` raised mid-iteration      | `error` (pre-result) → retry counter |
 | `CodexTimeoutError` / `CodexTransportError`        | `error` (pre-result) -> retry counter; close + reopen client; transport errors include captured app-server stderr tail when available |
@@ -596,6 +622,13 @@ cancellations rendered green and were indistinguishable from real
 successes — Coach historically paraphrased them as generic "rejected
 by the coordination layer" because there was no clean error signal
 to lean on.
+
+When a completed tool item matches the `cancel` / `reject` safety
+heuristic and has result text, CodexRuntime also emits a
+`codex_safety_suspected` event before the corresponding `tool_result`.
+The event carries `tool_use_id`, `item_type`, `tool`, `status`, and the
+result `content` so telemetry consumers can separate suspected OpenAI
+safety-monitor refusals from ordinary command failures.
 
 Substring matching is intentional (handles `cancelled`/`canceled`,
 `user_cancelled`, `cancellation_pending`, `rejected`, etc.); no real

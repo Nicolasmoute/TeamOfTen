@@ -533,6 +533,117 @@ async def test_build_mcp_servers_pre_approves_external_servers() -> None:
     assert "default_tools_approval_mode" not in tc.external_mcp_servers["zeabur"]
 
 
+def test_build_mcp_servers_for_slot_coord_shape() -> None:
+    """_build_mcp_servers_for_slot produces the right coord server config
+    without requiring a TurnContext — used at subprocess spawn time."""
+    from server.runtimes.codex import _build_mcp_servers_for_slot
+
+    servers = _build_mcp_servers_for_slot("p3", "tok_abc123")
+    assert servers["coord"]["type"] == "stdio"
+    assert servers["coord"]["default_tools_approval_mode"] == "approve"
+    assert "--caller-id" in servers["coord"]["args"]
+    idx = servers["coord"]["args"].index("--caller-id")
+    assert servers["coord"]["args"][idx + 1] == "p3"
+    assert servers["coord"]["env"]["HARNESS_COORD_PROXY_TOKEN"] == "tok_abc123"
+    assert servers["coord"]["env"]["PYTHONPATH"]
+
+
+def test_build_mcp_servers_for_slot_external_pre_approved() -> None:
+    """External servers get default_tools_approval_mode='approve' injected."""
+    from server.runtimes.codex import _build_mcp_servers_for_slot
+
+    servers = _build_mcp_servers_for_slot(
+        "coach", "t", {"zeabur": {"type": "stdio", "command": "npx"}}
+    )
+    assert servers["zeabur"]["default_tools_approval_mode"] == "approve"
+    # coord server is always present
+    assert "coord" in servers
+
+
+def test_build_mcp_servers_for_slot_skips_coord_override() -> None:
+    """Passing 'coord' inside external_mcp_servers must not replace the
+    harness-managed coord server."""
+    from server.runtimes.codex import _build_mcp_servers_for_slot
+
+    servers = _build_mcp_servers_for_slot(
+        "p1", "t", {"coord": {"type": "stdio", "command": "evil"}}
+    )
+    # Our coord server, not the caller-supplied one
+    assert servers["coord"]["command"] != "evil"
+    assert "-m" in servers["coord"]["args"]
+
+
+def test_write_codex_mcp_json_creates_file(tmp_path) -> None:
+    """_write_codex_mcp_json writes a valid .mcp.json under cwd."""
+    import json as _json
+    from server.runtimes.codex import _write_codex_mcp_json
+
+    _write_codex_mcp_json("p1", "tok_xyz", str(tmp_path), {"extra": {"command": "x"}})
+
+    dest = tmp_path / ".mcp.json"
+    assert dest.exists()
+    data = _json.loads(dest.read_text())
+    assert "mcpServers" in data
+    assert "coord" in data["mcpServers"]
+    assert "extra" in data["mcpServers"]
+    assert data["mcpServers"]["coord"]["env"]["HARNESS_COORD_PROXY_TOKEN"] == "tok_xyz"
+
+
+def test_write_codex_mcp_json_token_current_on_fresh_spawn(tmp_path) -> None:
+    """Each call to _write_codex_mcp_json overwrites with the latest token,
+    so a new subprocess spawn after close_client always sees the right token."""
+    import json as _json
+    from server.runtimes.codex import _write_codex_mcp_json
+
+    _write_codex_mcp_json("p1", "tok_old", str(tmp_path))
+    _write_codex_mcp_json("p1", "tok_new", str(tmp_path))
+
+    data = _json.loads((tmp_path / ".mcp.json").read_text())
+    assert data["mcpServers"]["coord"]["env"]["HARNESS_COORD_PROXY_TOKEN"] == "tok_new"
+
+
+async def test_get_client_writes_mcp_json(monkeypatch, tmp_path) -> None:
+    """get_client writes .mcp.json to cwd before spawning the subprocess.
+    This is the critical path that makes coord_* tools visible to Codex."""
+    import json as _json
+    _install_fake_sdk(monkeypatch)
+    from server.runtimes.codex import get_client
+
+    await get_client("p1", cwd=str(tmp_path))
+
+    dest = tmp_path / ".mcp.json"
+    assert dest.exists(), ".mcp.json must be written before subprocess spawn"
+    data = _json.loads(dest.read_text())
+    assert "mcpServers" in data
+    assert "coord" in data["mcpServers"]
+    assert data["mcpServers"]["coord"]["type"] == "stdio"
+
+
+def test_config_dict_does_not_contain_mcp_servers() -> None:
+    """The config dict passed to thread/start must NOT contain mcp_servers.
+    The Codex binary ignores that key — MCP config is read from .mcp.json
+    at app-server startup time only."""
+    from server.runtimes.base import TurnContext
+    from server.runtimes.codex import _codex_config_overrides
+
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="hi",
+        system_prompt="",
+        workspace_cwd="",
+        allowed_tools=[],
+        external_mcp_servers={"extra": {"command": "x"}},
+        turn_ctx={},
+    )
+    cfg = _codex_config_overrides(tc)
+    assert "mcp_servers" not in cfg, (
+        "mcp_servers in the thread/start config dict is silently ignored by "
+        "the Codex binary — it must be removed to avoid confusion. "
+        "MCP servers are configured via .mcp.json written by get_client()."
+    )
+
+
 async def test_failed_handshake_does_not_poison_cache(
     monkeypatch, tmp_path,
 ) -> None:
@@ -1085,6 +1196,40 @@ async def test_handle_step_emits_tool_use_for_command_execution(monkeypatch) -> 
     assert captured[1]["content"] == "hi"
 
 
+async def test_handle_step_emits_safety_telemetry_for_cancelled_native_tool(
+    monkeypatch,
+) -> None:
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    step = _FakeStep(
+        step_type="exec",
+        item_type="commandExecution",
+        item_id="cmd_safety",
+        item={
+            "type": "commandExecution",
+            "command": "python risky.py",
+            "status": "cancelled",
+            "output": "OpenAI safety monitor cancelled this command.",
+        },
+    )
+    await handle_step(step, "p1", {})
+
+    assert [event["type"] for event in captured] == [
+        "tool_use",
+        "codex_safety_suspected",
+        "tool_result",
+    ]
+    telemetry = captured[1]
+    assert telemetry["agent_id"] == "p1"
+    assert telemetry["tool_use_id"] == "cmd_safety"
+    assert telemetry["tool"] == "Bash"
+    assert telemetry["item_type"] == "commandExecution"
+    assert telemetry["status"] == "cancelled"
+    assert "safety monitor" in telemetry["content"]
+    assert captured[2]["is_error"] is True
+
+
 async def test_handle_step_emits_tool_use_for_apply_patch(monkeypatch) -> None:
     captured = _capture_emit(monkeypatch)
     from server.runtimes.codex import handle_step
@@ -1271,6 +1416,42 @@ async def test_handle_step_mcp_tool_call_parses_sdk_arguments_and_result(
     assert captured[1]["content"] == '{"ok":true}'
 
 
+async def test_handle_step_emits_safety_telemetry_for_rejected_mcp_tool(
+    monkeypatch,
+) -> None:
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    step = _FakeStep(
+        step_type="tool",
+        item_type="mcpToolCall",
+        item_id="mcp_safety",
+        item={
+            "type": "mcpToolCall",
+            "id": "mcp_safety",
+            "serverName": "coord",
+            "toolName": "coord_send_message",
+            "arguments": '{"to":"coach","body":"status"}',
+            "status": "rejected",
+            "result": [{"type": "text", "text": "rejected by safety monitor"}],
+        },
+    )
+    await handle_step(step, "p1", {})
+
+    assert [event["type"] for event in captured] == [
+        "tool_use",
+        "codex_safety_suspected",
+        "tool_result",
+    ]
+    telemetry = captured[1]
+    assert telemetry["tool_use_id"] == "mcp_safety"
+    assert telemetry["tool"] == "mcp__coord__coord_send_message"
+    assert telemetry["item_type"] == "mcpToolCall"
+    assert telemetry["status"] == "rejected"
+    assert telemetry["content"] == "rejected by safety monitor"
+    assert captured[2]["is_error"] is True
+
+
 def test_step_payload_is_error_detects_cancellation_and_rejection() -> None:
     """OpenAI's Codex safety monitor surfaces a refused tool call as a
     "completed" item with status='cancelled' (or similar) and a prose
@@ -1434,9 +1615,14 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
     get_client_calls: list[dict] = []
     open_thread_calls: list[dict] = []
 
-    async def fake_get_client(slot, *, cwd, env_overrides=None):
+    async def fake_get_client(slot, *, cwd, env_overrides=None, external_mcp_servers=None):
         get_client_calls.append(
-            {"slot": slot, "cwd": cwd, "env_overrides": dict(env_overrides or {})}
+            {
+                "slot": slot,
+                "cwd": cwd,
+                "env_overrides": dict(env_overrides or {}),
+                "external_mcp_servers": external_mcp_servers,
+            }
         )
         return client
 
@@ -1488,6 +1674,7 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
             "slot": "p1",
             "cwd": "C:/work/p1/project",
             "env_overrides": {"OPENAI_API_KEY": "sk-test"},
+            "external_mcp_servers": {"extra": {"command": "extra-mcp"}},
         }
     ]
     config = open_thread_calls[0]["config"]
@@ -1501,18 +1688,11 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
     assert config.kwargs["model"] == "gpt-5.4-mini"
     assert config.kwargs["sandbox"] == "danger-full-access"
     assert "plugins" not in config.kwargs["config"]
-    mcp_servers = config.kwargs["config"]["mcp_servers"]
-    assert mcp_servers["coord"]["type"] == "stdio"
-    assert mcp_servers["coord"]["cwd"]
-    assert mcp_servers["coord"]["env"]["PYTHONPATH"].startswith(mcp_servers["coord"]["cwd"])
-    assert mcp_servers["coord"]["env"]["HARNESS_COORD_PROXY_TOKEN"] == "tok_test"
-    # External MCP server config is passed through, plus an injected
-    # `default_tools_approval_mode='approve'` so Coach (read-only) can
-    # use it. See test_build_mcp_servers_pre_approves_external_servers.
-    assert mcp_servers["extra"] == {
-        "command": "extra-mcp",
-        "default_tools_approval_mode": "approve",
-    }
+    # MCP servers are configured via .mcp.json written by get_client(), NOT via
+    # the thread/start config dict — the Codex binary ignores config["mcp_servers"].
+    # The real get_client is monkeypatched here, so .mcp.json writing is tested
+    # separately in test_write_codex_mcp_json_*.
+    assert "mcp_servers" not in config.kwargs["config"]
 
     assert thread.chat_calls[0]["text"] == "say hello"
     assert thread.chat_calls[0]["user"] == "p1"
@@ -1637,7 +1817,7 @@ async def test_codex_run_turn_consumes_prepared_turn_state(
     get_client_calls: list[dict] = []
     open_thread_calls: list[dict] = []
 
-    async def fake_get_client(slot, *, cwd, env_overrides=None):
+    async def fake_get_client(slot, *, cwd, env_overrides=None, external_mcp_servers=None):
         get_client_calls.append(
             {"slot": slot, "cwd": cwd, "env_overrides": dict(env_overrides or {})}
         )
@@ -1727,7 +1907,7 @@ async def test_codex_run_manual_compact_uses_native_compact(
     cleared: list[str] = []
     client = _CompactFakeClient()
 
-    async def fake_get_client(slot, *, cwd, env_overrides=None):
+    async def fake_get_client(slot, *, cwd, env_overrides=None, external_mcp_servers=None):
         return client
 
     async def fake_set_note(agent_id, note):
@@ -1853,7 +2033,7 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
     notes: list[tuple[str, str | None]] = []
     cleared: list[str] = []
 
-    async def fake_get_client(slot, *, cwd, env_overrides=None):
+    async def fake_get_client(slot, *, cwd, env_overrides=None, external_mcp_servers=None):
         return client
 
     async def fake_set_note(agent_id, note):
@@ -1934,7 +2114,7 @@ async def test_codex_maybe_auto_compact_emits_failed_on_compact_error(
     monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
     monkeypatch.setenv("HARNESS_AUTO_COMPACT_THRESHOLD", "0.7")
 
-    async def fake_get_client(slot, *, cwd, env_overrides=None):
+    async def fake_get_client(slot, *, cwd, env_overrides=None, external_mcp_servers=None):
         return _RaisingCompactClient()
 
     async def fake_close_client(slot):

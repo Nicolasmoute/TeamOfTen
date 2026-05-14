@@ -29,3 +29,7 @@ Thumbs.db
 
 # Retired specs — kept locally for reference, not tracked
 Docs/Deprecated/
+
+# Codex runtime — MCP server config written by the harness to each
+# per-slot worktree before spawning `codex app-server`.  Never commit.
+.mcp.json
