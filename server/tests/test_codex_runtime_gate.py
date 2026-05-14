@@ -1085,6 +1085,40 @@ async def test_handle_step_emits_tool_use_for_command_execution(monkeypatch) -> 
     assert captured[1]["content"] == "hi"
 
 
+async def test_handle_step_emits_safety_telemetry_for_cancelled_native_tool(
+    monkeypatch,
+) -> None:
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    step = _FakeStep(
+        step_type="exec",
+        item_type="commandExecution",
+        item_id="cmd_safety",
+        item={
+            "type": "commandExecution",
+            "command": "python risky.py",
+            "status": "cancelled",
+            "output": "OpenAI safety monitor cancelled this command.",
+        },
+    )
+    await handle_step(step, "p1", {})
+
+    assert [event["type"] for event in captured] == [
+        "tool_use",
+        "codex_safety_suspected",
+        "tool_result",
+    ]
+    telemetry = captured[1]
+    assert telemetry["agent_id"] == "p1"
+    assert telemetry["tool_use_id"] == "cmd_safety"
+    assert telemetry["tool"] == "Bash"
+    assert telemetry["item_type"] == "commandExecution"
+    assert telemetry["status"] == "cancelled"
+    assert "safety monitor" in telemetry["content"]
+    assert captured[2]["is_error"] is True
+
+
 async def test_handle_step_emits_tool_use_for_apply_patch(monkeypatch) -> None:
     captured = _capture_emit(monkeypatch)
     from server.runtimes.codex import handle_step
@@ -1269,6 +1303,42 @@ async def test_handle_step_mcp_tool_call_parses_sdk_arguments_and_result(
     assert captured[1]["type"] == "tool_result"
     assert captured[1]["tool_use_id"] == "mcp_call_real"
     assert captured[1]["content"] == '{"ok":true}'
+
+
+async def test_handle_step_emits_safety_telemetry_for_rejected_mcp_tool(
+    monkeypatch,
+) -> None:
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    step = _FakeStep(
+        step_type="tool",
+        item_type="mcpToolCall",
+        item_id="mcp_safety",
+        item={
+            "type": "mcpToolCall",
+            "id": "mcp_safety",
+            "serverName": "coord",
+            "toolName": "coord_send_message",
+            "arguments": '{"to":"coach","body":"status"}',
+            "status": "rejected",
+            "result": [{"type": "text", "text": "rejected by safety monitor"}],
+        },
+    )
+    await handle_step(step, "p1", {})
+
+    assert [event["type"] for event in captured] == [
+        "tool_use",
+        "codex_safety_suspected",
+        "tool_result",
+    ]
+    telemetry = captured[1]
+    assert telemetry["tool_use_id"] == "mcp_safety"
+    assert telemetry["tool"] == "mcp__coord__coord_send_message"
+    assert telemetry["item_type"] == "mcpToolCall"
+    assert telemetry["status"] == "rejected"
+    assert telemetry["content"] == "rejected by safety monitor"
+    assert captured[2]["is_error"] is True
 
 
 def test_step_payload_is_error_detects_cancellation_and_rejection() -> None:

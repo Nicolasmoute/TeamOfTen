@@ -561,6 +561,7 @@ Observed and implemented item_type mapping:
 | `codex` / `apply_patch`                            | `tool_use` (`name=Edit`, `tool=Edit`)   | draft compatibility; unified diff feeds diff@7 |
 | `codex` / `web_search` or `webSearch`              | `tool_use` (`name=WebSearch`, `tool=WebSearch`) | reuse WebSearch card |
 | `tool` / `mcpToolCall` or `mcp_tool_call`          | `tool_use` (`name=mcp__...`, `tool=mcp__...`) + optional `tool_result` | coord_* + external MCPs; unwrap `args`/`arguments`/`input` into renderer input |
+| safety-monitor cancelled/rejected tool result      | `codex_safety_suspected` + `tool_result(is_error=True)` | emitted when a Codex tool payload status/state contains `cancel` or `reject`; keeps monitor refusals queryable separately from ordinary tool failures |
 | stream exhaustion                                  | `result`                   | usage is read from the rollout JSONL pointed to by `thread.read().thread.path` (see §E.5); thread.read fields are unused by SDK 0.3.2 |
 | `CodexTurnInactiveError` raised mid-iteration      | `error` (pre-result) → retry counter |
 | `CodexTimeoutError` / `CodexTransportError`        | `error` (pre-result) -> retry counter; close + reopen client; transport errors include captured app-server stderr tail when available |
@@ -596,6 +597,13 @@ cancellations rendered green and were indistinguishable from real
 successes — Coach historically paraphrased them as generic "rejected
 by the coordination layer" because there was no clean error signal
 to lean on.
+
+When a completed tool item matches the `cancel` / `reject` safety
+heuristic and has result text, CodexRuntime also emits a
+`codex_safety_suspected` event before the corresponding `tool_result`.
+The event carries `tool_use_id`, `item_type`, `tool`, `status`, and the
+result `content` so telemetry consumers can separate suspected OpenAI
+safety-monitor refusals from ordinary command failures.
 
 Substring matching is intentional (handles `cancelled`/`canceled`,
 `user_cancelled`, `cancellation_pending`, `rejected`, etc.); no real
