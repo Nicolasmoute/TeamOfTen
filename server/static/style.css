@@ -3113,6 +3113,7 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 }
 .pane-settings-actions button:hover { border-color: var(--accent); }
 .pane-settings-reset { color: var(--muted); }
+.pane-settings-cancel { color: var(--muted); }
 
 .pane-body {
   flex: 1 1 auto;

@@ -3805,7 +3805,13 @@ Pane settings:
 - Model override.
 - Plan mode toggle.
 - Effort selector 1 to 4.
+- Thinking toggle (Claude only).
 - Agent brief editor.
+- Three action buttons: **Cancel** (discards model/plan/effort/thinking changes
+  made since the popover opened, via snapshot-restore; does NOT undo runtime
+  changes which fire API immediately), **clear overrides** (resets all
+  pane-local overrides to empty), **done** (closes the popover keeping all
+  staged changes).
 
 ### 16.4 Slash Commands
 

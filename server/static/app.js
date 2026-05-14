@@ -603,6 +603,11 @@ function PaneSettingsPopover({
     ? !!settings.thinking
     : !!effectiveThinking;
   const rootRef = useRef(null);
+  // Snapshot of settings at popover-open time. Cancel restores to this,
+  // discarding any model/planMode/effort/thinking changes without an API call.
+  // Runtime changes fire an API immediately on radio change and cannot be
+  // undone via Cancel — the runtime-reset button is the escape hatch there.
+  const _settingsSnapshot = useRef(settings);
   const [briefDraft, setBriefDraft] = useState(initialBrief || "");
   const [briefSaving, setBriefSaving] = useState(false);
   const [briefSavedAt, setBriefSavedAt] = useState(null);
@@ -916,6 +921,11 @@ function PaneSettingsPopover({
         </div>
       </div>
       <div class="pane-settings-actions">
+        <button
+          class="pane-settings-cancel"
+          onClick=${() => { onChange(_settingsSnapshot.current); onClose(); }}
+          title="Discard model, plan mode, effort, and thinking changes made since opening. Runtime changes cannot be undone here."
+        >cancel</button>
         <button
           class="pane-settings-reset"
           onClick=${() => onChange({})}
