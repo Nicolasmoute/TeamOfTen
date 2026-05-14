@@ -2323,6 +2323,11 @@ def _trajectory_marker(trajectory_json: Any, current_stage: str | None) -> str:
     return "→".join(tokens)
 
 
+# Maximum number of tasks shown in the `## Active task health` Coach block.
+# Caps O(N_tasks) growth to O(1) — H1 efficiency fix (2026-05-14).
+ACTIVE_TASK_HEALTH_CAP = 3
+
+
 async def _build_active_task_health_rows(
     project_id: str,
 ) -> list[dict[str, Any]]:
@@ -2339,6 +2344,7 @@ async def _build_active_task_health_rows(
             cur = await c.execute(
                 """
                 SELECT t.id AS task_id, t.title, t.owner AS executor,
+                       t.last_stage_change_at,
                        SUM(CASE WHEN tra.role = 'auditor_syntax'
                                 AND tra.verdict = 'fail'
                            THEN 1 ELSE 0 END) AS syntax_fails,
@@ -2389,11 +2395,17 @@ async def _build_active_task_health_rows(
                     "latest_verdict": r.get("latest_verdict") or "?",
                     "executor_effort": effort,
                     "executor_model": model,
+                    "last_stage_change_at": r.get("last_stage_change_at") or "",
                 })
         finally:
             await c.close()
     except Exception:
         return []
+    # Sort by fail_count DESC, tiebreak by last_stage_change_at DESC.
+    rows.sort(
+        key=lambda r: (r["kind_fail_count"], r.get("last_stage_change_at") or ""),
+        reverse=True,
+    )
     return rows
 
 
@@ -3663,11 +3675,16 @@ async def _build_coach_coordination_block(
         lines.append("")
 
     # ---- Active task health (kind_fail_count >= 2) -----------------
+    # Rows already sorted by fail_count DESC, tiebreak recency DESC.
+    # Cap to top-3 to keep Coach's coordination block O(1) regardless
+    # of how many active tasks exist (H1 efficiency fix, 2026-05-14).
     health_rows = await _build_active_task_health_rows(active)
     if health_rows:
+        shown = health_rows[:ACTIVE_TASK_HEALTH_CAP]
+        overflow = len(health_rows) - len(shown)
         lines.append("## Active task health")
         lines.append("")
-        for row in health_rows:
+        for row in shown:
             effort = row.get("executor_effort") or "default"
             model = row.get("executor_model") or "default"
             lines.append(
@@ -3676,6 +3693,8 @@ async def _build_coach_coordination_block(
                 f"{row['kind']} fail count {row['kind_fail_count']} "
                 f"(latest verdict: {row['latest_verdict']})"
             )
+        if overflow:
+            lines.append(f"(+{overflow} more)")
         lines.append("")
 
     # ---- Audit history (§11.2, position 5 in v2 §14 ordering) -----

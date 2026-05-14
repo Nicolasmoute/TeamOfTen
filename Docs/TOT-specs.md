@@ -1727,6 +1727,19 @@ Built in `agents.py` for Coach turns. It includes:
 - Wiki paths.
 - Reminder to assign roles and coordinate.
 
+**Active task health rollup** (`## Active task health` sub-section,
+`_build_active_task_health_rows` in `server/agents.py`):
+Surfaces tasks where the same audit kind has failed ≥ 2 times —
+the first fail is expected correction noise; the second is signal.
+The rollup is capped at the top **3** tasks sorted by
+`kind_fail_count` descending, with tiebreaker on
+`last_stage_change_at` descending (most recently active first).
+Fewer than 3 qualifying tasks → only those with a signal are shown.
+More than 3 qualifying tasks → the three highest-fail-count tasks
+are shown and a `(+N more)` footer line counts the remainder.
+The cap is enforced by the constant `ACTIVE_TASK_HEALTH_CAP = 3`
+in `server/agents.py`.
+
 ### 10.3 Compact and Continuity
 
 Manual compact:
