@@ -402,6 +402,18 @@ async def lifespan(app: FastAPI):
         await start_escalation_watcher()
     except Exception:
         logger.exception("telegram escalation watcher failed to start (non-fatal)")
+    # Wiki INDEX.md file watcher — polls /data/wiki/ every
+    # HARNESS_WIKI_WATCHER_INTERVAL seconds (default 30) and rebuilds
+    # INDEX.md when any wiki .md file is newer than the current index.
+    # Runtime-independent: catches writes from Claude Write tool,
+    # Codex apply_patch, Bash, kDrive sync, etc. The ClaudeRuntime
+    # PostToolUse hook that previously handled this was removed;
+    # this watcher is the single source of truth.
+    from server.wiki_watcher import start_wiki_watcher, stop_wiki_watcher
+    try:
+        await start_wiki_watcher()
+    except Exception:
+        logger.exception("wiki watcher failed to start (non-fatal)")
     # Kanban auto-advance subscriber — listens for commit_pushed /
     # audit_report_submitted / task_shipped / compass_audit_logged
     # events and applies the resulting stage transitions. Sibling of
@@ -490,6 +502,10 @@ async def lifespan(app: FastAPI):
             await stop_telegram_bridge()
         except Exception:
             logger.exception("telegram bridge shutdown failed")
+        try:
+            await stop_wiki_watcher()
+        except Exception:
+            logger.exception("wiki watcher shutdown failed")
         try:
             await stop_audit_watcher()
         except Exception:

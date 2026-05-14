@@ -4730,44 +4730,6 @@ async def _pretool_secret_guard_hook(
         return {}
 
 
-async def _posttool_wiki_index_hook(
-    input_data: dict[str, Any],
-    tool_use_id: str | None,
-    context: Any,
-) -> dict[str, Any]:
-    """Rebuild /data/wiki/INDEX.md after an agent Write/Edit/MultiEdit/
-    NotebookEdit lands under the wiki tree. The harness's HTTP file-write
-    endpoint already triggers this; agent SDK tool calls bypass that
-    endpoint, so without this hook the auto-update the wiki skill
-    promises never fires for the most common writer (the agent itself)."""
-    try:
-        tool_input = input_data.get("tool_input") or {}
-        path_str = (
-            tool_input.get("file_path")
-            or tool_input.get("notebook_path")
-            or ""
-        )
-        if not path_str:
-            return {}
-        from server.paths import global_paths, update_wiki_index
-
-        gp = global_paths()
-        wiki_root = gp.wiki.resolve()
-        try:
-            target = Path(path_str).resolve()
-        except OSError:
-            return {}
-        try:
-            target.relative_to(wiki_root)
-        except ValueError:
-            return {}
-        if target == gp.wiki_index.resolve():
-            return {}
-        await asyncio.to_thread(update_wiki_index)
-    except Exception:
-        logger.exception("posttool wiki index rebuild failed (non-fatal)")
-    return {}
-
 
 def _normalize_question_payload(input_data: dict[str, Any]) -> list[dict[str, Any]]:
     """Take AskUserQuestion's input (may be dict[{"questions": [...]}]

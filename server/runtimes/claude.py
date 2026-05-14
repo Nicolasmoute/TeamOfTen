@@ -117,7 +117,6 @@ class ClaudeRuntime:
             _get_recent_exchanges,
             _handle_message,
             _now,
-            _posttool_wiki_index_hook,
             _pretool_continue_hook,
             _pretool_file_guard_hook,
             _pretool_secret_guard_hook,
@@ -163,12 +162,7 @@ class ClaudeRuntime:
                         hooks=[_pretool_secret_guard_hook],
                     ),
                 ],
-                "PostToolUse": [
-                    HookMatcher(
-                        matcher=r"^(Write|Edit|MultiEdit|NotebookEdit)$",
-                        hooks=[_posttool_wiki_index_hook],
-                    )
-                ],
+                "PostToolUse": [],
             },
         )
         # Partial-message streaming — on by default. Set

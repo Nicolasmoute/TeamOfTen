@@ -1182,7 +1182,8 @@ The LLM-Wiki skill is copied from `server/templates/llm_wiki_skill.md`.
 The global CLAUDE.md is copied from `server/templates/global_claude_md.md`.
 Both are first-write-only.
 
-`/data/wiki/INDEX.md` is auto-rebuilt on wiki writes and on boot. Agents should
+`/data/wiki/INDEX.md` is auto-rebuilt on wiki writes and on boot by the
+`wiki_watcher` background task (`server/wiki_watcher.py`). Agents should
 not edit it directly.
 
 ### 8.2 Project Tree
@@ -1489,15 +1490,21 @@ Write rules:
 - WebDAV mirroring happens later through project/global sync loops.
 - `file_written` event emitted by API.
 - Wiki writes trigger `update_wiki_index()` unless writing `INDEX.md` itself.
-  Triggers fire on three paths: (1) the HTTP file-write endpoint above
-  (UI Files-pane writes), (2) project creation in `projects_api.py`,
-  and (3) a `PostToolUse` SDK hook in `server/agents.py` matching
-  `Write|Edit|MultiEdit|NotebookEdit` whose tool_input path resolves
-  under `global_paths().wiki` — this last one is what catches agent
-  Write tool calls (which go through the SDK directly to disk and
-  bypass the HTTP write endpoint). `POST /api/wiki/reindex` is the
-  manual catch-all for external writers (cloud sync from another
-  machine, snapshot restore, manual `cp` into the tree).
+  Triggers fire on two paths: (1) the HTTP file-write endpoint above
+  (UI Files-pane writes), (2) project creation in `projects_api.py`.
+  Additionally, the **Wiki INDEX.md watcher** (`server/wiki_watcher.py`)
+  is a background task that polls `/data/wiki/` every
+  `HARNESS_WIKI_WATCHER_INTERVAL` seconds (default 30) and rebuilds
+  `INDEX.md` whenever any `.md` file in the tree is newer than the current
+  index. This makes INDEX.md maintenance **runtime-independent**: it fires
+  regardless of whether the write came from a Claude `Write` tool, a Codex
+  `apply_patch`, a Bash command, or a kDrive sync — none of which route
+  through the HTTP endpoint. The `PostToolUse` ClaudeRuntime hook that
+  previously handled Claude-side agent writes has been removed; the watcher
+  is the single source of truth. Kill-switch: `HARNESS_WIKI_WATCHER_ENABLED=false`.
+  `POST /api/wiki/reindex` remains the "force rebuild now" escape hatch for
+  external writers (cloud sync from another machine, snapshot restore,
+  manual `cp` into the tree).
 
 The `global` tree hides noisy/sensitive top-level entries:
 
