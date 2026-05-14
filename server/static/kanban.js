@@ -969,8 +969,13 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
   const descTruncated = desc.length > _BACKLOG_DESC_PREVIEW && !expanded;
   const descVisible = descTruncated ? desc.slice(0, _BACKLOG_DESC_PREVIEW) + "…" : desc;
 
+  const pri = entry.priority || "normal";
+
   return html`
-    <div class="kbn-card kbn-backlog-card">
+    <div
+      class="kbn-card kbn-backlog-card kbn-backlog-pri-${pri}${expanded ? " expanded" : ""}"
+      onClick=${!editing ? () => setExpanded(!expanded) : undefined}
+    >
       ${editing
         ? html`
           <div class="kbn-backlog-edit">
@@ -1003,16 +1008,13 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
           </div>`
         : html`
           <div class="kbn-card-title">${entry.title}</div>
-          ${desc ? html`
-            <div class="kbn-backlog-desc">${descVisible}${descTruncated || (desc.length > _BACKLOG_DESC_PREVIEW && expanded)
-              ? html`<button class="kbn-backlog-expand-btn" onClick=${() => setExpanded(!expanded)}>
-                  ${expanded ? " less" : " more"}
-                </button>`
-              : null}
-            </div>` : null}
+          ${expanded && desc ? html`
+            <div class="kbn-backlog-desc">${desc}</div>` : null}
           <div class="kbn-card-meta">
+            <span class="kbn-backlog-priority-chip kbn-backlog-pri-${pri}">${pri.toUpperCase()}</span>
             <span class="kbn-backlog-proposer">${proposerLabel}</span>
             <span class="kbn-card-age">${timeAgo(entry.proposed_at)}</span>
+            ${desc && !expanded ? html`<span class="kbn-backlog-has-desc" title="Has description">…</span>` : null}
           </div>
           <div class="kbn-card-actions kbn-backlog-actions">
             <button class="kbn-card-act-btn" title="Edit" onClick=${startEdit}>${_PENCIL_SVG}</button>
