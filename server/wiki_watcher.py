@@ -55,7 +55,14 @@ def _watcher_interval() -> int:
 
 
 def _needs_rebuild(wiki: Path, index: Path) -> bool:
-    """Return True when any wiki .md file is newer than INDEX.md (or INDEX is missing)."""
+    """Return True when any wiki .md file is newer than INDEX.md (or INDEX is missing).
+
+    Design note: update_wiki_index() (server/paths.py) maintains a SINGLE master
+    INDEX.md at /data/wiki/INDEX.md covering both cross-project (/data/wiki/*.md)
+    and per-project (/data/wiki/<slug>/*.md) entries in one file.  There are no
+    per-project INDEX files, so comparing every source .md against the one
+    INDEX.md is both necessary and sufficient.
+    """
     if not index.exists():
         return True
     try:
