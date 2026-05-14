@@ -762,6 +762,19 @@ async def _is_locked(agent_id: str) -> bool:
     return bool(dict(row).get("locked"))
 
 
+async def _set_agent_role_tools(c: Any, agent_id: str, role: str | None) -> None:
+    from server.role_tool_allowlists import tools_json_for_role
+
+    await c.execute(
+        "UPDATE agents SET allowed_tools = ? WHERE id = ?",
+        (tools_json_for_role(role), agent_id),
+    )
+
+
+async def _reset_agent_idle_tools(c: Any, agent_id: str) -> None:
+    await _set_agent_role_tools(c, agent_id, "idle")
+
+
 def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) -> Any:
     """Build an in-process MCP server whose tools know which agent is calling.
 
@@ -2355,6 +2368,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     "AND superseded_by IS NULL",
                     (_now_iso(), kanban_task_id, caller_id),
                 )
+                await _reset_agent_idle_tools(c, caller_id)
                 await c.commit()
             finally:
                 await c.close()
@@ -5957,6 +5971,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "WHERE id = ?",
                 (rel, verdict, submitted_at, assignment_id),
             )
+            await _reset_agent_idle_tools(c, effective_auditor)
             await c.execute(
                 "UPDATE tasks SET latest_audit_report_path = ?, "
                 "latest_audit_kind = ?, latest_audit_verdict = ? "
@@ -7061,6 +7076,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                         "WHERE id = ? AND current_task_id IS NULL",
                         (task_id, assignee),
                     )
+                for displaced in set(displaced_source + displaced_target):
+                    if displaced != assignee:
+                        await _reset_agent_idle_tools(c, displaced)
+                await _set_agent_role_tools(c, assignee, target_role)
             await c.commit()
         finally:
             await c.close()
@@ -7564,6 +7583,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                         "SET completed_at = ? WHERE id = ?",
                         (_now_iso(), role_id),
                     )
+                await _reset_agent_idle_tools(c, caller_id)
             else:
                 if not target_role:
                     return _err(
@@ -7592,6 +7612,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     "WHERE id = ?",
                     (now, role_id),
                 )
+                await _reset_agent_idle_tools(c, caller_id)
             if artifact_path:
                 cur = await c.execute(
                     "SELECT artifacts FROM tasks "

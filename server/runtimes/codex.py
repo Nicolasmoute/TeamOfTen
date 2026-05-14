@@ -57,7 +57,7 @@ _client_locks: dict[str, asyncio.Lock] = {}
 
 # Bump when the Codex-visible coord tool contract changes in a way that
 # old persisted Codex threads might not pick up on resume.
-_CODEX_TOOL_CONTRACT_VERSION = "2026-05-14.codex-memory-salvage"
+_CODEX_TOOL_CONTRACT_VERSION = "2026-05-14.role-tool-allowlists"
 
 
 class _CapturedStdioTransport:
@@ -248,6 +248,7 @@ async def get_client(
     cwd: str,
     env_overrides: dict[str, str] | None = None,
     external_mcp_servers: dict[str, Any] | None = None,
+    allowed_tools: list[str] | None = None,
 ) -> Any:
     """Return a started, initialized `CodexClient` for `slot`.
 
@@ -294,7 +295,13 @@ async def get_client(
         # The Codex binary discovers MCP servers via this file at startup.
         # Passing mcp_servers inside the thread/start config dict is a
         # no-op — the binary's thread/start handler does not read that key.
-        _write_codex_mcp_json(slot, token, cwd, external_mcp_servers)
+        _write_codex_mcp_json(
+            slot,
+            token,
+            cwd,
+            external_mcp_servers,
+            allowed_tools,
+        )
 
         _install_captured_stdio_transport(sdk)
         client = sdk.CodexClient.connect_stdio(
@@ -1060,37 +1067,67 @@ def _coord_mcp_env_for_slot(agent_id: str, token: str) -> dict[str, str]:
     }
 
 
+def _coord_allowed_tool_names(allowed_tools: list[str] | None) -> list[str]:
+    prefix = "mcp__coord__"
+    names = [
+        tool[len(prefix):]
+        for tool in (allowed_tools or [])
+        if isinstance(tool, str) and tool.startswith(prefix)
+    ]
+    return list(dict.fromkeys(names))
+
+
+def _mcp_server_allowed_by_tools(server_name: str, allowed_tools: set[str]) -> bool:
+    prefix = f"mcp__{server_name}__"
+    return any(tool.startswith(prefix) for tool in allowed_tools)
+
+
 def _build_mcp_servers_for_slot(
     agent_id: str,
     token: str,
     external_mcp_servers: dict[str, Any] | None = None,
+    allowed_tools: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the MCP server config dict keyed by server name.
 
     Unlike `_build_mcp_servers` (which requires a full TurnContext), this
-    variant only needs the slot identity + the coord-proxy token.  Used by
-    `_write_codex_mcp_json` which runs at subprocess-spawn time, before any
-    thread (and therefore before any TurnContext) exists.
+    variant uses only spawn-time inputs. Used by `_write_codex_mcp_json`
+    which runs before any thread exists.
     """
     servers: dict[str, Any] = {}
     root = _harness_root()
-    servers["coord"] = {
+    coord_allowed = _coord_allowed_tool_names(allowed_tools)
+    coord_args = [
+        "-m",
+        "server.coord_mcp",
+        "--caller-id",
+        agent_id,
+        "--proxy-url",
+        _coord_proxy_url(),
+    ]
+    if coord_allowed:
+        coord_args.extend(
+            ["--allowed-tools", json.dumps(coord_allowed, separators=(",", ":"))]
+        )
+    coord_server: dict[str, Any] = {
         "type": "stdio",
         "command": sys.executable,
         "cwd": root,
-        "args": [
-            "-m",
-            "server.coord_mcp",
-            "--caller-id",
-            agent_id,
-            "--proxy-url",
-            _coord_proxy_url(),
-        ],
+        "args": coord_args,
         "env": _coord_mcp_env_for_slot(agent_id, token),
         "default_tools_approval_mode": "approve",
     }
+    if coord_allowed:
+        # Codex understands per-server enabled_tools in MCP config. This
+        # keeps the app-server's schema/tool-registration path role-scoped
+        # instead of relying only on the coord proxy rejecting calls later.
+        coord_server["enabled_tools"] = coord_allowed
+    servers["coord"] = coord_server
+    allowed = set(allowed_tools or [])
     for name, cfg in (external_mcp_servers or {}).items():
         if name == "coord":
+            continue
+        if allowed and not _mcp_server_allowed_by_tools(name, allowed):
             continue
         if isinstance(cfg, dict) and "default_tools_approval_mode" not in cfg:
             cfg = {**cfg, "default_tools_approval_mode": "approve"}
@@ -1103,6 +1140,7 @@ def _write_codex_mcp_json(
     token: str,
     cwd: str,
     external_mcp_servers: dict[str, Any] | None = None,
+    allowed_tools: list[str] | None = None,
 ) -> None:
     """Write `.mcp.json` to the Codex app-server's working directory.
 
@@ -1118,7 +1156,12 @@ def _write_codex_mcp_json(
     File format (camelCase key per Codex convention):
         {"mcpServers": {"coord": {...}, ...}}
     """
-    servers = _build_mcp_servers_for_slot(agent_id, token, external_mcp_servers)
+    servers = _build_mcp_servers_for_slot(
+        agent_id,
+        token,
+        external_mcp_servers,
+        allowed_tools,
+    )
     mcp_json = {"mcpServers": servers}
     dest = Path(cwd) / ".mcp.json"
     try:
@@ -1132,50 +1175,12 @@ def _write_codex_mcp_json(
 
 
 def _build_mcp_servers(tc: TurnContext) -> dict[str, Any]:
-    servers: dict[str, Any] = {}
-    root = _harness_root()
-    servers["coord"] = {
-        "type": "stdio",
-        "command": sys.executable,
-        "cwd": root,
-        "args": [
-            "-m",
-            "server.coord_mcp",
-            "--caller-id",
-            tc.agent_id,
-            "--proxy-url",
-            _coord_proxy_url(),
-        ],
-        "env": _coord_mcp_env(tc),
-        # Pre-approve every coord_* tool. Without this, Codex routes
-        # MCP calls through the elicitation/approval path under
-        # restrictive sandboxes (Coach is read-only) and the embedded
-        # client has no user-input handler — the call is auto-cancelled
-        # with "user rejected MCP tool call". coord_* is harness-trusted
-        # by definition (single write-handle invariant), so blanket
-        # approval is the right default. See openai/codex issue #16685
-        # and PR #16632 for the upstream context.
-        "default_tools_approval_mode": "approve",
-    }
-    for name, cfg in (tc.external_mcp_servers or {}).items():
-        if name == "coord":
-            continue
-        # Mirror the approval policy applied to `coord`: external MCP
-        # servers added through the Options drawer are user-authorized
-        # by the act of adding them, so pre-approve their tool calls.
-        # Without this, Coach (read-only sandbox) can't invoke any
-        # external MCP tool — Codex routes the call through the
-        # elicitation/approval path, the embedded app-server client
-        # has no `request_user_input` handler, and the call is
-        # auto-cancelled with "user rejected MCP tool call". Players
-        # (danger-full-access) skip approval so they're unaffected
-        # either way. Caller-provided `default_tools_approval_mode` is
-        # respected if present (so a user who explicitly wants
-        # approval-on-use can keep it).
-        if isinstance(cfg, dict) and "default_tools_approval_mode" not in cfg:
-            cfg = {**cfg, "default_tools_approval_mode": "approve"}
-        servers[name] = cfg
-    return servers
+    return _build_mcp_servers_for_slot(
+        tc.agent_id,
+        _coord_mcp_env(tc)["HARNESS_COORD_PROXY_TOKEN"],
+        tc.external_mcp_servers,
+        tc.allowed_tools,
+    )
 
 
 _CODEX_CLAUDE_COMPAT_INSTRUCTIONS = """## Codex compatibility note
@@ -1190,12 +1195,15 @@ directories because they use Claude naming.
 """
 
 
-def _codex_developer_instructions(system_prompt: str | None) -> str:
+def _codex_developer_instructions(
+    system_prompt: str | None,
+    allowed_tools: list[str] | None = None,
+) -> str:
     body = (system_prompt or "").strip()
     compat = (
         _CODEX_CLAUDE_COMPAT_INSTRUCTIONS
         + "\n\n"
-        + _codex_coord_tool_instructions()
+        + _codex_coord_tool_instructions(allowed_tools)
         + "\n\n"
         + _codex_web_tool_instructions()
     )
@@ -1224,10 +1232,18 @@ def _codex_web_tool_instructions() -> str:
     )
 
 
-def _codex_coord_tool_instructions() -> str:
+def _codex_coord_tool_instructions(allowed_tools: list[str] | None) -> str:
     try:
-        from server.tools import coord_tool_names
-        names = coord_tool_names()
+        if allowed_tools is None:
+            from server.tools import coord_tool_names
+            names = coord_tool_names()
+        else:
+            prefix = "mcp__coord__"
+            names = [
+                tool[len(prefix):]
+                for tool in allowed_tools
+                if isinstance(tool, str) and tool.startswith(prefix)
+            ]
     except Exception:
         logger.exception("CodexRuntime: failed to build coord tool instruction list")
         names = []
@@ -1288,7 +1304,10 @@ def _build_thread_config(sdk: Any, tc: TurnContext) -> Any:
     """Build the SDK ThreadConfig while tolerating fake SDKs in tests."""
     kwargs: dict[str, Any] = {
         "cwd": tc.workspace_cwd or None,
-        "developer_instructions": _codex_developer_instructions(tc.system_prompt),
+        "developer_instructions": _codex_developer_instructions(
+            tc.system_prompt,
+            tc.allowed_tools,
+        ),
         "approval_policy": "never",
         "sandbox": _codex_sandbox_for(tc.agent_id),
         "config": _codex_config_overrides(tc),
@@ -1771,6 +1790,7 @@ class CodexRuntime:
                 cwd=tc.workspace_cwd,
                 env_overrides=env_overrides,
                 external_mcp_servers=tc.external_mcp_servers,
+                allowed_tools=tc.allowed_tools,
             )
             config = _build_thread_config(sdk, tc)
             turn_overrides = _build_turn_overrides(sdk, tc)
@@ -1899,6 +1919,7 @@ class CodexRuntime:
                 cwd=tc.workspace_cwd,
                 env_overrides=env_overrides,
                 external_mcp_servers=tc.external_mcp_servers,
+                allowed_tools=tc.allowed_tools,
             )
             config = _build_thread_config(sdk, tc)
             turn_overrides = _build_turn_overrides(sdk, tc)
@@ -2247,6 +2268,7 @@ class CodexRuntime:
                 cwd=str(await workspace_dir(tc.agent_id)),
                 env_overrides=env_overrides,
                 external_mcp_servers=tc.external_mcp_servers,
+                allowed_tools=tc.allowed_tools,
             )
         except ImportError as exc:
             await _emit(

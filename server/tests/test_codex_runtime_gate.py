@@ -7,6 +7,8 @@ flag is unset.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from server.runtimes import CodexRuntime, get_runtime, is_codex_enabled
@@ -560,6 +562,37 @@ def test_build_mcp_servers_for_slot_external_pre_approved() -> None:
     assert "coord" in servers
 
 
+def test_build_mcp_servers_for_slot_filters_by_allowed_tools() -> None:
+    from server.runtimes.codex import _build_mcp_servers_for_slot
+
+    servers = _build_mcp_servers_for_slot(
+        "p1",
+        "tok",
+        {
+            "github": {"type": "stdio", "command": "github-mcp"},
+            "slack": {"type": "stdio", "command": "slack-mcp"},
+        },
+        [
+            "mcp__coord__coord_my_assignments",
+            "mcp__coord__coord_commit_push",
+            "mcp__github__list_issues",
+        ],
+    )
+
+    args = servers["coord"]["args"]
+    allowed_arg = args[args.index("--allowed-tools") + 1]
+    assert json.loads(allowed_arg) == [
+        "coord_my_assignments",
+        "coord_commit_push",
+    ]
+    assert servers["coord"]["enabled_tools"] == [
+        "coord_my_assignments",
+        "coord_commit_push",
+    ]
+    assert "github" in servers
+    assert "slack" not in servers
+
+
 def test_build_mcp_servers_for_slot_skips_coord_override() -> None:
     """Passing 'coord' inside external_mcp_servers must not replace the
     harness-managed coord server."""
@@ -642,7 +675,6 @@ def test_config_dict_does_not_contain_mcp_servers() -> None:
         "the Codex binary — it must be removed to avoid confusion. "
         "MCP servers are configured via .mcp.json written by get_client()."
     )
-
 
 async def test_failed_handshake_does_not_poison_cache(
     monkeypatch, tmp_path,
@@ -1659,7 +1691,12 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
         prompt="say hello",
         system_prompt="system rules",
         workspace_cwd="C:/work/p1/project",
-        allowed_tools=["Bash", "Edit"],
+        allowed_tools=[
+            "Bash",
+            "Edit",
+            "mcp__coord__coord_read_inbox",
+            "mcp__extra__ping",
+        ],
         external_mcp_servers={"extra": {"command": "extra-mcp"}},
         model="gpt-5.4-mini",
         effort=4,

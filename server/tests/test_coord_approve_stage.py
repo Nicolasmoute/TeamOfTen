@@ -348,6 +348,37 @@ async def test_approve_stage_supersedes_prior_target_role_with_stand_down(
         await c.close()
 
 
+async def test_approve_stage_sets_role_allowed_tools_and_idles_displaced(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed_task(status="plan")
+    await _plant_role(task_id="t-2026-05-07-aaaa1111", role="executor", owner="p3")
+
+    server = _server_for("coach")
+    _ok_text(await _handler(server, "approve_stage")({
+        "task_id": "t-2026-05-07-aaaa1111",
+        "next_stage": "execute",
+        "assignee": "p2",
+        "note": "assign executor",
+    }))
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT id, allowed_tools FROM agents WHERE id IN ('p2', 'p3')"
+        )
+        rows = {dict(r)["id"]: dict(r) for r in await cur.fetchall()}
+    finally:
+        await c.close()
+
+    p2_tools = set(json.loads(rows["p2"]["allowed_tools"]))
+    p3_tools = set(json.loads(rows["p3"]["allowed_tools"]))
+    assert "mcp__coord__coord_commit_push" in p2_tools
+    assert "mcp__coord__coord_commit_push" not in p3_tools
+    assert "mcp__coord__coord_my_assignments" in p3_tools
+
+
 async def test_approve_stage_archive_no_assignee_marks_roles_complete(
     fresh_db: str,
 ) -> None:
