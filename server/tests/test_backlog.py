@@ -924,3 +924,83 @@ async def test_post_backlog_invalid_priority(fresh_db: str) -> None:
             "/api/backlog", json={"title": "x", "priority": "critical"}
         )
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------- PATCH priority
+
+
+@pytest.mark.asyncio
+async def test_patch_backlog_priority_only(fresh_db: str) -> None:  # noqa: ARG001
+    """PATCH /api/backlog/{id} with only priority updates priority, returns it."""
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    row_id = await _insert_backlog("Low priority idea", proposed_by="human")
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.patch(
+            f"/api/backlog/{row_id}",
+            json={"priority": "urgent"},
+        )
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["priority"] == "urgent"
+    row = await _get_backlog(row_id)
+    assert row is not None
+    assert row["priority"] == "urgent"
+
+
+@pytest.mark.asyncio
+async def test_patch_backlog_priority_with_title(fresh_db: str) -> None:  # noqa: ARG001
+    """PATCH can update priority and title together."""
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    row_id = await _insert_backlog("Old title", proposed_by="p3")
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.patch(
+            f"/api/backlog/{row_id}",
+            json={"title": "New title", "priority": "high"},
+        )
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["title"] == "New title"
+    assert d["priority"] == "high"
+    row = await _get_backlog(row_id)
+    assert row is not None
+    assert row["title"] == "New title"
+    assert row["priority"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_patch_backlog_invalid_priority_rejected(fresh_db: str) -> None:  # noqa: ARG001
+    """PATCH with an unknown priority value returns 400."""
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    row_id = await _insert_backlog("Some idea", proposed_by="p1")
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.patch(
+            f"/api/backlog/{row_id}",
+            json={"priority": "critical"},
+        )
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_patch_backlog_no_fields_rejected(fresh_db: str) -> None:  # noqa: ARG001
+    """PATCH with no recognized fields returns 400."""
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    row_id = await _insert_backlog("Some idea", proposed_by="p1")
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.patch(f"/api/backlog/{row_id}", json={})
+    assert r.status_code == 400
