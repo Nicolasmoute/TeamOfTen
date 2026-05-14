@@ -3046,6 +3046,36 @@ Human task creation supports:
 - optional parent id
 - priority `low`, `normal`, `high`, `urgent`
 
+### 14.5.5 Backlog
+
+The backlog is the pre-task inbox where agents and humans propose ideas
+before Coach triages them into tasks (see `kanban-specs-v2.md` §4.0).
+
+**Schema.** `backlog_tasks` table columns: `id`, `title`, `description` (TEXT, nullable), `proposed_by`, `proposed_at`, `status`, `reject_reason`, `promoted_task_id`. Existing rows on upgrade get `description = NULL` via `_ensure_columns`.
+
+| Endpoint | Notes |
+| --- | --- |
+| `POST /api/backlog` | Propose a backlog entry (any caller). Body `{title, description?}`. Returns `{id, title, description, status}`. `description` max 8000 chars; omit or `null` for none. Emits `backlog_task_proposed{..., description_present: bool}`. |
+| `GET /api/backlog?status=` | List backlog entries. `status=pending` (default) / `all`. Returns `{backlog: [...]}` — each entry includes `description` (string or `null`). 400 on unknown status. |
+| `PATCH /api/backlog/{id}` | Edit a **pending** backlog entry. Body `{title?, description?}` (at least one required). `description: ""` clears to `null`. Returns `{id, title, description}`. 400 if title is blank or description exceeds 8000 chars; 404 if not found; 409 if status ≠ `pending`. Emits `backlog_entry_updated{id, old_title, new_title, actor, description_present: bool}`. Token-gated. |
+| `DELETE /api/backlog/{id}` | Delete a **pending** backlog entry. Returns `{id, deleted: true}`. 404 if not found; 409 if status ≠ `pending`. Emits `backlog_entry_deleted{id, title, actor}`. Token-gated. |
+
+**Status restriction.** Both mutating endpoints check `status = 'pending'`
+before acting. Entries that have been promoted or rejected are immutable
+via these paths — the 409 response includes the actual status so the
+caller can display a useful message.
+
+**UI.** The `BacklogCard` component in `kanban.js` renders a pencil and
+trash icon group on card hover. Clicking the pencil opens an inline edit
+form with two textareas — title (required) and description (optional).
+Clicking the trash opens a confirmation modal. Both call the corresponding
+HTTP endpoints via `authedFetch`, then `onRefresh()`. Description text is
+shown as a preview (first 120 chars) below the card title, with a "more" /
+"less" expand toggle when the text is longer. The `ComposerModal` ("Add to
+backlog") also includes an optional description textarea. The two bus events
+(`backlog_entry_updated`, `backlog_entry_deleted`) are in the `backlogWatched`
+set so the board auto-refreshes on remote changes.
+
 ### 14.6 Messages
 
 | Endpoint | Notes |
@@ -3562,6 +3592,32 @@ above peer chatter and tool narration):
   `coord_*` rendered as "Reading inbox" / "Listing tasks") dim. The
   left border + `summary::before` dot also stay colored.
 
+**Direction tags on `message_sent` rows.** Every Tier-2 `message_sent`
+(`.peer-thread`) row shows a compact direction tag chip at the start of
+the meta line, rendered as an inline SVG arrow (drawn with
+`currentColor`, no emoji). Tag semantics relative to the pane's viewer
+slot:
+- Outgoing (`event.agent_id === viewerSlot`): right-arrow SVG + short
+  recipient label (`slotShortLabel(to)`). CSS class `msg-dir-out`,
+  color `var(--accent)` (blue). `border-color` stays accent.
+- Incoming (`event.to === viewerSlot`): left-arrow SVG + short sender
+  label. CSS class `msg-dir-in`, color `var(--ok)` (green). The event
+  `div` also gets class `msg-incoming` which overrides the left-border
+  to `var(--ok)` — visually separates "arrived for me" from "I sent
+  this".
+- Broadcast (`event.to === "broadcast"`): bidirectional-arrow SVG +
+  label `"all"`. CSS class `msg-dir-bc`, color `var(--muted)`.
+- Third-party observer (fan-out to a pane that is neither sender nor
+  recipient): bidirectional-arrow SVG + `"AB"` label (short form of
+  both parties). `msg-dir-bc`.
+- Null viewer slot (prop not passed): tag omitted; rendering is
+  identical to the pre-feature behavior.
+Tier-1 (`.human-thread`) messages are unaffected — direction tag is
+peer-thread only. `viewerSlot` is threaded from `AgentPane(slot)` →
+`EventList(viewerSlot)` → `EventItem(viewerSlot)`. Pure helper
+`msgDirTag(event, viewerSlot)` is defined in `app.js` alongside
+`slotShortLabel`.
+
 Errors and asks ignore the tiering and stay loud regardless: `.event.error`
 red, `.event.tool_result.error` red, plus AskUserQuestion / plan-mode
 / file-write-proposal / human_attention escalations.
@@ -3599,6 +3655,16 @@ Turn-header (`agent_started`) rendering rules:
   glance. System self-retries (`Your previous turn was cut off …` /
   `Your previous turn errored …`) and recurrence-tick wakes do NOT
   match — they stay `var(--fg)` to read as routine.
+
+**Chat reply button.** `message_sent` rows reveal a hover-only
+curved-arrow icon button (CSS-drawn inline SVG, no emoji). Clicking
+pre-fills the pane textarea with a quoted snippet and focuses it:
+`` `> Re: ${subject} (from ${sender}): ${first 80 chars of body}…\n\n` ``.
+Reply target = original sender's `agent_id`; `broadcast` senders
+default to `coach`. No new endpoints or schema changes. The same
+affordance appears on inbox rows in the Environment Pane (§16.6);
+there it opens the EnvPane Inbox composer, sets the `to` field, and
+pre-fills the body.
 
 Input:
 

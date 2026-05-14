@@ -929,6 +929,28 @@ body {
   flex-direction: column;
   gap: 2px;
 }
+/* Reply button for inbox message rows — same hover-reveal shape as
+   .msg-reply-btn on agent-pane message_sent rows. */
+.env-decision { position: relative; }
+.env-reply-btn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 20px;
+  height: 20px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+  color: var(--fg2, #7e8694);
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.env-decision:hover .env-reply-btn { opacity: 1; }
+.env-reply-btn:hover { color: var(--accent); }
 .env-decision-head {
   display: flex;
   align-items: center;
@@ -3533,9 +3555,53 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 .event.tool_use .tool-card.comm-tool .tool-summary {
   color: var(--accent) !important;
 }
-/* `.event.message_sent` styling lives in the tiering block above —
-   modifier classes `.human-thread` (Tier 1) and `.peer-thread`
-   (Tier 2) are added by the renderer based on from/to ids. */
+/* `.event.message_sent` hover-reveal reply button. position:relative
+   anchors the absolute-positioned button inside the card; the button
+   is hidden by default and revealed on hover via opacity transition.
+   Modifier classes `.human-thread` / `.peer-thread` live in the
+   tiering block above. */
+.event.message_sent { position: relative; }
+.msg-reply-btn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 22px;
+  height: 22px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+  color: var(--fg2, #7e8694);
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.event.message_sent:hover .msg-reply-btn { opacity: 1; }
+.msg-reply-btn:hover { color: var(--accent); }
+
+/* Direction tag chips on message_sent peer-thread rows.
+   SVG arrows drawn with currentColor, no emoji.
+   Outgoing: accent blue. Incoming: ok green. Broadcast/observer: muted. */
+.msg-dir-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 3px;
+  vertical-align: middle;
+  background: rgba(255,255,255,0.04);
+}
+.msg-dir-out { color: var(--accent); }
+.msg-dir-in  { color: var(--ok); }
+.msg-dir-bc  { color: var(--muted); }
+
+/* Incoming peer messages get a green left-border accent instead of blue
+   to visually distinguish "something arrived for me" from "I sent this". */
+.event.message_sent.peer-thread.msg-incoming { border-color: var(--ok); }
 
 /* `coord_request_human` escalations. Rendered as a prominent card
    (subject + full markdown body) so the message that just pinged the
@@ -4936,8 +5002,60 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 
 /* Backlog column */
 .kbn-backlog-column { opacity: 0.9; }
-.kbn-backlog-card { cursor: default; border-left-color: var(--muted, #7e8694); }
+.kbn-backlog-card { cursor: default; border-left-color: var(--muted, #7e8694); position: relative; }
 .kbn-backlog-card:hover { border-color: var(--border, #2c3340); }
+
+/* Hover-revealed edit/delete icon buttons on backlog cards */
+.kbn-card-actions.kbn-backlog-actions {
+  display: none;
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  gap: 4px;
+  align-items: center;
+}
+.kbn-backlog-card:hover .kbn-card-actions.kbn-backlog-actions { display: flex; }
+.kbn-card-act-btn {
+  width: 20px; height: 20px; padding: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--muted, #7e8694);
+  display: inline-flex; align-items: center; justify-content: center;
+  cursor: pointer; line-height: 1;
+}
+.kbn-card-act-btn:hover { color: var(--fg); border-color: var(--accent, #6da3d4); background: rgba(255,255,255,0.05); }
+.kbn-card-act-btn.kbn-card-act-danger:hover { color: var(--err, #c44); border-color: var(--err, #c44); }
+
+/* Inline edit area inside backlog card */
+.kbn-backlog-edit { display: flex; flex-direction: column; gap: 4px; }
+.kbn-backlog-edit-input { width: 100%; box-sizing: border-box; resize: vertical; font-size: 12px; }
+.kbn-backlog-desc-input { width: 100%; box-sizing: border-box; resize: vertical; font-size: 11px; }
+.kbn-backlog-edit-err { font-size: 11px; color: var(--err, #c44); }
+.kbn-backlog-edit-actions { display: flex; gap: 6px; }
+
+/* Description preview on backlog cards */
+.kbn-backlog-desc {
+  font-size: 11px;
+  color: var(--fg-muted, #9aa2af);
+  line-height: 1.4;
+  margin-top: 3px;
+  word-break: break-word;
+}
+.kbn-backlog-expand-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent, #5b9bd5);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.kbn-backlog-expand-btn:hover { text-decoration: underline; }
+.kbn-btn-sm { padding: 2px 8px; font-size: 11px; }
+.kbn-btn-danger { color: var(--err, #c44); border-color: var(--err, #c44); }
+.kbn-btn-danger:hover:not(:disabled) { background: rgba(200,68,68,0.12); }
+.kbn-modal-body-text { margin: 0 0 12px; font-size: 13px; line-height: 1.5; color: var(--fg); }
 .kbn-card-meta { display: flex; gap: 8px; align-items: center; }
 .kbn-backlog-proposer {
   font-size: 10px; font-weight: 600; letter-spacing: 0.04em;

@@ -531,6 +531,7 @@ function AuditColumn(props) {
 
 function ComposerModal({ open, onClose, onCreate }) {
   const [title, setTitle] = useState("");
+  const [desc, setDesc] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
 
@@ -545,8 +546,11 @@ function ComposerModal({ open, onClose, onCreate }) {
     setBusy(true);
     setErr(null);
     try {
-      await onCreate({ title: title.trim() });
+      const payload = { title: title.trim() };
+      if (desc.trim()) payload.description = desc.trim();
+      await onCreate(payload);
       setTitle("");
+      setDesc("");
       onClose();
     } catch (e) {
       setErr(e.message || String(e));
@@ -566,8 +570,16 @@ function ComposerModal({ open, onClose, onCreate }) {
             value=${title}
             onInput=${(e) => setTitle(e.target.value)}
             autoFocus
-            rows="4"
+            rows="3"
             placeholder="Describe the idea — a sentence or two is fine"
+          ></textarea>
+          <label class="kbn-label" style="margin-top:8px">Description (optional)</label>
+          <textarea
+            class="kbn-input kbn-backlog-desc-input"
+            value=${desc}
+            onInput=${(e) => setDesc(e.target.value)}
+            rows="3"
+            placeholder="More context for Coach — background, motivation, scope..."
           ></textarea>
           <div class="kbn-help">
             Coach will review this on the next tick and either promote it
@@ -856,7 +868,14 @@ function FlowHealthFooter({ authedFetch, kanbanEvents }) {
 // ---------------------------------------------------------------- BacklogColumn
 
 
-function BacklogCard({ entry }) {
+// Inline SVG icons for BacklogCard actions (CSS-drawn; no emoji).
+const _PENCIL_SVG = html`<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>`;
+const _TRASH_SVG = html`<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>`;
+
+
+const _BACKLOG_DESC_PREVIEW = 120;
+
+function BacklogCard({ entry, authedFetch, onRefresh }) {
   const proposer = entry.proposed_by || "?";
   let proposerLabel;
   if (proposer === "coach") proposerLabel = "C";
@@ -865,18 +884,145 @@ function BacklogCard({ entry }) {
     proposerLabel = proposer.slice(1);
   else proposerLabel = proposer;
 
+  const [editing, setEditing] = useState(false);
+  const [editTitle, setEditTitle] = useState(entry.title);
+  const [editDesc, setEditDesc] = useState(entry.description || "");
+  const [editBusy, setEditBusy] = useState(false);
+  const [editErr, setEditErr] = useState(null);
+  const [expanded, setExpanded] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteErr, setDeleteErr] = useState(null);
+
+  const startEdit = (e) => {
+    e.stopPropagation();
+    setEditTitle(entry.title);
+    setEditDesc(entry.description || "");
+    setEditErr(null);
+    setEditing(true);
+  };
+
+  const saveEdit = async () => {
+    const t = editTitle.trim();
+    if (!t) { setEditErr("title is required"); return; }
+    setEditBusy(true);
+    setEditErr(null);
+    try {
+      const payload = { title: t, description: editDesc.trim() || null };
+      const r = await authedFetch(`/api/backlog/${entry.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) {
+        const msg = await r.text().catch(() => r.statusText);
+        throw new Error(msg);
+      }
+      setEditing(false);
+      onRefresh();
+    } catch (err) {
+      setEditErr(err.message || String(err));
+    } finally {
+      setEditBusy(false);
+    }
+  };
+
+  const onEditKeyDown = (e) => {
+    if (e.key === "Escape") { setEditing(false); }
+  };
+
+  const confirmAndDelete = async (e) => {
+    e.stopPropagation();
+    setDeleteBusy(true);
+    setDeleteErr(null);
+    try {
+      const r = await authedFetch(`/api/backlog/${entry.id}`, { method: "DELETE" });
+      if (!r.ok) {
+        const msg = await r.text().catch(() => r.statusText);
+        throw new Error(msg);
+      }
+      setConfirmDelete(false);
+      onRefresh();
+    } catch (err) {
+      setDeleteErr(err.message || String(err));
+      setDeleteBusy(false);
+    }
+  };
+
+  const desc = entry.description || "";
+  const descTruncated = desc.length > _BACKLOG_DESC_PREVIEW && !expanded;
+  const descVisible = descTruncated ? desc.slice(0, _BACKLOG_DESC_PREVIEW) + "…" : desc;
+
   return html`
     <div class="kbn-card kbn-backlog-card">
-      <div class="kbn-card-title">${entry.title}</div>
-      <div class="kbn-card-meta">
-        <span class="kbn-backlog-proposer">${proposerLabel}</span>
-        <span class="kbn-card-age">${timeAgo(entry.proposed_at)}</span>
-      </div>
+      ${editing
+        ? html`
+          <div class="kbn-backlog-edit">
+            <textarea
+              class="kbn-input kbn-backlog-edit-input"
+              value=${editTitle}
+              onInput=${(e) => setEditTitle(e.target.value)}
+              onKeyDown=${onEditKeyDown}
+              rows="2"
+              autoFocus
+              disabled=${editBusy}
+            ></textarea>
+            <label class="kbn-label" style="margin-top:6px;font-size:0.75rem">Description (optional)</label>
+            <textarea
+              class="kbn-input kbn-backlog-desc-input"
+              value=${editDesc}
+              onInput=${(e) => setEditDesc(e.target.value)}
+              onKeyDown=${onEditKeyDown}
+              rows="3"
+              placeholder="More context for Coach…"
+              disabled=${editBusy}
+            ></textarea>
+            ${editErr ? html`<div class="kbn-error kbn-backlog-edit-err">${editErr}</div>` : null}
+            <div class="kbn-backlog-edit-actions">
+              <button class="kbn-btn kbn-btn-primary kbn-btn-sm" onClick=${saveEdit} disabled=${editBusy}>
+                ${editBusy ? "Saving…" : "Save"}
+              </button>
+              <button class="kbn-btn kbn-btn-sm" onClick=${() => setEditing(false)} disabled=${editBusy}>Cancel</button>
+            </div>
+          </div>`
+        : html`
+          <div class="kbn-card-title">${entry.title}</div>
+          ${desc ? html`
+            <div class="kbn-backlog-desc">${descVisible}${descTruncated || (desc.length > _BACKLOG_DESC_PREVIEW && expanded)
+              ? html`<button class="kbn-backlog-expand-btn" onClick=${() => setExpanded(!expanded)}>
+                  ${expanded ? " less" : " more"}
+                </button>`
+              : null}
+            </div>` : null}
+          <div class="kbn-card-meta">
+            <span class="kbn-backlog-proposer">${proposerLabel}</span>
+            <span class="kbn-card-age">${timeAgo(entry.proposed_at)}</span>
+          </div>
+          <div class="kbn-card-actions kbn-backlog-actions">
+            <button class="kbn-card-act-btn" title="Edit" onClick=${startEdit}>${_PENCIL_SVG}</button>
+            <button class="kbn-card-act-btn kbn-card-act-danger" title="Delete" onClick=${(e) => { e.stopPropagation(); setDeleteErr(null); setConfirmDelete(true); }}>${_TRASH_SVG}</button>
+          </div>`}
+      ${confirmDelete
+        ? html`
+          <div class="kbn-modal-backdrop" onClick=${() => setConfirmDelete(false)}>
+            <div class="kbn-modal" onClick=${(e) => e.stopPropagation()}>
+              <div class="kbn-modal-head">Delete idea?</div>
+              <p class="kbn-modal-body-text">Delete "<strong>${entry.title}</strong>"? This cannot be undone.</p>
+              ${deleteErr ? html`<div class="kbn-error">${deleteErr}</div>` : null}
+              <div class="kbn-modal-actions">
+                <button class="kbn-btn" onClick=${() => setConfirmDelete(false)} disabled=${deleteBusy}>Cancel</button>
+                <button class="kbn-btn kbn-btn-danger" onClick=${confirmAndDelete} disabled=${deleteBusy}>
+                  ${deleteBusy ? "Deleting…" : "Delete"}
+                </button>
+              </div>
+            </div>
+          </div>`
+        : null}
     </div>
   `;
 }
 
-function BacklogColumn({ entries, onRefresh }) {
+function BacklogColumn({ entries, onRefresh, authedFetch }) {
   if (!entries) return null;
   return html`
     <div class="kbn-column kbn-backlog-column">
@@ -887,7 +1033,7 @@ function BacklogColumn({ entries, onRefresh }) {
       <div class="kbn-column-body">
         ${entries.length === 0
           ? html`<div class="kbn-empty">No pending ideas</div>`
-          : entries.map((e) => html`<${BacklogCard} key=${e.id} entry=${e} />`)}
+          : entries.map((e) => html`<${BacklogCard} key=${e.id} entry=${e} authedFetch=${authedFetch} onRefresh=${onRefresh} />`)}
       </div>
     </div>
   `;
@@ -960,6 +1106,7 @@ export function KanbanPane({
     ]);
     const backlogWatched = new Set([
       "backlog_task_proposed", "backlog_task_promoted", "backlog_task_rejected",
+      "backlog_entry_updated", "backlog_entry_deleted",
     ]);
     return kanbanEvents.subscribe((evt) => {
       if (!evt) return;
@@ -1074,6 +1221,7 @@ export function KanbanPane({
           <${BacklogColumn}
             entries=${backlogEntries}
             onRefresh=${refreshBacklog}
+            authedFetch=${authedFetch}
           />
           <${Column}
             stage="plan"
