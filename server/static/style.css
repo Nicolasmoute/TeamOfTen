@@ -5095,11 +5095,8 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 .kbn-card-act-btn:hover { color: var(--fg); border-color: var(--accent, #6da3d4); background: rgba(255,255,255,0.05); }
 .kbn-card-act-btn.kbn-card-act-danger:hover { color: var(--err, #c44); border-color: var(--err, #c44); }
 
-/* Inline edit area inside backlog card */
-.kbn-backlog-edit { display: flex; flex-direction: column; gap: 4px; }
-.kbn-backlog-edit-input { width: 100%; box-sizing: border-box; resize: vertical; font-size: 12px; }
 .kbn-backlog-desc-input { width: 100%; box-sizing: border-box; resize: vertical; font-size: 11px; }
-/* Priority row in the backlog creation modal */
+/* Priority row in the backlog creation/edit modal */
 .kbn-modal-priority-row {
   display: flex;
   align-items: center;
@@ -5123,9 +5120,6 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   cursor: pointer;
 }
 .kbn-priority-select:focus { outline: none; border-color: var(--accent, #6da3d4); }
-.kbn-backlog-edit-err { font-size: 11px; color: var(--err, #c44); }
-.kbn-backlog-edit-actions { display: flex; gap: 6px; }
-
 .kbn-btn-sm { padding: 2px 8px; font-size: 11px; }
 .kbn-btn-danger { color: var(--err, #c44); border-color: var(--err, #c44); }
 .kbn-btn-danger:hover:not(:disabled) { background: rgba(200,68,68,0.12); }
