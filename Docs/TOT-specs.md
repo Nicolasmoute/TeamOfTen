@@ -3182,7 +3182,7 @@ before Coach triages them into tasks (see `kanban-specs-v2.md` §4.0).
 
 | Endpoint | Notes |
 | --- | --- |
-| `POST /api/backlog` | Propose a backlog entry (any caller). Body `{title, description?}`. Returns `{id, title, description, status}`. `description` max 8000 chars; omit or `null` for none. Emits `backlog_task_proposed{..., description_present: bool}`. |
+| `POST /api/backlog` | Propose a backlog entry (any caller). Body `{title, description?, priority?}`. `priority` ∈ `low\|normal\|high\|urgent` (default `normal`). Returns `{id, title, description, priority, status}`. `description` max 8000 chars; omit or `null` for none. Emits `backlog_task_proposed{..., priority, description_present: bool}`. The kanban **Add to backlog** modal includes a priority selector; default is `normal`. |
 | `GET /api/backlog?status=` | List backlog entries. `status=pending` (default) / `all`. Returns `{backlog: [...]}` — each entry includes `description` (string or `null`). 400 on unknown status. |
 | `PATCH /api/backlog/{id}` | Edit a **pending** backlog entry. Body `{title?, description?}` (at least one required). `description: ""` clears to `null`. Returns `{id, title, description}`. 400 if title is blank or description exceeds 8000 chars; 404 if not found; 409 if status ≠ `pending`. Emits `backlog_entry_updated{id, old_title, new_title, actor, description_present: bool}`. Token-gated. |
 | `DELETE /api/backlog/{id}` | Delete a **pending** backlog entry. Returns `{id, deleted: true}`. 404 if not found; 409 if status ≠ `pending`. Emits `backlog_entry_deleted{id, title, actor}`. Token-gated. |

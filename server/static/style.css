@@ -5054,6 +5054,30 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 .kbn-backlog-edit { display: flex; flex-direction: column; gap: 4px; }
 .kbn-backlog-edit-input { width: 100%; box-sizing: border-box; resize: vertical; font-size: 12px; }
 .kbn-backlog-desc-input { width: 100%; box-sizing: border-box; resize: vertical; font-size: 11px; }
+/* Priority row in the backlog creation modal */
+.kbn-modal-priority-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+.kbn-priority-label {
+  flex-shrink: 0;
+  flex-direction: row;
+  align-items: center;
+  margin-bottom: 0;
+}
+.kbn-priority-select {
+  background: rgba(255,255,255,0.025);
+  border: 1px solid var(--border, #2c3340);
+  color: var(--fg);
+  padding: 4px 8px;
+  font-size: 12px;
+  font-family: inherit;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.kbn-priority-select:focus { outline: none; border-color: var(--accent, #6da3d4); }
 .kbn-backlog-edit-err { font-size: 11px; color: var(--err, #c44); }
 .kbn-backlog-edit-actions { display: flex; gap: 6px; }
 

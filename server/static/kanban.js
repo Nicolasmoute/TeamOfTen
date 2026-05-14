@@ -532,6 +532,7 @@ function AuditColumn(props) {
 function ComposerModal({ open, onClose, onCreate }) {
   const [title, setTitle] = useState("");
   const [desc, setDesc] = useState("");
+  const [priority, setPriority] = useState("normal");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(null);
 
@@ -546,11 +547,12 @@ function ComposerModal({ open, onClose, onCreate }) {
     setBusy(true);
     setErr(null);
     try {
-      const payload = { title: title.trim() };
+      const payload = { title: title.trim(), priority };
       if (desc.trim()) payload.description = desc.trim();
       await onCreate(payload);
       setTitle("");
       setDesc("");
+      setPriority("normal");
       onClose();
     } catch (e) {
       setErr(e.message || String(e));
@@ -581,6 +583,20 @@ function ComposerModal({ open, onClose, onCreate }) {
             rows="3"
             placeholder="More context for Coach — background, motivation, scope..."
           ></textarea>
+          <div class="kbn-modal-priority-row">
+            <label class="kbn-label kbn-priority-label" for="kbn-backlog-priority">Priority</label>
+            <select
+              id="kbn-backlog-priority"
+              class="kbn-priority-select"
+              value=${priority}
+              onChange=${(e) => setPriority(e.target.value)}
+            >
+              <option value="low">low</option>
+              <option value="normal" selected>normal</option>
+              <option value="high">high</option>
+              <option value="urgent">urgent</option>
+            </select>
+          </div>
           <div class="kbn-help">
             Coach will review this on the next tick and either promote it
             to a real task (with trajectory) or reject it with a reason.
