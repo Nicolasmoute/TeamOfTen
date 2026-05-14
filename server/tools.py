@@ -2443,6 +2443,354 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         return _ok(msg)
 
     @tool(
+        "coord_ship_to_dev",
+        (
+            "Ship an audited task to dev via cherry-pick + PR. "
+            "Player-only (Coach uses coord_approve_stage).\n"
+            "\n"
+            "Guards (fail-fast, in order):\n"
+            "- task must be in 'ship' stage\n"
+            "- caller must not be Coach\n"
+            "- caller must have an active (uncompleted, not-superseded) "
+            "shipper role row on the task\n"
+            "- a commit_pushed project_event must exist for the task "
+            "(executor must have called coord_commit_push first)\n"
+            "- every audit stage in the task's trajectory must have a "
+            "PASS verdict (no un-superseded FAIL allowed)\n"
+            "\n"
+            "On success: cherry-picks the executor commit onto a temp "
+            "branch off origin/dev, opens a GitHub PR, squash-merges "
+            "it, deletes the remote branch, closes the shipper role "
+            "row, emits task_shipped_to_dev, and wakes Coach.\n"
+            "\n"
+            "Cherry-pick conflicts return an error and leave the "
+            "worktree on the temp branch so the Player can resolve "
+            "manually.\n"
+            "\n"
+            "Params:\n"
+            "- task_id: the kanban task id to ship (required)"
+        ),
+        {"task_id": str},
+    )
+    async def ship_to_dev(args: dict[str, Any]) -> dict[str, Any]:
+        task_id = (args.get("task_id") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+
+        # Gate: caller must not be Coach
+        if caller_is_coach:
+            return _err(
+                "coord_ship_to_dev is a Player tool — Coach ships via "
+                "coord_approve_stage. Only Players in the shipper role "
+                "call this tool."
+            )
+
+        project_id = await resolve_active_project()
+
+        c = await configured_conn()
+        try:
+            # Gate: task must exist and be in 'ship' stage
+            cur = await c.execute(
+                "SELECT id, title, status, trajectory FROM tasks "
+                "WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            task_row_raw = await cur.fetchone()
+            if not task_row_raw:
+                return _err(
+                    f"task {task_id} not found in project {project_id}"
+                )
+            task_row = dict(task_row_raw)
+            status = task_row.get("status") or ""
+            if status != "ship":
+                return _err(
+                    f"task is in '{status}', not 'ship' — cannot ship"
+                )
+            task_title = (task_row.get("title") or "").strip()
+
+            # Gate: caller must be the active shipper
+            cur = await c.execute(
+                "SELECT id FROM task_role_assignments "
+                "WHERE task_id = ? AND role = 'shipper' AND owner = ? "
+                "AND completed_at IS NULL AND superseded_by IS NULL",
+                (task_id, caller_id),
+            )
+            shipper_row_raw = await cur.fetchone()
+            if not shipper_row_raw:
+                return _err(
+                    f"caller {caller_id} is not the active shipper for "
+                    f"task {task_id}"
+                )
+            shipper_row_id = dict(shipper_row_raw)["id"]
+
+            # Gate: find executor commit SHA in project_events
+            cur = await c.execute(
+                "SELECT payload_pointer FROM project_events "
+                "WHERE task_id = ? AND type = 'commit_pushed' "
+                "ORDER BY ts DESC LIMIT 1",
+                (task_id,),
+            )
+            pe_row = await cur.fetchone()
+            if not pe_row:
+                return _err(
+                    f"no executor commit found for task {task_id} — "
+                    f"executor must coord_commit_push before ship"
+                )
+            executor_sha = (
+                dict(pe_row).get("payload_pointer") or ""
+            ).strip()
+            if not executor_sha:
+                return _err(
+                    f"commit_pushed event for task {task_id} has no SHA "
+                    f"— executor must coord_commit_push before ship"
+                )
+
+            # Gate: audit verdicts — every audit stage in trajectory
+            # must have an un-superseded PASS from the right role
+            trajectory_raw = task_row.get("trajectory") or "[]"
+            try:
+                trajectory = json.loads(trajectory_raw)
+            except Exception:
+                trajectory = []
+            stages_in_traj = {
+                (s.get("stage") or "")
+                for s in trajectory
+                if isinstance(s, dict)
+            }
+            # Map stage name → role name used in task_role_assignments
+            audit_checks = []
+            if "audit_syntax" in stages_in_traj:
+                audit_checks.append(("auditor_syntax", "audit_syntax"))
+            if "audit_semantics" in stages_in_traj:
+                audit_checks.append(
+                    ("auditor_semantics", "audit_semantics")
+                )
+            for role_name, stage_name in audit_checks:
+                if not await _has_passing_auditor(c, task_id, role_name):
+                    return _err(
+                        f"{stage_name} has no PASS verdict for task "
+                        f"{task_id} — ship rejected"
+                    )
+
+            # Fetch repo_url for GitHub API PAT extraction
+            cur = await c.execute(
+                "SELECT repo_url FROM projects WHERE id = ?",
+                (project_id,),
+            )
+            proj_row = await cur.fetchone()
+            repo_url = (
+                (dict(proj_row).get("repo_url") or "") if proj_row else ""
+            ).strip()
+        finally:
+            await c.close()
+
+        if not repo_url:
+            return _err(
+                "project has no repo_url configured — cannot ship via "
+                "GitHub PR. Set it under Options → Projects."
+            )
+
+        # Parse PAT + owner/repo from repo_url
+        # Expected pattern: https://<token>@github.com/<owner>/<repo>
+        m = re.match(
+            r"https://([^@]+)@github\.com/([^/]+)/([^/]+?)(?:\.git)?$",
+            repo_url,
+        )
+        if not m:
+            return _err(
+                "repo_url does not match expected pattern "
+                "https://<token>@github.com/<owner>/<repo> — "
+                "cannot extract PAT for GitHub API"
+            )
+        gh_token, gh_owner, gh_repo = m.group(1), m.group(2), m.group(3)
+
+        # --- Git operations in caller's worktree ---
+        cwd = await workspace_dir(caller_id)
+
+        from server.agent_env import build_clean_agent_env
+
+        clean_env = build_clean_agent_env()
+        branch_name = f"ship-{task_id}"
+        caller_branch = f"work/{caller_id}"
+
+        async def _git(
+            cmd: list[str], timeout: int = 60
+        ) -> tuple[int, str, str]:
+            def _do() -> tuple[int, str, str]:
+                p = subprocess.run(
+                    cmd,
+                    cwd=str(cwd),
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=clean_env,
+                )
+                return p.returncode, p.stdout, p.stderr
+
+            return await asyncio.to_thread(_do)
+
+        rc, _, err = await _git(["git", "fetch", "origin"])
+        if rc != 0:
+            return _err(f"git fetch failed: {err.strip()}")
+
+        rc, _, err = await _git(
+            ["git", "checkout", "-b", branch_name, "origin/dev"]
+        )
+        if rc != 0:
+            return _err(
+                f"git checkout ship branch failed: {err.strip()}"
+            )
+
+        rc, out, err = await _git(
+            ["git", "cherry-pick", executor_sha]
+        )
+        if rc != 0:
+            # Leave the worktree on the temp branch for manual resolution
+            conflict_detail = (err.strip() or out.strip())[:300]
+            return _err(
+                f"cherry-pick of {executor_sha} onto origin/dev "
+                f"conflicted: {conflict_detail}\n"
+                f"Resolve manually: fix conflicts, then "
+                f"`git cherry-pick --continue`.\n"
+                f"To abort and clean up: "
+                f"`git cherry-pick --abort && "
+                f"git checkout {caller_branch} && "
+                f"git branch -D {branch_name}`."
+            )
+
+        rc, _, err = await _git(
+            ["git", "push", "origin", f"{branch_name}:{branch_name}"]
+        )
+        if rc != 0:
+            return _err(f"git push ship branch failed: {err.strip()}")
+
+        # --- GitHub API: create PR → squash merge → delete remote branch ---
+        import httpx
+
+        gh_headers = {
+            "Authorization": f"Bearer {gh_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        api_base = (
+            f"https://api.github.com/repos/{gh_owner}/{gh_repo}"
+        )
+        pr_title = (
+            f"[ship] {task_id}: {task_title}"
+            if task_title
+            else f"[ship] {task_id}"
+        )
+        pr_body = (
+            f"Auto-shipped via coord_ship_to_dev.\n"
+            f"Task: {task_id}\n"
+            f"Executor commit: {executor_sha}"
+        )
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Create PR
+                r = await client.post(
+                    f"{api_base}/pulls",
+                    headers=gh_headers,
+                    json={
+                        "title": pr_title,
+                        "head": branch_name,
+                        "base": "dev",
+                        "body": pr_body,
+                    },
+                )
+                if r.status_code not in (200, 201):
+                    return _err(
+                        f"GitHub API {r.status_code} on PR create: "
+                        f"{r.text[:200]}"
+                    )
+                pr_data = r.json()
+                pr_number = pr_data.get("number")
+                pr_url = pr_data.get("html_url", "")
+
+                # Squash merge PR
+                r = await client.put(
+                    f"{api_base}/pulls/{pr_number}/merge",
+                    headers=gh_headers,
+                    json={
+                        "merge_method": "squash",
+                        "commit_title": f"[ship] {task_id}",
+                    },
+                )
+                if r.status_code not in (200, 201):
+                    return _err(
+                        f"GitHub API {r.status_code} on PR merge: "
+                        f"{r.text[:200]}"
+                    )
+                merge_data = r.json()
+                merge_sha = merge_data.get("sha", "")
+
+                # Delete remote ship branch (best-effort; non-fatal)
+                try:
+                    await client.delete(
+                        f"{api_base}/git/refs/heads/{branch_name}",
+                        headers=gh_headers,
+                    )
+                except Exception:
+                    pass
+
+        except httpx.HTTPError as exc:
+            return _err(f"GitHub API request failed: {exc}")
+
+        # Cleanup local ship branch (best-effort)
+        try:
+            await _git(["git", "checkout", caller_branch])
+            await _git(["git", "branch", "-D", branch_name])
+        except Exception:
+            pass
+
+        # Close the shipper role row
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE task_role_assignments SET completed_at = ? "
+                "WHERE id = ?",
+                (_now_iso(), shipper_row_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+
+        # Emit event + wake Coach
+        await bus.publish(
+            {
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "task_shipped_to_dev",
+                "task_id": task_id,
+                "ship_sha": merge_sha,
+                "pr_number": pr_number,
+                "pr_url": pr_url,
+                "executor_sha": executor_sha,
+                "to": "coach",
+            }
+        )
+
+        await _wake_coach_for_completion(
+            caller_id=caller_id,
+            task_id=task_id,
+            role="shipper",
+            message_to_coach=None,
+            artifact_path=None,
+            extra_hint=(
+                f"Shipped to dev — PR #{pr_number} merged, "
+                f"dev now at {(merge_sha or '')[:8]}."
+            ),
+        )
+
+        return _ok(
+            f"Task {task_id} shipped to dev.\n"
+            f"PR: {pr_url} (#{pr_number}) — squash-merged.\n"
+            f"Dev HEAD: {merge_sha}.\n"
+            f"Shipper role complete. Coach has been woken."
+        )
+
+    @tool(
         "coord_write_decision",
         (
             "Coach-only. Append a dated, immutable architectural decision "
@@ -7693,6 +8041,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         read_memory,
         update_memory,
         commit_push,
+        ship_to_dev,
         write_decision,
         propose_file_write,
         read_file,
@@ -7839,6 +8188,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_read_memory",
     "mcp__coord__coord_update_memory",
     "mcp__coord__coord_commit_push",
+    "mcp__coord__coord_ship_to_dev",
     "mcp__coord__coord_write_decision",
     "mcp__coord__coord_propose_file_write",
     "mcp__coord__coord_read_file",

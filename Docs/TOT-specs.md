@@ -2400,6 +2400,48 @@ Current implementation gap:
 - Clean tree returns soft OK.
 - Emits `commit_pushed`.
 
+### 12.6.1 Ship to Dev
+
+`coord_ship_to_dev(task_id)`
+
+- **Players only** (Coach ships via `coord_approve_stage`).
+- Ships an audited task to the `dev` integration branch via cherry-pick
+  + GitHub PR (squash merge).
+- **Gate checks (fail-fast, in order):**
+  1. Task must be in `ship` stage.
+  2. Caller must not be Coach.
+  3. Caller must have an active (uncompleted, not-superseded) `shipper`
+     role row on the task.
+  4. A `commit_pushed` project event must exist for the task (executor
+     must have called `coord_commit_push` first); the event's
+     `payload_pointer` holds the executor commit SHA.
+  5. Every audit stage in the task's trajectory must have an
+     un-superseded `PASS` verdict from the matching auditor role
+     (`audit_syntax` → `auditor_syntax`,
+     `audit_semantics` → `auditor_semantics`).
+- **Git operations** (in caller's worktree):
+  1. `git fetch origin`
+  2. `git checkout -b ship-<task_id> origin/dev`
+  3. `git cherry-pick <executor_sha>`
+  4. `git push origin ship-<task_id>:ship-<task_id>`
+  - Cherry-pick conflict → returns error with the conflicted SHA and
+    instructs the Player to resolve manually or run
+    `git cherry-pick --abort` to clean up.
+- **GitHub API** (PAT extracted from `projects.repo_url`):
+  1. `POST /repos/{owner}/{repo}/pulls` → create PR titled
+     `[ship] <task_id>: <title>`
+  2. `PUT /repos/{owner}/{repo}/pulls/{n}/merge` (squash merge)
+  3. `DELETE /repos/{owner}/{repo}/git/refs/heads/ship-<task_id>`
+     (non-fatal on failure)
+- **Post-success:**
+  - Closes shipper role row (`completed_at` stamped).
+  - Emits `task_shipped_to_dev` event with `task_id`, `ship_sha`,
+    `pr_number`, `pr_url`, `executor_sha`.
+  - Wakes Coach via `_wake_coach_for_completion`.
+- **Return:** `ok=True` text with `pr_url`, `pr_number`, dev HEAD SHA.
+- Raw `git push origin ...:dev` bypasses this gate and is a pb-005
+  violation; use `coord_ship_to_dev` instead.
+
 ### 12.7 Decisions
 
 `coord_write_decision(title, body)`
