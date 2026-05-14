@@ -2266,19 +2266,30 @@ so permissions do not depend on the model truthfully passing its identity.
     audit report. When a completed audit row has no verdict (edge case),
     falls back to `<label>:done`.
 
-`coord_create_task(title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?)`
+`coord_create_task(title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?, note?, success_criteria?)`
 
-- Coach can create top-level tasks; Players can only create subtasks
-  under tasks they own. If a Player omits `parent_id`, their
-  `current_task_id` is used.
-- Priority: `low`, `normal`, `high`, `urgent`.
-- `trajectory` is REQUIRED for Coach: ordered list of `{stage, to,
-  focus?}` documenting the planned path. Pools are FYI only — the
-  first-stage entry is the only auto-plant (when `to` is a single
-  named slot). Subsequent stages never auto-plant; Coach drives them
-  via `coord_approve_stage`.
-- Emits `task_created` and (only when the first stage planted)
-  `task_role_assigned` + `task_stage_changed{from=null}`.
+- **Coach top-level tasks land in the Backlog first (FIFO discipline).**
+  When Coach calls this tool WITHOUT `parent_id`, the item is inserted
+  into `backlog_tasks` (same table as `coord_propose_task`). No kanban
+  row is created yet; no Player is woken. Coach must then call
+  `coord_triage_backlog(id, action='promote', trajectory=[...])` to
+  promote it to the kanban. This enforces FIFO priority ordering —
+  items are triaged in the order they arrived, not by recency of
+  creation (which was LIFO). The `priority`, `trajectory`, `note`, and
+  `success_criteria` params are stored on the backlog entry so Coach
+  does not need to repeat them at triage time.
+- **Player subtasks** (with `parent_id`) are unaffected — they still
+  plant directly on the kanban under their parent task.
+- Priority: `low`, `normal`, `high`, `urgent` (default `normal`).
+  Stored on the backlog entry for Coach top-level tasks; stored on the
+  task row for Player subtasks.
+- `trajectory` is REQUIRED for Coach top-level tasks. Stored on the
+  backlog entry; `coord_triage_backlog promote` reads it automatically
+  so Coach can omit it at triage time when it was already set at
+  creation time.
+- Emits `backlog_task_proposed` for Coach top-level tasks; emits
+  `task_created` + (when first stage planted) `task_role_assigned` +
+  `task_stage_changed{from=null}` for Player subtasks.
 - See `Docs/kanban-specs-v2.md` §7.1 for the canonical contract.
 
 `coord_approve_stage(task_id, next_stage, assignee, note?)`
@@ -4079,6 +4090,23 @@ Shows (top-to-bottom):
        reloads. ISO ts has microsecond precision so `ts + agent_id`
        is unique enough; correlation ids are server-assigned and
        stable across both ingestion paths.
+       **Non-dismissable interactive items.** `pending_question` and
+       `pending_plan` attention rows do NOT have a silent dismiss (×)
+       button. An agent is paused on its `pending_question` /
+       `pending_plan` Future; silently hiding the UI card leaves the
+       agent blocked indefinitely. Instead, these rows show a **"skip"
+       button** (`.env-attention-cancel`, amber border) that POSTs to
+       `POST /api/questions/{correlation_id}/cancel` or
+       `POST /api/plans/{correlation_id}/cancel`. The cancel endpoint
+       calls `interactions.reject(correlation_id, "cancelled by human
+       operator")` which resolves the Future with `InteractionRejected`;
+       the agent receives a `PermissionResultDeny` and can reformulate
+       or escalate. The `question_cancelled` / `plan_cancelled` bus
+       event is then published (existing path in `agents.py`), which
+       removes the item from the attention strip naturally. Other
+       attention item types (`human_attention`, `file_write_proposal`)
+       retain the plain dismiss (×) behaviour because they do not have
+       a waiting agent Future.
     4. **`EnvFileWriteProposalsSection` auto-expand.** When there's
        at least one pending row AND the user has never explicitly
        collapsed it (no localStorage entry), the section opens.
@@ -4173,6 +4201,15 @@ app for phones:
   The webkit-box approach collapses to 0px height on some Android Chrome builds,
   making titles invisible; the max-height approach is reliable and allows 3 lines.
   Expanded cards (`kbn-card.expanded`) remove the cap so the full title shows.
+- **Kanban card sizing on mobile** — cards felt cramped on smartphone screens
+  even after the title-visibility fix above. A second mobile pass (2026-05-14)
+  bumps card padding to `12px 13px` (from `8px 9px`), sets `min-height: 72px`,
+  increases the gap between card sub-rows to `8px`, and bumps `.kbn-card-title`
+  `font-size` from `13px` to `14.5px`. Stage labels (`kbn-stage-label`) step up
+  from `9px` to `10px`. Interactive icon buttons inside cards (`kbn-card-act-btn`)
+  get `min-height: 44px` + `min-width: 44px` with flex centering to meet the
+  ≥44px touch target guideline. All rules are scoped to `@media (max-width: 700px)`
+  and do not affect desktop layout.
 - **Touch-inaccessible hover-reveal buttons** — two classes of buttons are hidden
   via CSS hover and never reachable on touch screens; both get always-visible
   overrides at the mobile breakpoint:

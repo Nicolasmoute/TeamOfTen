@@ -7468,6 +7468,22 @@ function EnvAttentionSection({ open, onDismiss, onDismissAll }) {
   const dismissAll = onDismissAll || (() => {});
   if (!Array.isArray(open) || open.length === 0) return null;
 
+  // Cancel a pending_question or pending_plan without answering.
+  // Calls the server cancel endpoint so the agent's paused Future is
+  // resolved with a rejection — the agent gets a PermissionResultDeny
+  // and can proceed. The question_cancelled / plan_cancelled bus event
+  // removes the item from the attention strip naturally.
+  const cancelInteraction = useCallback((ev) => {
+    const cid = ev.correlation_id;
+    if (!cid) return;
+    const url = ev.type === "pending_question"
+      ? `/api/questions/${encodeURIComponent(cid)}/cancel`
+      : `/api/plans/${encodeURIComponent(cid)}/cancel`;
+    apiFetch(url, { method: "POST" }).catch((err) => {
+      console.error("cancel interaction failed", err);
+    });
+  }, []);
+
   return html`
     <section class="env-section env-attention">
       <h3 class="env-section-title">
@@ -7477,35 +7493,42 @@ function EnvAttentionSection({ open, onDismiss, onDismissAll }) {
       </h3>
       <div class="env-attention-list">
         ${open.map(
-          (ev) => html`
-            <div
-              class=${"env-attention-item " + (ev.urgency === "blocker" ? "blocker" : "normal")}
-              key=${ev.__key}
-            >
-              <div class="env-attention-head">
-                <span class="env-attention-who">${ev.agent_id}</span>
-                ${ev.urgency === "blocker"
-                  ? html`<span class="env-attention-pill">BLOCKER</span>`
-                  : null}
-                <span class="env-attention-ts">${timeStrShort(ev.ts)}</span>
-                <button class="env-attention-dismiss"
-                  onClick=${() => dismiss(ev.__key)}
-                  title="Dismiss">×</button>
+          (ev) => {
+            const isInteractive = ev.type === "pending_question" || ev.type === "pending_plan";
+            return html`
+              <div
+                class=${"env-attention-item " + (ev.urgency === "blocker" ? "blocker" : "normal")}
+                key=${ev.__key}
+              >
+                <div class="env-attention-head">
+                  <span class="env-attention-who">${ev.agent_id}</span>
+                  ${ev.urgency === "blocker"
+                    ? html`<span class="env-attention-pill">BLOCKER</span>`
+                    : null}
+                  <span class="env-attention-ts">${timeStrShort(ev.ts)}</span>
+                  ${isInteractive
+                    ? html`<button class="env-attention-cancel"
+                        onClick=${() => cancelInteraction(ev)}
+                        title="Cancel — unblock the agent with a rejection so it can proceed">skip</button>`
+                    : html`<button class="env-attention-dismiss"
+                        onClick=${() => dismiss(ev.__key)}
+                        title="Dismiss">×</button>`}
+                </div>
+                <div class="env-attention-subject">${ev.subject}</div>
+                ${ev.type === "pending_question" && Array.isArray(ev.questions) && ev.questions.length > 0
+                  ? html`<${QuestionForm}
+                      event=${ev}
+                      onSubmitted=${() => dismiss(ev.__key)}
+                    />`
+                  : ev.type === "pending_plan"
+                  ? html`<${PlanApprovalForm}
+                      event=${ev}
+                      onSubmitted=${() => dismiss(ev.__key)}
+                    />`
+                  : html`<div class="env-attention-body">${ev.body}</div>`}
               </div>
-              <div class="env-attention-subject">${ev.subject}</div>
-              ${ev.type === "pending_question" && Array.isArray(ev.questions) && ev.questions.length > 0
-                ? html`<${QuestionForm}
-                    event=${ev}
-                    onSubmitted=${() => dismiss(ev.__key)}
-                  />`
-                : ev.type === "pending_plan"
-                ? html`<${PlanApprovalForm}
-                    event=${ev}
-                    onSubmitted=${() => dismiss(ev.__key)}
-                  />`
-                : html`<div class="env-attention-body">${ev.body}</div>`}
-            </div>
-          `
+            `;
+          }
         )}
       </div>
     </section>

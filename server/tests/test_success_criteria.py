@@ -42,6 +42,33 @@ def _extract_task_id(text: str) -> str:
     return m.group(0)
 
 
+def _extract_backlog_id(text: str) -> int:
+    """Parse 'Backlog entry #N' from a coord_create_task (Coach) response."""
+    m = re.search(r"Backlog entry #(\d+)", text)
+    assert m, f"no backlog id in response: {text}"
+    return int(m.group(1))
+
+
+async def _create_and_promote(
+    coach_server,
+    create_args: dict,
+) -> str:
+    """Two-step helper for the new Coach backlog-first flow:
+    1. coord_create_task  → backlog entry (trajectory stored automatically)
+    2. coord_triage_backlog action='promote' → kanban task id
+
+    Returns the task_id string ready for subsequent tool calls.
+    """
+    create_text = _ok(await _handler(coach_server, "create_task")(create_args))
+    bid = _extract_backlog_id(create_text)
+    promote_text = _ok(await _handler(coach_server, "triage_backlog")({
+        "id": str(bid),
+        "action": "promote",
+        # trajectory/priority/note/success_criteria already stored at creation
+    }))
+    return _extract_task_id(promote_text)
+
+
 async def _stub_wake(monkeypatch) -> list[tuple[str, str]]:
     calls: list[tuple[str, str]] = []
 
@@ -102,13 +129,12 @@ async def test_create_task_with_success_criteria_persists(
     await init_db()
     await _stub_wake(monkeypatch)
     coach = _server_for("coach")
-    text = _ok(await _handler(coach, "create_task")({
+    tid = await _create_and_promote(coach, {
         "title": "x",
         "description": "y",
         "trajectory": _TRAJECTORY_FULL,
         "success_criteria": "ships when API returns 200 and one happy-path test exists",
-    }))
-    tid = _extract_task_id(text)
+    })
     stored = await _read_criteria(tid)
     assert stored == "ships when API returns 200 and one happy-path test exists"
 
@@ -119,10 +145,9 @@ async def test_create_task_without_success_criteria_defaults_empty(
     await init_db()
     await _stub_wake(monkeypatch)
     coach = _server_for("coach")
-    text = _ok(await _handler(coach, "create_task")({
+    tid = await _create_and_promote(coach, {
         "title": "x", "description": "y", "trajectory": _TRAJECTORY_FULL,
-    }))
-    tid = _extract_task_id(text)
+    })
     assert await _read_criteria(tid) == ""
 
 
@@ -138,11 +163,10 @@ async def test_approve_plan_to_execute_updates_criteria(
     await _stub_wake(monkeypatch)
     coach = _server_for("coach")
     p5 = _server_for("p5")
-    text = _ok(await _handler(coach, "create_task")({
+    tid = await _create_and_promote(coach, {
         "title": "x", "description": "y", "trajectory": _TRAJECTORY_FULL,
         "success_criteria": "initial",
-    }))
-    tid = _extract_task_id(text)
+    })
     # Planner writes spec (required gate).
     _ok(await _handler(p5, "write_task_spec")({
         "task_id": tid, "body": "## Goal\nx\n",
@@ -165,11 +189,10 @@ async def test_approve_non_plan_transition_ignores_criteria(
     coach = _server_for("coach")
     p3 = _server_for("p3")
     p5 = _server_for("p5")
-    text = _ok(await _handler(coach, "create_task")({
+    tid = await _create_and_promote(coach, {
         "title": "x", "description": "y", "trajectory": _TRAJECTORY_FULL,
         "success_criteria": "initial",
-    }))
-    tid = _extract_task_id(text)
+    })
     _ok(await _handler(p5, "write_task_spec")({
         "task_id": tid, "body": "## Goal\nx\n",
     }))
@@ -248,11 +271,10 @@ async def test_approve_to_ship_echoes_criteria(
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
 
-    text = _ok(await _handler(coach, "create_task")({
+    tid = await _create_and_promote(coach, {
         "title": "x", "description": "y", "trajectory": _TRAJECTORY_FULL,
         "success_criteria": "tests green and 200 on /foo",
-    }))
-    tid = _extract_task_id(text)
+    })
     _ok(await _handler(p5, "write_task_spec")({
         "task_id": tid, "body": "## Goal\nx\n",
     }))
@@ -313,10 +335,9 @@ async def test_approve_to_ship_without_criteria_no_echo(
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
 
-    text = _ok(await _handler(coach, "create_task")({
+    tid = await _create_and_promote(coach, {
         "title": "x", "description": "y", "trajectory": _TRAJECTORY_FULL,
-    }))
-    tid = _extract_task_id(text)
+    })
     _ok(await _handler(p5, "write_task_spec")({
         "task_id": tid, "body": "## Goal\nx\n",
     }))

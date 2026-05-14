@@ -57,7 +57,7 @@ _client_locks: dict[str, asyncio.Lock] = {}
 
 # Bump when the Codex-visible coord tool contract changes in a way that
 # old persisted Codex threads might not pick up on resume.
-_CODEX_TOOL_CONTRACT_VERSION = "2026-05-14.coord-ship-to-dev"
+_CODEX_TOOL_CONTRACT_VERSION = "2026-05-14.coord-list-backlog"
 
 
 class _CapturedStdioTransport:
