@@ -3993,6 +3993,21 @@ app for phones:
   maximize button are hidden — they don't fit single-pane navigation and
   HTML5 drag-and-drop doesn't work on touch.
 - `EnvPane` becomes a full-screen overlay when toggled open.
+- **Kanban card titles** — `.kbn-card-title` switches from `display: -webkit-box`
+  / `-webkit-line-clamp: 2` to `display: block` + `max-height: calc(1.32em * 3)`.
+  The webkit-box approach collapses to 0px height on some Android Chrome builds,
+  making titles invisible; the max-height approach is reliable and allows 3 lines.
+  Expanded cards (`kbn-card.expanded`) remove the cap so the full title shows.
+- **Touch-inaccessible hover-reveal buttons** — two classes of buttons are hidden
+  via CSS hover and never reachable on touch screens; both get always-visible
+  overrides at the mobile breakpoint:
+  - Kanban backlog edit/delete icons (`.kbn-card-actions.kbn-backlog-actions`):
+    desktop uses `:hover { display: flex }` on the parent card; mobile forces
+    `display: flex` unconditionally. The buttons are `position: absolute` so they
+    don't shift card layout.
+  - Inbox reply button (`.env-reply-btn`) and agent-pane message reply button
+    (`.msg-reply-btn`): both use `opacity: 0` with `:hover { opacity: 1 }`;
+    mobile forces `opacity: 1` so the tap target is always present.
 
 Pane ordering on phones is canonical, not history-based. `useIsPhone()`
 in `app.js` listens to the `(max-width: 700px)` media query; when active,
