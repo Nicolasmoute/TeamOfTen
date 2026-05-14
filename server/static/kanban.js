@@ -1113,11 +1113,11 @@ export function KanbanPane({
     if (!kanbanEvents) return;
     const watched = new Set([
       "task_created", "task_claimed", "task_assigned",
-      "task_updated", "task_stage_changed",
+      "task_updated", "task_stage_changed", "task_archived",
       "task_trajectory_changed", "task_blocked_changed",
       "task_spec_written", "task_role_assigned", "task_role_claimed",
-      "task_role_called", "task_role_completed", "task_execution_completed",
-      "task_workflow_set", "task_drift_detected", "task_shipped",
+      "task_role_called", "task_role_stand_down", "task_role_completed",
+      "task_workflow_set", "task_drift_detected",
       "task_stage_stale", "audit_report_submitted",
       "audit_fail_notification", "compass_audit_logged",
       "commit_pushed", "project_switched", "socket_connected",
