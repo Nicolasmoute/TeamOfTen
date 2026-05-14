@@ -364,3 +364,104 @@ async def test_ship_to_dev_rejects_no_executor_commit(fresh_db: str) -> None:
     result = await _handler(server, "ship_to_dev")({"task_id": TASK_ID})
     err = _err_text(result)
     assert "no executor commit found" in err
+
+
+async def test_ship_to_dev_expands_github_token_placeholder(
+    fresh_db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(h) repo_url uses ${GITHUB_TOKEN} placeholder — must be expanded before
+    GitHub API call.  Without the fix, the Bearer token would be the literal
+    string '${GITHUB_TOKEN}' and every GitHub call returns 401."""
+    import os
+
+    await init_db()
+    await _seed_task()
+    await _seed_shipper_role()
+    await _seed_auditor_role()
+    await _seed_executor_commit()
+    # Store URL with placeholder, not a raw token
+    await _seed_repo_url(repo_url="https://${GITHUB_TOKEN}@github.com/owner/repo")
+    _stub_workspace(monkeypatch, tmp_path)
+    _stub_git_success(monkeypatch)
+
+    # Inject GITHUB_TOKEN into env so _expand_placeholders can resolve it
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_testtoken123")
+
+    # Capture the Authorization header seen by the GitHub API stub
+    captured_auth: list[str] = []
+
+    import httpx
+
+    class _AuthCapturingClient:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_AuthCapturingClient":
+            return self
+
+        async def __aexit__(self, *_: Any) -> None:
+            pass
+
+        async def post(self, url: str, **kwargs: Any):
+            captured_auth.append(kwargs.get("headers", {}).get("Authorization", ""))
+
+            class _R:
+                status_code = 201
+                text = '{"number": 7, "html_url": "https://github.com/owner/repo/pull/7"}'
+
+                def json(self):
+                    return {"number": 7, "html_url": self.text}
+
+            return _R()
+
+        async def put(self, url: str, **kwargs: Any):
+            class _R:
+                status_code = 200
+                text = '{"sha": "aabbccdd1122"}'
+
+                def json(self):
+                    return {"sha": "aabbccdd1122"}
+
+            return _R()
+
+        async def delete(self, url: str, **kwargs: Any):
+            class _R:
+                status_code = 204
+                text = ""
+
+                def json(self):
+                    return {}
+
+            return _R()
+
+    monkeypatch.setattr("httpx.AsyncClient", _AuthCapturingClient)
+
+    server = _server_for("p2")
+    result = await _handler(server, "ship_to_dev")({"task_id": TASK_ID})
+    _ok_text(result)  # must not error
+
+    # The Authorization header must use the expanded token, not the literal placeholder
+    assert captured_auth, "no GitHub API call was made"
+    assert "Bearer ghp_testtoken123" in captured_auth[0], (
+        f"Expected expanded token, got: {captured_auth[0]}"
+    )
+    assert "${GITHUB_TOKEN}" not in captured_auth[0], (
+        f"Placeholder was NOT expanded: {captured_auth[0]}"
+    )
+
+
+async def test_ship_to_dev_empty_expanded_token_returns_error(
+    fresh_db: str,
+) -> None:
+    """(i) Placeholder expands to empty string (env var not set) → clear error."""
+    await init_db()
+    await _seed_task()
+    await _seed_shipper_role()
+    await _seed_auditor_role()
+    await _seed_executor_commit()
+    await _seed_repo_url(repo_url="https://${MISSING_TOKEN}@github.com/owner/repo")
+
+    server = _server_for("p2")
+    result = await _handler(server, "ship_to_dev")({"task_id": TASK_ID})
+    err = _err_text(result)
+    assert "expanded to empty" in err or "MISSING_TOKEN" in err or "PAT" in err
