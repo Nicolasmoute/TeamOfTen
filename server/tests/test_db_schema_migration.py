@@ -47,9 +47,11 @@ async def test_ensure_columns_adds_runtime_override_to_existing_agents(fresh_db:
     async with aiosqlite.connect(fresh_db, timeout=10.0) as db:
         cols = await _columns(db, "agents")
         assert "runtime_override" in cols, "migration did not add agents.runtime_override"
+        assert "allowed_tools" in cols, "migration did not add agents.allowed_tools"
         # Nullable on existing rows — no NOT NULL because role defaults
         # apply when null.
         assert cols["runtime_override"]["notnull"] == 0
+        assert cols["allowed_tools"]["notnull"] == 0
         cur = await db.execute("SELECT runtime_override FROM agents WHERE id = ?", ("p1",))
         row = await cur.fetchone()
         assert row is not None and row[0] is None, "existing row should have NULL runtime_override"
