@@ -5760,6 +5760,9 @@ async def reply_human_attention(
     """
     if attention_id <= 0:
         raise HTTPException(404, detail=f"human_attention {attention_id!r} not found")
+    body = req.body.strip()
+    if not body:
+        raise HTTPException(422, detail="body is required")
 
     project_id = await resolve_active_project()
     c = await configured_conn()
@@ -5802,7 +5805,7 @@ async def reply_human_attention(
         from_id="human",
         to_id="coach",
         subject=subject,
-        body=req.body,
+        body=body,
         priority="normal",
         wake=True,
     )
