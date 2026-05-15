@@ -3518,9 +3518,7 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
   //       per `dotStates` Map computed in App.
   const renderSlot = (a) => {
     if (!a) return null;
-    const hasSession =
-      Boolean(a.session_id) || Boolean(a.codex_thread_id) ||
-      a.status === "working" || a.status === "waiting";
+    const hasSession = hasActiveSession(a);
     const status = a.status || "idle";
     // Visual work-state class. `state-problem` collects three things
     // surfaced via the problemSlots Set computed in App: hard errors
@@ -5606,7 +5604,7 @@ function SessionsSection() {
     return next;
   });
 
-  const _hasSession = (a) => !!(a.session_id || a.codex_thread_id);
+  const _hasSession = (a) => hasActiveSession(a);
   const targets = agents.filter((a) => selected[a.id]).map((a) => a.id);
   const withSession = agents.filter(_hasSession).map((a) => a.id);
 
@@ -5647,8 +5645,8 @@ function SessionsSection() {
     <p class="muted" style="margin: 0 0 8px 0; font-size: 12px;">
       Tick the agents whose conversation you want to reset, then Clear.
       Equivalent to the pane header 🗑 button but in batch. Only clears
-      the SDK <code>session_id</code> — tasks, memory, inbox, briefs
-      are untouched. Agents with no active session show dimmed.
+      the stored session row — tasks, memory, inbox, briefs are
+      untouched. Agents with no active session show dimmed.
     </p>
     ${loaded
       ? agents.length === 0
@@ -11640,7 +11638,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
                 : `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="9" width="11" height="8" rx="1.2"/><path d="M13 9V6 A3 3 0 0 0 6 4.5"/></svg>` }}
             ></button>`
           : null}
-        ${agent?.session_id || agent?.codex_thread_id
+        ${hasActiveSession(agent)
           ? html`<button
               class="pane-session-clear"
               onClick=${async () => {
@@ -11965,6 +11963,15 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
     </section>
   `;
 }
+
+const hasActiveSession = (agent) =>
+  Boolean(
+    agent &&
+    (agent.session_id ||
+      agent.codex_thread_id ||
+      agent.status === "working" ||
+      agent.status === "waiting")
+  );
 
 // ------------------------------------------------------------------
 // event renderer (v2b generic; v2c adds per-tool richness)
