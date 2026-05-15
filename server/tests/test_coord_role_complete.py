@@ -378,3 +378,73 @@ async def test_role_complete_shipper_without_artifact_succeeds(fresh_db: str) ->
         "message_to_coach": "shipped — no local file artifact",
     }))
     assert "shipper" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# t-2026-05-15-33471969: dict-shorthand schema sweep — 4 more tools fixed
+# ---------------------------------------------------------------------------
+
+import os as _os_schema
+from unittest.mock import patch as _patch_schema
+
+_SAFE_ENV_SCHEMA = {
+    "HARNESS_AGENT_DAILY_CAP": "5.0", "HARNESS_TEAM_DAILY_CAP": "20.0",
+    "HARNESS_ERROR_RETRY_DELAY": "45", "HARNESS_ERROR_RETRY_MAX_CONSECUTIVE": "3",
+    "HARNESS_HANDOFF_TOKEN_BUDGET": "4000",
+    "HARNESS_IDLE_POLL_TRANSFER_COOLDOWN_SECONDS": "300",
+    "HARNESS_QUESTION_TIMEOUT_SECONDS": "3600",
+    "HARNESS_STREAM_TOKENS": "true",
+}
+
+
+def _get_schema(tool_name: str) -> dict:
+    """Build coord server and extract the input_schema for a named tool."""
+    with _patch_schema.dict(_os_schema.environ, _SAFE_ENV_SCHEMA, clear=False):
+        server = build_coord_server("coach", include_proxy_metadata=True)
+    specs = server["_tool_specs"]
+    t = next((s for s in specs if s.name == tool_name), None)
+    assert t is not None, f"Tool {tool_name!r} not found"
+    return t.input_schema
+
+
+def test_commit_push_schema_task_id_not_required() -> None:
+    """task_id is optional on coord_commit_push — callers without a kanban
+    task must not be rejected by the MCP framework."""
+    schema = _get_schema("coord_commit_push")
+    required = schema.get("required", [])
+    assert "message" in required
+    assert "task_id" not in required
+    assert "push" not in required
+    assert "message_to_coach" not in required
+
+
+def test_create_task_schema_only_title_required() -> None:
+    """Only title is required on coord_create_task; all other fields are
+    optional (description, parent_id, note, success_criteria, etc.)."""
+    schema = _get_schema("coord_create_task")
+    required = schema.get("required", [])
+    assert required == ["title"], f"expected only title required, got {required}"
+    optional = [k for k in schema.get("properties", {}) if k not in required]
+    for field in ("description", "parent_id", "note", "success_criteria",
+                  "tracking_reason", "workflow", "trajectory"):
+        assert field in optional, f"{field} should be optional, not in {optional}"
+
+
+def test_send_message_schema_subject_not_required() -> None:
+    """subject is optional on coord_send_message."""
+    schema = _get_schema("coord_send_message")
+    required = schema.get("required", [])
+    assert "to" in required
+    assert "body" in required
+    assert "subject" not in required
+    assert "priority" not in required
+
+
+def test_answer_plan_schema_comments_not_required() -> None:
+    """comments is optional on coord_answer_plan (only required for
+    'reject' / 'approve_with_comments' — validated at runtime, not schema)."""
+    schema = _get_schema("coord_answer_plan")
+    required = schema.get("required", [])
+    assert "correlation_id" in required
+    assert "decision" in required
+    assert "comments" not in required
