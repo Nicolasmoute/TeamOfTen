@@ -1552,6 +1552,29 @@ def _mcp_server_allowed_by_tools(server_name: str, allowed_tools: set[str]) -> b
     return any(tool.startswith(prefix) for tool in allowed_tools)
 
 
+def _normalize_external_mcp_config_for_codex(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return a Codex-safe copy of a user-provided MCP server config.
+
+    Stdio MCP servers must keep stdout reserved for JSON-RPC. A bare
+    ``npx <package>`` can print an install prompt to stdout on a fresh
+    container after redeploy, which Codex's MCP reader treats as a
+    transport-level serde failure. Force non-interactive npx and fill in
+    the stdio type for command-based configs.
+    """
+    normalized = dict(cfg)
+    command = normalized.get("command")
+    if isinstance(command, str) and command.strip():
+        normalized.setdefault("type", "stdio")
+        command_name = Path(command).name.lower()
+        if command_name in {"npx", "npx.cmd"}:
+            args = normalized.get("args")
+            arg_list = list(args) if isinstance(args, list) else []
+            has_yes = any(str(arg) in {"-y", "--yes"} for arg in arg_list)
+            if not has_yes:
+                normalized["args"] = ["-y", *arg_list]
+    return normalized
+
+
 def _build_mcp_servers_for_slot(
     agent_id: str,
     token: str,
@@ -1599,9 +1622,13 @@ def _build_mcp_servers_for_slot(
             continue
         if allowed and not _mcp_server_allowed_by_tools(name, allowed):
             continue
-        if isinstance(cfg, dict) and "default_tools_approval_mode" not in cfg:
-            cfg = {**cfg, "default_tools_approval_mode": "approve"}
-        servers[name] = cfg
+        if isinstance(cfg, dict):
+            normalized_cfg = _normalize_external_mcp_config_for_codex(cfg)
+            if "default_tools_approval_mode" not in normalized_cfg:
+                normalized_cfg["default_tools_approval_mode"] = "approve"
+            servers[name] = normalized_cfg
+        else:
+            servers[name] = cfg
     return servers
 
 
