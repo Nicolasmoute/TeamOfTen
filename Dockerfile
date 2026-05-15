@@ -80,6 +80,12 @@ RUN git config --global user.name "${GIT_USER_NAME}" \
 WORKDIR /app
 
 COPY pyproject.toml ./
+
+# Install the dependency graph before copying server sources so Zeabur can
+# cache this slow layer across normal application-code redeploys. The final
+# package install below uses --no-deps and is cheap when only server/ changes.
+RUN python -c "import subprocess, sys, tomllib; data = tomllib.load(open('pyproject.toml', 'rb')); deps = data['build-system']['requires'] + data['project']['dependencies'] + data['project']['optional-dependencies']['dev']; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--prefer-binary', '--progress-bar', 'off', '--retries', '10', '--timeout', '120', *deps])"
+
 COPY server/ ./server/
 
 # `[dev]` brings in pytest + pytest-asyncio. They're not strictly
@@ -89,7 +95,7 @@ COPY server/ ./server/
 # project-local runner. Installing here puts a working pytest at
 # /usr/local/bin so any agent (Claude or Codex) can fall through to
 # it when the project repo doesn't bring its own.
-RUN pip install ".[dev]"
+RUN pip install --no-deps --no-build-isolation .
 
 EXPOSE 8000
 

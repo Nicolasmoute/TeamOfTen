@@ -95,7 +95,7 @@ async def _persist(event: dict[str, Any]) -> None:
 # Tests that use EventBus directly don't need it — _persist still works
 # stand-alone.
 
-_write_queue: asyncio.Queue[dict[str, Any]] | None = None
+_write_queue: asyncio.Queue[dict[str, Any] | None] | None = None
 _writer_task: asyncio.Task[None] | None = None
 _writer_stopping = False
 
@@ -108,10 +108,12 @@ async def _writer_loop() -> None:
     connection and let the outer `while` reopen it next iteration —
     a transient DB error must not kill the writer permanently.
     """
-    global _write_queue
+    global _write_queue, _writer_stopping
     assert _write_queue is not None
     queue = _write_queue
-    while not _writer_stopping:
+    while True:
+        if _writer_stopping and queue.empty():
+            return
         # Block until at least one event is available, then opportunistically
         # drain up to BATCH_SIZE-1 more without waiting. This keeps idle
         # CPU at zero (we only wake when there's work) and gives the
@@ -120,9 +122,15 @@ async def _writer_loop() -> None:
             first = await queue.get()
         except asyncio.CancelledError:
             return
+        if first is None:
+            if _writer_stopping:
+                return
+            continue
         batch: list[dict[str, Any]] = [first]
         deadline = asyncio.get_running_loop().time() + BATCH_INTERVAL
         while len(batch) < BATCH_SIZE:
+            if _writer_stopping and queue.empty():
+                break
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 break
@@ -132,6 +140,9 @@ async def _writer_loop() -> None:
                 break
             except asyncio.CancelledError:
                 # Mid-flush cancellation — finish what we have, then exit.
+                break
+            if ev is None:
+                _writer_stopping = True
                 break
             batch.append(ev)
         await _flush_batch(batch)
@@ -178,13 +189,12 @@ async def stop_event_writer(timeout: float = 2.0) -> None:
     """Drain pending events and stop the writer task.
 
     Called from main.py lifespan teardown so a redeploy doesn't drop
-    the last few seconds of audit history. We set the stopping flag,
-    drain whatever's already queued, cancel the writer, then drain
-    once more to catch anything published during the cancel window
-    (publish() fires from many call sites and one might land between
-    our first drain and the writer terminating).
+    the last few seconds of audit history. We set the stopping flag
+    and enqueue a sentinel so the writer exits after flushing any
+    in-flight partial batch; a final drain catches events published
+    during the stop window.
     """
-    global _writer_task, _writer_stopping
+    global _write_queue, _writer_task, _writer_stopping
     _writer_stopping = True
 
     async def _drain_and_flush() -> None:
@@ -193,25 +203,27 @@ async def stop_event_writer(timeout: float = 2.0) -> None:
         drained: list[dict[str, Any]] = []
         try:
             while True:
-                drained.append(_write_queue.get_nowait())
+                ev = _write_queue.get_nowait()
+                if ev is not None:
+                    drained.append(ev)
         except asyncio.QueueEmpty:
             pass
         if drained:
             await _flush_batch(drained)
 
-    await _drain_and_flush()
     if _writer_task is not None and not _writer_task.done():
-        _writer_task.cancel()
+        if _write_queue is not None:
+            try:
+                await asyncio.wait_for(_write_queue.put(None), timeout=timeout)
+            except asyncio.TimeoutError:
+                _writer_task.cancel()
         try:
             await asyncio.wait_for(_writer_task, timeout=timeout)
         except (asyncio.CancelledError, asyncio.TimeoutError):
+            if _writer_task is not None and not _writer_task.done():
+                _writer_task.cancel()
             pass
-    # Second drain: covers events that publish()'d after the first
-    # drain but before the writer fully stopped. Tiny window but it's
-    # the difference between "shutdown is clean" and "occasionally
-    # loses the last event of a turn".
     await _drain_and_flush()
-    global _write_queue
     _write_queue = None
     _writer_task = None
 

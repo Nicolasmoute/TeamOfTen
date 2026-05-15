@@ -101,6 +101,7 @@ _ARTIFACT_TRUNCATE = 18_000
 
 # Module-level lifecycle handles, mirroring the telegram bridge pattern.
 _current_task: asyncio.Task[None] | None = None
+_current_queue: asyncio.Queue[dict[str, Any]] | None = None
 _stopping = False
 # Per-(project, task_id) monotonic timestamp of the last audit fired.
 # Used by the debounce window. Read + written from the bus-consumer
@@ -115,6 +116,7 @@ _last_fire_iso: dict[str, str] = {}
 # Per-project most recent skip — {reason, ts, task_id}. Operators ask
 # "why isn't the watcher firing?" — this answers it directly.
 _last_skip: dict[str, dict[str, Any]] = {}
+_audit_tasks: set[asyncio.Task[None]] = set()
 
 
 def is_running() -> bool:
@@ -215,7 +217,7 @@ async def start_audit_watcher() -> None:
     and the task actually running would be lost — easy to hit in
     tests, possible under load.
     """
-    global _current_task, _stopping
+    global _current_task, _current_queue, _stopping
     if not config.AUTO_AUDIT_ENABLED:
         logger.info("compass.audit_watcher: disabled via env (HARNESS_COMPASS_AUTO_AUDIT)")
         return
@@ -226,6 +228,7 @@ async def start_audit_watcher() -> None:
     _last_fire_iso.clear()
     _last_skip.clear()
     queue = bus.subscribe()
+    _current_queue = queue
     loop = asyncio.get_running_loop()
     _current_task = loop.create_task(
         _run(queue), name="harness.compass.audit_watcher",
@@ -239,7 +242,7 @@ async def start_audit_watcher() -> None:
 
 async def stop_audit_watcher(timeout: float = 2.0) -> None:
     """Stop the background subscriber and drain. Idempotent."""
-    global _current_task, _stopping
+    global _current_task, _current_queue, _stopping
     _stopping = True
     task = _current_task
     if task is None:
@@ -250,7 +253,43 @@ async def stop_audit_watcher(timeout: float = 2.0) -> None:
             await asyncio.wait_for(task, timeout=timeout)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
+    if _audit_tasks:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*list(_audit_tasks), return_exceptions=True),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            for audit_task in list(_audit_tasks):
+                audit_task.cancel()
+            await asyncio.gather(*list(_audit_tasks), return_exceptions=True)
     _current_task = None
+    _current_queue = None
+
+
+async def wait_until_idle_for_tests(timeout: float = 10.0) -> None:
+    """Wait until the watcher has consumed queued events and audit tasks.
+
+    Test-only synchronization hook. The production path remains
+    fire-and-forget, but tests can wait on the exact queue/task handles
+    instead of racing a poll loop against CI load and SQLite scheduling.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    async def _with_remaining(awaitable: Any) -> None:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        await asyncio.wait_for(awaitable, timeout=remaining)
+
+    queue = _current_queue
+    if queue is not None:
+        await _with_remaining(queue.join())
+
+    pending = [task for task in _audit_tasks if not task.done()]
+    if pending:
+        await _with_remaining(asyncio.gather(*pending, return_exceptions=True))
 
 
 # ---------------------------------------------------------------- core
@@ -273,6 +312,8 @@ async def _run(queue: asyncio.Queue[dict[str, Any]]) -> None:
                     "compass.audit_watcher: handler crashed on event %r",
                     ev.get("type"),
                 )
+            finally:
+                queue.task_done()
     finally:
         bus.unsubscribe(queue)
 
@@ -372,10 +413,12 @@ async def _handle_event(ev: dict[str, Any]) -> None:
     # (monotonic timestamp in `_last_fire` is debounce-only and not
     # human-readable).
     _last_fire_iso[project_id] = _now_iso()
-    asyncio.create_task(
+    audit_task = asyncio.create_task(
         _safe_audit(project_id, artifact, task_id),
         name=f"compass.audit_watcher.fire:plan:{project_id}:{task_id}",
     )
+    _audit_tasks.add(audit_task)
+    audit_task.add_done_callback(_audit_tasks.discard)
 
 
 async def _safe_audit(project_id: str, artifact: str, task_id: str) -> None:
@@ -408,8 +451,8 @@ def _debounce_ok(project_id: str, task_id: str) -> bool:
         return True
     key = (project_id, task_id)
     now = time.monotonic()
-    last = _last_fire.get(key, 0.0)
-    if now - last < window:
+    last = _last_fire.get(key)
+    if last is not None and now - last < window:
         return False
     _last_fire[key] = now
     return True
@@ -610,4 +653,5 @@ __all__ = [
     "snapshot_health",
     "start_audit_watcher",
     "stop_audit_watcher",
+    "wait_until_idle_for_tests",
 ]

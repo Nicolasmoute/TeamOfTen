@@ -2627,8 +2627,6 @@ async def patch_mcp_server(
         clean = [t for t in req.allowed_tools if isinstance(t, str) and t]
         updates.append("allowed_tools_json = ?")
         params.append(json.dumps(clean))
-    merged_cfg: dict[str, Any] | None = None
-    secret_warnings: list[str] = []
     pending_new_cfg: dict[str, Any] | None = None
     if req.config_json is not None:
         try:
@@ -2637,60 +2635,69 @@ async def patch_mcp_server(
             raise HTTPException(400, detail=f"invalid config JSON: {e}")
         if not isinstance(pending_new_cfg, dict):
             raise HTTPException(400, detail="config must be a JSON object")
-    # Single connection handles the probe (SELECT for redaction-merge)
-    # and the UPDATE. Two back-to-back sqlite3.connect() calls against
-    # the same file can leave the OS-level lock state in a way that
-    # makes the second commit() raise OperationalError("database is
-    # locked") under a still-running event loop, even after explicit
-    # close() of the first.
-    conn = sqlite3.connect(DB_PATH, timeout=5.0)
-    try:
-        # Existence check up front — issuing a write against a missing
-        # row still acquires the SQLite write lock and races with
-        # background readers on a busy harness. Surfacing 404 early
-        # avoids the pointless lock.
-        existing_row = conn.execute(
-            "SELECT config_json FROM mcp_servers WHERE name = ?",
-            (name,),
-        ).fetchone()
-        if existing_row is None:
-            raise HTTPException(404, detail=f"server {name!r} not found")
-        if pending_new_cfg is not None:
-            stored_cfg: dict[str, Any] = {}
-            if existing_row[0]:
-                try:
-                    parsed = json.loads(existing_row[0])
-                    if isinstance(parsed, dict):
-                        stored_cfg = parsed
-                except Exception:
-                    stored_cfg = {}
-            merged_cfg = _merge_redacted_config(pending_new_cfg, stored_cfg)
-            # Secret scan after merge so restored placeholders don't trip
-            # the warning, but freshly-pasted raw tokens still do.
-            secret_warnings = detect_secrets(json.dumps(merged_cfg))
-            if secret_warnings and not req.allow_secrets:
-                raise HTTPException(
-                    400,
-                    detail={
-                        "secret_warnings": secret_warnings,
-                        "hint": "Replace raw tokens with ${VAR} placeholders. "
-                        "Re-submit with allow_secrets=true to override.",
-                    },
-                )
-            updates.append("config_json = ?")
-            params.append(json.dumps(merged_cfg))
-        if not updates:
-            raise HTTPException(400, detail="nothing to update")
-        updates.append("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
-        params.append(name)
-        cur = conn.execute(
-            f"UPDATE mcp_servers SET {', '.join(updates)} WHERE name = ?",
-            params,
-        )
-        changed = cur.rowcount
-        conn.commit()
-    finally:
-        conn.close()
+
+    def _write_patch() -> tuple[int, list[str], bool]:
+        local_updates = list(updates)
+        local_params = list(params)
+        local_secret_warnings: list[str] = []
+        config_changed = False
+        # Single connection handles the probe (SELECT for redaction-merge)
+        # and the UPDATE. Run it off the event loop: if an aiosqlite task is
+        # releasing a lock on the loop, a synchronous sqlite wait here would
+        # otherwise block the very loop that needs to make progress.
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
+        try:
+            conn.execute("PRAGMA busy_timeout = 30000")
+            # Existence check up front — issuing a write against a missing
+            # row still acquires the SQLite write lock and races with
+            # background readers on a busy harness. Surfacing 404 early
+            # avoids the pointless lock.
+            existing_row = conn.execute(
+                "SELECT config_json FROM mcp_servers WHERE name = ?",
+                (name,),
+            ).fetchone()
+            if existing_row is None:
+                raise HTTPException(404, detail=f"server {name!r} not found")
+            if pending_new_cfg is not None:
+                stored_cfg: dict[str, Any] = {}
+                if existing_row[0]:
+                    try:
+                        parsed = json.loads(existing_row[0])
+                        if isinstance(parsed, dict):
+                            stored_cfg = parsed
+                    except Exception:
+                        stored_cfg = {}
+                merged_cfg = _merge_redacted_config(pending_new_cfg, stored_cfg)
+                # Secret scan after merge so restored placeholders don't trip
+                # the warning, but freshly-pasted raw tokens still do.
+                local_secret_warnings = detect_secrets(json.dumps(merged_cfg))
+                if local_secret_warnings and not req.allow_secrets:
+                    raise HTTPException(
+                        400,
+                        detail={
+                            "secret_warnings": local_secret_warnings,
+                            "hint": "Replace raw tokens with ${VAR} placeholders. "
+                            "Re-submit with allow_secrets=true to override.",
+                        },
+                    )
+                local_updates.append("config_json = ?")
+                local_params.append(json.dumps(merged_cfg))
+                config_changed = True
+            if not local_updates:
+                raise HTTPException(400, detail="nothing to update")
+            local_updates.append("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+            local_params.append(name)
+            cur = conn.execute(
+                f"UPDATE mcp_servers SET {', '.join(local_updates)} WHERE name = ?",
+                local_params,
+            )
+            changed = cur.rowcount
+            conn.commit()
+            return changed, local_secret_warnings, config_changed
+        finally:
+            conn.close()
+
+    changed, secret_warnings, config_changed = await asyncio.to_thread(_write_patch)
     if changed == 0:
         raise HTTPException(404, detail=f"server {name!r} not found")
     await bus.publish(
@@ -2699,7 +2706,7 @@ async def patch_mcp_server(
             "agent_id": "system",
             "type": "mcp_server_updated",
             "name": name,
-            "config_changed": merged_cfg is not None,
+            "config_changed": config_changed,
             "actor": actor,
         }
     )
