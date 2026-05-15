@@ -29,6 +29,7 @@ def _clean_codex_runtime_state():
         st.revoke(tok)
     codex_mod._codex_client_tokens.clear()
     codex_mod._codex_clients.clear()
+    codex_mod._codex_client_cwds.clear()
     codex_mod._client_locks.clear()
 
 
@@ -391,6 +392,7 @@ def _install_fake_sdk(monkeypatch):
         st.revoke(tok)
     codex_mod._codex_client_tokens.clear()
     codex_mod._codex_clients.clear()
+    codex_mod._codex_client_cwds.clear()
     codex_mod._client_locks.clear()
     monkeypatch.setattr(codex_mod, "_import_codex_sdk", lambda: _FakeSdk)
 
@@ -441,6 +443,83 @@ async def test_close_client_drops_and_closes(monkeypatch, tmp_path) -> None:
     # Calling close on an already-empty slot is a no-op (no exception).
     await close_client("p1")
     assert client.closed == 1
+
+
+async def test_close_client_clears_cwd_cache(monkeypatch, tmp_path) -> None:
+    """close_client must remove the cwd entry so a subsequent spawn
+    in a different cwd isn't falsely treated as a mismatch."""
+    _install_fake_sdk(monkeypatch)
+    from server.runtimes.codex import get_client, close_client
+    from server.runtimes import codex as codex_mod
+
+    await get_client("p1", cwd=str(tmp_path))
+    assert codex_mod._codex_client_cwds.get("p1") == str(tmp_path)
+    await close_client("p1")
+    assert "p1" not in codex_mod._codex_client_cwds
+
+
+async def test_get_client_cwd_match_returns_cached(monkeypatch, tmp_path) -> None:
+    """Calling get_client with the same cwd must return the cached client."""
+    _install_fake_sdk(monkeypatch)
+    from server.runtimes.codex import get_client
+
+    c1 = await get_client("p1", cwd=str(tmp_path))
+    c2 = await get_client("p1", cwd=str(tmp_path))
+    assert c1 is c2
+
+
+async def test_get_client_cwd_mismatch_evicts_and_respawns(
+    monkeypatch, tmp_path
+) -> None:
+    """If the cached client was spawned with cwd=A but the turn resolves
+    cwd=B, the stale client must be evicted and a fresh one spawned.
+    Defense D2 from codex-failure-rootcause-2026-05-15.md."""
+    _install_fake_sdk(monkeypatch)
+    from server.runtimes.codex import get_client
+    from server.runtimes import codex as codex_mod
+
+    cwd_a = str(tmp_path / "slot_a")
+    cwd_b = str(tmp_path / "slot_b")
+
+    c1 = await get_client("p1", cwd=cwd_a)
+    assert codex_mod._codex_client_cwds.get("p1") == cwd_a
+
+    c2 = await get_client("p1", cwd=cwd_b)
+    assert c1 is not c2
+    assert codex_mod._codex_client_cwds.get("p1") == cwd_b
+
+
+async def test_evict_client_in_flight_clears_cwd_cache(
+    monkeypatch, tmp_path
+) -> None:
+    """In-flight evict (cache-pop-only path) must also clear the cwd
+    entry so the next turn doesn't see a phantom mismatch."""
+    import sys, os
+    # Pre-import server.agents with safe env so the module-level
+    # float(HARNESS_AGENT_DAILY_CAP) doesn't crash on empty-string env.
+    if "server.agents" not in sys.modules:
+        _saved = {}
+        for k in ("HARNESS_AGENT_DAILY_CAP", "HARNESS_TEAM_DAILY_CAP",
+                  "HARNESS_ERROR_RETRY_DELAY", "HARNESS_ERROR_RETRY_MAX_CONSECUTIVE",
+                  "HARNESS_HANDOFF_TOKEN_BUDGET", "HARNESS_STREAM_TOKENS"):
+            _saved[k] = os.environ.get(k)
+            os.environ[k] = os.environ.get(k) or ("true" if k == "HARNESS_STREAM_TOKENS" else "5.0" if "CAP" in k else "45" if "DELAY" in k else "3" if "MAX" in k else "4000")
+        import server.agents  # noqa: F401
+        for k, v in _saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    _install_fake_sdk(monkeypatch)
+    monkeypatch.setattr("server.agents.is_agent_running", lambda _slot: True)
+    from server.runtimes.codex import get_client, evict_client
+    from server.runtimes import codex as codex_mod
+
+    await get_client("p1", cwd=str(tmp_path))
+    assert "p1" in codex_mod._codex_client_cwds
+    await evict_client("p1")
+    assert "p1" not in codex_mod._codex_client_cwds
 
 
 async def test_close_all_clients(monkeypatch, tmp_path) -> None:
