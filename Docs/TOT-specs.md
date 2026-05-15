@@ -2255,10 +2255,13 @@ so permissions do not depend on the model truthfully passing its identity.
 
 ### 12.1 Task Tools
 
-`coord_list_tasks(status?, owner?)`
+`coord_list_tasks(status?, owner?, include_backlog?)`
 
 - Lists up to 100 tasks in active project.
-- Optional `status`.
+- Optional `status`. No-args and `status='pending'` views include pending
+  Backlog entries by default when no owner filter is present, rendered as
+  `kind=backlog`. Concrete kanban stage filters (`execute`, `audit_syntax`,
+  etc.) remain task-only.
 - Optional `owner`, with `null`/`none`/`unassigned` matching tasks whose
   current stage has no active `task_role_assignments` row (kanban v2
   role-state model). Specifically: NOT EXISTS a row for the current
@@ -2269,8 +2272,9 @@ so permissions do not depend on the model truthfully passing its identity.
 - The `owner=` field in each output row shows the active role assignee from
   `task_role_assignments` (the kanban v2 source of truth), falling back to
   `tasks.owner` for archive/non-standard stages where no role row exists.
-- Each row for an active kanban stage (plan/execute/audit_syntax/
-  audit_semantics/ship) includes a `stage_role=<role>:<state>` field:
+- Each task row includes `kind=task`; each row for an active kanban stage
+  (plan/execute/audit_syntax/audit_semantics/ship) includes a
+  `stage_role=<role>:<state>` field:
   - `executor:p3` — live assignment with named owner
   - `executor:done` — non-audit role row completed (awaiting Coach advance)
   - `complete:p5:pass` — audit stage completed with pass verdict

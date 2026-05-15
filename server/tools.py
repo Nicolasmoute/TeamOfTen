@@ -799,22 +799,40 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "Legacy values (open/claimed/in_progress/blocked/done/cancelled) "
             "are translated to their kanban equivalent for back-compat.\n"
             "- owner: agent id ('coach', 'p1'..'p10'), or 'null' for unassigned\n"
-            "Returns up to 100 most recent tasks. Each row shows stage, "
+            "- include_backlog: optional boolean; no-args and status='pending' "
+            "views include pending Backlog entries by default.\n"
+            "Returns up to 100 most recent tasks. Each task row shows kind, stage, "
             "trajectory ([P,E,AY,AE,S] tokens), blocked flag, owner, "
             "priority, and title. "
-            "For a full board view including the pre-plan holding area, "
-            "also call coord_list_backlog."
+            "Pending Backlog rows are shown with kind=backlog."
         ),
-        {"status": str, "owner": str},
+        {"status": str, "owner": str, "include_backlog": str},
     )
     async def list_tasks(args: dict[str, Any]) -> dict[str, Any]:
         status = (args.get("status") or "").strip() or None
         owner_arg = args.get("owner")
         owner = owner_arg.strip() if isinstance(owner_arg, str) else None
+        status_l = status.lower() if status else None
+        # Backlog is the pre-plan holding area, so it belongs in the
+        # whole-board and pending-only views. A concrete kanban stage
+        # filter must stay task-only even if include_backlog is truthy.
+        include_backlog_raw = args.get("include_backlog")
+        include_backlog_requested = True
+        if include_backlog_raw is not None:
+            include_backlog_requested = (
+                str(include_backlog_raw).strip().lower()
+                not in {"0", "false", "no", "off"}
+            )
+        include_backlog = (
+            include_backlog_requested
+            and owner is None
+            and (status_l is None or status_l == "pending")
+        )
+        query_tasks = status_l != "pending"
 
         where_parts: list[str] = []
         params: list[Any] = []
-        if status:
+        if status and query_tasks:
             # Translate legacy aliases for back-compat. The DB CHECK only
             # accepts kanban values now; passing 'in_progress' would
             # quietly return nothing without this.
@@ -865,43 +883,55 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         )
         c = await configured_conn()
         try:
-            cur = await c.execute(
-                f"SELECT t.id, t.title, t.status, t.owner, t.created_by, "
-                f"t.parent_id, t.priority, t.trajectory, t.blocked, "
-                f"t.blocked_reason, t.created_at, "
-                # active_owner: owner of the live (non-completed) role row
-                f"(SELECT tra.owner FROM task_role_assignments tra "
-                f" WHERE tra.task_id = t.id "
-                f" AND tra.role = {_STAGE_TO_ROLE_SQL} "
-                f" AND tra.completed_at IS NULL "
-                f" AND tra.superseded_by IS NULL "
-                f" AND tra.owner IS NOT NULL "
-                f" LIMIT 1) AS active_owner, "
-                # role_done_owner: owner of the completed role row (awaiting
-                # Coach advance), NULL if not yet done
-                f"(SELECT tra.owner FROM task_role_assignments tra "
-                f" WHERE tra.task_id = t.id "
-                f" AND tra.role = {_STAGE_TO_ROLE_SQL} "
-                f" AND tra.completed_at IS NOT NULL "
-                f" AND tra.superseded_by IS NULL "
-                f" LIMIT 1) AS role_done_owner, "
-                # role_done_verdict: verdict of the completed role row (pass/fail),
-                # NULL for non-audit stages or when not yet done
-                f"(SELECT tra.verdict FROM task_role_assignments tra "
-                f" WHERE tra.task_id = t.id "
-                f" AND tra.role = {_STAGE_TO_ROLE_SQL} "
-                f" AND tra.completed_at IS NOT NULL "
-                f" AND tra.superseded_by IS NULL "
-                f" LIMIT 1) AS role_done_verdict "
-                f"FROM tasks t{clause} "
-                f"ORDER BY t.created_at DESC LIMIT 100",
-                params,
-            )
-            rows = await cur.fetchall()
+            if query_tasks:
+                cur = await c.execute(
+                    f"SELECT t.id, t.title, t.status, t.owner, t.created_by, "
+                    f"t.parent_id, t.priority, t.trajectory, t.blocked, "
+                    f"t.blocked_reason, t.created_at, "
+                    # active_owner: owner of the live (non-completed) role row
+                    f"(SELECT tra.owner FROM task_role_assignments tra "
+                    f" WHERE tra.task_id = t.id "
+                    f" AND tra.role = {_STAGE_TO_ROLE_SQL} "
+                    f" AND tra.completed_at IS NULL "
+                    f" AND tra.superseded_by IS NULL "
+                    f" AND tra.owner IS NOT NULL "
+                    f" LIMIT 1) AS active_owner, "
+                    # role_done_owner: owner of the completed role row (awaiting
+                    # Coach advance), NULL if not yet done
+                    f"(SELECT tra.owner FROM task_role_assignments tra "
+                    f" WHERE tra.task_id = t.id "
+                    f" AND tra.role = {_STAGE_TO_ROLE_SQL} "
+                    f" AND tra.completed_at IS NOT NULL "
+                    f" AND tra.superseded_by IS NULL "
+                    f" LIMIT 1) AS role_done_owner, "
+                    # role_done_verdict: verdict of the completed role row (pass/fail),
+                    # NULL for non-audit stages or when not yet done
+                    f"(SELECT tra.verdict FROM task_role_assignments tra "
+                    f" WHERE tra.task_id = t.id "
+                    f" AND tra.role = {_STAGE_TO_ROLE_SQL} "
+                    f" AND tra.completed_at IS NOT NULL "
+                    f" AND tra.superseded_by IS NULL "
+                    f" LIMIT 1) AS role_done_verdict "
+                    f"FROM tasks t{clause} "
+                    f"ORDER BY t.created_at DESC LIMIT 100",
+                    params,
+                )
+                rows = await cur.fetchall()
+            else:
+                rows = []
+            if include_backlog:
+                cur = await c.execute(
+                    "SELECT id, title, proposed_by, proposed_at, status "
+                    "FROM backlog_tasks WHERE status = 'pending' "
+                    "ORDER BY proposed_at DESC LIMIT 100"
+                )
+                backlog_rows = await cur.fetchall()
+            else:
+                backlog_rows = []
         finally:
             await c.close()
 
-        if not rows:
+        if not rows and not backlog_rows:
             return _ok("(no tasks match)")
 
         # Map status → short role label used in stage_role display.
@@ -953,9 +983,32 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             else:
                 stage_role = ""
             lines.append(
-                f"{d['id']}  [{d['status']}]{traj}{blocked}{stage_role}  "
+                f"{d['id']}  kind=task  [{d['status']}]{traj}{blocked}{stage_role}  "
                 f"owner={display_owner}  pri={d['priority']}  "
                 f"{d['title']}{parent}"
+            )
+        now = datetime.now(timezone.utc)
+        for r in backlog_rows:
+            d = dict(r)
+            age = "?"
+            try:
+                ts_str = d.get("proposed_at") or ""
+                if ts_str:
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    secs = int((now - ts).total_seconds())
+                    if secs < 60:
+                        age = f"{secs}s"
+                    elif secs < 3600:
+                        age = f"{secs // 60}m"
+                    elif secs < 86400:
+                        age = f"{secs // 3600}h"
+                    else:
+                        age = f"{secs // 86400}d"
+            except Exception:
+                pass
+            lines.append(
+                f"#{d['id']}  kind=backlog  [{d['status']}]  "
+                f"\"{d['title']}\"  by {d['proposed_by']}, {age} ago"
             )
         return _ok("\n".join(lines))
 
@@ -8385,7 +8438,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             title = (d.get("title") or "").strip()
             proposer = d.get("proposed_by") or "?"
             line = (
-                f"#{d['id']}  [{status_tag}]  \"{title}\"  "
+                f"#{d['id']}  kind=backlog  [{status_tag}]  \"{title}\"  "
                 f"by {proposer}, {age} ago"
             )
             if status_tag == "rejected" and d.get("reject_reason"):
