@@ -15,6 +15,7 @@ spawn agents — runs entirely against the harness's data plane.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -45,8 +46,12 @@ def stub_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tools_mod, "workspace_dir", _workspace_dir)
 
     def _fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        if cmd[:3] == ["git", "branch", "--show-current"]:
+            return subprocess.CompletedProcess(cmd, 0, "work/p3\n", "")
         if cmd[:2] == ["git", "status"]:
             return subprocess.CompletedProcess(cmd, 0, "M file.py\n", "")
+        if cmd[:2] == ["git", "rev-parse"] and "--abbrev-ref" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "work/p3\n", "")
         if cmd[:2] == ["git", "rev-parse"]:
             return subprocess.CompletedProcess(cmd, 0, "abc123\n", "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -75,6 +80,28 @@ def _ok(result: dict[str, Any]) -> str:
         f"tool returned error: {result.get('content')}"
     )
     return result["content"][0]["text"]
+
+
+def _extract_task_id(body: str) -> str:
+    m = re.search(r"t-\d{4}-\d{2}-\d{2}-[a-f0-9]{8}", body)
+    assert m, f"no task id in body: {body}"
+    return m.group(0)
+
+
+def _extract_backlog_id(body: str) -> int:
+    m = re.search(r"Backlog entry #(\d+)", body)
+    assert m, f"no backlog id in body: {body}"
+    return int(m.group(1))
+
+
+async def _create_and_promote(coach: Any, args: dict[str, Any]) -> str:
+    create_text = _ok(await _handler(coach, "create_task")(args))
+    backlog_id = _extract_backlog_id(create_text)
+    promote_text = _ok(await _handler(coach, "triage_backlog")({
+        "id": str(backlog_id),
+        "action": "promote",
+    }))
+    return _extract_task_id(promote_text)
 
 
 async def _project_event_types(project_id: str) -> list[str]:
@@ -132,18 +159,11 @@ async def test_full_v2_lifecycle_smoke(
     p5 = _server_for("p5")
 
     # 1. Coach creates the task. First-stage `to` is single-name → role row plants.
-    create = _handler(coach, "create_task")
-    res = await create({
+    tid = await _create_and_promote(coach, {
         "title": "Build feature X",
         "description": "Spec + commit + audit + ship",
         "trajectory": _TRAJECTORY,
     })
-    text = _ok(res)
-    # Pull task_id back from the response body.
-    import re
-    m = re.search(r"t-\d{4}-\d{2}-\d{2}-[a-f0-9]{8}", text)
-    assert m, f"no task id in response: {text}"
-    tid = m.group(0)
 
     # 2. Planner submits spec with message_to_coach.
     write_spec = _handler(p5, "write_task_spec")
@@ -251,13 +271,10 @@ async def test_audit_fail_does_not_auto_revert(
     p4 = _server_for("p4")
     p5 = _server_for("p5")
 
-    create = _handler(coach, "create_task")
-    text = _ok(await create({
+    tid = await _create_and_promote(coach, {
         "title": "fail-revert demo", "description": "x",
         "trajectory": _TRAJECTORY,
-    }))
-    import re
-    tid = re.search(r"t-\d{4}-\d{2}-\d{2}-[a-f0-9]{8}", text).group(0)
+    })
     _ok(await _handler(p5, "write_task_spec")({
         "task_id": tid, "body": "## Goal\nx\n",
     }))

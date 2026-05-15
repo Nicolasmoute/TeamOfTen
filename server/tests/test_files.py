@@ -21,6 +21,10 @@ from server.db import (
 from server.paths import global_paths, project_paths
 
 
+def _run(coro):
+    return asyncio.run(coro)
+
+
 # ---------- path safety ----------
 
 
@@ -30,21 +34,21 @@ def test_resolve_rejects_unknown_root(fresh_db) -> None:
 
 
 def test_resolve_rejects_traversal(fresh_db) -> None:
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
     for bad in ("../../etc/passwd", "../escape", "a/../../escape"):
         with pytest.raises(ValueError):
             filesmod._resolve("global", bad)
 
 
 def test_resolve_strips_leading_slash(fresh_db) -> None:
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
     target = filesmod._resolve("global", "/foo.md")
     # Resolves under the global root (not as an absolute filesystem path).
     assert target.parent == global_paths().root.resolve()
 
 
 def test_resolve_empty_returns_root(fresh_db) -> None:
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
     assert filesmod._resolve("global", "") == global_paths().root.resolve()
 
 
@@ -54,7 +58,7 @@ def test_resolve_empty_returns_root(fresh_db) -> None:
 def test_list_roots_phase5_two_root_payload(fresh_db) -> None:
     """Phase 5 (PROJECTS_SPEC.md §7) — list_roots() surfaces exactly
     two scoped roots: `global` and `project` (the active project's tree)."""
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
 
     rows = filesmod.list_roots()
     assert len(rows) == 2, f"expected 2 roots, got {len(rows)}: {rows}"
@@ -84,7 +88,7 @@ def test_list_roots_omits_legacy_keys(fresh_db) -> None:
     subtrees (context/knowledge/decisions/workspaces/outputs/uploads/
     plans/handoffs) are reached by drilling into `project`, not as
     top-level roots."""
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
 
     rows = filesmod.list_roots()
     ids = {r["id"] for r in rows}
@@ -123,14 +127,14 @@ def test_list_roots_project_path_tracks_active_project(fresh_db) -> None:
             await c.close()
         await set_active_project("alpha")
 
-    asyncio.get_event_loop().run_until_complete(setup_two_projects())
+    _run(setup_two_projects())
 
     alpha_rows = filesmod.list_roots()
     alpha_project = next(r for r in alpha_rows if r["id"] == "project")
     assert alpha_project["project_id"] == "alpha"
     assert alpha_project["path"].endswith("alpha")
 
-    asyncio.get_event_loop().run_until_complete(set_active_project("beta"))
+    _run(set_active_project("beta"))
 
     beta_rows = filesmod.list_roots()
     beta_project = next(r for r in beta_rows if r["id"] == "project")
@@ -143,7 +147,7 @@ def test_list_roots_project_path_tracks_active_project(fresh_db) -> None:
 
 
 def test_tree_empty_root_returns_no_children(fresh_db) -> None:
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
     pp = project_paths(MISC_PROJECT_ID)
     # Wipe the misc project tree so tree() has nothing to enumerate.
     import shutil
@@ -155,7 +159,7 @@ def test_tree_empty_root_returns_no_children(fresh_db) -> None:
 
 
 def test_tree_missing_root_returns_empty(fresh_db) -> None:
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
     pp = project_paths(MISC_PROJECT_ID)
     import shutil
     shutil.rmtree(pp.root, ignore_errors=True)
@@ -165,7 +169,7 @@ def test_tree_missing_root_returns_empty(fresh_db) -> None:
 
 
 def test_tree_sorts_dirs_before_files_case_insensitive(fresh_db) -> None:
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
     pp = project_paths(MISC_PROJECT_ID)
     # Use working/workspace as a clean sandbox where we control everything.
     sandbox = pp.working_workspace
@@ -184,7 +188,7 @@ def test_tree_sorts_dirs_before_files_case_insensitive(fresh_db) -> None:
 
 
 def test_tree_skips_noise_dirs(fresh_db) -> None:
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
     pp = project_paths(MISC_PROJECT_ID)
     sandbox = pp.working_workspace
     sandbox.mkdir(parents=True, exist_ok=True)
@@ -203,13 +207,13 @@ def test_tree_skips_noise_dirs(fresh_db) -> None:
 
 
 def test_read_missing_raises_filenotfound(fresh_db) -> None:
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
     with pytest.raises(FileNotFoundError):
         filesmod.read_text("project", "does/not/exist.md")
 
 
 def test_read_oversize_raises_value_error(fresh_db) -> None:
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
     pp = project_paths(MISC_PROJECT_ID)
     huge_path = pp.working_workspace / "huge.md"
     pp.working_workspace.mkdir(parents=True, exist_ok=True)
@@ -219,7 +223,7 @@ def test_read_oversize_raises_value_error(fresh_db) -> None:
 
 
 def test_read_roundtrip(fresh_db) -> None:
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
     pp = project_paths(MISC_PROJECT_ID)
     pp.working_workspace.mkdir(parents=True, exist_ok=True)
     # write_bytes (not write_text) so Windows doesn't translate
@@ -271,7 +275,7 @@ def test_resolve_denies_claude_credentials(fresh_db) -> None:
     """Direct `read` / `write` of the OAuth token file is refused even
     though `tree('global')` already hides it. _resolve() is the choke
     point so all three operations honour the same denylist."""
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
     from server.paths import DATA_ROOT
     claude_dir = DATA_ROOT / "claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
@@ -283,7 +287,7 @@ def test_resolve_denies_claude_credentials(fresh_db) -> None:
 
 
 def test_resolve_denies_codex_auth(fresh_db) -> None:
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
     from server.paths import DATA_ROOT
     codex_dir = DATA_ROOT / "codex"
     codex_dir.mkdir(parents=True, exist_ok=True)
@@ -297,7 +301,7 @@ def test_resolve_denies_codex_auth(fresh_db) -> None:
 def test_resolve_denies_sqlite_db(fresh_db) -> None:
     """Direct read of harness.db bypasses every API guard — refuse it
     even though the file lives under a writable root."""
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
     # The fresh_db fixture points DB_PATH at a tempfile, but the
     # `DATA_ROOT/harness.db` default is also denied (covers production
     # deploys regardless of HARNESS_DB_PATH override).
@@ -310,7 +314,7 @@ def test_resolve_denies_sqlite_db(fresh_db) -> None:
 
 
 def test_resolve_denies_sqlite_wal_sidecar(fresh_db) -> None:
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
     from server.paths import DATA_ROOT
     sidecar = DATA_ROOT / "harness.db-wal"
     sidecar.write_bytes(b"")
@@ -322,7 +326,7 @@ def test_resolve_denies_sqlite_wal_sidecar(fresh_db) -> None:
 def test_resolve_denies_anything_inside_claude_dir(fresh_db) -> None:
     """A nested file inside the OAuth dir is denied even if its name
     looks innocuous — the whole subtree is off-limits."""
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
     from server.paths import DATA_ROOT
     nested = DATA_ROOT / "claude" / "subdir"
     nested.mkdir(parents=True, exist_ok=True)
@@ -336,7 +340,7 @@ def test_resolve_allows_lookalike_paths_outside_denied(fresh_db) -> None:
     """Don't false-positive on paths whose names start with `claude` /
     `codex` / `harness.db` but live elsewhere on the tree (e.g. a
     project named `claude-helper`, a doc called `harness.db.md`)."""
-    asyncio.get_event_loop().run_until_complete(init_db())
+    _run(init_db())
     from server.paths import DATA_ROOT
     # A lookalike directory next to the denied one — different name,
     # not a prefix issue.

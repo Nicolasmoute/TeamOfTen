@@ -53,6 +53,22 @@ def _extract_task_id(body: str) -> str:
     return m.group(0)
 
 
+def _extract_backlog_id(body: str) -> int:
+    m = re.search(r"Backlog entry #(\d+)", body)
+    assert m, f"no backlog id in body: {body}"
+    return int(m.group(1))
+
+
+async def _create_and_promote(coach: Any, args: dict[str, Any]) -> str:
+    body = _ok(await _handler(coach, "create_task")(args))
+    backlog_id = _extract_backlog_id(body)
+    promoted = _ok(await _handler(coach, "triage_backlog")({
+        "id": str(backlog_id),
+        "action": "promote",
+    }))
+    return _extract_task_id(promoted)
+
+
 async def _stub_wake(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
     calls: list[tuple[str, str]] = []
 
@@ -83,18 +99,17 @@ async def _active_role_owner(task_id: str, role: str) -> str | None:
 async def test_single_name_first_stage_plants_role_at_create(
     fresh_db: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """v2.0.1: trajectory[0].to=['p2'] plants the executor role row at
-    create time. tasks.owner is set; agents.current_task_id propagates."""
+    """v2.0.1: trajectory[0].to=['p2'] plants the executor role row when
+    the backlog entry is promoted. tasks.owner is set."""
     await init_db()
     await _stub_wake(monkeypatch)
     coach = _server_for("coach")
 
-    body = _ok(await _handler(coach, "create_task")({
+    tid = await _create_and_promote(coach, {
         "title": "single-name demo",
         "description": "x",
         "trajectory": '[{"stage":"execute","to":["p2"]}]',
-    }))
-    tid = _extract_task_id(body)
+    })
     assert await _active_role_owner(tid, "executor") == "p2"
 
 
@@ -109,12 +124,11 @@ async def test_same_stage_approve_rejected_when_role_active(
     await _stub_wake(monkeypatch)
     coach = _server_for("coach")
 
-    body = _ok(await _handler(coach, "create_task")({
+    tid = await _create_and_promote(coach, {
         "title": "double-same-stage demo",
         "description": "x",
         "trajectory": '[{"stage":"execute","to":["p2"]}]',
-    }))
-    tid = _extract_task_id(body)
+    })
 
     err = _err(await _handler(coach, "approve_stage")({
         "task_id": tid,
@@ -135,15 +149,14 @@ async def test_normal_next_stage_after_create(
     await _stub_wake(monkeypatch)
     coach = _server_for("coach")
 
-    body = _ok(await _handler(coach, "create_task")({
+    tid = await _create_and_promote(coach, {
         "title": "normal-next demo",
         "description": "x",
         "trajectory": (
             '[{"stage":"execute","to":["p2"]},'
             '{"stage":"audit_syntax","to":["p4"]}]'
         ),
-    }))
-    tid = _extract_task_id(body)
+    })
 
     _ok(await _handler(coach, "approve_stage")({
         "task_id": tid,
