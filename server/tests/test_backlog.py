@@ -197,6 +197,66 @@ async def test_propose_task_requires_title() -> None:
     result = await fn({"title": ""})
     assert _is_err(result)
 
+# ---------------------------------------------------------------- coord_list_tasks / coord_list_backlog
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_default_include_backlog_includes_both_kinds() -> None:
+    # Regression: the no-args path must still include pending backlog rows.
+    await _insert_task("Implement search")
+    backlog_id = await _insert_backlog("Plan roadmap")
+
+    fn = _handler("coach", "coord_list_tasks")
+    result = await fn({})
+    text = _text(result)
+
+    assert _is_ok(result), text
+    assert "kind=task" in text
+    assert "kind=backlog" in text
+    assert f"#{backlog_id}" in text
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_pending_returns_backlog_only() -> None:
+    await _insert_task("Implement search")
+    await _insert_backlog("Plan roadmap")
+
+    fn = _handler("coach", "coord_list_tasks")
+    result = await fn({"status": "pending"})
+    text = _text(result)
+
+    assert _is_ok(result), text
+    assert "kind=backlog" in text
+    assert "kind=task" not in text
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_task_stage_stays_task_only() -> None:
+    await _insert_task("Implement search")
+    await _insert_backlog("Plan roadmap")
+
+    fn = _handler("coach", "coord_list_tasks")
+    result = await fn({"status": "execute", "include_backlog": "true"})
+    text = _text(result)
+
+    assert _is_ok(result), text
+    assert "kind=task" in text
+    assert "kind=backlog" not in text
+
+
+@pytest.mark.asyncio
+async def test_list_backlog_shim_keeps_backlog_shape() -> None:
+    backlog_id = await _insert_backlog("Plan roadmap")
+
+    fn = _handler("coach", "coord_list_backlog")
+    result = await fn({"status": "pending", "limit": "10"})
+    text = _text(result)
+
+    assert _is_ok(result), text
+    assert f"#{backlog_id}" in text
+    assert "kind=backlog" in text
+    assert "kind=task" not in text
+
 
 # ---------------------------------------------------------------- coord_triage_backlog
 

@@ -455,6 +455,20 @@ that prompt leaks, Codex's MCP reader reports `serde error expected value
 at line 1 column 1`, poisons the app-server stdio transport, and the
 harness surfaces it as `CodexTransportError: receiver loop failed`.
 
+**Codex external MCP isolation (2026-05-15).** Unlike Claude, Codex
+hosts every MCP server inside the `codex app-server` subprocess. A
+single external stdio MCP that logs to stdout, exits during startup, or
+otherwise corrupts its JSON-RPC stream can poison the whole app-server
+receiver loop, including turns that only use native tools and `coord_*`.
+So Codex no longer ambient-starts all UI/file-configured external MCP
+servers just because they exist in `mcp_servers`. Default behavior:
+only the harness-owned `coord` proxy is started. External servers are
+included for Codex only when the slot's explicit `agents.allowed_tools`
+override already names an `mcp__<server>__...` tool. Set
+`HARNESS_CODEX_EXTERNAL_MCP=true` to restore the old ambient behavior
+for a deployment that accepts the stability risk. ClaudeRuntime remains
+unchanged and still receives the configured external MCP catalogue.
+
 **Deprecated `.mcp.json` path.** `_write_codex_mcp_json` is retained
 only as a reference helper. The runtime no longer relies on workspace
 files for Codex MCP configuration. The old `.gitignore` entry remains:
