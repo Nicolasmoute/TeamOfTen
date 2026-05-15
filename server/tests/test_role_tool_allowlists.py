@@ -13,6 +13,15 @@ def test_executor_allowlist_has_delivery_tools_but_not_stage_approval() -> None:
     assert "mcp__coord__coord_approve_stage" not in tools
 
 
+def test_shipper_allowlist_has_ship_gate_but_not_stage_approval() -> None:
+    tools = set(tools_for_role("shipper"))
+
+    assert "Bash" in tools
+    assert "mcp__coord__coord_ship_to_dev" in tools
+    assert "mcp__coord__coord_role_complete" in tools
+    assert "mcp__coord__coord_approve_stage" not in tools
+
+
 def test_idle_allowlist_keeps_read_and_coord_status_surface_only() -> None:
     tools = set(tools_for_role("idle"))
 

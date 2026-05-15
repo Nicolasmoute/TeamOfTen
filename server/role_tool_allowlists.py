@@ -111,6 +111,7 @@ ROLE_TOOL_ALLOWLISTS: Final[dict[str, list[str]]] = {
         + COORD_BASE
         + COORD_WRITE_CONTEXT
         + [
+            _coord("coord_ship_to_dev"),
             _coord("coord_role_complete"),
         ]
         + INTERACTIVE_TOOLS
