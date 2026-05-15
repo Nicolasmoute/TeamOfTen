@@ -448,3 +448,71 @@ async def test_run_agent_passes_codex_role_allowlist_to_mcp_config(
     assert captured["coord_enabled_tools"] == captured["coord_allowed_arg"]
     assert "coord_commit_push" in captured["coord_enabled_tools"]
     assert "coord_approve_stage" not in captured["coord_enabled_tools"]
+
+
+async def test_run_agent_recovers_repeated_codex_transport_error_before_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_db: str,
+) -> None:
+    """The second consecutive Codex stdio failure clears the stored
+    thread before the next auto-retry, avoiding the coach retry loop
+    seen when a poisoned codex_thread_id keeps crashing resume."""
+    import server.db as dbmod
+    await dbmod.init_db()
+
+    import server.agents as agentsmod
+    import server.runtimes as runtimes_mod
+    import server.runtimes.codex as codex_mod
+
+    class _Runtime:
+        name = "codex"
+
+        async def maybe_auto_compact(self, tc):
+            return False
+
+        async def run_turn(self, tc):
+            raise RuntimeError(
+                "CodexTransportError: receiver loop failed: "
+                "failed reading from stdio transport"
+            )
+
+        async def run_manual_compact(self, tc):
+            await self.run_turn(tc)
+
+    calls: dict[str, object] = {}
+
+    async def runtime_for(agent_id):
+        return "codex"
+
+    async def get_codex_thread(agent_id):
+        return "poisoned-thread"
+
+    async def recover(agent_id, *, consecutive_errors, error):
+        calls["agent_id"] = agent_id
+        calls["consecutive_errors"] = consecutive_errors
+        calls["error"] = error
+        return True
+
+    async def schedule(agent_id, **kwargs):
+        calls["scheduled_agent_id"] = agent_id
+
+    monkeypatch.setattr(agentsmod, "_resolve_runtime_for", runtime_for)
+    monkeypatch.setattr(runtimes_mod, "get_runtime", lambda name: _Runtime())
+    monkeypatch.setattr(codex_mod, "_get_codex_thread_id", get_codex_thread)
+    monkeypatch.setattr(
+        codex_mod,
+        "recover_codex_thread_after_repeated_transport_error",
+        recover,
+    )
+    monkeypatch.setattr(agentsmod, "_schedule_post_error_retry", schedule)
+
+    agentsmod._consecutive_errors["coach"] = 1
+    try:
+        await agentsmod.run_agent("coach", "resume")
+    finally:
+        agentsmod._consecutive_errors.pop("coach", None)
+
+    assert calls["agent_id"] == "coach"
+    assert calls["consecutive_errors"] == 2
+    assert "failed reading from stdio transport" in str(calls["error"])
+    assert calls["scheduled_agent_id"] == "coach"

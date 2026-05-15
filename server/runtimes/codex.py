@@ -868,15 +868,13 @@ async def open_thread(
             )
 
         # Memory salvage — mirror Claude's session_auto_recovered path.
-        # ALWAYS attempt continuity-note salvage (unions dev's R4 path
-        # which ran unconditionally) so callers that didn't pass tc
-        # still get next-turn memory recovery via the normal run_agent
-        # system-prompt composition. ADDITIONALLY, when tc is provided,
+        # Only attempt continuity-note salvage when the dispatcher
+        # supplied a TurnContext; legacy/test callers keep the historical
+        # session_resume_failed + clear + start_thread behavior. With tc,
         # rebuild ThreadConfig with augmented developer_instructions so
-        # the IMMEDIATE current-turn start_thread sees the handoff
-        # inline (Stage 3a enhancement). The salvage MUST happen BEFORE
-        # `_clear_codex_thread_id` so a future read-from-disk of the
-        # rolling exchange log is consistent.
+        # the immediate current-turn start_thread sees the handoff inline.
+        # The salvage MUST happen BEFORE `_clear_codex_thread_id` so a
+        # future read-from-disk of the rolling exchange log is consistent.
         config = await _maybe_salvage_for_codex_resume_failure(
             agent_id=agent_id,
             tc=tc,
@@ -897,14 +895,17 @@ async def _maybe_salvage_for_codex_resume_failure(
     tc: Any,
     sdk: Any,
     current_config: Any,
+    emit_recovered: bool = True,
+    allow_without_turn_context: bool = False,
 ) -> Any:
     """Try to salvage prior-conversation memory before a Codex stale-
     thread fall-back to `start_thread`. Returns the (possibly rebuilt)
     config that the caller should pass to `start_thread`.
 
-    No-op when `tc` is None (legacy / test caller) or when the rolling
-    exchange log is empty (fresh agent or already-cleared). On
-    success: writes a synthetic continuity_note via
+    No-op when `tc` is None (legacy / test caller) unless explicitly
+    allowed by a dispatcher recovery path, or when the rolling exchange
+    log is empty (fresh agent or already-cleared). On success: writes a
+    synthetic continuity_note via
     `_set_continuity_note`, rebuilds the ThreadConfig with augmented
     developer_instructions (so the new thread sees the handoff suffix
     inline), sets `tc.turn_ctx["had_handoff_on_entry"] = True`, and
@@ -922,21 +923,23 @@ async def _maybe_salvage_for_codex_resume_failure(
 
     Returns the original `current_config` unchanged when no rebuild
     happened (tc=None caller, OR rebuild raised), OR a freshly-built
-    ThreadConfig with the augmented developer_instructions when it
-    did. Either way the caller passes the returned value to
-    `start_thread` without needing to know which path ran.
+    ThreadConfig with the augmented developer_instructions when it did.
+    Either way the caller passes the returned value to `start_thread`
+    without needing to know which path ran.
 
     Two salvage tiers:
-    - Tier 1 (always when log non-empty): write synthetic
-      continuity_note + emit session_auto_recovered. Unions dev's
-      R4 path which ran unconditionally; gives next-turn memory
-      recovery via the normal run_agent system-prompt composition
-      even for callers that didn't pass tc (legacy / tests).
+    - Tier 1 (when a TurnContext is present, or when a dispatcher
+      recovery explicitly opts in): write synthetic continuity_note +
+      emit session_auto_recovered. This gives next-turn memory recovery
+      via the normal run_agent system-prompt composition.
     - Tier 2 (only when tc provided): rebuild ThreadConfig with
       augmented developer_instructions so the IMMEDIATE current-turn
       start_thread sees the handoff inline + flip
       tc.turn_ctx["had_handoff_on_entry"] for post-result cleanup.
     """
+    if tc is None and not allow_without_turn_context:
+        return current_config
+
     # Late imports to avoid a module-load cycle: server.agents imports
     # server.runtimes.codex via the runtime registry.
     try:
@@ -989,20 +992,22 @@ async def _maybe_salvage_for_codex_resume_failure(
             "slot=%s — skipping rebuild + flag", agent_id,
         )
 
-    # Tier 1 emit — also unconditional (gives the dashboard / Coach
-    # visibility into the boundary even for legacy callers).
-    try:
-        await _emit(
-            agent_id,
-            "session_auto_recovered",
-            salvaged_exchanges=salvaged_count,
-            runtime="codex",
-        )
-    except Exception:
-        logger.exception(
-            "CodexRuntime: session_auto_recovered emit failed for "
-            "slot=%s", agent_id,
-        )
+    # Tier 1 emit — only after the synthetic note was written. Otherwise
+    # `session_auto_recovered` would overstate a degraded path where the
+    # next turn has no continuity note to consume.
+    if emit_recovered and note_written:
+        try:
+            await _emit(
+                agent_id,
+                "session_auto_recovered",
+                salvaged_exchanges=salvaged_count,
+                runtime="codex",
+            )
+        except Exception:
+            logger.exception(
+                "CodexRuntime: session_auto_recovered emit failed for "
+                "slot=%s", agent_id,
+            )
 
     # Tier 2 — only when tc was provided AND the note was written
     # successfully. Without tc we can't rebuild ThreadConfig (no
@@ -1071,6 +1076,84 @@ async def _maybe_salvage_for_codex_resume_failure(
         )
 
     return new_config
+
+
+def looks_like_codex_transport_error(exc: BaseException) -> bool:
+    """Best-effort classifier for Codex app-server stdio death."""
+    text = str(exc).lower()
+    return (
+        type(exc).__name__ == "CodexTransportError"
+        or "codextransporterror" in text
+        or "failed reading from stdio transport" in text
+        or "receiver loop failed" in text
+    )
+
+
+async def recover_codex_thread_after_repeated_transport_error(
+    agent_id: str,
+    *,
+    consecutive_errors: int,
+    error: str,
+) -> bool:
+    """Clear a likely poisoned Codex thread before the next retry.
+
+    A single transport failure usually just means the cached app-server
+    subprocess died; rebuilding the client and preserving the thread is
+    the right first response. If the same slot keeps failing, the stored
+    thread itself may be unrecoverable. In that case, salvage the rolling
+    exchange log into continuity_note and clear codex_thread_id so the
+    next auto-retry starts fresh instead of exhausting the retry budget.
+    """
+    existing = await _get_codex_thread_id(agent_id)
+    if not existing:
+        return False
+    try:
+        await _maybe_salvage_for_codex_resume_failure(
+            agent_id=agent_id,
+            tc=None,
+            sdk=None,
+            current_config=None,
+            emit_recovered=False,
+            allow_without_turn_context=True,
+        )
+    except Exception:
+        logger.exception(
+            "CodexRuntime: transport recovery salvage failed for slot=%s",
+            agent_id,
+        )
+    await _clear_codex_thread_id(agent_id)
+    try:
+        await close_client(agent_id)
+    except Exception:
+        logger.exception(
+            "CodexRuntime: close_client failed during transport recovery "
+            "for slot=%s",
+            agent_id,
+        )
+    try:
+        from server.agents import _emit
+        await _emit(
+            agent_id,
+            "session_auto_recovered",
+            runtime="codex",
+            reason="repeated_transport_error",
+            session_id=existing,
+            consecutive_errors=consecutive_errors,
+            error=error[:500],
+        )
+    except Exception:
+        logger.exception(
+            "CodexRuntime: repeated transport recovery emit failed for slot=%s",
+            agent_id,
+        )
+    logger.warning(
+        "CodexRuntime: cleared Codex thread after repeated transport errors "
+        "slot=%s thread_id=%s consecutive=%d",
+        agent_id,
+        existing,
+        consecutive_errors,
+    )
+    return True
 
 
 # ---------------------------------------------------------------------
