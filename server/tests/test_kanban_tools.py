@@ -182,6 +182,40 @@ async def test_create_task_first_stage_assignment_sets_role_tools(
     assert row["current_task_id"]
 
 
+async def test_set_agent_role_tools_evicts_codex_client(
+    fresh_db: str,
+) -> None:
+    """_set_agent_role_tools must schedule a Codex client eviction so the
+    next Codex spawn picks up the new allowed_tools from the DB, not the
+    stale cached subprocess config."""
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    await init_db()
+    evicted: list[str] = []
+
+    async def fake_evict(slot: str) -> None:
+        evicted.append(slot)
+
+    with patch("server.runtimes.codex.evict_client", new=fake_evict):
+        # Import inside the patch so the lazy import in _set_agent_role_tools
+        # picks up the patched version.
+        from server.tools import _set_agent_role_tools
+        from server.db import configured_conn as _cc
+
+        c = await _cc()
+        try:
+            await _set_agent_role_tools(c, "p3", "executor")
+            await c.commit()
+        finally:
+            await c.close()
+
+        # Let the ensure_future task run.
+        await asyncio.sleep(0)
+
+    assert "p3" in evicted, "evict_client must be called after role change"
+
+
 async def test_create_task_pool_first_stage_rejected(
     fresh_db: str,
 ) -> None:

@@ -769,6 +769,20 @@ async def _set_agent_role_tools(c: Any, agent_id: str, role: str | None) -> None
         "UPDATE agents SET allowed_tools = ? WHERE id = ?",
         (tools_json_for_role(role), agent_id),
     )
+    # Evict any cached Codex client so the next spawn rebuilds with the
+    # updated tool list. Codex clients capture allowed_tools at subprocess
+    # start (via --allowed-tools CLI flag to coord_mcp) and never re-read
+    # the DB — without eviction, a role change is invisible to the running
+    # Codex session even after the DB is updated.
+    # Schedule as a fire-and-forget task so the eviction runs after the
+    # caller's DB transaction commits (we're still inside a transaction here).
+    try:
+        import asyncio
+        from server.runtimes.codex import evict_client
+
+        asyncio.ensure_future(evict_client(agent_id))
+    except Exception:
+        pass  # Never block a role assignment on eviction failure
 
 
 async def _reset_agent_idle_tools(c: Any, agent_id: str) -> None:
