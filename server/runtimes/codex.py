@@ -22,6 +22,8 @@ import contextlib
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import time
 from collections.abc import Mapping
@@ -65,6 +67,7 @@ _client_locks: dict[str, asyncio.Lock] = {}
 # Bump when the Codex-visible coord tool contract changes in a way that
 # old persisted Codex threads might not pick up on resume.
 _CODEX_TOOL_CONTRACT_VERSION = "2026-05-14.role-tool-allowlists"
+_CODEX_WORKTREE_SANDBOX_PROBE_CACHE: dict[str, Any] | None = None
 
 
 def _codex_request_timeout_seconds() -> float:
@@ -81,6 +84,96 @@ def _codex_request_timeout_seconds() -> float:
     except ValueError:
         value = 120.0
     return max(30.0, value)
+
+
+def reset_codex_worktree_sandbox_probe_for_tests() -> None:
+    global _CODEX_WORKTREE_SANDBOX_PROBE_CACHE
+    _CODEX_WORKTREE_SANDBOX_PROBE_CACHE = None
+
+
+def codex_worktree_sandbox_status() -> dict[str, Any]:
+    """Probe whether Codex's bwrap-backed workspace sandbox can run.
+
+    Codex's `workspaceWrite` sandboxPolicy ultimately depends on
+    bubblewrap being able to create a mount namespace and set mount
+    propagation. Some hosted containers allow `bwrap --version` but
+    deny the actual namespace setup, producing:
+
+        bwrap: Failed to make / slave: Permission denied
+
+    Cache the live capability result so Player turns can choose the
+    strongest usable policy without paying a probe every turn.
+    """
+    global _CODEX_WORKTREE_SANDBOX_PROBE_CACHE
+    if _CODEX_WORKTREE_SANDBOX_PROBE_CACHE is not None:
+        return dict(_CODEX_WORKTREE_SANDBOX_PROBE_CACHE)
+
+    if os.name != "posix":
+        result = {
+            "ok": True,
+            "supported": True,
+            "skipped": True,
+            "reason": "non-posix host; runtime probe only applies in Linux containers",
+        }
+        _CODEX_WORKTREE_SANDBOX_PROBE_CACHE = result
+        return dict(result)
+
+    bwrap = shutil.which("bwrap")
+    true_bin = shutil.which("true") or "/bin/true"
+    if not bwrap:
+        result = {
+            "ok": False,
+            "supported": False,
+            "reason": "bwrap not found on PATH",
+            "mode": "danger-full-access-fallback",
+        }
+        _CODEX_WORKTREE_SANDBOX_PROBE_CACHE = result
+        return dict(result)
+
+    cmd = [bwrap, "--ro-bind", "/", "/", true_bin]
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        result = {
+            "ok": False,
+            "supported": False,
+            "reason": "bwrap capability probe timed out",
+            "command": " ".join(cmd),
+            "mode": "danger-full-access-fallback",
+        }
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "supported": False,
+            "reason": f"{type(exc).__name__}: {exc}",
+            "command": " ".join(cmd),
+            "mode": "danger-full-access-fallback",
+        }
+    else:
+        stderr = (proc.stderr or "").strip()
+        result = {
+            "ok": proc.returncode == 0,
+            "supported": proc.returncode == 0,
+            "command": " ".join(cmd),
+            "exit_code": proc.returncode,
+        }
+        if proc.returncode == 0:
+            result["mode"] = "workspaceWrite"
+        else:
+            result["mode"] = "danger-full-access-fallback"
+            result["reason"] = stderr or f"bwrap exited {proc.returncode}"
+            if stderr:
+                result["stderr"] = stderr[:1200]
+
+    _CODEX_WORKTREE_SANDBOX_PROBE_CACHE = result
+    return dict(result)
 
 
 class _CapturedStdioTransport:
@@ -1656,6 +1749,22 @@ def _codex_sandbox_policy(tc: TurnContext) -> dict[str, Any] | None:
     """
     if tc.agent_id == "coach" or not tc.workspace_cwd:
         return None
+    sandbox_status = codex_worktree_sandbox_status()
+    if not sandbox_status.get("supported"):
+        logger.warning(
+            "CodexRuntime: Player worktree sandboxPolicy unsupported; "
+            "slot=%s will use danger-full-access fallback: %s",
+            tc.agent_id,
+            sandbox_status.get("reason") or sandbox_status,
+        )
+        if isinstance(getattr(tc, "turn_ctx", None), dict):
+            tc.turn_ctx["codex_sandbox_degraded"] = {
+                "reason": sandbox_status.get("reason") or "unsupported",
+                "mode": sandbox_status.get("mode")
+                or "danger-full-access-fallback",
+                "stderr": sandbox_status.get("stderr"),
+            }
+        return None
     # The harness normally runs in Linux containers, but unit tests may
     # execute on Windows while still passing container-style /data paths.
     # Preserve POSIX path strings in that case so blockedPaths match what
@@ -2443,6 +2552,17 @@ class CodexRuntime:
             else:
                 thread, resumed = await open_thread(tc.agent_id, client, config=config, tc=tc)
             tc.turn_ctx["codex_resumed_session"] = resumed
+            sandbox_degraded = tc.turn_ctx.pop("codex_sandbox_degraded", None)
+            if sandbox_degraded and not tc.turn_ctx.get("_codex_sandbox_degraded_emitted"):
+                tc.turn_ctx["_codex_sandbox_degraded_emitted"] = True
+                await _emit(
+                    tc.agent_id,
+                    "runtime_sandbox_degraded",
+                    runtime="codex",
+                    sandbox="danger-full-access",
+                    reason=sandbox_degraded.get("reason"),
+                    stderr=sandbox_degraded.get("stderr"),
+                )
 
             stream = thread.chat(
                 tc.prompt,

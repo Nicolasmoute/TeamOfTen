@@ -3744,6 +3744,7 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
 function summarizeHealthCheck(c) {
   if (!c) return "";
   if (c.skipped) return c.reason ? `skipped — ${c.reason}` : "skipped";
+  if (c.degraded && c.reason) return `degraded: ${c.reason}`;
   if (c.error) return String(c.error);
   if (c.version) return String(c.version);
   if (c.exit_code != null) return `exit ${c.exit_code}`;

@@ -236,6 +236,10 @@ async def _serve(client: CoordProxyClient) -> int:
     async def _list_resources() -> list[types.Resource]:
         return []
 
+    @server.list_resource_templates()
+    async def _list_resource_templates() -> list[types.ResourceTemplate]:
+        return []
+
     @server.list_prompts()
     async def _list_prompts() -> list[types.Prompt]:
         return []
