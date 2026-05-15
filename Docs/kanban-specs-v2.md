@@ -487,6 +487,32 @@ The tier-2 task hydration query filters `AND status != 'archive'` (both the sing
 
 `coord_role_complete` accepts completion against an archived task when the caller still has a non-superseded `task_role_assignments` row on it. The event emits with `post_archive: true` so subscribers (Coach rollup, Telegram bridge) can distinguish a routine in-stage completion from a "verification landed after archive" report. No stage advance is possible — the task stays archived — but Coach receives the message + artifact via the normal `task_role_completed` event fan-out and wake path. This closes the race observed in Coach's 2026-05-12 report where Players polling a long-running Zeabur deploy (30–35 min) would find the task auto-archived under them and silently lose their verification work.
 
+### 10.8 Active-task soft cap — Coach confirmation gate
+
+Limits the number of non-archive kanban tasks that can be live simultaneously per project, reducing WIP overload. The gate fires at `coord_triage_backlog(action='promote')` only — ideas accumulate in backlog freely; the friction is at promotion.
+
+**Default limit:** 3. Overridable at deploy time via `HARNESS_KANBAN_ACTIVE_LIMIT` env var. Per-project override stored in `team_config['kanban_active_limit_<project_id>']` (wins over env var once set; ratchets up on confirmed overruns — never decremented automatically).
+
+**Count scope:** `tasks.status NOT IN ('archive')` for the active project. All non-terminal stages (plan, execute, audit_syntax, audit_semantics, ship) count equally.
+
+**Gate behaviour:**
+
+1. Before inserting the promoted task, `coord_triage_backlog` reads the active count and the current limit inside a single `configured_conn()` block (atomic with the subsequent INSERT — no TOCTOU window).
+2. If `active_count >= limit` and `confirm_over_limit` is absent or false, the call refuses with a structured error:
+   ```json
+   { "ok": false, "over_limit": true, "active_count": N, "limit": M,
+     "error": "Active task count (N) is at the soft cap (M). Pass confirm_over_limit=true to promote anyway — this will ratchet the cap to N+1." }
+   ```
+3. If `confirm_over_limit=true`, the task is planted AND `kanban_active_limit_<project_id>` is updated to `active_count + 1` in the same atomic commit. The cap only ever increases via explicit confirmation; it does not auto-reset when tasks archive.
+
+**Exemptions (no gate applied):**
+- `coord_create_task` (top-level, no `parent_id`) — lands in backlog; never hits the kanban directly.
+- `coord_create_task` (subtask, `parent_id` set) — lives under its parent's existing task; not a new concurrency source.
+- `coord_propose_task` — backlog only.
+- `coord_update_task`, `coord_approve_stage`, and all other stage-transition tools — cap only fires at promotion, not at moves within the kanban.
+
+**Observability:** `GET /api/team/kanban/limit` returns `{limit, active_count, env_default}` for dashboards and scripts.
+
 ---
 
 ## 11 · Pattern detection layer (N4 / N6 / N8)
