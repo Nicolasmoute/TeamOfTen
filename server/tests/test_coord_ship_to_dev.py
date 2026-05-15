@@ -141,14 +141,15 @@ async def _seed_executor_commit(
     *,
     task_id: str = TASK_ID,
     sha: str = EXECUTOR_SHA,
+    actor: str = "p2",
 ) -> None:
     c = await configured_conn()
     try:
         await c.execute(
             "INSERT INTO project_events "
             "(project_id, actor, type, task_id, payload_json, payload_pointer) "
-            "VALUES (?, 'p2', 'commit_pushed', ?, '{}', ?)",
-            (MISC_PROJECT, task_id, sha),
+            "VALUES (?, ?, 'commit_pushed', ?, '{}', ?)",
+            (MISC_PROJECT, actor, task_id, sha),
         )
         await c.commit()
     finally:
@@ -292,6 +293,51 @@ async def test_ship_to_dev_happy_path(
         assert row["completed_at"], "shipper role row should have completed_at set"
     finally:
         await c.close()
+
+
+async def test_ship_to_dev_happy_path_after_reassigned_executor_push(
+    fresh_db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A commit from the reassigned executor should still unblock ship.
+
+    This regression pairs with the commit_push authorization fix: the
+    executor commit event may come from a task whose stored tasks.owner
+    is stale, but ship still keys off the live commit event and the active
+    shipper/audit rows.
+    """
+    await init_db()
+    await _seed_task(owner="p4")
+    await _seed_shipper_role()
+    await _seed_auditor_role()
+    await _seed_executor_commit(actor="p3")
+    await _seed_repo_url()
+    _stub_workspace(monkeypatch, tmp_path)
+    _stub_git_success(monkeypatch)
+    _stub_github_success(monkeypatch)
+
+    q = bus.subscribe()
+    captured: list[dict[str, Any]] = []
+    try:
+        server = _server_for("p2")
+        result = await _handler(server, "ship_to_dev")({"task_id": TASK_ID})
+        text = _ok_text(result)
+        assert "shipped to dev" in text.lower()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        while True:
+            try:
+                captured.append(q.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+    finally:
+        bus.unsubscribe(q)
+
+    shipped = [e for e in captured if e.get("type") == "task_shipped_to_dev"]
+    assert shipped, f"no task_shipped_to_dev event: {captured}"
+    ev = shipped[0]
+    assert ev["task_id"] == TASK_ID
+    assert ev["pr_number"] == 42
+    assert ev["executor_sha"] == EXECUTOR_SHA
 
 
 async def test_ship_to_dev_rejects_coach(fresh_db: str) -> None:

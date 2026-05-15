@@ -5,6 +5,7 @@ Coverage:
   - task_id validation: task missing → error
   - task_id validation: wrong stage (not 'execute') → error
   - task_id validation: wrong owner → error
+  - live executor role overrides stale tasks.owner on reassigned tasks
   - task_id validation: no active executor role → error
   - push-failure gate: failed push drops task_id from the event so
     the kanban subscriber doesn't auto-advance, and the executor
@@ -202,6 +203,53 @@ async def test_commit_push_wrong_owner_rejected(
     assert "not p3" in msg
 
 
+async def test_commit_push_accepts_reassigned_executor_even_if_task_owner_stale(
+    fresh_db: str,
+    stub_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.events import bus
+
+    await init_db()
+    await _seed_task(owner="p4")  # stale tasks.owner after reassignment
+    role_id = await _seed_executor_role(owner="p3")
+
+    captured: list[dict[str, Any]] = []
+    queue = bus.subscribe()
+
+    _stub_subprocess(monkeypatch)
+
+    server = _server_for("p3")
+    result = await _handler(server, "commit_push")({
+        "message": "reassigned executor commit",
+        "task_id": "t-2026-05-03-abc12345",
+    })
+    text = _ok_text(result)
+    assert "Linked to task" in text
+
+    while True:
+        try:
+            captured.append(queue.get_nowait())
+        except Exception:
+            break
+
+    pushed = [e for e in captured if e.get("type") == "commit_pushed"]
+    assert len(pushed) == 1
+    assert pushed[0].get("task_id") == "t-2026-05-03-abc12345"
+    assert pushed[0].get("pushed") is True
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT completed_at FROM task_role_assignments WHERE id = ?",
+            (role_id,),
+        )
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    assert row["completed_at"] is not None
+
+
 async def test_commit_push_no_active_executor_role_rejected(
     fresh_db: str, stub_workspace: Path
 ) -> None:
@@ -390,6 +438,40 @@ async def test_commit_push_auto_binds_when_task_id_omitted_and_one_active(
     text = _ok_text(result)
     assert "auto-bound" in text.lower() or "auto-bind" in text.lower()
     assert "t-2026-05-03-abc12345" in text
+
+    while True:
+        try:
+            captured.append(queue.get_nowait())
+        except Exception:
+            break
+    pushed = [e for e in captured if e.get("type") == "commit_pushed"]
+    assert len(pushed) == 1
+    assert pushed[0].get("task_id") == "t-2026-05-03-abc12345"
+    assert pushed[0].get("task_id_auto_bound") is True
+
+
+async def test_commit_push_auto_binds_with_stale_task_owner_when_live_role_matches(
+    fresh_db: str,
+    stub_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.events import bus
+
+    await init_db()
+    await _seed_task(owner="p4")  # stale owner should not block auto-bind
+    await _seed_executor_role(owner="p3")
+    _stub_subprocess(monkeypatch)
+
+    captured: list[dict[str, Any]] = []
+    queue = bus.subscribe()
+
+    server = _server_for("p3")
+    result = await _handler(server, "commit_push")({
+        "message": "auto-bind stale owner",
+        # task_id intentionally omitted
+    })
+    text = _ok_text(result)
+    assert "auto-bound" in text.lower()
 
     while True:
         try:
