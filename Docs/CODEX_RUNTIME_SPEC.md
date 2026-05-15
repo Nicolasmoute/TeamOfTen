@@ -646,9 +646,10 @@ thread.compact()          # native compact (returns Any)
 
 - On entry: read `agent_sessions.codex_thread_id` for `(slot, project_id)`.
 - If null → `client.start_thread(config)`. `thread.thread_id` is available
-  immediately; persist it on first successful `chat()` step. The
+  immediately; persist it before starting `chat()`. The
   app-server client uses the harness request timeout above, so fresh
-  thread creation is not capped by the SDK's 30s default.
+  thread creation is not capped by the SDK's 30s default, and a mid-turn
+  transport crash can still clear the poisoned thread on retry.
 - If set → `client.resume_thread(thread_id, overrides=cfg)`. On failure
   (CodexProtocolError, "thread not found", etc.), mirror Claude's
   stale-session auto-heal: emit `session_resume_failed`, null
@@ -667,13 +668,16 @@ thread.compact()          # native compact (returns Any)
     `session_resume_failed`, and re-raises so the caller closes the
     cached client. For any pre-result transport failure in the
     dispatcher error path, the stored thread is now treated as likely
-    poisoned before retry: the rolling exchange log is salvaged into
+    poisoned before retry: the in-flight partial turn (assistant text,
+    bounded tool calls/results, and transport diagnostics) is appended
+    to `last_exchange_json`, the rolling exchange log is salvaged into
     `continuity_note`, only `codex_thread_id` is cleared, the cached
     client is closed, `session_auto_recovered` is emitted with
     `reason='transport_error'` on the first strike (and
     `reason='repeated_transport_error'` on later strikes), and the
     normal auto-retry starts a fresh Codex thread. This avoids burning
-    all retry attempts against the same broken stdio/thread pair.
+    all retry attempts against the same broken stdio/thread pair and
+    preserves the failed tool/edit context for the fresh thread.
   - Other non-timeout exception classes (CodexProtocolError or
     plain Exception) skip the retry and fall back on the first
     attempt — they are not transient.
@@ -688,6 +692,12 @@ Claude-origin harness treats `CLAUDE.md` as `AGENTS.md`/`agents.md`,
 and `.claude/` directories as `.agents/`. Codex agents must read and
 obey those files/directories for the applicable tree instead of
 ignoring them because of the Claude names.
+The same bridge now warns Codex agents resolving Git conflicts to
+re-read the current file or index stages immediately before editing and
+to avoid retrying a failed native Edit/apply_patch with stale context.
+This reflects the p4 incident where a long conflicted merge turn
+included stale patch verification failures shortly before the
+app-server stdio transport died.
 
 `thread.chat(text)` yields `ConversationStep` objects. Each step has:
 `thread_id`, `turn_id`, `item_id`, `step_type`, `item_type`, `status`,
@@ -715,7 +725,7 @@ Observed and implemented item_type mapping:
 | safety-monitor cancelled/rejected tool result      | `codex_safety_suspected` + `tool_result(is_error=True)` | emitted when a Codex tool payload status/state contains `cancel` or `reject`; keeps monitor refusals queryable separately from ordinary tool failures |
 | stream exhaustion                                  | `result`                   | usage is read from the rollout JSONL pointed to by `thread.read().thread.path` (see §E.5); thread.read fields are unused by SDK 0.3.2 |
 | `CodexTurnInactiveError` raised mid-iteration      | `error` (pre-result) → retry counter |
-| `CodexTimeoutError` / `CodexTransportError`        | `error` (pre-result) -> retry counter; close + reopen client; transport errors include captured app-server stderr tail / process diagnostics when available. For Codex transport errors, salvage recent exchanges, clear `codex_thread_id`, emit `session_auto_recovered(reason='transport_error' or 'repeated_transport_error')`, then retry fresh. |
+| `CodexTimeoutError` / `CodexTransportError`        | `error` (pre-result) -> retry counter; close + reopen client; transport errors include captured app-server stderr tail / process diagnostics when available. For Codex transport errors, append the partial in-flight turn to the handoff log, salvage recent exchanges, clear `codex_thread_id`, emit `session_auto_recovered(reason='transport_error' or 'repeated_transport_error')`, then retry fresh. |
 | `CodexProtocolError`                               | `error`; if "thread not found" trigger stale-session retry |
 | `ApprovalRequest` via `set_approval_handler`       | `human_attention`, then decline (§E.8 option b) |
 | `thread.compact()` return                          | `session_compacted` (§E.6) |

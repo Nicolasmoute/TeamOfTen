@@ -1545,9 +1545,15 @@ async def test_handle_step_emits_tool_use_for_apply_patch(monkeypatch) -> None:
         step_type="codex", item_type="apply_patch",
         item_id="patch_1", item=item_payload,
     )
-    await handle_step(step, "p1", {})
+    ctx: dict = {}
+    await handle_step(step, "p1", ctx)
     assert captured[0]["tool"] == "Edit"
     assert captured[0]["input"] == item_payload
+    trace = ctx.get("codex_recovery_log")
+    assert isinstance(trace, list)
+    assert "TOOL USE Edit" in trace[0]
+    assert "foo.py" in trace[0]
+    assert "*** Begin Patch" in trace[0]
 
 
 async def test_handle_step_emits_tool_use_for_web_search(monkeypatch) -> None:
@@ -2027,6 +2033,120 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
     assert insert_rows[0]["cache_read_tokens"] == 200
     assert insert_rows[0]["output_tokens"] == 300
     assert added_costs == [("p1", 0.002115)]
+    assert client.handlers[-1] is None
+
+
+async def test_codex_run_turn_salvages_inflight_trace_on_transport_crash(
+    monkeypatch,
+) -> None:
+    import pytest
+    import server.agents as agentsmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    class _TransportBrokenThread(_RunTurnFakeThread):
+        async def chat(self, text, *, user=None, metadata=None, turn_overrides=None):
+            self.chat_calls.append(
+                {
+                    "text": text,
+                    "user": user,
+                    "metadata": metadata,
+                    "turn_overrides": turn_overrides,
+                }
+            )
+            yield _FakeStep(
+                step_type="codex",
+                item_type="shell",
+                item_id="cmd_1",
+                item={
+                    "type": "shell",
+                    "command": "sed -n '190,235p' Docs/kanban-specs-v2.md",
+                    "status": "completed",
+                    "output": "excerpt",
+                },
+            )
+            yield _FakeStep(
+                step_type="codex",
+                item_type="apply_patch",
+                item_id="patch_1",
+                item={
+                    "type": "apply_patch",
+                    "patch": "*** Begin Patch\n*** Update File: server/tools.py\n",
+                    "path": "server/tools.py",
+                },
+            )
+            raise RuntimeError(
+                "CodexTransportError: failed reading from stdio transport"
+            )
+
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    _capture_emit(monkeypatch)
+    client = _RunTurnFakeClient()
+    thread = _TransportBrokenThread()
+    persisted_threads: list[tuple[str, str | None]] = []
+    appended: list[tuple[str, str, str]] = []
+    closed_slots: list[str] = []
+
+    async def fake_set_thread(agent_id, thread_id):
+        persisted_threads.append((agent_id, thread_id))
+
+    async def fake_append(agent_id, prompt, response):
+        appended.append((agent_id, prompt, response))
+
+    async def fake_close(slot):
+        closed_slots.append(slot)
+
+    monkeypatch.setattr(
+        codex_mod,
+        "resolve_auth",
+        lambda: _async_value(("api_key", {"OPENAI_API_KEY": "sk-test"})),
+    )
+    monkeypatch.setattr(codex_mod, "_import_codex_sdk", lambda: _FakeCodexSdk)
+    monkeypatch.setattr(
+        codex_mod,
+        "get_client",
+        lambda *args, **kwargs: _async_value(client),
+    )
+    monkeypatch.setattr(
+        codex_mod,
+        "open_thread",
+        lambda agent_id, client_arg, *, config=None, tc=None: _async_value(
+            (thread, False)
+        ),
+    )
+    monkeypatch.setattr(codex_mod, "_set_codex_thread_id", fake_set_thread)
+    monkeypatch.setattr(codex_mod, "close_client", fake_close)
+    monkeypatch.setattr(agentsmod, "_append_exchange", fake_append)
+
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="continue the conflicted merge",
+        system_prompt="system rules",
+        workspace_cwd="C:/work/p1/project",
+        allowed_tools=["Bash", "Edit"],
+        external_mcp_servers={},
+        model="gpt-5.4-mini",
+        turn_ctx={
+            "entry_prompt": "continue the conflicted merge",
+            "coord_proxy_token": "tok_test",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="failed reading from stdio transport"):
+        await CodexRuntime().run_turn(tc)
+
+    assert persisted_threads == [("p1", "thread_run_turn")]
+    assert closed_slots == ["p1"]
+    assert len(appended) == 1
+    assert appended[0][1] == "continue the conflicted merge"
+    recovered = appended[0][2]
+    assert "Turn crashed before Codex produced a final result" in recovered
+    assert "TOOL USE Bash" in recovered
+    assert "TOOL USE Edit" in recovered
+    assert "Docs/kanban-specs-v2.md" in recovered
+    assert "server/tools.py" in recovered
+    assert "failed reading from stdio transport" in recovered
     assert client.handlers[-1] is None
 
 
