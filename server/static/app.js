@@ -7533,6 +7533,11 @@ function EnvAttentionSection({ open, onDismiss, onDismissAll }) {
                       event=${ev}
                       onSubmitted=${() => dismiss(ev.__key)}
                     />`
+                  : ev.type === "human_attention"
+                  ? html`<${HumanAttentionReplyForm}
+                      event=${ev}
+                      onSubmitted=${() => dismiss(ev.__key)}
+                    />`
                   : html`<div class="env-attention-body">${ev.body}</div>`}
               </div>
             `;
@@ -7854,6 +7859,68 @@ function PlanApprovalForm({ event, onSubmitted }) {
         class="plan-reject"
         title="Agent stays in plan mode and revises per your comments"
       >${sending ? "…" : "Reject (revise)"}</button>
+    </div>
+  </div>`;
+}
+
+// Human-attention reply form rendered inside EnvAttentionSection. The
+// reply goes through the same message pipeline as the Inbox composer,
+// but the recipient and subject are fixed by the escalation card.
+function HumanAttentionReplyForm({ event, onSubmitted }) {
+  const [body, setBody] = useState("");
+  const [sending, setSending] = useState(false);
+  const [err, setErr] = useState(null);
+  const priority = event.urgency === "blocker" ? "interrupt" : "normal";
+
+  const submit = async () => {
+    const text = body.trim();
+    if (!text) {
+      setErr("Reply text required.");
+      return;
+    }
+    setSending(true);
+    setErr(null);
+    try {
+      const res = await authFetch("/api/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          to: "coach",
+          subject: replySubject(event.subject),
+          body: text,
+          priority,
+        }),
+      });
+      if (!res.ok) {
+        const raw = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status}${raw ? " — " + raw.slice(0, 120) : ""}`);
+      }
+      setBody("");
+      onSubmitted();
+    } catch (e) {
+      setErr(String(e.message || e));
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return html`<div class="env-msg-composer">
+    <div class="env-msg-composer-row">
+      <label class="env-msg-composer-label">Reply</label>
+      <span class="env-model-runtime">to coach${priority === "interrupt" ? " · interrupt" : ""}</span>
+    </div>
+    <textarea
+      class="env-msg-composer-body"
+      placeholder="Type a reply for Coach…"
+      value=${body}
+      onInput=${(e) => setBody(e.target.value)}
+      rows=${3}
+    ></textarea>
+    <div class="env-msg-composer-row">
+      ${err ? html`<span class="question-form-err">${err}</span>` : null}
+      <button class="primary" disabled=${sending || !body.trim()} onClick=${submit}>
+        ${sending ? "sending…" : "Send reply"}
+      </button>
     </div>
   </div>`;
 }
