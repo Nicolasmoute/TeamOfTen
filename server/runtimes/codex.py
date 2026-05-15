@@ -71,7 +71,7 @@ _client_locks: dict[str, asyncio.Lock] = {}
 
 # Bump when the Codex-visible coord tool contract changes in a way that
 # old persisted Codex threads might not pick up on resume.
-_CODEX_TOOL_CONTRACT_VERSION = "2026-05-15.coach-coord-descriptors"
+_CODEX_TOOL_CONTRACT_VERSION = "2026-05-15.shipper-gate-refresh"
 _CODEX_WORKTREE_SANDBOX_PROBE_CACHE: dict[str, Any] | None = None
 _RECOVERY_LOG_KEY = "codex_recovery_log"
 _RECOVERY_LOG_MAX_EVENTS = 24

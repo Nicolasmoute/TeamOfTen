@@ -509,6 +509,96 @@ async def test_run_agent_passes_codex_shipper_gate_to_mcp_config(
     assert "coord_approve_stage" not in captured["coord_enabled_tools"]
 
 
+async def test_run_agent_refreshes_stale_shipper_allowed_tools(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_db: str,
+) -> None:
+    """Existing ship rows must pick up newly-added role tools.
+
+    Role assignments persist a JSON snapshot on agents.allowed_tools. When
+    the role allowlist changes after assignment, a later Codex turn must not
+    keep spawning from the stale snapshot.
+    """
+    import server.db as dbmod
+    await dbmod.init_db()
+
+    import aiosqlite
+    import server.agents as agentsmod
+    import server.runtimes as runtimes_mod
+    from server.role_tool_allowlists import tools_for_role
+
+    stale_shipper_tools = [
+        t for t in tools_for_role("shipper")
+        if t != "mcp__coord__coord_ship_to_dev"
+    ]
+
+    async with aiosqlite.connect(fresh_db, timeout=10.0) as db:
+        await db.execute(
+            "UPDATE agents SET allowed_tools = ? WHERE id = 'p3'",
+            (json.dumps(stale_shipper_tools),),
+        )
+        await db.execute(
+            "INSERT INTO tasks "
+            "(id, project_id, title, status, owner, created_by, trajectory) "
+            "VALUES (?, 'default', 'ship stale tools', 'ship', 'p2', "
+            "'coach', ?)",
+            (
+                "t-2026-05-15-staletls",
+                json.dumps([
+                    {"stage": "execute", "to": ["p2"]},
+                    {"stage": "audit_syntax", "to": ["p4"]},
+                    {"stage": "ship", "to": ["p3"]},
+                ]),
+            ),
+        )
+        await db.execute(
+            "INSERT INTO task_role_assignments "
+            "(task_id, role, eligible_owners, owner, claimed_at) "
+            "VALUES (?, 'shipper', '[]', 'p3', "
+            "strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            ("t-2026-05-15-staletls",),
+        )
+        await db.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Runtime:
+        name = "codex"
+
+        async def maybe_auto_compact(self, tc):
+            return False
+
+        async def run_turn(self, tc):
+            from server.runtimes.codex import _build_mcp_servers
+
+            servers = _build_mcp_servers(tc)
+            captured["allowed_tools"] = tc.allowed_tools
+            captured["coord_enabled_tools"] = servers["coord"]["enabled_tools"]
+            tc.turn_ctx["got_result"] = True
+
+        async def run_manual_compact(self, tc):
+            await self.run_turn(tc)
+
+    async def runtime_for(agent_id):
+        return "codex"
+
+    monkeypatch.setattr(agentsmod, "_resolve_runtime_for", runtime_for)
+    monkeypatch.setattr(runtimes_mod, "get_runtime", lambda name: _Runtime())
+
+    await agentsmod.run_agent("p3", "hello")
+
+    allowed_tools = set(captured["allowed_tools"])
+    assert "mcp__coord__coord_ship_to_dev" in allowed_tools
+    assert "coord_ship_to_dev" in captured["coord_enabled_tools"]
+
+    async with aiosqlite.connect(fresh_db, timeout=10.0) as db:
+        cur = await db.execute(
+            "SELECT allowed_tools FROM agents WHERE id = 'p3'"
+        )
+        row = await cur.fetchone()
+    assert "mcp__coord__coord_ship_to_dev" in set(json.loads(row[0]))
+
+
 async def test_run_agent_recovers_codex_transport_error_before_retry(
     monkeypatch: pytest.MonkeyPatch,
     fresh_db: str,

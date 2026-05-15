@@ -188,7 +188,11 @@ kanban routing. `coord_approve_stage` writes the named assignee's
 current role list from `server/role_tool_allowlists.py`; Player
 completion paths reset the slot to the idle list. NULL or malformed
 JSON falls back to the dispatcher defaults so a bad row cannot brick
-a spawn.
+a spawn. If a Player has an active kanban role row, the Codex
+dispatcher also compares the stored JSON with the current generated
+role list at turn start and refreshes stale rows before spawning; this
+lets already-assigned roles pick up newly-added role tools without
+waiting for a same-stage reassignment.
 
 On `agent_sessions` (per-project per-slot session state) — **separate
 columns per runtime, not a generic field**:
