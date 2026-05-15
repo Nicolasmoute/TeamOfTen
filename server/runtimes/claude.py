@@ -392,11 +392,11 @@ class ClaudeRuntime:
         """
         if tc.compact_mode:
             return False
-        threshold_env = os.environ.get("HARNESS_AUTO_COMPACT_THRESHOLD", "0.5")
+        threshold_env = os.environ.get("HARNESS_AUTO_COMPACT_THRESHOLD", "0.65")
         try:
             threshold = float(threshold_env)
         except ValueError:
-            threshold = 0.5
+            threshold = 0.65
         if not (0.0 < threshold < 1.0):
             return False
 

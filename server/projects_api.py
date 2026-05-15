@@ -1025,6 +1025,66 @@ def build_router(*, require_token, audit_actor):
         )
         return {"ok": ok, "project_id": project_id, "result": result}
 
+    @router.get(
+        "/api/projects/{project_id}/repo/status",
+        dependencies=[Depends(require_token)],
+    )
+    async def get_project_repo_status(project_id: str) -> dict[str, Any]:
+        """Per-slot worktree branch verification for the given project.
+
+        Returns the actual checked-out branch vs the expected `work/<slot>`
+        branch for every slot so operators can detect identity mismatches
+        (e.g. p6 worktree checked out to work/p5).
+
+        Response shape:
+        {
+            "project_id": "<id>",
+            "slots": [
+                {
+                    "slot": "p3",
+                    "path": "/data/projects/<id>/repo/p3",
+                    "expected_branch": "work/p3",
+                    "actual_branch": "work/p3",
+                    "git_ok": true,
+                    "branch_ok": true
+                },
+                ...
+            ]
+        }
+        """
+        from server.paths import project_paths
+        from server.workspaces import SLOT_IDS, _run
+        pp = project_paths(project_id)
+        results = []
+        for slot in SLOT_IDS:
+            worktree = pp.worktree(slot)
+            expected = f"work/{slot}"
+            entry: dict[str, Any] = {
+                "slot": slot,
+                "path": str(worktree),
+                "expected_branch": expected,
+                "actual_branch": None,
+                "git_ok": False,
+                "branch_ok": False,
+            }
+            if not (worktree / ".git").exists():
+                entry["actual_branch"] = "(not provisioned)"
+                results.append(entry)
+                continue
+            code, out, _ = await _run(
+                ["git", "branch", "--show-current"], cwd=worktree
+            )
+            if code != 0:
+                entry["actual_branch"] = "(git error)"
+                results.append(entry)
+                continue
+            actual = out.strip()
+            entry["git_ok"] = True
+            entry["actual_branch"] = actual
+            entry["branch_ok"] = (actual == expected)
+            results.append(entry)
+        return {"project_id": project_id, "slots": results}
+
     # ---- Coach todos + project objectives (recurrence-specs.md §9) ----
 
     async def _project_must_exist(project_id: str) -> None:

@@ -310,9 +310,12 @@ body {
 
   /* Reply buttons (inbox + agent-pane message_sent rows) use
      opacity:0 / :hover opacity:1 — hover never fires on touch.
-     Always show them on mobile so the action is reachable. */
-  .env-reply-btn,
-  .msg-reply-btn {
+     Always show them on mobile so the action is reachable.
+     Use higher-specificity selectors so this override wins regardless
+     of source order (the base opacity:0 rules appear later in the file
+     and would otherwise win at equal specificity). */
+  .event.message_sent .msg-reply-btn,
+  .env-decision .env-reply-btn {
     opacity: 1;
   }
 }
@@ -5570,15 +5573,40 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   text-decoration: underline;
 }
 
-/* Mobile reflow — phones get a single-column board with horizontal
-   scroll between columns; archive drawer goes full width. */
+/* Mobile reflow — phones get horizontally-scrollable kanban columns;
+   archive drawer goes full width. */
 @media (max-width: 700px) {
-  .kbn-columns {
-    grid-template-columns: 1fr;
-    overflow-y: auto;
-    overflow-x: hidden;
+  /* Allow the pane body to scroll in both axes so the 5-column board
+     is fully reachable without stacking everything vertically. */
+  .pane-body.kbn-body {
+    overflow: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 8px 0 8px 8px;
   }
-  .kbn-column { min-height: 160px; }
+
+  .kbn-columns {
+    /* Switch from the desktop grid to a horizontal flex row.
+       width: max-content lets the row expand beyond the viewport
+       so .kbn-body's overflow:auto scrolls it into view. */
+    display: flex;
+    flex-direction: row;
+    grid-template-columns: unset;
+    width: max-content;
+    min-width: 100%;
+    overflow: visible;
+    gap: 10px;
+    padding-right: 8px;   /* trailing gap so last column clears edge */
+    align-items: flex-start;
+  }
+
+  /* Each column is 280px wide (or 82vw on very narrow phones).
+     min-height gives empty columns a visible tap target. */
+  .kbn-column {
+    flex: 0 0 min(280px, 82vw);
+    min-width: min(280px, 82vw);
+    min-height: 160px;
+  }
+
   .kbn-archive-drawer { max-height: 60vh; }
   .kbn-modal { width: 96vw; max-height: 92vh; }
 
@@ -5609,8 +5637,7 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 
   /* Kanban card sizing — more breathing room on phone screens.
      Larger padding + bumped title font so titles/chips are readable
-     at arm's length. Single-column layout is already enforced by
-     .kbn-columns above; no horizontal reflow needed here.
+     at arm's length.
      Tap target: kbn-card-act-btn min-height raised to 44px to meet
      the ≥44px touch target guideline. */
   .kbn-card {

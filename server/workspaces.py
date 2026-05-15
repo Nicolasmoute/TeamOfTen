@@ -447,6 +447,52 @@ async def _ensure_worktree(
     branch_name = f"work/{slot}"
 
     if (worktree / ".git").exists():
+        # Verify the worktree is actually on the expected branch.
+        # Without this check a slot that was provisioned with the wrong
+        # branch (e.g. `work/p5` on p6's worktree) silently reports
+        # ok=True and coord_commit_push then pushes to the WRONG remote
+        # branch — corrupting peer history (the "p6 session on p5
+        # worktree" identity bug, t-2026-05-15-45716da0).
+        code, out, _ = await _run(
+            ["git", "branch", "--show-current"], cwd=worktree
+        )
+        actual_branch = out.strip()
+        if actual_branch != branch_name:
+            logger.error(
+                "worktree %s is on branch %r (expected %r) — "
+                "attempting non-destructive checkout",
+                worktree, actual_branch, branch_name,
+            )
+            # Non-destructive: `git checkout` fails loudly on dirty trees
+            # (uncommitted changes) — intentional; better to surface the
+            # error than silently discard work.
+            code2, _, err2 = await _run(
+                ["git", "checkout", branch_name], cwd=worktree
+            )
+            if code2 != 0:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"worktree at {worktree} is on wrong branch "
+                        f"{actual_branch!r}; checkout {branch_name!r} "
+                        f"failed (dirty tree or branch missing): "
+                        f"{err2.strip()}"
+                    ),
+                }
+            from server.events import bus
+            try:
+                await bus.publish({
+                    "type": "workspace_branch_mismatch",
+                    "slot": slot,
+                    "path": str(worktree),
+                    "actual_branch": actual_branch,
+                    "expected_branch": branch_name,
+                    "corrected": True,
+                })
+            except Exception:
+                logger.exception(
+                    "workspace_branch_mismatch event failed for slot=%s", slot
+                )
         return {
             "ok": True,
             "path": str(worktree),
