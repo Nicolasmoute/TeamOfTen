@@ -932,6 +932,26 @@ async def health_detail() -> JSONResponse:
             "reason": "CODEX_HOME not set — Codex runtime unavailable until set on a /data path",
         }
 
+    # 3d. Codex Player sandbox capability. This probes the actual
+    # bubblewrap namespace path, not just `bwrap --version`: hosted
+    # containers can have the binary installed while denying the mount
+    # propagation operation that workspaceWrite needs.
+    try:
+        from server.runtimes.codex import codex_worktree_sandbox_status
+        sandbox_status = codex_worktree_sandbox_status()
+        checks["codex_sandbox"] = {
+            "ok": True,
+            **sandbox_status,
+            "degraded": not bool(sandbox_status.get("supported")),
+        }
+    except Exception as e:
+        checks["codex_sandbox"] = {
+            "ok": True,
+            "supported": False,
+            "degraded": True,
+            "reason": f"{type(e).__name__}: {e}",
+        }
+
     # 4. Cloud drive — only check if configured. Cached for 60s to avoid
     # writing a probe file on every health hit. We cache the full
     # detail dict (not just a bool) so the UI can keep rendering the

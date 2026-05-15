@@ -31,6 +31,7 @@ def _clean_codex_runtime_state():
     codex_mod._codex_clients.clear()
     codex_mod._codex_client_cwds.clear()
     codex_mod._client_locks.clear()
+    codex_mod.reset_codex_worktree_sandbox_probe_for_tests()
 
 
 def test_codex_runtime_satisfies_protocol() -> None:
@@ -1935,10 +1936,84 @@ def test_codex_thread_config_makes_coach_read_only() -> None:
     assert "plugins" not in config.kwargs["config"]
 
 
-def test_codex_turn_overrides_block_sibling_worktrees() -> None:
+def test_codex_worktree_sandbox_probe_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+    import server.runtimes.codex as codex_mod
+
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(codex_mod.os, "name", "posix", raising=False)
+    monkeypatch.setattr(
+        codex_mod.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}",
+    )
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
+    codex_mod.reset_codex_worktree_sandbox_probe_for_tests()
+
+    status = codex_mod.codex_worktree_sandbox_status()
+    cached = codex_mod.codex_worktree_sandbox_status()
+
+    assert status["supported"] is True
+    assert status["mode"] == "workspaceWrite"
+    assert status["exit_code"] == 0
+    assert cached == status
+    assert len(calls) == 1
+    assert calls[0][:4] == ["/usr/bin/bwrap", "--ro-bind", "/", "/"]
+
+
+def test_codex_worktree_sandbox_probe_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+    import server.runtimes.codex as codex_mod
+
+    monkeypatch.setattr(codex_mod.os, "name", "posix", raising=False)
+    monkeypatch.setattr(
+        codex_mod.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}",
+    )
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd,
+            1,
+            stdout="",
+            stderr="bwrap: Failed to make / slave: Permission denied",
+        )
+
+    monkeypatch.setattr(codex_mod.subprocess, "run", fake_run)
+    codex_mod.reset_codex_worktree_sandbox_probe_for_tests()
+
+    status = codex_mod.codex_worktree_sandbox_status()
+
+    assert status["supported"] is False
+    assert status["mode"] == "danger-full-access-fallback"
+    assert status["exit_code"] == 1
+    assert "Failed to make / slave" in status["reason"]
+    assert status["stderr"] == status["reason"]
+
+
+def test_codex_turn_overrides_block_sibling_worktrees(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from server.runtimes.base import TurnContext
+    import server.runtimes.codex as codex_mod
     from server.runtimes.codex import _build_turn_overrides
 
+    monkeypatch.setattr(
+        codex_mod,
+        "codex_worktree_sandbox_status",
+        lambda: {"supported": True, "mode": "workspaceWrite"},
+    )
     tc = TurnContext(
         agent_id="p6",
         project_id="teamoften",
@@ -1966,6 +2041,42 @@ def test_codex_turn_overrides_block_sibling_worktrees() -> None:
     assert "/data/projects/teamoften/repo/p10" in sandbox["blockedPaths"]
     assert "/data/projects/teamoften/repo/p6" not in sandbox["blockedPaths"]
     assert "/data/projects/teamoften/repo/coach" not in sandbox["blockedPaths"]
+
+
+def test_codex_turn_overrides_degrade_when_worktree_sandbox_unsupported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.runtimes.base import TurnContext
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.codex import _build_turn_overrides
+
+    monkeypatch.setattr(
+        codex_mod,
+        "codex_worktree_sandbox_status",
+        lambda: {
+            "supported": False,
+            "mode": "danger-full-access-fallback",
+            "reason": "bwrap: Failed to make / slave: Permission denied",
+        },
+    )
+    tc = TurnContext(
+        agent_id="p6",
+        project_id="teamoften",
+        prompt="fix it",
+        system_prompt="system rules",
+        workspace_cwd="/data/projects/teamoften/repo/p6",
+        allowed_tools=[],
+        external_mcp_servers={},
+        model="gpt-5.4-mini",
+        effort=4,
+    )
+
+    overrides = _build_turn_overrides(_FakeCodexSdk, tc)
+    assert overrides.kwargs["cwd"] == "/data/projects/teamoften/repo/p6"
+    assert overrides.kwargs["model"] == "gpt-5.4-mini"
+    assert overrides.kwargs["effort"] == "xhigh"
+    assert "sandbox_policy" not in overrides.kwargs
+    assert tc.turn_ctx["codex_sandbox_degraded"]["reason"].startswith("bwrap:")
 
 
 def test_codex_turn_overrides_omit_sandbox_policy_for_coach() -> None:
