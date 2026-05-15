@@ -2022,8 +2022,14 @@ async def test_codex_run_turn_evicts_client_when_usage_read_transport_fails(
     captured = _capture_emit(monkeypatch)
     insert_rows: list[dict] = []
     closed_slots: list[str] = []
+    cleared_threads: list[str] = []
+    salvage_calls: list[dict] = []
     client = _RunTurnFakeClient()
     thread = _UsageReadBrokenThread()
+
+    async def fake_salvage(**kwargs):
+        salvage_calls.append(kwargs)
+        return kwargs.get("current_config")
 
     monkeypatch.setattr(
         codex_mod,
@@ -2031,6 +2037,11 @@ async def test_codex_run_turn_evicts_client_when_usage_read_transport_fails(
         lambda: _async_value(("api_key", {"OPENAI_API_KEY": "sk-test"})),
     )
     monkeypatch.setattr(codex_mod, "_import_codex_sdk", lambda: _FakeCodexSdk)
+    monkeypatch.setattr(
+        codex_mod,
+        "_maybe_salvage_for_codex_resume_failure",
+        fake_salvage,
+    )
     monkeypatch.setattr(
         codex_mod,
         "get_client",
@@ -2045,6 +2056,11 @@ async def test_codex_run_turn_evicts_client_when_usage_read_transport_fails(
         ),
     )
     monkeypatch.setattr(codex_mod, "_set_codex_thread_id", lambda *_: _async_value(None))
+    monkeypatch.setattr(
+        codex_mod,
+        "_clear_codex_thread_id",
+        lambda slot: _async_value(cleared_threads.append(slot)),
+    )
     monkeypatch.setattr(
         codex_mod,
         "close_client",
@@ -2072,8 +2088,15 @@ async def test_codex_run_turn_evicts_client_when_usage_read_transport_fails(
     await CodexRuntime().run_turn(tc)
 
     assert closed_slots == ["p1"]
+    assert cleared_threads == ["p1"]
+    assert salvage_calls
+    assert salvage_calls[0]["agent_id"] == "p1"
+    assert salvage_calls[0]["allow_without_turn_context"] is True
     assert any(ev["type"] == "result" and ev["is_error"] is False for ev in captured)
     assert not any(ev["type"] == "error" for ev in captured)
+    recovered = [ev for ev in captured if ev["type"] == "session_auto_recovered"]
+    assert recovered[0]["reason"] == "post_turn_transport_error"
+    assert recovered[0]["session_id"] == "thread_run_turn"
     assert insert_rows[0]["is_error"] is False
     assert insert_rows[0]["input_tokens"] == 0
     assert insert_rows[0]["output_tokens"] == 0

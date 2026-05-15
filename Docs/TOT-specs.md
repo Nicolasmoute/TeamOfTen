@@ -4752,9 +4752,12 @@ cached client through the caller's error path, and lets the next retry
 rebuild before attempting resume again.
 If the turn stream already completed and only the post-turn
 `thread.read(include_turns=True)` usage lookup hits a transport error,
-the turn remains successful but the cached app-server client is closed
-before the next turn. This prevents a dead stdio receiver from being
-reused while still preserving the resumed Codex thread id.
+the turn remains successful, the cached app-server client is closed,
+recent exchanges are salvaged into `continuity_note`, and
+`codex_thread_id` is cleared before the next turn. In production this
+shape has correlated with an unresumable Codex thread, so clearing it
+immediately prevents the next auto-wake from burning retry attempts on
+the same dead stdio receiver.
 If the same Codex slot then records a second consecutive pre-result
 transport failure, the dispatcher escalates from client rebuild to
 thread reset: it salvages recent exchanges into `continuity_note`,
