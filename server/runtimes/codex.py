@@ -2859,6 +2859,7 @@ class CodexRuntime:
             usage_from_rollout: dict[str, int] | None = None
             rollout_model: str | None = None
             rollout_context_window: int | None = None
+            post_turn_transport_error: Exception | None = None
             try:
                 read = thread.read(include_turns=True)
                 thread_state = await _await_if_needed(read)
@@ -2879,6 +2880,7 @@ class CodexRuntime:
                     )
             except Exception as exc:
                 if looks_like_codex_transport_error(exc):
+                    post_turn_transport_error = exc
                     logger.warning(
                         "CodexRuntime: failed to read thread usage for slot=%s; "
                         "evicting cached app-server client before next turn",
@@ -2962,6 +2964,41 @@ class CodexRuntime:
                 cache_creation_tokens=usage["cache_creation"],
             )
             await _add_cost(tc.agent_id, cost_usd)
+            if post_turn_transport_error is not None and thread_id:
+                try:
+                    await _maybe_salvage_for_codex_resume_failure(
+                        agent_id=tc.agent_id,
+                        tc=None,
+                        sdk=sdk,
+                        current_config=config,
+                        emit_recovered=False,
+                        allow_without_turn_context=True,
+                    )
+                    await _clear_codex_thread_id(tc.agent_id)
+                    await _emit(
+                        tc.agent_id,
+                        "session_auto_recovered",
+                        runtime="codex",
+                        reason="post_turn_transport_error",
+                        session_id=thread_id,
+                        error=(
+                            f"{type(post_turn_transport_error).__name__}: "
+                            f"{str(post_turn_transport_error)[:500]}"
+                        ),
+                    )
+                    logger.warning(
+                        "CodexRuntime: cleared Codex thread after post-turn "
+                        "usage transport error slot=%s thread_id=%s",
+                        tc.agent_id,
+                        thread_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "CodexRuntime: failed to clear Codex thread after "
+                        "post-turn usage transport error slot=%s thread_id=%s",
+                        tc.agent_id,
+                        thread_id,
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

@@ -724,8 +724,11 @@ rollout JSONL — see §E.5 for the parser the runtime now uses.
 If the post-turn `thread.read(include_turns=True)` call itself fails
 with a Codex transport/receiver-loop error after the stream completed,
 the runtime still emits a successful `result` with zero fallback usage
-but closes the cached app-server client before returning. The next turn
-therefore rebuilds stdio instead of reusing a dead receiver.
+but closes the cached app-server client, salvages recent exchanges into
+`continuity_note`, clears `codex_thread_id`, and emits
+`session_auto_recovered{reason='post_turn_transport_error'}`. The next
+turn starts a fresh Codex thread with the handoff note instead of
+trying to resume a thread whose app-server receiver already died.
 
 #### E.3.1 Tool-result error classification
 
