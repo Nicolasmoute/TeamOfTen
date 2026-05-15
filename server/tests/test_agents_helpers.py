@@ -57,6 +57,61 @@ def test_filter_external_mcp_servers_for_allowed_tools_empty_is_none() -> None:
     assert kept_tools == []
 
 
+# ---------- stale working-status repair ----------
+
+
+async def test_cancel_agent_repairs_stale_working_status() -> None:
+    from datetime import datetime, timedelta, timezone
+    from server.agents import cancel_agent
+
+    old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE agents SET status = 'working', last_heartbeat = ? WHERE id = 'coach'",
+            (old,),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    assert await cancel_agent("coach") is True
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute("SELECT status FROM agents WHERE id = 'coach'")
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    assert dict(row)["status"] == "idle"
+
+
+async def test_repair_stale_working_status_keeps_recent_worker() -> None:
+    from datetime import datetime, timezone
+    from server.agents import repair_stale_working_status
+
+    recent = datetime.now(timezone.utc).isoformat()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE agents SET status = 'working', last_heartbeat = ? WHERE id = 'coach'",
+            (recent,),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    assert await repair_stale_working_status("coach") is False
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute("SELECT status FROM agents WHERE id = 'coach'")
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    assert dict(row)["status"] == "working"
+
+
 # ---------- _today_spend ----------
 
 

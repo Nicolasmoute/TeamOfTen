@@ -374,6 +374,95 @@ def _slot_lock(slot: str) -> asyncio.Lock:
     return lock
 
 
+def _toml_basic_string(value: str) -> str:
+    # JSON strings are valid TOML basic strings and handle path quoting.
+    return json.dumps(value)
+
+
+def _copy_if_changed(src: Path, dst: Path, *, mode: int | None = None) -> None:
+    try:
+        src_bytes = src.read_bytes()
+    except FileNotFoundError:
+        return
+    except Exception:
+        logger.exception("CodexRuntime: failed to read %s", src)
+        return
+    try:
+        current = dst.read_bytes() if dst.exists() else None
+    except Exception:
+        current = None
+    if current != src_bytes:
+        tmp = dst.with_name(f".{dst.name}.tmp")
+        tmp.write_bytes(src_bytes)
+        tmp.replace(dst)
+    if mode is not None:
+        with contextlib.suppress(Exception):
+            dst.chmod(mode)
+
+
+def _prepare_runtime_codex_home(slot: str, cwd: str) -> str | None:
+    """Return a per-slot CODEX_HOME for harness app-server subprocesses.
+
+    The operator-facing CODEX_HOME stores auth and user preferences. It
+    may also contain persisted MCP servers from manual probes or UI
+    experiments. Codex merges those with our app-server ``-c`` MCP flags,
+    and any noisy stdio entry can poison every harness turn. Runtime
+    subprocesses therefore get a clean per-slot home with copied auth and
+    a minimal config that deliberately contains no ``mcp_servers`` table.
+    """
+    base_raw = os.environ.get("CODEX_HOME", "").strip()
+    if not base_raw:
+        return None
+    base = Path(base_raw)
+    runtime_root_raw = os.environ.get("HARNESS_CODEX_RUNTIME_HOME", "").strip()
+    runtime_root = (
+        Path(runtime_root_raw) if runtime_root_raw else base / "harness-runtime"
+    )
+    safe_slot = "".join(
+        ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in slot
+    )
+    home = runtime_root / (safe_slot or "slot")
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(Exception):
+            home.chmod(0o700)
+    except Exception:
+        logger.exception(
+            "CodexRuntime: failed to create isolated CODEX_HOME for slot=%s",
+            slot,
+        )
+        return None
+
+    # ChatGPT/OAuth auth lives here. Keep it fresh without copying the
+    # operator's config.toml, which is exactly where inherited MCP
+    # servers can sneak in.
+    _copy_if_changed(base / "auth.json", home / "auth.json", mode=0o600)
+
+    config_path = home / "config.toml"
+    managed = (
+        "# Managed by TeamOfTen CodexRuntime.\n"
+        "# Auth is copied from the operator CODEX_HOME, but MCP servers\n"
+        "# are supplied only by app-server -c flags. Do not add MCP tables here.\n\n"
+        f"[projects.{_toml_basic_string(cwd)}]\n"
+        "trust_level = \"trusted\"\n"
+    )
+    try:
+        if (
+            not config_path.exists()
+            or config_path.read_text(encoding="utf-8") != managed
+        ):
+            config_path.write_text(managed, encoding="utf-8")
+            with contextlib.suppress(Exception):
+                config_path.chmod(0o600)
+    except Exception:
+        logger.exception(
+            "CodexRuntime: failed to write isolated config for slot=%s",
+            slot,
+        )
+        return None
+    return str(home)
+
+
 async def get_client(
     slot: str,
     *,
@@ -441,6 +530,9 @@ async def get_client(
         # scrubbed env transitively. See server/agent_env.py.
         from server.agent_env import build_clean_agent_env
         env = build_clean_agent_env(extra=env_overrides or {})
+        runtime_codex_home = _prepare_runtime_codex_home(slot, cwd)
+        if runtime_codex_home:
+            env["CODEX_HOME"] = runtime_codex_home
 
         # Mint the coord-proxy token here, not in the dispatcher: the
         # subprocess we're about to spawn captures its env once and
