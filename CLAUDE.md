@@ -1388,6 +1388,19 @@ OpenAI's Codex safety monitor, which cancelled the subsequent
   `danger-full-access` behavior; Coach remains read-only.
   `/api/health/detail` exposes `checks.codex_sandbox`.
 
+- **Update (2026-05-15): Codex Coach parity.**
+  The coord loopback catalog now exposes the real `@tool`
+  descriptions and input schemas to Codex MCP `tools/list` instead
+  of bare names with permissive placeholder schemas. Codex Coach also
+  receives explicit compatibility notes that map Claude-only
+  affordances (`AskUserQuestion`, `ExitPlanMode`, `Write`/`Edit`/`Bash`)
+  onto coord tools: `coord_request_human`,
+  `coord_answer_question` / `coord_answer_plan`,
+  `coord_set_tick_interval`, `coord_set_project_objectives`,
+  `compass_*`, and `coord_propose_playbook_changes`. Project
+  objectives now have a proper Coach MCP writer
+  (`coord_set_project_objectives`) shared with the EnvPane writer.
+
 - **Codex monitor cancellation rendered as error.**
   `_step_payload_is_error` in
   [server/runtimes/codex.py](server/runtimes/codex.py) previously

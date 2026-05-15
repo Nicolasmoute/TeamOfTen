@@ -3,8 +3,9 @@ like (`recurrence-specs.md` §3.3).
 
 Free-form markdown at ``/data/projects/<slug>/project-objectives.md``.
 No mandated sections — the operator describes goals however they like.
-The harness mirrors writes to the cloud drive but Coach edits the file via the
-standard Write tool (no MCP wrapper needed; see spec §7.5).
+The harness mirrors writes to the cloud drive. Coach edits the file through
+``coord_set_project_objectives`` so the flow works identically in Claude and
+Codex runtimes.
 
 This module provides:
 
@@ -13,6 +14,8 @@ This module provides:
   * :func:`objectives_block` — formatted section for Coach's system
     prompt. Returns ``""`` when the file is missing or empty so the
     section is omitted entirely (per spec §6).
+  * :func:`write_objectives` — runtime-neutral write path used by the
+    EnvPane API and Coach's MCP tool.
   * :data:`OBJECTIVES_ELICITATION_PROMPT` — the wording phase 5's
     smart tick uses when inbox + todos are empty AND objectives are
     missing.
@@ -22,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from server.paths import project_paths
@@ -39,6 +43,7 @@ if not logger.handlers:
 # Sanity ceiling — same shape as CLAUDE.md: long objectives are
 # legitimate but a runaway file shouldn't dominate every Coach turn.
 _MAX_OBJECTIVES_CHARS = 50_000
+_MAX_OBJECTIVES_WRITE_CHARS = 100_000
 
 
 # Verbatim from spec §14 ("Bootstrapping a new project"). Phase 5's
@@ -88,3 +93,49 @@ def objectives_block(project_id: str) -> str:
     if not body:
         return ""
     return "## Project objectives\n\n" + body
+
+
+async def write_objectives(
+    project_id: str,
+    text: str,
+    *,
+    agent_id: str = "coach",
+    actor: dict | None = None,
+) -> dict[str, int | str | bool]:
+    """Replace ``project-objectives.md`` and mirror it to the cloud drive.
+
+    This is the shared writer for the EnvPane HTTP endpoint and Coach's
+    coord MCP tool. Empty text is allowed and clears the file.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    if len(text) > _MAX_OBJECTIVES_WRITE_CHARS:
+        raise ValueError(
+            f"text too long ({len(text)} chars, max {_MAX_OBJECTIVES_WRITE_CHARS})"
+        )
+    pp = project_paths(project_id)
+    pp.project_objectives.parent.mkdir(parents=True, exist_ok=True)
+    pp.project_objectives.write_text(text, encoding="utf-8")
+
+    from server.webdav import webdav
+    if webdav.enabled:
+        try:
+            await webdav.write_text(
+                f"projects/{project_id}/project-objectives.md",
+                text,
+            )
+        except Exception:
+            logger.exception(
+                "objectives: cloud-drive mirror failed for %s",
+                project_id,
+            )
+
+    from server.events import bus
+    await bus.publish({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent_id": agent_id,
+        "type": "objectives_updated",
+        "project_id": project_id,
+        "actor": actor or {"source": agent_id},
+    })
+    return {"ok": True, "project_id": project_id, "size": len(text)}

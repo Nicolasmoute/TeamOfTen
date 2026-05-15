@@ -1356,8 +1356,9 @@ changes (see also "Migration: existing projects" further down):
 ## Project objectives
 <pointer paragraph: the project's goals / scope live in the separate
 file `/data/projects/<slug>/project-objectives.md`, kDrive-mirrored,
-edited via the EnvPane Objectives section or Coach's Write tool;
-the harness injects that file into Coach's system prompt every turn>
+edited via the EnvPane Objectives section or Coach's
+`coord_set_project_objectives` tool; the harness injects that file
+into Coach's system prompt every turn>
 
 ## Repo
 <repo_url or placeholder>
@@ -2066,6 +2067,10 @@ UI surface:
   cards, status dots, next/last fire stamps.
 - **EnvPane sections** — `Project objectives` (multiline editor) +
   `Coach todos` (checkbox list, click-to-expand, archive toggle).
+- **Coach MCP surface** — `coord_set_project_objectives(text)` replaces
+  the active project's objectives file, mirrors it to kDrive, and emits
+  `objectives_updated`. This is the supported Coach write path in both
+  Claude and Codex runtimes.
 
 Busy-Coach behavior splits by kind (recurrence-specs.md §2 / §11):
 
@@ -3164,6 +3169,10 @@ slot / runtime / unset `HARNESS_CODEX_ENABLED`. 409 if mid-turn.
 | `POST /api/projects/{id}/coach-todos/{tid}/complete` | Mark todo done |
 | `GET /api/projects/{id}/coach-todos/archive` | Archived todos |
 | `GET/PUT /api/projects/{id}/objectives` | Project objectives |
+
+Coach can update the same objectives file mid-turn through
+`coord_set_project_objectives(text)`, which shares the EnvPane writer
+and emits the same `objectives_updated` event.
 
 ### 14.5 Tasks
 
@@ -4651,10 +4660,16 @@ process via two internal endpoints:
 - `POST /api/_coord/{tool_name}` — dispatches to the in-process
   coord handler.
 - `GET /api/_coord/_tools` — tool catalog for the subprocess to
-  publish over MCP `tools/list`.
+  publish over MCP `tools/list`. The catalog carries the same
+  `@tool` descriptions and input schemas Claude receives in-process,
+  not placeholder schemas; this is what lets Codex Coach use
+  recurrence, Compass, playbook, and kanban tools without guessing
+  parameters.
 
-Both are loopback-only and bearer-token gated
-(`HARNESS_COORD_PROXY_TOKEN` env). The token is minted by
+Both are loopback-only. `POST /api/_coord/{tool_name}` is also
+bearer-token gated (`HARNESS_COORD_PROXY_TOKEN` env); the catalog is
+non-sensitive source-derived metadata and remains loopback-only. The
+token is minted by
 `server.spawn_tokens.mint(caller_id)` and bound to the caller — the
 endpoint resolves `caller_id` from the token, not the request body.
 ClaudeRuntime is unaffected; it uses an in-process MCP server and
@@ -4678,6 +4693,9 @@ Token lifetime, MCP cache invalidation on config change,
 `default_tools_approval_mode` injection, and the stdio error-shape
 contract are CodexRuntime concerns — see
 `Docs/CODEX_RUNTIME_SPEC.md` §C.4 and §E.1.
+The proxy also implements empty MCP `resources/list`,
+`resources/templates/list`, and `prompts/list`; Codex app-server
+startup treats unsupported capability probes as transport errors.
 
 CodexRuntime spawns `codex app-server` with a harness-controlled SDK
 request timeout (`HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS`, default
