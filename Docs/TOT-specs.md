@@ -207,18 +207,21 @@ Important deployment decisions:
   slower `find` on every search. Claude Players bundle ripgrep behind
   the SDK's `Grep` tool so they were unaffected; this gap only
   surfaced when Codex agents hit it directly via `shell`.
-- The image installs the harness with `pip install ".[dev]"` rather
-  than just `.`, which adds `pytest` + `pytest-asyncio` to
+- The Dockerfile installs the Python dependency graph from
+  `pyproject.toml` before copying `server/`, then installs the
+  harness package with `pip install --no-deps --no-build-isolation .`.
+  This keeps normal server-code redeploys from invalidating the slow
+  dependency-download layer. The installed dependency graph includes
+  the `dev` extra, which adds `pytest` + `pytest-asyncio` to
   `/usr/local/bin`. Same rationale as ripgrep: Codex Players reach
-  for `pytest` directly via `shell`, and a missing binary turns
-  into a multi-turn detour while the agent investigates the env.
-  The dev extras are tiny and version-pinned in `pyproject.toml`, so
-  shipping them costs almost nothing and removes one common
-  failure mode. Project repos that bring their own pytest still win
-  via venv activation; the system pytest is a fallback.
-- The image bakes in Playwright Chromium (`pip install playwright &&
-  python -m playwright install --with-deps chromium`) AND the
-  `@playwright/mcp` npm package (alongside Claude Code and Codex). A
+  for `pytest` directly via `shell`, and a missing binary turns into
+  a multi-turn detour while the agent investigates the env. Project
+  repos that bring their own pytest still win via venv activation;
+  the system pytest is a fallback.
+- The image bakes in Playwright Chromium via the Node Playwright
+  installer (`npx -p @playwright/mcp@latest playwright install
+  --with-deps chromium`) and installs the `@playwright/mcp` npm
+  package alongside Claude Code and Codex. A
   project that opts in via the Options drawer → MCP servers gets
   `browser_navigate` / `browser_click` / `browser_snapshot` /
   `browser_take_screenshot` / etc. as MCP tools, so any agent can
@@ -3454,6 +3457,12 @@ single + batch `DELETE /api/agents/{id}/session` endpoints also call
 clearing the cached Codex subprocess are two faces of the same
 "start fresh" intent.
 
+`PATCH /api/mcp/servers/{name}` runs its SQLite read/merge/update
+section in a worker thread with a 30 s busy timeout. The route is
+async, and keeping synchronous sqlite lock waits off the event loop
+prevents an aiosqlite task from being unable to release the same DB
+lock that PATCH is waiting on.
+
 MCP paste shapes accepted:
 
 - Claude Desktop style: `{ "mcpServers": { ... } }`
@@ -3490,6 +3499,9 @@ Event persistence:
 - Batch interval default: `HARNESS_EVENTS_BATCH_INTERVAL=0.1`.
 - Queue size default: `HARNESS_EVENTS_WRITE_QUEUE_SIZE=10000`.
 - If writer queue is full, falls back to single insert task.
+- Lifespan shutdown enqueues a sentinel and waits for the writer to flush any
+  in-flight partial batch before the final drain, so redeploys do not drop
+  events already claimed by the writer.
 
 Important event types:
 

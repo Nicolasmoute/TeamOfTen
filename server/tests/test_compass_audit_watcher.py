@@ -159,9 +159,13 @@ async def _isolate_watcher(
     and `_last_fire` populated with stale debounce entries.
     """
     await init_db()
+    from server import events as events_mod
+    await events_mod.stop_event_writer()
+    await events_mod.start_event_writer()
     # Defensive: ensure no leftover watcher / debounce state.
     await watcher.stop_audit_watcher()
     watcher._last_fire.clear()
+    watcher._audit_tasks.clear()
     # Observability state (Fix 12) — clear so cross-test mutation
     # doesn't leak. `start_audit_watcher` also clears these, but the
     # fixture must bring the test to a known state even when the test
@@ -173,6 +177,7 @@ async def _isolate_watcher(
     monkeypatch.setattr(cmp_config, "AUTO_AUDIT_DEBOUNCE_SECONDS", 30)
     # Disable the cost cap by default — individual tests can flip it on.
     from server import agents as agents_mod
+    monkeypatch.setattr(agents_mod, "_paused", False)
     monkeypatch.setattr(agents_mod, "TEAM_DAILY_CAP_USD", 0.0)
 
     # Redirect DATA_ROOT via paths module so spec_path() lands in tmp.
@@ -183,6 +188,8 @@ async def _isolate_watcher(
     watcher._last_fire.clear()
     watcher._last_fire_iso.clear()
     watcher._last_skip.clear()
+    watcher._audit_tasks.clear()
+    await events_mod.stop_event_writer()
 
 
 # ----------------------------------------------------- tests
@@ -386,7 +393,22 @@ async def test_debounce_drops_reemit(
             "owner": "p1",
             "project_id": "misc",
         })
-    assert await _wait_for(lambda: len(calls) == 1)
+    await watcher.wait_until_idle_for_tests()
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_debounce_allows_first_fire_before_monotonic_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh Linux runners can have monotonic() below the debounce window;
+    the first event for a task must still fire."""
+    watcher._last_fire.clear()
+    monkeypatch.setattr(cmp_config, "AUTO_AUDIT_DEBOUNCE_SECONDS", 60)
+    monkeypatch.setattr(watcher.time, "monotonic", lambda: 10.0)
+
+    assert watcher._debounce_ok("misc", _valid_task_id())
+    assert not watcher._debounce_ok("misc", _valid_task_id())
 
 
 @pytest.mark.asyncio
@@ -418,7 +440,8 @@ async def test_debounce_distinct_tasks_both_fire(
             "owner": "p1",
             "project_id": "misc",
         })
-    assert await _wait_for(lambda: len(calls) == 2)
+    await watcher.wait_until_idle_for_tests()
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio
