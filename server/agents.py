@@ -1252,6 +1252,11 @@ _running_tasks: dict[str, asyncio.Task[Any]] = {}
 _paused = False
 
 
+AGENT_WORKING_STALE_SECONDS = int(
+    os.environ.get("HARNESS_AGENT_WORKING_STALE_SECONDS", "900")
+)
+
+
 def is_paused() -> bool:
     return _paused
 
@@ -1276,7 +1281,7 @@ async def cancel_agent(agent_id: str) -> bool:
     handler catches it, emits an 'error' event, and sets status=error."""
     task = _running_tasks.get(agent_id)
     if task is None or task.done():
-        return False
+        return await repair_stale_working_status(agent_id, force=True)
     task.cancel()
     return True
 
@@ -1288,7 +1293,71 @@ async def cancel_all_agents() -> list[str]:
     for agent_id in list(_running_tasks.keys()):
         if await cancel_agent(agent_id):
             cancelled.append(agent_id)
+    for sid in ["coach"] + [f"p{i}" for i in range(1, 11)]:
+        if sid not in cancelled:
+            await repair_stale_working_status(sid, force=True)
     return cancelled
+
+
+def _heartbeat_age_seconds(value: Any) -> float | None:
+    if not value:
+        return None
+    try:
+        raw = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (
+            datetime.now(timezone.utc) - dt.astimezone(timezone.utc)
+        ).total_seconds()
+    except Exception:
+        return None
+
+
+async def repair_stale_working_status(agent_id: str, *, force: bool = False) -> bool:
+    """Clear a persisted working flag when no in-process turn exists.
+
+    Transport crashes can leave ``agents.status='working'`` even after the
+    asyncio task is gone. That blocks Coach ticks and makes the UI stop
+    button return "not running". The in-memory task map is authoritative
+    inside this process; when it has no live task, a working DB row is
+    repairable once stale, or immediately for an explicit cancel request.
+    """
+    if is_agent_running(agent_id):
+        return False
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT status, last_heartbeat FROM agents WHERE id = ?",
+            (agent_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return False
+        data = dict(row)
+        if data.get("status") != "working":
+            return False
+        age = _heartbeat_age_seconds(data.get("last_heartbeat"))
+        if not force and (
+            age is None or age < AGENT_WORKING_STALE_SECONDS
+        ):
+            return False
+        now = _now()
+        await c.execute(
+            "UPDATE agents SET status = 'idle', last_heartbeat = ? WHERE id = ?",
+            (now, agent_id),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    await _emit(
+        agent_id,
+        "agent_stale_status_repaired",
+        force=force,
+        stale_seconds=age,
+    )
+    await _emit(agent_id, "agent_stopped")
+    return True
 
 # The compact prompt used by both the manual /compact endpoint and the
 # auto-compact trip-wire. The handoff is written to
@@ -6617,7 +6686,10 @@ async def _coach_is_working() -> bool:
     except Exception:
         logger.exception("coach autoloop: status read failed")
         return False
-    return bool(row) and dict(row)["status"] == "working"
+    if not row or dict(row)["status"] != "working":
+        return False
+    repaired = await repair_stale_working_status("coach")
+    return not repaired
 
 
 # Stale-task watchdog config. Env-tunable so the default can be safe

@@ -426,6 +426,61 @@ async def test_get_client_caches_per_slot(monkeypatch, tmp_path) -> None:
     assert c1.initialized == 1
 
 
+async def test_get_client_uses_isolated_codex_home(monkeypatch, tmp_path) -> None:
+    """User CODEX_HOME config can contain arbitrary MCP servers.
+
+    Harness app-server subprocesses must not inherit those persisted
+    entries because stdio MCP noise poisons Codex's receiver loop.
+    """
+    _install_fake_sdk(monkeypatch)
+    operator_home = tmp_path / "operator-codex"
+    operator_home.mkdir()
+    (operator_home / "auth.json").write_text('{"mode":"chatgpt"}', encoding="utf-8")
+    (operator_home / "config.toml").write_text(
+        '[mcp_servers."echo-poison"]\n'
+        'command = "/bin/echo"\n'
+        'args = ["hello"]\n'
+        "enabled = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(operator_home))
+    from server.runtimes.codex import get_client
+
+    cwd = tmp_path / "repo" / "p1"
+    cwd.mkdir(parents=True)
+    await get_client("p1", cwd=str(cwd))
+
+    inst = _FakeClient.instances[0]
+    runtime_home = tmp_path / "operator-codex" / "harness-runtime" / "p1"
+    assert inst.env["CODEX_HOME"] == str(runtime_home)
+    assert (
+        runtime_home / "auth.json"
+    ).read_text(encoding="utf-8") == '{"mode":"chatgpt"}'
+    runtime_config = (runtime_home / "config.toml").read_text(encoding="utf-8")
+    assert "mcp_servers" not in runtime_config
+    assert f'[projects.{json.dumps(str(cwd))}]' in runtime_config
+    assert str(operator_home) != inst.env["CODEX_HOME"]
+
+
+async def test_get_client_honors_runtime_codex_home_override(
+    monkeypatch, tmp_path,
+) -> None:
+    _install_fake_sdk(monkeypatch)
+    operator_home = tmp_path / "operator"
+    runtime_root = tmp_path / "runtime"
+    operator_home.mkdir()
+    (operator_home / "auth.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(operator_home))
+    monkeypatch.setenv("HARNESS_CODEX_RUNTIME_HOME", str(runtime_root))
+    from server.runtimes.codex import get_client
+
+    await get_client("p2", cwd=str(tmp_path))
+
+    assert _FakeClient.instances[0].env["CODEX_HOME"] == str(
+        runtime_root / "p2"
+    )
+
+
 async def test_get_client_passes_codex_request_timeout(
     monkeypatch, tmp_path,
 ) -> None:

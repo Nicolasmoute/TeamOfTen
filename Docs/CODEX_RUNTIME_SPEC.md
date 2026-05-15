@@ -469,6 +469,20 @@ override already names an `mcp__<server>__...` tool. Set
 for a deployment that accepts the stability risk. ClaudeRuntime remains
 unchanged and still receives the configured external MCP catalogue.
 
+**Codex user-config MCP isolation (2026-05-15).** The app-server also
+loads `$CODEX_HOME/config.toml` before applying the harness `-c` flags.
+That file is operator-owned and may contain persisted `mcp_servers`
+from manual probes. A real production failure came from enabled
+`/bin/echo hello` test MCP entries in `/data/codex/config.toml`; Codex
+started them, read `hello` from their stdout, and failed with `serde
+error expected value at line 1 column 1`. To prevent recurrence,
+CodexRuntime starts app-server with an isolated per-slot `CODEX_HOME`
+under `${CODEX_HOME}/harness-runtime/<slot>` (or
+`HARNESS_CODEX_RUNTIME_HOME/<slot>`). It copies only `auth.json` from
+the operator home and writes a minimal trusted-project config with no
+`mcp_servers` table. Harness MCP servers continue to come solely from
+startup `-c mcp_servers...` flags.
+
 **Deprecated `.mcp.json` path.** `_write_codex_mcp_json` is retained
 only as a reference helper. The runtime no longer relies on workspace
 files for Codex MCP configuration. The old `.gitignore` entry remains:
@@ -519,6 +533,12 @@ entirely — see §E.8.
 ChatGPT-session token persists at `/data/codex/auth.json` and survives
 redeploys. After deploy, run `CODEX_HOME=/data/codex codex login
 --device-auth` once in the container to create the session.
+
+Runtime app-server subprocesses do not use `/data/codex` directly as
+their config home. They use a clean per-slot runtime home that copies
+`auth.json` from `/data/codex` but does not inherit
+`/data/codex/config.toml`, so operator/user MCP config cannot corrupt
+the harness MCP transport.
 
 ### D.2 Dockerfile
 ```dockerfile
