@@ -45,6 +45,11 @@ const KANBAN_FORWARD_TYPES = new Set([
   "compass_audit_logged",
   "commit_pushed", "project_switched", "socket_connected",
   "backlog_task_proposed", "backlog_task_promoted", "backlog_task_rejected",
+  // backlog edit/delete events — emitted by server but were missing here,
+  // so BacklogColumn didn't live-update when entries changed or were removed.
+  "backlog_entry_updated", "backlog_entry_deleted",
+  // ship-stage completion — lets the board reflect role closure immediately.
+  "task_shipped_to_dev",
 ]);
 // Short labels for the pane-header current-task chip. Keeps the
 // chip from blowing up when a task is in audit_*; archive isn't
