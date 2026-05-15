@@ -2270,6 +2270,24 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 return p.returncode, p.stdout, p.stderr
             return await asyncio.to_thread(_do)
 
+        # Push-time HEAD enforcement: verify the worktree is on work/<slot>
+        # before touching the index. Without this check a slot whose
+        # worktree is on the wrong branch (e.g. work/p5 on p6's tree)
+        # would push to the wrong remote branch and corrupt peer history.
+        # This is the push-time guard complementary to _ensure_worktree's
+        # provision-time guard (t-2026-05-15-45716da0 / 75666c9).
+        expected_branch = f"work/{caller_id}"
+        code, branch_out, _ = await run(["git", "branch", "--show-current"])
+        current_branch = branch_out.strip()
+        if current_branch != expected_branch:
+            return _err(
+                f"worktree is on branch {current_branch!r} but should be "
+                f"{expected_branch!r}. Run `git checkout {expected_branch}` "
+                f"in {cwd} to fix, or call POST /api/projects/{{id}}/repo/provision "
+                f"to re-provision the slot. Do NOT push from the wrong branch — "
+                f"that would write your work into another slot's history."
+            )
+
         code, _out, err = await run(["git", "add", "-A"])
         if code != 0:
             return _err(f"git add failed: {err.strip()[:300]}")
