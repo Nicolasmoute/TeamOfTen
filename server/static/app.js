@@ -5604,7 +5604,7 @@ function SessionsSection() {
     return next;
   });
 
-  const _hasSession = (a) => hasActiveSession(a);
+  const _hasSession = (a) => hasClearableSession(a);
   const targets = agents.filter((a) => selected[a.id]).map((a) => a.id);
   const withSession = agents.filter(_hasSession).map((a) => a.id);
 
@@ -11638,7 +11638,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
                 : `<svg viewBox="0 0 20 20" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4.5" y="9" width="11" height="8" rx="1.2"/><path d="M13 9V6 A3 3 0 0 0 6 4.5"/></svg>` }}
             ></button>`
           : null}
-        ${hasActiveSession(agent)
+        ${hasClearableSession(agent)
           ? html`<button
               class="pane-session-clear"
               onClick=${async () => {
@@ -11972,6 +11972,9 @@ const hasActiveSession = (agent) =>
       agent.status === "working" ||
       agent.status === "waiting")
   );
+
+const hasClearableSession = (agent) =>
+  Boolean(agent && (agent.session_id || agent.codex_thread_id));
 
 // ------------------------------------------------------------------
 // event renderer (v2b generic; v2c adds per-tool richness)
