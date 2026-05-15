@@ -5680,6 +5680,10 @@ class HumanMessageRequest(BaseModel):
     priority: str = Field(default="normal", pattern=r"^(normal|interrupt)$")
 
 
+class HumanAttentionReplyRequest(BaseModel):
+    body: str = Field(min_length=1, max_length=5000)
+
+
 @app.post("/api/messages", dependencies=[Depends(require_token)])
 async def send_human_message(req: HumanMessageRequest) -> dict[str, Any]:
     """Queue a message from the human into an agent's inbox AND auto-wake
@@ -5739,6 +5743,73 @@ async def send_human_message(req: HumanMessageRequest) -> dict[str, Any]:
             bypass_debounce=True,
         )
     return {"ok": True, "message_id": msg_id}
+
+
+@app.post(
+    "/api/human_attention/{attention_id}/reply",
+    dependencies=[Depends(require_token)],
+)
+async def reply_human_attention(
+    attention_id: int,
+    req: HumanAttentionReplyRequest,
+) -> dict[str, Any]:
+    """Reply to a human_attention card by sending a human→coach message.
+
+    The attention id is used to anchor the subject so the reply can be
+    traced back to the originating escalation in the inbox and event log.
+    """
+    if attention_id <= 0:
+        raise HTTPException(404, detail=f"human_attention {attention_id!r} not found")
+    body = req.body.strip()
+    if not body:
+        raise HTTPException(422, detail="body is required")
+
+    project_id = await resolve_active_project()
+    c = await configured_conn()
+    payload: dict[str, Any] | None = None
+    try:
+        cur = await c.execute(
+            "SELECT id, type, payload FROM events WHERE project_id = ? AND id = ? LIMIT 1",
+            (project_id, attention_id),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(
+                404,
+                detail=f"human_attention {attention_id!r} not found",
+            )
+        event = dict(row)
+        if event.get("type") != "human_attention":
+            raise HTTPException(
+                404,
+                detail=f"human_attention {attention_id!r} not found",
+            )
+        try:
+            payload = json.loads(event.get("payload") or "{}")
+        except Exception:
+            payload = {}
+    finally:
+        await c.close()
+
+    original_subject = ""
+    if isinstance(payload, dict):
+        maybe_subject = payload.get("subject")
+        if isinstance(maybe_subject, str):
+            original_subject = maybe_subject.strip()
+    subject = f"re: {attention_id}"
+    if original_subject:
+        subject = f"{subject}: {original_subject}"
+
+    from server.agents import _deliver_system_message
+    await _deliver_system_message(
+        from_id="human",
+        to_id="coach",
+        subject=subject,
+        body=body,
+        priority="normal",
+        wake=True,
+    )
+    return {"ok": True, "attention_id": attention_id, "subject": subject}
 
 
 @app.get("/api/messages", dependencies=[Depends(require_token)])

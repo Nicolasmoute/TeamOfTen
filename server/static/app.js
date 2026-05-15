@@ -7474,6 +7474,9 @@ function EnvPlayerHealthSection({ conversations, activeProjectId }) {
 function EnvAttentionSection({ open, onDismiss, onDismissAll }) {
   const dismiss = onDismiss || (() => {});
   const dismissAll = onDismissAll || (() => {});
+  const [replyDrafts, setReplyDrafts] = useState({});
+  const [replyBusy, setReplyBusy] = useState({});
+  const [replyErrors, setReplyErrors] = useState({});
   if (!Array.isArray(open) || open.length === 0) return null;
 
   // Cancel a pending_question or pending_plan without answering.
@@ -7492,6 +7495,34 @@ function EnvAttentionSection({ open, onDismiss, onDismissAll }) {
     });
   }, []);
 
+  const sendReply = useCallback(async (ev) => {
+    const id = ev.__id;
+    if (!id) return;
+    const body = (replyDrafts[id] || "").trim();
+    if (!body) return;
+    setReplyBusy((prev) => ({ ...prev, [id]: true }));
+    setReplyErrors((prev) => ({ ...prev, [id]: "" }));
+    try {
+      const res = await authFetch(
+        `/api/human_attention/${encodeURIComponent(id)}/reply`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ body }),
+        }
+      );
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(`HTTP ${res.status}${txt ? " — " + txt.slice(0, 120) : ""}`);
+      }
+      setReplyDrafts((prev) => ({ ...prev, [id]: "" }));
+    } catch (err) {
+      setReplyErrors((prev) => ({ ...prev, [id]: String(err.message || err) }));
+    } finally {
+      setReplyBusy((prev) => ({ ...prev, [id]: false }));
+    }
+  }, [replyDrafts]);
+
   return html`
     <section class="env-section env-attention">
       <h3 class="env-section-title">
@@ -7503,6 +7534,10 @@ function EnvAttentionSection({ open, onDismiss, onDismissAll }) {
         ${open.map(
           (ev) => {
             const isInteractive = ev.type === "pending_question" || ev.type === "pending_plan";
+            const replyId = ev.__id || null;
+            const replyText = replyId ? (replyDrafts[replyId] || "") : "";
+            const isReplying = replyId ? !!replyBusy[replyId] : false;
+            const replyError = replyId ? (replyErrors[replyId] || "") : "";
             return html`
               <div
                 class=${"env-attention-item " + (ev.urgency === "blocker" ? "blocker" : "normal")}
@@ -7534,6 +7569,33 @@ function EnvAttentionSection({ open, onDismiss, onDismissAll }) {
                       onSubmitted=${() => dismiss(ev.__key)}
                     />`
                   : html`<div class="env-attention-body">${ev.body}</div>`}
+                ${ev.type === "human_attention"
+                  ? html`<div class="env-msg-composer" style="margin-top: 10px;">
+                      <textarea
+                        class="env-msg-composer-body"
+                        placeholder=${replyId ? "Reply to Coach…" : "Reply available after the event is persisted"}
+                        value=${replyText}
+                        disabled=${!replyId || isReplying}
+                        onInput=${(e) => {
+                          if (!replyId) return;
+                          const value = e.target.value;
+                          setReplyDrafts((prev) => ({ ...prev, [replyId]: value }));
+                        }}
+                        rows=${3}
+                      ></textarea>
+                      <div class="env-msg-composer-row">
+                        <button
+                          class="primary"
+                          style="flex: 1"
+                          disabled=${!replyId || isReplying || !replyText.trim()}
+                          onClick=${() => sendReply(ev)}
+                        >${isReplying ? "sending…" : "send reply"}</button>
+                      </div>
+                      ${replyError
+                        ? html`<div class="rec-error">${replyError}</div>`
+                        : null}
+                    </div>`
+                  : null}
               </div>
             `;
           }
