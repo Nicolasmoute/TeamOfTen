@@ -25,7 +25,7 @@ import os
 import sys
 import time
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from server.runtimes.base import TurnContext
@@ -65,6 +65,22 @@ _client_locks: dict[str, asyncio.Lock] = {}
 # Bump when the Codex-visible coord tool contract changes in a way that
 # old persisted Codex threads might not pick up on resume.
 _CODEX_TOOL_CONTRACT_VERSION = "2026-05-14.role-tool-allowlists"
+
+
+def _codex_request_timeout_seconds() -> float:
+    """Default request/response timeout for codex app-server JSON-RPC.
+
+    The SDK default is 30s, which is tight for cold `thread/start` and
+    `thread/resume` calls when the app-server is starting MCP servers or
+    Codex is slow under load. Keep this runtime-local so tests and live
+    deploys can tune it without changing the SDK package.
+    """
+    raw = os.environ.get("HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS", "").strip()
+    try:
+        value = float(raw) if raw else 120.0
+    except ValueError:
+        value = 120.0
+    return max(30.0, value)
 
 
 class _CapturedStdioTransport:
@@ -340,11 +356,23 @@ async def get_client(
         )
 
         _install_captured_stdio_transport(sdk)
-        client = sdk.CodexClient.connect_stdio(
-            command=["codex", "app-server"] + mcp_flags,
-            cwd=cwd,
-            env=env,
-        )
+        connect_kwargs = {
+            "command": ["codex", "app-server"] + mcp_flags,
+            "cwd": cwd,
+            "env": env,
+            "request_timeout": _codex_request_timeout_seconds(),
+        }
+        try:
+            client = sdk.CodexClient.connect_stdio(**connect_kwargs)
+        except TypeError as exc:
+            # codex-app-server-sdk >=0.3.2 supports request_timeout.
+            # Some test fakes and older local SDK builds may not; keep
+            # those environments usable while the real deploy path still
+            # gets the longer timeout.
+            if "request_timeout" not in str(exc):
+                raise
+            connect_kwargs.pop("request_timeout", None)
+            client = sdk.CodexClient.connect_stdio(**connect_kwargs)
         # `connect_stdio` is sync in 0.3.2 (returns CodexClient directly,
         # not a coroutine), but the spec calls out that some early
         # builds returned awaitables. Accept both shapes.
@@ -583,10 +611,10 @@ async def ensure_codex_tool_contract_current() -> int:
 
 
 # Number of extra resume attempts on `CodexTimeoutError` before we give
-# up and fall back to `start_thread`. The SDK's default `request_timeout`
-# is 30s; under load (cold app-server subprocess, slow Codex backend, or
-# a thread with substantial state — Coach is the usual victim) `thread/
-# resume` can transiently exceed it. Treating every timeout as a stale
+# up and fall back to `start_thread`. The harness raises the SDK's
+# default request timeout, but cold app-server startup, slow Codex
+# backend responses, or substantial thread state can still exceed it.
+# Treating every timeout as a stale
 # thread loses continuity unnecessarily; retrying first preserves it.
 # Genuine stale-thread errors raise `CodexProtocolError` immediately and
 # don't go through this path.
@@ -603,8 +631,11 @@ async def open_thread(
 ) -> tuple[Any, bool]:
     """Return a `ThreadHandle` for `agent_id`, creating or resuming as
     appropriate. Implements §E.2's stale-thread auto-heal: if a stored
-    `codex_thread_id` fails to resume (any non-cancellation exception),
-    null it and fall back to `start_thread` once.
+    `codex_thread_id` fails to resume with a protocol/thread-state
+    error, null it and fall back to `start_thread` once. Transport
+    errors are different: the stdio receiver is poisoned, so this
+    function preserves `codex_thread_id` and re-raises for the caller
+    to close/rebuild the app-server client.
 
     `CodexTimeoutError` on `thread/resume` is retried a small number of
     times before falling back, since it's typically a transient backend
@@ -646,6 +677,7 @@ async def open_thread(
     if existing:
         sdk_for_resume = _import_codex_sdk()
         timeout_cls = getattr(sdk_for_resume, "CodexTimeoutError", None)
+        transport_cls = getattr(sdk_for_resume, "CodexTransportError", None)
         last_exc: Exception | None = None
         for attempt in range(_CODEX_RESUME_TIMEOUT_RETRIES + 1):
             try:
@@ -655,6 +687,18 @@ async def open_thread(
                 return (r, True)
             except Exception as exc:
                 last_exc = exc
+                if (
+                    transport_cls is not None
+                    and isinstance(exc, transport_cls)
+                ) or type(exc).__name__ == "CodexTransportError":
+                    logger.warning(
+                        "CodexRuntime: resume_thread transport failed for "
+                        "slot=%s thread_id=%s; preserving stored thread id "
+                        "and rebuilding the app-server client on retry",
+                        agent_id,
+                        existing,
+                    )
+                    raise
                 is_timeout = (
                     timeout_cls is not None and isinstance(exc, timeout_cls)
                 )
@@ -672,15 +716,18 @@ async def open_thread(
         assert last_exc is not None
 
         # Auth-failure guard (mirrors server/runtimes/claude.py §2026-05-05).
-        # If $CODEX_HOME/auth.json is absent, the resume failure is almost
-        # certainly an auth error, NOT a stale thread. Clearing codex_thread_id
-        # would nuke thread continuity that comes back the moment the operator
-        # signs in again. Bail without touching the thread id so the outer error
-        # path handles it; the operator can re-sign-in and the next spawn will
-        # resume cleanly.
+        # Only apply it when this turn actually resolved to ChatGPT auth.
+        # API-key Codex turns legitimately run with no $CODEX_HOME/auth.json,
+        # and low-level tests may call open_thread without a TurnContext.
+        # Clearing codex_thread_id after a real ChatGPT sign-out would nuke
+        # continuity that comes back the moment the operator signs in again,
+        # so in that narrow case we bail without touching the thread id.
+        auth_method = None
+        if tc is not None and isinstance(getattr(tc, "turn_ctx", None), dict):
+            auth_method = tc.turn_ctx.get("codex_auth_method")
         try:
             from server.codex_login import auth_present
-            if not auth_present():
+            if auth_method == "chatgpt" and not auth_present():
                 logger.warning(
                     "CodexRuntime: resume_thread failed for slot=%s "
                     "thread_id=%s AND auth.json absent — treating as auth "
@@ -1320,8 +1367,8 @@ def _build_mcp_servers_for_slot(
     """Build the MCP server config dict keyed by server name.
 
     Unlike `_build_mcp_servers` (which requires a full TurnContext), this
-    variant uses only spawn-time inputs. Used by `_write_codex_mcp_json`
-    which runs before any thread exists.
+    variant uses only spawn-time inputs. Used by `_build_mcp_cli_flags`
+    before `codex app-server` starts.
     """
     servers: dict[str, Any] = {}
     root = _harness_root()
@@ -1573,9 +1620,9 @@ def _codex_sandbox_for(agent_id: str) -> str:
 
 def _codex_config_overrides(tc: TurnContext) -> dict[str, Any]:
     # NOTE: `mcp_servers` is intentionally NOT included here.
-    # The Codex binary reads MCP server config from `.mcp.json` at startup,
-    # not from the `config` dict passed to `thread/start`.  We write
-    # `.mcp.json` in `get_client()` before spawning the subprocess.
+    # Codex reads MCP server config at app-server startup, not from the
+    # `config` dict passed to `thread/start`. `get_client()` injects
+    # MCP servers through `codex app-server -c mcp_servers.<name>=...`.
     # See Docs/CODEX_RUNTIME_SPEC.md §C.5 for the full design.
     overrides: dict[str, Any] = {}
     # Translate the team-wide web-access toggle into Codex's native
@@ -1609,7 +1656,15 @@ def _codex_sandbox_policy(tc: TurnContext) -> dict[str, Any] | None:
     """
     if tc.agent_id == "coach" or not tc.workspace_cwd:
         return None
-    cwd = Path(tc.workspace_cwd)
+    # The harness normally runs in Linux containers, but unit tests may
+    # execute on Windows while still passing container-style /data paths.
+    # Preserve POSIX path strings in that case so blockedPaths match what
+    # Codex will see inside the container.
+    cwd = (
+        PurePosixPath(tc.workspace_cwd)
+        if str(tc.workspace_cwd).startswith("/")
+        else Path(tc.workspace_cwd)
+    )
     repo_root = cwd.parent
     if repo_root.name != "repo":
         return None

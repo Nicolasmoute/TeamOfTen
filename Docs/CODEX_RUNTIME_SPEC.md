@@ -366,7 +366,8 @@ it. Two paths, same handlers.
 mcp_servers = {"coord": coord_server, **external_servers}
 ```
 
-**CodexRuntime: `.mcp.json` at workspace CWD (NOT `thread/start` config).**
+**CodexRuntime: app-server `-c mcp_servers...` flags (NOT
+`thread/start` config).**
 
 The Codex binary's `thread/start` handler does NOT read
 `config["mcp_servers"]` — it supports only `persistFullHistory`,
@@ -375,27 +376,26 @@ The Codex binary's `thread/start` handler does NOT read
 subprocess startup. Passing `mcp_servers` in the config dict is
 silently ignored; `coord_*` tools never appear.
 
-**Fix:** `get_client` calls `_write_codex_mcp_json(slot, token, cwd,
-external_mcp_servers)` to write `<workspace_cwd>/.mcp.json` immediately
-before `connect_stdio` spawns the subprocess. The Codex binary
-auto-discovers `.mcp.json` in its CWD at startup.
+**Fix:** `get_client` builds transient Codex CLI overrides with
+`_build_mcp_cli_flags(slot, token, external_mcp_servers,
+allowed_tools)` and spawns `codex app-server -c
+mcp_servers.coord={...} -c mcp_servers.<external>={...}`. Verified on
+2026-05-15 against `codex-cli 0.130.0`: `.mcp.json` in the workspace
+CWD is ignored by `config/read`, while `-c mcp_servers.<name>=...` is
+parsed as app-server startup config.
 
 ```json
-// .mcp.json written to workspace_cwd before every fresh subprocess spawn
+// TOML-equivalent inline value passed after `-c mcp_servers.coord=`
 {
-  "mcpServers": {
-    "coord": {
-      "type": "stdio",
-      "command": "<sys.executable>",
-      "args": ["-m", "server.coord_mcp", "--caller-id", "<slot>",
-               "--proxy-url", "http://127.0.0.1:8000",
-               "--allowed-tools", "[\"coord_my_assignments\", ...]"],
-      "env": {"HARNESS_COORD_PROXY_TOKEN": "<runtime-owned token>"},
-      "enabled_tools": ["coord_my_assignments", "..."],
-      "default_tools_approval_mode": "approve"
-    },
-    "<external-server>": { "...", "default_tools_approval_mode": "approve" }
-  }
+  "type": "stdio",
+  "command": "<sys.executable>",
+  "cwd": "<harness-root>",
+  "args": ["-m", "server.coord_mcp", "--caller-id", "<slot>",
+           "--proxy-url", "http://127.0.0.1:8000",
+           "--allowed-tools", "[\"coord_my_assignments\", ...]"],
+  "env": {"HARNESS_COORD_PROXY_TOKEN": "<runtime-owned token>"},
+  "enabled_tools": ["coord_my_assignments", "..."],
+  "default_tools_approval_mode": "approve"
 }
 ```
 
@@ -415,16 +415,17 @@ still runs read-only.
 
 
 **External MCP servers inherit the same approval policy.** Servers added
-through the Options drawer are included in `.mcp.json` with
+through the Options drawer are included in the `-c mcp_servers...`
+startup flags with
 `default_tools_approval_mode = "approve"` injected when not already
 set. An explicit value in the saved config is preserved (opt-out for
 users who want approval-on-use). Implementation in
-`_write_codex_mcp_json` / `_build_mcp_servers_for_slot`
+`_build_mcp_cli_flags` / `_build_mcp_servers_for_slot`
 ([server/runtimes/codex.py](../server/runtimes/codex.py)).
 
-**`.mcp.json` is gitignored.** The file is written fresh on every
-subprocess spawn and must not be committed (it contains a live
-`HARNESS_COORD_PROXY_TOKEN` secret). See `.gitignore` root entry
+**Deprecated `.mcp.json` path.** `_write_codex_mcp_json` is retained
+only as a reference helper. The runtime no longer relies on workspace
+files for Codex MCP configuration. The old `.gitignore` entry remains:
 `# Codex runtime — MCP server config written by the harness...`.
 
 **`_codex_config_overrides` does NOT include `mcp_servers`.** That
@@ -433,10 +434,11 @@ Codex binary's thread handler actually reads belong there (currently
 `web_search` only). Adding `mcp_servers` here has no effect and would
 mislead future readers.
 
-**Codex role allowlist filtering.** `_write_codex_mcp_json` derives the
+**Codex role allowlist filtering.** `_build_mcp_cli_flags` derives the
 bare coord names from the active `TurnContext.allowed_tools` and writes
-them into `.mcp.json` as both `server.coord_mcp --allowed-tools` and
-Codex `enabled_tools`. The proxy exposes only those tools in
+them into the coord MCP server startup config as both
+`server.coord_mcp --allowed-tools` and Codex `enabled_tools`. The
+proxy exposes only those tools in
 `tools/list` and rejects calls to any other coord tool. External MCP
 servers are included only when the active allowlist contains at least
 one `mcp__<server>__...` tool. This is the Codex substitute for
@@ -502,9 +504,13 @@ ChatGPT-session badge, write-only masked API-key field, "Test" button
 
 **One `CodexClient` instance per slot**, cached in module-level
 `_codex_clients: dict[str, CodexClient]`. Constructed via
-`CodexClient.connect_stdio(command=["codex", "app-server"], cwd=...,
-env=...)` which spawns the `codex app-server` subprocess. After
-construction call `await client.start()` then `await client.initialize()`.
+`CodexClient.connect_stdio(command=["codex", "app-server", "-c", ...],
+cwd=..., env=..., request_timeout=...)` which spawns the `codex
+app-server` subprocess with startup MCP config. The request timeout is
+`HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS` (default 120s, clamped to at
+least 30s) rather than the SDK's 30s default so cold `thread/start` and
+heavy `thread/resume` calls have room under load. After construction
+call `await client.start()` then `await client.initialize()`.
 The harness patches the SDK stdio transport to pipe a bounded
 `codex app-server` stderr tail into `CodexTransportError` messages;
 the stock SDK transport discards stderr and otherwise leaves only
@@ -514,10 +520,10 @@ satisfying the SDK's "one active turn consumer per client" constraint.
 Close (`await client.close()`) and re-open on auth-error / transport
 error.
 
-**Cache invalidation on config change.** `.mcp.json` is written at
-subprocess spawn time (inside `get_client`), so a UI-side MCP server
-add / patch / delete won't propagate into the running subprocess. Two
-helpers handle this:
+**Cache invalidation on config change.** MCP config is captured at
+subprocess spawn time through the app-server `-c mcp_servers...`
+flags, so a UI-side MCP server add / patch / delete won't propagate
+into the running subprocess. Two helpers handle this:
 
 - `evict_client(slot)` — full close on idle slots; cache-pop only when
   a turn is in flight (lets the live turn finish on its own client
@@ -563,19 +569,27 @@ thread.compact()          # native compact (returns Any)
 
 - On entry: read `agent_sessions.codex_thread_id` for `(slot, project_id)`.
 - If null → `client.start_thread(config)`. `thread.thread_id` is available
-  immediately; persist it on first successful `chat()` step.
+  immediately; persist it on first successful `chat()` step. The
+  app-server client uses the harness request timeout above, so fresh
+  thread creation is not capped by the SDK's 30s default.
 - If set → `client.resume_thread(thread_id, overrides=cfg)`. On failure
   (CodexProtocolError, "thread not found", etc.), mirror Claude's
   stale-session auto-heal: emit `session_resume_failed`, null
   `codex_thread_id`, retry once with `start_thread`.
   - `CodexTimeoutError` is special-cased. The SDK's default
-    `request_timeout` is 30s; under load (cold app-server subprocess,
+    `request_timeout` is replaced by the harness timeout; under load
+    (cold app-server subprocess,
     slow Codex backend, large stored thread state — Coach especially)
     `thread/resume` can transiently exceed it. `open_thread` retries
     `_CODEX_RESUME_TIMEOUT_RETRIES` (default 2, total 3 attempts) with
     a brief inter-attempt delay before falling back, so a transient
-    blip does not cost the agent its thread continuity. Other
-    exception classes (CodexProtocolError, CodexTransportError,
+    blip does not cost the agent its thread continuity.
+  - `CodexTransportError` is not a stale-thread signal. It means the
+    stdio receiver/app-server client is poisoned. `open_thread`
+    preserves `codex_thread_id`, skips `session_resume_failed`, and
+    re-raises so the caller closes the cached client and the next
+    retry rebuilds it before attempting resume again.
+  - Other non-timeout exception classes (CodexProtocolError or
     plain Exception) skip the retry and fall back on the first
     attempt — they are not transient.
 - Codex prepares this start/resume before `agent_started` is emitted so

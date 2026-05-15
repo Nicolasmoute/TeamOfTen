@@ -351,6 +351,8 @@ class _FakeClient:
         self.command = command
         self.cwd = cwd
         self.env = env
+        self.kwargs = kwargs
+        self.request_timeout = kwargs.get("request_timeout")
         self.started = 0
         self.initialized = 0
         self.closed = 0
@@ -421,6 +423,29 @@ async def test_get_client_caches_per_slot(monkeypatch, tmp_path) -> None:
     # start + initialize each ran exactly once during construction.
     assert c1.started == 1
     assert c1.initialized == 1
+
+
+async def test_get_client_passes_codex_request_timeout(
+    monkeypatch, tmp_path,
+) -> None:
+    """Codex app-server request timeout must be harness-controlled.
+
+    The SDK default is 30s; production traces showed `thread/start`
+    timing out at that boundary after a resume recovery. The harness
+    should pass a longer default, with an env knob for deploy tuning.
+    """
+    _install_fake_sdk(monkeypatch)
+    monkeypatch.delenv("HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS", raising=False)
+    from server.runtimes.codex import get_client, close_client
+
+    await get_client("p1", cwd=str(tmp_path))
+    assert _FakeClient.instances[0].request_timeout == 120.0
+
+    await close_client("p1")
+    _FakeClient.instances.clear()
+    monkeypatch.setenv("HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS", "75")
+    await get_client("p1", cwd=str(tmp_path))
+    assert _FakeClient.instances[0].request_timeout == 75.0
 
 
 async def test_get_client_separate_slots_get_separate_clients(
@@ -751,8 +776,8 @@ async def test_get_client_passes_mcp_flags_to_command(monkeypatch, tmp_path) -> 
 
 def test_config_dict_does_not_contain_mcp_servers() -> None:
     """The config dict passed to thread/start must NOT contain mcp_servers.
-    The Codex binary ignores that key — MCP config is read from .mcp.json
-    at app-server startup time only."""
+    The Codex binary ignores that key. MCP config is app-server startup
+    state supplied by get_client's -c mcp_servers.<name>=... flags."""
     from server.runtimes.base import TurnContext
     from server.runtimes.codex import _codex_config_overrides
 
@@ -770,7 +795,7 @@ def test_config_dict_does_not_contain_mcp_servers() -> None:
     assert "mcp_servers" not in cfg, (
         "mcp_servers in the thread/start config dict is silently ignored by "
         "the Codex binary — it must be removed to avoid confusion. "
-        "MCP servers are configured via .mcp.json written by get_client()."
+        "MCP servers are configured via app-server -c flags."
     )
 
 async def test_failed_handshake_does_not_poison_cache(
@@ -1035,6 +1060,38 @@ async def test_open_thread_propagates_cancellation_during_resume(
     # Stored id MUST still be intact after a cancellation.
     assert (await _get_codex_thread_id("p1")) == "tid_alive"
     # start_thread must NOT have been called as a fallback.
+    assert client.start_calls == []
+
+
+async def test_open_thread_reraises_transport_resume_failure(
+    fresh_db,
+) -> None:
+    """A CodexTransportError means the stdio app-server client is dead.
+
+    Do not treat it like a stale thread, do not clear codex_thread_id,
+    and do not call start_thread on the same poisoned client. The
+    caller closes/rebuilds the client and retries with the stored
+    thread id still intact.
+    """
+    import pytest
+    import server.db as dbmod
+    from codex_app_server_sdk import CodexTransportError
+    from server.runtimes.codex import (
+        open_thread, _set_codex_thread_id, _get_codex_thread_id,
+    )
+    await dbmod.init_db()
+    _FakeThread.instances.clear()
+    client = _ThreadFakeClient()
+    client.fail_resume_with = CodexTransportError(
+        "receiver loop failed: failed reading from stdio transport"
+    )
+
+    await _set_codex_thread_id("p1", "tid_transport_alive")
+    with pytest.raises(CodexTransportError):
+        await open_thread("p1", client)
+
+    assert (await _get_codex_thread_id("p1")) == "tid_transport_alive"
+    assert len(client.resume_calls) == 1
     assert client.start_calls == []
 
 
@@ -1571,6 +1628,7 @@ async def test_handle_step_emits_safety_telemetry_for_rejected_mcp_tool(
         "tool_use",
         "codex_safety_suspected",
         "tool_result",
+        "codex_mcp_evict",
     ]
     telemetry = captured[1]
     assert telemetry["tool_use_id"] == "mcp_safety"
@@ -1763,7 +1821,7 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
         )
         return client
 
-    async def fake_open_thread(agent_id, client_arg, *, config=None):
+    async def fake_open_thread(agent_id, client_arg, *, config=None, tc=None):
         open_thread_calls.append(
             {"agent_id": agent_id, "client": client_arg, "config": config}
         )
@@ -1836,10 +1894,8 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
     assert config.kwargs["model"] == "gpt-5.4-mini"
     assert config.kwargs["sandbox"] == "danger-full-access"
     assert "plugins" not in config.kwargs["config"]
-    # MCP servers are configured via .mcp.json written by get_client(), NOT via
+    # MCP servers are configured via get_client's app-server -c flags, NOT via
     # the thread/start config dict — the Codex binary ignores config["mcp_servers"].
-    # The real get_client is monkeypatched here, so .mcp.json writing is tested
-    # separately in test_write_codex_mcp_json_*.
     assert "mcp_servers" not in config.kwargs["config"]
 
     assert thread.chat_calls[0]["text"] == "say hello"
@@ -1972,7 +2028,7 @@ async def test_codex_run_turn_updates_continuity_bookkeeping(
     monkeypatch.setattr(
         codex_mod,
         "open_thread",
-        lambda agent_id, client_arg, *, config=None: _async_value((thread, False)),
+        lambda agent_id, client_arg, *, config=None, tc=None: _async_value((thread, False)),
     )
     monkeypatch.setattr(codex_mod, "_set_codex_thread_id", lambda *_: _async_value(None))
     monkeypatch.setattr(agentsmod, "_insert_turn_row", fake_insert_turn_row)
@@ -2036,7 +2092,7 @@ async def test_codex_run_turn_consumes_prepared_turn_state(
         )
         return client
 
-    async def fake_open_thread(agent_id, client_arg, *, config=None):
+    async def fake_open_thread(agent_id, client_arg, *, config=None, tc=None):
         open_thread_calls.append(
             {"agent_id": agent_id, "client": client_arg, "config": config}
         )

@@ -17,7 +17,7 @@ import {
   buildSideBySideRows,
   renderDiffBody,
 } from "/static/tools.js";
-import { CompassPane, createCompassEventRouter } from "/static/compass.js?v=1778671319";
+import { CompassPane, createCompassEventRouter } from "/static/compass.js?v=1777887411";
 import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js";
 import { PlaybookPane, createPlaybookEventRouter } from "/static/playbook.js";
 

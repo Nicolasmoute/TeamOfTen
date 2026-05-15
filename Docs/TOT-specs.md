@@ -4672,6 +4672,14 @@ Token lifetime, MCP cache invalidation on config change,
 contract are CodexRuntime concerns — see
 `Docs/CODEX_RUNTIME_SPEC.md` §C.4 and §E.1.
 
+CodexRuntime spawns `codex app-server` with a harness-controlled SDK
+request timeout (`HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS`, default
+120s) instead of the SDK's 30s default. Resume-time
+`CodexTransportError` is treated as a poisoned app-server client, not
+a stale thread: the runtime preserves `codex_thread_id`, closes the
+cached client through the caller's error path, and lets the next retry
+rebuild before attempting resume again.
+
 **Transient-error retry (2026-05-13)**: `CoordProxyClient.call_tool`
 retries on transport errors (`httpx.ConnectError`, `ReadTimeout`,
 `WriteTimeout`, `PoolTimeout`, `RemoteProtocolError`, `ReadError`,
@@ -4705,6 +4713,7 @@ implementation):
 | `CLAUDE_CONFIG_DIR` | `/data/claude` | Claude OAuth/session dir |
 | `CODEX_HOME` | `/data/codex` | Codex CLI auth dir (`auth.json`). Must point at persistent storage; after deploy run `CODEX_HOME=/data/codex codex login --device-auth` in the container to create the ChatGPT OAuth session. |
 | `HARNESS_CODEX_ENABLED` | unset | Codex runtime feature gate. Must be truthy (`true`, `1`, `yes`, `on`) before `PUT /api/agents/{id}/runtime` or the UI runtime controls can select `runtime=codex`. |
+| `HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS` | `120` | Codex app-server JSON-RPC request timeout passed to `CodexClient.connect_stdio`; clamped to at least 30s. Covers `initialize`, `thread/start`, `thread/resume`, and similar request/response calls. |
 | `HARNESS_DB_PATH` | `/data/harness.db` | SQLite path |
 | `HARNESS_DATA_ROOT` | `/data` | Global/project data root |
 | `HARNESS_WEBDAV_URL` | unset | WebDAV base folder URL |

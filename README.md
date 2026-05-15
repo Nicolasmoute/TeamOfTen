@@ -299,6 +299,7 @@ Copy [`.env.example`](.env.example) to `.env` and edit. The file is intentionall
 | `HARNESS_WEBDAV_URL` + `_USER` + `_PASSWORD` | WebDAV mirror (kDrive / Nextcloud / ownCloud / Fastmail). All three or none. |
 | `HARNESS_AGENT_DAILY_CAP` / `_TEAM_DAILY_CAP` | USD/day per-Player and team-wide cost caps. Defaults: 5 / 20. |
 | `HARNESS_CODEX_ENABLED` | Gate the Codex runtime. When unset/false, the API rejects `runtime=codex`. |
+| `HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS` | Optional Codex app-server request timeout. Defaults to 120s; useful if cold `thread/start` / `thread/resume` calls are slow under load. |
 | `HARNESS_SECRETS_KEY` | Fernet key (44-char urlsafe-base64) for the encrypted secrets store. Required for managing MCP credentials and the Telegram token from the UI. |
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_ALLOWED_CHAT_IDS` | First-boot bootstrap for the Telegram bridge — once you save them in Options the env vars are ignored. |
 
