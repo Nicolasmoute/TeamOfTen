@@ -409,7 +409,12 @@ async def test_get_client_caches_per_slot(monkeypatch, tmp_path) -> None:
     inst = _FakeClient.instances[0]
     # Verify connect_stdio was invoked with the spec-correct command/cwd
     # and the env was os.environ + overrides (not overrides alone).
-    assert inst.command == ["codex", "app-server"]
+    # Command must start with ["codex", "app-server"]; additional -c flags
+    # follow for MCP server injection (root-cause fix 2026-05-15).
+    assert inst.command[:2] == ["codex", "app-server"]
+    assert any("mcp_servers.coord=" in arg for arg in inst.command), (
+        "coord MCP server -c flag missing from command"
+    )
     assert inst.cwd == str(tmp_path)
     assert inst.env.get("X") == "1"
     assert inst.env.get("PATH") == "/usr/bin:/usr/local/bin"
@@ -685,50 +690,63 @@ def test_build_mcp_servers_for_slot_skips_coord_override() -> None:
     assert "-m" in servers["coord"]["args"]
 
 
-def test_write_codex_mcp_json_creates_file(tmp_path) -> None:
-    """_write_codex_mcp_json writes a valid .mcp.json under cwd."""
-    import json as _json
-    from server.runtimes.codex import _write_codex_mcp_json
+def test_build_mcp_cli_flags_contains_coord_server(tmp_path) -> None:
+    """_build_mcp_cli_flags must produce -c flags for the coord server.
 
-    _write_codex_mcp_json("p1", "tok_xyz", str(tmp_path), {"extra": {"command": "x"}})
+    Root-cause fix (2026-05-15): .mcp.json in CWD is silently ignored by
+    codex-cli 0.130.0.  MCP servers must be injected via -c CLI overrides.
+    """
+    from server.runtimes.codex import _build_mcp_cli_flags
 
-    dest = tmp_path / ".mcp.json"
-    assert dest.exists()
-    data = _json.loads(dest.read_text())
-    assert "mcpServers" in data
-    assert "coord" in data["mcpServers"]
-    assert "extra" in data["mcpServers"]
-    assert data["mcpServers"]["coord"]["env"]["HARNESS_COORD_PROXY_TOKEN"] == "tok_xyz"
+    flags = _build_mcp_cli_flags("p1", "tok_xyz", {"extra": {"command": "x"}})
 
+    # Must be a list of alternating '-c', '<key>=<val>'
+    assert len(flags) >= 4  # at least 2 servers × 2 items
+    keys = [flags[i + 1].split("=")[0] for i in range(0, len(flags), 2)]
+    assert "mcp_servers.coord" in keys
+    assert "mcp_servers.extra" in keys
 
-def test_write_codex_mcp_json_token_current_on_fresh_spawn(tmp_path) -> None:
-    """Each call to _write_codex_mcp_json overwrites with the latest token,
-    so a new subprocess spawn after close_client always sees the right token."""
-    import json as _json
-    from server.runtimes.codex import _write_codex_mcp_json
-
-    _write_codex_mcp_json("p1", "tok_old", str(tmp_path))
-    _write_codex_mcp_json("p1", "tok_new", str(tmp_path))
-
-    data = _json.loads((tmp_path / ".mcp.json").read_text())
-    assert data["mcpServers"]["coord"]["env"]["HARNESS_COORD_PROXY_TOKEN"] == "tok_new"
+    # The coord entry must carry the token in the TOML inline value
+    coord_flag = next(v for v in flags if "mcp_servers.coord=" in v)
+    assert "tok_xyz" in coord_flag
 
 
-async def test_get_client_writes_mcp_json(monkeypatch, tmp_path) -> None:
-    """get_client writes .mcp.json to cwd before spawning the subprocess.
-    This is the critical path that makes coord_* tools visible to Codex."""
-    import json as _json
+def test_build_mcp_cli_flags_token_current_per_call(tmp_path) -> None:
+    """Each _build_mcp_cli_flags call uses the supplied token, so a new
+    subprocess spawn after close_client always carries the latest token."""
+    from server.runtimes.codex import _build_mcp_cli_flags
+
+    flags_old = _build_mcp_cli_flags("p1", "tok_old")
+    flags_new = _build_mcp_cli_flags("p1", "tok_new")
+
+    coord_old = next(v for v in flags_old if "mcp_servers.coord=" in v)
+    coord_new = next(v for v in flags_new if "mcp_servers.coord=" in v)
+    assert "tok_old" in coord_old
+    assert "tok_new" in coord_new
+    assert "tok_old" not in coord_new
+
+
+async def test_get_client_passes_mcp_flags_to_command(monkeypatch, tmp_path) -> None:
+    """get_client must pass -c mcp_servers.coord=... flags to the subprocess.
+
+    Root-cause fix: .mcp.json approach dropped; -c CLI flags are the
+    verified working injection path for codex-cli 0.130.0.
+
+    We verify by reading the command off the _FakeClient instance that
+    connect_stdio creates — _FakeClient stores kwargs.command."""
     _install_fake_sdk(monkeypatch)
     from server.runtimes.codex import get_client
+    from server.runtimes import codex as codex_mod
+    _FakeClient.instances.clear()
 
     await get_client("p1", cwd=str(tmp_path))
 
-    dest = tmp_path / ".mcp.json"
-    assert dest.exists(), ".mcp.json must be written before subprocess spawn"
-    data = _json.loads(dest.read_text())
-    assert "mcpServers" in data
-    assert "coord" in data["mcpServers"]
-    assert data["mcpServers"]["coord"]["type"] == "stdio"
+    assert _FakeClient.instances, "connect_stdio was not called"
+    cmd = _FakeClient.instances[0].command
+    assert "app-server" in cmd
+    # Must have at least one -c mcp_servers.coord= flag
+    has_coord_flag = any("mcp_servers.coord=" in arg for arg in cmd)
+    assert has_coord_flag, f"No -c mcp_servers.coord= flag in command: {cmd}"
 
 
 def test_config_dict_does_not_contain_mcp_servers() -> None:
