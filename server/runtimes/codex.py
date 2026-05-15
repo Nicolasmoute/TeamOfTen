@@ -264,14 +264,12 @@ async def get_client(
     `CodexProtocolError` should call `close_client(slot)` and retry —
     that drops the cached client so the next `get_client` rebuilds it.
 
-    `external_mcp_servers` is written into `.mcp.json` in `cwd` alongside
-    the built-in `coord` server.  The Codex binary discovers `.mcp.json`
-    at startup — this is the ONLY supported path for configuring MCP
-    servers at the app-server level.  Passing `mcp_servers` inside the
-    `config` dict of `thread/start` is silently ignored by the binary.
-
-    Confirmed against live SDK 0.3.2 on 2026-04-28; see
-    Docs/CODEX_PROBE_OUTPUT.md for the surface this calls into.
+    MCP servers are injected via ``-c mcp_servers.<name>=<toml_inline>``
+    CLI overrides appended to the ``codex app-server`` command.  This is
+    the ONLY confirmed working path for codex-cli 0.130.0.  The earlier
+    approach of writing ``.mcp.json`` to CWD was silently ignored by the
+    binary (``config/read`` returns ``mcp_servers: {}``).  Verified live
+    on 2026-05-15; see ``_build_mcp_cli_flags`` for full details.
     """
     async with _slot_lock(slot):
         cached = _codex_clients.get(slot)
@@ -329,21 +327,21 @@ async def get_client(
         _codex_client_tokens[slot] = token
         env["HARNESS_COORD_PROXY_TOKEN"] = token
 
-        # Write .mcp.json to the app-server's CWD BEFORE spawning.
-        # The Codex binary discovers MCP servers via this file at startup.
-        # Passing mcp_servers inside the thread/start config dict is a
-        # no-op — the binary's thread/start handler does not read that key.
-        _write_codex_mcp_json(
+        # Build per-slot MCP server CLI flags.
+        # Root-cause fix (2026-05-15): Codex does NOT read .mcp.json from
+        # CWD.  MCP servers must be injected via ``-c mcp_servers.<name>=``
+        # CLI overrides which Codex parses as transient TOML.  Verified live
+        # against codex-cli 0.130.0 — see _build_mcp_cli_flags docstring.
+        mcp_flags = _build_mcp_cli_flags(
             slot,
             token,
-            cwd,
             external_mcp_servers,
             allowed_tools,
         )
 
         _install_captured_stdio_transport(sdk)
         client = sdk.CodexClient.connect_stdio(
-            command=["codex", "app-server"],
+            command=["codex", "app-server"] + mcp_flags,
             cwd=cwd,
             env=env,
         )
@@ -1182,6 +1180,74 @@ def _build_mcp_servers_for_slot(
     return servers
 
 
+def _mcp_server_to_toml_inline(cfg: dict[str, Any]) -> str:
+    """Serialise one MCP server config dict as a TOML inline table.
+
+    Codex's ``-c`` flag parses the value as TOML.  JSON strings and arrays
+    are valid TOML literals, so we use ``json.dumps`` for scalar and list
+    values.  Nested dicts (e.g. ``env``) are rendered as TOML inline tables
+    recursively.  This covers the fields we actually use: ``command``,
+    ``args``, ``env``, ``enabled``, ``default_tools_approval_mode``,
+    ``enabled_tools``, ``cwd``.
+
+    TOML inline tables must be on one line with no trailing commas.
+    """
+    parts: list[str] = []
+    for key, val in cfg.items():
+        if val is None:
+            continue
+        if isinstance(val, bool):
+            parts.append(f"{key} = {'true' if val else 'false'}")
+        elif isinstance(val, (int, float)):
+            parts.append(f"{key} = {val}")
+        elif isinstance(val, str):
+            # JSON string escaping is a superset of TOML basic string
+            parts.append(f"{key} = {json.dumps(val)}")
+        elif isinstance(val, list):
+            # JSON array syntax is valid TOML array syntax
+            parts.append(f"{key} = {json.dumps(val)}")
+        elif isinstance(val, dict):
+            # Nested inline table
+            parts.append(f"{key} = {_mcp_server_to_toml_inline(val)}")
+    return "{" + ", ".join(parts) + "}"
+
+
+def _build_mcp_cli_flags(
+    agent_id: str,
+    token: str,
+    external_mcp_servers: dict[str, Any] | None = None,
+    allowed_tools: list[str] | None = None,
+) -> list[str]:
+    """Build ``-c mcp_servers.<name>=<toml_inline>`` flags for each MCP server.
+
+    Root-cause fix (2026-05-15): Codex does NOT read ``.mcp.json`` from its
+    working directory.  MCP server config must be supplied via the ``-c`` CLI
+    override flag, which Codex parses as a transient TOML override (never
+    written back to ``$CODEX_HOME/config.toml``).
+
+    Verified live against ``codex-cli 0.130.0``:
+    - ``.mcp.json`` in CWD → silently ignored (``config/read`` shows
+      ``mcp_servers: {}``)
+    - ``-c mcp_servers.<name>={...}`` → correctly appears in ``config/read``
+      and triggers ``mcpServer/startupStatus/updated`` at thread/start
+    """
+    servers = _build_mcp_servers_for_slot(
+        agent_id,
+        token,
+        external_mcp_servers,
+        allowed_tools,
+    )
+    flags: list[str] = []
+    for name, cfg in servers.items():
+        toml_val = _mcp_server_to_toml_inline(cfg)
+        flags.extend(["-c", f"mcp_servers.{name}={toml_val}"])
+        logger.debug(
+            "CodexRuntime: MCP server %r → -c mcp_servers.%s=%s",
+            name, name, toml_val[:120],
+        )
+    return flags
+
+
 def _write_codex_mcp_json(
     agent_id: str,
     token: str,
@@ -1189,19 +1255,17 @@ def _write_codex_mcp_json(
     external_mcp_servers: dict[str, Any] | None = None,
     allowed_tools: list[str] | None = None,
 ) -> None:
-    """Write `.mcp.json` to the Codex app-server's working directory.
+    """DEPRECATED — .mcp.json in CWD is not read by codex app-server 0.130.0.
 
-    The Codex binary (`codex app-server`) discovers MCP servers at startup
-    by reading `.mcp.json` from its CWD.  The `mcp_servers` key inside
-    `config` passed to `thread/start` is NOT read by the binary — that was
-    the root cause of coord_* tools being invisible to Codex Players.
+    Use ``_build_mcp_cli_flags`` and pass the result to ``connect_stdio``
+    as additional command arguments instead.  This function is kept for
+    reference but no longer called from ``get_client``.
 
-    This function must be called before `CodexClient.connect_stdio` so the
-    file is present when the subprocess starts.  It is re-written on every
-    fresh spawn (after `close_client`) so the token is always current.
-
-    File format (camelCase key per Codex convention):
-        {"mcpServers": {"coord": {...}, ...}}
+    Investigation (2026-05-15): ``config/read`` on a freshly-initialized
+    app-server started in a directory containing ``.mcp.json`` shows
+    ``mcp_servers: {}`` — the file is silently ignored.  The ``-c`` CLI
+    flag (``codex app-server -c mcp_servers.coord={...}``) is the only
+    supported injection path verified to work.
     """
     servers = _build_mcp_servers_for_slot(
         agent_id,
