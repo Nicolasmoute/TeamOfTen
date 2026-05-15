@@ -176,6 +176,22 @@ def codex_worktree_sandbox_status() -> dict[str, Any]:
     return dict(result)
 
 
+def _codex_request_timeout_seconds() -> float:
+    """Default request/response timeout for codex app-server JSON-RPC.
+
+    The SDK default is 30s, which is tight for cold `thread/start` and
+    `thread/resume` calls when the app-server is starting MCP servers or
+    Codex is slow under load. Keep this runtime-local so tests and live
+    deploys can tune it without changing the SDK package.
+    """
+    raw = os.environ.get("HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS", "").strip()
+    try:
+        value = float(raw) if raw else 120.0
+    except ValueError:
+        value = 120.0
+    return max(30.0, value)
+
+
 class _CapturedStdioTransport:
     """SDK-compatible stdio transport that keeps a stderr tail.
 
