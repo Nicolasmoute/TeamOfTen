@@ -48,6 +48,11 @@ _codex_clients: dict[str, Any] = {}
 # stale subprocess before it operates in the old directory.
 _codex_client_cwds: dict[str, str] = {}
 
+# Per-slot allowed_tools key recorded at client spawn time. Codex captures
+# MCP tool exposure when the app-server starts, so a role/tool change must
+# force a fresh subprocess even when cwd is unchanged.
+_codex_client_allowed_tool_keys: dict[str, tuple[str, ...] | None] = {}
+
 # Per-slot coord-MCP-proxy tokens. The codex app-server subprocess is
 # long-lived (cached across turns), and the env it inherits — including
 # `HARNESS_COORD_PROXY_TOKEN` — is captured at spawn time. A per-turn
@@ -470,9 +475,13 @@ async def get_client(
     on 2026-05-15; see ``_build_mcp_cli_flags`` for full details.
     """
     async with _slot_lock(slot):
+        requested_tool_key = (
+            tuple(allowed_tools) if allowed_tools is not None else None
+        )
         cached = _codex_clients.get(slot)
         if cached is not None:
             cached_cwd = _codex_client_cwds.get(slot)
+            cached_tool_key = _codex_client_allowed_tool_keys.get(slot)
             if cached_cwd is not None and cached_cwd != cwd:
                 # Defense in depth (D2 from root-cause doc, 2026-05-15):
                 # The cached subprocess was spawned with a different cwd —
@@ -502,6 +511,16 @@ async def get_client(
                 # the subprocess is still alive, the token will expire
                 # naturally when the caller doesn't call it again.
                 # Fall through to spawn a fresh client below.
+                _codex_client_allowed_tool_keys.pop(slot, None)
+            elif cached_tool_key != requested_tool_key:
+                logger.info(
+                    "CodexRuntime: cached client allowed_tools mismatch "
+                    "for slot=%s — evicting stale client",
+                    slot,
+                )
+                _codex_clients.pop(slot, None)
+                _codex_client_cwds.pop(slot, None)
+                _codex_client_allowed_tool_keys.pop(slot, None)
             else:
                 return cached
 
@@ -593,6 +612,7 @@ async def get_client(
 
         _codex_clients[slot] = client
         _codex_client_cwds[slot] = cwd
+        _codex_client_allowed_tool_keys[slot] = requested_tool_key
         logger.info("CodexRuntime: opened client for slot=%s cwd=%s", slot, cwd)
         return client
 
@@ -603,6 +623,7 @@ async def close_client(slot: str) -> None:
     async with _slot_lock(slot):
         client = _codex_clients.pop(slot, None)
         _codex_client_cwds.pop(slot, None)
+        _codex_client_allowed_tool_keys.pop(slot, None)
         # Revoke the proxy token bound to this subprocess. Done
         # whether or not the client object existed — defensive cleanup.
         token = _codex_client_tokens.pop(slot, None)
@@ -657,6 +678,7 @@ async def evict_client(slot: str) -> None:
         async with _slot_lock(slot):
             _codex_clients.pop(slot, None)
             _codex_client_cwds.pop(slot, None)
+            _codex_client_allowed_tool_keys.pop(slot, None)
         logger.info(
             "CodexRuntime: evicted cache entry for slot=%s "
             "(turn in flight; subprocess kept alive)", slot,

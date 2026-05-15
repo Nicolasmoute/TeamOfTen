@@ -17,6 +17,7 @@ priority actionable item and surfaces just that one.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -162,6 +163,62 @@ async def test_executor_task_takes_priority_over_pending_planner(
     assert "coord_commit_push" in next_action
     assert "t-2026-05-06-00000020" in next_action
     assert "t-2026-05-06-00000021" not in next_action
+
+
+async def test_stale_archived_current_task_does_not_hide_executor_role(
+    fresh_db: str,
+) -> None:
+    """Stale archived current_task_id must not mask live executor work."""
+    await init_db()
+    await _seed_task(
+        task_id="t-2026-05-06-00000030",
+        status="archive",
+        owner="p3",
+        title="old archived task",
+    )
+    await _seed_task(
+        task_id="t-2026-05-06-00000031",
+        status="execute",
+        owner="p3",
+        spec_path="tasks/t/spec.md",
+        title="live executor task",
+    )
+    await _seed_role(
+        task_id="t-2026-05-06-00000031", role="executor", owner="p3",
+    )
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE agents SET current_task_id = ?, allowed_tools = ? "
+            "WHERE id = 'p3'",
+            (
+                "t-2026-05-06-00000030",
+                json.dumps(["mcp__coord__coord_my_assignments"]),
+            ),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    server = _server_for("p3")
+    text = _ok_text(await _handler(server, "my_assignments")({}))
+    next_action = text.split("## Next action:")[1]
+
+    assert "t-2026-05-06-00000031" in next_action
+    assert "coord_commit_push" in next_action
+    assert "t-2026-05-06-00000030" not in text
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT current_task_id, allowed_tools FROM agents WHERE id = 'p3'"
+        )
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+
+    assert row["current_task_id"] == "t-2026-05-06-00000031"
+    assert "mcp__coord__coord_commit_push" in set(json.loads(row["allowed_tools"]))
 
 
 async def test_pending_review_surfaces_audit_report(

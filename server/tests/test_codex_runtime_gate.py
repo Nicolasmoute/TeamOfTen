@@ -396,6 +396,7 @@ def _install_fake_sdk(monkeypatch):
     codex_mod._codex_client_tokens.clear()
     codex_mod._codex_clients.clear()
     codex_mod._codex_client_cwds.clear()
+    codex_mod._codex_client_allowed_tool_keys.clear()
     codex_mod._client_locks.clear()
     monkeypatch.setattr(codex_mod, "_import_codex_sdk", lambda: _FakeSdk)
 
@@ -552,6 +553,35 @@ async def test_get_client_cwd_match_returns_cached(monkeypatch, tmp_path) -> Non
     c1 = await get_client("p1", cwd=str(tmp_path))
     c2 = await get_client("p1", cwd=str(tmp_path))
     assert c1 is c2
+
+
+async def test_get_client_allowed_tools_mismatch_respawns(
+    monkeypatch, tmp_path,
+) -> None:
+    """Role-tool changes must rebuild the Codex app-server.
+
+    The coord MCP catalogue is captured at subprocess startup. If the DB
+    allowlist changes from idle tools to executor tools while cwd stays the
+    same, reusing the cached client keeps coord_commit_push hidden.
+    """
+    _install_fake_sdk(monkeypatch)
+    from server.runtimes.codex import get_client
+
+    idle_tools = ["mcp__coord__coord_my_assignments"]
+    executor_tools = [
+        "mcp__coord__coord_my_assignments",
+        "mcp__coord__coord_commit_push",
+    ]
+
+    c1 = await get_client("p1", cwd=str(tmp_path), allowed_tools=idle_tools)
+    c2 = await get_client("p1", cwd=str(tmp_path), allowed_tools=executor_tools)
+
+    assert c1 is not c2
+    assert len(_FakeClient.instances) == 2
+    assert any(
+        "coord_commit_push" in part
+        for part in _FakeClient.instances[1].command
+    )
 
 
 async def test_get_client_cwd_mismatch_evicts_and_respawns(

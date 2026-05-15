@@ -592,10 +592,14 @@ satisfying the SDK's "one active turn consumer per client" constraint.
 Close (`await client.close()`) and re-open on auth-error / transport
 error.
 
-**Cache invalidation on config change.** MCP config is captured at
-subprocess spawn time through the app-server `-c mcp_servers...`
-flags, so a UI-side MCP server add / patch / delete won't propagate
-into the running subprocess. Two helpers handle this:
+**Cache invalidation on config/tool-surface change.** MCP config is
+captured at subprocess spawn time through the app-server
+`-c mcp_servers...` flags, so a UI-side MCP server add / patch / delete
+or role-scoped `agents.allowed_tools` change won't propagate into the
+running subprocess. `get_client` records both the spawn cwd and the
+allowed-tools key; if a later turn asks for the same slot with a
+different cwd or allowed-tools list, the stale cached app-server is
+evicted before the turn starts. Two helpers handle explicit eviction:
 
 - `evict_client(slot)` — full close on idle slots; cache-pop only when
   a turn is in flight (lets the live turn finish on its own client
@@ -608,7 +612,8 @@ a Player's runtime (a codex→claude flip would otherwise leave the
 cached Codex subprocess + proxy token dangling until the next
 MCP-config change). `evict_all_clients()` is called from
 `POST/PATCH/DELETE /api/mcp/servers/...`. Result: MCP server changes
-take effect on the agent's next turn without a server restart.
+and role tool changes take effect on the agent's next turn without a
+server restart.
 
 **Tool-contract version bump on coord-tool changes.**
 `_CODEX_TOOL_CONTRACT_VERSION` (see [server/runtimes/codex.py]) is a
