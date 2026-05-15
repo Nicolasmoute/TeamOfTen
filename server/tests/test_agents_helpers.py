@@ -19,6 +19,44 @@ async def _init(fresh_db: str) -> None:
     await init_db()
 
 
+# ---------- Codex external MCP filtering ----------
+
+
+def test_filter_external_mcp_servers_for_allowed_tools_is_explicit() -> None:
+    from server.agents import _filter_external_mcp_servers_for_allowed_tools
+
+    servers = {
+        "github": {"command": "github-mcp"},
+        "zeabur": {"command": "zeabur-mcp"},
+    }
+    tools = [
+        "mcp__github__list_issues",
+        "mcp__zeabur__list_projects",
+    ]
+
+    kept_servers, kept_tools = _filter_external_mcp_servers_for_allowed_tools(
+        servers,
+        tools,
+        ["mcp__coord__coord_read_inbox", "mcp__github__list_issues"],
+    )
+
+    assert kept_servers == {"github": {"command": "github-mcp"}}
+    assert kept_tools == ["mcp__github__list_issues"]
+
+
+def test_filter_external_mcp_servers_for_allowed_tools_empty_is_none() -> None:
+    from server.agents import _filter_external_mcp_servers_for_allowed_tools
+
+    kept_servers, kept_tools = _filter_external_mcp_servers_for_allowed_tools(
+        {"github": {"command": "github-mcp"}},
+        ["mcp__github__list_issues"],
+        None,
+    )
+
+    assert kept_servers == {}
+    assert kept_tools == []
+
+
 # ---------- _today_spend ----------
 
 

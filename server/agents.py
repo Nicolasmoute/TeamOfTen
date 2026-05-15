@@ -4944,6 +4944,41 @@ def _build_can_use_tool(agent_id: str):
     return _cb
 
 
+def _codex_external_mcp_enabled() -> bool:
+    return os.environ.get("HARNESS_CODEX_EXTERNAL_MCP", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _filter_external_mcp_servers_for_allowed_tools(
+    external_servers: dict[str, Any],
+    external_tools: list[str],
+    allowed_tools: list[str] | None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Keep only external MCP servers explicitly named by an allowlist."""
+    allowed = set(allowed_tools or [])
+    if not allowed:
+        return {}, []
+    kept_names = {
+        name
+        for name in external_servers
+        if any(tool.startswith(f"mcp__{name}__") for tool in allowed)
+    }
+    if not kept_names:
+        return {}, []
+    return (
+        {name: cfg for name, cfg in external_servers.items() if name in kept_names},
+        [
+            tool
+            for tool in external_tools
+            if any(tool.startswith(f"mcp__{name}__") for name in kept_names)
+        ],
+    )
+
+
 async def _handle_ask_user_question(
     agent_id: str,
     caller_is_coach: bool,
@@ -5420,7 +5455,19 @@ async def run_agent(
     if team_extras:
         allowed.extend(team_extras)
     external_servers, external_tools = load_external_servers()
-    allowed.extend(external_tools)
+    if _runtime_name == "codex" and not _codex_external_mcp_enabled():
+        # Codex hosts MCP servers inside its app-server subprocess. One
+        # noisy or crashing external stdio server can poison the whole
+        # receiver loop, even when the turn only uses native tools and
+        # coord_*. Keep Codex external MCP opt-in unless a per-agent
+        # role allowlist explicitly names an external mcp__server__tool.
+        external_servers, external_tools = _filter_external_mcp_servers_for_allowed_tools(
+            external_servers,
+            external_tools,
+            allowed_override,
+        )
+    else:
+        allowed.extend(external_tools)
 
     # Governance-layer docs (CLAUDE.md / skills / rules) from cloud-drive / disk.
     # Appended to the hardcoded role brief so context edits take effect on
