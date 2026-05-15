@@ -264,10 +264,10 @@ Context / compaction:
   `continuity_note`, nulls `session_id`, clears the exchange log.
   UI shows `session_compact_requested` → compact turn →
   `session_compacted`.
-- **Auto-compact at 50% context** (`HARNESS_AUTO_COMPACT_THRESHOLD`,
-  default 0.5 — lowered from 0.7 on 2026-05-09 after live observation
-  showed 70% was too late: turns in the 60–70% band were already
-  degrading before the trip-wire fired). Pre-spawn check in
+- **Auto-compact at 65% context** (`HARNESS_AUTO_COMPACT_THRESHOLD`,
+  default 0.65 — lowered from 0.7 on 2026-05-09, then bumped back to 0.65
+  on 2026-05-15 after 0.5 proved too aggressive; fires well before the
+  60–70% degradation band but leaves room to finish tasks). Pre-spawn check in
   `run_agent`: if prior session's estimated token use ≥ threshold ×
   model's window, run a compact turn first (recursive call with
   `compact_mode=True`), then the user's original prompt on the fresh
@@ -1394,7 +1394,7 @@ OpenAI's Codex safety monitor, which cancelled the subsequent
   tokens in the same shape Claude's JSONL probe produces; the UI
   context bar already used it). Trip-wire now mirrors Claude's:
   honors the shared `HARNESS_AUTO_COMPACT_THRESHOLD` env (default
-  0.5), short-circuits on `compact_mode` / unparseable threshold /
+  0.65), short-circuits on `compact_mode` / unparseable threshold /
   no `codex_thread_id`, computes `used / window` against
   `_context_window_for(tc.model)`, emits `auto_compact_triggered`
   with the same payload shape, then delegates to `run_manual_compact`
