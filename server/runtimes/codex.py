@@ -1436,6 +1436,63 @@ def _extract_step_tool_result(item_payload: Mapping[str, Any]) -> str | None:
     return None
 
 
+# Keywords that distinguish an auth-failure CodexTransportError from a
+# generic transport blip. When the ChatGPT session in $CODEX_HOME/auth.json
+# expires, `codex app-server` exits at startup with a 401-shaped stderr;
+# without a detector the harness retries 3× (each spawn paying the same
+# 401), then escalates as a generic transport error. Editing the MCP card
+# from the UI is also a no-op once the cache cleared, so the user has no
+# self-service recovery path. The detector lets us emit `human_attention`
+# with actionable steps on the FIRST failure and suppress the futile
+# retry loop.
+_CODEX_AUTH_ERROR_KEYWORDS: tuple[str, ...] = (
+    "401",
+    "unauthorized",
+    "authentication",
+    "session expired",
+    "session has expired",
+    "auth.json",
+    "chatgpt",
+    "openai api key",
+    "openai_api_key",
+    "invalid api key",
+    "api key not set",
+    "no auth",
+    "missing auth",
+    "please log in",
+    "please login",
+    "codex login",
+    "token expired",
+    "expired token",
+    "credentials",
+)
+
+
+def _looks_like_codex_auth_error(exc: Exception) -> bool:
+    """True iff the exception's string representation matches a known
+    auth-failure keyword from the Codex app-server's stderr.
+
+    `_CapturedStdioTransport._message_with_diagnostics` includes the
+    last ~12 KB of subprocess stderr in the exception message, so the
+    raw `str(exc)` contains the codex CLI's actual error output. We
+    match case-insensitively against a small set of high-precision
+    keywords — broad enough to catch the common auth-failure shapes
+    (expired ChatGPT session, missing/invalid API key) without false-
+    positiving on unrelated 401s in tool output.
+
+    Negative case examples (must NOT match):
+      - "stdio transport closed" alone (transport blip, no auth keyword)
+      - "process exit code: 1" alone
+      - JSON parse errors from a corrupt SDK response
+
+    See p2's investigation:
+      working/knowledge/research/p5-codex-transport-error-investigation-2026-05-14.md
+      Part 3 + Fix 1.
+    """
+    msg = str(exc).lower()
+    return any(k in msg for k in _CODEX_AUTH_ERROR_KEYWORDS)
+
+
 def _step_payload_is_error(item_payload: Mapping[str, Any]) -> bool:
     status = str(item_payload.get("status") or item_payload.get("state") or "").lower()
     # `cancel` / `reject` cover the OpenAI Codex safety-monitor path: a
@@ -2156,7 +2213,7 @@ class CodexRuntime:
             await _add_cost(tc.agent_id, cost_usd)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             # Transport/protocol failures often poison the app-server
             # stdio session. Drop the cached client so the dispatcher
             # retry gets a fresh subprocess. Wrapped in its own
@@ -2169,6 +2226,88 @@ class CodexRuntime:
                     "CodexRuntime: close_client failed on error-path for slot=%s",
                     tc.agent_id,
                 )
+            # Auth-failure short-circuit. When the ChatGPT session in
+            # $CODEX_HOME/auth.json expires (or no API-key fallback is
+            # configured), every retry pays the same 401 and the user
+            # ends up reading "auto_retry_gave_up" 3 attempts later
+            # without a clear path to recovery. Detect the shape now,
+            # emit `human_attention` with actionable steps, suppress
+            # the auto-retry by flipping got_result, and clear the
+            # stored thread id so the next (post-fix) turn doesn't
+            # try to resume a thread the new auth might not have access
+            # to. The current turn still ends in error (the work
+            # didn't complete), but the user sees a precise diagnosis
+            # instead of a 3-cycle cascade.
+            if _looks_like_codex_auth_error(exc):
+                stderr_excerpt = str(exc)[:800]
+                await _emit(
+                    tc.agent_id,
+                    "human_attention",
+                    subject=(
+                        f"{tc.agent_id}: Codex auth expired — re-login "
+                        "required"
+                    ),
+                    body=(
+                        "The Codex app-server exited with what looks "
+                        "like an auth error. The harness has stopped "
+                        "auto-retrying because every retry would hit "
+                        "the same failure.\n\n"
+                        "Recovery (pick one):\n"
+                        "1. Open the harness UI → Settings → Codex "
+                        "auth → Sign in to Codex (in-container "
+                        "device-code login).\n"
+                        "2. OR paste a fresh OPENAI_API_KEY via "
+                        "Options → Codex auth (acts as fallback when "
+                        "ChatGPT session is unavailable).\n"
+                        "3. OR shell into the container and run "
+                        "`codex login` directly.\n\n"
+                        "After re-login, click the clear-session "
+                        "button on this agent's pane to drop "
+                        "any cached app-server subprocess, then "
+                        "retry the assignment.\n\n"
+                        "Note: editing the MCP card does NOT recover "
+                        "from this state (the cached client was "
+                        "already cleared on the first failure, so "
+                        "evict_all_clients is a no-op for this slot).\n\n"
+                        f"Diagnostic excerpt:\n{stderr_excerpt}"
+                    ),
+                    urgency="high",
+                    reason="codex_auth_expired",
+                )
+                await _clear_codex_thread_id(tc.agent_id)
+                # Suppress the soft-error auto-retry policy. The error
+                # event still fires below (re-raise propagates to the
+                # dispatcher's outer handler) BUT got_result=True
+                # changes how the dispatcher treats the post-result
+                # exception path: it logs the suppression and resets
+                # the consecutive-error counter, so we don't accumulate
+                # toward the 3-strikes auto_retry_gave_up escalation.
+                # The human now owns the next move (auth refresh).
+                tc.turn_ctx["got_result"] = True
+                # Emit a distinct error event so the timeline shows
+                # this slot stopped on auth, not on a generic transport
+                # blip. The dispatcher's outer except suppresses the
+                # generic error-emit path when got_result=True is set,
+                # so this is the only error-row the agent's pane will
+                # carry for this turn.
+                await _emit(
+                    tc.agent_id,
+                    "error",
+                    error=(
+                        f"Codex auth failure detected — see "
+                        f"human_attention. {type(exc).__name__}: "
+                        f"{str(exc)[:300]}"
+                    ),
+                    reason="codex_auth_expired",
+                )
+                await _set_status(tc.agent_id, "error")
+                # Don't re-raise — we've already emitted the error
+                # explicitly and got_result=True. Re-raising would
+                # cause the dispatcher to log a "suppressed post-
+                # result" warning, which is correct behaviour but
+                # noise: the error message is in the human_attention
+                # body, not the post-result warning.
+                return
             raise
         finally:
             if hasattr(client, "set_approval_handler"):
