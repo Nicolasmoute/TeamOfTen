@@ -5978,6 +5978,25 @@ async def run_agent(
             # without an intervening success) and the no-op-if-
             # recovered check.
             _consecutive_errors[agent_id] = _consecutive_errors.get(agent_id, 0) + 1
+            if _runtime_name == "codex" and _consecutive_errors[agent_id] >= 2:
+                try:
+                    from server.runtimes.codex import (
+                        looks_like_codex_transport_error,
+                        recover_codex_thread_after_repeated_transport_error,
+                    )
+
+                    if looks_like_codex_transport_error(e):
+                        await recover_codex_thread_after_repeated_transport_error(
+                            agent_id,
+                            consecutive_errors=_consecutive_errors[agent_id],
+                            error=err_msg,
+                        )
+                except Exception:
+                    logger.exception(
+                        "run_agent: Codex repeated-transport recovery failed "
+                        "for %s",
+                        agent_id,
+                    )
             await _schedule_post_error_retry(agent_id)
     else:
         await _set_status(agent_id, "idle")

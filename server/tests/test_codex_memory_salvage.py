@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from server.db import configured_conn, init_db, resolve_active_project
+from server.runtimes.base import TurnContext
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +99,18 @@ def _drain(q) -> list[dict]:
             return out
 
 
+def _turn_context(slot: str) -> TurnContext:
+    return TurnContext(
+        agent_id=slot,
+        project_id="teamoften",
+        prompt="resume",
+        system_prompt="system prompt",
+        workspace_cwd=".",
+        allowed_tools=[],
+        external_mcp_servers={},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers to build a mock Codex client
 # ---------------------------------------------------------------------------
@@ -145,7 +158,7 @@ async def test_open_thread_salvage_writes_continuity_note_on_resume_fail(
         pass
 
     client = _mock_client_resume_raises(RuntimeError("thread not found"))
-    thread, resumed = await open_thread("p5", client)
+    thread, resumed = await open_thread("p5", client, tc=_turn_context("p5"))
 
     # Thread id should be cleared → fell through to start_thread.
     assert not resumed
@@ -181,7 +194,7 @@ async def test_open_thread_salvage_emits_session_auto_recovered(
     client = _mock_client_resume_raises(RuntimeError("stale"))
     q = bus.subscribe()
     try:
-        await open_thread("p6", client)
+        await open_thread("p6", client, tc=_turn_context("p6"))
         await asyncio.sleep(0.05)
         events = _drain(q)
     finally:
@@ -194,11 +207,12 @@ async def test_open_thread_salvage_emits_session_auto_recovered(
     assert ev.get("salvaged_exchanges") == 1
 
 
-async def test_open_thread_salvage_zero_exchanges_no_note_but_still_emits(
+async def test_open_thread_salvage_zero_exchanges_no_note_and_no_recovery_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no exchanges, continuity_note stays None but event is emitted
-    (salvaged_exchanges=0) so the recovery is still visible in the timeline."""
+    """With no exchanges, continuity_note stays None and no synthetic
+    recovery event is emitted. The stale resume is already visible through
+    session_resume_failed."""
     monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
     from server.events import bus
     from server.runtimes.codex import open_thread
@@ -215,7 +229,7 @@ async def test_open_thread_salvage_zero_exchanges_no_note_but_still_emits(
     client = _mock_client_resume_raises(RuntimeError("stale"))
     q = bus.subscribe()
     try:
-        await open_thread("p7", client)
+        await open_thread("p7", client, tc=_turn_context("p7"))
         await asyncio.sleep(0.05)
         events = _drain(q)
     finally:
@@ -224,8 +238,62 @@ async def test_open_thread_salvage_zero_exchanges_no_note_but_still_emits(
     # No continuity note written when exchange log is empty.
     assert await _read_continuity_note("p7") is None
 
-    # Event still emitted so the UI shows the recovery boundary.
+    # No synthetic recovery event when there was nothing to salvage.
     recovered = [e for e in events if e.get("type") == "session_auto_recovered"]
-    assert len(recovered) >= 1
-    assert recovered[0].get("salvaged_exchanges") == 0
-    assert recovered[0].get("runtime") == "codex"
+    assert recovered == []
+
+
+def test_codex_transport_error_classifier_matches_stdio_failures() -> None:
+    from server.runtimes.codex import looks_like_codex_transport_error
+
+    assert looks_like_codex_transport_error(
+        RuntimeError("CodexTransportError: failed reading from stdio transport")
+    )
+    assert looks_like_codex_transport_error(
+        RuntimeError("receiver loop failed: failed reading from stdio transport")
+    )
+    assert not looks_like_codex_transport_error(
+        RuntimeError("tool returned an application error")
+    )
+
+
+async def test_repeated_transport_recovery_clears_thread_and_salvages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.events import bus
+    from server.runtimes.codex import (
+        recover_codex_thread_after_repeated_transport_error,
+    )
+
+    exchanges = [{"prompt": "read audit", "response": "spec mirror missing"}]
+    await _seed_session(
+        "coach",
+        thread_id="poisoned-codex-thread",
+        last_exchange_json=json.dumps(exchanges),
+    )
+
+    q = bus.subscribe()
+    try:
+        recovered = await recover_codex_thread_after_repeated_transport_error(
+            "coach",
+            consecutive_errors=2,
+            error="CodexTransportError: failed reading from stdio transport",
+        )
+        await asyncio.sleep(0.05)
+        events = _drain(q)
+    finally:
+        bus.unsubscribe(q)
+
+    assert recovered is True
+    assert await _read_thread_id("coach") is None
+
+    note = await _read_continuity_note("coach")
+    assert note is not None
+    assert "prior codex thread was reset" in note.lower()
+
+    recovered_events = [
+        e for e in events if e.get("type") == "session_auto_recovered"
+    ]
+    assert len(recovered_events) == 1
+    assert recovered_events[0].get("reason") == "repeated_transport_error"
+    assert recovered_events[0].get("session_id") == "poisoned-codex-thread"
