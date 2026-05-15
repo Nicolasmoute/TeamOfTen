@@ -507,8 +507,8 @@ async def compose_tick_prompt(project_id: str) -> str:
         "\n\nNote: project-objectives.md is missing or empty. If "
         "your inbox is empty AND there are no open coach-todos, "
         f"ask the operator: \"{OBJECTIVES_ELICITATION_PROMPT}\" "
-        "Once they reply, save the answer via the Write tool to "
-        f"/data/projects/{project_id}/project-objectives.md."
+        "Once they reply, save the answer with "
+        "`coord_set_project_objectives`."
     )
     return prompt
 

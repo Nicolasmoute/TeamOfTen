@@ -3668,13 +3668,16 @@ async def coord_proxy_tools(request: Request) -> dict[str, object]:
 
     Loopback-only, no token (the catalog is non-sensitive — the same
     information is in the source). Lets `coord_mcp.py` declare the
-    static tool list at MCP init time without re-hardcoding it.
+    static tool list at MCP init time without re-hardcoding it. The
+    descriptors intentionally include full tool descriptions and input
+    schemas so Codex gets the same coordination catalogue Claude gets
+    from the in-process SDK MCP server.
     """
     client = request.client
     if not _is_loopback(client.host if client else None):
         raise HTTPException(403, detail="loopback only")
-    from server.tools import coord_tool_names
-    return {"tools": coord_tool_names()}
+    from server.tools import coord_tool_descriptors
+    return {"tools": coord_tool_descriptors()}
 
 
 @app.put("/api/agents/{agent_id}/locked", dependencies=[Depends(require_token)])

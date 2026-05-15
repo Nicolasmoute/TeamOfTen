@@ -66,7 +66,7 @@ _client_locks: dict[str, asyncio.Lock] = {}
 
 # Bump when the Codex-visible coord tool contract changes in a way that
 # old persisted Codex threads might not pick up on resume.
-_CODEX_TOOL_CONTRACT_VERSION = "2026-05-14.role-tool-allowlists"
+_CODEX_TOOL_CONTRACT_VERSION = "2026-05-15.coach-coord-descriptors"
 _CODEX_WORKTREE_SANDBOX_PROBE_CACHE: dict[str, Any] | None = None
 
 
@@ -1037,6 +1037,8 @@ async def _maybe_salvage_for_codex_resume_failure(
             "cwd": tc.workspace_cwd or None,
             "developer_instructions": _codex_developer_instructions(
                 augmented_system_prompt,
+                tc.allowed_tools,
+                tc.agent_id,
             ),
             "approval_policy": "never",
             "sandbox": _codex_sandbox_for(tc.agent_id),
@@ -1633,12 +1635,13 @@ directories because they use Claude naming.
 def _codex_developer_instructions(
     system_prompt: str | None,
     allowed_tools: list[str] | None = None,
+    agent_id: str | None = None,
 ) -> str:
     body = (system_prompt or "").strip()
     compat = (
         _CODEX_CLAUDE_COMPAT_INSTRUCTIONS
         + "\n\n"
-        + _codex_coord_tool_instructions(allowed_tools)
+        + _codex_coord_tool_instructions(allowed_tools, agent_id=agent_id)
         + "\n\n"
         + _codex_web_tool_instructions()
     )
@@ -1667,7 +1670,11 @@ def _codex_web_tool_instructions() -> str:
     )
 
 
-def _codex_coord_tool_instructions(allowed_tools: list[str] | None) -> str:
+def _codex_coord_tool_instructions(
+    allowed_tools: list[str] | None,
+    *,
+    agent_id: str | None = None,
+) -> str:
     try:
         if allowed_tools is None:
             from server.tools import coord_tool_names
@@ -1687,14 +1694,33 @@ def _codex_coord_tool_instructions(allowed_tools: list[str] | None) -> str:
         list_line = f"Current coord MCP tools: {tool_list}."
     else:
         list_line = "Current coord MCP tools are exposed by the `coord` MCP server."
+    role_note = ""
+    if agent_id == "coach":
+        role_note = (
+            "\n\nCoach-specific Codex notes: Claude built-ins such as "
+            "`AskUserQuestion`, `ExitPlanMode`, `Write`, `Edit`, and `Bash` "
+            "are not your Coach control plane in this runtime. Ask the human "
+            "with `coord_request_human`; resolve Player question/plan "
+            "correlation ids from your inbox with `coord_answer_question` "
+            "and `coord_answer_plan`; manage recurrence with "
+            "`coord_set_tick_interval`; save project objectives with "
+            "`coord_set_project_objectives`; update coach todos with "
+            "`coord_add_todo`, `coord_update_todo`, and "
+            "`coord_complete_todo`; query Compass with `compass_*`; and "
+            "adjust the orchestration playbook with "
+            "`coord_propose_playbook_changes`."
+        )
     return (
         "## TeamOfTen coord tools in Codex\n\n"
         "TeamOfTen coord_* tools are exposed through the MCP server named "
         "`coord`. In Codex they may appear as MCP tools named like "
         "`coord_read_inbox`, or internally as `mcp__coord__coord_read_inbox`. "
         "Use those MCP tools directly for board, inbox, memory, role, todo, "
-        "and human-escalation work.\n\n"
+        "and human-escalation work. The MCP tool catalogue includes the "
+        "same descriptions and input schemas as Claude's in-process coord "
+        "server; rely on those schemas for parameters.\n\n"
         + list_line
+        + role_note
         + "\n\nDo not use shell commands, direct SQLite/database access, "
         "or HTTP API fallbacks for harness state when a coord_* tool exists. "
         "Do not say a coord_* tool is unavailable unless an attempted MCP "
@@ -1800,6 +1826,7 @@ def _build_thread_config(sdk: Any, tc: TurnContext) -> Any:
         "developer_instructions": _codex_developer_instructions(
             tc.system_prompt,
             tc.allowed_tools,
+            tc.agent_id,
         ),
         "approval_policy": "never",
         "sandbox": _codex_sandbox_for(tc.agent_id),
