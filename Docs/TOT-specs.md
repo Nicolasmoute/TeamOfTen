@@ -4438,6 +4438,14 @@ DB-managed MCP servers:
 - Inline secret warnings by regex.
 - `test` endpoint checks stdio command path or HTTP reachability.
 
+Codex runtime note: before passing UI/file MCP configs to `codex
+app-server`, command-based external servers are normalized for stdio
+safety. A config with `command` but no `type` is treated as
+`type="stdio"`, and `npx` / `npx.cmd` commands get `-y` injected unless
+already present. This prevents cold-redeploy `npx` install prompts from
+printing non-JSON to MCP stdout and killing the Codex app-server with a
+`serde error expected value at line 1 column 1` transport failure.
+
 ### 18.2 Secrets Store
 
 Requires:

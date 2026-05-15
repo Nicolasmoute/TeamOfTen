@@ -672,6 +672,35 @@ def test_build_mcp_servers_for_slot_external_pre_approved() -> None:
     assert "coord" in servers
 
 
+def test_build_mcp_servers_for_slot_normalizes_npx_external_server() -> None:
+    """Bare npx can print install prompts to stdout on cold redeploys.
+
+    Codex reads MCP stdio as JSON-RPC, so the runtime forces npx into
+    non-interactive mode before passing user-provided configs to the
+    app-server.
+    """
+    from server.runtimes.codex import _build_mcp_servers_for_slot
+
+    external = {"zeabur": {"command": "npx", "args": ["@zeabur/mcp-server"]}}
+    servers = _build_mcp_servers_for_slot("coach", "t", external)
+
+    assert servers["zeabur"]["type"] == "stdio"
+    assert servers["zeabur"]["args"] == ["-y", "@zeabur/mcp-server"]
+    assert external["zeabur"]["args"] == ["@zeabur/mcp-server"]
+
+
+def test_build_mcp_servers_for_slot_preserves_explicit_npx_yes() -> None:
+    from server.runtimes.codex import _build_mcp_servers_for_slot
+
+    servers = _build_mcp_servers_for_slot(
+        "coach",
+        "t",
+        {"playwright": {"command": "npx", "args": ["-y", "@playwright/mcp"]}},
+    )
+
+    assert servers["playwright"]["args"] == ["-y", "@playwright/mcp"]
+
+
 def test_build_mcp_servers_for_slot_filters_by_allowed_tools() -> None:
     from server.runtimes.codex import _build_mcp_servers_for_slot
 
