@@ -4540,6 +4540,47 @@ _BASH_PROJECT_CLAUDE_MD_PATTERN = re.compile(
 )
 
 
+async def _posttool_wiki_index_hook(
+    input_data: dict[str, Any],
+    tool_use_id: str | None,
+    context: Any,
+) -> None:
+    """Compatibility PostToolUse hook for wiki writes.
+
+    Wiki writes through the file browser rebuild the index in
+    `server.files`. Agent SDK writes bypass that path, so this hook
+    preserves the Phase 7 guarantee that a wiki write refreshes
+    `wiki/INDEX.md`.
+    """
+    try:
+        tool_name = input_data.get("tool_name") or ""
+        if tool_name not in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
+            return
+        tool_input = input_data.get("tool_input") or {}
+        path_str = (
+            tool_input.get("file_path")
+            or tool_input.get("notebook_path")
+            or ""
+        )
+        if not path_str:
+            return
+        from server.paths import global_paths, update_wiki_index
+
+        gp = global_paths()
+        target = Path(path_str).resolve()
+        wiki_root = gp.wiki.resolve()
+        wiki_index = gp.wiki_index.resolve()
+        if target == wiki_index:
+            return
+        try:
+            target.relative_to(wiki_root)
+        except ValueError:
+            return
+        await asyncio.to_thread(update_wiki_index)
+    except Exception:
+        logger.exception("wiki-index posttool hook error (failing open)")
+
+
 async def _pretool_file_guard_hook(
     input_data: dict[str, Any],
     tool_use_id: str | None,

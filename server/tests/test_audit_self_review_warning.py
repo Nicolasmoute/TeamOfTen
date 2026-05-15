@@ -54,6 +54,22 @@ def _extract_task_id(body: str) -> str:
     return m.group(0)
 
 
+def _extract_backlog_id(body: str) -> int:
+    m = re.search(r"Backlog entry #(\d+)", body)
+    assert m, f"no backlog id in body: {body}"
+    return int(m.group(1))
+
+
+async def _create_and_promote(coach: Any, args: dict[str, Any]) -> str:
+    body = _ok(await _handler(coach, "create_task")(args))
+    backlog_id = _extract_backlog_id(body)
+    promoted = _ok(await _handler(coach, "triage_backlog")({
+        "id": str(backlog_id),
+        "action": "promote",
+    }))
+    return _extract_task_id(promoted)
+
+
 async def _stub_wake(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _rec(*a: Any, **k: Any) -> bool:
         return True
@@ -70,14 +86,13 @@ async def test_self_review_warning_fires_on_same_player_audit(
     await init_db()
     await _stub_wake(monkeypatch)
     coach = _server_for("coach")
-    body = _ok(await _handler(coach, "create_task")({
+    tid = await _create_and_promote(coach, {
         "title": "self-review demo", "description": "x",
         "trajectory": (
             '[{"stage":"execute","to":["p3"]},'
             '{"stage":"audit_syntax","to":[]}]'
         ),
-    }))
-    tid = _extract_task_id(body)
+    })
 
     q = bus.subscribe()
     try:
@@ -108,14 +123,13 @@ async def test_self_review_warning_quiet_on_different_player(
     await init_db()
     await _stub_wake(monkeypatch)
     coach = _server_for("coach")
-    body = _ok(await _handler(coach, "create_task")({
+    tid = await _create_and_promote(coach, {
         "title": "no-self-review demo", "description": "x",
         "trajectory": (
             '[{"stage":"execute","to":["p3"]},'
             '{"stage":"audit_syntax","to":[]}]'
         ),
-    }))
-    tid = _extract_task_id(body)
+    })
 
     q = bus.subscribe()
     try:
@@ -141,14 +155,13 @@ async def test_self_review_warning_kind_semantics(
     await init_db()
     await _stub_wake(monkeypatch)
     coach = _server_for("coach")
-    body = _ok(await _handler(coach, "create_task")({
+    tid = await _create_and_promote(coach, {
         "title": "semantic self-review", "description": "x",
         "trajectory": (
             '[{"stage":"execute","to":["p7"]},'
             '{"stage":"audit_semantics","to":[],"focus":"check"}]'
         ),
-    }))
-    tid = _extract_task_id(body)
+    })
 
     q = bus.subscribe()
     try:

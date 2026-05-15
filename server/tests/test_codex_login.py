@@ -613,8 +613,20 @@ async def test_open_thread_auth_guard_no_clear_when_creds_missing(monkeypatch, t
     mock_agents._emit = fake_emit
     monkeypatch.setitem(sys.modules, "server.agents", mock_agents)
 
+    from server.runtimes.base import TurnContext
+    tc = TurnContext(
+        agent_id="p3",
+        project_id="misc",
+        prompt="",
+        system_prompt="",
+        workspace_cwd=str(tmp_path),
+        allowed_tools=[],
+        external_mcp_servers={},
+        turn_ctx={"codex_auth_method": "chatgpt"},
+    )
+
     with pytest.raises(FakeExc):
-        await codex_mod.open_thread("p3", FakeClient())
+        await codex_mod.open_thread("p3", FakeClient(), tc=tc)
 
     # thread id must NOT have been cleared
     assert cleared == [], "codex_thread_id must not be cleared when creds missing"

@@ -216,8 +216,12 @@ async def test_approve_non_plan_transition_ignores_criteria(
     monkeypatch.setattr(tools_mod, "workspace_dir", _workspace_dir)
 
     def _fake_run(cmd, **kwargs):
+        if cmd[:3] == ["git", "branch", "--show-current"]:
+            return subprocess.CompletedProcess(cmd, 0, "work/p3\n", "")
         if cmd[:2] == ["git", "status"]:
             return subprocess.CompletedProcess(cmd, 0, "M f.py\n", "")
+        if cmd[:2] == ["git", "rev-parse"] and "--abbrev-ref" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "work/p3\n", "")
         if cmd[:2] == ["git", "rev-parse"]:
             return subprocess.CompletedProcess(cmd, 0, "abc\n", "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -263,8 +267,12 @@ async def test_approve_to_ship_echoes_criteria(
     monkeypatch.setattr(tools_mod, "workspace_dir", _workspace_dir)
 
     def _fake_run(cmd, **kwargs):
+        if cmd[:3] == ["git", "branch", "--show-current"]:
+            return subprocess.CompletedProcess(cmd, 0, "work/p3\n", "")
         if cmd[:2] == ["git", "status"]:
             return subprocess.CompletedProcess(cmd, 0, "M f.py\n", "")
+        if cmd[:2] == ["git", "rev-parse"] and "--abbrev-ref" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "work/p3\n", "")
         if cmd[:2] == ["git", "rev-parse"]:
             return subprocess.CompletedProcess(cmd, 0, "abc\n", "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -327,8 +335,12 @@ async def test_approve_to_ship_without_criteria_no_echo(
     monkeypatch.setattr(tools_mod, "workspace_dir", _workspace_dir)
 
     def _fake_run(cmd, **kwargs):
+        if cmd[:3] == ["git", "branch", "--show-current"]:
+            return subprocess.CompletedProcess(cmd, 0, "work/p3\n", "")
         if cmd[:2] == ["git", "status"]:
             return subprocess.CompletedProcess(cmd, 0, "M f.py\n", "")
+        if cmd[:2] == ["git", "rev-parse"] and "--abbrev-ref" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "work/p3\n", "")
         if cmd[:2] == ["git", "rev-parse"]:
             return subprocess.CompletedProcess(cmd, 0, "abc\n", "")
         return subprocess.CompletedProcess(cmd, 0, "", "")

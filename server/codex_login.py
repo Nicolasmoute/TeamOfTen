@@ -223,7 +223,7 @@ def auth_present() -> bool:
 
 def _spawn_subprocess() -> subprocess.Popen:
     """Spawn `codex login --device-auth` with pipes. POSIX-only."""
-    if sys.platform == "win32":
+    if sys.platform == "win32" and _COMMAND == ["codex", "login", "--device-auth"]:
         raise RuntimeError(
             "codex login is POSIX-only on this harness — "
             "use the paste-auth.json fallback instead."

@@ -48,6 +48,22 @@ def _extract_task_id(body: str) -> str:
     return m.group(0)
 
 
+def _extract_backlog_id(body: str) -> int:
+    m = re.search(r"Backlog entry #(\d+)", body)
+    assert m, f"no backlog id in body: {body}"
+    return int(m.group(1))
+
+
+async def _create_and_promote(coach: Any, args: dict[str, Any]) -> str:
+    body = _ok(await _handler(coach, "create_task")(args))
+    backlog_id = _extract_backlog_id(body)
+    promoted = _ok(await _handler(coach, "triage_backlog")({
+        "id": str(backlog_id),
+        "action": "promote",
+    }))
+    return _extract_task_id(promoted)
+
+
 async def _stub_wake(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _rec(*a: Any, **k: Any) -> bool:
         return True
@@ -112,16 +128,14 @@ def test_extract_no_match_returns_none() -> None:
 # ---------------------------------------------------------------- end-to-end
 
 async def _setup_execute_task(coach: Any) -> str:
-    create = _handler(coach, "create_task")
-    body = _ok(await create({
+    return await _create_and_promote(coach, {
         "title": "phase4 demo",
         "description": "x",
         "trajectory": (
             '[{"stage":"execute","to":["p3"]},'
             '{"stage":"audit_syntax","to":["p4"]}]'
         ),
-    }))
-    return _extract_task_id(body)
+    })
 
 
 async def test_approve_stage_with_tag_inserts_push_row(
@@ -198,15 +212,14 @@ async def test_approve_stage_non_execute_source_no_row(
     await _stub_wake(monkeypatch)
     coach = _server_for("coach")
 
-    body = _ok(await _handler(coach, "create_task")({
+    tid = await _create_and_promote(coach, {
         "title": "non-execute source",
         "description": "x",
         "trajectory": (
             '[{"stage":"plan","to":["p5"]},'
             '{"stage":"execute","to":["p3"]}]'
         ),
-    }))
-    tid = _extract_task_id(body)
+    })
 
     # plan → execute approval with a deviation tag — source is `plan`,
     # not `execute`, so no push row even though the tag is present.

@@ -116,6 +116,8 @@ def _stub_subprocess_with_per_cwd_status(
     in the misplaced-work path)."""
     def _fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
         cwd = kwargs.get("cwd") or ""
+        if cmd[:3] == ["git", "branch", "--show-current"]:
+            return subprocess.CompletedProcess(cmd, 0, "work/p3\n", "")
         if cmd[:2] == ["git", "add"]:
             return subprocess.CompletedProcess(cmd, 0, "", "")
         if cmd[:2] == ["git", "status"]:
@@ -130,6 +132,8 @@ def _stub_subprocess_with_per_cwd_status(
             return subprocess.CompletedProcess(cmd, 0, "", "")
         if cmd[:2] == ["git", "commit"]:
             return subprocess.CompletedProcess(cmd, 0, "", "")
+        if cmd[:2] == ["git", "rev-parse"] and "--abbrev-ref" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "work/p3\n", "")
         if cmd[:2] == ["git", "rev-parse"]:
             return subprocess.CompletedProcess(cmd, 0, "abc123\n", "")
         if cmd[:2] == ["git", "push"]:
@@ -247,8 +251,12 @@ async def test_clean_slot_no_base_repo_falls_back_to_soft_ok(
     monkeypatch.setattr(tools_mod, "workspace_dir", _workspace_dir)
 
     def _fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        if cmd[:3] == ["git", "branch", "--show-current"]:
+            return subprocess.CompletedProcess(cmd, 0, "work/p3\n", "")
         if cmd[:2] == ["git", "status"]:
             return subprocess.CompletedProcess(cmd, 0, "", "")
+        if cmd[:2] == ["git", "rev-parse"] and "--abbrev-ref" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "work/p3\n", "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
     monkeypatch.setattr(subprocess, "run", _fake_run)
 
