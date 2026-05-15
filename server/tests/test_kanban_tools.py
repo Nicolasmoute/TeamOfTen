@@ -20,6 +20,7 @@ test_message_to_coach.py.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from server.db import configured_conn, init_db
@@ -51,6 +52,28 @@ def _ok_text(result: dict[str, Any]) -> str:
 def _err_text(result: dict[str, Any]) -> str:
     assert result.get("is_error"), f"expected error, got {result}"
     return result["content"][0]["text"]
+
+
+def _extract_task_id(body: str) -> str:
+    m = re.search(r"t-\d{4}-\d{2}-\d{2}-[a-f0-9]{8}", body)
+    assert m, f"no task id in body: {body}"
+    return m.group(0)
+
+
+def _extract_backlog_id(body: str) -> int:
+    m = re.search(r"Backlog entry #(\d+)", body)
+    assert m, f"no backlog id in body: {body}"
+    return int(m.group(1))
+
+
+async def _create_and_promote(server: Any, args: dict[str, Any]) -> str:
+    create_text = _ok_text(await _handler(server, "create_task")(args))
+    backlog_id = _extract_backlog_id(create_text)
+    promote_text = _ok_text(await _handler(server, "triage_backlog")({
+        "id": str(backlog_id),
+        "action": "promote",
+    }))
+    return _extract_task_id(promote_text)
 
 
 async def _seed_task(
@@ -111,14 +134,13 @@ async def test_create_task_single_name_first_stage_plants_role_row(
 ) -> None:
     await init_db()
     server = _server_for("coach")
-    text = _ok_text(await _handler(server, "create_task")({
+    await _create_and_promote(server, {
         "title": "demo",
         "trajectory": [
             {"stage": "execute", "to": "p2"},
             {"stage": "audit_syntax", "to": ["p4", "p5"]},
         ],
-    }))
-    assert "Planted executor role" in text
+    })
     # Role row exists for the first stage's named owner; NOT for the
     # second stage (pool — auto-plant skipped per v2 §7.1).
     c = await configured_conn()

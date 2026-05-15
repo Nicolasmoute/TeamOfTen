@@ -106,6 +106,12 @@ def _extract_task_id(body: str) -> str:
     return m.group(0)
 
 
+def _extract_backlog_id(body: str) -> int:
+    m = re.search(r"Backlog entry #(\d+)", body)
+    assert m, f"no backlog id in body: {body}"
+    return int(m.group(1))
+
+
 async def _stub_wake(monkeypatch: pytest.MonkeyPatch) -> None:
     async def _rec(*a: Any, **k: Any) -> bool:
         return True
@@ -155,7 +161,12 @@ async def test_mcp_create_task_accepts_single_name_first_stage(
             '{"stage":"audit_syntax","to":[]}]'
         ),
     }))
-    tid = _extract_task_id(body)
+    backlog_id = _extract_backlog_id(body)
+    promoted = _ok(await _handler(coach, "triage_backlog")({
+        "id": str(backlog_id),
+        "action": "promote",
+    }))
+    tid = _extract_task_id(promoted)
     assert tid
 
 
