@@ -157,6 +157,31 @@ async def test_create_task_single_name_first_stage_plants_role_row(
     assert rows[0]["owner"] == "p2"
 
 
+async def test_create_task_first_stage_assignment_sets_role_tools(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    server = _server_for("coach")
+    await _create_and_promote(server, {
+        "title": "demo",
+        "trajectory": [{"stage": "execute", "to": "p2"}],
+    })
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT allowed_tools, current_task_id FROM agents WHERE id = 'p2'"
+        )
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+
+    tools = set(json.loads(row["allowed_tools"]))
+    assert "mcp__coord__coord_commit_push" in tools
+    assert "mcp__coord__coord_role_complete" in tools
+    assert row["current_task_id"]
+
+
 async def test_create_task_pool_first_stage_rejected(
     fresh_db: str,
 ) -> None:
