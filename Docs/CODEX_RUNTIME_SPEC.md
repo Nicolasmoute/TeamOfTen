@@ -616,7 +616,15 @@ thread.compact()          # native compact (returns Any)
     stdio receiver/app-server client is poisoned. `open_thread`
     preserves `codex_thread_id`, skips `session_resume_failed`, and
     re-raises so the caller closes the cached client and the next
-    retry rebuilds it before attempting resume again.
+    retry rebuilds it before attempting resume again. If a Codex slot
+    hits a second consecutive pre-result transport failure, the
+    dispatcher treats the stored thread as likely poisoned: it salvages
+    the rolling exchange log into `continuity_note`, clears only
+    `codex_thread_id`, closes the cached client, emits
+    `session_auto_recovered{reason='repeated_transport_error'}`, and
+    then schedules the normal auto-retry. This keeps the first blip
+    continuity-preserving while preventing Coach from exhausting all
+    retries against the same broken stdio/thread pair.
   - Other non-timeout exception classes (CodexProtocolError or
     plain Exception) skip the retry and fall back on the first
     attempt — they are not transient.
@@ -658,7 +666,7 @@ Observed and implemented item_type mapping:
 | safety-monitor cancelled/rejected tool result      | `codex_safety_suspected` + `tool_result(is_error=True)` | emitted when a Codex tool payload status/state contains `cancel` or `reject`; keeps monitor refusals queryable separately from ordinary tool failures |
 | stream exhaustion                                  | `result`                   | usage is read from the rollout JSONL pointed to by `thread.read().thread.path` (see §E.5); thread.read fields are unused by SDK 0.3.2 |
 | `CodexTurnInactiveError` raised mid-iteration      | `error` (pre-result) → retry counter |
-| `CodexTimeoutError` / `CodexTransportError`        | `error` (pre-result) -> retry counter; close + reopen client; transport errors include captured app-server stderr tail when available |
+| `CodexTimeoutError` / `CodexTransportError`        | `error` (pre-result) -> retry counter; close + reopen client; transport errors include captured app-server stderr tail when available. On the second consecutive Codex transport error, salvage recent exchanges, clear `codex_thread_id`, emit `session_auto_recovered(reason='repeated_transport_error')`, then retry fresh. |
 | `CodexProtocolError`                               | `error`; if "thread not found" trigger stale-session retry |
 | `ApprovalRequest` via `set_approval_handler`       | `human_attention`, then decline (§E.8 option b) |
 | `thread.compact()` return                          | `session_compacted` (§E.6) |

@@ -4709,6 +4709,14 @@ request timeout (`HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS`, default
 a stale thread: the runtime preserves `codex_thread_id`, closes the
 cached client through the caller's error path, and lets the next retry
 rebuild before attempting resume again.
+If the same Codex slot then records a second consecutive pre-result
+transport failure, the dispatcher escalates from client rebuild to
+thread reset: it salvages recent exchanges into `continuity_note`,
+clears `codex_thread_id`, closes the cached client, emits
+`session_auto_recovered{reason='repeated_transport_error'}`, and lets
+the normal auto-retry start a fresh Codex thread. The first failure
+therefore preserves continuity; repeated stdio/receiver-loop failures
+no longer burn all retry attempts on the same poisoned thread.
 
 **Transient-error retry (2026-05-13)**: `CoordProxyClient.call_tool`
 retries on transport errors (`httpx.ConnectError`, `ReadTimeout`,
