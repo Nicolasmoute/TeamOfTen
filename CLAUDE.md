@@ -1434,6 +1434,17 @@ OpenAI's Codex safety monitor, which cancelled the subsequent
   app-server exception) emit `auto_compact_failed` symmetrically with
   Claude. Spec mirror in `Docs/CODEX_RUNTIME_SPEC.md` §A.5 / §E.6.
 
+- **Codex `gpt-5.5` context window is runtime-reported.**
+  Do not assume the public/API `gpt-5.5` window is the Codex
+  app-server window. Codex rollout JSONL `token_count.info` includes
+  `model_context_window`; `CodexRuntime` now records it as an exact
+  provider-reported denominator for `_context_window_for(model)`.
+  This value is allowed to override the static table downward, so the
+  pane CTX bar and auto-compact threshold adapt to the real Codex
+  window. `maybe_auto_compact` also reads the existing rollout for the
+  prior `codex_thread_id` before computing `used / window`, covering
+  already-running threads whose reported window predates this change.
+
 **Recent (2026-05-02, follow-up) — Env-toggle attention signal + auto-pop-open:**
 
 The pending-review signal on the left-rail env-toggle button used to

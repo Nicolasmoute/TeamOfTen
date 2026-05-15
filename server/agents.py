@@ -322,10 +322,12 @@ _CONTEXT_WINDOWS = {
 }
 
 # Observed ceilings learned from one assistant API call's prompt usage.
-# Ratchets upward only. Persisted to team_config on every bump so a
-# restart doesn't lose the learning. In-memory cache mirrors the DB
-# row; refreshed at startup via _load_observed_windows().
+# Ratchets upward only. Separately, Codex app-server token_count events
+# can report an exact model_context_window; that value may be lower
+# than the public API table for the same model id, so it must be able
+# to override downward for CTX % and auto-compact.
 _OBSERVED_CONTEXT_WINDOWS: dict[str, int] = {}
+_REPORTED_CONTEXT_WINDOWS: dict[str, int] = {}
 
 
 async def _load_observed_windows() -> None:
@@ -335,21 +337,30 @@ async def _load_observed_windows() -> None:
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT value FROM team_config WHERE key = 'context_observed'"
+                "SELECT key, value FROM team_config "
+                "WHERE key IN ('context_observed', 'context_reported')"
             )
-            row = await cur.fetchone()
+            rows = await cur.fetchall()
         finally:
             await c.close()
     except Exception:
         logger.exception("context: observed-windows load failed")
         return
-    if not row:
+    if not rows:
         return
-    try:
-        parsed = json.loads(dict(row).get("value") or "{}")
-    except Exception:
-        return
-    if isinstance(parsed, dict):
+    for row in rows:
+        r = dict(row)
+        try:
+            parsed = json.loads(r.get("value") or "{}")
+        except Exception:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        if r.get("key") == "context_reported":
+            for k, v in parsed.items():
+                if isinstance(k, str) and isinstance(v, int) and 1_000 <= v <= 2_000_000:
+                    _REPORTED_CONTEXT_WINDOWS[k] = v
+            continue
         for k, v in parsed.items():
             if isinstance(k, str) and isinstance(v, int) and v > 0:
                 table = _CONTEXT_WINDOWS.get(k, 0)
@@ -384,6 +395,52 @@ async def _persist_observed_windows() -> None:
             await c.close()
     except Exception:
         logger.exception("context: observed-windows persist failed")
+
+
+async def _persist_reported_windows() -> None:
+    """Persist exact provider-reported context windows."""
+    payload = json.dumps(_REPORTED_CONTEXT_WINDOWS, ensure_ascii=False)
+    try:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "INSERT INTO team_config (key, value) VALUES "
+                "('context_reported', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (payload,),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+    except Exception:
+        logger.exception("context: reported-windows persist failed")
+
+
+async def _observe_reported_context_window(
+    model: str | None,
+    context_window: int | None,
+) -> None:
+    """Record an exact context window reported by the runtime/provider.
+
+    Unlike _observe_context_usage, this is allowed to move downward:
+    Codex app-server can expose a runtime-specific effective window for
+    a model id whose public API maximum is larger.
+    """
+    if not model or context_window is None:
+        return
+    from server.models_catalog import resolve_model_alias
+    resolved_id = resolve_model_alias(model)
+    try:
+        window = int(context_window)
+    except (TypeError, ValueError):
+        return
+    if not (1_000 <= window <= 2_000_000):
+        return
+    if _REPORTED_CONTEXT_WINDOWS.get(resolved_id) == window:
+        return
+    _REPORTED_CONTEXT_WINDOWS[resolved_id] = window
+    logger.info("context: runtime reported %s window = %d", resolved_id, window)
+    await _persist_reported_windows()
 
 
 async def _observe_context_usage(
@@ -421,12 +478,11 @@ async def _observe_context_usage(
 def _context_window_for(model: str | None) -> int:
     """Resolve the context window for a model id.
 
-    Precedence: observed-max > table > 1M fallback. The observed map
-    ratchets upward, so a new model shipping with a bigger window
-    than we assumed self-corrects after one real turn. For unknown
-    smaller-than-1M models, the fallback over-reports — acceptable
-    because the compact threshold then fires later than ideal rather
-    than prematurely (premature compact is the worse failure).
+    Precedence: provider-reported exact window > observed-max > table
+    > 1M fallback. The observed map ratchets upward, so a new model
+    shipping with a bigger window than we assumed self-corrects after
+    one real turn. The reported map can also correct downward when a
+    runtime has a smaller effective window than the generic model id.
 
     Tier aliases (`latest_opus`, `latest_gpt`, …) are resolved to
     their concrete id before lookup so external callers (the
@@ -435,10 +491,14 @@ def _context_window_for(model: str | None) -> int:
     if not model:
         return max(
             1_000_000,
+            max(_REPORTED_CONTEXT_WINDOWS.values(), default=0),
             max(_OBSERVED_CONTEXT_WINDOWS.values(), default=0),
         )
     from server.models_catalog import resolve_model_alias
     resolved_id = resolve_model_alias(model)
+    reported = _REPORTED_CONTEXT_WINDOWS.get(resolved_id, 0)
+    if reported > 0:
+        return reported
     observed = _OBSERVED_CONTEXT_WINDOWS.get(resolved_id, 0)
     table = _CONTEXT_WINDOWS.get(resolved_id, 0)
     resolved = max(observed, table)

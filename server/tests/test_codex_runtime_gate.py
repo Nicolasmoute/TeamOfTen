@@ -1943,6 +1943,21 @@ def test_codex_thread_config_makes_coach_read_only() -> None:
     assert "same descriptions and input schemas" in instructions
 
 
+def test_codex_rollout_context_window_parser() -> None:
+    from server.runtimes.codex import _codex_context_window_from_rollout_info
+
+    assert _codex_context_window_from_rollout_info({
+        "last_token_usage": {"input_tokens": 123},
+        "model_context_window": 400_000,
+    }) == 400_000
+    assert _codex_context_window_from_rollout_info({
+        "model_context_window": "384000",
+    }) == 384_000
+    assert _codex_context_window_from_rollout_info({
+        "model_context_window": "not-a-number",
+    }) is None
+
+
 def test_codex_worktree_sandbox_probe_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2405,6 +2420,77 @@ async def test_codex_maybe_auto_compact_below_threshold_returns_false(
 
     assert await CodexRuntime().maybe_auto_compact(tc) is False
     assert not any(ev["type"] == "auto_compact_triggered" for ev in captured)
+
+
+async def test_codex_maybe_auto_compact_uses_reported_rollout_window(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """A Codex thread's model_context_window must override the static
+    gpt-5.5 table before the auto-compact ratio is computed."""
+    import json
+    import server.agents as agentsmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    previous = agentsmod._REPORTED_CONTEXT_WINDOWS.pop("gpt-5.5", None)
+    try:
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        monkeypatch.setenv("HARNESS_AUTO_COMPACT_THRESHOLD", "0.7")
+        sessions = tmp_path / "sessions" / "2026" / "05" / "15"
+        sessions.mkdir(parents=True)
+        (sessions / "rollout-abc-tid_gpt55.jsonl").write_text(
+            json.dumps({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {"input_tokens": 123},
+                        "model_context_window": 400_000,
+                    },
+                },
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(
+            codex_mod,
+            "_get_codex_thread_id",
+            lambda agent_id: _async_value("tid_gpt55"),
+        )
+        monkeypatch.setattr(
+            agentsmod,
+            "_codex_session_context_estimate",
+            lambda thread_id: _async_value(300_000),
+        )
+
+        async def fake_compact(self, tc):
+            tc.turn_ctx["got_result"] = True
+
+        monkeypatch.setattr(codex_mod.CodexRuntime, "run_manual_compact", fake_compact)
+        captured = _capture_emit(monkeypatch)
+
+        tc = TurnContext(
+            agent_id="p1",
+            project_id="default",
+            prompt="deferred",
+            system_prompt="",
+            workspace_cwd="C:/work/p1/project",
+            allowed_tools=[],
+            external_mcp_servers={},
+            model="gpt-5.5",
+            turn_ctx={},
+        )
+
+        assert await CodexRuntime().maybe_auto_compact(tc) is True
+        triggered = [ev for ev in captured if ev["type"] == "auto_compact_triggered"]
+        assert triggered[0]["context_window"] == 400_000
+        assert triggered[0]["ratio"] == 0.75
+    finally:
+        if previous is None:
+            agentsmod._REPORTED_CONTEXT_WINDOWS.pop("gpt-5.5", None)
+        else:
+            agentsmod._REPORTED_CONTEXT_WINDOWS["gpt-5.5"] = previous
 
 
 async def test_codex_maybe_auto_compact_trips_native_compact(

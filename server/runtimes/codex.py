@@ -2165,6 +2165,28 @@ def _rollout_path_from_thread_state(thread_state: Any) -> Path | None:
     return p if p.is_file() else None
 
 
+def _rollout_path_for_thread_id(thread_id: str) -> Path | None:
+    """Best-effort lookup for an existing Codex rollout JSONL by thread id."""
+    if not thread_id:
+        return None
+    codex_home = os.environ.get("CODEX_HOME", "").strip()
+    if not codex_home:
+        return None
+    sessions = Path(codex_home) / "sessions"
+    try:
+        if not sessions.is_dir():
+            return None
+        matches = list(sessions.rglob(f"rollout-*{thread_id}.jsonl"))
+    except OSError:
+        return None
+    if not matches:
+        return None
+    try:
+        return max(matches, key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return matches[-1]
+
+
 def _read_codex_token_count_from_rollout(rollout_path: Path) -> Mapping[str, Any] | None:
     """Parse the most recent `token_count` event from a Codex rollout JSONL.
 
@@ -2250,6 +2272,18 @@ def _codex_usage_from_rollout_info(info: Mapping[str, Any]) -> dict[str, int]:
         "cache_read": cached,
         "cache_creation": 0,
     }
+
+
+def _codex_context_window_from_rollout_info(info: Mapping[str, Any]) -> int | None:
+    """Return Codex's provider-reported effective context window."""
+    if not isinstance(info, Mapping):
+        return None
+    value = info.get("model_context_window")
+    try:
+        window = int(value) if value is not None else 0
+    except (TypeError, ValueError):
+        return None
+    return window if window > 0 else None
 
 
 def _model_from_rollout(rollout_path: Path) -> str | None:
@@ -2472,6 +2506,7 @@ class CodexRuntime:
             _extract_usage_codex,
             _insert_turn_row,
             _now,
+            _observe_reported_context_window,
             _set_continuity_note,
             _set_status,
         )
@@ -2621,6 +2656,7 @@ class CodexRuntime:
             usage_raw = None
             usage_from_rollout: dict[str, int] | None = None
             rollout_model: str | None = None
+            rollout_context_window: int | None = None
             try:
                 read = thread.read(include_turns=True)
                 thread_state = await _await_if_needed(read)
@@ -2629,6 +2665,9 @@ class CodexRuntime:
                     rollout_info = _read_codex_token_count_from_rollout(rollout_path)
                     if rollout_info is not None:
                         usage_from_rollout = _codex_usage_from_rollout_info(rollout_info)
+                        rollout_context_window = _codex_context_window_from_rollout_info(
+                            rollout_info
+                        )
                     if not tc.model:
                         rollout_model = _model_from_rollout(rollout_path)
                 if usage_from_rollout is None:
@@ -2643,6 +2682,10 @@ class CodexRuntime:
                 )
             usage = usage_from_rollout if usage_from_rollout is not None else _extract_usage_codex(usage_raw)
             effective_model = tc.model or rollout_model
+            await _observe_reported_context_window(
+                effective_model,
+                rollout_context_window,
+            )
 
             cost_basis = "plan_included" if method == "chatgpt" else "token_priced"
             if cost_basis == "plan_included":
@@ -2847,11 +2890,20 @@ class CodexRuntime:
             _codex_session_context_estimate,
             _context_window_for,
             _emit,
+            _observe_reported_context_window,
         )
 
         prior_thread = await _get_codex_thread_id(tc.agent_id)
         if not prior_thread:
             return False
+        rollout_path = _rollout_path_for_thread_id(prior_thread)
+        if rollout_path is not None:
+            rollout_info = _read_codex_token_count_from_rollout(rollout_path)
+            if rollout_info is not None:
+                await _observe_reported_context_window(
+                    tc.model,
+                    _codex_context_window_from_rollout_info(rollout_info),
+                )
         used = await _codex_session_context_estimate(prior_thread)
         ctx_max = _context_window_for(tc.model)
         if ctx_max <= 0 or used / ctx_max < threshold:
