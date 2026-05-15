@@ -261,7 +261,12 @@ async def _drive_run_turn_with_failing_client(
         return ("chatgpt", {})
 
     async def _stub_get_client(
-        slot: str, *, cwd: str, env_overrides=None,
+        slot: str,
+        *,
+        cwd: str,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
     ) -> Any:
         return client
 
