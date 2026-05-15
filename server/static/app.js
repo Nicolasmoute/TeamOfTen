@@ -7933,7 +7933,8 @@ function EnvInboxSection({ conversations }) {
         ? html`<div class="env-empty">(no messages — click "+ send" to start)</div>`
         : null}
       ${composing
-        ? html`<div class="env-msg-composer">
+        ? html`<div class="env-msg-composer"
+            onKeyDown=${(e) => { if (e.key === "Escape") { e.preventDefault(); setComposing(false); } }}>
             <div class="env-msg-composer-row">
               <label class="env-msg-composer-label">To</label>
               <select value=${to} onChange=${(e) => setTo(e.target.value)}>

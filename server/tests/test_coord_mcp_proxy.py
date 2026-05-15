@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import threading
 import types
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import server.spawn_tokens as st
 from server.tools import build_coord_server, coord_tool_names
@@ -571,11 +573,71 @@ class _StubTransport(httpx.AsyncBaseTransport):
         )
 
 
-def _client_with(responses):
+def _client_with(responses, *, allowed_tools=None):
     transport = _StubTransport(responses)
-    c = CoordProxyClient("http://stub", "tok", "p3")
+    c = CoordProxyClient(
+        "http://stub",
+        "tok",
+        "p3",
+        allowed_tools=set(allowed_tools) if allowed_tools is not None else None,
+    )
     c._client = httpx.AsyncClient(transport=transport, timeout=5.0)
     return c, transport
+
+
+def test_coord_mcp_cli_accepts_allowed_tools_flag():
+    """Regression for R6: argparse must accept the proxy allowlist flag.
+
+    The token is intentionally absent, so a successful parse exits at
+    the env-var validation path. An argparse failure would return the
+    same code but include "unrecognized arguments" on stderr.
+    """
+    root = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env.pop("HARNESS_COORD_PROXY_TOKEN", None)
+    env["PYTHONPATH"] = str(root)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "server.coord_mcp",
+            "--caller-id",
+            "p3",
+            "--proxy-url",
+            "http://127.0.0.1:8000",
+            "--allowed-tools",
+            "[]",
+        ],
+        cwd=root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "HARNESS_COORD_PROXY_TOKEN" in result.stderr
+    assert "unrecognized arguments" not in result.stderr
+
+
+def test_proxy_allowlist_filters_catalog_and_rejects_call():
+    """R6 requires protocol-level enforcement in the stdio proxy layer."""
+    async def run():
+        c, t = _client_with(
+            [(200, {"tools": ["coord_read_inbox", "coord_approve_stage"]})],
+            allowed_tools={"coord_read_inbox"},
+        )
+        try:
+            listed = await c.list_tools()
+            assert listed == ["coord_read_inbox"]
+
+            result = await c.call_tool("coord_approve_stage", {})
+            assert result["ok"] is False
+            assert "not allowed" in result["error"]
+            assert t.calls == 1
+        finally:
+            await c.aclose()
+    asyncio.run(run())
 
 
 def test_proxy_call_succeeds_on_first_attempt():

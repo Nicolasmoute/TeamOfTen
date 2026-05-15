@@ -97,17 +97,27 @@ class CoordProxyClient:
     # next scheduled wake. One transparent retry closes that gap.
     _RETRY_BACKOFF_S: tuple[float, ...] = (0.1, 0.4, 1.5)
 
-    def __init__(self, proxy_url: str, token: str, caller_id: str) -> None:
+    def __init__(
+        self,
+        proxy_url: str,
+        token: str,
+        caller_id: str,
+        allowed_tools: set[str] | None = None,
+    ) -> None:
         self.base = proxy_url.rstrip("/")
         self.token = token
         self.caller_id = caller_id
+        self.allowed_tools = allowed_tools
         self._client = httpx.AsyncClient(timeout=120.0)
 
     async def list_tools(self) -> list[str]:
         resp = await self._client.get(f"{self.base}/api/_coord/_tools")
         resp.raise_for_status()
         data = resp.json()
-        return list(data.get("tools", []))
+        tools = list(data.get("tools", []))
+        if self.allowed_tools is None:
+            return tools
+        return [tool for tool in tools if tool in self.allowed_tools]
 
     async def call_tool(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
         """POST the tool call, retrying transient transport errors
@@ -115,6 +125,11 @@ class CoordProxyClient:
         not retried — they're caller-side validation / auth issues
         and looping wouldn't help.
         """
+        if self.allowed_tools is not None and tool_name not in self.allowed_tools:
+            return {
+                "ok": False,
+                "error": f"coord tool not allowed for this role: {tool_name}",
+            }
         url = f"{self.base}/api/_coord/{tool_name}"
         body = {"caller_id": self.caller_id, "args": args}
         headers = {"Authorization": f"Bearer {self.token}"}
@@ -278,6 +293,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Coord MCP stdio proxy")
     parser.add_argument("--caller-id", required=True)
     parser.add_argument("--proxy-url", required=True)
+    parser.add_argument(
+        "--allowed-tools",
+        default=None,
+        help=(
+            "JSON array of bare coord tool names to expose. Omit to expose "
+            "the full catalog."
+        ),
+    )
     args = parser.parse_args()
 
     token = os.environ.get("HARNESS_COORD_PROXY_TOKEN", "").strip()
@@ -296,7 +319,22 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     )
-    client = CoordProxyClient(args.proxy_url, token, args.caller_id)
+    allowed_tools: set[str] | None = None
+    if args.allowed_tools is not None:
+        try:
+            parsed = json.loads(args.allowed_tools)
+        except Exception:
+            parsed = []
+        allowed_tools = {
+            item for item in parsed if isinstance(item, str) and item
+        } if isinstance(parsed, list) else set()
+
+    client = CoordProxyClient(
+        args.proxy_url,
+        token,
+        args.caller_id,
+        allowed_tools=allowed_tools,
+    )
     try:
         return asyncio.run(_serve(client))
     except KeyboardInterrupt:

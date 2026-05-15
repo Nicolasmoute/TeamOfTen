@@ -4660,6 +4660,13 @@ endpoint resolves `caller_id` from the token, not the request body.
 ClaudeRuntime is unaffected; it uses an in-process MCP server and
 never touches these endpoints.
 
+CodexRuntime also applies a turn-level sandbox policy for Player
+turns: the active slot's worktree remains writable, while the shared
+`.project` seed checkout and sibling slot worktrees are blocked via the
+Codex sandbox `blockedPaths` / workspace-write policy surface. Coach's
+Codex sandbox remains read-only. This is the runtime-level boundary
+that complements the existing file-guard hooks in ClaudeRuntime.
+
 Token lifetime, MCP cache invalidation on config change,
 `default_tools_approval_mode` injection, and the stdio error-shape
 contract are CodexRuntime concerns — see

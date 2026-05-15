@@ -8,6 +8,8 @@ lands once the run_agent carve-out completes.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from server.runtimes import AgentRuntime, ClaudeRuntime, TurnContext, get_runtime
@@ -387,3 +389,62 @@ async def test_run_agent_uses_codex_prepared_resume_flag_for_started_event(
         assert calls == ["maybe_auto_compact", "prepare_turn_start", "run_turn"]
     finally:
         bus.unsubscribe(q)
+
+
+async def test_run_agent_passes_codex_role_allowlist_to_mcp_config(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_db: str,
+) -> None:
+    """A Codex Player spawn must carry the role-scoped allowlist all the
+    way into the runtime MCP config, not just store it on agents."""
+    import server.db as dbmod
+    await dbmod.init_db()
+
+    import aiosqlite
+    import server.agents as agentsmod
+    import server.runtimes as runtimes_mod
+    from server.role_tool_allowlists import tools_json_for_role
+
+    async with aiosqlite.connect(fresh_db, timeout=10.0) as db:
+        await db.execute(
+            "UPDATE agents SET allowed_tools = ? WHERE id = 'p2'",
+            (tools_json_for_role("executor"),),
+        )
+        await db.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Runtime:
+        name = "codex"
+
+        async def maybe_auto_compact(self, tc):
+            return False
+
+        async def run_turn(self, tc):
+            from server.runtimes.codex import _build_mcp_servers
+
+            servers = _build_mcp_servers(tc)
+            args = servers["coord"]["args"]
+            allowed_arg = args[args.index("--allowed-tools") + 1]
+            captured["allowed_tools"] = tc.allowed_tools
+            captured["coord_enabled_tools"] = servers["coord"]["enabled_tools"]
+            captured["coord_allowed_arg"] = json.loads(allowed_arg)
+            tc.turn_ctx["got_result"] = True
+
+        async def run_manual_compact(self, tc):
+            await self.run_turn(tc)
+
+    async def runtime_for(agent_id):
+        return "codex"
+
+    monkeypatch.setattr(agentsmod, "_resolve_runtime_for", runtime_for)
+    monkeypatch.setattr(runtimes_mod, "get_runtime", lambda name: _Runtime())
+
+    await agentsmod.run_agent("p2", "hello")
+
+    allowed_tools = set(captured["allowed_tools"])
+    assert "mcp__coord__coord_commit_push" in allowed_tools
+    assert "mcp__coord__coord_approve_stage" not in allowed_tools
+    assert captured["coord_enabled_tools"] == captured["coord_allowed_arg"]
+    assert "coord_commit_push" in captured["coord_enabled_tools"]
+    assert "coord_approve_stage" not in captured["coord_enabled_tools"]

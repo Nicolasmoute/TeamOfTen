@@ -7,6 +7,8 @@ flag is unset.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from server.runtimes import CodexRuntime, get_runtime, is_codex_enabled
@@ -560,6 +562,37 @@ def test_build_mcp_servers_for_slot_external_pre_approved() -> None:
     assert "coord" in servers
 
 
+def test_build_mcp_servers_for_slot_filters_by_allowed_tools() -> None:
+    from server.runtimes.codex import _build_mcp_servers_for_slot
+
+    servers = _build_mcp_servers_for_slot(
+        "p1",
+        "tok",
+        {
+            "github": {"type": "stdio", "command": "github-mcp"},
+            "slack": {"type": "stdio", "command": "slack-mcp"},
+        },
+        [
+            "mcp__coord__coord_my_assignments",
+            "mcp__coord__coord_commit_push",
+            "mcp__github__list_issues",
+        ],
+    )
+
+    args = servers["coord"]["args"]
+    allowed_arg = args[args.index("--allowed-tools") + 1]
+    assert json.loads(allowed_arg) == [
+        "coord_my_assignments",
+        "coord_commit_push",
+    ]
+    assert servers["coord"]["enabled_tools"] == [
+        "coord_my_assignments",
+        "coord_commit_push",
+    ]
+    assert "github" in servers
+    assert "slack" not in servers
+
+
 def test_build_mcp_servers_for_slot_skips_coord_override() -> None:
     """Passing 'coord' inside external_mcp_servers must not replace the
     harness-managed coord server."""
@@ -642,7 +675,6 @@ def test_config_dict_does_not_contain_mcp_servers() -> None:
         "the Codex binary — it must be removed to avoid confusion. "
         "MCP servers are configured via .mcp.json written by get_client()."
     )
-
 
 async def test_failed_handshake_does_not_poison_cache(
     monkeypatch, tmp_path,
@@ -1615,13 +1647,21 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
     get_client_calls: list[dict] = []
     open_thread_calls: list[dict] = []
 
-    async def fake_get_client(slot, *, cwd, env_overrides=None, external_mcp_servers=None):
+    async def fake_get_client(
+        slot,
+        *,
+        cwd,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
+    ):
         get_client_calls.append(
             {
                 "slot": slot,
                 "cwd": cwd,
                 "env_overrides": dict(env_overrides or {}),
                 "external_mcp_servers": external_mcp_servers,
+                "allowed_tools": allowed_tools,
             }
         )
         return client
@@ -1659,7 +1699,12 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
         prompt="say hello",
         system_prompt="system rules",
         workspace_cwd="C:/work/p1/project",
-        allowed_tools=["Bash", "Edit"],
+        allowed_tools=[
+            "Bash",
+            "Edit",
+            "mcp__coord__coord_read_inbox",
+            "mcp__extra__ping",
+        ],
         external_mcp_servers={"extra": {"command": "extra-mcp"}},
         model="gpt-5.4-mini",
         effort=4,
@@ -1675,6 +1720,12 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
             "cwd": "C:/work/p1/project",
             "env_overrides": {"OPENAI_API_KEY": "sk-test"},
             "external_mcp_servers": {"extra": {"command": "extra-mcp"}},
+            "allowed_tools": [
+                "Bash",
+                "Edit",
+                "mcp__coord__coord_read_inbox",
+                "mcp__extra__ping",
+            ],
         }
     ]
     config = open_thread_calls[0]["config"]
@@ -1731,6 +1782,58 @@ def test_codex_thread_config_makes_coach_read_only() -> None:
     assert "plugins" not in config.kwargs["config"]
 
 
+def test_codex_turn_overrides_block_sibling_worktrees() -> None:
+    from server.runtimes.base import TurnContext
+    from server.runtimes.codex import _build_turn_overrides
+
+    tc = TurnContext(
+        agent_id="p6",
+        project_id="teamoften",
+        prompt="fix it",
+        system_prompt="system rules",
+        workspace_cwd="/data/projects/teamoften/repo/p6",
+        allowed_tools=[],
+        external_mcp_servers={},
+        model="gpt-5.4-mini",
+        effort=4,
+    )
+
+    overrides = _build_turn_overrides(_FakeCodexSdk, tc)
+    assert overrides.kwargs["cwd"] == "/data/projects/teamoften/repo/p6"
+    assert overrides.kwargs["model"] == "gpt-5.4-mini"
+    assert overrides.kwargs["effort"] == "xhigh"
+    sandbox = overrides.kwargs["sandbox_policy"]
+    assert sandbox["type"] == "workspaceWrite"
+    assert sandbox["networkAccess"] is True
+    assert sandbox["writableRoots"] == ["/data/projects/teamoften/repo/p6"]
+    assert sandbox["excludeSlashTmp"] is True
+    assert sandbox["excludeTmpdirEnvVar"] is True
+    assert "/data/projects/teamoften/repo/.project" in sandbox["blockedPaths"]
+    assert "/data/projects/teamoften/repo/p1" in sandbox["blockedPaths"]
+    assert "/data/projects/teamoften/repo/p10" in sandbox["blockedPaths"]
+    assert "/data/projects/teamoften/repo/p6" not in sandbox["blockedPaths"]
+    assert "/data/projects/teamoften/repo/coach" not in sandbox["blockedPaths"]
+
+
+def test_codex_turn_overrides_omit_sandbox_policy_for_coach() -> None:
+    from server.runtimes.base import TurnContext
+    from server.runtimes.codex import _build_turn_overrides
+
+    tc = TurnContext(
+        agent_id="coach",
+        project_id="teamoften",
+        prompt="check board",
+        system_prompt="system rules",
+        workspace_cwd="/data/projects/teamoften/repo/coach",
+        allowed_tools=[],
+        external_mcp_servers={},
+    )
+
+    overrides = _build_turn_overrides(_FakeCodexSdk, tc)
+    assert overrides.kwargs["cwd"] == "/data/projects/teamoften/repo/coach"
+    assert "sandbox_policy" not in overrides.kwargs
+
+
 async def test_codex_run_turn_updates_continuity_bookkeeping(
     monkeypatch,
 ) -> None:
@@ -1766,7 +1869,8 @@ async def test_codex_run_turn_updates_continuity_bookkeeping(
     monkeypatch.setattr(
         codex_mod,
         "get_client",
-        lambda slot, *, cwd, env_overrides=None: _async_value(client),
+        lambda slot, *, cwd, env_overrides=None, external_mcp_servers=None,
+        allowed_tools=None: _async_value(client),
     )
     monkeypatch.setattr(
         codex_mod,
@@ -1817,9 +1921,21 @@ async def test_codex_run_turn_consumes_prepared_turn_state(
     get_client_calls: list[dict] = []
     open_thread_calls: list[dict] = []
 
-    async def fake_get_client(slot, *, cwd, env_overrides=None, external_mcp_servers=None):
+    async def fake_get_client(
+        slot,
+        *,
+        cwd,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
+    ):
         get_client_calls.append(
-            {"slot": slot, "cwd": cwd, "env_overrides": dict(env_overrides or {})}
+            {
+                "slot": slot,
+                "cwd": cwd,
+                "env_overrides": dict(env_overrides or {}),
+                "allowed_tools": allowed_tools,
+            }
         )
         return client
 
@@ -1907,7 +2023,14 @@ async def test_codex_run_manual_compact_uses_native_compact(
     cleared: list[str] = []
     client = _CompactFakeClient()
 
-    async def fake_get_client(slot, *, cwd, env_overrides=None, external_mcp_servers=None):
+    async def fake_get_client(
+        slot,
+        *,
+        cwd,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
+    ):
         return client
 
     async def fake_set_note(agent_id, note):
@@ -2033,7 +2156,14 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
     notes: list[tuple[str, str | None]] = []
     cleared: list[str] = []
 
-    async def fake_get_client(slot, *, cwd, env_overrides=None, external_mcp_servers=None):
+    async def fake_get_client(
+        slot,
+        *,
+        cwd,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
+    ):
         return client
 
     async def fake_set_note(agent_id, note):
@@ -2114,7 +2244,14 @@ async def test_codex_maybe_auto_compact_emits_failed_on_compact_error(
     monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
     monkeypatch.setenv("HARNESS_AUTO_COMPACT_THRESHOLD", "0.7")
 
-    async def fake_get_client(slot, *, cwd, env_overrides=None, external_mcp_servers=None):
+    async def fake_get_client(
+        slot,
+        *,
+        cwd,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
+    ):
         return _RaisingCompactClient()
 
     async def fake_close_client(slot):
@@ -2170,3 +2307,143 @@ async def test_codex_maybe_auto_compact_emits_failed_on_compact_error(
     assert "auto_compact_failed" in types
     # got_result must NOT be set — it's the failure signal the trip-wire reads.
     assert tc.turn_ctx.get("got_result") is not True
+
+
+
+
+def _ensure_agents_safe(monkeypatch) -> None:
+    """Pre-import server.agents with safe env vars so the module-level
+    float()/int() calls don't crash on empty HARNESS_* vars."""
+    import os, sys
+    safe = {
+        'HARNESS_AGENT_DAILY_CAP': '5.0',
+        'HARNESS_TEAM_DAILY_CAP': '20.0',
+        'HARNESS_ERROR_RETRY_DELAY': '45',
+        'HARNESS_ERROR_RETRY_MAX_CONSECUTIVE': '3',
+        'HARNESS_HANDOFF_TOKEN_BUDGET': '4000',
+        'HARNESS_STREAM_TOKENS': 'true',
+    }
+    for k, v in safe.items():
+        if not os.environ.get(k):
+            monkeypatch.setenv(k, v)
+    if 'server.agents' not in sys.modules:
+        import server.agents  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# _maybe_evict_on_mcp_error — auto-evict stale client on MCP transport error
+# ---------------------------------------------------------------------------
+
+
+async def test_mcp_error_evicts_client_once_per_turn(monkeypatch) -> None:
+    """Two failing MCP steps in one turn: evict_client called once, flag set,
+    codex_mcp_evict event emitted exactly once."""
+    _ensure_agents_safe(monkeypatch)
+    captured = _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step, _codex_clients
+
+    evict_calls: list[str] = []
+
+    async def fake_evict(slot: str) -> None:
+        evict_calls.append(slot)
+
+    import server.runtimes.codex as codex_mod
+    monkeypatch.setattr(codex_mod, "evict_client", fake_evict)
+
+    # Build a fake mcp_tool_call step whose result payload has status="error".
+    # _step_payload_is_error checks item_payload.get("status") at top level;
+    # _extract_step_tool_result looks for top-level "output" string.
+    error_item = {
+        "type": "mcp_tool_call",
+        "server": "coord",
+        "tool": "coord_read_inbox",
+        "status": "error",        # drives _step_payload_is_error
+        "output": "stdio pipe broken",  # drives _extract_step_tool_result
+    }
+    step1 = _FakeStep(
+        step_type="tool",
+        item_type="mcp_tool_call",
+        item_id="mcp_1",
+        item=error_item,
+    )
+    step2 = _FakeStep(
+        step_type="tool",
+        item_type="mcp_tool_call",
+        item_id="mcp_2",
+        item=error_item,
+    )
+
+    turn_ctx: dict = {}
+    await handle_step(step1, "p5", turn_ctx)
+    await handle_step(step2, "p5", turn_ctx)
+
+    # evict_client called exactly once (flag prevents second call)
+    assert evict_calls == ["p5"]
+    # flag is set
+    assert turn_ctx.get("_mcp_transport_evicted") is True
+    # codex_mcp_evict event emitted exactly once
+    evict_events = [e for e in captured if e["type"] == "codex_mcp_evict"]
+    assert len(evict_events) == 1
+    assert evict_events[0]["reason"] == "mcp_transport_error"
+
+
+async def test_mcp_success_does_not_evict(monkeypatch) -> None:
+    """Successful MCP result (status='completed'): evict_client never called."""
+    _ensure_agents_safe(monkeypatch)
+    _capture_emit(monkeypatch)
+    from server.runtimes.codex import handle_step
+
+    evict_calls: list[str] = []
+
+    async def fake_evict(slot: str) -> None:
+        evict_calls.append(slot)
+
+    import server.runtimes.codex as codex_mod
+    monkeypatch.setattr(codex_mod, "evict_client", fake_evict)
+
+    success_item = {
+        "type": "mcp_tool_call",
+        "server": "coord",
+        "tool": "coord_read_inbox",
+        "result": {"status": "completed", "output": "no messages"},
+    }
+    step = _FakeStep(
+        step_type="tool",
+        item_type="mcp_tool_call",
+        item_id="mcp_ok",
+        item=success_item,
+    )
+
+    turn_ctx: dict = {}
+    await handle_step(step, "p5", turn_ctx)
+
+    assert evict_calls == []
+    assert "_mcp_transport_evicted" not in turn_ctx
+
+
+async def test_mcp_evict_flag_prevents_double_evict(monkeypatch) -> None:
+    """Direct unit test: calling _maybe_evict_on_mcp_error twice in the same
+    turn_ctx calls evict_client exactly once."""
+    _ensure_agents_safe(monkeypatch)
+    _capture_emit(monkeypatch)
+
+    evict_calls: list[str] = []
+
+    async def fake_evict(slot: str) -> None:
+        evict_calls.append(slot)
+
+    import server.runtimes.codex as codex_mod
+    monkeypatch.setattr(codex_mod, "evict_client", fake_evict)
+
+    from server.runtimes.codex import _maybe_evict_on_mcp_error
+
+    error_payload = {
+        "type": "mcp_tool_call",
+        "result": {"status": "error", "output": "broken"},
+    }
+    turn_ctx: dict = {}
+
+    await _maybe_evict_on_mcp_error("p7", error_payload, turn_ctx)
+    await _maybe_evict_on_mcp_error("p7", error_payload, turn_ctx)
+
+    assert evict_calls == ["p7"], "evict_client must be called exactly once"
