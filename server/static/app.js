@@ -12044,6 +12044,7 @@ const hasActiveSession = (agent) =>
 const hasClearableSession = (agent) =>
   Boolean(agent && (agent.session_id || agent.codex_thread_id));
 
+
 // ------------------------------------------------------------------
 // event renderer (v2b generic; v2c adds per-tool richness)
 // ------------------------------------------------------------------
