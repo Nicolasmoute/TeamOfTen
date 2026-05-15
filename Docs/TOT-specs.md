@@ -4666,6 +4666,13 @@ turns: the active slot's worktree remains writable, while the shared
 Codex sandbox `blockedPaths` / workspace-write policy surface. Coach's
 Codex sandbox remains read-only. This is the runtime-level boundary
 that complements the existing file-guard hooks in ClaudeRuntime.
+The Codex runtime probes bubblewrap's actual namespace capability once
+per process before applying that Player policy. If the host denies the
+mount propagation step (`bwrap: Failed to make / slave: Permission
+denied`), Player turns automatically degrade to the pre-boundary
+`danger-full-access` mode and emit `runtime_sandbox_degraded`; Coach
+remains read-only. `/api/health/detail` exposes
+`checks.codex_sandbox` with the probe result.
 
 Token lifetime, MCP cache invalidation on config change,
 `default_tools_approval_mode` injection, and the stdio error-shape

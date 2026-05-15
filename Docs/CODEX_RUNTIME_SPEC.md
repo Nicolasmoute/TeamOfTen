@@ -411,7 +411,25 @@ CodexRuntime also applies a turn-level sandbox policy for Player turns:
 the active slot's worktree stays writable, while the shared `.project`
 seed checkout and sibling slot worktrees are listed in `blockedPaths`.
 This mirrors the Claude file-guard boundary at the sandbox layer. Coach
-still runs read-only.
+still runs read-only. Before applying Player `sandboxPolicy`, the
+runtime probes the actual bubblewrap namespace path with a cached
+`bwrap --ro-bind / / true` check. This catches hosted containers where
+`bwrap --version` succeeds but mount propagation fails with `bwrap:
+Failed to make / slave: Permission denied`. If the probe fails,
+Players automatically omit `sandboxPolicy`, emit
+`runtime_sandbox_degraded`, and fall back to the thread-level
+`danger-full-access` mode that existed before the worktree-boundary
+policy. `/api/health/detail` reports `checks.codex_sandbox` so the
+operator can distinguish "container cannot support workspaceWrite"
+from repo or auth failures. When the host capability is restored, a
+fresh process probe re-enables `workspaceWrite` without a config flag.
+
+The coord MCP proxy implements empty `resources/list`,
+`resources/templates/list`, and `prompts/list` handlers. Codex
+app-server may probe all MCP capability surfaces during startup; "no
+resource templates" must be an empty result, not JSON-RPC `-32601`
+`Method not found`, because that can poison the stdio app-server
+transport before the agent's next turn.
 
 
 **External MCP servers inherit the same approval policy.** Servers added

@@ -192,6 +192,11 @@ async def test_coord_mcp_stdio_subprocess_lists_and_calls_tool() -> None:
                     "coord_approve_stage",
                 ]
 
+                resources = await session.list_resources()
+                assert resources.resources == []
+                templates = await session.list_resource_templates()
+                assert templates.resourceTemplates == []
+
                 result = await session.call_tool("coord_list_team", {"verbose": True})
                 assert result.isError is False
                 assert json.loads(result.content[0].text) == {
