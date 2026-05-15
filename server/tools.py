@@ -1010,11 +1010,24 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "  'done' looks like. Stored on the Backlog entry; promoted "
             "  to the task row at triage time."
         ),
+        # Raw JSON schema: dict-shorthand marks ALL keys required; only
+        # title is truly required here. description/parent_id/priority/
+        # workflow/tracking_reason/trajectory/note/success_criteria are
+        # all optional per the tool description above.
         {
-            "title": str, "description": str, "parent_id": str,
-            "priority": str, "workflow": str,
-            "tracking_reason": str, "trajectory": Any,
-            "note": str, "success_criteria": str,
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+                "parent_id": {"type": "string"},
+                "priority": {"type": "string"},
+                "workflow": {"type": "string"},
+                "tracking_reason": {"type": "string"},
+                "trajectory": {},
+                "note": {"type": "string"},
+                "success_criteria": {"type": "string"},
+            },
+            "required": ["title"],
         },
     )
     async def create_task(args: dict[str, Any]) -> dict[str, Any]:
@@ -1585,7 +1598,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "sharing. Assigning work still only happens through the task "
             "board (Coach creates + assigns, Players claim)."
         ),
-        {"to": str, "body": str, "subject": str, "priority": str},
+        # Raw JSON schema: to + body required; subject + priority optional.
+        {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string"},
+                "body": {"type": "string"},
+                "subject": {"type": "string"},
+                "priority": {"type": "string"},
+            },
+            "required": ["to", "body"],
+        },
     )
     async def send_message(args: dict[str, Any]) -> dict[str, Any]:
         to = (args.get("to") or "").strip().lower()
@@ -2100,9 +2123,18 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "URL configured; push also needs pushable credentials "
             "(typically a PAT embedded in the project repo URL)."
         ),
+        # Raw JSON schema: message required; push/task_id/message_to_coach
+        # are all optional (task_id especially — "optional but strongly
+        # recommended" per the tool description).
         {
-            "message": str, "push": str, "task_id": str,
-            "message_to_coach": str,
+            "type": "object",
+            "properties": {
+                "message": {"type": "string"},
+                "push": {"type": "string"},
+                "task_id": {"type": "string"},
+                "message_to_coach": {"type": "string"},
+            },
+            "required": ["message"],
         },
     )
     async def commit_push(args: dict[str, Any]) -> dict[str, Any]:
@@ -4358,7 +4390,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- comments: required for 'reject' and 'approve_with_comments', "
             "optional for 'approve'. Max 10k chars."
         ),
-        {"correlation_id": str, "decision": str, "comments": str},
+        # Raw JSON schema: correlation_id + decision required; comments
+        # optional (only required for 'reject' and 'approve_with_comments').
+        {
+            "type": "object",
+            "properties": {
+                "correlation_id": {"type": "string"},
+                "decision": {"type": "string"},
+                "comments": {"type": "string"},
+            },
+            "required": ["correlation_id", "decision"],
+        },
     )
     async def answer_plan(args: dict[str, Any]) -> dict[str, Any]:
         if not caller_is_coach:
