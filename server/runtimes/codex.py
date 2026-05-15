@@ -40,6 +40,12 @@ logger = logging.getLogger(__name__)
 # Closed and re-opened on auth-error / transport error.
 _codex_clients: dict[str, Any] = {}
 
+# Per-slot cwd recorded at client spawn time.  Used by `get_client` to
+# detect when the resolved workspace path changed between turns (e.g.
+# branch correction after a wrong-worktree detection) and evict the
+# stale subprocess before it operates in the old directory.
+_codex_client_cwds: dict[str, str] = {}
+
 # Per-slot coord-MCP-proxy tokens. The codex app-server subprocess is
 # long-lived (cached across turns), and the env it inherits — including
 # `HARNESS_COORD_PROXY_TOKEN` — is captured at spawn time. A per-turn
@@ -270,7 +276,38 @@ async def get_client(
     async with _slot_lock(slot):
         cached = _codex_clients.get(slot)
         if cached is not None:
-            return cached
+            cached_cwd = _codex_client_cwds.get(slot)
+            if cached_cwd is not None and cached_cwd != cwd:
+                # Defense in depth (D2 from root-cause doc, 2026-05-15):
+                # The cached subprocess was spawned with a different cwd —
+                # most likely the wrong-worktree-cwd symptom (Symptom 2)
+                # where _ensure_worktree returned ok without branch check.
+                # Evict the stale client so this turn spawns fresh.
+                logger.error(
+                    "CodexRuntime: cached client cwd mismatch for slot=%s "
+                    "(cached=%s, requested=%s) — evicting stale client",
+                    slot, cached_cwd, cwd,
+                )
+                from server.events import bus as _bus
+                import asyncio as _asyncio
+                _asyncio.ensure_future(_bus.publish({
+                    "type": "codex_client_cwd_mismatch",
+                    "agent_id": slot,
+                    "cached_cwd": cached_cwd,
+                    "requested_cwd": cwd,
+                }))
+                # Inline evict (we already hold the slot lock — can't call
+                # evict_client which would deadlock on _slot_lock).
+                _codex_clients.pop(slot, None)
+                _codex_client_cwds.pop(slot, None)
+                # Leave _codex_client_tokens in place: the subprocess is
+                # now gone (we won't use it), and close_client will revoke
+                # the token when it's called by the caller on error. If
+                # the subprocess is still alive, the token will expire
+                # naturally when the caller doesn't call it again.
+                # Fall through to spawn a fresh client below.
+            else:
+                return cached
 
         sdk = _import_codex_sdk()
         # Env scrub — the codex app-server subprocess (and every shell
@@ -344,7 +381,8 @@ async def get_client(
             raise
 
         _codex_clients[slot] = client
-        logger.info("CodexRuntime: opened client for slot=%s", slot)
+        _codex_client_cwds[slot] = cwd
+        logger.info("CodexRuntime: opened client for slot=%s cwd=%s", slot, cwd)
         return client
 
 
@@ -353,6 +391,7 @@ async def close_client(slot: str) -> None:
     cached. Called on auth-error / transport-error / shutdown."""
     async with _slot_lock(slot):
         client = _codex_clients.pop(slot, None)
+        _codex_client_cwds.pop(slot, None)
         # Revoke the proxy token bound to this subprocess. Done
         # whether or not the client object existed — defensive cleanup.
         token = _codex_client_tokens.pop(slot, None)
@@ -406,6 +445,7 @@ async def evict_client(slot: str) -> None:
     if is_agent_running(slot):
         async with _slot_lock(slot):
             _codex_clients.pop(slot, None)
+            _codex_client_cwds.pop(slot, None)
         logger.info(
             "CodexRuntime: evicted cache entry for slot=%s "
             "(turn in flight; subprocess kept alive)", slot,
