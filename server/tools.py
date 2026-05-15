@@ -1287,6 +1287,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             }
             first_entry = trajectory[0]
             first_to: list[str] = first_entry.get("to") or []
+            first_role: str | None = None
             planted_first_stage = False
             if len(first_to) == 1:
                 first_role = role_for_stage[first_entry["stage"]]
@@ -1318,6 +1319,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     "WHERE id = ? AND current_task_id IS NULL",
                     (task_id, initial_owner),
                 )
+            if planted_first_stage and initial_owner and first_role:
+                await _set_agent_role_tools(c, initial_owner, first_role)
             await c.commit()
         finally:
             await c.close()
@@ -8313,6 +8316,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     (task_id, first_role, eligible_json, first_to[0],
                      now_iso, now_iso),
                 )
+                if initial_status == "execute":
+                    await c.execute(
+                        "UPDATE agents SET current_task_id = ? "
+                        "WHERE id = ? AND current_task_id IS NULL",
+                        (task_id, first_to[0]),
+                    )
+                await _set_agent_role_tools(c, first_to[0], first_role)
             await c.execute(
                 "UPDATE backlog_tasks SET status='promoted', "
                 "promoted_task_id=? WHERE id=?",

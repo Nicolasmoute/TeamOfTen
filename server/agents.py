@@ -1236,8 +1236,8 @@ async def _set_status(agent_id: str, status: str) -> None:
         logger.exception("set_status failed: agent=%s status=%s", agent_id, status)
 
 
-AGENT_DAILY_CAP_USD = float(os.environ.get("HARNESS_AGENT_DAILY_CAP", "5.0"))
-TEAM_DAILY_CAP_USD = float(os.environ.get("HARNESS_TEAM_DAILY_CAP", "20.0"))
+AGENT_DAILY_CAP_USD = float(os.environ.get("HARNESS_AGENT_DAILY_CAP") or "5.0")
+TEAM_DAILY_CAP_USD = float(os.environ.get("HARNESS_TEAM_DAILY_CAP") or "20.0")
 
 # Currently-running agent tasks, keyed by slot id. Used by the cancel
 # endpoint to abort a spiraling run without waiting for max_turns / cap.
@@ -1541,10 +1541,10 @@ _pending_wakes: dict[str, tuple[str, str | None, bool | None]] = {}
 _retry_pending: set[str] = set()
 _consecutive_errors: dict[str, int] = {}
 ERROR_RETRY_DELAY_SECONDS = int(
-    os.environ.get("HARNESS_ERROR_RETRY_DELAY", "45")
+    os.environ.get("HARNESS_ERROR_RETRY_DELAY") or "45"
 )
 ERROR_RETRY_MAX_CONSECUTIVE = int(
-    os.environ.get("HARNESS_ERROR_RETRY_MAX_CONSECUTIVE", "3")
+    os.environ.get("HARNESS_ERROR_RETRY_MAX_CONSECUTIVE") or "3"
 )
 
 # SDK ClaudeAgentOptions.max_turns — the per-spawn ceiling on the
@@ -1555,7 +1555,7 @@ ERROR_RETRY_MAX_CONSECUTIVE = int(
 # plan + write a TodoWrite already burns most of it). 50 leaves
 # plenty of headroom for ordinary workflows; the daily cost cap
 # remains the brake against a runaway turn.
-MAX_TURNS_PER_SPAWN = int(os.environ.get("HARNESS_MAX_TURNS", "50"))
+MAX_TURNS_PER_SPAWN = int(os.environ.get("HARNESS_MAX_TURNS") or "50")
 
 # Soft-error tracking — last-turn diagnostics surfaced into the next
 # spawn's system prompt so a follow-up turn knows why the previous
@@ -6701,7 +6701,7 @@ async def _coach_is_working() -> bool:
 #   HARNESS_STALE_TASK_CHECK_INTERVAL_SECONDS: how often the loop runs.
 #     Default 60.
 # Setting STALE_TASK_MINUTES to 0 disables the watchdog entirely.
-STALE_TASK_MINUTES = int(os.environ.get("HARNESS_STALE_TASK_MINUTES", "15"))
+STALE_TASK_MINUTES = int(os.environ.get("HARNESS_STALE_TASK_MINUTES") or "15")
 STALE_TASK_NOTIFY_INTERVAL_MIN = int(
     os.environ.get("HARNESS_STALE_TASK_NOTIFY_INTERVAL_MINUTES", "30")
 )
