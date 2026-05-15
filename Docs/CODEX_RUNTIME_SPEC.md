@@ -445,6 +445,16 @@ users who want approval-on-use). Implementation in
 `_build_mcp_cli_flags` / `_build_mcp_servers_for_slot`
 ([server/runtimes/codex.py](../server/runtimes/codex.py)).
 
+Command-based external MCP configs are normalized before being handed
+to Codex: if `command` is present and `type` is omitted, CodexRuntime
+fills `type = "stdio"`. If `command` is `npx` / `npx.cmd`, CodexRuntime
+also prepends `-y` unless `-y` / `--yes` is already present. This is
+required for cold redeploys: a bare `npx <package>` can print an install
+prompt to stdout, but MCP stdio stdout must contain only JSON-RPC. When
+that prompt leaks, Codex's MCP reader reports `serde error expected value
+at line 1 column 1`, poisons the app-server stdio transport, and the
+harness surfaces it as `CodexTransportError: receiver loop failed`.
+
 **Deprecated `.mcp.json` path.** `_write_codex_mcp_json` is retained
 only as a reference helper. The runtime no longer relies on workspace
 files for Codex MCP configuration. The old `.gitignore` entry remains:
