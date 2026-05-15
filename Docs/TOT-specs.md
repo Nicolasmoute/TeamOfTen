@@ -4750,6 +4750,11 @@ request timeout (`HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS`, default
 a stale thread: the runtime preserves `codex_thread_id`, closes the
 cached client through the caller's error path, and lets the next retry
 rebuild before attempting resume again.
+If the turn stream already completed and only the post-turn
+`thread.read(include_turns=True)` usage lookup hits a transport error,
+the turn remains successful but the cached app-server client is closed
+before the next turn. This prevents a dead stdio receiver from being
+reused while still preserving the resumed Codex thread id.
 If the same Codex slot then records a second consecutive pre-result
 transport failure, the dispatcher escalates from client rebuild to
 thread reset: it salvages recent exchanges into `continuity_note`,

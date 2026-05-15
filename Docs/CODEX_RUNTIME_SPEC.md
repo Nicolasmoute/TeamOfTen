@@ -721,6 +721,12 @@ without a `usage` field either (verified live 2026-04-29 against
 Codex CLI 0.125.0 / SDK 0.3.2). Token counts only land on disk in the
 rollout JSONL — see §E.5 for the parser the runtime now uses.
 
+If the post-turn `thread.read(include_turns=True)` call itself fails
+with a Codex transport/receiver-loop error after the stream completed,
+the runtime still emits a successful `result` with zero fallback usage
+but closes the cached app-server client before returning. The next turn
+therefore rebuilds stdio instead of reusing a dead receiver.
+
 #### E.3.1 Tool-result error classification
 
 `_step_payload_is_error(item_payload)` decides whether a completed

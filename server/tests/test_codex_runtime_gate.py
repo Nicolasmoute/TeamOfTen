@@ -2000,6 +2000,86 @@ async def test_codex_run_turn_streams_records_usage_and_persists_thread(
     assert client.handlers[-1] is None
 
 
+async def test_codex_run_turn_evicts_client_when_usage_read_transport_fails(
+    monkeypatch,
+) -> None:
+    """A successful turn can still lose the app-server stdio transport
+    during the post-turn thread.read() usage lookup. The turn should stay
+    successful, but the poisoned cached client must not be reused.
+    """
+    import server.agents as agentsmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    class _UsageReadBrokenThread(_RunTurnFakeThread):
+        async def read(self, *, include_turns=True):
+            self.read_calls.append({"include_turns": include_turns})
+            raise RuntimeError(
+                "receiver loop failed: failed reading from stdio transport"
+            )
+
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    captured = _capture_emit(monkeypatch)
+    insert_rows: list[dict] = []
+    closed_slots: list[str] = []
+    client = _RunTurnFakeClient()
+    thread = _UsageReadBrokenThread()
+
+    monkeypatch.setattr(
+        codex_mod,
+        "resolve_auth",
+        lambda: _async_value(("api_key", {"OPENAI_API_KEY": "sk-test"})),
+    )
+    monkeypatch.setattr(codex_mod, "_import_codex_sdk", lambda: _FakeCodexSdk)
+    monkeypatch.setattr(
+        codex_mod,
+        "get_client",
+        lambda slot, *, cwd, env_overrides=None, external_mcp_servers=None,
+        allowed_tools=None: _async_value(client),
+    )
+    monkeypatch.setattr(
+        codex_mod,
+        "open_thread",
+        lambda agent_id, client_arg, *, config=None, tc=None: _async_value(
+            (thread, False)
+        ),
+    )
+    monkeypatch.setattr(codex_mod, "_set_codex_thread_id", lambda *_: _async_value(None))
+    monkeypatch.setattr(
+        codex_mod,
+        "close_client",
+        lambda slot: _async_value(closed_slots.append(slot)),
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_insert_turn_row",
+        lambda **kw: _async_value(insert_rows.append(kw)),
+    )
+    monkeypatch.setattr(agentsmod, "_add_cost", lambda *_: _async_value(None))
+
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="say hello",
+        system_prompt="system rules",
+        workspace_cwd="C:/work/p1/project",
+        allowed_tools=[],
+        external_mcp_servers={},
+        model="gpt-5.4-mini",
+        turn_ctx={},
+    )
+
+    await CodexRuntime().run_turn(tc)
+
+    assert closed_slots == ["p1"]
+    assert any(ev["type"] == "result" and ev["is_error"] is False for ev in captured)
+    assert not any(ev["type"] == "error" for ev in captured)
+    assert insert_rows[0]["is_error"] is False
+    assert insert_rows[0]["input_tokens"] == 0
+    assert insert_rows[0]["output_tokens"] == 0
+    assert client.handlers[-1] is None
+
+
 def test_codex_thread_config_makes_coach_read_only() -> None:
     from server.runtimes.base import TurnContext
     from server.runtimes.codex import _build_thread_config
