@@ -805,9 +805,20 @@ different path through the dispatcher.
 no `codex_thread_id` / `used / window < threshold`, and computes
 `used / window` from `_codex_session_context_estimate(thread_id)`
 (falls back to 0 if no `turns` row exists yet) and
-`_context_window_for(tc.model)` (1M floor for unknown models, so
-Codex auto-compact errs on the conservative side rather than
-firing prematurely). When the ratio trips, it:
+`_context_window_for(tc.model)`.
+
+Important Codex-specific detail: `token_count.info.model_context_window`
+from the Codex rollout JSONL is treated as an exact runtime-reported
+window and is allowed to override the static model table downward. This
+matters for Codex `gpt-5.5`: the generic public model id may have a
+larger API max than the effective window Codex app-server is actually
+using. `CodexRuntime` records the reported value after successful
+turns, and `maybe_auto_compact` opportunistically reads the existing
+rollout for `codex_thread_id` before calculating the ratio. Unknown
+models still fall back to 1M only until Codex reports a concrete
+`model_context_window`.
+
+When the ratio trips, it:
 
 1. Emits `auto_compact_triggered` with the same payload shape Claude
    emits (`used_tokens`, `context_window`, `ratio`, `threshold`,

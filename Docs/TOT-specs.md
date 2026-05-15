@@ -1916,7 +1916,12 @@ known limitations: see `Docs/CODEX_RUNTIME_SPEC.md` §E.5.
 
 Window resolution: `_context_window_for(model)` returns the per-model
 max. When the UI doesn't pass `?model=`, the server reads the model
-recorded on the latest turn for the active session.
+recorded on the latest turn for the active session. For Codex turns,
+`token_count.info.model_context_window` from the rollout JSONL is
+stored as a provider-reported exact window and takes precedence over
+the static table. That lets the CTX bar and auto-compact adapt when
+Codex `gpt-5.5` has a smaller effective app-server window than the
+generic model id's public API maximum.
 
 The pane renders this as a compact `ctx` bar: current footprint as a fraction
 of the model's max window.

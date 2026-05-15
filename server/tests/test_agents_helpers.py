@@ -176,6 +176,45 @@ async def test_session_context_estimate_finds_claude_project_jsonl(
     assert await _session_context_estimate(session_id) == 56
 
 
+async def test_reported_context_window_can_override_gpt55_downward() -> None:
+    """Codex app-server may report an effective runtime window that is
+    lower than the generic API table for the same model id."""
+    import server.agents as agentsmod
+    from server.agents import _context_window_for, _observe_reported_context_window
+
+    previous = agentsmod._REPORTED_CONTEXT_WINDOWS.pop("gpt-5.5", None)
+    try:
+        assert _context_window_for("gpt-5.5") > 400_000
+
+        await _observe_reported_context_window("gpt-5.5", 400_000)
+
+        assert _context_window_for("gpt-5.5") == 400_000
+    finally:
+        if previous is None:
+            agentsmod._REPORTED_CONTEXT_WINDOWS.pop("gpt-5.5", None)
+        else:
+            agentsmod._REPORTED_CONTEXT_WINDOWS["gpt-5.5"] = previous
+
+
+async def test_reported_context_window_resolves_aliases() -> None:
+    import server.agents as agentsmod
+    from server.agents import _context_window_for, _observe_reported_context_window
+    from server.models_catalog import _ALIAS_TO_CONCRETE
+
+    concrete = _ALIAS_TO_CONCRETE["latest_gpt"]
+    previous = agentsmod._REPORTED_CONTEXT_WINDOWS.pop(concrete, None)
+    try:
+        await _observe_reported_context_window("latest_gpt", 384_000)
+
+        assert _context_window_for("latest_gpt") == 384_000
+        assert _context_window_for(concrete) == 384_000
+    finally:
+        if previous is None:
+            agentsmod._REPORTED_CONTEXT_WINDOWS.pop(concrete, None)
+        else:
+            agentsmod._REPORTED_CONTEXT_WINDOWS[concrete] = previous
+
+
 # ---------- _get_agent_brief / _clear_session_id ----------
 
 
