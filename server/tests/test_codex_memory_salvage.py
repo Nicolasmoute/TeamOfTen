@@ -257,6 +257,27 @@ def test_codex_transport_error_classifier_matches_stdio_failures() -> None:
     )
 
 
+def test_codex_transport_diagnostics_include_process_and_stderr() -> None:
+    from server.runtimes.codex import _codex_client_transport_diagnostics
+
+    class _Proc:
+        pid = 123
+        returncode = 1
+
+    class _Transport:
+        _proc = _Proc()
+        _stderr_tail = "rmcp stderr tail"
+
+    class _Client:
+        _transport = _Transport()
+
+    text = _codex_client_transport_diagnostics(_Client())
+
+    assert "pid=123" in text
+    assert "returncode=1" in text
+    assert "rmcp stderr tail" in text
+
+
 async def test_repeated_transport_recovery_clears_thread_and_salvages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -297,3 +318,40 @@ async def test_repeated_transport_recovery_clears_thread_and_salvages(
     assert len(recovered_events) == 1
     assert recovered_events[0].get("reason") == "repeated_transport_error"
     assert recovered_events[0].get("session_id") == "poisoned-codex-thread"
+
+
+async def test_first_transport_recovery_clears_thread_and_marks_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.events import bus
+    from server.runtimes.codex import recover_codex_thread_after_transport_error
+
+    exchanges = [{"prompt": "run checks", "response": "tests started"}]
+    await _seed_session(
+        "p4",
+        thread_id="crashy-codex-thread",
+        last_exchange_json=json.dumps(exchanges),
+    )
+
+    q = bus.subscribe()
+    try:
+        recovered = await recover_codex_thread_after_transport_error(
+            "p4",
+            consecutive_errors=1,
+            error="CodexTransportError: failed reading from stdio transport",
+        )
+        await asyncio.sleep(0.05)
+        events = _drain(q)
+    finally:
+        bus.unsubscribe(q)
+
+    assert recovered is True
+    assert await _read_thread_id("p4") is None
+    assert await _read_continuity_note("p4") is not None
+
+    recovered_events = [
+        e for e in events if e.get("type") == "session_auto_recovered"
+    ]
+    assert len(recovered_events) == 1
+    assert recovered_events[0].get("reason") == "transport_error"
+    assert recovered_events[0].get("consecutive_errors") == 1

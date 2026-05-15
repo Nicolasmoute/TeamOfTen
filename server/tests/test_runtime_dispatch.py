@@ -450,13 +450,15 @@ async def test_run_agent_passes_codex_role_allowlist_to_mcp_config(
     assert "coord_approve_stage" not in captured["coord_enabled_tools"]
 
 
-async def test_run_agent_recovers_repeated_codex_transport_error_before_retry(
+async def test_run_agent_recovers_codex_transport_error_before_retry(
     monkeypatch: pytest.MonkeyPatch,
     fresh_db: str,
 ) -> None:
-    """The second consecutive Codex stdio failure clears the stored
-    thread before the next auto-retry, avoiding the coach retry loop
-    seen when a poisoned codex_thread_id keeps crashing resume."""
+    """A Codex stdio failure clears the stored thread before retry.
+
+    This avoids the retry loop seen when a poisoned codex_thread_id keeps
+    crashing resume until auto_retry_gave_up strands the slot.
+    """
     import server.db as dbmod
     await dbmod.init_db()
 
@@ -501,18 +503,17 @@ async def test_run_agent_recovers_repeated_codex_transport_error_before_retry(
     monkeypatch.setattr(codex_mod, "_get_codex_thread_id", get_codex_thread)
     monkeypatch.setattr(
         codex_mod,
-        "recover_codex_thread_after_repeated_transport_error",
+        "recover_codex_thread_after_transport_error",
         recover,
     )
     monkeypatch.setattr(agentsmod, "_schedule_post_error_retry", schedule)
 
-    agentsmod._consecutive_errors["coach"] = 1
     try:
         await agentsmod.run_agent("coach", "resume")
     finally:
         agentsmod._consecutive_errors.pop("coach", None)
 
     assert calls["agent_id"] == "coach"
-    assert calls["consecutive_errors"] == 2
+    assert calls["consecutive_errors"] == 1
     assert "failed reading from stdio transport" in str(calls["error"])
     assert calls["scheduled_agent_id"] == "coach"
