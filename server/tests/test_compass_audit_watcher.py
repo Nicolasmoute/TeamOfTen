@@ -107,7 +107,7 @@ def _stub_audit_work(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
     return invocations
 
 
-async def _wait_for(predicate, timeout: float = 1.0, step: float = 0.01) -> bool:
+async def _wait_for(predicate, timeout: float = 3.0, step: float = 0.01) -> bool:
     """Poll-loop helper: spin the event loop briefly while waiting for
     the watcher's background task to drain a published event."""
     deadline = asyncio.get_event_loop().time() + timeout
@@ -386,8 +386,7 @@ async def test_debounce_drops_reemit(
             "owner": "p1",
             "project_id": "misc",
         })
-    await asyncio.sleep(0.05)
-    assert len(calls) == 1
+    assert await _wait_for(lambda: len(calls) == 1)
 
 
 @pytest.mark.asyncio

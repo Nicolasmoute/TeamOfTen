@@ -73,6 +73,30 @@ async def _insert_backlog(
     return row_id  # type: ignore[return-value]
 
 
+async def _insert_task(
+    title: str,
+    task_id: str = "t-2026-05-15-00000001",
+    status: str = "execute",
+) -> str:
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO tasks (id, project_id, title, status, owner, "
+            "created_by, trajectory) "
+            "VALUES (?, 'misc', ?, ?, 'p1', 'coach', ?)",
+            (
+                task_id,
+                title,
+                status,
+                '[{"stage":"execute","to":["p1"]}]',
+            ),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    return task_id
+
+
 async def _get_backlog(row_id: int) -> dict[str, Any] | None:
     c = await configured_conn()
     try:
