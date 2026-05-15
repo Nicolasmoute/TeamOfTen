@@ -725,7 +725,7 @@ Every Coach delegation goes through the kanban. Stages: plan → execute → aud
   - executor (code) → `coord_commit_push(message, task_id, push?, message_to_coach?)`
   - executor (non-code) → `coord_role_complete(task_id, message_to_coach, artifact_path)`
   - auditor → `coord_submit_audit_report(task_id, kind, body, verdict, message_to_coach?)`
-  - shipper (GitHub-backed repo) → `coord_ship_to_dev(task_id)` — enforces the audit-pass gate, cherry-picks the executor commit onto a temp branch off `origin/dev`, opens a GitHub PR, squash-merges it, closes the shipper role row, and wakes Coach. **Recommended tool for all ship-stage work.** Raw `git push origin ...:dev` bypasses the audit gate and is a pb-005 violation.
+  - shipper (GitHub-backed repo) → `coord_ship_to_dev(task_id)` — exposed in shipper role allowlists, enforces the audit-pass gate, cherry-picks the executor commit onto a temp branch off `origin/dev`, opens a GitHub PR, squash-merges it, closes the shipper role row, and wakes Coach. **Recommended tool for all ship-stage work.** Raw `git push origin ...:dev` bypasses the audit gate and is a pb-005 violation.
   - shipper (no GitHub / manual) → `coord_role_complete(task_id, message_to_coach)` — for environments without a GitHub PAT-in-URL repo_url.
 - **`message_to_coach` is your response.** What you noticed, any caveats, what the next person should know. Write it like you're talking to Coach — because you are.
 - **The kanban does NOT advance until Coach reviews and approves.** Your turn ends when you've called the completion tool. Coach reads on the next tick.

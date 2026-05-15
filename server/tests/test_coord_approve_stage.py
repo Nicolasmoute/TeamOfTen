@@ -395,6 +395,33 @@ async def test_approve_stage_sets_role_allowed_tools_and_idles_displaced(
     assert rows["p2"]["current_task_id"] == "t-2026-05-07-aaaa1111"
 
 
+async def test_approve_stage_ship_sets_ship_gate_allowed_tool(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed_task(status="audit_syntax")
+
+    server = _server_for("coach")
+    _ok_text(await _handler(server, "approve_stage")({
+        "task_id": "t-2026-05-07-aaaa1111",
+        "next_stage": "ship",
+        "assignee": "p3",
+        "note": "assign shipper",
+    }))
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute("SELECT allowed_tools FROM agents WHERE id = 'p3'")
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+
+    tools = set(json.loads(row["allowed_tools"]))
+    assert "mcp__coord__coord_ship_to_dev" in tools
+    assert "mcp__coord__coord_role_complete" in tools
+    assert "mcp__coord__coord_approve_stage" not in tools
+
+
 async def test_approve_stage_archive_no_assignee_marks_roles_complete(
     fresh_db: str,
 ) -> None:
