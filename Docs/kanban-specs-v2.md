@@ -152,8 +152,12 @@ coord_list_backlog(status?, limit?)
 Available to **Coach and all Players** (read-only, no side effects). Returns entries newest-first. One line per entry:
 
 ```
-#<id>  [<status>]  "<title>"  by <proposed_by>, <age> ago
+#<id>  kind=backlog  [<status>]  "<title>"  by <proposed_by>, <age> ago
 ```
+
+`coord_list_tasks` includes pending backlog rows in its no-filter and
+`status='pending'` views when no owner filter is present, alongside active
+task rows marked `kind=task`. Concrete kanban stage filters remain task-only.
 
 Rejected entries append `  reason: <reject_reason>`; promoted entries append `  → task <promoted_task_id>`. Titles are never truncated.
 
