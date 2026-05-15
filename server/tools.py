@@ -2184,16 +2184,20 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 try:
                     # Require a LIVE (uncompleted, unsuperseded)
                     # executor role row so the downstream validator
-                    # cannot reject what we just bound. Filtering on
-                    # status='execute' alone could pick up a task
-                    # whose executor row got marked complete by a
-                    # prior commit but never advanced (subscriber
-                    # crash / push failure), producing a confusing
-                    # "no active uncompleted executor role" error
-                    # immediately after auto-bind.
+                    # cannot reject what we just bound. The live role
+                    # row, not tasks.owner, is authoritative here:
+                    # tasks.owner can lag behind after reassignment,
+                    # so the query only cares that the caller holds the
+                    # active executor assignment on an execute-stage
+                    # task. Filtering on status='execute' alone could
+                    # still pick up a task whose executor row got
+                    # marked complete by a prior commit but never
+                    # advanced (subscriber crash / push failure),
+                    # producing a confusing "no active uncompleted
+                    # executor role" error immediately after auto-bind.
                     cur = await c.execute(
                         "SELECT t.id FROM tasks t "
-                        "WHERE t.project_id = ? AND t.owner = ? "
+                        "WHERE t.project_id = ? "
                         "AND t.status = 'execute' "
                         "AND EXISTS ("
                         "  SELECT 1 FROM task_role_assignments tra "
@@ -2204,7 +2208,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                         "  AND tra.superseded_by IS NULL "
                         ") "
                         "ORDER BY t.claimed_at DESC LIMIT 2",
-                        (project_id_for_lookup, caller_id, caller_id),
+                        (project_id_for_lookup, caller_id),
                     )
                     candidates = [dict(r)["id"] for r in await cur.fetchall()]
                 finally:
@@ -2212,8 +2216,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             except Exception:
                 candidates = []
             # Exactly one active executor task → auto-bind. Multiple
-            # is technically not possible (tasks.owner is 1:1) but we
-            # guard anyway.
+            # live executor tasks for a caller are rare but possible
+            # during odd reassignment states, so we guard anyway.
             if len(candidates) == 1:
                 task_id_in = candidates[0]
                 auto_bound_task_id = task_id_in
@@ -2222,19 +2226,29 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         # we run any git work — so a Player can't pass another Player's
         # task_id (or a stale id) and ride it into the kanban
         # subscriber. Validation: task is in the active project, sits
-        # in `execute`, has `owner=caller_id`, and an active executor
-        # role assignment owned by caller exists with completed_at NULL.
+        # in `execute`, and the live executor role assignment belongs
+        # to the caller with completed_at NULL.
         if task_id_in:
             project_id = await resolve_active_project()
             c = await configured_conn()
             try:
                 cur = await c.execute(
-                    "SELECT t.status, t.owner, "
-                    "(SELECT 1 FROM task_role_assignments "
-                    " WHERE task_id = t.id AND role = 'executor' "
-                    " AND owner = ? AND completed_at IS NULL "
-                    " AND superseded_by IS NULL "
-                    " ORDER BY assigned_at DESC LIMIT 1) AS has_role "
+                    "SELECT t.status, "
+                    "(SELECT tra.owner FROM task_role_assignments tra "
+                    " WHERE tra.task_id = t.id AND tra.role = 'executor' "
+                    " AND tra.completed_at IS NULL "
+                    " AND tra.superseded_by IS NULL "
+                    " ORDER BY tra.assigned_at DESC LIMIT 1) AS active_owner, "
+                    "(SELECT 1 FROM task_role_assignments tra "
+                    " WHERE tra.task_id = t.id AND tra.role = 'executor' "
+                    " AND tra.completed_at IS NULL "
+                    " AND tra.superseded_by IS NULL "
+                    " LIMIT 1) AS has_live_role, "
+                    "(SELECT 1 FROM task_role_assignments tra "
+                    " WHERE tra.task_id = t.id AND tra.role = 'executor' "
+                    " AND tra.owner = ? AND tra.completed_at IS NULL "
+                    " AND tra.superseded_by IS NULL "
+                    " LIMIT 1) AS has_role "
                     "FROM tasks t "
                     "WHERE t.id = ? AND t.project_id = ?",
                     (caller_id, task_id_in, project_id),
@@ -2257,19 +2271,20 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"coord_commit_push can only deliver against an "
                     f"executor task currently in execute."
                 )
-            if t.get("owner") != caller_id:
-                return _err(
-                    f"task {task_id_in} is owned by "
-                    f"{t.get('owner') or 'no one'}, not {caller_id}. "
-                    f"You can only call coord_commit_push for your own "
-                    f"executor task."
-                )
-            if not t.get("has_role"):
+            if not t.get("has_live_role"):
                 return _err(
                     f"task {task_id_in} has no active uncompleted "
                     f"executor role for {caller_id}. The role may have "
                     f"been superseded by a re-assignment, or already "
                     f"completed by a prior commit."
+                )
+            active_owner = t.get("active_owner")
+            if active_owner != caller_id:
+                return _err(
+                    f"task {task_id_in} has active executor role owned by "
+                    f"{active_owner or 'no one'}, not {caller_id}. "
+                    f"You can only call coord_commit_push for your own "
+                    f"executor task."
                 )
 
         cwd = await workspace_dir(caller_id)
