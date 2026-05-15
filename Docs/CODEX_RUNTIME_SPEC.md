@@ -291,9 +291,13 @@ Body is a stdio MCP server that:
   harness root to `PYTHONPATH`, because Codex turns execute inside the
   agent workspace (`/data/projects/<active>/repo/<slot>`) while the
   proxy module lives in the TeamOfTen server package.
-- Statically declares the coord tool list (names, permissive schemas)
-  fetched from the loopback catalog. Handler drift between the proxy
-  catalog and the real handlers is caught by contract tests (§J).
+- Declares the coord tool catalogue fetched from the loopback catalog:
+  names, real `@tool` descriptions, and JSON input schemas. This keeps
+  Codex Coach at parity with Claude's in-process coord MCP catalogue for
+  recurrence, Compass, playbook, and kanban tools. Handler drift between
+  the proxy catalog and the real handlers is caught by contract tests
+  (§J). Older string-only catalog responses are still accepted by the
+  proxy as a compatibility fallback.
 - On each tool invocation, POSTs to `${proxy_url}/api/_coord/{tool_name}`
   with `{caller_id, args}` and `Authorization: Bearer ${proxy_token}`.
 - Streams the response back as the MCP tool result. FastAPI HTTP errors
@@ -411,7 +415,25 @@ CodexRuntime also applies a turn-level sandbox policy for Player turns:
 the active slot's worktree stays writable, while the shared `.project`
 seed checkout and sibling slot worktrees are listed in `blockedPaths`.
 This mirrors the Claude file-guard boundary at the sandbox layer. Coach
-still runs read-only.
+still runs read-only. Before applying Player `sandboxPolicy`, the
+runtime probes the actual bubblewrap namespace path with a cached
+`bwrap --ro-bind / / true` check. This catches hosted containers where
+`bwrap --version` succeeds but mount propagation fails with `bwrap:
+Failed to make / slave: Permission denied`. If the probe fails,
+Players automatically omit `sandboxPolicy`, emit
+`runtime_sandbox_degraded`, and fall back to the thread-level
+`danger-full-access` mode that existed before the worktree-boundary
+policy. `/api/health/detail` reports `checks.codex_sandbox` so the
+operator can distinguish "container cannot support workspaceWrite"
+from repo or auth failures. When the host capability is restored, a
+fresh process probe re-enables `workspaceWrite` without a config flag.
+
+The coord MCP proxy implements empty `resources/list`,
+`resources/templates/list`, and `prompts/list` handlers. Codex
+app-server may probe all MCP capability surfaces during startup; "no
+resource templates" must be an empty result, not JSON-RPC `-32601`
+`Method not found`, because that can poison the stdio app-server
+transport before the agent's next turn.
 
 
 **External MCP servers inherit the same approval policy.** Servers added
@@ -444,6 +466,12 @@ servers are included only when the active allowlist contains at least
 one `mcp__<server>__...` tool. This is the Codex substitute for
 Claude's tool-search savings: role-specific Player turns carry a
 smaller coord schema instead of the full board-control surface.
+Coach intentionally receives the full Coach coord catalogue; Codex
+gets concrete schemas rather than the placeholder
+`additionalProperties` proxy shape so Coach can call
+`coord_set_tick_interval`, `coord_set_project_objectives`,
+`compass_*`, and `coord_propose_playbook_changes` without guessing
+arguments.
 
 > **Don't pass `config.plugins`.** Codex's TOML schema treats
 > `plugins` as a map keyed by plugin *name* with `PluginConfig`
@@ -944,6 +972,13 @@ and shipped behavior degrades: the runtime sets
 side-channel request, the harness surfaces `human_attention` and
 declines so the turn does not hang behind an invisible prompt. Coach
 and Players are expected to escalate via `coord_request_human` instead.
+Codex Coach receives an explicit developer-instruction bridge: answer
+pending Player question/plan correlation ids with
+`coord_answer_question` / `coord_answer_plan`, ask the human with
+`coord_request_human`, save project objectives with
+`coord_set_project_objectives`, manage recurrence with
+`coord_set_tick_interval`, query Compass with `compass_*`, and adjust
+the playbook with `coord_propose_playbook_changes`.
 
 A future `coord_ask_user` MCP tool could replace this degradation if
 Codex agents prove to need synchronous user questions; not shipped.
@@ -1045,6 +1080,17 @@ Bash, Edit, WebSearch. coord_* is identical on both.
 ```
 
 Skip block when all 10 Players are on the same runtime — saves tokens on default deploy.
+
+Codex also appends a Coach-only compatibility note after the normal
+system prompt. It does not change Coach's responsibilities; it maps the
+Claude-shaped affordances in older prose onto runtime-neutral coord
+tools. The important mappings are: no `AskUserQuestion`/`ExitPlanMode`
+side-channel in Codex; use `coord_request_human` for human outreach and
+`coord_answer_question` / `coord_answer_plan` for pending Player
+correlations. No Coach `Write`/`Edit`/`Bash` control plane in Codex;
+use coord tools such as `coord_set_project_objectives`,
+`coord_set_tick_interval`, `compass_*`, and
+`coord_propose_playbook_changes`.
 
 ---
 

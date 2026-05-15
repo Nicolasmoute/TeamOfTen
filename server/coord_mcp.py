@@ -110,14 +110,44 @@ class CoordProxyClient:
         self.allowed_tools = allowed_tools
         self._client = httpx.AsyncClient(timeout=120.0)
 
-    async def list_tools(self) -> list[str]:
+    @staticmethod
+    def _normalize_tool_descriptor(item: Any) -> dict[str, Any] | None:
+        if isinstance(item, str) and item:
+            return {
+                "name": item,
+                "description": f"Coord proxy tool {item}",
+                "input_schema": {
+                    "type": "object",
+                    "additionalProperties": True,
+                },
+            }
+        if not isinstance(item, dict):
+            return None
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            return None
+        schema = item.get("input_schema") or item.get("inputSchema")
+        if not isinstance(schema, dict):
+            schema = {"type": "object", "additionalProperties": True}
+        description = item.get("description")
+        return {
+            "name": name,
+            "description": description if isinstance(description, str) else "",
+            "input_schema": schema,
+        }
+
+    async def list_tools(self) -> list[dict[str, Any]]:
         resp = await self._client.get(f"{self.base}/api/_coord/_tools")
         resp.raise_for_status()
         data = resp.json()
-        tools = list(data.get("tools", []))
+        tools = [
+            desc
+            for item in list(data.get("tools", []))
+            if (desc := self._normalize_tool_descriptor(item)) is not None
+        ]
         if self.allowed_tools is None:
             return tools
-        return [tool for tool in tools if tool in self.allowed_tools]
+        return [tool for tool in tools if tool["name"] in self.allowed_tools]
 
     async def call_tool(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
         """POST the tool call, retrying transient transport errors
@@ -212,18 +242,18 @@ class CoordProxyClient:
 async def _serve(client: CoordProxyClient) -> int:
     """Serve the coord proxy over the official MCP stdio transport."""
     try:
-        tool_names = await client.list_tools()
+        tool_descriptors_raw = await client.list_tools()
     except Exception as exc:
         logger.exception("coord_mcp: failed to fetch tool catalog: %s", exc)
         return 2
 
     tool_descriptors = [
         types.Tool(
-            name=name,
-            description=f"Coord proxy tool {name}",
-            inputSchema={"type": "object", "additionalProperties": True},
+            name=desc["name"],
+            description=desc["description"] or f"Coord proxy tool {desc['name']}",
+            inputSchema=desc["input_schema"],
         )
-        for name in tool_names
+        for desc in tool_descriptors_raw
     ]
 
     server = Server("coord-proxy", version="0.1.0")
@@ -234,6 +264,10 @@ async def _serve(client: CoordProxyClient) -> int:
 
     @server.list_resources()
     async def _list_resources() -> list[types.Resource]:
+        return []
+
+    @server.list_resource_templates()
+    async def _list_resource_templates() -> list[types.ResourceTemplate]:
         return []
 
     @server.list_prompts()

@@ -1373,6 +1373,34 @@ OpenAI's Codex safety monitor, which cancelled the subsequent
   "thread not found", transport errors) skip the retry — they're
   not transient. Spec mirror in `Docs/CODEX_RUNTIME_SPEC.md` §E.2.
 
+- **Update (2026-05-15): Codex sandbox + transport hardening.**
+  Current behavior supersedes the older timeout wording above:
+  `CodexClient.connect_stdio` receives
+  `HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS` (default 120s), and
+  resume-time `CodexTransportError` preserves `codex_thread_id`,
+  closes/rebuilds the poisoned app-server client, and lets the next
+  dispatcher retry attempt resume again. For Player shell turns, the
+  runtime probes bubblewrap's real namespace setup once per process
+  before applying the `workspaceWrite` sandboxPolicy. If the host
+  rejects mount propagation (`bwrap: Failed to make / slave:
+  Permission denied`), Player turns omit `sandboxPolicy`, emit
+  `runtime_sandbox_degraded`, and fall back to the prior
+  `danger-full-access` behavior; Coach remains read-only.
+  `/api/health/detail` exposes `checks.codex_sandbox`.
+
+- **Update (2026-05-15): Codex Coach parity.**
+  The coord loopback catalog now exposes the real `@tool`
+  descriptions and input schemas to Codex MCP `tools/list` instead
+  of bare names with permissive placeholder schemas. Codex Coach also
+  receives explicit compatibility notes that map Claude-only
+  affordances (`AskUserQuestion`, `ExitPlanMode`, `Write`/`Edit`/`Bash`)
+  onto coord tools: `coord_request_human`,
+  `coord_answer_question` / `coord_answer_plan`,
+  `coord_set_tick_interval`, `coord_set_project_objectives`,
+  `compass_*`, and `coord_propose_playbook_changes`. Project
+  objectives now have a proper Coach MCP writer
+  (`coord_set_project_objectives`) shared with the EnvPane writer.
+
 - **Codex monitor cancellation rendered as error.**
   `_step_payload_is_error` in
   [server/runtimes/codex.py](server/runtimes/codex.py) previously

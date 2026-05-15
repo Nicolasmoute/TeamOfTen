@@ -932,6 +932,26 @@ async def health_detail() -> JSONResponse:
             "reason": "CODEX_HOME not set — Codex runtime unavailable until set on a /data path",
         }
 
+    # 3d. Codex Player sandbox capability. This probes the actual
+    # bubblewrap namespace path, not just `bwrap --version`: hosted
+    # containers can have the binary installed while denying the mount
+    # propagation operation that workspaceWrite needs.
+    try:
+        from server.runtimes.codex import codex_worktree_sandbox_status
+        sandbox_status = codex_worktree_sandbox_status()
+        checks["codex_sandbox"] = {
+            "ok": True,
+            **sandbox_status,
+            "degraded": not bool(sandbox_status.get("supported")),
+        }
+    except Exception as e:
+        checks["codex_sandbox"] = {
+            "ok": True,
+            "supported": False,
+            "degraded": True,
+            "reason": f"{type(e).__name__}: {e}",
+        }
+
     # 4. Cloud drive — only check if configured. Cached for 60s to avoid
     # writing a probe file on every health hit. We cache the full
     # detail dict (not just a bool) so the UI can keep rendering the
@@ -3648,13 +3668,16 @@ async def coord_proxy_tools(request: Request) -> dict[str, object]:
 
     Loopback-only, no token (the catalog is non-sensitive — the same
     information is in the source). Lets `coord_mcp.py` declare the
-    static tool list at MCP init time without re-hardcoding it.
+    static tool list at MCP init time without re-hardcoding it. The
+    descriptors intentionally include full tool descriptions and input
+    schemas so Codex gets the same coordination catalogue Claude gets
+    from the in-process SDK MCP server.
     """
     client = request.client
     if not _is_loopback(client.host if client else None):
         raise HTTPException(403, detail="loopback only")
-    from server.tools import coord_tool_names
-    return {"tools": coord_tool_names()}
+    from server.tools import coord_tool_descriptors
+    return {"tools": coord_tool_descriptors()}
 
 
 @app.put("/api/agents/{agent_id}/locked", dependencies=[Depends(require_token)])

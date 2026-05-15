@@ -8,7 +8,7 @@ import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args, get_origin
 
 from claude_agent_sdk import create_sdk_mcp_server, tool
 
@@ -4504,6 +4504,53 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         )
 
     @tool(
+        "coord_set_project_objectives",
+        (
+            "Coach-only. Replace the active project's "
+            "project-objectives.md — the human-authored north star "
+            "injected into Coach's system prompt every turn and read "
+            "by Compass as part of the truth corpus.\n"
+            "\n"
+            "Use this after the human replies to the empty-objectives "
+            "bootstrap question, or when the operator explicitly asks "
+            "you to revise the project objectives. Empty text clears "
+            "the file. This is the runtime-neutral replacement for "
+            "trying to use a Write/Edit tool from Coach.\n"
+            "\n"
+            "Params:\n"
+            "- text: full replacement markdown body (required, max 100k chars)"
+        ),
+        {"text": str},
+    )
+    async def set_project_objectives(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err(
+                "Only Coach updates project objectives. Players: send "
+                "a coord_send_message to coach if objectives need a "
+                "revision."
+            )
+        text = args.get("text")
+        if text is None:
+            return _err("text is required")
+        if not isinstance(text, str):
+            return _err("text must be a string")
+        project_id = await resolve_active_project()
+        from server import coach_objectives as objectives_mod
+        try:
+            result = await objectives_mod.write_objectives(
+                project_id,
+                text,
+                agent_id=caller_id,
+                actor={"source": "mcp-tool", "agent_id": caller_id},
+            )
+        except (TypeError, ValueError) as exc:
+            return _err(str(exc))
+        return _ok(
+            f"project objectives updated for {project_id} "
+            f"({result['size']} chars)"
+        )
+
+    @tool(
         "coord_add_todo",
         (
             "Coach-only. Append a new entry to the project's "
@@ -8460,6 +8507,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         answer_question,
         answer_plan,
         request_human,
+        set_project_objectives,
         add_todo,
         complete_todo,
         update_todo,
@@ -8508,6 +8556,131 @@ def coord_tool_names() -> list[str]:
     """
     server = build_coord_server("coach", include_proxy_metadata=True)
     return list(server["_tool_names"])
+
+
+_JSON_SCHEMA_KEYS = frozenset({
+    "$schema",
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "items",
+    "oneOf",
+    "anyOf",
+    "allOf",
+    "enum",
+})
+
+
+def _json_type_for_python_type(value: Any) -> dict[str, Any]:
+    origin = get_origin(value)
+    args = get_args(value)
+    if origin is list or value is list:
+        item_schema = _json_type_for_python_type(args[0]) if args else {}
+        return {"type": "array", "items": item_schema}
+    if origin is dict or value is dict:
+        return {"type": "object", "additionalProperties": True}
+    if origin is None and args:
+        # PEP 604 unions (e.g. str | None) report args but no useful
+        # origin on some Python versions. Preserve the broad shape.
+        types = [
+            _json_type_for_python_type(arg).get("type")
+            for arg in args
+            if arg is not type(None)  # noqa: E721 - literal None type check
+        ]
+        types = [t for t in types if isinstance(t, str)]
+        if len(types) == 1:
+            return {"type": types[0]}
+        if types:
+            return {"type": sorted(set(types))}
+        return {}
+    if origin is not None and args:
+        types = [
+            _json_type_for_python_type(arg).get("type")
+            for arg in args
+            if arg is not type(None)  # noqa: E721
+        ]
+        types = [t for t in types if isinstance(t, str)]
+        if len(types) == 1:
+            return {"type": types[0]}
+        if types:
+            return {"type": sorted(set(types))}
+        return {}
+    if value is str:
+        return {"type": "string"}
+    if value is int:
+        return {"type": "integer"}
+    if value is float:
+        return {"type": "number"}
+    if value is bool:
+        return {"type": "boolean"}
+    if value is Any:
+        return {}
+    return {}
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, type):
+        return value.__name__
+    return str(value)
+
+
+def _coord_tool_input_schema(raw_schema: Any) -> dict[str, Any]:
+    """Convert Claude SDK tool schemas into MCP JSON schema.
+
+    The SDK accepts either a real JSON schema dict or a compact
+    ``{"arg": type}`` mapping. Codex's stdio MCP proxy needs a real
+    JSON-schema-ish ``inputSchema`` so Coach can see parameters instead
+    of an opaque ``additionalProperties`` object.
+    """
+    if not isinstance(raw_schema, dict):
+        return {"type": "object", "additionalProperties": True}
+    if any(key in raw_schema for key in _JSON_SCHEMA_KEYS):
+        schema = _jsonable(raw_schema)
+        if isinstance(schema, dict):
+            schema.setdefault("type", "object")
+            return schema
+        return {"type": "object", "additionalProperties": True}
+    return {
+        "type": "object",
+        "properties": {
+            str(name): _json_type_for_python_type(spec)
+            for name, spec in raw_schema.items()
+        },
+        "additionalProperties": True,
+    }
+
+
+def coord_tool_descriptors(caller_id: str = "coach") -> list[dict[str, Any]]:
+    """Return JSON-serializable coord tool descriptors for the Codex proxy.
+
+    Claude receives the in-process SDK MCP server directly, including
+    full descriptions and schemas from ``@tool``. Codex reaches the same
+    handlers through ``server.coord_mcp`` over loopback HTTP, so this
+    descriptor surface keeps the stdio proxy from degrading to bare tool
+    names.
+    """
+    server = build_coord_server(caller_id, include_proxy_metadata=True)
+    specs = server.get("_tool_specs") or []
+    descriptors: list[dict[str, Any]] = []
+    for spec in specs:
+        name = getattr(spec, "name", "") or ""
+        if not name:
+            continue
+        descriptors.append({
+            "name": name,
+            "description": getattr(spec, "description", "") or "",
+            "input_schema": _coord_tool_input_schema(
+                getattr(spec, "input_schema", None)
+            ),
+        })
+    return descriptors
 
 
 _COORD_SCHEMA_CHARS_CACHE: dict[str, int] = {}
@@ -8610,6 +8783,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_answer_question",
     "mcp__coord__coord_answer_plan",
     "mcp__coord__coord_request_human",
+    "mcp__coord__coord_set_project_objectives",
     "mcp__coord__coord_add_todo",
     "mcp__coord__coord_complete_todo",
     "mcp__coord__coord_update_todo",
