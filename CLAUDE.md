@@ -1379,7 +1379,12 @@ OpenAI's Codex safety monitor, which cancelled the subsequent
   `HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS` (default 120s), and
   resume-time `CodexTransportError` preserves `codex_thread_id`,
   closes/rebuilds the poisoned app-server client, and lets the next
-  dispatcher retry attempt resume again. For Player shell turns, the
+  dispatcher retry attempt resume again. If a Codex slot hits a second
+  consecutive pre-result transport failure, the dispatcher salvages
+  recent exchanges into `continuity_note`, clears `codex_thread_id`,
+  closes the cached client, emits
+  `session_auto_recovered{reason='repeated_transport_error'}`, and
+  lets the next retry start fresh. For Player shell turns, the
   runtime probes bubblewrap's real namespace setup once per process
   before applying the `workspaceWrite` sandboxPolicy. If the host
   rejects mount propagation (`bwrap: Failed to make / slave:
