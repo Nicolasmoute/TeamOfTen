@@ -2877,11 +2877,27 @@ class CodexRuntime:
                         thread_state,
                         final_turn_id,
                     )
-            except Exception:
-                logger.exception(
-                    "CodexRuntime: failed to read thread usage for slot=%s",
-                    tc.agent_id,
-                )
+            except Exception as exc:
+                if looks_like_codex_transport_error(exc):
+                    logger.warning(
+                        "CodexRuntime: failed to read thread usage for slot=%s; "
+                        "evicting cached app-server client before next turn",
+                        tc.agent_id,
+                        exc_info=True,
+                    )
+                    try:
+                        await close_client(tc.agent_id)
+                    except Exception:
+                        logger.exception(
+                            "CodexRuntime: close_client failed after usage-read "
+                            "transport error for slot=%s",
+                            tc.agent_id,
+                        )
+                else:
+                    logger.exception(
+                        "CodexRuntime: failed to read thread usage for slot=%s",
+                        tc.agent_id,
+                    )
             usage = usage_from_rollout if usage_from_rollout is not None else _extract_usage_codex(usage_raw)
             effective_model = tc.model or rollout_model
             await _observe_reported_context_window(
