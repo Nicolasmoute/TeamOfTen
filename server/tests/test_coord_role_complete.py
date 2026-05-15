@@ -329,3 +329,52 @@ async def test_role_complete_infers_shipper_at_ship_stage(fresh_db: str) -> None
         "message_to_coach": "merged + tagged",
     }))
     assert "shipper" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# artifact_path is optional — omitting it must not cause rejection
+# (t-2026-05-15-095cff78: SDK marks all dict-schema keys as required;
+# fix uses raw JSON schema with artifact_path excluded from "required")
+# ---------------------------------------------------------------------------
+
+
+async def test_role_complete_without_artifact_path_succeeds(fresh_db: str) -> None:
+    """Calling without artifact_path must succeed — shippers & writers with
+    no file deliverable were previously rejected by the MCP schema gate."""
+    await init_db()
+    await _seed_with_role(status="execute", role="executor")
+    server = _server_for("p2")
+    text = _ok_text(await _handler(server, "role_complete")({
+        "task_id": "t-2026-05-07-cccc3333",
+        "message_to_coach": "done, no file artifact",
+    }))
+    assert "cccc3333" in text
+
+
+async def test_role_complete_schema_artifact_path_not_required(fresh_db: str) -> None:
+    """Verify the MCP JSON schema does NOT list artifact_path in 'required'.
+    The dict-shorthand would have made it required; raw JSON schema fixes it."""
+    await init_db()
+    server = _server_for("p2")
+    specs = server["_tool_specs"]
+    rc = next(s for s in specs if s.name == "coord_role_complete")
+    schema = rc.input_schema
+    assert isinstance(schema, dict), "expected JSON schema dict"
+    required = schema.get("required", [])
+    assert "artifact_path" not in required, (
+        f"artifact_path must not be in required, got required={required}"
+    )
+    assert "task_id" in required
+    assert "message_to_coach" in required
+
+
+async def test_role_complete_shipper_without_artifact_succeeds(fresh_db: str) -> None:
+    """Shippers calling coord_role_complete without a file artifact must succeed."""
+    await init_db()
+    await _seed_with_role(status="ship", role="shipper")
+    server = _server_for("p2")
+    text = _ok_text(await _handler(server, "role_complete")({
+        "task_id": "t-2026-05-07-cccc3333",
+        "message_to_coach": "shipped — no local file artifact",
+    }))
+    assert "shipper" in text.lower()

@@ -7438,8 +7438,19 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "wake reason for Coach.\n"
             "- artifact_path: optional durable path; verified on disk"
         ),
+        # Raw JSON schema so artifact_path is NOT in "required" — the
+        # dict-shorthand would mark every key required, forcing callers
+        # (especially shippers with no file deliverable) to pass an
+        # empty string or get rejected by the MCP framework before the
+        # handler even runs.
         {
-            "task_id": str, "message_to_coach": str, "artifact_path": str,
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "message_to_coach": {"type": "string"},
+                "artifact_path": {"type": "string"},
+            },
+            "required": ["task_id", "message_to_coach"],
         },
     )
     async def role_complete(args: dict[str, Any]) -> dict[str, Any]:
