@@ -1327,43 +1327,22 @@ def build_router(*, require_token, audit_actor):
         actor: dict = Depends(audit_actor),
     ) -> dict[str, Any]:
         """Replace project-objectives.md. Empty body clears the file."""
-        from server.paths import project_paths
+        from server import coach_objectives as objs
         await _project_must_exist(project_id)
         text = body.get("text")
         if text is None:
             raise HTTPException(400, detail="'text' field required")
         if not isinstance(text, str):
             raise HTTPException(400, detail="'text' must be a string")
-        if len(text) > 100_000:
-            raise HTTPException(
-                400, detail=f"text too long ({len(text)} chars, max 100000)"
+        try:
+            return await objs.write_objectives(
+                project_id,
+                text,
+                agent_id=actor.get("source", "human"),
+                actor=actor,
             )
-        pp = project_paths(project_id)
-        pp.project_objectives.parent.mkdir(parents=True, exist_ok=True)
-        pp.project_objectives.write_text(text, encoding="utf-8")
-        # Spec §3.3 "cloud-drive mirror: yes". Mirror synchronously so
-        # the human-readable .md is durable the moment the PUT returns —
-        # same shape as coach_todos._write_with_mirror.
-        from server.webdav import webdav
-        if webdav.enabled:
-            try:
-                await webdav.write_text(
-                    f"projects/{project_id}/project-objectives.md",
-                    text,
-                )
-            except Exception:
-                logger.exception(
-                    "objectives PUT: cloud-drive mirror failed for %s",
-                    project_id,
-                )
-        await bus.publish({
-            "ts": _now_iso(),
-            "agent_id": actor.get("source", "human"),
-            "type": "objectives_updated",
-            "project_id": project_id,
-            "actor": actor,
-        })
-        return {"ok": True, "project_id": project_id, "size": len(text)}
+        except ValueError as exc:
+            raise HTTPException(400, detail=str(exc)) from exc
 
     return router
 

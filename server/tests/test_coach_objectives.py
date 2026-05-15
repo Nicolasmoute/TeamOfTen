@@ -62,6 +62,41 @@ async def test_block_empty_file_omitted(fresh_db: str) -> None:
     assert objs.has_objectives("misc") is False
 
 
+async def test_coord_set_project_objectives_coach_writes_file(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    ensure_project_scaffold("misc")
+    from server.tools import build_coord_server
+
+    srv = build_coord_server("coach", include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_set_project_objectives"]
+
+    result = await handler({"text": "## Goals\n\nShip the Codex Coach path."})
+
+    text = result["content"][0]["text"]
+    assert "project objectives updated" in text
+    assert project_paths("misc").project_objectives.read_text(
+        encoding="utf-8"
+    ) == "## Goals\n\nShip the Codex Coach path."
+
+
+async def test_coord_set_project_objectives_rejects_player(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    ensure_project_scaffold("misc")
+    from server.tools import build_coord_server
+
+    srv = build_coord_server("p1", include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_set_project_objectives"]
+
+    result = await handler({"text": "Nope"})
+
+    assert result["is_error"] is True
+    assert "Only Coach updates project objectives" in result["content"][0]["text"]
+
+
 async def test_truncation_kicks_in(
     fresh_db: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

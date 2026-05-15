@@ -117,8 +117,7 @@ throttle down to 1/15min when there's nothing pressing, throttle up to
 
 - **Path:** `/data/projects/<slug>/project-objectives.md`.
 - **kDrive mirror:** yes (synchronous on `PUT /api/projects/{id}/
-  objectives`; the periodic project sync loop covers other writers
-  like Coach via the Write tool).
+  objectives` and Coach's `coord_set_project_objectives`).
 - **Format:** free-form markdown. No mandated sections — operator describes
   goals however they like.
 - **Injected** into Coach's system prompt every turn alongside CLAUDE.md
@@ -128,8 +127,9 @@ throttle down to 1/15min when there's nothing pressing, throttle up to
   - First Coach turn for a project with no objectives → Coach asks the human
     to define them rather than acting on anything else.
   - Tick behavior when empty: see §5.
-- Editable by hand (Files pane), by Coach (Write tool), or via the EnvPane
-  Objectives section.
+- Editable by hand (Files pane), by Coach
+  (`coord_set_project_objectives`), or via the EnvPane Objectives
+  section.
 
 ---
 
@@ -433,11 +433,20 @@ coord_update_todo(id: str, title: str | None = None,
 Coach reads the file directly via Read (or just relies on the system-prompt
 injection). No MCP tool needed.
 
-### 7.5 Objectives are not MCP-mediated
+### 7.5 `coord_set_project_objectives`
 
-`project-objectives.md` is small, low-frequency, and edited by both human
-and Coach. Coach uses the standard `Write` tool. No MCP tool. The harness
-allows direct writes to that one path under the project root.
+```
+coord_set_project_objectives(text: str)
+```
+
+- **Coach-only.** Replaces the active project's
+  `project-objectives.md` with the provided markdown body. Empty text
+  clears the file.
+- Runtime-neutral replacement for the old "Coach uses Write" idea:
+  Coach has no structural Write tool, and Codex Coach is read-only.
+- Mirrors synchronously to kDrive and emits `objectives_updated`.
+- Used after the human answers the empty-objectives bootstrap prompt,
+  or when the operator explicitly asks Coach to revise objectives.
 
 ### 7.6 `coord_set_tick_interval`
 
@@ -882,8 +891,8 @@ When `coord_create_project` (or whatever creates a project today) runs:
   > This project has no objectives defined. What are we trying to
   > accomplish? Once you reply, I'll save them to project-objectives.md.
 
-- Coach saves objectives via Write tool. Subsequent ticks then proceed
-  normally.
+- Coach saves objectives via `coord_set_project_objectives`. Subsequent
+  ticks then proceed normally.
 
 ---
 

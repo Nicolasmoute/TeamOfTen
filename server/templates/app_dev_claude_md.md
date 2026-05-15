@@ -14,8 +14,10 @@
 ## Project objectives
 
 Live in `/data/projects/{slug}/project-objectives.md` (kDrive-
-mirrored, injected into Coach's prompt every turn). Update there;
-this file describes **how the team works on this project**.
+mirrored, injected into Coach's prompt every turn). Coach updates it
+with `coord_set_project_objectives`; humans can also edit it in the
+EnvPane/Files pane. This file describes **how the team works on this
+project**.
 
 ## Repo
 {repo}

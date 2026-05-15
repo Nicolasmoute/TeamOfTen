@@ -26,7 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import server.spawn_tokens as st
-from server.tools import build_coord_server, coord_tool_names
+from server.tools import build_coord_server, coord_tool_descriptors, coord_tool_names
 
 
 def test_coord_tool_names_matches_in_process_registry() -> None:
@@ -41,6 +41,31 @@ def test_coord_tool_names_matches_in_process_registry() -> None:
     assert set(names) == handler_names, (
         f"proxy catalog drift: catalog={set(names)} handlers={handler_names}"
     )
+
+
+def test_coord_tool_descriptors_preserve_coach_catalog_semantics() -> None:
+    """Codex's stdio proxy must not degrade Coach's coord catalogue to
+    bare names. Coach depends on descriptions + schemas to choose among
+    recurrence, Compass, playbook, and kanban tools."""
+    descriptors = coord_tool_descriptors()
+    by_name = {d["name"]: d for d in descriptors}
+    assert set(by_name) == set(coord_tool_names())
+
+    tick = by_name["coord_set_tick_interval"]
+    assert "Coach-only" in tick["description"]
+    assert tick["input_schema"]["properties"]["minutes"]["type"] == "integer"
+
+    compass = by_name["compass_ask"]
+    assert "Coach-only" in compass["description"]
+    assert compass["input_schema"]["properties"]["query"]["type"] == "string"
+
+    playbook = by_name["coord_propose_playbook_changes"]
+    assert "weighted lattice" in playbook["description"]
+    assert playbook["input_schema"]["properties"]["operations"]["type"] == "array"
+
+    objectives = by_name["coord_set_project_objectives"]
+    assert "Coach-only" in objectives["description"]
+    assert objectives["input_schema"]["properties"]["text"]["type"] == "string"
 
 
 def test_coord_server_default_has_no_non_json_proxy_metadata() -> None:
@@ -543,6 +568,32 @@ async def test_proxy_endpoint_missing_or_invalid_token(
         assert r3.status_code == 401
 
 
+async def test_proxy_tools_endpoint_returns_descriptors(
+    fresh_db: str,
+    monkeypatch,
+) -> None:
+    import pytest
+    pytest.importorskip("fastapi")
+    import server.db as dbmod
+    import server.main as mainmod
+    await dbmod.init_db()
+    monkeypatch.setattr(mainmod, "_is_loopback", lambda _h: True)
+
+    from fastapi.testclient import TestClient
+    with TestClient(mainmod.app) as c:
+        resp = c.get("/api/_coord/_tools")
+        assert resp.status_code == 200
+        tools = resp.json()["tools"]
+        by_name = {t["name"]: t for t in tools}
+        assert "coord_set_project_objectives" in by_name
+        assert "description" in by_name["coord_set_project_objectives"]
+        assert (
+            by_name["coord_set_project_objectives"]["input_schema"]
+            ["properties"]["text"]["type"]
+            == "string"
+        )
+
+
 # ---------- CoordProxyClient.call_tool retry behavior (PR-2 Fix 7) ----------
 
 
@@ -629,12 +680,40 @@ def test_proxy_allowlist_filters_catalog_and_rejects_call():
     """R6 requires protocol-level enforcement in the stdio proxy layer."""
     async def run():
         c, t = _client_with(
-            [(200, {"tools": ["coord_read_inbox", "coord_approve_stage"]})],
+            [
+                (
+                    200,
+                    {
+                        "tools": [
+                            {
+                                "name": "coord_read_inbox",
+                                "description": "Read inbox",
+                                "input_schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "limit": {"type": "integer"}
+                                    },
+                                },
+                            },
+                            "coord_approve_stage",
+                        ]
+                    },
+                )
+            ],
             allowed_tools={"coord_read_inbox"},
         )
         try:
             listed = await c.list_tools()
-            assert listed == ["coord_read_inbox"]
+            assert listed == [
+                {
+                    "name": "coord_read_inbox",
+                    "description": "Read inbox",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"limit": {"type": "integer"}},
+                    },
+                }
+            ]
 
             result = await c.call_tool("coord_approve_stage", {})
             assert result["ok"] is False

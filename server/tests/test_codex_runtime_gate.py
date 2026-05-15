@@ -1934,6 +1934,13 @@ def test_codex_thread_config_makes_coach_read_only() -> None:
     config = _build_thread_config(_FakeCodexSdk, tc)
     assert config.kwargs["sandbox"] == "read-only"
     assert "plugins" not in config.kwargs["config"]
+    instructions = config.kwargs["developer_instructions"]
+    assert "Coach-specific Codex notes" in instructions
+    assert "coord_answer_question" in instructions
+    assert "coord_set_tick_interval" in instructions
+    assert "coord_set_project_objectives" in instructions
+    assert "coord_propose_playbook_changes" in instructions
+    assert "same descriptions and input schemas" in instructions
 
 
 def test_codex_worktree_sandbox_probe_success(
