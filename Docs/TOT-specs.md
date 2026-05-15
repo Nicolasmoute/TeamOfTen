@@ -4753,10 +4753,15 @@ startup treats unsupported capability probes as transport errors.
 CodexRuntime spawns `codex app-server` with a harness-controlled SDK
 request timeout (`HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS`, default
 120s) instead of the SDK's 30s default. Resume-time
-`CodexTransportError` is treated as a poisoned app-server client, not
-a stale thread: the runtime preserves `codex_thread_id`, closes the
-cached client through the caller's error path, and lets the next retry
-rebuild before attempting resume again.
+`CodexTransportError` is treated as a poisoned app-server client. On
+resume it is not handled as an ordinary stale-thread failure, but once a
+pre-result turn fails in the dispatcher error path the retry is forced
+onto a fresh Codex thread: recent exchanges are salvaged into
+`continuity_note`, `codex_thread_id` is cleared, the cached app-server
+client is closed, and `session_auto_recovered` records
+`reason='transport_error'` (or `reason='repeated_transport_error'` for
+later consecutive strikes). This avoids exhausting the auto-retry budget
+against the same broken stdio/thread pair.
 If the turn stream already completed and only the post-turn
 `thread.read(include_turns=True)` usage lookup hits a transport error,
 the turn remains successful, the cached app-server client is closed,
@@ -4765,14 +4770,6 @@ recent exchanges are salvaged into `continuity_note`, and
 shape has correlated with an unresumable Codex thread, so clearing it
 immediately prevents the next auto-wake from burning retry attempts on
 the same dead stdio receiver.
-If the same Codex slot then records a second consecutive pre-result
-transport failure, the dispatcher escalates from client rebuild to
-thread reset: it salvages recent exchanges into `continuity_note`,
-clears `codex_thread_id`, closes the cached client, emits
-`session_auto_recovered{reason='repeated_transport_error'}`, and lets
-the normal auto-retry start a fresh Codex thread. The first failure
-therefore preserves continuity; repeated stdio/receiver-loop failures
-no longer burn all retry attempts on the same poisoned thread.
 
 **Transient-error retry (2026-05-13)**: `CoordProxyClient.call_tool`
 retries on transport errors (`httpx.ConnectError`, `ReadTimeout`,

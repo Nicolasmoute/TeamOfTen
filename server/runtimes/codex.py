@@ -1203,21 +1203,51 @@ def looks_like_codex_transport_error(exc: BaseException) -> bool:
     )
 
 
-async def recover_codex_thread_after_repeated_transport_error(
+def _codex_client_transport_diagnostics(client: Any) -> str:
+    """Return best-effort diagnostics from the SDK client's transport.
+
+    codex-app-server-sdk turns background receiver failures into a
+    synthetic ``__transport_error__`` notification whose message is only
+    ``str(exc)`` from the transport. If that path strips stderr details,
+    pull the process status and captured stderr tail from our patched
+    transport before ``close_client`` tears it down.
+    """
+    transport = getattr(client, "_transport", None)
+    if transport is None:
+        return ""
+    bits: list[str] = []
+    proc = getattr(transport, "_proc", None)
+    if proc is not None:
+        pid = getattr(proc, "pid", None)
+        returncode = getattr(proc, "returncode", None)
+        bits.append(f"transport process pid={pid} returncode={returncode}")
+    tail = getattr(transport, "_stderr_tail", "")
+    if isinstance(tail, str) and tail.strip():
+        bits.append("transport stderr tail:\n" + tail.strip()[-4000:])
+    return "\n".join(bits)
+
+
+async def recover_codex_thread_after_transport_error(
     agent_id: str,
     *,
     consecutive_errors: int,
     error: str,
+    reason: str | None = None,
 ) -> bool:
     """Clear a likely poisoned Codex thread before the next retry.
 
-    A single transport failure usually just means the cached app-server
-    subprocess died; rebuilding the client and preserving the thread is
-    the right first response. If the same slot keeps failing, the stored
-    thread itself may be unrecoverable. In that case, salvage the rolling
-    exchange log into continuity_note and clear codex_thread_id so the
-    next auto-retry starts fresh instead of exhausting the retry budget.
+    In practice the app-server stdio transport tends to fail after a
+    thread has been alive for a while. Retrying against the same stored
+    thread can work, but when the thread is the poisoned part it burns
+    through the retry budget and strands the slot. Prefer a fresh thread
+    on the next retry, carrying forward the rolling exchange log through
+    ``continuity_note``.
     """
+    recovery_reason = reason or (
+        "repeated_transport_error"
+        if consecutive_errors >= 2
+        else "transport_error"
+    )
     existing = await _get_codex_thread_id(agent_id)
     if not existing:
         return False
@@ -1250,7 +1280,7 @@ async def recover_codex_thread_after_repeated_transport_error(
             agent_id,
             "session_auto_recovered",
             runtime="codex",
-            reason="repeated_transport_error",
+            reason=recovery_reason,
             session_id=existing,
             consecutive_errors=consecutive_errors,
             error=error[:500],
@@ -1261,13 +1291,26 @@ async def recover_codex_thread_after_repeated_transport_error(
             agent_id,
         )
     logger.warning(
-        "CodexRuntime: cleared Codex thread after repeated transport errors "
-        "slot=%s thread_id=%s consecutive=%d",
-        agent_id,
-        existing,
-        consecutive_errors,
+        "CodexRuntime: cleared Codex thread after transport error "
+        "slot=%s thread_id=%s consecutive=%d reason=%s",
+        agent_id, existing, consecutive_errors, recovery_reason,
     )
     return True
+
+
+async def recover_codex_thread_after_repeated_transport_error(
+    agent_id: str,
+    *,
+    consecutive_errors: int,
+    error: str,
+) -> bool:
+    """Backward-compatible wrapper for older dispatcher/tests."""
+    return await recover_codex_thread_after_transport_error(
+        agent_id,
+        consecutive_errors=consecutive_errors,
+        error=error,
+        reason="repeated_transport_error",
+    )
 
 
 # ---------------------------------------------------------------------
@@ -3024,6 +3067,9 @@ class CodexRuntime:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            transport_diagnostics = ""
+            if looks_like_codex_transport_error(exc):
+                transport_diagnostics = _codex_client_transport_diagnostics(client)
             # Transport/protocol failures often poison the app-server
             # stdio session. Drop the cached client so the dispatcher
             # retry gets a fresh subprocess. Wrapped in its own
@@ -3048,8 +3094,13 @@ class CodexRuntime:
             # to. The current turn still ends in error (the work
             # didn't complete), but the user sees a precise diagnosis
             # instead of a 3-cycle cascade.
-            if _looks_like_codex_auth_error(exc):
-                stderr_excerpt = str(exc)[:800]
+            diagnostic_text = (
+                str(exc)
+                if not transport_diagnostics
+                else f"{exc}\n{transport_diagnostics}"
+            )
+            if _looks_like_codex_auth_error(RuntimeError(diagnostic_text)):
+                stderr_excerpt = diagnostic_text[:800]
                 await _emit(
                     tc.agent_id,
                     "human_attention",
@@ -3118,6 +3169,10 @@ class CodexRuntime:
                 # noise: the error message is in the human_attention
                 # body, not the post-result warning.
                 return
+            if transport_diagnostics and looks_like_codex_transport_error(exc):
+                raise RuntimeError(
+                    f"{type(exc).__name__}: {exc}\n{transport_diagnostics}"
+                ) from exc
             raise
         finally:
             if hasattr(client, "set_approval_handler"):
