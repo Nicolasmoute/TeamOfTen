@@ -122,11 +122,19 @@ def _stub_subprocess(
     *,
     push_returncode: int = 0,
     has_changes: bool = True,
+    branch: str = "work/p3",
 ) -> None:
     """Make `subprocess.run` return canned values for git add / status /
-    commit / rev-parse / push so coord_commit_push doesn't hit a real git."""
+    commit / rev-parse / push so coord_commit_push doesn't hit a real git.
+
+    `branch` defaults to 'work/p3' to satisfy the HEAD enforcement check
+    added in t-2026-05-15-c935dad0 (all pre-existing tests use _server_for
+    ('p3') so work/p3 is the correct expected value).
+    """
 
     def _fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        if cmd[:2] == ["git", "branch"] and "--show-current" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, branch + "\n", "")
         if cmd[:2] == ["git", "add"]:
             return subprocess.CompletedProcess(cmd, 0, "", "")
         if cmd[:2] == ["git", "status"]:
@@ -517,3 +525,79 @@ async def test_commit_push_explicit_task_id_does_not_emit_warning(
     assert warnings == []
     pushed = [e for e in captured if e.get("type") == "commit_pushed"]
     assert pushed and pushed[0].get("task_id_auto_bound") is False
+
+
+# ---------- HEAD branch enforcement (t-2026-05-15-c935dad0) ----------
+
+
+def _stub_subprocess_with_branch(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    branch: str = "work/p3",
+    push_returncode: int = 0,
+    has_changes: bool = True,
+) -> None:
+    """Like _stub_subprocess but also handles `git branch --show-current`
+    so the HEAD enforcement check in coord_commit_push can be exercised."""
+
+    def _fake_run(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        if cmd[:2] == ["git", "branch"] and "--show-current" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, branch + "\n", "")
+        if cmd[:2] == ["git", "add"]:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if cmd[:2] == ["git", "status"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, "M file.py\n" if has_changes else "", ""
+            )
+        if cmd[:2] == ["git", "commit"]:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if cmd[:2] == ["git", "rev-parse"]:
+            return subprocess.CompletedProcess(cmd, 0, "abc123\n", "")
+        if cmd[:2] == ["git", "push"]:
+            return subprocess.CompletedProcess(
+                cmd, push_returncode, "",
+                "remote rejected" if push_returncode else "",
+            )
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+
+async def test_commit_push_wrong_branch_rejected(
+    fresh_db: str, stub_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """coord_commit_push must refuse when the worktree HEAD is on the
+    wrong branch (e.g. work/p5 instead of work/p3)."""
+    await init_db()
+    await _seed_task()
+    await _seed_executor_role()
+
+    # Simulate a slot whose worktree is on work/p5 instead of work/p3
+    _stub_subprocess_with_branch(monkeypatch, branch="work/p5")
+
+    server = _server_for("p3")
+    result = await _handler(server, "commit_push")({
+        "message": "should fail",
+        "task_id": "t-2026-05-03-abc12345",
+    })
+    msg = _err_text(result)
+    assert "work/p5" in msg
+    assert "work/p3" in msg
+
+
+async def test_commit_push_correct_branch_passes(
+    fresh_db: str, stub_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """coord_commit_push succeeds when the worktree HEAD matches work/<slot>."""
+    await init_db()
+    await _seed_task()
+    await _seed_executor_role()
+
+    _stub_subprocess_with_branch(monkeypatch, branch="work/p3")
+
+    server = _server_for("p3")
+    result = await _handler(server, "commit_push")({
+        "message": "correct branch",
+        "task_id": "t-2026-05-03-abc12345",
+    })
+    _ok_text(result)
