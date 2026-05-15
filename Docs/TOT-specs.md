@@ -4756,12 +4756,20 @@ request timeout (`HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS`, default
 `CodexTransportError` is treated as a poisoned app-server client. On
 resume it is not handled as an ordinary stale-thread failure, but once a
 pre-result turn fails in the dispatcher error path the retry is forced
-onto a fresh Codex thread: recent exchanges are salvaged into
-`continuity_note`, `codex_thread_id` is cleared, the cached app-server
-client is closed, and `session_auto_recovered` records
+onto a fresh Codex thread: the failed in-flight turn is first appended
+to the rolling handoff log with bounded assistant text, tool
+calls/results, and stderr/process diagnostics; recent exchanges are then
+salvaged into `continuity_note`, `codex_thread_id` is cleared, the
+cached app-server client is closed, and `session_auto_recovered` records
 `reason='transport_error'` (or `reason='repeated_transport_error'` for
 later consecutive strikes). This avoids exhausting the auto-retry budget
-against the same broken stdio/thread pair.
+against the same broken stdio/thread pair and preserves the failed
+Edit/Bash context for the fresh retry.
+Codex developer instructions also tell agents resolving conflicted
+files to re-read the live file or index stages immediately before
+native Edit/apply_patch and to switch to smaller/fresher edits after a
+patch verification failure. This addresses the p4 failure pattern where
+stale patch contexts appeared shortly before the stdio stream died.
 If the turn stream already completed and only the post-turn
 `thread.read(include_turns=True)` usage lookup hits a transport error,
 the turn remains successful, the cached app-server client is closed,

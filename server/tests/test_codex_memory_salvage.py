@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -88,6 +89,27 @@ async def _read_thread_id(slot: str) -> str | None:
     if not row:
         return None
     return dict(row).get("codex_thread_id")
+
+
+async def _read_exchanges(slot: str) -> list[dict]:
+    pid = await resolve_active_project()
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT last_exchange_json FROM agent_sessions "
+            "WHERE slot = ? AND project_id = ?",
+            (slot, pid),
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    if not row:
+        return []
+    raw = dict(row).get("last_exchange_json")
+    if not raw:
+        return []
+    parsed = json.loads(raw)
+    return parsed if isinstance(parsed, list) else [parsed]
 
 
 def _drain(q) -> list[dict]:
@@ -267,6 +289,8 @@ def test_codex_transport_diagnostics_include_process_and_stderr() -> None:
     class _Transport:
         _proc = _Proc()
         _stderr_tail = "rmcp stderr tail"
+        _stderr_last_at_wall = time.time() - 5
+        _stderr_last_at_monotonic = time.monotonic() - 5
 
     class _Client:
         _transport = _Transport()
@@ -275,7 +299,49 @@ def test_codex_transport_diagnostics_include_process_and_stderr() -> None:
 
     assert "pid=123" in text
     assert "returncode=1" in text
+    assert "stderr last captured at" in text
+    assert "stderr age at failure" in text
     assert "rmcp stderr tail" in text
+
+
+async def test_inflight_transport_crash_persists_partial_turn_context() -> None:
+    from server.runtimes.codex import _append_inflight_codex_exchange_for_recovery
+
+    tc = _turn_context("p4")
+    tc.prompt = "Continue the p4 merge resolution."
+    tc.turn_ctx = {
+        "entry_prompt": "Wake p4 to finish the merge.",
+        "accumulated_text": (
+            "The current working copy has unresolved conflicts; I am "
+            "combining origin/dev into the executor work."
+        ),
+        "codex_recovery_log": [
+            "TOOL USE Bash id=cmd_1: sed -n '190,235p' Docs/kanban-specs-v2.md",
+            "TOOL USE Edit id=patch_1: server/tools.py apply_patch",
+        ],
+    }
+
+    saved = await _append_inflight_codex_exchange_for_recovery(
+        tc,
+        RuntimeError("CodexTransportError: failed reading from stdio transport"),
+        diagnostics=(
+            "transport stderr tail:\n"
+            "apply_patch verification failed: Failed to find expected lines "
+            "in /data/projects/teamoften/repo/p4/server/tools.py"
+        ),
+    )
+
+    assert saved is True
+    exchanges = await _read_exchanges("p4")
+    assert len(exchanges) == 1
+    exchange = exchanges[0]
+    assert exchange["prompt"] == "Wake p4 to finish the merge."
+    response = exchange["response"]
+    assert "Turn crashed before Codex produced a final result" in response
+    assert "unresolved conflicts" in response
+    assert "sed -n '190,235p' Docs/kanban-specs-v2.md" in response
+    assert "server/tools.py apply_patch" in response
+    assert "apply_patch verification failed" in response
 
 
 async def test_repeated_transport_recovery_clears_thread_and_salvages(

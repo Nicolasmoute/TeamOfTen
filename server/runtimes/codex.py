@@ -73,6 +73,10 @@ _client_locks: dict[str, asyncio.Lock] = {}
 # old persisted Codex threads might not pick up on resume.
 _CODEX_TOOL_CONTRACT_VERSION = "2026-05-15.coach-coord-descriptors"
 _CODEX_WORKTREE_SANDBOX_PROBE_CACHE: dict[str, Any] | None = None
+_RECOVERY_LOG_KEY = "codex_recovery_log"
+_RECOVERY_LOG_MAX_EVENTS = 24
+_RECOVERY_LOG_MAX_CHARS = 12_000
+_RECOVERY_EVENT_MAX_CHARS = 1_600
 
 
 def _codex_request_timeout_seconds() -> float:
@@ -211,6 +215,8 @@ class _CapturedStdioTransport:
         self._stderr_limit = stderr_limit
         self._proc: asyncio.subprocess.Process | None = None
         self._stderr_tail = ""
+        self._stderr_last_at_monotonic: float | None = None
+        self._stderr_last_at_wall: float | None = None
         self._stderr_task: asyncio.Task[None] | None = None
 
     async def connect(self) -> None:
@@ -245,6 +251,8 @@ class _CapturedStdioTransport:
                 return
             text = chunk.decode("utf-8", errors="replace")
             self._stderr_tail = (self._stderr_tail + text)[-self._stderr_limit:]
+            self._stderr_last_at_monotonic = time.monotonic()
+            self._stderr_last_at_wall = time.time()
 
     def _message_with_diagnostics(self, message: str) -> str:
         bits = [message]
@@ -253,6 +261,15 @@ class _CapturedStdioTransport:
             bits.append(f"process exit code: {proc.returncode}")
         tail = self._stderr_tail.strip()
         if tail:
+            if self._stderr_last_at_wall is not None:
+                at = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ",
+                    time.gmtime(self._stderr_last_at_wall),
+                )
+                bits.append(f"stderr last captured at: {at}")
+            if self._stderr_last_at_monotonic is not None:
+                age = max(0.0, time.monotonic() - self._stderr_last_at_monotonic)
+                bits.append(f"stderr age at failure: {age:.1f}s")
             bits.append("stderr tail:\n" + tail)
         return "\n".join(bits)
 
@@ -280,12 +297,12 @@ class _CapturedStdioTransport:
             self._raise_transport("failed reading from stdio transport", exc)
         if not line:
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(self._proc.wait(), timeout=0.05)
+                await asyncio.wait_for(self._proc.wait(), timeout=0.5)
             if self._stderr_task is not None:
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(
                         asyncio.shield(self._stderr_task),
-                        timeout=0.05,
+                        timeout=0.5,
                     )
             self._raise_transport("stdio transport closed")
         try:
@@ -1223,8 +1240,99 @@ def _codex_client_transport_diagnostics(client: Any) -> str:
         bits.append(f"transport process pid={pid} returncode={returncode}")
     tail = getattr(transport, "_stderr_tail", "")
     if isinstance(tail, str) and tail.strip():
+        wall = getattr(transport, "_stderr_last_at_wall", None)
+        if isinstance(wall, (int, float)):
+            bits.append(
+                "transport stderr last captured at: "
+                + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(wall))
+            )
+        mono = getattr(transport, "_stderr_last_at_monotonic", None)
+        if isinstance(mono, (int, float)):
+            bits.append(
+                f"transport stderr age at failure: "
+                f"{max(0.0, time.monotonic() - mono):.1f}s"
+            )
         bits.append("transport stderr tail:\n" + tail.strip()[-4000:])
     return "\n".join(bits)
+
+
+async def _append_inflight_codex_exchange_for_recovery(
+    tc: TurnContext,
+    exc: BaseException,
+    *,
+    diagnostics: str = "",
+) -> bool:
+    """Persist the failed in-flight Codex turn into the handoff log.
+
+    A transport crash can happen after Codex has emitted text/tool steps
+    but before the normal success hook appends the completed exchange.
+    Without this partial append, `session_auto_recovered` correctly
+    starts a fresh thread but the agent loses the exact tool/edit
+    context that caused the crash.
+    """
+    if getattr(tc, "compact_mode", False):
+        return False
+    turn_ctx = getattr(tc, "turn_ctx", None)
+    if not isinstance(turn_ctx, dict):
+        return False
+    if turn_ctx.get("_codex_inflight_exchange_saved"):
+        return False
+
+    prompt = (
+        str(turn_ctx.get("entry_prompt") or getattr(tc, "prompt", "") or "")
+    ).strip()
+    response_text = (
+        str(
+            turn_ctx.get("accumulated_text")
+            or turn_ctx.get("response_text")
+            or ""
+        ).strip()
+    )
+    raw_trace = turn_ctx.get(_RECOVERY_LOG_KEY, [])
+    if not isinstance(raw_trace, list):
+        raw_trace = [raw_trace]
+    trace = [str(item).strip() for item in raw_trace if str(item).strip()]
+    error_text = f"{type(exc).__name__}: {exc}"
+    if diagnostics:
+        error_text = f"{error_text}\n{diagnostics}"
+
+    if not (prompt or response_text or trace or error_text):
+        return False
+
+    parts = [
+        "Turn crashed before Codex produced a final result. "
+        "This partial recovery transcript was saved by the harness so "
+        "the next fresh Codex thread can continue the in-flight work.",
+    ]
+    if response_text:
+        parts.append("Assistant text before crash:\n" + response_text)
+    if trace:
+        parts.append(
+            "Tool activity before crash, oldest first:\n"
+            + "\n".join(f"- {line}" for line in trace)
+        )
+    parts.append(
+        "Failure that triggered recovery:\n"
+        + _clip_recovery_text(error_text, 4000)
+    )
+
+    try:
+        from server.agents import _append_exchange
+
+        await _append_exchange(
+            tc.agent_id,
+            prompt or "(prompt unavailable; recovered from in-flight Codex turn)",
+            "\n\n".join(parts),
+        )
+        turn_ctx["_codex_inflight_exchange_saved"] = True
+        return True
+    except Exception:
+        logger.exception(
+            "CodexRuntime: failed to persist in-flight recovery exchange "
+            "for slot=%s",
+            getattr(tc, "agent_id", "<unknown>"),
+        )
+        return False
 
 
 async def recover_codex_thread_after_transport_error(
@@ -1506,6 +1614,105 @@ def _step_item_payload(step: Any) -> dict[str, Any]:
     return {}
 
 
+def _clip_recovery_text(value: Any, limit: int = _RECOVERY_EVENT_MAX_CHARS) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            text = repr(value)
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n...[truncated]"
+
+
+def _recovery_tool_details(item_payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Select the fields most useful when rebuilding a crashed turn."""
+    details: dict[str, Any] = {}
+    for key in (
+        "type",
+        "command",
+        "cwd",
+        "path",
+        "patch",
+        "query",
+        "server",
+        "tool",
+        "toolName",
+        "name",
+        "arguments",
+        "input",
+        "status",
+    ):
+        if key in item_payload:
+            details[key] = item_payload.get(key)
+    return details or dict(item_payload)
+
+
+def _remember_codex_recovery_event(
+    turn_ctx: dict[str, Any],
+    line: str,
+) -> None:
+    """Keep a bounded, per-turn trace for crash recovery handoff.
+
+    The normal rolling exchange log is written only after a successful
+    turn. If the app-server stdio transport dies mid-tool, that success
+    hook never runs, so the fresh retry wakes without the most relevant
+    context. This trace is intentionally small and lives only in
+    ``turn_ctx`` until the exception handler promotes it into
+    ``last_exchange_json``.
+    """
+    if not isinstance(turn_ctx, dict):
+        return
+    line = _clip_recovery_text(line)
+    if not line:
+        return
+    log = turn_ctx.get(_RECOVERY_LOG_KEY)
+    if not isinstance(log, list):
+        log = []
+        turn_ctx[_RECOVERY_LOG_KEY] = log
+    log.append(line)
+    while len(log) > _RECOVERY_LOG_MAX_EVENTS:
+        log.pop(0)
+    while len(log) > 1 and sum(len(str(x)) for x in log) > _RECOVERY_LOG_MAX_CHARS:
+        log.pop(0)
+
+
+def _remember_codex_tool_use(
+    turn_ctx: dict[str, Any],
+    *,
+    tool_name: str,
+    item_id: str | None,
+    item_payload: Mapping[str, Any],
+) -> None:
+    details = _recovery_tool_details(item_payload)
+    _remember_codex_recovery_event(
+        turn_ctx,
+        f"TOOL USE {tool_name} id={item_id or '<unknown>'}: "
+        f"{_clip_recovery_text(details)}",
+    )
+
+
+def _remember_codex_tool_result(
+    turn_ctx: dict[str, Any],
+    *,
+    tool_name: str,
+    item_id: str | None,
+    result_text: str,
+    is_error: bool,
+) -> None:
+    label = "ERROR" if is_error else "OK"
+    _remember_codex_recovery_event(
+        turn_ctx,
+        f"TOOL RESULT {tool_name} id={item_id or '<unknown>'} "
+        f"{label}: {_clip_recovery_text(result_text)}",
+    )
+
+
 async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> None:
     """Translate one ConversationStep to harness events via `_emit`.
 
@@ -1534,6 +1741,12 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
             id=item_id,
             input=tool_input,
         )
+        _remember_codex_tool_use(
+            turn_ctx,
+            tool_name=tool_name,
+            item_id=item_id,
+            item_payload={**item_payload, "input": tool_input},
+        )
         result_text = _extract_step_tool_result(item_payload)
         if result_text:
             is_err = bool(_step_payload_is_error(item_payload))
@@ -1550,6 +1763,13 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
                 "tool_result",
                 tool_use_id=item_id,
                 content=result_text,
+                is_error=is_err,
+            )
+            _remember_codex_tool_result(
+                turn_ctx,
+                tool_name=tool_name,
+                item_id=item_id,
+                result_text=result_text,
                 is_error=is_err,
             )
             # Auto-evict the stale cached client on the first MCP error
@@ -1614,6 +1834,12 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
             id=item_id,
             input=item_payload,
         )
+        _remember_codex_tool_use(
+            turn_ctx,
+            tool_name=tool_name,
+            item_id=item_id,
+            item_payload=item_payload,
+        )
         result_text = _extract_step_tool_result(item_payload)
         if result_text:
             await _emit_codex_safety_suspected(
@@ -1629,6 +1855,13 @@ async def handle_step(step: Any, agent_id: str, turn_ctx: dict[str, Any]) -> Non
                 "tool_result",
                 tool_use_id=item_id,
                 content=result_text,
+                is_error=bool(_step_payload_is_error(item_payload)),
+            )
+            _remember_codex_tool_result(
+                turn_ctx,
+                tool_name=tool_name,
+                item_id=item_id,
+                result_text=result_text,
                 is_error=bool(_step_payload_is_error(item_payload)),
             )
         return
@@ -1896,6 +2129,16 @@ the applicable directory tree. Treat .claude/ directories exactly as
 .agents/ directories: look there for project or agent instructions,
 skills, commands, and related metadata. Do not ignore these files or
 directories because they use Claude naming.
+
+When resolving a Git merge/rebase or any file with conflict markers,
+re-read the current file or index stages immediately before editing.
+Native Codex Edit/apply_patch is strict about exact context; if an
+Edit/apply_patch verification fails, do not retry the same stale patch.
+Inspect the live file state, use smaller patches, or use Bash to
+reconstruct the conflicted file deliberately. In this harness, stale
+patch context inside a long Codex turn has correlated with app-server
+stdio transport failure, so preserving fresh context is part of the
+reliability contract.
 """
 
 
@@ -2881,6 +3124,13 @@ class CodexRuntime:
             else:
                 thread, resumed = await open_thread(tc.agent_id, client, config=config, tc=tc)
             tc.turn_ctx["codex_resumed_session"] = resumed
+            early_thread_id = getattr(thread, "thread_id", None)
+            if early_thread_id:
+                # Persist as soon as the thread exists, not only after a
+                # clean terminal result. Mid-turn stdio crashes need the
+                # id so the recovery path can clear the poisoned thread
+                # and force the retry onto a fresh one.
+                await _set_codex_thread_id(tc.agent_id, early_thread_id)
             sandbox_degraded = tc.turn_ctx.pop("codex_sandbox_degraded", None)
             if sandbox_degraded and not tc.turn_ctx.get("_codex_sandbox_degraded_emitted"):
                 tc.turn_ctx["_codex_sandbox_degraded_emitted"] = True
@@ -2906,7 +3156,7 @@ class CodexRuntime:
                 await handle_step(step, tc.agent_id, tc.turn_ctx)
 
             thread_id = getattr(thread, "thread_id", None)
-            if thread_id:
+            if thread_id and thread_id != early_thread_id:
                 await _set_codex_thread_id(tc.agent_id, thread_id)
 
             if not tc.turn_ctx.get("got_result"):
@@ -3070,6 +3320,11 @@ class CodexRuntime:
             transport_diagnostics = ""
             if looks_like_codex_transport_error(exc):
                 transport_diagnostics = _codex_client_transport_diagnostics(client)
+                await _append_inflight_codex_exchange_for_recovery(
+                    tc,
+                    exc,
+                    diagnostics=transport_diagnostics,
+                )
             # Transport/protocol failures often poison the app-server
             # stdio session. Drop the cached client so the dispatcher
             # retry gets a fresh subprocess. Wrapped in its own
