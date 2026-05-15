@@ -601,6 +601,7 @@ async def open_thread(
     client: Any,
     *,
     config: Any | None = None,
+    tc: Any = None,
 ) -> tuple[Any, bool]:
     """Return a `ThreadHandle` for `agent_id`, creating or resuming as
     appropriate. Implements §E.2's stale-thread auto-heal: if a stored
@@ -622,11 +623,31 @@ async def open_thread(
 
     `asyncio.CancelledError` inherits from `BaseException` in Py 3.12+
     so `except Exception` correctly lets cancellations propagate.
+
+    Memory salvage on stale-thread fall-back (Stage 3a — mirrors
+    Claude's `session_auto_recovered` pattern from 2026-05-06):
+    when `tc` is provided AND `resume_thread` failed, before clearing
+    the stored thread id we read `agent_sessions.last_exchange_json`
+    (rolling per-turn log populated on every successful non-compact
+    turn), write a synthetic `continuity_note` so the next system
+    prompt's handoff suffix carries the recent exchanges verbatim,
+    rebuild `config` with augmented developer_instructions for the
+    immediate `start_thread` call, set
+    `tc.turn_ctx["had_handoff_on_entry"] = True` so the post-result
+    handler in `run_turn` clears the synthetic note on first
+    successful turn (mirrors Claude's `had_handoff_on_entry` cleanup),
+    and emit `session_auto_recovered{salvaged_exchanges, runtime}`.
+    The retry runs WITH memory of recent work instead of starting blind.
+
+    `tc=None` keeps legacy behaviour (no salvage) — preserves backwards
+    compat for tests and any caller that doesn't have a TurnContext
+    in scope.
     """
     existing = await _get_codex_thread_id(agent_id)
+    sdk_for_resume: Any = None
     if existing:
-        sdk = _import_codex_sdk()
-        timeout_cls = getattr(sdk, "CodexTimeoutError", None)
+        sdk_for_resume = _import_codex_sdk()
+        timeout_cls = getattr(sdk_for_resume, "CodexTimeoutError", None)
         last_exc: Exception | None = None
         for attempt in range(_CODEX_RESUME_TIMEOUT_RETRIES + 1):
             try:
@@ -707,46 +728,209 @@ async def open_thread(
                 "CodexRuntime: session_resume_failed emit failed for slot=%s",
                 agent_id,
             )
-        # R4: memory salvage — mirror ClaudeRuntime's auto-heal path.
-        # Before nuking the thread id, read the rolling exchange log and
-        # write a synthetic continuity_note. The NEXT run_agent call will
-        # compose a handoff suffix from it (had_handoff_on_entry=True),
-        # so the agent starts that turn with memory of its prior work.
-        # The note is cleared by run_turn's post-result handler when
-        # had_handoff_on_entry is True (line ~1841 in this file).
-        salvaged = 0
-        try:
-            from server.agents import (
-                _emit as _salvage_emit,
-                _get_recent_exchanges,
-                _set_continuity_note,
-            )
-            recent = await _get_recent_exchanges(agent_id)
-            salvaged = len([e for e in recent if isinstance(e, dict)])
-            if salvaged > 0:
-                await _set_continuity_note(
-                    agent_id,
-                    "Your prior Codex thread was reset by the harness "
-                    "because resume failed. The verbatim exchanges below "
-                    "are your only memory of the prior conversation; pick "
-                    "up from there.",
-                )
-            await _salvage_emit(
-                agent_id,
-                "session_auto_recovered",
-                salvaged_exchanges=salvaged,
-                runtime="codex",
-            )
-        except Exception:
-            logger.exception(
-                "CodexRuntime: memory salvage/event failed for slot=%s", agent_id
-            )
+
+        # Memory salvage — mirror Claude's session_auto_recovered path.
+        # ALWAYS attempt continuity-note salvage (unions dev's R4 path
+        # which ran unconditionally) so callers that didn't pass tc
+        # still get next-turn memory recovery via the normal run_agent
+        # system-prompt composition. ADDITIONALLY, when tc is provided,
+        # rebuild ThreadConfig with augmented developer_instructions so
+        # the IMMEDIATE current-turn start_thread sees the handoff
+        # inline (Stage 3a enhancement). The salvage MUST happen BEFORE
+        # `_clear_codex_thread_id` so a future read-from-disk of the
+        # rolling exchange log is consistent.
+        config = await _maybe_salvage_for_codex_resume_failure(
+            agent_id=agent_id,
+            tc=tc,
+            sdk=sdk_for_resume,
+            current_config=config,
+        )
         await _clear_codex_thread_id(agent_id)
 
     r = client.start_thread(config)
     if hasattr(r, "__await__"):
         r = await r
     return (r, False)
+
+
+async def _maybe_salvage_for_codex_resume_failure(
+    *,
+    agent_id: str,
+    tc: Any,
+    sdk: Any,
+    current_config: Any,
+) -> Any:
+    """Try to salvage prior-conversation memory before a Codex stale-
+    thread fall-back to `start_thread`. Returns the (possibly rebuilt)
+    config that the caller should pass to `start_thread`.
+
+    No-op when `tc` is None (legacy / test caller) or when the rolling
+    exchange log is empty (fresh agent or already-cleared). On
+    success: writes a synthetic continuity_note via
+    `_set_continuity_note`, rebuilds the ThreadConfig with augmented
+    developer_instructions (so the new thread sees the handoff suffix
+    inline), sets `tc.turn_ctx["had_handoff_on_entry"] = True`, and
+    emits `session_auto_recovered{salvaged_exchanges, runtime}`.
+
+    Mirrors `ClaudeRuntime`'s auto-heal path
+    (server/runtimes/claude.py lines ~297–375) adapted for Codex's
+    ThreadConfig-based developer-instructions injection (Codex passes
+    instructions through ThreadConfig once per thread; Claude rebuilds
+    a per-turn system_prompt file). The `had_handoff_on_entry` flag
+    + post-result clear semantics are identical across runtimes —
+    same `_set_continuity_note(tc.agent_id, None)` call in
+    `run_turn`'s success path (codex.py ~line 1862,
+    claude.py via the dispatcher).
+
+    Returns the original `current_config` unchanged when no rebuild
+    happened (tc=None caller, OR rebuild raised), OR a freshly-built
+    ThreadConfig with the augmented developer_instructions when it
+    did. Either way the caller passes the returned value to
+    `start_thread` without needing to know which path ran.
+
+    Two salvage tiers:
+    - Tier 1 (always when log non-empty): write synthetic
+      continuity_note + emit session_auto_recovered. Unions dev's
+      R4 path which ran unconditionally; gives next-turn memory
+      recovery via the normal run_agent system-prompt composition
+      even for callers that didn't pass tc (legacy / tests).
+    - Tier 2 (only when tc provided): rebuild ThreadConfig with
+      augmented developer_instructions so the IMMEDIATE current-turn
+      start_thread sees the handoff inline + flip
+      tc.turn_ctx["had_handoff_on_entry"] for post-result cleanup.
+    """
+    # Late imports to avoid a module-load cycle: server.agents imports
+    # server.runtimes.codex via the runtime registry.
+    try:
+        from server.agents import (
+            _compose_handoff_suffix,
+            _emit,
+            _get_recent_exchanges,
+            _set_continuity_note,
+        )
+    except Exception:
+        logger.exception(
+            "CodexRuntime: salvage helpers unavailable for slot=%s — "
+            "skipping memory salvage", agent_id,
+        )
+        return current_config
+
+    # Read the rolling per-turn log. Empty (or DB-error) → no salvage.
+    salvaged_count = 0
+    try:
+        recent = await _get_recent_exchanges(agent_id)
+        salvaged_count = len([e for e in recent if isinstance(e, dict)])
+    except Exception:
+        logger.exception(
+            "CodexRuntime: read recent exchanges failed for slot=%s — "
+            "skipping memory salvage", agent_id,
+        )
+        return current_config
+    if salvaged_count <= 0:
+        return current_config
+
+    # Tier 1 — write synthetic note. Mirrors the prose in claude.py
+    # auto-heal so the two runtimes produce interchangeable handoff
+    # text (the agent should not be able to tell which runtime
+    # salvaged it). ALWAYS attempted when log is non-empty,
+    # regardless of tc.
+    note_written = False
+    try:
+        await _set_continuity_note(
+            agent_id,
+            "Your prior Codex thread was reset by the harness because "
+            "thread/resume failed (typically a stale thread, network "
+            "blip, or backend restart). The verbatim exchanges below "
+            "are your only memory of the prior conversation; pick up "
+            "from there.",
+        )
+        note_written = True
+    except Exception:
+        logger.exception(
+            "CodexRuntime: write synthetic continuity_note failed for "
+            "slot=%s — skipping rebuild + flag", agent_id,
+        )
+
+    # Tier 1 emit — also unconditional (gives the dashboard / Coach
+    # visibility into the boundary even for legacy callers).
+    try:
+        await _emit(
+            agent_id,
+            "session_auto_recovered",
+            salvaged_exchanges=salvaged_count,
+            runtime="codex",
+        )
+    except Exception:
+        logger.exception(
+            "CodexRuntime: session_auto_recovered emit failed for "
+            "slot=%s", agent_id,
+        )
+
+    # Tier 2 — only when tc was provided AND the note was written
+    # successfully. Without tc we can't rebuild ThreadConfig (no
+    # workspace_cwd / model / external_mcp_servers in scope). Without
+    # the note we'd compose a handoff suffix but the post-result
+    # handler would clear a non-existent note.
+    if tc is None or not note_written:
+        return current_config
+
+    try:
+        handoff_suffix = await _compose_handoff_suffix(agent_id)
+    except Exception:
+        logger.exception(
+            "CodexRuntime: compose handoff suffix failed for "
+            "slot=%s — skipping rebuild + flag", agent_id,
+        )
+        return current_config
+
+    # Rebuild config with augmented developer_instructions so the
+    # fresh thread's first turn sees the handoff inline. The original
+    # `tc.system_prompt` is left untouched on `tc` itself — we use a
+    # local augmented copy via _codex_developer_instructions, which is
+    # the canonical place developer_instructions are composed. Falling
+    # back to `current_config` if the rebuild raises (rare — the
+    # ThreadConfig kwargs are pure Python dicts at this layer).
+    new_config: Any = current_config
+    try:
+        augmented_system_prompt = (tc.system_prompt or "") + (
+            handoff_suffix or ""
+        )
+        kwargs: dict[str, Any] = {
+            "cwd": tc.workspace_cwd or None,
+            "developer_instructions": _codex_developer_instructions(
+                augmented_system_prompt,
+            ),
+            "approval_policy": "never",
+            "sandbox": _codex_sandbox_for(tc.agent_id),
+            "config": _codex_config_overrides(tc),
+        }
+        if tc.model:
+            kwargs["model"] = tc.model
+        cls = getattr(sdk, "ThreadConfig", None) if sdk is not None else None
+        new_config = cls(**kwargs) if cls is not None else kwargs
+    except Exception:
+        logger.exception(
+            "CodexRuntime: rebuild ThreadConfig with handoff suffix "
+            "failed for slot=%s — proceeding with original config "
+            "(memory salvage degraded but not aborted)", agent_id,
+        )
+
+    # Flag the post-result handler to clear the synthetic note on
+    # first non-error turn (cleanup at codex.py ~line 1862).
+    try:
+        if isinstance(getattr(tc, "turn_ctx", None), dict):
+            tc.turn_ctx["had_handoff_on_entry"] = True
+    except Exception:
+        # turn_ctx is optional / may be a non-dict mapping. Don't
+        # block salvage on this — the synthetic note will simply
+        # persist until the agent calls /compact or the human clears
+        # it. Better than no salvage.
+        logger.exception(
+            "CodexRuntime: set had_handoff_on_entry failed for slot=%s",
+            agent_id,
+        )
+
+    return new_config
 
 
 # ---------------------------------------------------------------------
@@ -1997,7 +2181,7 @@ class CodexRuntime:
 
                 client.set_approval_handler(_approval_handler)
 
-            thread, resumed = await open_thread(tc.agent_id, client, config=config)
+            thread, resumed = await open_thread(tc.agent_id, client, config=config, tc=tc)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -2138,7 +2322,7 @@ class CodexRuntime:
                 thread = prepared["thread"]
                 resumed = bool(prepared["resumed"])
             else:
-                thread, resumed = await open_thread(tc.agent_id, client, config=config)
+                thread, resumed = await open_thread(tc.agent_id, client, config=config, tc=tc)
             tc.turn_ctx["codex_resumed_session"] = resumed
 
             stream = thread.chat(
