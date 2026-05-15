@@ -789,6 +789,33 @@ async def _reset_agent_idle_tools(c: Any, agent_id: str) -> None:
     await _set_agent_role_tools(c, agent_id, "idle")
 
 
+async def _set_agent_current_task_if_free_or_stale(
+    c: Any,
+    agent_id: str,
+    task_id: str,
+) -> None:
+    """Point a slot at task_id unless it is already on live work.
+
+    Older builds sometimes left current_task_id pointing at an archived task.
+    A later execute assignment guarded with `IS NULL` then failed to surface
+    the real active executor task, and the slot kept its idle tool allowlist.
+    Treat missing/archived task pointers as stale and replace them.
+    """
+    await c.execute(
+        "UPDATE agents SET current_task_id = ? "
+        "WHERE id = ? AND ("
+        "  current_task_id IS NULL "
+        "  OR current_task_id = ? "
+        "  OR NOT EXISTS ("
+        "    SELECT 1 FROM tasks t "
+        "    WHERE t.id = agents.current_task_id "
+        "    AND t.status != 'archive'"
+        "  )"
+        ")",
+        (task_id, agent_id, task_id),
+    )
+
+
 def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) -> Any:
     """Build an in-process MCP server whose tools know which agent is calling.
 
@@ -1324,14 +1351,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             # still NULL — the executor can't find their own task. The
             # mid-flight `coord_assign_task` path already does this; the
             # create-time path was missing it. Idempotent: guarded with
-            # `WHERE current_task_id IS NULL` so we don't stomp an
-            # existing assignment if the same Player already owns
-            # something else (the idle poller / pane will sort it out).
+            # a live-task check so we don't stomp an existing assignment
+            # if the same Player already owns something else, but we do
+            # replace archived/missing stale pointers left by older builds.
             if initial_status == "execute" and initial_owner:
-                await c.execute(
-                    "UPDATE agents SET current_task_id = ? "
-                    "WHERE id = ? AND current_task_id IS NULL",
-                    (task_id, initial_owner),
+                await _set_agent_current_task_if_free_or_stale(
+                    c, initial_owner, task_id,
                 )
             if planted_first_stage and initial_owner and first_role:
                 await _set_agent_role_tools(c, initial_owner, first_role)
@@ -6413,17 +6438,32 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         try:
             # Bucket 1: active executor task.
             cur = await c.execute(
-                "SELECT a.current_task_id, t.title, t.status, t.priority, "
-                "t.trajectory, t.spec_path "
+                "SELECT a.current_task_id, t.id AS task_id, t.title, "
+                "t.status, t.priority, t.trajectory, t.spec_path, "
+                "EXISTS ("
+                "  SELECT 1 FROM task_role_assignments r "
+                "  WHERE r.task_id = a.current_task_id "
+                "  AND r.role = 'executor' "
+                "  AND r.owner = ? "
+                "  AND r.completed_at IS NULL "
+                "  AND r.superseded_by IS NULL"
+                ") AS has_active_executor "
                 "FROM agents a LEFT JOIN tasks t ON t.id = a.current_task_id "
                 "WHERE a.id = ?",
-                (caller_id,),
+                (caller_id, caller_id),
             )
             arow = await cur.fetchone()
             executor_task = None
             if arow:
                 ad = dict(arow)
-                if ad.get("current_task_id"):
+                current_task_id = ad.get("current_task_id")
+                task_status = ad.get("status")
+                if (
+                    current_task_id
+                    and ad.get("task_id")
+                    and task_status != "archive"
+                    and ad.get("has_active_executor")
+                ):
                     ad_stages = _trajectory_stages_from_row(ad)
                     executor_task = {
                         "id": ad["current_task_id"],
@@ -6433,6 +6473,16 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                         "trajectory": ad_stages,
                         "has_spec": bool(ad.get("spec_path")),
                     }
+                elif (
+                    current_task_id
+                    and (not ad.get("task_id") or task_status == "archive")
+                ):
+                    await c.execute(
+                        "UPDATE agents SET current_task_id = NULL "
+                        "WHERE id = ? AND current_task_id = ?",
+                        (caller_id, current_task_id),
+                    )
+                    await c.commit()
 
             # Defensive Bucket 1b: if `agents.current_task_id` is out
             # of sync with the executor role row (the production bug
@@ -6467,15 +6517,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                         "trajectory": rd_stages,
                         "has_spec": bool(rd.get("spec_path")),
                     }
-                    # Self-heal: write back current_task_id so the
-                    # next read goes through Bucket 1's fast path.
-                    # Guarded with `IS NULL` so we don't stomp a
-                    # legitimately different active task.
-                    await c.execute(
-                        "UPDATE agents SET current_task_id = ? "
-                        "WHERE id = ? AND current_task_id IS NULL",
-                        (rd["id"], caller_id),
+                    # Self-heal: write back current_task_id so the next
+                    # read goes through Bucket 1's fast path, and restore
+                    # the executor tool allowlist so the next Codex spawn
+                    # exposes coord_commit_push.
+                    await _set_agent_current_task_if_free_or_stale(
+                        c, caller_id, rd["id"],
                     )
+                    await _set_agent_role_tools(c, caller_id, "executor")
                     await c.commit()
 
             # Bucket 2 + 3: pending planner / reviewer / shipper
@@ -7263,10 +7312,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 # Propagate current_task_id when entering execute with
                 # a hard-assigned executor (mirror coord_create_task).
                 if next_stage == "execute":
-                    await c.execute(
-                        "UPDATE agents SET current_task_id = ? "
-                        "WHERE id = ? AND current_task_id IS NULL",
-                        (task_id, assignee),
+                    await _set_agent_current_task_if_free_or_stale(
+                        c, assignee, task_id,
                     )
                 for displaced in set(displaced_source + displaced_target):
                     if displaced != assignee:
@@ -8331,10 +8378,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                      now_iso, now_iso),
                 )
                 if initial_status == "execute":
-                    await c.execute(
-                        "UPDATE agents SET current_task_id = ? "
-                        "WHERE id = ? AND current_task_id IS NULL",
-                        (task_id, first_to[0]),
+                    await _set_agent_current_task_if_free_or_stale(
+                        c, first_to[0], task_id,
                     )
                 await _set_agent_role_tools(c, first_to[0], first_role)
             await c.execute(

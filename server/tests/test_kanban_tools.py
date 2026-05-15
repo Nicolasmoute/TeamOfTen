@@ -162,10 +162,30 @@ async def test_create_task_first_stage_assignment_sets_role_tools(
 ) -> None:
     await init_db()
     server = _server_for("coach")
-    await _create_and_promote(server, {
+    create_text = _ok_text(await _handler(server, "create_task")({
         "title": "demo",
         "trajectory": [{"stage": "execute", "to": "p2"}],
-    })
+    }))
+    backlog_id = _extract_backlog_id(create_text)
+    await _seed_task(
+        task_id="t-2026-05-03-11111111",
+        status="archive",
+        owner="p2",
+    )
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE agents SET current_task_id = ? WHERE id = 'p2'",
+            ("t-2026-05-03-11111111",),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    promote_text = _ok_text(await _handler(server, "triage_backlog")({
+        "id": str(backlog_id),
+        "action": "promote",
+    }))
+    task_id = _extract_task_id(promote_text)
 
     c = await configured_conn()
     try:
@@ -179,7 +199,7 @@ async def test_create_task_first_stage_assignment_sets_role_tools(
     tools = set(json.loads(row["allowed_tools"]))
     assert "mcp__coord__coord_commit_push" in tools
     assert "mcp__coord__coord_role_complete" in tools
-    assert row["current_task_id"]
+    assert row["current_task_id"] == task_id
 
 
 async def test_set_agent_role_tools_evicts_codex_client(

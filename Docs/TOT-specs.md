@@ -772,6 +772,12 @@ cancelled   -> terminal
 ```
 
 Completing or cancelling a task clears the owner's `current_task_id`.
+When a Player is hard-assigned to execute, the harness writes that task
+to `agents.current_task_id` if the slot is free or if the existing
+pointer is stale (missing/archived task). `coord_my_assignments` applies
+the same defensive read: an archived pointer cannot hide a live active
+executor role, and the tool self-heals the slot back to the executor
+task/tool surface.
 
 ### 6.6 `messages`
 
@@ -4735,9 +4741,10 @@ denied`), Player turns automatically degrade to the pre-boundary
 remains read-only. `/api/health/detail` exposes
 `checks.codex_sandbox` with the probe result.
 
-Token lifetime, MCP cache invalidation on config change,
-`default_tools_approval_mode` injection, and the stdio error-shape
-contract are CodexRuntime concerns — see
+Token lifetime, MCP cache invalidation on config change or
+`agents.allowed_tools` mismatch, `default_tools_approval_mode`
+injection, and the stdio error-shape contract are CodexRuntime concerns
+— see
 `Docs/CODEX_RUNTIME_SPEC.md` §C.4 and §E.1.
 The proxy also implements empty MCP `resources/list`,
 `resources/templates/list`, and `prompts/list`; Codex app-server

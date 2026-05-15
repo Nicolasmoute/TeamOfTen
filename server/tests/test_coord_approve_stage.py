@@ -354,6 +354,20 @@ async def test_approve_stage_sets_role_allowed_tools_and_idles_displaced(
     await init_db()
     await _seed_task(status="plan")
     await _plant_role(task_id="t-2026-05-07-aaaa1111", role="executor", owner="p3")
+    await _seed_task(
+        task_id="t-2026-05-07-deadbeef",
+        status="archive",
+        owner="p2",
+    )
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE agents SET current_task_id = ? WHERE id = 'p2'",
+            ("t-2026-05-07-deadbeef",),
+        )
+        await c.commit()
+    finally:
+        await c.close()
 
     server = _server_for("coach")
     _ok_text(await _handler(server, "approve_stage")({
@@ -366,7 +380,8 @@ async def test_approve_stage_sets_role_allowed_tools_and_idles_displaced(
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "SELECT id, allowed_tools FROM agents WHERE id IN ('p2', 'p3')"
+            "SELECT id, allowed_tools, current_task_id "
+            "FROM agents WHERE id IN ('p2', 'p3')"
         )
         rows = {dict(r)["id"]: dict(r) for r in await cur.fetchall()}
     finally:
@@ -377,6 +392,7 @@ async def test_approve_stage_sets_role_allowed_tools_and_idles_displaced(
     assert "mcp__coord__coord_commit_push" in p2_tools
     assert "mcp__coord__coord_commit_push" not in p3_tools
     assert "mcp__coord__coord_my_assignments" in p3_tools
+    assert rows["p2"]["current_task_id"] == "t-2026-05-07-aaaa1111"
 
 
 async def test_approve_stage_archive_no_assignee_marks_roles_complete(
