@@ -23,6 +23,7 @@ from typing import Any
 from server.db import configured_conn
 from server.events import bus
 from server.paths import project_paths
+from server.protected_file_limits import FILE_WRITE_PROPOSAL_MAX_CHARS
 
 
 class FileWriteProposalNotFound(Exception):
@@ -150,9 +151,10 @@ async def resolve_file_write_proposal(
     if new_status == "approved":
         target = resolve_target_path(proposal)
         content = proposal["proposed_content"]
-        if len(content) > 200_000:
+        if len(content) > FILE_WRITE_PROPOSAL_MAX_CHARS:
             raise FileWriteProposalBadRequest(
-                f"content too long ({len(content)} chars, max 200000)"
+                f"content too long ({len(content)} chars, "
+                f"max {FILE_WRITE_PROPOSAL_MAX_CHARS})"
             )
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -203,5 +205,4 @@ async def resolve_file_write_proposal(
         "status": new_status,
         "size": write_size,
     }
-
 

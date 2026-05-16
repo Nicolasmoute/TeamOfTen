@@ -1280,7 +1280,7 @@ path, content, summary)` with `scope='truth'` selecting this lane:
    `POST /api/file-write-proposals/{id}/approve` which (a) writes
    the proposed content to `truth/<path>` directly (the truth-scope
    resolver uses its own write — broader extension allowlist +
-   200 KB cap — not the Files-pane write_text endpoint), then (b)
+   512,000-char cap — not the Files-pane write_text endpoint), then (b)
    marks the row `approved` with timestamp + `resolved_by =
    "human"` + actor metadata. Deny only marks the row.
 5. Approve emits `file_write_proposal_approved`; deny emits
@@ -2566,10 +2566,16 @@ Current implementation gap:
     resolver refuses to write if the row's path was tampered with).
   - The harness-wide `/data/CLAUDE.md` is NOT a valid scope; only
     the user edits that file.
-- `content` is a full file body (max 200,000 chars). This is a full
+- `content` is a full file body (hard cap 512,000 chars). This is a full
   REPLACE — Coach must include the parts being kept verbatim. The
   user reviews a side-by-side diff against the current file content
   in the UI before approving.
+- Human-reviewable truth should stay much smaller than the hard cap:
+  target 2-8 KB per truth section, warn above 12 KB, strongly prefer
+  splitting above 25 KB, and avoid full-file proposals above 50 KB
+  unless bridging an existing monolithic file. The hard cap exists so
+  legacy files like `TOT-specs.md` can still be mirrored while the
+  section-based truth flow is built.
 - `summary` is a single-line "why" (max 200 chars) shown next to the
   approve/deny buttons.
 - **Auto-supersede invariant**: at most one `pending` proposal per
@@ -2610,7 +2616,7 @@ The resolver in `server/truth.py` handles approve/deny:
   with a `relative_to` check (rejects traversal as
   `FileWriteProposalBadRequest`), `mkdir(parents=True, exist_ok=True)` on
   the parent, then `write_text(content, encoding="utf-8")`. Caps at
-  200 KB. Bypasses the Files-pane endpoint's `.md`/`.txt` restriction
+  512,000 chars. Bypasses the Files-pane endpoint's `.md`/`.txt` restriction
   on purpose — text-of-any-extension is the right policy for truth
   (specs, brand YAML, JSON contracts) since the user is the gate at
   approval time.
@@ -2632,10 +2638,13 @@ The resolver in `server/truth.py` handles approve/deny:
 - Rejects leading `/` and any `..` segment; resolves the target
   with `Path.resolve()` and re-anchors under the project root so a
   symlink / weird-casing trick can't escape the lane.
-- 200 KB size cap (matches the propose tool's write cap). Files
+- 512,000-char size cap (matches the protected proposal hard cap). Files
   that aren't valid UTF-8 are rejected with a clear error rather
   than returning garbage; binary deliverables under `outputs/`
   cannot be read through this tool.
+- This is hard-cap headroom, not the desired long-term truth shape:
+  large truth/spec files should be split into human-reviewable sections
+  with a target of 2-8 KB per section.
 - Exists in addition to Claude's native `Read` because the Codex
   runtime's restrictive sandbox blocks alternative read paths;
   `coord_read_file` bypasses that constraint via the MCP proxy. See
@@ -3268,7 +3277,7 @@ user reviews a diff and approves/denies here.
 | --- | --- |
 | `GET /api/file-write-proposals?status=&scope=&limit=` | List file-write proposals for the active project, newest first. Status filter ∈ `pending` / `approved` / `denied` / `cancelled` / `superseded`; scope filter ∈ `truth` / `project_claude_md`; omit either for all. Default limit 50, cap 200. |
 | `GET /api/file-write-proposals/{id}/diff` | Returns `{id, scope, path, before, after}` so the UI can render a side-by-side diff. `before` is the current file content read fresh from disk (or `null` if the file doesn't exist yet — UI falls back to a plain proposed-content render). `after` is the proposed content. 404 if proposal missing; 400 if the row's scope/path is malformed. |
-| `POST /api/file-write-proposals/{id}/approve` | Resolve a pending proposal as approved. Dispatches on scope: `truth` writes to `truth/<path>` (broader extension allowlist than the Files-pane endpoint, 200 KB cap); `project_claude_md` writes to the project's `CLAUDE.md`. Then marks the row. Body `{note}` optional. Emits `file_write_proposal_approved`. |
+| `POST /api/file-write-proposals/{id}/approve` | Resolve a pending proposal as approved. Dispatches on scope: `truth` writes to `truth/<path>` (broader extension allowlist than the Files-pane endpoint, 512,000-char cap); `project_claude_md` writes to the project's `CLAUDE.md`. Then marks the row. Body `{note}` optional. Emits `file_write_proposal_approved`. |
 | `POST /api/file-write-proposals/{id}/deny` | Resolve a pending proposal as denied. No file write. Body `{note}` optional. Emits `file_write_proposal_denied`. |
 
 All file-write-proposal endpoints are token-gated; the resolve endpoints carry an `audit_actor` payload on emitted events.

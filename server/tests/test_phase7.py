@@ -738,6 +738,42 @@ async def test_propose_truth_update_accepts_bare_filename(fresh_db) -> None:
     assert "queued" in text or "proposal" in text.lower()
 
 
+async def test_propose_truth_update_accepts_tot_spec_sized_file(
+    fresh_db,
+) -> None:
+    """The monolithic TOT spec is larger than the old 200k protected-file
+    cap. Until truth moves to section-based promotion, Coach must still
+    be able to queue a full-file mirror proposal."""
+    await init_db()
+    from server.paths import ensure_project_scaffold
+    ensure_project_scaffold("misc")
+    from server.tools import build_coord_server
+    srv = build_coord_server("coach", include_proxy_metadata=True)
+    handler = srv["_handlers"]["coord_propose_file_write"]
+
+    content = "x" * 220_960
+    out = await _propose_truth(
+        handler,
+        path="TOT-specs.md",
+        content=content,
+        summary="mirror current TOT spec",
+    )
+    assert out.get("is_error") is not True
+    assert "220960 chars" in out["content"][0]["text"]
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT length(proposed_content) FROM file_write_proposals "
+            "WHERE project_id = ? AND path = ? AND status = 'pending'",
+            (MISC_PROJECT_ID, "TOT-specs.md"),
+        )
+        row = await cur.fetchone()
+    finally:
+        await c.close()
+    assert row[0] == len(content)
+
+
 async def test_file_write_proposals_schema_smoke(fresh_db) -> None:
     """file_write_proposals table exists, accepts an insert, status defaults
     to 'pending', and the CHECK constraint rejects bad statuses."""
@@ -889,8 +925,8 @@ async def test_resolve_file_write_proposal_approves_yaml_and_oversize_md(
     pp = ensure_project_scaffold(MISC_PROJECT_ID)
 
     yaml_body = "primary_color: '#0066cc'\nsecondary_color: '#003366'\n"
-    big_md = "# Spec\n\n" + ("paragraph. " * 12_000)  # ~144 KB > 100 KB
-    assert len(big_md) > 100_000
+    big_md = "# Spec\n\n" + ("paragraph. " * 23_000)  # ~253 KB > old 200 KB cap
+    assert len(big_md) > 220_960
 
     for path, content in (
         ("brand-colors.yaml", yaml_body),
@@ -1820,18 +1856,36 @@ async def test_coord_read_file_missing_file(fresh_db) -> None:
 
 
 async def test_coord_read_file_oversize_rejected(fresh_db) -> None:
-    """Files over 200 KB are refused — the tool isn't a streaming
-    reader, and the surrounding system prompt has a budget."""
+    """Files over the protected read cap are refused. The tool is not
+    a streaming reader, and the surrounding system prompt has a budget."""
     await init_db()
     from server.paths import ensure_project_scaffold, project_paths
+    from server.protected_file_limits import COORD_READ_FILE_MAX_CHARS
     ensure_project_scaffold(MISC_PROJECT_ID)
     pp = project_paths(MISC_PROJECT_ID)
     big = pp.knowledge / "big.md"
     big.parent.mkdir(parents=True, exist_ok=True)
-    big.write_text("x" * 200_001, encoding="utf-8")
+    big.write_text("x" * (COORD_READ_FILE_MAX_CHARS + 1), encoding="utf-8")
     out = await _read_via_handler("coach", "working/knowledge/big.md")
     assert out.get("is_error") is True
     assert "too large" in out["content"][0]["text"].lower()
+
+
+async def test_coord_read_file_accepts_tot_spec_sized_file(fresh_db) -> None:
+    """Coach can read today's monolithic TOT spec-sized docs through
+    coord_read_file; otherwise protected truth mirrors deadlock when
+    shell fallback is unavailable in the deploy sandbox."""
+    await init_db()
+    from server.paths import ensure_project_scaffold, project_paths
+    ensure_project_scaffold(MISC_PROJECT_ID)
+    pp = project_paths(MISC_PROJECT_ID)
+    target = pp.root / "Docs" / "TOT-specs.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("x" * 220_960, encoding="utf-8")
+
+    out = await _read_via_handler("coach", "Docs/TOT-specs.md")
+    assert out.get("is_error") is not True
+    assert "(220960 chars)" in out["content"][0]["text"]
 
 
 async def test_coord_read_file_rejects_binary(fresh_db) -> None:

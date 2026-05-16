@@ -16,6 +16,10 @@ from server import knowledge as knowmod
 from server import outputs as outmod
 from server.db import configured_conn, resolve_active_project
 from server.events import bus
+from server.protected_file_limits import (
+    COORD_READ_FILE_MAX_CHARS,
+    FILE_WRITE_PROPOSAL_MAX_CHARS,
+)
 from server.webdav import webdav
 from server.workspaces import project_repo_configured, workspace_dir
 
@@ -3284,9 +3288,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
 
         if not isinstance(content, str):
             return _err("content is required (string)")
-        if len(content) > 200_000:
+        if len(content) > FILE_WRITE_PROPOSAL_MAX_CHARS:
             return _err(
-                f"content too long ({len(content)} chars, max 200000)"
+                f"content too long ({len(content)} chars, "
+                f"max {FILE_WRITE_PROPOSAL_MAX_CHARS})"
             )
         if not summary:
             return _err("summary is required (one-line 'why' the user reads)")
@@ -3399,7 +3404,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "prompt copy is frozen at turn start).\n"
             "\n"
             "Limits:\n"
-            "- Returns up to 200 KB of file content; larger files are "
+            "- Returns up to 512 KB of file content; larger files are "
             "  rejected with a size error (use `coord_list_knowledge` / "
             "  the Files pane for an index of large trees).\n"
             "- Text-only: files that aren't valid UTF-8 are rejected. "
@@ -3445,9 +3450,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             size = target.stat().st_size
         except OSError as e:
             return _err(f"stat failed: {e}")
-        if size > 200_000:
+        if size > COORD_READ_FILE_MAX_CHARS:
             return _err(
-                f"file too large ({size} chars, max 200000); use the "
+                f"file too large ({size} chars, "
+                f"max {COORD_READ_FILE_MAX_CHARS}); use the "
                 "Files pane or chunk via Read tool / shell"
             )
         try:
