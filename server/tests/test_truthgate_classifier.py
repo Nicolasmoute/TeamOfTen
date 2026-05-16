@@ -1,0 +1,185 @@
+from __future__ import annotations
+
+import asyncio
+import json
+
+import pytest
+
+from server.paths import ensure_project_scaffold
+from server.shared.llm_types import LLMResult
+from server.truthgate.classifier import (
+    TruthGateClassificationError,
+    TruthGateTaskInput,
+    parse_classifier_output,
+    run_truthgate_classifier,
+)
+from server.truthgate.config import TruthGateConfigError, load_config
+from server.truthgate.corpus import gather_truth_corpus
+
+
+def _write_truth(project_id: str, name: str, body: str) -> None:
+    pp = ensure_project_scaffold(project_id)
+    target = pp.truth / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_sparse_corpus_passes_without_llm(
+    fresh_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id = "sparse"
+    _write_truth(project_id, "one.md", "# One\n")
+
+    called = False
+
+    async def fake_call(*args, **kwargs):
+        nonlocal called
+        called = True
+        return LLMResult(text="{}")
+
+    import server.truthgate.llm as tg_llm
+
+    monkeypatch.setattr(tg_llm, "call_classifier", fake_call)
+    monkeypatch.setenv("HARNESS_TRUTHGATE_MIN_CORPUS_FILES", "3")
+
+    result = await run_truthgate_classifier(
+        project_id,
+        TruthGateTaskInput(title="Do thing", task_id="t-2026-05-16-aaaaaaaa"),
+    )
+
+    assert result["verdict"] == "truthgate_pass"
+    assert result["method"] == "classifier_sparse"
+    assert result["truth_basis"] == []
+    assert "sparse mode" in result["warning"]
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_classifier_parses_mocked_llm_and_validates_basis(
+    fresh_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id = "full"
+    _write_truth(project_id, "alpha.md", "# Alpha\n")
+    _write_truth(project_id, "beta.md", "# Beta\n")
+    _write_truth(project_id, "nested/gamma.txt", "Gamma\n")
+
+    async def fake_call(*args, **kwargs):
+        return LLMResult(
+            text=json.dumps({
+                "verdict": "truthgate_pass",
+                "truth_basis": ["truth/alpha.md#scope"],
+                "truth_concerns": ["keep within alpha"],
+                "rationale": "authorized",
+                "suggested_amendment": None,
+                "confidence": 0.8,
+            })
+        )
+
+    import server.truthgate.llm as tg_llm
+
+    monkeypatch.setattr(tg_llm, "call_classifier", fake_call)
+    monkeypatch.setenv("HARNESS_TRUTHGATE_MIN_CORPUS_FILES", "3")
+
+    result = await run_truthgate_classifier(
+        project_id,
+        TruthGateTaskInput(
+            title="Implement alpha",
+            description="Must match alpha.",
+            success_criteria="passes",
+            workflow="code",
+            trajectory='[{"stage":"execute","to":["p1"]}]',
+        ),
+    )
+
+    assert result["method"] == "classifier"
+    assert result["truth_basis"] == ["truth/alpha.md#scope"]
+    assert result["confidence"] == 0.8
+    assert result["model_alias"] == "latest_sonnet"
+    assert result["fallback_model"] == "gpt-5.4-mini"
+
+
+def test_parse_invalid_json_fails_closed(fresh_db: str) -> None:
+    project_id = "parsefail"
+    _write_truth(project_id, "a.md", "A")
+    corpus = gather_truth_corpus(
+        project_id,
+        total_budget_chars=32_000,
+        per_file_chars=16_000,
+    )
+    with pytest.raises(TruthGateClassificationError, match="invalid JSON"):
+        parse_classifier_output("not json", project_id=project_id, corpus=corpus)
+
+
+def test_parse_rejects_basis_outside_truth(fresh_db: str) -> None:
+    project_id = "badbasis"
+    _write_truth(project_id, "a.md", "A")
+    corpus = gather_truth_corpus(
+        project_id,
+        total_budget_chars=32_000,
+        per_file_chars=16_000,
+    )
+    raw = json.dumps({
+        "verdict": "truthgate_pass",
+        "truth_basis": ["Docs/TOT-specs.md"],
+        "truth_concerns": [],
+        "rationale": "bad",
+        "suggested_amendment": None,
+        "confidence": 0.5,
+    })
+    with pytest.raises(TruthGateClassificationError, match="truth/"):
+        parse_classifier_output(raw, project_id=project_id, corpus=corpus)
+
+
+def test_config_rejects_opus_and_gpt_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HARNESS_TRUTHGATE_MODEL", "latest_opus")
+    with pytest.raises(TruthGateConfigError):
+        load_config()
+
+    monkeypatch.setenv("HARNESS_TRUTHGATE_MODEL", "latest_sonnet")
+    monkeypatch.setenv("HARNESS_TRUTHGATE_FALLBACK_MODEL", "latest_gpt")
+    with pytest.raises(TruthGateConfigError):
+        load_config()
+
+    monkeypatch.setenv("HARNESS_TRUTHGATE_FALLBACK_MODEL", "gpt-5.5")
+    with pytest.raises(TruthGateConfigError):
+        load_config()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runs_are_locked(
+    fresh_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id = "locked"
+    _write_truth(project_id, "a.md", "A")
+    _write_truth(project_id, "b.md", "B")
+    _write_truth(project_id, "c.md", "C")
+    release = asyncio.Event()
+
+    async def fake_call(*args, **kwargs):
+        await release.wait()
+        return LLMResult(
+            text=json.dumps({
+                "verdict": "truthgate_pass",
+                "truth_basis": ["truth/a.md"],
+                "truth_concerns": [],
+                "rationale": "ok",
+                "suggested_amendment": None,
+                "confidence": 0.9,
+            })
+        )
+
+    import server.truthgate.llm as tg_llm
+
+    monkeypatch.setattr(tg_llm, "call_classifier", fake_call)
+    first = asyncio.create_task(
+        run_truthgate_classifier(project_id, TruthGateTaskInput(title="one"))
+    )
+    await asyncio.sleep(0)
+    with pytest.raises(TruthGateClassificationError, match="already running"):
+        await run_truthgate_classifier(project_id, TruthGateTaskInput(title="two"))
+    release.set()
+    await first
