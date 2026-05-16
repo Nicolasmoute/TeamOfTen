@@ -2531,22 +2531,47 @@ Current implementation gap:
      `audit_semantics` → `auditor_semantics`).
 - **Git operations** (in caller's worktree):
   1. `git fetch origin`
-  2. `git checkout -b ship-<task_id> origin/dev`
-  3. `git cherry-pick <executor_sha>`
-  4. `git push origin ship-<task_id>:ship-<task_id>`
+  2. If a prior `task_shipped_to_dev` event exists, treat the call as
+     idempotent: close any still-open shipper role row and return the
+     existing evidence without another GitHub PR or duplicate ship event.
+  3. If the executor commit or equivalent patch is already present on
+     `origin/dev`, close the shipper role row, emit `task_shipped_to_dev`
+     with `ship_method='already_present'`, `idempotent=true`, and
+     `ship_sha=<origin/dev sha>`, then return without opening a PR.
+  4. If local branch `ship-<task_id>` already exists, resume it:
+     - If already on the branch and there is no `CHERRY_PICK_HEAD` or
+       unmerged path, continue to push/PR/merge.
+     - If on another branch, require a clean worktree before checking out
+       `ship-<task_id>`.
+     - If conflicts are still unresolved, fail closed with instructions
+       and do not push, create a PR, emit ship evidence, or complete the
+       role.
+  5. Otherwise, `git checkout -b ship-<task_id> origin/dev`
+  6. `git cherry-pick -x <executor_sha>`
+  7. `git push origin ship-<task_id>:ship-<task_id>`
   - Cherry-pick conflict → returns error with the conflicted SHA and
     instructs the Player to resolve manually or run
-    `git cherry-pick --abort` to clean up.
+    `git cherry-pick --abort` to clean up. After manual resolution and
+    `git cherry-pick --continue`, rerun `coord_ship_to_dev(task_id)` to
+    resume the existing temp branch.
+  - Empty/no-op cherry-pick → re-checks whether the patch is already
+    present on `origin/dev`; if confirmed, uses the already-present
+    success path, otherwise fails closed.
 - **GitHub API** (PAT extracted from `projects.repo_url`):
-  1. `POST /repos/{owner}/{repo}/pulls` → create PR titled
-     `[ship] <task_id>: <title>`
-  2. `PUT /repos/{owner}/{repo}/pulls/{n}/merge` (squash merge)
-  3. `DELETE /repos/{owner}/{repo}/git/refs/heads/ship-<task_id>`
+  1. Query open PRs for `head=<owner>:ship-<task_id>&base=dev`; reuse
+     one if present.
+  2. `POST /repos/{owner}/{repo}/pulls` → create PR titled
+     `[ship] <task_id>: <title>` when no reusable PR exists. A 422
+     collision triggers another open-PR lookup before failing.
+  3. `PUT /repos/{owner}/{repo}/pulls/{n}/merge` (squash merge)
+  4. `DELETE /repos/{owner}/{repo}/git/refs/heads/ship-<task_id>`
      (non-fatal on failure)
 - **Post-success:**
   - Closes shipper role row (`completed_at` stamped).
   - Emits `task_shipped_to_dev` event with `task_id`, `ship_sha`,
-    `pr_number`, `pr_url`, `executor_sha`.
+    `pr_number`, `pr_url`, `executor_sha`, `deploy_target='dev'`,
+    `ship_method` (`'pr'`, `'resumed_pr'`, or `'already_present'`), and
+    `idempotent`.
   - Wakes Coach via `_wake_coach_for_completion`.
 - **Return:** `ok=True` text with `pr_url`, `pr_number`, dev HEAD SHA.
   If the trajectory includes `verify`, the response reminds Coach to
