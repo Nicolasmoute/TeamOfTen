@@ -655,6 +655,69 @@ async def test_run_agent_passes_codex_shipper_gate_to_mcp_config(
     assert "coord_approve_stage" not in captured["coord_enabled_tools"]
 
 
+async def test_run_agent_uses_team_extra_tools_to_start_codex_external_mcp(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_db: str,
+) -> None:
+    """Team-wide extra tools are an explicit Codex MCP opt-in.
+
+    Without this, a connected external MCP server can be omitted from the
+    Codex app-server even though its `mcp__server__tool` name is allowed,
+    leaving deferred tool search with no metadata to surface.
+    """
+    import server.db as dbmod
+    await dbmod.init_db()
+
+    import aiosqlite
+    import server.agents as agentsmod
+    import server.runtimes as runtimes_mod
+
+    async with aiosqlite.connect(fresh_db, timeout=10.0) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO team_config (key, value) VALUES (?, ?)",
+            ("extra_tools", json.dumps(["mcp__zeabur__logs"])),
+        )
+        await db.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Runtime:
+        name = "codex"
+
+        async def maybe_auto_compact(self, tc):
+            return False
+
+        async def run_turn(self, tc):
+            from server.runtimes.codex import _build_mcp_servers
+
+            captured["allowed_tools"] = tc.allowed_tools
+            captured["servers"] = _build_mcp_servers(tc)
+            tc.turn_ctx["got_result"] = True
+
+        async def run_manual_compact(self, tc):
+            await self.run_turn(tc)
+
+    async def runtime_for(agent_id):
+        return "codex"
+
+    monkeypatch.delenv("HARNESS_CODEX_EXTERNAL_MCP", raising=False)
+    monkeypatch.setattr(agentsmod, "_resolve_runtime_for", runtime_for)
+    monkeypatch.setattr(
+        agentsmod,
+        "load_external_servers",
+        lambda: (
+            {"zeabur": {"type": "stdio", "command": "zeabur-mcp"}},
+            ["mcp__zeabur__logs"],
+        ),
+    )
+    monkeypatch.setattr(runtimes_mod, "get_runtime", lambda name: _Runtime())
+
+    await agentsmod.run_agent("coach", "hello")
+
+    assert "mcp__zeabur__logs" in set(captured["allowed_tools"])
+    assert "zeabur" in captured["servers"]
+
+
 async def test_run_agent_refreshes_stale_shipper_allowed_tools(
     monkeypatch: pytest.MonkeyPatch,
     fresh_db: str,
