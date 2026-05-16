@@ -184,8 +184,8 @@ deployed Zeabur instance — see "What needs verification" below.
 
 Data lanes shipped & documented:
 - **attachments** — UI paste-target for images, local-only, 30d trim.
-- **uploads** — human → kDrive → container, pulled every 60s,
-  per-slot `./uploads` symlink. Read-only for agents.
+- **uploads** — human → top-level kDrive `uploads/` → `/data/uploads`,
+  pulled every 60s. Read-only for agents.
 - **outputs** — agent → binary deliverables (`coord_save_output`,
   base64) + safety-net push loop every 60s for Write/Bash bypass.
 - **knowledge** — agent → text artifacts (.md/.txt) via

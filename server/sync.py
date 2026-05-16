@@ -86,9 +86,8 @@ SESSION_RETENTION_DAYS = int(
 
 # WebDAV → local uploads pull. Users drop reference docs at
 # <webdav>/uploads/ via the web UI or sync client; we mirror them
-# into /data/uploads (which each agent workspace symlinks as
-# ./uploads) so Players can Read ./uploads/foo.pdf. Default 60s —
-# it's user-driven so a minute is snappy enough.
+# into /data/uploads so Players can read /data/uploads/foo.pdf.
+# Default 60s — it's user-driven so a minute is snappy enough.
 UPLOADS_PULL_INTERVAL_SECONDS = int(
     os.environ.get("HARNESS_UPLOADS_PULL_INTERVAL", "60")
 )
@@ -307,6 +306,12 @@ async def pull_uploads_once() -> dict[str, int]:
     """
     if not webdav.enabled:
         return {"added": 0, "removed": 0, "kept": 0}
+    ensure_dir = getattr(webdav, "ensure_dir", None)
+    if callable(ensure_dir):
+        try:
+            await ensure_dir("uploads")
+        except Exception:
+            logger.exception("uploads pull: remote mkdir failed")
     try:
         remote_names = await webdav.list_dir("uploads")
     except Exception:
