@@ -422,6 +422,55 @@ async def test_approve_stage_ship_sets_ship_gate_allowed_tool(
     assert "mcp__coord__coord_approve_stage" not in tools
 
 
+async def test_approve_stage_ship_to_verify_sets_verifier_tools(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed_task(status="ship", owner="p2")
+    await _plant_role(task_id="t-2026-05-07-aaaa1111", role="shipper", owner="p2")
+
+    server = _server_for("coach")
+    _ok_text(await _handler(server, "approve_stage")({
+        "task_id": "t-2026-05-07-aaaa1111",
+        "next_stage": "verify",
+        "assignee": "p4",
+        "note": "verify dev deployment",
+    }))
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            ("t-2026-05-07-aaaa1111",),
+        )
+        task = dict(await cur.fetchone())
+        cur = await c.execute(
+            "SELECT role, owner, completed_at, superseded_by "
+            "FROM task_role_assignments WHERE task_id = ? "
+            "ORDER BY id",
+            ("t-2026-05-07-aaaa1111",),
+        )
+        roles = [dict(r) for r in await cur.fetchall()]
+        cur = await c.execute("SELECT allowed_tools FROM agents WHERE id = 'p4'")
+        agent = dict(await cur.fetchone())
+    finally:
+        await c.close()
+
+    assert task["status"] == "verify"
+    assert any(
+        r["role"] == "verifier"
+        and r["owner"] == "p4"
+        and r["completed_at"] is None
+        and r["superseded_by"] is None
+        for r in roles
+    )
+    tools = set(json.loads(agent["allowed_tools"]))
+    assert "mcp__coord__coord_submit_verification_report" in tools
+    assert "mcp__coord__coord_ship_to_dev" not in tools
+    assert "mcp__coord__coord_commit_push" not in tools
+    assert "mcp__coord__coord_approve_stage" not in tools
+
+
 async def test_approve_stage_archive_no_assignee_marks_roles_complete(
     fresh_db: str,
 ) -> None:

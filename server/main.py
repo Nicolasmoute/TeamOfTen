@@ -743,7 +743,7 @@ class TaskApproveStageRequest(BaseModel):
     `coord_approve_stage` — single transition tool that authorizes the
     next stage, names the assignee, and provides the wake prompt."""
     next_stage: str = Field(
-        pattern=r"^(plan|execute|audit_syntax|audit_semantics|ship|archive)$"
+        pattern=r"^(plan|execute|audit_syntax|audit_semantics|ship|verify|archive)$"
     )
     # Required for any non-archive next_stage; rejected on archive.
     assignee: str | None = Field(default=None, max_length=10)
@@ -4295,6 +4295,7 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
         "audit_syntax": "auditor_syntax",
         "audit_semantics": "auditor_semantics",
         "ship": "shipper",
+        "verify": "verifier",
     }
 
     c = await configured_conn()
@@ -4576,6 +4577,7 @@ async def get_tasks_board() -> dict[str, Any]:
         "audit_syntax": [],
         "audit_semantics": [],
         "ship": [],
+        "verify": [],
     }
     for row in rows:
         row["assignments"] = role_map.get(row["id"], [])

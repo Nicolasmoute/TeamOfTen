@@ -394,7 +394,7 @@ async def _on_compass_audit_logged(ev: dict[str, Any]) -> None:
 
 
 _VALID_TRAJECTORY_STAGES = {
-    "plan", "execute", "audit_syntax", "audit_semantics", "ship",
+    "plan", "execute", "audit_syntax", "audit_semantics", "ship", "verify",
 }
 
 
@@ -441,6 +441,7 @@ def _role_for_stage(stage: str) -> str | None:
         "audit_syntax": "auditor_syntax",
         "audit_semantics": "auditor_semantics",
         "ship": "shipper",
+        "verify": "verifier",
     }.get(stage)
 
 
@@ -451,6 +452,7 @@ def _role_label(role: str) -> str:
         "auditor_syntax": "formal reviewer",
         "auditor_semantics": "semantic reviewer",
         "shipper": "shipper",
+        "verifier": "verifier",
     }.get(role, role)
 
 
@@ -1276,6 +1278,19 @@ async def _completion_hint_for_role(task_id: str, role: str) -> str:
             f"{_SHIP_STAGE_BOUNDARY}"
             f"{_TOOL_NOT_VISIBLE_ESCAPE}"
         )
+    if role == "verifier":
+        return (
+            f"Verify the shipped/deployed task, then SIGNAL COACH with "
+            f"your verdict by calling coord_submit_verification_report("
+            f"task_id={task_id!r}, verdict='pass' or 'fail', "
+            f"body=<your report>, message_to_coach=<one-line summary>, "
+            f"evidence=<deploy URL/SHA/checks?>). That tool call IS "
+            f"your message to Coach and records the post-ship report. "
+            f"FAIL does NOT auto-revert, create follow-up work, or "
+            f"archive the task; Coach reads the report and decides "
+            f"whether to archive, follow up, roll back, reroute to "
+            f"execute, or re-ship.{_TOOL_NOT_VISIBLE_ESCAPE}"
+        )
     return (
         f"Call coord_my_assignments(); it will print the next "
         f"actionable step + the completion tool to call."
@@ -1319,6 +1334,7 @@ async def _wake_role_or_emit_needed(*, task_id: str, role: str) -> None:
             "auditor_syntax": "audit_syntax",
             "auditor_semantics": "audit_semantics",
             "shipper": "ship",
+            "verifier": "verify",
         }
         await _emit_assignment_needed(
             task_id=task_id,
@@ -1346,6 +1362,7 @@ async def _wake_role_or_emit_needed(*, task_id: str, role: str) -> None:
             "auditor_syntax": "audit_syntax",
             "auditor_semantics": "audit_semantics",
             "shipper": "ship",
+            "verifier": "verify",
         }
         await _emit_assignment_needed(
             task_id=task_id,
