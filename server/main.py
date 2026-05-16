@@ -107,6 +107,22 @@ def audit_actor(request: Request) -> dict[str, str]:
     ua = request.headers.get("user-agent", "")[:120]
     return {"source": "human", "ip": ip, "ua": ua}
 
+
+def _cache_bust_module_imports(
+    app_source: str, versions: dict[str, str],
+) -> str:
+    """Stamp same-origin ES-module imports that browsers cache directly."""
+    out = app_source
+    for filename, version in versions.items():
+        escaped = re.escape(filename)
+        out = re.sub(
+            rf'from\s+"/static/{escaped}(?:\?v=\d+)?"',
+            f'from "/static/{filename}?v={version}"',
+            out,
+        )
+    return out
+
+
 # If package-data shipped /static correctly, INDEX_HTML is the real page.
 # If not, we want a visible error page, not an import crash that makes
 # the container restart-loop with zero logs.
@@ -123,27 +139,27 @@ try:
             return f"{int((STATIC_DIR / filename).stat().st_mtime)}"
         except Exception:
             return "1"
-    # Cache-bust the ES-module import of compass.js inside app.js
+    # Cache-bust ES-module imports inside app.js
     # FIRST — browsers cache module URLs aggressively, and a stale
-    # compass.js produces hard-to-reproduce bugs (e.g. dashboard
-    # hitting an old API contract). We rewrite the import path in
-    # app.js with compass.js's mtime; then app.js's own mtime is
-    # captured for _v_app AFTER that write. The regex matches both
-    # the first-boot form (no query) and re-boots (already stamped).
+    # dashboard module produces hard-to-reproduce bugs. We rewrite the
+    # import paths with each module's mtime; then app.js's own mtime is
+    # captured for _v_app AFTER that write.
     _v_compass = _stamp("compass.js")
+    _v_kanban = _stamp("kanban.js")
     try:
-        import re as _re
         app_path = STATIC_DIR / "app.js"
         _app_raw = app_path.read_text(encoding="utf-8")
-        _app_busted = _re.sub(
-            r'from\s+"/static/compass\.js(?:\?v=\d+)?"',
-            f'from "/static/compass.js?v={_v_compass}"',
+        _app_busted = _cache_bust_module_imports(
             _app_raw,
+            {
+                "compass.js": _v_compass,
+                "kanban.js": _v_kanban,
+            },
         )
         if _app_busted != _app_raw:
             app_path.write_text(_app_busted, encoding="utf-8")
     except Exception:
-        logger.exception("compass.js cache-bust rewrite failed (non-fatal)")
+        logger.exception("dashboard module cache-bust rewrite failed (non-fatal)")
 
     _v_app = _stamp("app.js")
     _v_css = _stamp("style.css")
