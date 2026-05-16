@@ -17,6 +17,16 @@ import pytest
 import server.mcp_config as mcp_config
 
 
+@pytest.fixture(autouse=True)
+def isolated_db(fresh_db: str) -> None:
+    """Keep loader tests off the live harness DB.
+
+    The loader merges file config with enabled rows from `mcp_servers`;
+    without `fresh_db`, local/live MCP rows can change these assertions.
+    """
+    assert fresh_db
+
+
 @pytest.fixture
 def tmp_config(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> Path:
     """Point HARNESS_MCP_CONFIG at a tempfile, return the path so each
