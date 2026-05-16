@@ -79,7 +79,7 @@ The truthgate stage is **mandatory** for every task promoted out of backlog. It 
 
 When Coach explicitly promotes a task from `backlog` to the live trajectory, the task enters the `truthgate` column. Coach first decides whether the task is trivial enough for an override; otherwise the harness runs a dedicated classifier call:
 
-1. **Inputs**: task title + description + objective, plus a curated slice of the project's `truth/**/*.{md,txt}` corpus (always-include set + keyword-relevant files + alphabetical fallback, capped at ~32 KB - same pattern as TruthScore's truth-budget).
+1. **Inputs**: task title + description + objective, plus a curated slice of the project's `truth/**/*.{md,txt}` corpus (always-include core truth files + keyword-relevant files + alphabetical fallback, capped at ~32 KB - same pattern as TruthScore's truth-budget). Sparse-mode eligibility is based on the actual eligible truth file count before prompt-budget slicing, not on how many files fit in the prompt.
 2. **Model**: dedicated one-shot LLM call. `latest_sonnet` is the preferred default; `latest_mini` is the automatic fallback when Sonnet is unavailable, rate-limited, or out of credit. `latest_opus` and `latest_gpt` are excluded from classifier use because this is structural pattern-matching, not deep reasoning. This restriction applies to the truthgate classifier only; drafting protected truth/spec changes uses top models, defined below.
 3. **Output**: strict JSON with verdict + truth_basis (list of truth files/sections the task is authorized against) + optional truth_concerns (specific clauses the task should respect during implementation).
 
@@ -210,7 +210,7 @@ The recorded `affected_docs` surface as a coordination-block reminder for Coach 
 
 For new projects, `truth/` is mostly empty. Truthgate gracefully degrades:
 
-- If `truth/` has fewer than `HARNESS_TRUTHGATE_MIN_CORPUS_FILES` (default 3), truthgate returns `truthgate_pass` with `truth_basis: []` and a warning surfaced in the coordination block: "Truth corpus is sparse; truthgate is permissive until you populate it."
+- If `truth/` has fewer than `HARNESS_TRUTHGATE_MIN_CORPUS_FILES` (default 3) eligible `.md`/`.txt` files before budget slicing, truthgate returns `truthgate_pass` with `truth_basis: []` and a warning surfaced in the coordination block: "Truth corpus is sparse; truthgate is permissive until you populate it."
 - The first amendments filed on a new project bootstrap the corpus.
 - After the threshold is crossed, truthgate engages with full classifier behavior.
 

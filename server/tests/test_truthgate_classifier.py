@@ -156,6 +156,104 @@ def test_parse_rejects_basis_outside_truth(fresh_db: str) -> None:
         parse_classifier_output(raw, project_id=project_id, corpus=corpus)
 
 
+def test_corpus_always_includes_core_files_before_alphabetical(
+    fresh_db: str,
+) -> None:
+    project_id = "corefirst"
+    _write_truth(project_id, "aaa.md", "alpha\n")
+    _write_truth(project_id, "TOT-specs.md", "core\n")
+
+    corpus = gather_truth_corpus(
+        project_id,
+        total_budget_chars=10,
+        per_file_chars=5,
+        query_text="unrelated",
+    )
+
+    assert corpus.eligible_files == 3
+    assert corpus.files == ("truth/truth-index.md", "truth/TOT-specs.md")
+    assert corpus.skipped == ("truth/aaa.md",)
+
+
+def test_corpus_keyword_relevance_beats_alphabetical_order(
+    fresh_db: str,
+) -> None:
+    project_id = "keywordfirst"
+    _write_truth(project_id, "aaa.md", "alpha\n")
+    _write_truth(project_id, "zzz.md", "rocket guidance\n")
+
+    corpus = gather_truth_corpus(
+        project_id,
+        total_budget_chars=10,
+        per_file_chars=5,
+        query_text="rocket task",
+    )
+
+    assert corpus.files == ("truth/truth-index.md", "truth/zzz.md")
+    assert corpus.skipped == ("truth/aaa.md",)
+
+
+def test_corpus_alphabetical_fallback_and_skipped_accounting(
+    fresh_db: str,
+) -> None:
+    project_id = "fallback"
+    _write_truth(project_id, "b.md", "bravo\n")
+    _write_truth(project_id, "a.md", "alpha\n")
+    _write_truth(project_id, "c.md", "charlie\n")
+
+    corpus = gather_truth_corpus(
+        project_id,
+        total_budget_chars=10,
+        per_file_chars=5,
+    )
+
+    assert corpus.files == ("truth/truth-index.md", "truth/a.md")
+    assert corpus.skipped == ("truth/b.md", "truth/c.md")
+
+
+@pytest.mark.asyncio
+async def test_sparse_uses_actual_eligible_file_count_not_included_slice(
+    fresh_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id = "densebudget"
+    _write_truth(project_id, "TOT-specs.md", "core\n")
+    _write_truth(project_id, "b.md", "bravo\n")
+    _write_truth(project_id, "c.md", "charlie\n")
+    called = False
+
+    async def fake_call(*args, **kwargs):
+        nonlocal called
+        called = True
+        return LLMResult(
+            text=json.dumps({
+                "verdict": "truthgate_pass",
+                "truth_basis": ["truth/TOT-specs.md"],
+                "truth_concerns": [],
+                "rationale": "ok",
+                "suggested_amendment": None,
+                "confidence": 0.7,
+            })
+        )
+
+    import server.truthgate.llm as tg_llm
+
+    monkeypatch.setattr(tg_llm, "call_classifier", fake_call)
+    monkeypatch.setenv("HARNESS_TRUTHGATE_MIN_CORPUS_FILES", "4")
+    monkeypatch.setenv("HARNESS_TRUTHGATE_TRUTH_BUDGET_CHARS", "10")
+    monkeypatch.setenv("HARNESS_TRUTHGATE_TRUTH_PER_FILE_CHARS", "5")
+
+    result = await run_truthgate_classifier(
+        project_id,
+        TruthGateTaskInput(title="dense corpus"),
+    )
+
+    assert called is True
+    assert result["method"] == "classifier"
+    assert result["corpus_eligible_files"] == 4
+    assert result["corpus_files"] == ["truth/truth-index.md", "truth/TOT-specs.md"]
+
+
 def test_config_rejects_opus_and_gpt_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HARNESS_TRUTHGATE_MODEL", "latest_opus")
     with pytest.raises(TruthGateConfigError):
