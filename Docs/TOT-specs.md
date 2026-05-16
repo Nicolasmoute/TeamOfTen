@@ -3245,6 +3245,11 @@ shown as a preview (first 120 chars) below the card title, with a "more" /
 backlog") also includes an optional description textarea. The two bus events
 (`backlog_entry_updated`, `backlog_entry_deleted`) are in the `backlogWatched`
 set so the board auto-refreshes on remote changes.
+Backlog promotion also emits the normal task creation/stage/role events
+and the Kanban pane treats `backlog_task_promoted` as a board refresh
+trigger, so a promoted entry disappears from Backlog and appears in its
+initial active column without the operator pressing Refresh or reloading.
+Rejection emits `backlog_task_rejected`, which refreshes the Backlog list.
 
 ### 14.6 Messages
 

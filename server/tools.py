@@ -8418,6 +8418,43 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         await bus.publish({
             "ts": now_iso,
             "agent_id": caller_id,
+            "type": "task_created",
+            "task_id": task_id,
+            "title": title,
+            "parent_id": None,
+            "priority": promote_priority,
+            "workflow": "generic",
+            "tracking_reason": "backlog",
+            "trajectory": trajectory,
+            "project_id": project_id,
+        })
+        if initial_owner and len(first_to) == 1:
+            first_role = _role_for_stage_map[trajectory[0]["stage"]]
+            await bus.publish({
+                "ts": now_iso,
+                "agent_id": "system",
+                "type": "task_stage_changed",
+                "task_id": task_id,
+                "from": None,
+                "to": initial_status,
+                "reason": "backlog_promoted",
+                "owner": initial_owner,
+                "assignee": initial_owner,
+                "project_id": project_id,
+            })
+            await bus.publish({
+                "ts": now_iso,
+                "agent_id": caller_id,
+                "type": "task_role_assigned",
+                "task_id": task_id,
+                "role": first_role,
+                "owner": initial_owner,
+                "stage": initial_status,
+                "project_id": project_id,
+            })
+        await bus.publish({
+            "ts": now_iso,
+            "agent_id": caller_id,
             "type": "backlog_task_promoted",
             "backlog_id": backlog_id,
             "task_id": task_id,

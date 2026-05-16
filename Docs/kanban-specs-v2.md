@@ -125,7 +125,7 @@ coord_triage_backlog(id, action, trajectory?, modified_title?, reason?)
 
 | `action` | Effect |
 |---|---|
-| `promote` | Atomically: UPDATE `backlog_tasks.status='promoted'`, INSERT into `tasks` (title = `modified_title ?? title`, `trajectory` required), plant the first-stage role row, and switch the assignee's runtime tool allowlist to that role. Execute-stage promotions also set `agents.current_task_id`. Emits `backlog_task_promoted {backlog_id, task_id, title}`. |
+| `promote` | Atomically: UPDATE `backlog_tasks.status='promoted'`, INSERT into `tasks` (title = `modified_title ?? title`, `trajectory` required), plant the first-stage role row, and switch the assignee's runtime tool allowlist to that role. Execute-stage promotions also set `agents.current_task_id`. Emits `task_created`, `task_stage_changed{from=null, to=<first_stage>, reason='backlog_promoted'}`, `task_role_assigned`, and `backlog_task_promoted {backlog_id, task_id, title}` so open Kanban panes update both the Backlog and active board without manual refresh. |
 | `reject` | UPDATE `backlog_tasks.status='rejected', reject_reason=reason`. Emits `backlog_task_rejected {id, title, reason}`. |
 
 ### 4.0.4 Rejection notification (human-proposed)

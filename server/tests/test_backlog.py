@@ -411,6 +411,21 @@ async def test_triage_backlog_promote() -> None:
     promoted = [e for e in events if e.get("type") == "backlog_task_promoted"]
     assert len(promoted) == 1
     assert promoted[0]["task_id"] == promoted_task_id
+    created = [e for e in events if e.get("type") == "task_created"]
+    assert len(created) == 1
+    assert created[0]["task_id"] == promoted_task_id
+    assert created[0]["tracking_reason"] == "backlog"
+    stage_changed = [e for e in events if e.get("type") == "task_stage_changed"]
+    assert len(stage_changed) == 1
+    assert stage_changed[0]["task_id"] == promoted_task_id
+    assert stage_changed[0]["from"] is None
+    assert stage_changed[0]["to"] == "execute"
+    assert stage_changed[0]["reason"] == "backlog_promoted"
+    role_assigned = [e for e in events if e.get("type") == "task_role_assigned"]
+    assert len(role_assigned) == 1
+    assert role_assigned[0]["task_id"] == promoted_task_id
+    assert role_assigned[0]["role"] == "executor"
+    assert role_assigned[0]["owner"] == "p1"
 
 
 @pytest.mark.asyncio
