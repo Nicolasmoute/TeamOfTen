@@ -331,6 +331,31 @@ async def test_role_complete_infers_shipper_at_ship_stage(fresh_db: str) -> None
     assert "shipper" in text.lower()
 
 
+async def test_role_complete_rejects_verifier_at_verify_stage(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed_with_role(status="verify", owner="p6", role="verifier")
+    from server.role_tool_allowlists import tools_json_for_role
+
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE agents SET allowed_tools = ? WHERE id = 'p6'",
+            (tools_json_for_role("verifier"),),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    server = _server_for("p6")
+    err = _err_text(await _handler(server, "role_complete")({
+        "task_id": "t-2026-05-07-cccc3333",
+        "message_to_coach": "shipment verified; okay to archive",
+    }))
+    assert "coord_submit_verification_report" in err
+
+
 # ---------------------------------------------------------------------------
 # artifact_path is optional — omitting it must not cause rejection
 # (t-2026-05-15-095cff78: SDK marks all dict-schema keys as required;

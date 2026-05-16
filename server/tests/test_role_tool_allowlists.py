@@ -27,7 +27,7 @@ def test_verifier_allowlist_has_report_tool_but_not_ship_or_stage() -> None:
 
     assert "Bash" in tools
     assert "mcp__coord__coord_submit_verification_report" in tools
-    assert "mcp__coord__coord_role_complete" in tools
+    assert "mcp__coord__coord_role_complete" not in tools
     assert "mcp__coord__coord_ship_to_dev" not in tools
     assert "mcp__coord__coord_commit_push" not in tools
     assert "mcp__coord__coord_approve_stage" not in tools
