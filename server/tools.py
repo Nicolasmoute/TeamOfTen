@@ -8820,7 +8820,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "Params:\n"
             "- task_id: required\n"
             "- force: optional boolean/string. When false, an existing "
-            "  pass/override verdict is returned without re-running."
+            "  TruthGate verdict is preserved and rerun is rejected. "
+            "  force=true intentionally reruns and overwrites prior "
+            "  TruthGate verdict state."
         ),
         {"task_id": str, "force": Any},
     )
