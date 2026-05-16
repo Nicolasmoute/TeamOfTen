@@ -130,7 +130,7 @@ FIXTURE_STDOUT = (
 
 
 @pytest.mark.asyncio
-async def test_start_login_extracts_url_and_code(tmp_path, monkeypatch):
+async def test_start_login_extracts_url_and_code(tmp_path, monkeypatch, caplog):
     """start_login() should return {session_id, url, device_code}."""
     # Substitute a Python one-liner that prints fixture output then sleeps.
     import base64
@@ -143,6 +143,7 @@ async def test_start_login_extracts_url_and_code(tmp_path, monkeypatch):
     )
     cl._set_command_for_tests([sys.executable, "-c", script])
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    caplog.set_level("INFO", logger="server.codex_login")
 
     try:
         result = await cl.start_login()
@@ -153,6 +154,10 @@ async def test_start_login_extracts_url_and_code(tmp_path, monkeypatch):
     assert "session_id" in result
     assert result["url"].startswith("https://auth.openai.com/codex/device")
     assert result["device_code"] == "Z7MT-0V759"
+    assert result["session_id"] in caplog.text
+    assert result["url"] in caplog.text
+    assert "device_code_len=10" in caplog.text
+    assert "Z7MT-0V759" not in caplog.text
 
 
 # ===========================================================================
