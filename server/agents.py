@@ -5609,12 +5609,14 @@ async def run_agent(
         # Codex hosts MCP servers inside its app-server subprocess. One
         # noisy or crashing external stdio server can poison the whole
         # receiver loop, even when the turn only uses native tools and
-        # coord_*. Keep Codex external MCP opt-in unless a per-agent
-        # role allowlist explicitly names an external mcp__server__tool.
+        # coord_*. Keep Codex external MCP opt-in unless the final
+        # spawn allowlist explicitly names an external mcp__server__tool.
+        # This includes team-wide extra tools from Settings; those are
+        # the operator's deployment-scoped opt-in for shared connectors.
         external_servers, external_tools = _filter_external_mcp_servers_for_allowed_tools(
             external_servers,
             external_tools,
-            allowed_override,
+            allowed,
         )
     else:
         allowed.extend(external_tools)
