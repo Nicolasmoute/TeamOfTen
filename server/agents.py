@@ -5506,6 +5506,35 @@ async def run_agent(
         _runtime_name,
         model,
     )
+    # Codex auto-compact is an in-process side effect
+    # (`client.compact_thread`) rather than a recursive `run_agent`
+    # compact turn. Claim the slot before that preflight so parallel
+    # wakes cannot all compact the same `codex_thread_id` before the
+    # normal spawn guard runs.
+    preclaimed_slot = False
+    this_task = asyncio.current_task()
+    if _runtime_name == "codex":
+        rejected = False
+        async with _SPAWN_LOCK:
+            existing = _running_tasks.get(agent_id)
+            if (
+                existing is not None
+                and not existing.done()
+                and existing is not this_task
+            ):
+                rejected = True
+            elif this_task is not None:
+                _running_tasks[agent_id] = this_task
+                preclaimed_slot = True
+        if rejected:
+            await _emit(
+                agent_id,
+                "spawn_rejected",
+                reason="already running a turn — wait or ⏹ cancel first",
+                prompt=prompt,
+            )
+            logger.info("spawn_rejected: %s already running", agent_id)
+            return
     _tc_compact = TurnContext(
         agent_id=agent_id,
         project_id="",  # not consumed by maybe_auto_compact
@@ -5521,7 +5550,12 @@ async def run_agent(
         auto_compact=auto_compact,
         transfer_to_runtime=transfer_to_runtime,
     )
-    await _runtime.maybe_auto_compact(_tc_compact)
+    try:
+        await _runtime.maybe_auto_compact(_tc_compact)
+    except Exception:
+        if preclaimed_slot:
+            _running_tasks.pop(agent_id, None)
+        raise
 
     # Concurrent-spawn guard: check + claim the slot atomically under
     # _SPAWN_LOCK so two parallel run_agent coroutines can't both pass
@@ -5530,17 +5564,21 @@ async def run_agent(
     # callers see the same ordering — no duplicated subprocesses for
     # the same slot regardless of entry path.
     rejected = False
-    this_task = asyncio.current_task()
-    async with _SPAWN_LOCK:
-        existing = _running_tasks.get(agent_id)
-        if existing is not None and not existing.done():
-            rejected = True
-        elif this_task is not None:
-            # Claim the slot synchronously with the check so no other
-            # coroutine can race past its own guard. The full setup
-            # (autoname / cost cap / session read) continues AFTER the
-            # lock releases, which is fine — we already hold the slot.
-            _running_tasks[agent_id] = this_task
+    if not preclaimed_slot:
+        async with _SPAWN_LOCK:
+            existing = _running_tasks.get(agent_id)
+            if (
+                existing is not None
+                and not existing.done()
+                and existing is not this_task
+            ):
+                rejected = True
+            elif this_task is not None:
+                # Claim the slot synchronously with the check so no other
+                # coroutine can race past its own guard. The full setup
+                # (autoname / cost cap / session read) continues AFTER the
+                # lock releases, which is fine — we already hold the slot.
+                _running_tasks[agent_id] = this_task
     if rejected:
         await _emit(
             agent_id,

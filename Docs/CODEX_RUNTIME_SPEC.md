@@ -44,7 +44,10 @@ plus the latest `turns` row for that thread (via
 `_codex_session_context_estimate`). The dispatcher calls
 `runtime.maybe_auto_compact(tc)` before the main turn; if it returns
 True, the dispatcher proceeds to run the user's original prompt on
-the now-fresh session.
+the now-fresh session. Codex claims the slot before this preflight
+because its compact path is an inline app-server mutation; Claude
+keeps the legacy pre-claim shape because its compact path recursively
+uses `run_agent(COMPACT_PROMPT, auto_compact=True)`.
 
 ### A.3 ClaudeRuntime responsibilities
 `coord_server` build, allowed-tools assembly, external MCP load,
@@ -135,9 +138,12 @@ The dispatcher delegates **both** flows to the runtime:
   `input + cache_read + cache_creation + output` — and when the ratio
   trips, delegates to its own `run_manual_compact` so the compact uses
   the native `client.compact_thread(thread_id)` endpoint (cheaper than
-  a full LLM round-trip). On failure both runtimes emit
-  `auto_compact_failed` and the dispatcher proceeds with the original
-  session.
+  a full LLM round-trip). Codex auto-compact first claims the slot so
+  parallel wakes cannot issue duplicate `compact_thread` calls. If a
+  stale race finds the thread already cleared, it emits
+  `auto_compact_skipped` instead of `session_compacted(0 chars)`. On
+  failure both runtimes emit `auto_compact_failed` and the dispatcher
+  proceeds with the original session.
 - **Manual `/compact` (or `POST /api/agents/{id}/compact`)**:
   dispatcher calls `runtime.run_manual_compact(...)`. ClaudeRuntime
   runs the existing COMPACT_PROMPT turn. CodexRuntime uses the native
@@ -989,16 +995,13 @@ documented for future maintainers):
   rejected with `cost_capped`. When budget frees up, the next user
   turn lands on the already-compacted fresh thread with the
   continuity note in place.
-- Both runtimes share the spawn-lock-after-`maybe_auto_compact` race
-  window: two concurrent `run_agent` calls for the same slot can
-  both enter `maybe_auto_compact` before either claims the spawn
-  lock. Claude's recursive path serializes via the inner spawn
-  lock; Codex's direct path can fire two `compact_thread` calls
-  back-to-back. In practice, the second one sees a cleared
-  `codex_thread_id` (the first finished before the second's
-  `_get_codex_thread_id` re-read inside `run_manual_compact`) and
-  no-ops via the existing "no codex thread to compact" branch.
-  Acceptable.
+- Claude still has a spawn-lock-after-`maybe_auto_compact` shape, but
+  its recursive compact turn serializes through the inner spawn lock.
+  Codex does not share that race: the dispatcher claims the slot
+  before the Codex auto-compact preflight because `compact_thread` is
+  an inline app-server mutation. Parallel Codex wakes are rejected
+  before they can emit duplicate `auto_compact_triggered` events or
+  race the cached client into "client is closing".
 
 The original "context-pressure signal isn't exposed yet" caveat
 applied before `_codex_session_context_estimate` shipped (that

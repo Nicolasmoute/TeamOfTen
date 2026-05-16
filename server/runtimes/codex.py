@@ -538,6 +538,25 @@ def _prepare_runtime_codex_home(slot: str, cwd: str) -> str | None:
     return str(home)
 
 
+def _codex_client_closed_or_closing(client: Any) -> bool:
+    """Best-effort check for a cached SDK client that cannot be reused."""
+    for attr in ("_closed", "_closing", "closed", "closing"):
+        try:
+            if bool(getattr(client, attr, False)):
+                return True
+        except Exception:
+            return True
+    transport = getattr(client, "_transport", None)
+    if transport is not None:
+        for attr in ("_closed", "_closing", "closed", "closing"):
+            try:
+                if bool(getattr(transport, attr, False)):
+                    return True
+            except Exception:
+                return True
+    return False
+
+
 async def get_client(
     slot: str,
     *,
@@ -565,6 +584,23 @@ async def get_client(
             tuple(allowed_tools) if allowed_tools is not None else None
         )
         cached = _codex_clients.get(slot)
+        if cached is not None:
+            if _codex_client_closed_or_closing(cached):
+                logger.info(
+                    "CodexRuntime: cached client already closing for slot=%s "
+                    "-- evicting before reuse",
+                    slot,
+                )
+                stale_client = _codex_clients.pop(slot, None)
+                _codex_client_cwds.pop(slot, None)
+                stale_token = _codex_client_tokens.pop(slot, None)
+                if stale_client is not None:
+                    await _close_codex_client_object(slot, stale_client)
+                if stale_token:
+                    from server.spawn_tokens import revoke as _revoke_proxy_token
+                    _revoke_proxy_token(stale_token)
+                _codex_client_allowed_tool_keys.pop(slot, None)
+                cached = None
         if cached is not None:
             cached_cwd = _codex_client_cwds.get(slot)
             cached_tool_key = _codex_client_allowed_tool_keys.get(slot)
@@ -3820,6 +3856,8 @@ class CodexRuntime:
         # return. Use got_result as the success signal to surface the
         # symmetric `auto_compact_failed` event in those cases too.
         if not tc.turn_ctx.get("got_result"):
+            if tc.turn_ctx.get("auto_compact_skipped"):
+                return False
             await _emit(tc.agent_id, "auto_compact_failed")
             return False
         return True
@@ -3879,6 +3917,14 @@ class CodexRuntime:
 
         thread_id = await _get_codex_thread_id(tc.agent_id)
         if not thread_id:
+            if tc.auto_compact or tc.turn_ctx.get("auto_compact"):
+                await _emit(
+                    tc.agent_id,
+                    "auto_compact_skipped",
+                    note="no codex thread to compact after preflight",
+                )
+                tc.turn_ctx["auto_compact_skipped"] = True
+                return
             # No prior thread → nothing to compact. Treat as no-op success
             # so the dispatcher's /compact slash command doesn't loop.
             # If a transfer was requested, the endpoint should have

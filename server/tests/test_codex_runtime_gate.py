@@ -2450,6 +2450,19 @@ def test_codex_rollout_context_token_estimate_uses_latest_prompt() -> None:
     }) == 815_000
 
 
+def test_codex_client_closed_or_closing_detects_client_and_transport_flags() -> None:
+    from types import SimpleNamespace
+    from server.runtimes.codex import _codex_client_closed_or_closing
+
+    assert _codex_client_closed_or_closing(SimpleNamespace(_closed=True)) is True
+    assert _codex_client_closed_or_closing(
+        SimpleNamespace(_transport=SimpleNamespace(_closing=True))
+    ) is True
+    assert _codex_client_closed_or_closing(
+        SimpleNamespace(_transport=SimpleNamespace())
+    ) is False
+
+
 def test_codex_worktree_sandbox_probe_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2978,6 +2991,46 @@ async def test_codex_run_manual_compact_writes_synthetic_handoff_when_native_emp
     assert compacted[-1]["chars"] > 0
     assert compacted[-1]["handoff_file"] == "p1-synthetic.md"
     assert compacted[-1]["synthetic_summary"] is True
+
+
+async def test_codex_auto_compact_no_thread_skips_without_zero_char_event(
+    monkeypatch, fresh_db,
+) -> None:
+    import server.db as dbmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    await dbmod.init_db()
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    captured = _capture_emit(monkeypatch)
+    monkeypatch.setattr(
+        codex_mod,
+        "resolve_auth",
+        lambda: _async_value(("chatgpt", {})),
+    )
+    monkeypatch.setattr(
+        codex_mod,
+        "_get_codex_thread_id",
+        lambda agent_id: _async_value(None),
+    )
+
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="deferred",
+        system_prompt="",
+        workspace_cwd="C:/work/p1/project",
+        allowed_tools=[],
+        external_mcp_servers={},
+        auto_compact=True,
+        turn_ctx={"auto_compact": True},
+    )
+
+    await CodexRuntime().run_manual_compact(tc)
+
+    assert tc.turn_ctx.get("got_result") is not True
+    assert tc.turn_ctx["auto_compact_skipped"] is True
+    assert [ev["type"] for ev in captured] == ["auto_compact_skipped"]
 
 
 async def test_codex_maybe_auto_compact_no_thread_returns_false(
