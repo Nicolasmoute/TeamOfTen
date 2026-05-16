@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import pytest
 
 from server.db import configured_conn, init_db
+from server.events import bus
 from server.paths import ensure_project_scaffold
 from server.tools import build_coord_server
 from server.truth import resolve_file_write_proposal
 
 
 TASK_ID = "t-2026-05-16-44444444"
+TASK_ID_2 = "t-2026-05-16-66666666"
 
 
 def _server_for(slot: str) -> Any:
@@ -83,6 +86,25 @@ async def _proposal_row(proposal_id: int) -> dict[str, Any]:
         await c.close()
 
 
+async def _call_with_events(
+    call: Callable[[], Awaitable[dict[str, Any]]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    q = bus.subscribe()
+    try:
+        result = await call()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        events: list[dict[str, Any]] = []
+        while True:
+            try:
+                events.append(q.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return result, events
+    finally:
+        bus.unsubscribe(q)
+
+
 @pytest.mark.asyncio
 async def test_coord_propose_truth_amendment_records_metadata_and_approval(
     fresh_db: str,
@@ -125,14 +147,22 @@ async def test_coord_propose_truth_amendment_records_metadata_and_approval(
     task = await _task_row()
     assert task["truthgate_pending_proposal_id"] == proposal_id
 
-    res = await resolve_file_write_proposal(
-        proposal_id,
-        new_status="approved",
-        note="approved",
-        actor={"source": "test"},
+    res, events = await _call_with_events(
+        lambda: resolve_file_write_proposal(
+            proposal_id,
+            new_status="approved",
+            note="approved",
+            actor={"source": "test"},
+        )
     )
     assert res["status"] == "approved"
     assert target.read_text(encoding="utf-8") == "# Phase 4\n\nApproved truth.\n"
+    resolved = [e for e in events if e.get("type") == "truth_amendment_resolved"]
+    assert resolved
+    assert resolved[0]["proposal_id"] == proposal_id
+    assert resolved[0]["task_id"] == TASK_ID
+    assert resolved[0]["status"] == "approved"
+    assert resolved[0]["affected_docs"] == ["Docs/truthgate-approach.md"]
 
     task = await _task_row()
     assert task["truthgate_pending_proposal_id"] is None
@@ -162,14 +192,21 @@ async def test_coord_propose_truth_amendment_denial_keeps_truth_unchanged(
     }))
     proposal_id = _proposal_id(text)
 
-    res = await resolve_file_write_proposal(
-        proposal_id,
-        new_status="denied",
-        note="not accepted",
-        actor={"source": "test"},
+    res, events = await _call_with_events(
+        lambda: resolve_file_write_proposal(
+            proposal_id,
+            new_status="denied",
+            note="not accepted",
+            actor={"source": "test"},
+        )
     )
     assert res["status"] == "denied"
     assert not target.exists()
+    resolved = [e for e in events if e.get("type") == "truth_amendment_resolved"]
+    assert resolved
+    assert resolved[0]["proposal_id"] == proposal_id
+    assert resolved[0]["task_id"] == "t-2026-05-16-55555555"
+    assert resolved[0]["status"] == "denied"
 
     task = await _task_row("t-2026-05-16-55555555")
     assert task["truthgate_pending_proposal_id"] is None
@@ -179,16 +216,84 @@ async def test_coord_propose_truth_amendment_denial_keeps_truth_unchanged(
 
 
 @pytest.mark.asyncio
-async def test_coord_propose_truth_amendment_is_coach_only(
+async def test_coord_propose_truth_amendment_player_queues_existing_flow(
     fresh_db: str,
 ) -> None:
     await _seed_truthgate_task()
     player = _server_for("p2")
-    err = _err(await _handler(player, "propose_truth_amendment")({
+    text = _ok(await _handler(player, "propose_truth_amendment")({
         "task_id": TASK_ID,
         "path": "phase4.md",
         "content": "body",
         "summary": "why",
         "rationale": "because",
     }))
-    assert "Coach-only" in err
+    proposal_id = _proposal_id(text)
+    proposal = await _proposal_row(proposal_id)
+    assert proposal["scope"] == "truth"
+    assert proposal["originating_task_id"] == TASK_ID
+    task = await _task_row()
+    assert task["truthgate_pending_proposal_id"] == proposal_id
+
+
+@pytest.mark.asyncio
+async def test_coord_propose_truth_amendment_supersede_clears_old_task_pointer(
+    fresh_db: str,
+) -> None:
+    await _seed_truthgate_task(TASK_ID)
+    await _seed_truthgate_task(TASK_ID_2)
+    coach = _server_for("coach")
+
+    old_id = _proposal_id(_ok(await _handler(coach, "propose_truth_amendment")({
+        "task_id": TASK_ID,
+        "path": "phase4-supersede.md",
+        "content": "old",
+        "summary": "old",
+        "rationale": "old rationale",
+    })))
+    new_id = _proposal_id(_ok(await _handler(coach, "propose_truth_amendment")({
+        "task_id": TASK_ID_2,
+        "path": "phase4-supersede.md",
+        "content": "new",
+        "summary": "new",
+        "rationale": "new rationale",
+    })))
+
+    old = await _proposal_row(old_id)
+    new = await _proposal_row(new_id)
+    assert old["status"] == "superseded"
+    assert new["status"] == "pending"
+    old_metadata = json.loads(old["metadata_json"])
+    assert old_metadata["superseded_by"] == new_id
+    assert old_metadata["originating_task_id"] == TASK_ID
+
+    old_task = await _task_row(TASK_ID)
+    new_task = await _task_row(TASK_ID_2)
+    assert old_task["truthgate_pending_proposal_id"] is None
+    assert f"superseded by #{new_id}" in old_task["blocked_reason"]
+    assert new_task["truthgate_pending_proposal_id"] == new_id
+
+
+@pytest.mark.asyncio
+async def test_list_file_write_proposals_exposes_truthgate_correlation(
+    fresh_db: str,
+) -> None:
+    await _seed_truthgate_task()
+    coach = _server_for("coach")
+    proposal_id = _proposal_id(_ok(await _handler(coach, "propose_truth_amendment")({
+        "task_id": TASK_ID,
+        "path": "phase4-list-api.md",
+        "content": "body",
+        "summary": "why",
+        "rationale": "because",
+        "affected_docs": ["Docs/truthgate-approach.md"],
+    })))
+
+    from server.main import list_file_write_proposals
+
+    data = await list_file_write_proposals(status="pending", scope="truth")
+    row = next(p for p in data["proposals"] if p["id"] == proposal_id)
+    assert row["originating_task_id"] == TASK_ID
+    metadata = json.loads(row["metadata_json"])
+    assert metadata["originating_task_id"] == TASK_ID
+    assert metadata["affected_docs"] == ["Docs/truthgate-approach.md"]

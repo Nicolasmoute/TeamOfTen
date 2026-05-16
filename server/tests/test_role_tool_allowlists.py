@@ -39,8 +39,23 @@ def test_idle_allowlist_keeps_read_and_coord_status_surface_only() -> None:
     assert "Read" in tools
     assert "mcp__coord__coord_my_assignments" in tools
     assert "mcp__coord__coord_read_inbox" in tools
+    assert "mcp__coord__coord_propose_truth_amendment" not in tools
     assert "Bash" not in tools
     assert "mcp__coord__coord_commit_push" not in tools
+
+
+def test_active_roles_can_queue_truth_amendments() -> None:
+    for role in (
+        "planner",
+        "executor",
+        "auditor_syntax",
+        "auditor_semantics",
+        "shipper",
+        "verifier",
+    ):
+        assert "mcp__coord__coord_propose_truth_amendment" in set(
+            tools_for_role(role)
+        )
 
 
 def test_singular_semantic_alias_matches_real_role() -> None:

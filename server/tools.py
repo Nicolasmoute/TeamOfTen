@@ -3777,12 +3777,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT id FROM file_write_proposals "
+                "SELECT id, metadata_json, originating_task_id "
+                "FROM file_write_proposals "
                 "WHERE project_id = ? AND scope = ? AND path = ? "
                 "AND status = 'pending'",
                 (project_id, scope, rel),
             )
-            superseded_ids = [row[0] for row in await cur.fetchall()]
+            superseded_rows = [dict(row) for row in await cur.fetchall()]
+            superseded_ids = [row["id"] for row in superseded_rows]
             cur = await c.execute(
                 "INSERT INTO file_write_proposals "
                 "(project_id, proposer_id, scope, path, "
@@ -3795,14 +3797,43 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 ),
             )
             proposal_id = cur.lastrowid
-            for sid in superseded_ids:
+            for old in superseded_rows:
+                sid = old["id"]
+                try:
+                    old_metadata = json.loads(old.get("metadata_json") or "{}")
+                    if not isinstance(old_metadata, dict):
+                        old_metadata = {}
+                except Exception:
+                    old_metadata = {}
+                old_metadata["superseded_by"] = proposal_id
+                old_metadata["superseded_at"] = now_iso
                 await c.execute(
                     "UPDATE file_write_proposals SET status = 'superseded', "
                     "resolved_at = ?, resolved_by = 'system', "
-                    "resolved_note = ? "
+                    "resolved_note = ?, metadata_json = ? "
                     "WHERE id = ? AND status = 'pending'",
-                    (now_iso, f"superseded by #{proposal_id}", sid),
+                    (
+                        now_iso,
+                        f"superseded by #{proposal_id}",
+                        json.dumps(old_metadata, separators=(",", ":")),
+                        sid,
+                    ),
                 )
+                old_task_id = (old.get("originating_task_id") or "").strip()
+                if old_task_id:
+                    await c.execute(
+                        "UPDATE tasks SET truthgate_pending_proposal_id = NULL, "
+                        "blocked = 1, blocked_reason = ? "
+                        "WHERE id = ? AND project_id = ? "
+                        "AND truthgate_pending_proposal_id = ?",
+                        (
+                            f"TruthGate amendment proposal #{sid} superseded "
+                            f"by #{proposal_id}; Coach decision required.",
+                            old_task_id,
+                            project_id,
+                            sid,
+                        ),
+                    )
             if originating_task_id and scope == "truth":
                 await c.execute(
                     "UPDATE tasks SET truthgate_pending_proposal_id = ? "
@@ -4048,7 +4079,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     @tool(
         "coord_propose_truth_amendment",
         (
-            "Coach-only. Convenience wrapper for proposing a protected "
+            "Coach + active Player roles. Convenience wrapper for proposing a protected "
             "truth/ amendment tied to a TruthGate task. This does not "
             "write truth/ directly and does not create a separate "
             "registry; it queues a normal file_write_proposals row with "
@@ -4086,8 +4117,6 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         },
     )
     async def propose_truth_amendment(args: dict[str, Any]) -> dict[str, Any]:
-        if not caller_is_coach:
-            return _err("coord_propose_truth_amendment is Coach-only.")
         task_id = (args.get("task_id") or "").strip()
         rel = (args.get("path") or "").strip()
         content = args.get("content")

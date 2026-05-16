@@ -260,6 +260,24 @@ async def resolve_file_write_proposal(
             "actor": actor,
         }
     )
+    if proposal["scope"] == "truth" and proposal.get("originating_task_id"):
+        metadata = _safe_metadata(proposal.get("metadata_json"))
+        await bus.publish({
+            "ts": now_iso,
+            "agent_id": "human",
+            "type": "truth_amendment_resolved",
+            "proposal_id": proposal_id,
+            "task_id": proposal.get("originating_task_id"),
+            "project_id": proposal["project_id"],
+            "path": proposal["path"],
+            "status": new_status,
+            "note": note,
+            "actor": actor,
+            "affected_docs": metadata.get("affected_docs") or [],
+            "provisional_impl": bool(metadata.get("provisional_impl")),
+            "rejection_consequence": metadata.get("rejection_consequence") or "",
+            "to": "coach",
+        })
     return {
         "ok": True,
         "id": proposal_id,
@@ -267,3 +285,15 @@ async def resolve_file_write_proposal(
         "status": new_status,
         "size": write_size,
     }
+
+
+def _safe_metadata(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
