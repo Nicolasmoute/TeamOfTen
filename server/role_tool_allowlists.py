@@ -116,6 +116,16 @@ ROLE_TOOL_ALLOWLISTS: Final[dict[str, list[str]]] = {
         ]
         + INTERACTIVE_TOOLS
     ),
+    "verifier": (
+        READ_TOOLS
+        + WRITE_TOOLS
+        + COORD_BASE
+        + COORD_WRITE_CONTEXT
+        + [
+            _coord("coord_submit_verification_report"),
+        ]
+        + INTERACTIVE_TOOLS
+    ),
 }
 
 

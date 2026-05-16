@@ -391,6 +391,72 @@ async def test_run_agent_uses_codex_prepared_resume_flag_for_started_event(
         bus.unsubscribe(q)
 
 
+async def test_run_agent_resolves_effective_model_before_auto_compact(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_db: str,
+    tmp_path,
+) -> None:
+    """Auto-compact must see the same concrete model as the real turn.
+
+    Auto-wakes call run_agent without a per-pane model argument. If the
+    preflight checks `tc.model is None`, `_context_window_for(None)` uses
+    the generic 1M fallback while the UI context endpoint uses the latest
+    concrete turn model, so a Codex thread can show 90% in the pane and
+    still miss the threshold.
+    """
+    import server.db as dbmod
+    await dbmod.init_db()
+
+    import server.agents as agentsmod
+    import server.runtimes as runtimes_mod
+
+    seen: dict[str, object] = {}
+
+    class _Runtime:
+        name = "codex"
+
+        async def maybe_auto_compact(self, tc):
+            seen["compact_model"] = tc.model
+            return False
+
+        async def prepare_turn_start(self, tc):
+            return False
+
+        async def run_turn(self, tc):
+            seen["turn_model"] = tc.model
+            tc.turn_ctx["got_result"] = True
+
+        async def run_manual_compact(self, tc):
+            tc.turn_ctx["got_result"] = True
+
+    workspace = tmp_path / "p1"
+    workspace.mkdir()
+
+    async def runtime_for(agent_id):
+        return "codex"
+
+    async def no_slot_model(agent_id):
+        return None
+
+    async def codex_role_default(agent_id, runtime_name="claude"):
+        assert runtime_name == "codex"
+        return "latest_gpt"
+
+    async def workspace_for(agent_id):
+        return workspace
+
+    monkeypatch.setattr(agentsmod, "_resolve_runtime_for", runtime_for)
+    monkeypatch.setattr(runtimes_mod, "get_runtime", lambda name: _Runtime())
+    monkeypatch.setattr(agentsmod, "_get_agent_model_override", no_slot_model)
+    monkeypatch.setattr(agentsmod, "_get_role_default_model", codex_role_default)
+    monkeypatch.setattr(agentsmod, "workspace_dir", workspace_for)
+
+    await agentsmod.run_agent("p1", "hello")
+
+    assert seen["compact_model"] == "gpt-5.5"
+    assert seen["turn_model"] == "gpt-5.5"
+
+
 async def test_run_agent_passes_codex_role_allowlist_to_mcp_config(
     monkeypatch: pytest.MonkeyPatch,
     fresh_db: str,
@@ -507,6 +573,269 @@ async def test_run_agent_passes_codex_shipper_gate_to_mcp_config(
     assert captured["coord_enabled_tools"] == captured["coord_allowed_arg"]
     assert "coord_ship_to_dev" in captured["coord_enabled_tools"]
     assert "coord_approve_stage" not in captured["coord_enabled_tools"]
+
+
+async def test_run_agent_uses_team_extra_tools_to_start_codex_external_mcp(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_db: str,
+) -> None:
+    """Team-wide extra tools are an explicit Codex MCP opt-in.
+
+    Without this, a connected external MCP server can be omitted from the
+    Codex app-server even though its `mcp__server__tool` name is allowed,
+    leaving deferred tool search with no metadata to surface.
+    """
+    import server.db as dbmod
+    await dbmod.init_db()
+
+    import aiosqlite
+    import server.agents as agentsmod
+    import server.runtimes as runtimes_mod
+
+    async with aiosqlite.connect(fresh_db, timeout=10.0) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO team_config (key, value) VALUES (?, ?)",
+            ("extra_tools", json.dumps(["mcp__zeabur__logs"])),
+        )
+        await db.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Runtime:
+        name = "codex"
+
+        async def maybe_auto_compact(self, tc):
+            return False
+
+        async def run_turn(self, tc):
+            from server.runtimes.codex import _build_mcp_servers
+
+            captured["allowed_tools"] = tc.allowed_tools
+            captured["servers"] = _build_mcp_servers(tc)
+            tc.turn_ctx["got_result"] = True
+
+        async def run_manual_compact(self, tc):
+            await self.run_turn(tc)
+
+    async def runtime_for(agent_id):
+        return "codex"
+
+    monkeypatch.delenv("HARNESS_CODEX_EXTERNAL_MCP", raising=False)
+    monkeypatch.setattr(agentsmod, "_resolve_runtime_for", runtime_for)
+    monkeypatch.setattr(
+        agentsmod,
+        "load_external_servers",
+        lambda: (
+            {"zeabur": {"type": "stdio", "command": "zeabur-mcp"}},
+            ["mcp__zeabur__logs"],
+        ),
+    )
+    monkeypatch.setattr(runtimes_mod, "get_runtime", lambda name: _Runtime())
+
+    await agentsmod.run_agent("coach", "hello")
+
+    assert "mcp__zeabur__logs" in set(captured["allowed_tools"])
+    assert "zeabur" in captured["servers"]
+
+
+async def test_run_agent_refreshes_stale_shipper_allowed_tools(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_db: str,
+) -> None:
+    """Existing ship rows must pick up newly-added role tools.
+
+    Role assignments persist a JSON snapshot on agents.allowed_tools. When
+    the role allowlist changes after assignment, a later Codex turn must not
+    keep spawning from the stale snapshot.
+    """
+    import server.db as dbmod
+    await dbmod.init_db()
+
+    import aiosqlite
+    import server.agents as agentsmod
+    import server.runtimes as runtimes_mod
+    from server.role_tool_allowlists import tools_for_role
+
+    stale_shipper_tools = [
+        t for t in tools_for_role("shipper")
+        if t != "mcp__coord__coord_ship_to_dev"
+    ]
+
+    async with aiosqlite.connect(fresh_db, timeout=10.0) as db:
+        await db.execute(
+            "UPDATE agents SET allowed_tools = ? WHERE id = 'p3'",
+            (json.dumps(stale_shipper_tools),),
+        )
+        await db.execute(
+            "INSERT INTO tasks "
+            "(id, project_id, title, status, owner, created_by, trajectory) "
+            "VALUES (?, 'default', 'ship stale tools', 'ship', 'p2', "
+            "'coach', ?)",
+            (
+                "t-2026-05-15-staletls",
+                json.dumps([
+                    {"stage": "execute", "to": ["p2"]},
+                    {"stage": "audit_syntax", "to": ["p4"]},
+                    {"stage": "ship", "to": ["p3"]},
+                ]),
+            ),
+        )
+        await db.execute(
+            "INSERT INTO task_role_assignments "
+            "(task_id, role, eligible_owners, owner, claimed_at) "
+            "VALUES (?, 'shipper', '[]', 'p3', "
+            "strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            ("t-2026-05-15-staletls",),
+        )
+        await db.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Runtime:
+        name = "codex"
+
+        async def maybe_auto_compact(self, tc):
+            return False
+
+        async def run_turn(self, tc):
+            from server.runtimes.codex import _build_mcp_servers
+
+            servers = _build_mcp_servers(tc)
+            captured["allowed_tools"] = tc.allowed_tools
+            captured["coord_enabled_tools"] = servers["coord"]["enabled_tools"]
+            tc.turn_ctx["got_result"] = True
+
+        async def run_manual_compact(self, tc):
+            await self.run_turn(tc)
+
+    async def runtime_for(agent_id):
+        return "codex"
+
+    monkeypatch.setattr(agentsmod, "_resolve_runtime_for", runtime_for)
+    monkeypatch.setattr(runtimes_mod, "get_runtime", lambda name: _Runtime())
+
+    await agentsmod.run_agent("p3", "hello")
+
+    allowed_tools = set(captured["allowed_tools"])
+    assert "mcp__coord__coord_ship_to_dev" in allowed_tools
+    assert "coord_ship_to_dev" in captured["coord_enabled_tools"]
+
+    async with aiosqlite.connect(fresh_db, timeout=10.0) as db:
+        cur = await db.execute(
+            "SELECT allowed_tools FROM agents WHERE id = 'p3'"
+        )
+        row = await cur.fetchone()
+    assert "mcp__coord__coord_ship_to_dev" in set(json.loads(row[0]))
+
+
+async def test_run_agent_prefers_current_task_role_when_refreshing_tools(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_db: str,
+) -> None:
+    """A pending ship role must not leak ship tools into an executor turn.
+
+    Existing Codex sessions can carry stale role-tool snapshots. When a
+    slot has multiple active role rows, the dispatcher must refresh from
+    the row for agents.current_task_id first, not whichever row was most
+    recently assigned.
+    """
+    import server.db as dbmod
+    await dbmod.init_db()
+
+    import aiosqlite
+    import server.agents as agentsmod
+    import server.runtimes as runtimes_mod
+    from server.role_tool_allowlists import tools_json_for_role
+
+    async with aiosqlite.connect(fresh_db, timeout=10.0) as db:
+        await db.execute(
+            "UPDATE agents SET current_task_id = ?, allowed_tools = ? "
+            "WHERE id = 'p3'",
+            ("t-2026-05-15-execrow", tools_json_for_role("idle")),
+        )
+        await db.execute(
+            "INSERT INTO tasks "
+            "(id, project_id, title, status, owner, created_by, trajectory) "
+            "VALUES (?, 'default', 'current executor', 'execute', 'p3', "
+            "'coach', ?)",
+            (
+                "t-2026-05-15-execrow",
+                json.dumps([
+                    {"stage": "execute", "to": ["p3"]},
+                    {"stage": "ship", "to": ["p3"]},
+                ]),
+            ),
+        )
+        await db.execute(
+            "INSERT INTO task_role_assignments "
+            "(task_id, role, eligible_owners, owner, claimed_at, assigned_at) "
+            "VALUES (?, 'executor', '[]', 'p3', "
+            "'2026-05-15T00:00:00.000Z', '2026-05-15T00:00:00.000Z')",
+            ("t-2026-05-15-execrow",),
+        )
+        await db.execute(
+            "INSERT INTO tasks "
+            "(id, project_id, title, status, owner, created_by, trajectory) "
+            "VALUES (?, 'default', 'pending ship', 'ship', 'p2', "
+            "'coach', ?)",
+            (
+                "t-2026-05-15-shiprow",
+                json.dumps([
+                    {"stage": "execute", "to": ["p2"]},
+                    {"stage": "ship", "to": ["p3"]},
+                ]),
+            ),
+        )
+        await db.execute(
+            "INSERT INTO task_role_assignments "
+            "(task_id, role, eligible_owners, owner, claimed_at, assigned_at) "
+            "VALUES (?, 'shipper', '[]', 'p3', "
+            "'2026-05-15T01:00:00.000Z', '2026-05-15T01:00:00.000Z')",
+            ("t-2026-05-15-shiprow",),
+        )
+        await db.commit()
+
+    captured: dict[str, object] = {}
+
+    class _Runtime:
+        name = "codex"
+
+        async def maybe_auto_compact(self, tc):
+            return False
+
+        async def run_turn(self, tc):
+            from server.runtimes.codex import _build_mcp_servers
+
+            servers = _build_mcp_servers(tc)
+            captured["allowed_tools"] = tc.allowed_tools
+            captured["coord_enabled_tools"] = servers["coord"]["enabled_tools"]
+            tc.turn_ctx["got_result"] = True
+
+        async def run_manual_compact(self, tc):
+            await self.run_turn(tc)
+
+    async def runtime_for(agent_id):
+        return "codex"
+
+    monkeypatch.setattr(agentsmod, "_resolve_runtime_for", runtime_for)
+    monkeypatch.setattr(runtimes_mod, "get_runtime", lambda name: _Runtime())
+
+    await agentsmod.run_agent("p3", "hello")
+
+    allowed_tools = set(captured["allowed_tools"])
+    assert "mcp__coord__coord_commit_push" in allowed_tools
+    assert "mcp__coord__coord_ship_to_dev" not in allowed_tools
+    assert "coord_commit_push" in captured["coord_enabled_tools"]
+    assert "coord_ship_to_dev" not in captured["coord_enabled_tools"]
+
+    async with aiosqlite.connect(fresh_db, timeout=10.0) as db:
+        cur = await db.execute(
+            "SELECT allowed_tools FROM agents WHERE id = 'p3'"
+        )
+        row = await cur.fetchone()
+    stored_tools = set(json.loads(row[0]))
+    assert "mcp__coord__coord_commit_push" in stored_tools
+    assert "mcp__coord__coord_ship_to_dev" not in stored_tools
 
 
 async def test_run_agent_recovers_codex_transport_error_before_retry(

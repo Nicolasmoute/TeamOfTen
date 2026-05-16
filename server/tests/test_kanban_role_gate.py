@@ -183,6 +183,65 @@ async def test_update_task_ship_to_archive_passes_when_shipper_completed(
     _ok_text(result)
 
 
+async def test_update_task_ship_to_verify_passes_when_shipper_completed(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed_task(
+        status="ship",
+        owner="p3",
+        spec_path="x",
+        trajectory=(
+            '[{"stage":"plan","to":[]},'
+            '{"stage":"execute","to":[]},'
+            '{"stage":"audit_syntax","to":[]},'
+            '{"stage":"audit_semantics","to":[]},'
+            '{"stage":"ship","to":[]},'
+            '{"stage":"verify","to":["p6"]}]'
+        ),
+    )
+    await _insert_role_row(
+        role="shipper", owner="p5", completed_at="2026-05-03T02:00:00",
+    )
+    server = _server_for("p3")
+    result = await _handler(server, "update_task")({
+        "task_id": "t-2026-05-03-abc12345",
+        "status": "verify",
+    })
+    _ok_text(result)
+
+
+async def test_update_task_verify_to_archive_requires_completed_verifier(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed_task(status="verify", owner="p3", spec_path="x")
+    await _insert_role_row(role="verifier", owner="p6")
+    server = _server_for("p3")
+    result = await _handler(server, "update_task")({
+        "task_id": "t-2026-05-03-abc12345",
+        "status": "archive",
+    })
+    msg = _err_text(result)
+    assert "coord_submit_verification_report" in msg
+
+
+async def test_update_task_verify_to_archive_passes_when_verifier_completed(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed_task(status="verify", owner="p3", spec_path="x")
+    await _insert_role_row(
+        role="verifier", owner="p6", completed_at="2026-05-03T03:00:00",
+    )
+    server = _server_for("p3")
+    result = await _handler(server, "update_task")({
+        "task_id": "t-2026-05-03-abc12345",
+        "status": "archive",
+    })
+    _ok_text(result)
+
+
 # ---------- cancellation skips the gate ----------
 
 

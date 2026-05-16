@@ -1927,6 +1927,32 @@ async def _get_agent_model_override(agent_id: str) -> str | None:
     return v if v else None
 
 
+async def _resolve_effective_model_for_turn(
+    agent_id: str,
+    runtime_name: str,
+    requested_model: str | None,
+) -> str | None:
+    """Resolve the model id a turn will use.
+
+    This is intentionally shared by the auto-compact preflight and the
+    actual SDK turn. The context bar also falls back to the latest turn's
+    concrete model, so using the same resolver here keeps "ctx %" and the
+    auto-compact threshold aligned for auto-wakes that do not pass a
+    per-pane model argument.
+    """
+    model = (requested_model or "").strip()
+    if not model:
+        slot_override = await _get_agent_model_override(agent_id)
+        if slot_override and _model_fits_runtime(slot_override, runtime_name):
+            model = slot_override
+    if not model:
+        model = await _get_role_default_model(agent_id, runtime_name) or ""
+    if model:
+        from server.models_catalog import resolve_model_alias
+        model = resolve_model_alias(model)
+    return model or None
+
+
 async def _get_agent_effort_override(agent_id: str) -> int | None:
     """Read agent_project_roles.effort_override (1..4) for the active project.
 
@@ -2544,6 +2570,7 @@ _STAGE_TO_ROLE = {
     "audit_syntax": "auditor_syntax",
     "audit_semantics": "auditor_semantics",
     "ship": "shipper",
+    "verify": "verifier",
 }
 
 
@@ -4058,23 +4085,72 @@ async def _get_agent_allowed_tools_override(
                 (agent_id,),
             )
             row = await cur.fetchone()
+            cur = await c.execute(
+                "SELECT r.role "
+                "FROM task_role_assignments r "
+                "JOIN tasks t ON t.id = r.task_id "
+                "JOIN agents a ON a.id = ? "
+                "WHERE r.owner = ? "
+                "AND r.completed_at IS NULL "
+                "AND r.superseded_by IS NULL "
+                "AND ("
+                "  (t.status = 'plan' AND r.role = 'planner') OR "
+                "  (t.status = 'execute' AND r.role = 'executor') OR "
+                "  (t.status = 'audit_syntax' AND r.role = 'auditor_syntax') OR "
+                "  (t.status = 'audit_semantics' AND r.role = 'auditor_semantics') OR "
+                "  (t.status = 'ship' AND r.role = 'shipper') OR "
+                "  (t.status = 'verify' AND r.role = 'verifier')"
+                ") "
+                "ORDER BY "
+                "  CASE WHEN a.current_task_id = r.task_id THEN 0 ELSE 1 END, "
+                "  r.assigned_at DESC, r.id DESC "
+                "LIMIT 1",
+                (agent_id, agent_id),
+            )
+            role_row = await cur.fetchone()
+            active_role = dict(role_row).get("role") if role_row else None
         finally:
             await c.close()
     except Exception:
         logger.exception("get_agent_allowed_tools_override failed: agent=%s", agent_id)
         return None
     raw = (dict(row).get("allowed_tools") if row else None) or ""
-    if not raw:
-        return None
+    parsed: Any = []
     try:
-        parsed = json.loads(raw)
+        if raw:
+            parsed = json.loads(raw)
     except Exception:
         logger.exception("invalid agents.allowed_tools JSON for agent=%s", agent_id)
-        return None
     if not isinstance(parsed, list):
-        return None
+        parsed = []
     tools = [t for t in parsed if isinstance(t, str) and t]
-    return list(dict.fromkeys(tools)) or None
+    tools = list(dict.fromkeys(tools))
+    if active_role:
+        from server.role_tool_allowlists import tools_for_role, tools_json_for_role
+        expected = tools_for_role(active_role)
+        if set(tools) != set(expected):
+            try:
+                c = await configured_conn()
+                try:
+                    await c.execute(
+                        "UPDATE agents SET allowed_tools = ? WHERE id = ?",
+                        (tools_json_for_role(active_role), agent_id),
+                    )
+                    await c.commit()
+                finally:
+                    await c.close()
+            except Exception:
+                logger.exception(
+                    "refresh agent allowed_tools failed: agent=%s role=%s",
+                    agent_id, active_role,
+                )
+            else:
+                logger.info(
+                    "refreshed stale allowed_tools for agent=%s role=%s",
+                    agent_id, active_role,
+                )
+            return expected
+    return tools or None
 
 
 async def _get_team_extra_tools() -> list[str]:
@@ -5427,6 +5503,11 @@ async def run_agent(
 
     _runtime_name = await _resolve_runtime_for(agent_id)
     _runtime = get_runtime(_runtime_name)
+    model = await _resolve_effective_model_for_turn(
+        agent_id,
+        _runtime_name,
+        model,
+    )
     _tc_compact = TurnContext(
         agent_id=agent_id,
         project_id="",  # not consumed by maybe_auto_compact
@@ -5528,12 +5609,14 @@ async def run_agent(
         # Codex hosts MCP servers inside its app-server subprocess. One
         # noisy or crashing external stdio server can poison the whole
         # receiver loop, even when the turn only uses native tools and
-        # coord_*. Keep Codex external MCP opt-in unless a per-agent
-        # role allowlist explicitly names an external mcp__server__tool.
+        # coord_*. Keep Codex external MCP opt-in unless the final
+        # spawn allowlist explicitly names an external mcp__server__tool.
+        # This includes team-wide extra tools from Settings; those are
+        # the operator's deployment-scoped opt-in for shared connectors.
         external_servers, external_tools = _filter_external_mcp_servers_for_allowed_tools(
             external_servers,
             external_tools,
-            allowed_override,
+            allowed,
         )
     else:
         allowed.extend(external_tools)
@@ -5848,28 +5931,15 @@ async def run_agent(
     #      `coord_set_player_model`)
     #   3. runtime-aware per-role team default, set in Settings
     #   4. SDK default (no kwarg)
-    # Resolved here in the dispatcher because the turn ledger row
-    # (turns.model) records what we actually told the SDK to use.
+    # Resolved near the top of the dispatcher before auto-compact so
+    # the trip-wire, ContextBar, and turn ledger all use the same model
+    # window. `model` is already concrete here.
     # The Coach override is silently dropped if it doesn't fit the
     # current runtime — protects against the case where Coach picked a
     # Claude model and the player later flipped to Codex.
-    #
-    # The fit-check happens BEFORE alias resolution because aliases
-    # carry runtime info (`latest_opus` is unambiguously Claude); the
-    # SDK call below sees the post-resolution concrete id.
-    if not model:
-        slot_override = await _get_agent_model_override(agent_id)
-        if slot_override and _model_fits_runtime(slot_override, _runtime_name):
-            model = slot_override
-    if not model:
-        model = await _get_role_default_model(agent_id, _runtime_name)
-    # Resolve tier alias → concrete id. No-op for concrete inputs and
-    # for None/empty (returns "" which the SDK reads as "no override").
-    # All downstream consumers — turns ledger, runtime fit checks,
-    # context-window estimates — see the concrete id.
-    from server.models_catalog import resolve_model_alias
-    if model:
-        model = resolve_model_alias(model)
+    # The fit-check happens inside `_resolve_effective_model_for_turn`
+    # BEFORE alias resolution because aliases carry runtime info
+    # (`latest_opus` is unambiguously Claude).
 
     # plan_mode / effort resolution mirror the model chain:
     #   1. per-pane explicit value (the request kwarg, or None for "no
@@ -5934,11 +6004,8 @@ async def run_agent(
     # query loop, and stale-session retry. The dispatcher's outer
     # try/except below owns post-result exception suppression and
     # the auto-retry counter (universal to all runtimes).
-    from server.runtimes import get_runtime
-    from server.runtimes.base import TurnContext
-
-    runtime_name = await _resolve_runtime_for(agent_id)
-    runtime = get_runtime(runtime_name)
+    runtime_name = _runtime_name
+    runtime = _runtime
     # Pre-flight: refuse to spawn when the workspace dir doesn't exist
     # (and `workspace_dir`'s self-heal mkdir failed — typically a
     # /data volume mount issue, FS read-only, or a path collision).

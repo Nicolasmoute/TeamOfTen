@@ -18,7 +18,7 @@ import {
   renderDiffBody,
 } from "/static/tools.js";
 import { CompassPane, createCompassEventRouter } from "/static/compass.js?v=1778671319";
-import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js";
+import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js?v=1778952032";
 import { PlaybookPane, createPlaybookEventRouter } from "/static/playbook.js";
 
 const html = htm.bind(h);
@@ -42,6 +42,7 @@ const KANBAN_FORWARD_TYPES = new Set([
   "task_role_completed", "task_drift_detected",
   "task_stage_stale", "task_workflow_set",
   "audit_report_submitted", "audit_fail_notification",
+  "verification_report_submitted",
   "compass_audit_logged",
   "commit_pushed", "project_switched", "socket_connected",
   "backlog_task_proposed", "backlog_task_promoted", "backlog_task_rejected",
@@ -60,6 +61,7 @@ const KANBAN_STAGE_SHORT = {
   audit_syntax: "syn",
   audit_semantics: "sem",
   ship: "ship",
+  verify: "ver",
 };
 
 // markdown rendering: parse / sanitise / math / mermaid pipeline lives
@@ -1893,7 +1895,7 @@ function App() {
       // Broadcasts fan to every agent id we know about.
       // Recurrence pane live refresh (recurrence-specs.md §12.4).
       // Any of these events means a row was added/removed/changed/
-      // fired/skipped/deferred/disabled — reload the list so
+      // fired/skipped/deferred/disabled/expired — reload the list so
       // timestamps and counts stay accurate.
       if (
         ev.type === "recurrence_added" ||
@@ -1902,7 +1904,8 @@ function App() {
         ev.type === "recurrence_fired" ||
         ev.type === "recurrence_skipped" ||
         ev.type === "recurrence_deferred" ||
-        ev.type === "recurrence_disabled"
+        ev.type === "recurrence_disabled" ||
+        ev.type === "recurrence_expired"
       ) {
         if (recurrenceOpen) refreshRecurrences();
       }
@@ -6115,10 +6118,11 @@ function MCPServerCard({ server, testing, onToggle, onSaveTools, onSaveConfig, o
 }
 
 function SecretsSection() {
-  // Encrypted UI-managed secrets. These feed ${VAR} interpolation in MCP
-  // configs (and anything else that calls _interpolate) — the store wins
-  // over os.environ on name collision. Plaintext values never round-trip:
-  // once saved you can only replace or delete, not view.
+  // Encrypted UI-managed secrets. These feed explicit ${VAR}
+  // interpolation sites such as MCP configs and repo URLs; they are not
+  // exported as global Coach/Player env. The store wins over
+  // os.environ on interpolation-name collision. Plaintext values never
+  // round-trip: once saved you can only replace or delete, not view.
   const [rows, setRows] = useState([]);
   const [status, setStatus] = useState(null); // {ok, reason?}
   const [loaded, setLoaded] = useState(false);
@@ -6220,8 +6224,10 @@ function SecretsSection() {
       <code>\${...}</code> wrapper — the wrapper is the placeholder
       syntax used in the config files that consume the secret. On
       collision with an env var of the same name, the stored secret
-      wins. Values are write-only — you can replace or delete, but
-      never read back.
+      wins for interpolation only. These values are not exported into
+      Coach or Player runtime environments; configure API auth like
+      <code>HARNESS_TOKEN</code> in deployment env. Values are write-only
+      — you can replace or delete, but never read back.
     </p>
     ${disabled
       ? html`<p style="font-size: 12px; color: var(--err); margin: 0 0 6px 0;">
@@ -6647,6 +6653,59 @@ function _formatRelative(iso) {
   return delta >= 0 ? `in ${label}` : `${label} ago`;
 }
 
+function _formatFireCount(row) {
+  const count = Number.isFinite(Number(row.fire_count))
+    ? Number(row.fire_count)
+    : 0;
+  if (row.max_fires != null) return `${count}/${row.max_fires} fires`;
+  return `${count} fires`;
+}
+
+function _rowLooksExpired(row) {
+  if (row.enabled) return false;
+  const count = Number(row.fire_count || 0);
+  const max = row.max_fires == null ? null : Number(row.max_fires);
+  if (max != null && Number.isFinite(max) && count >= max) return true;
+  if (row.end_date) {
+    const ts = Date.parse(row.end_date);
+    if (Number.isFinite(ts) && ts <= Date.now()) return true;
+  }
+  return false;
+}
+
+function _recurrenceChips(row) {
+  const chips = [];
+  const fireTitle = row.max_fires == null
+    ? "Successful fires"
+    : "Successful fires before this recurrence expires";
+  chips.push(html`
+    <span class="rec-chip" title=${fireTitle}>
+      ${_formatFireCount(row)}
+    </span>
+  `);
+  if (row.end_date) {
+    const expired = Date.parse(row.end_date) <= Date.now();
+    chips.push(html`
+      <span
+        class=${"rec-chip " + (expired ? "expired" : "expiry")}
+        title=${row.end_date}
+      >
+        ${expired ? "expired" : "expires"} ${_formatRelative(row.end_date)}
+      </span>
+    `);
+  }
+  if (_rowLooksExpired(row)) {
+    chips.push(html`
+      <span class="rec-chip expired" title="Recurrence has auto-disabled">
+        expired
+      </span>
+    `);
+  }
+  return chips.length
+    ? html`<div class="rec-card-chips">${chips}</div>`
+    : null;
+}
+
 function _tickRow(rows) {
   return rows.find((r) => r.kind === "tick") || null;
 }
@@ -6877,9 +6936,10 @@ function RecurrencePane({ rows, error, onClose, onRefresh, onError, onClearError
           ${tick
             ? html`
                 <div class="rec-card">
-                  <div class="rec-card-row">
+                  <div class="rec-card-row rec-card-head">
                     <span class="rec-status-dot ${tick.enabled ? "on" : "off"}"></span>
-                    <span>every <strong>${tick.cadence}</strong> min</span>
+                    <span class="rec-card-title">every <strong>${tick.cadence}</strong> min</span>
+                    ${_recurrenceChips(tick)}
                   </div>
                   <div class="rec-card-meta">
                     <span title=${tick.next_fire_at || ""}>next: ${_formatRelative(tick.next_fire_at)}</span>
@@ -6930,9 +6990,10 @@ function RecurrencePane({ rows, error, onClose, onRefresh, onError, onClearError
             ? html`<div class="rec-empty">No repeats.</div>`
             : repeats.map((r) => html`
                 <div class="rec-card" key=${r.id}>
-                  <div class="rec-card-row">
+                  <div class="rec-card-row rec-card-head">
                     <span class="rec-status-dot ${r.enabled ? "on" : "off"}"></span>
-                    <span>#${r.id}</span>
+                    <span class="rec-card-title">#${r.id}</span>
+                    ${_recurrenceChips(r)}
                   </div>
                   <div class="rec-card-row">
                     <label>minutes</label>
@@ -7003,9 +7064,10 @@ function RecurrencePane({ rows, error, onClose, onRefresh, onError, onClearError
             ? html`<div class="rec-empty">No crons.</div>`
             : crons.map((r) => html`
                 <div class="rec-card" key=${r.id}>
-                  <div class="rec-card-row">
+                  <div class="rec-card-row rec-card-head">
                     <span class="rec-status-dot ${r.enabled ? "on" : "off"}"></span>
-                    <span>#${r.id}</span>
+                    <span class="rec-card-title">#${r.id}</span>
+                    ${_recurrenceChips(r)}
                   </div>
                   <div class="rec-card-row">
                     <label>schedule</label>

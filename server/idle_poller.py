@@ -965,6 +965,7 @@ def _role_for_stage(stage: str) -> str | None:
         "audit_syntax": "auditor_syntax",
         "audit_semantics": "auditor_semantics",
         "ship": "shipper",
+        "verify": "verifier",
     }.get(stage)
 
 
@@ -1111,7 +1112,8 @@ async def _has_available_work(slot: str) -> tuple[str, str | None] | None:
             "  (r.role = 'planner' AND t.status = 'plan') "
             "  OR (r.role = 'auditor_syntax' AND t.status = 'audit_syntax') "
             "  OR (r.role = 'auditor_semantics' AND t.status = 'audit_semantics') "
-            "  OR (r.role = 'shipper' AND t.status = 'ship')"
+            "  OR (r.role = 'shipper' AND t.status = 'ship') "
+            "  OR (r.role = 'verifier' AND t.status = 'verify')"
             ") "
             "ORDER BY assigned_at LIMIT 1",
             (slot,),

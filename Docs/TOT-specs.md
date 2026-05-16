@@ -42,7 +42,7 @@ Dependent specs (subordinate to this document):
   `coord_create_task` is the planned contract; pools are FYI only
   (Coach explicitly assigns one named Player at each transition).
   Stages: plan → execute → audit_syntax → audit_semantics → ship →
-  archive. A new per-project event log feeds Coach's tick context;
+  optional verify → archive. A new per-project event log feeds Coach's tick context;
   pattern-detection counters (Player health, audit aggregator,
   push-time deviation flag, recent-patterns block) surface drift
   proactively. v1 archive at `Docs/kanban-specs-v1-archived.md`.
@@ -1280,7 +1280,7 @@ path, content, summary)` with `scope='truth'` selecting this lane:
    `POST /api/file-write-proposals/{id}/approve` which (a) writes
    the proposed content to `truth/<path>` directly (the truth-scope
    resolver uses its own write — broader extension allowlist +
-   200 KB cap — not the Files-pane write_text endpoint), then (b)
+   512,000-char cap — not the Files-pane write_text endpoint), then (b)
    marks the row `approved` with timestamp + `resolved_by =
    "human"` + actor metadata. Deny only marks the row.
 5. Approve emits `file_write_proposal_approved`; deny emits
@@ -1770,18 +1770,25 @@ Manual compact:
 
 - UI slash command `/compact`.
 - API `POST /api/agents/{id}/compact`.
-- Runs the agent with `COMPACT_PROMPT`.
+- Claude runs the agent with `COMPACT_PROMPT`; Codex silently resumes
+  the stored Codex thread and generates COMPACT_PROMPT-style markdown
+  without streaming the handoff text to normal UI/events/logs.
 - Captures the summary as `agent_sessions.continuity_note`.
 - Writes full handoff file under active project's `working/handoffs/`.
 - Clears session id so the next turn starts fresh.
-- Emits `session_compacted`.
+- Emits `session_compacted` with metadata only (`chars`,
+  `handoff_file`, and for Codex `summary_source` /
+  `synthetic_summary`).
 
 Auto-compact:
 
-- Controlled by `HARNESS_AUTO_COMPACT_THRESHOLD`, default 0.5 (lowered from 0.7 on 2026-05-09).
+- Controlled by `HARNESS_AUTO_COMPACT_THRESHOLD`, default 0.65 (lowered from 0.7 on 2026-05-09, then raised from 0.5 on 2026-05-15 after 0.5 proved too aggressive).
 - Estimates session context from Claude CLI JSONL files under
   `CLAUDE_CONFIG_DIR/projects/`.
 - If over threshold, runs a compact turn first.
+- The preflight resolves the same effective model the turn will use (pane
+  override, Coach-set slot override, role default, alias-to-concrete), so the
+  threshold window matches the pane `ctx` bar.
 - If auto-compact produces no summary, it force-clears the session to escape a
   threshold loop.
 
@@ -1840,20 +1847,21 @@ Failure modes:
   emits and the runtime stays put. The intent of transfer is "carry
   forward via summary"; a flip with empty context is a destructive
   blind switch.
-- Compact yields no summary on Codex → flip still proceeds because
-  `client.compact_thread()` already cleared the thread; not flipping
-  would leave the agent on Codex with no thread to resume, strictly
-  worse than flipping with thin context. Asymmetry intentional.
+- Compact yields no generated summary on Codex → recent-exchange
+  fallback may be used, but it is marked
+  `summary_source='recent_exchange_fallback'` and
+  `synthetic_summary=true`. If neither generated nor fallback handoff
+  can be durably persisted, `session_transfer_failed` emits and the
+  runtime plus `codex_thread_id` stay put.
 - Helper failure on `_clear_codex_thread_id` is logged but doesn't
   abort; `runtime_updated` still emits so the UI doesn't silently
   miss the change.
 
 Why not just `/compact` followed by a blunt PUT: atomicity. The flip
 only happens iff the compact succeeded with a non-empty summary
-(Claude side) or the native `compact_thread` call succeeded (Codex
-side). A user who runs the two operations separately gets the flip
-even when the compact failed, leaving the agent on the new runtime
-with no handoff. The transfer flow also emits the right event
+on both runtimes. A user who runs the two operations separately gets
+the flip even when the compact failed, leaving the agent on the new
+runtime with no handoff. The transfer flow also emits the right event
 vocabulary so timelines read as a single transfer boundary, not as a
 compact plus an unrelated runtime change.
 
@@ -1925,7 +1933,10 @@ known limitations: see `Docs/CODEX_RUNTIME_SPEC.md` §E.5.
 
 Window resolution: `_context_window_for(model)` returns the per-model
 max. When the UI doesn't pass `?model=`, the server reads the model
-recorded on the latest turn for the active session. For Codex turns,
+recorded on the latest turn for the active session. Auto-compact uses
+the same effective model resolver before its threshold check, so
+auto-wakes that omit a pane model do not fall back to the generic 1M
+window. For Codex turns,
 `token_count.info.model_context_window` from the rollout JSONL is
 stored as a provider-reported exact window and takes precedence over
 the static table. That lets the CTX bar and auto-compact adapt when
@@ -2282,7 +2293,7 @@ so permissions do not depend on the model truthfully passing its identity.
   `task_role_assignments` (the kanban v2 source of truth), falling back to
   `tasks.owner` for archive/non-standard stages where no role row exists.
 - Each task row includes `kind=task`; each row for an active kanban stage
-  (plan/execute/audit_syntax/audit_semantics/ship) includes a
+  (plan/execute/audit_syntax/audit_semantics/ship/verify) includes a
   `stage_role=<role>:<state>` field:
   - `executor:p3` — live assignment with named owner
   - `executor:done` — non-audit role row completed (awaiting Coach advance)
@@ -2328,7 +2339,7 @@ so permissions do not depend on the model truthfully passing its identity.
 - THE single stage-transition tool in v2. Replaces v1's
   `coord_advance_task_stage` and the four `coord_assign_*` variants.
 - `next_stage` ∈ {plan, execute, audit_syntax, audit_semantics, ship,
-  archive}; transition validated against the §3.1 state machine.
+  verify, archive}; transition validated against the §3.1 state machine.
 - `assignee` is required for any non-archive `next_stage`; pass a
   single Player slot. Pools are FYI only — pick one explicit name.
 - Atomically: stamps `last_stage_change_at`; deactivates any prior
@@ -2351,6 +2362,17 @@ so permissions do not depend on the model truthfully passing its identity.
   with the summary in the payload.
 - v2 has NO auto-archive on trajectory completion — every task ends
   with this Coach-written wrap-up.
+
+`coord_submit_verification_report(task_id, verdict, body, message_to_coach?, evidence?)`
+
+- Players only; requires task status `verify` and an active verifier role
+  row for the caller.
+- Writes `verifications/verification_<round>.md`, records `pass`/`fail`
+  on the verifier role row, marks that row complete, resets the verifier
+  to idle tools, emits `verification_report_submitted`, and wakes Coach.
+- `verdict='fail'` does not auto-revert, auto-create follow-up work, or
+  archive. Coach reads the report and decides whether to archive, create
+  a follow-up, roll back, reroute to execute, or re-ship.
 
 `coord_set_task_trajectory(task_id, trajectory)`
 
@@ -2509,24 +2531,52 @@ Current implementation gap:
      `audit_semantics` → `auditor_semantics`).
 - **Git operations** (in caller's worktree):
   1. `git fetch origin`
-  2. `git checkout -b ship-<task_id> origin/dev`
-  3. `git cherry-pick <executor_sha>`
-  4. `git push origin ship-<task_id>:ship-<task_id>`
+  2. If a prior `task_shipped_to_dev` event exists, treat the call as
+     idempotent: close any still-open shipper role row and return the
+     existing evidence without another GitHub PR or duplicate ship event.
+  3. If the executor commit or equivalent patch is already present on
+     `origin/dev`, close the shipper role row, emit `task_shipped_to_dev`
+     with `ship_method='already_present'`, `idempotent=true`, and
+     `ship_sha=<origin/dev sha>`, then return without opening a PR.
+  4. If local branch `ship-<task_id>` already exists, resume it:
+     - If already on the branch and there is no `CHERRY_PICK_HEAD` or
+       unmerged path, continue to push/PR/merge.
+     - If on another branch, require a clean worktree before checking out
+       `ship-<task_id>`.
+     - If conflicts are still unresolved, fail closed with instructions
+       and do not push, create a PR, emit ship evidence, or complete the
+       role.
+  5. Otherwise, `git checkout -b ship-<task_id> origin/dev`
+  6. `git cherry-pick -x <executor_sha>`
+  7. `git push origin ship-<task_id>:ship-<task_id>`
   - Cherry-pick conflict → returns error with the conflicted SHA and
     instructs the Player to resolve manually or run
-    `git cherry-pick --abort` to clean up.
+    `git cherry-pick --abort` to clean up. After manual resolution and
+    `git cherry-pick --continue`, rerun `coord_ship_to_dev(task_id)` to
+    resume the existing temp branch.
+  - Empty/no-op cherry-pick → re-checks whether the patch is already
+    present on `origin/dev`; if confirmed, uses the already-present
+    success path, otherwise fails closed.
 - **GitHub API** (PAT extracted from `projects.repo_url`):
-  1. `POST /repos/{owner}/{repo}/pulls` → create PR titled
-     `[ship] <task_id>: <title>`
-  2. `PUT /repos/{owner}/{repo}/pulls/{n}/merge` (squash merge)
-  3. `DELETE /repos/{owner}/{repo}/git/refs/heads/ship-<task_id>`
+  1. Query open PRs for `head=<owner>:ship-<task_id>&base=dev`; reuse
+     one if present.
+  2. `POST /repos/{owner}/{repo}/pulls` → create PR titled
+     `[ship] <task_id>: <title>` when no reusable PR exists. A 422
+     collision triggers another open-PR lookup before failing.
+  3. `PUT /repos/{owner}/{repo}/pulls/{n}/merge` (squash merge)
+  4. `DELETE /repos/{owner}/{repo}/git/refs/heads/ship-<task_id>`
      (non-fatal on failure)
 - **Post-success:**
   - Closes shipper role row (`completed_at` stamped).
   - Emits `task_shipped_to_dev` event with `task_id`, `ship_sha`,
-    `pr_number`, `pr_url`, `executor_sha`.
+    `pr_number`, `pr_url`, `executor_sha`, `deploy_target='dev'`,
+    `ship_method` (`'pr'`, `'resumed_pr'`, or `'already_present'`), and
+    `idempotent`.
   - Wakes Coach via `_wake_coach_for_completion`.
 - **Return:** `ok=True` text with `pr_url`, `pr_number`, dev HEAD SHA.
+  If the trajectory includes `verify`, the response reminds Coach to
+  approve the optional post-ship verification stage; it does not
+  transition automatically.
 - Raw `git push origin ...:dev` bypasses this gate and is a pb-005
   violation; use `coord_ship_to_dev` instead.
 
@@ -2566,10 +2616,16 @@ Current implementation gap:
     resolver refuses to write if the row's path was tampered with).
   - The harness-wide `/data/CLAUDE.md` is NOT a valid scope; only
     the user edits that file.
-- `content` is a full file body (max 200,000 chars). This is a full
+- `content` is a full file body (hard cap 512,000 chars). This is a full
   REPLACE — Coach must include the parts being kept verbatim. The
   user reviews a side-by-side diff against the current file content
   in the UI before approving.
+- Human-reviewable truth should stay much smaller than the hard cap:
+  target 2-8 KB per truth section, warn above 12 KB, strongly prefer
+  splitting above 25 KB, and avoid full-file proposals above 50 KB
+  unless bridging an existing monolithic file. The hard cap exists so
+  legacy files like `TOT-specs.md` can still be mirrored while the
+  section-based truth flow is built.
 - `summary` is a single-line "why" (max 200 chars) shown next to the
   approve/deny buttons.
 - **Auto-supersede invariant**: at most one `pending` proposal per
@@ -2610,7 +2666,7 @@ The resolver in `server/truth.py` handles approve/deny:
   with a `relative_to` check (rejects traversal as
   `FileWriteProposalBadRequest`), `mkdir(parents=True, exist_ok=True)` on
   the parent, then `write_text(content, encoding="utf-8")`. Caps at
-  200 KB. Bypasses the Files-pane endpoint's `.md`/`.txt` restriction
+  512,000 chars. Bypasses the Files-pane endpoint's `.md`/`.txt` restriction
   on purpose — text-of-any-extension is the right policy for truth
   (specs, brand YAML, JSON contracts) since the user is the gate at
   approval time.
@@ -2632,10 +2688,13 @@ The resolver in `server/truth.py` handles approve/deny:
 - Rejects leading `/` and any `..` segment; resolves the target
   with `Path.resolve()` and re-anchors under the project root so a
   symlink / weird-casing trick can't escape the lane.
-- 200 KB size cap (matches the propose tool's write cap). Files
+- 512,000-char size cap (matches the protected proposal hard cap). Files
   that aren't valid UTF-8 are rejected with a clear error rather
   than returning garbage; binary deliverables under `outputs/`
   cannot be read through this tool.
+- This is hard-cap headroom, not the desired long-term truth shape:
+  large truth/spec files should be split into human-reviewable sections
+  with a target of 2-8 KB per section.
 - Exists in addition to Claude's native `Read` because the Codex
   runtime's restrictive sandbox blocks alternative read paths;
   `coord_read_file` bypasses that constraint via the MCP proxy. See
@@ -3236,6 +3295,11 @@ shown as a preview (first 120 chars) below the card title, with a "more" /
 backlog") also includes an optional description textarea. The two bus events
 (`backlog_entry_updated`, `backlog_entry_deleted`) are in the `backlogWatched`
 set so the board auto-refreshes on remote changes.
+Backlog promotion also emits the normal task creation/stage/role events
+and the Kanban pane treats `backlog_task_promoted` as a board refresh
+trigger, so a promoted entry disappears from Backlog and appears in its
+initial active column without the operator pressing Refresh or reloading.
+Rejection emits `backlog_task_rejected`, which refreshes the Backlog list.
 
 ### 14.6 Messages
 
@@ -3268,7 +3332,7 @@ user reviews a diff and approves/denies here.
 | --- | --- |
 | `GET /api/file-write-proposals?status=&scope=&limit=` | List file-write proposals for the active project, newest first. Status filter ∈ `pending` / `approved` / `denied` / `cancelled` / `superseded`; scope filter ∈ `truth` / `project_claude_md`; omit either for all. Default limit 50, cap 200. |
 | `GET /api/file-write-proposals/{id}/diff` | Returns `{id, scope, path, before, after}` so the UI can render a side-by-side diff. `before` is the current file content read fresh from disk (or `null` if the file doesn't exist yet — UI falls back to a plain proposed-content render). `after` is the proposed content. 404 if proposal missing; 400 if the row's scope/path is malformed. |
-| `POST /api/file-write-proposals/{id}/approve` | Resolve a pending proposal as approved. Dispatches on scope: `truth` writes to `truth/<path>` (broader extension allowlist than the Files-pane endpoint, 200 KB cap); `project_claude_md` writes to the project's `CLAUDE.md`. Then marks the row. Body `{note}` optional. Emits `file_write_proposal_approved`. |
+| `POST /api/file-write-proposals/{id}/approve` | Resolve a pending proposal as approved. Dispatches on scope: `truth` writes to `truth/<path>` (broader extension allowlist than the Files-pane endpoint, 512,000-char cap); `project_claude_md` writes to the project's `CLAUDE.md`. Then marks the row. Body `{note}` optional. Emits `file_write_proposal_approved`. |
 | `POST /api/file-write-proposals/{id}/deny` | Resolve a pending proposal as denied. No file write. Body `{note}` optional. Emits `file_write_proposal_denied`. |
 
 All file-write-proposal endpoints are token-gated; the resolve endpoints carry an `audit_actor` payload on emitted events.
@@ -3462,6 +3526,10 @@ single + batch `DELETE /api/agents/{id}/session` endpoints also call
 `evict_client(slot)` for the same reason — clearing a session and
 clearing the cached Codex subprocess are two faces of the same
 "start fresh" intent.
+If an eviction happens while a Codex turn is still in flight, the
+runtime cache-pops the client immediately but queues the old
+client/token pair for close in that turn's `finally` block; this lets
+the live stream finish without leaking an orphaned app-server process.
 
 `PATCH /api/mcp/servers/{name}` runs its SQLite read/merge/update
 section in a worker thread with a 30 s busy timeout. The route is
@@ -4471,11 +4539,13 @@ printing non-JSON to MCP stdout and killing the Codex app-server with a
 By default, CodexRuntime does **not** ambient-start UI/file-configured
 external MCP servers. Codex runs MCP servers inside the app-server
 subprocess, so one bad external stdio server can kill unrelated Codex
-turns. Codex starts external MCP servers only when the slot has an
-explicit `agents.allowed_tools` override naming an `mcp__<server>__...`
-tool. Set `HARNESS_CODEX_EXTERNAL_MCP=true` to restore ambient external
-MCP loading for Codex. ClaudeRuntime is unchanged and continues to load
-external MCPs from this section through its normal SDK path.
+turns. Codex starts external MCP servers only when the final spawn
+allowlist contains an `mcp__<server>__...` tool. That
+allowlist can come from a role/slot `agents.allowed_tools` entry or the
+team-wide `extra_tools` setting. Set `HARNESS_CODEX_EXTERNAL_MCP=true`
+to restore ambient external MCP loading for Codex. ClaudeRuntime is
+unchanged and continues to load external MCPs from this section through
+its normal SDK path.
 
 CodexRuntime also isolates app-server from operator-owned
 `$CODEX_HOME/config.toml`. The app-server uses a clean per-slot
@@ -4513,6 +4583,13 @@ harness expands `${VAR}` placeholders — MCP server configs, the
 project repo URL, future config fields. The store wins over `os.environ`
 on name collision so a UI-stored secret transparently overrides any
 matching env var.
+
+This interpolation scope is intentionally narrower than process
+environment. Creating a stored secret named `HARNESS_TOKEN` does not
+set the FastAPI/UI bearer token and does not make that token visible to
+Coach or Player subprocesses. Configure API/WS auth through deployment
+process env; keep external-service credentials in the secrets store and
+reference them from the specific config field that consumes them.
 
 Values max 32,768 chars through API.
 
@@ -4603,6 +4680,9 @@ on next boot. The EnvPane still surfaces it on reconnect.
 - If set:
   - all `/api/*` except `/api/health` require `Authorization: Bearer <token>`
   - WebSocket requires `?token=<token>`
+- It is deployment process env only. Storing a UI-managed encrypted
+  secret named `HARNESS_TOKEN` does not configure the API auth gate and
+  does not export that value to Coach or Player runtimes.
 
 This is single-user security, not a multi-user auth system.
 
@@ -4636,7 +4716,11 @@ They are not exposed through API beyond enabled/reason/url status.
 ### 19.4 MCP/Telegram Secrets
 
 UI-managed secrets are encrypted in SQLite. API never returns plaintext. The
-runtime interpolator can read them for MCP/Telegram use.
+runtime interpolator can read them for MCP/Telegram use, repo URL
+interpolation, and other explicit `${VAR}` expansion sites. The
+secrets table is not a general environment-injection mechanism for
+agents. Agents do not receive arbitrary stored secrets; Codex coord
+access uses its own per-slot `HARNESS_COORD_PROXY_TOKEN`.
 
 ### 19.4.1 Secret-path agent guard
 
@@ -4743,8 +4827,8 @@ remains read-only. `/api/health/detail` exposes
 
 Token lifetime, MCP cache invalidation on config change or
 `agents.allowed_tools` mismatch, `default_tools_approval_mode`
-injection, and the stdio error-shape contract are CodexRuntime concerns
-— see
+injection, process-tree cleanup, and the stdio error-shape contract are
+CodexRuntime concerns — see
 `Docs/CODEX_RUNTIME_SPEC.md` §C.4 and §E.1.
 The proxy also implements empty MCP `resources/list`,
 `resources/templates/list`, and `prompts/list`; Codex app-server
@@ -4778,6 +4862,27 @@ recent exchanges are salvaged into `continuity_note`, and
 shape has correlated with an unresumable Codex thread, so clearing it
 immediately prevents the next auto-wake from burning retry attempts on
 the same dead stdio receiver.
+The patched stdio transport starts the Codex Node wrapper/native
+app-server tree in its own process group and closes that group
+explicitly. The 2026-05-16 production incident showed stale Codex
+process pairs reparented under PID 1 and accumulating per Player slot;
+closing only the SDK client or wrapper process is insufficient.
+The patched transport also raises the subprocess StreamReader line
+limit above Python's 64 KiB default (`HARNESS_CODEX_STDIO_LIMIT_BYTES`,
+default 8 MiB, clamped 256 KiB..64 MiB). Codex app-server uses
+newline-delimited JSON, so a single large Bash output, file-read result,
+or post-turn thread-read payload can otherwise look like a stdio
+receiver-loop failure even though the app-server process is still alive
+and has no stderr.
+Before each Codex Player spawn, the dispatcher also refreshes
+`agents.allowed_tools` from the active kanban role row for
+`agents.current_task_id` when that row exists; otherwise it falls back
+to the newest active current-stage role row. When the stored JSON no
+longer matches that role allowlist, existing shipper or executor
+assignments pick up newly-added completion tools without a same-stage
+reassignment. Pending ship rows cannot leak `coord_ship_to_dev` into an
+executor turn for another current task, and pending verifier rows only
+expose `coord_submit_verification_report` once the task is in `verify`.
 
 **Transient-error retry (2026-05-13)**: `CoordProxyClient.call_tool`
 retries on transport errors (`httpx.ConnectError`, `ReadTimeout`,
@@ -4808,13 +4913,14 @@ implementation):
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `HARNESS_TOKEN` | unset | Optional API/WS bearer token |
+| `HARNESS_TOKEN` | unset | Optional API/WS bearer token. Deployment process env only; not resolved from the encrypted secrets table and not exported to agent runtimes. |
 | `CLAUDE_CONFIG_DIR` | `/data/claude` | Claude OAuth/session dir |
 | `CODEX_HOME` | `/data/codex` | Codex CLI auth dir (`auth.json`). Must point at persistent storage; after deploy run `CODEX_HOME=/data/codex codex login --device-auth` in the container to create the ChatGPT OAuth session. |
 | `HARNESS_CODEX_ENABLED` | unset | Codex runtime feature gate. Must be truthy (`true`, `1`, `yes`, `on`) before `PUT /api/agents/{id}/runtime` or the UI runtime controls can select `runtime=codex`. |
-| `HARNESS_CODEX_EXTERNAL_MCP` | unset / false | When truthy, CodexRuntime ambient-starts UI/file-configured external MCP servers. Default false: only `coord` starts unless a slot's explicit `agents.allowed_tools` override names an external `mcp__<server>__...` tool. |
+| `HARNESS_CODEX_EXTERNAL_MCP` | unset / false | When truthy, CodexRuntime ambient-starts UI/file-configured external MCP servers. Default false: only `coord` starts unless the final spawn allowlist contains an external `mcp__<server>__...` tool from role/slot `agents.allowed_tools` or team-wide `extra_tools`. |
 | `HARNESS_CODEX_RUNTIME_HOME` | `$CODEX_HOME/harness-runtime` | Optional root for per-slot Codex app-server homes. Runtime homes copy `$CODEX_HOME/auth.json` but use a clean config without inherited `mcp_servers`, preventing operator/test MCP config from poisoning harness Codex sessions. |
 | `HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS` | `120` | Codex app-server JSON-RPC request timeout passed to `CodexClient.connect_stdio`; clamped to at least 30s. Covers `initialize`, `thread/start`, `thread/resume`, and similar request/response calls. |
+| `HARNESS_CODEX_STDIO_LIMIT_BYTES` | `8388608` | Codex app-server subprocess stdout/stderr StreamReader line limit for newline-delimited JSON-RPC. Clamped to 256 KiB..64 MiB; prevents large tool/result messages from tripping Python's 64 KiB default and surfacing as false stdio transport failures. |
 | `HARNESS_DB_PATH` | `/data/harness.db` | SQLite path |
 | `HARNESS_DATA_ROOT` | `/data` | Global/project data root |
 | `HARNESS_WEBDAV_URL` | unset | WebDAV base folder URL |
@@ -4841,7 +4947,7 @@ implementation):
 | `HARNESS_STALE_TASK_MINUTES` | `15` | Stale task threshold, 0 disables |
 | `HARNESS_STALE_TASK_NOTIFY_INTERVAL_MINUTES` | `30` | Re-notify cadence |
 | `HARNESS_STALE_TASK_CHECK_INTERVAL_SECONDS` | `60` | Watchdog loop cadence |
-| `HARNESS_AUTO_COMPACT_THRESHOLD` | `0.5` | Context fraction for auto-compact (lowered from 0.7 on 2026-05-09) |
+| `HARNESS_AUTO_COMPACT_THRESHOLD` | `0.65` | Context fraction for auto-compact (lowered from 0.7 on 2026-05-09, then raised from 0.5 on 2026-05-15) |
 | `HARNESS_THINKING_BUDGET_TOKENS` | `8000` | Extended-thinking budget when a Player's `thinking_override` (or per-pane toggle) is on. Claude runtime only; clamped ≥ 1024. |
 | `HARNESS_HANDOFF_TOKEN_BUDGET` | `20000` | Recent exchange budget |
 | `HARNESS_STREAM_TOKENS` | `true` | Token delta streaming. Set to `false`/`0`/`no`/`off` to disable (only needed for the rare CLI build that crashes on the underlying flag). |

@@ -185,3 +185,53 @@ async def test_archive_task_happy_path(fresh_db: str) -> None:
         assert a["current_task_id"] is None
     finally:
         await c.close()
+
+
+async def test_archive_task_accepts_verify_stage(fresh_db: str) -> None:
+    await init_db()
+    await _seed_task(status="verify", owner="p2")
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO task_role_assignments "
+            "(task_id, role, eligible_owners, owner, assigned_at, claimed_at) "
+            "VALUES ('t-2026-05-07-bbbb2222', 'verifier', '[]', 'p4', "
+            "strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
+            "strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
+        )
+        await c.execute(
+            "UPDATE agents SET current_task_id = ? WHERE id = 'p4'",
+            ("t-2026-05-07-bbbb2222",),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    server = _server_for("coach")
+    _ok_text(await _handler(server, "archive_task")({
+        "task_id": "t-2026-05-07-bbbb2222",
+        "summary": "Verified in dev; ready to close.",
+    }))
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT status, archived_at FROM tasks WHERE id = ?",
+            ("t-2026-05-07-bbbb2222",),
+        )
+        task = dict(await cur.fetchone())
+        cur = await c.execute(
+            "SELECT completed_at FROM task_role_assignments "
+            "WHERE task_id = ? AND role = 'verifier'",
+            ("t-2026-05-07-bbbb2222",),
+        )
+        verifier = dict(await cur.fetchone())
+        cur = await c.execute("SELECT current_task_id FROM agents WHERE id = 'p4'")
+        agent = dict(await cur.fetchone())
+    finally:
+        await c.close()
+
+    assert task["status"] == "archive"
+    assert task["archived_at"]
+    assert verifier["completed_at"]
+    assert agent["current_task_id"] is None
