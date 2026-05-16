@@ -108,6 +108,22 @@ def audit_actor(request: Request) -> dict[str, str]:
     ua = request.headers.get("user-agent", "")[:120]
     return {"source": "human", "ip": ip, "ua": ua}
 
+
+def _cache_bust_module_imports(
+    app_source: str, versions: dict[str, str],
+) -> str:
+    """Stamp same-origin ES-module imports that browsers cache directly."""
+    out = app_source
+    for filename, version in versions.items():
+        escaped = re.escape(filename)
+        out = re.sub(
+            rf'from\s+"/static/{escaped}(?:\?v=\d+)?"',
+            f'from "/static/{filename}?v={version}"',
+            out,
+        )
+    return out
+
+
 # If package-data shipped /static correctly, INDEX_HTML is the real page.
 # If not, we want a visible error page, not an import crash that makes
 # the container restart-loop with zero logs.
@@ -124,27 +140,27 @@ try:
             return f"{int((STATIC_DIR / filename).stat().st_mtime)}"
         except Exception:
             return "1"
-    # Cache-bust the ES-module import of compass.js inside app.js
+    # Cache-bust ES-module imports inside app.js
     # FIRST — browsers cache module URLs aggressively, and a stale
-    # compass.js produces hard-to-reproduce bugs (e.g. dashboard
-    # hitting an old API contract). We rewrite the import path in
-    # app.js with compass.js's mtime; then app.js's own mtime is
-    # captured for _v_app AFTER that write. The regex matches both
-    # the first-boot form (no query) and re-boots (already stamped).
+    # dashboard module produces hard-to-reproduce bugs. We rewrite the
+    # import paths with each module's mtime; then app.js's own mtime is
+    # captured for _v_app AFTER that write.
     _v_compass = _stamp("compass.js")
+    _v_kanban = _stamp("kanban.js")
     try:
-        import re as _re
         app_path = STATIC_DIR / "app.js"
         _app_raw = app_path.read_text(encoding="utf-8")
-        _app_busted = _re.sub(
-            r'from\s+"/static/compass\.js(?:\?v=\d+)?"',
-            f'from "/static/compass.js?v={_v_compass}"',
+        _app_busted = _cache_bust_module_imports(
             _app_raw,
+            {
+                "compass.js": _v_compass,
+                "kanban.js": _v_kanban,
+            },
         )
         if _app_busted != _app_raw:
             app_path.write_text(_app_busted, encoding="utf-8")
     except Exception:
-        logger.exception("compass.js cache-bust rewrite failed (non-fatal)")
+        logger.exception("dashboard module cache-bust rewrite failed (non-fatal)")
 
     _v_app = _stamp("app.js")
     _v_css = _stamp("style.css")
@@ -751,7 +767,7 @@ class TaskApproveStageRequest(BaseModel):
     `coord_approve_stage` — single transition tool that authorizes the
     next stage, names the assignee, and provides the wake prompt."""
     next_stage: str = Field(
-        pattern=r"^(plan|execute|audit_syntax|audit_semantics|ship|archive)$"
+        pattern=r"^(plan|execute|audit_syntax|audit_semantics|ship|verify|archive)$"
     )
     # Required for any non-archive next_stage; rejected on archive.
     assignee: str | None = Field(default=None, max_length=10)
@@ -4303,6 +4319,7 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
         "audit_syntax": "auditor_syntax",
         "audit_semantics": "auditor_semantics",
         "ship": "shipper",
+        "verify": "verifier",
     }
 
     c = await configured_conn()
@@ -4513,7 +4530,7 @@ async def _load_active_role_assignments(
         cur = await c.execute(
             f"SELECT id, task_id, role, eligible_owners, owner, "
             f"assigned_at, claimed_at, started_at, completed_at, "
-            f"report_path, verdict "
+            f"report_path, verdict, focus "
             f"FROM task_role_assignments "
             f"WHERE task_id IN ({placeholders}) "
             f"AND completed_at IS NULL AND superseded_by IS NULL "
@@ -4545,7 +4562,7 @@ async def _load_role_assignment_history(
         cur = await c.execute(
             f"SELECT id, task_id, role, eligible_owners, owner, "
             f"assigned_at, claimed_at, started_at, completed_at, "
-            f"report_path, verdict, superseded_by "
+            f"report_path, verdict, focus, superseded_by "
             f"FROM task_role_assignments "
             f"WHERE task_id IN ({placeholders}) "
             f"ORDER BY assigned_at",
@@ -4554,6 +4571,70 @@ async def _load_role_assignment_history(
         for row in await cur.fetchall():
             d = dict(row)
             out.setdefault(d["task_id"], []).append(d)
+    finally:
+        await c.close()
+    return out
+
+
+async def _load_postship_context(
+    task_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Attach latest ship evidence and verification verdict/report.
+
+    This is read-only UI enrichment over the existing project_events log;
+    no schema changes are needed for the Verify column to show PR/SHA and
+    report links.
+    """
+    if not task_ids:
+        return {}
+    placeholders = ",".join("?" * len(task_ids))
+    out: dict[str, dict[str, Any]] = {tid: {} for tid in task_ids}
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            f"SELECT task_id, type, ts, payload_json, payload_pointer "
+            f"FROM project_events "
+            f"WHERE task_id IN ({placeholders}) "
+            f"AND type IN ('task_shipped_to_dev', 'verification_report_submitted') "
+            f"ORDER BY ts ASC",
+            task_ids,
+        )
+        for row in await cur.fetchall():
+            d = dict(row)
+            task_id = d.get("task_id")
+            if not task_id:
+                continue
+            try:
+                payload = json.loads(d.get("payload_json") or "{}")
+                if not isinstance(payload, dict):
+                    payload = {}
+            except Exception:
+                payload = {}
+            ctx = out.setdefault(task_id, {})
+            if d.get("type") == "task_shipped_to_dev":
+                ctx["latest_ship_evidence"] = {
+                    "ts": d.get("ts"),
+                    "pr_number": payload.get("pr_number"),
+                    "pr_url": payload.get("pr_url") or "",
+                    "ship_sha": payload.get("ship_sha") or "",
+                    "executor_sha": payload.get("executor_sha") or "",
+                    "deploy_target": payload.get("deploy_target") or "dev",
+                    "pointer": d.get("payload_pointer") or "",
+                }
+            elif d.get("type") == "verification_report_submitted":
+                ctx["latest_verification"] = {
+                    "ts": d.get("ts"),
+                    "verdict": payload.get("verdict") or "",
+                    "report_path": (
+                        payload.get("report_path")
+                        or d.get("payload_pointer")
+                        or ""
+                    ),
+                    "round": payload.get("round"),
+                    "verifier_id": payload.get("verifier_id") or "",
+                    "evidence": payload.get("evidence"),
+                    "message_to_coach": payload.get("message_to_coach") or "",
+                }
     finally:
         await c.close()
     return out
@@ -4576,7 +4657,9 @@ async def get_tasks_board() -> dict[str, Any]:
     finally:
         await c.close()
 
-    role_map = await _load_active_role_assignments([r["id"] for r in rows])
+    task_ids = [r["id"] for r in rows]
+    role_map = await _load_active_role_assignments(task_ids)
+    postship_map = await _load_postship_context(task_ids)
 
     buckets: dict[str, list[dict[str, Any]]] = {
         "plan": [],
@@ -4584,9 +4667,11 @@ async def get_tasks_board() -> dict[str, Any]:
         "audit_syntax": [],
         "audit_semantics": [],
         "ship": [],
+        "verify": [],
     }
     for row in rows:
         row["assignments"] = role_map.get(row["id"], [])
+        row.update(postship_map.get(row["id"], {}))
         buckets.setdefault(row["status"], []).append(row)
     for stage in buckets:
         buckets[stage].sort(key=_priority_sort_key)
@@ -4633,8 +4718,10 @@ async def get_tasks_archive(
     finally:
         await c.close()
     role_map = await _load_role_assignment_history([r["id"] for r in rows])
+    postship_map = await _load_postship_context([r["id"] for r in rows])
     for row in rows:
         row["assignments"] = role_map.get(row["id"], [])
+        row.update(postship_map.get(row["id"], {}))
     return {"tasks": rows, "total": total, "limit": limit, "offset": offset}
 
 
@@ -4678,6 +4765,7 @@ async def get_task_assignments(task_id: str) -> dict[str, Any]:
 # through the same validator as Coach's MCP-tool override.
 from server.tools import (  # noqa: E402
     ALL_KANBAN_STAGES,
+    _ship_verify_context_or_error,
     _valid_transition,
     _validate_trajectory,
 )
@@ -4754,6 +4842,7 @@ async def post_task_approve_stage(
     old_status: str | None = None
     old_owner: str | None = None
     new_role_id: int | None = None
+    ship_verify_context = ""
     try:
         cur = await c.execute(
             "SELECT status, owner FROM tasks "
@@ -4810,6 +4899,14 @@ async def post_task_approve_stage(
                 400,
                 detail=f"invalid transition: {old_status} → {next_stage}",
             )
+
+        if old_status == "ship" and next_stage == "verify":
+            context, error = await _ship_verify_context_or_error(
+                c, task_id, req.note or "",
+            )
+            if error:
+                raise HTTPException(400, detail=error)
+            ship_verify_context = context or ""
 
         now = datetime.now(timezone.utc).isoformat()
         if next_stage == "archive":
@@ -4937,10 +5034,13 @@ async def post_task_approve_stage(
     if next_stage != "archive" and assignee:
         from server.agents import maybe_wake_agent
         from server.tools import _with_player_reminder
-        wake_body = _with_player_reminder(req.note or (
+        base_wake = req.note or (
             f"Human approved task {task_id} → stage "
             f"{next_stage!r} ({target_role})."
-        ))
+        )
+        if ship_verify_context:
+            base_wake = f"{base_wake}\n\n{ship_verify_context}"
+        wake_body = _with_player_reminder(base_wake)
         try:
             await maybe_wake_agent(
                 assignee, wake_body,
@@ -4956,6 +5056,7 @@ async def post_task_approve_stage(
         "from": old_status,
         "to": next_stage,
         "assignee": assignee,
+        "ship_verify_context": ship_verify_context or None,
     }
 
 
@@ -5230,7 +5331,9 @@ async def get_tasks_flow_health() -> dict[str, Any]:
     actually moving' without scraping events."""
     from server import kanban as kanban_mod
     project_id = await resolve_active_project()
-    stages = ["plan", "execute", "audit_syntax", "audit_semantics", "ship"]
+    stages = [
+        "plan", "execute", "audit_syntax", "audit_semantics", "ship", "verify",
+    ]
     out_stages: dict[str, dict[str, Any]] = {}
     stalled_count = 0
 

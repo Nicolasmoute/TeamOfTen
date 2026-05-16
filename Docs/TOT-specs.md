@@ -42,7 +42,7 @@ Dependent specs (subordinate to this document):
   `coord_create_task` is the planned contract; pools are FYI only
   (Coach explicitly assigns one named Player at each transition).
   Stages: plan → execute → audit_syntax → audit_semantics → ship →
-  archive. A new per-project event log feeds Coach's tick context;
+  optional verify → archive. A new per-project event log feeds Coach's tick context;
   pattern-detection counters (Player health, audit aggregator,
   push-time deviation flag, recent-patterns block) surface drift
   proactively. v1 archive at `Docs/kanban-specs-v1-archived.md`.
@@ -2307,7 +2307,7 @@ so permissions do not depend on the model truthfully passing its identity.
   `task_role_assignments` (the kanban v2 source of truth), falling back to
   `tasks.owner` for archive/non-standard stages where no role row exists.
 - Each task row includes `kind=task`; each row for an active kanban stage
-  (plan/execute/audit_syntax/audit_semantics/ship) includes a
+  (plan/execute/audit_syntax/audit_semantics/ship/verify) includes a
   `stage_role=<role>:<state>` field:
   - `executor:p3` — live assignment with named owner
   - `executor:done` — non-audit role row completed (awaiting Coach advance)
@@ -2353,7 +2353,7 @@ so permissions do not depend on the model truthfully passing its identity.
 - THE single stage-transition tool in v2. Replaces v1's
   `coord_advance_task_stage` and the four `coord_assign_*` variants.
 - `next_stage` ∈ {plan, execute, audit_syntax, audit_semantics, ship,
-  archive}; transition validated against the §3.1 state machine.
+  verify, archive}; transition validated against the §3.1 state machine.
 - `assignee` is required for any non-archive `next_stage`; pass a
   single Player slot. Pools are FYI only — pick one explicit name.
 - Atomically: stamps `last_stage_change_at`; deactivates any prior
@@ -2376,6 +2376,17 @@ so permissions do not depend on the model truthfully passing its identity.
   with the summary in the payload.
 - v2 has NO auto-archive on trajectory completion — every task ends
   with this Coach-written wrap-up.
+
+`coord_submit_verification_report(task_id, verdict, body, message_to_coach?, evidence?)`
+
+- Players only; requires task status `verify` and an active verifier role
+  row for the caller.
+- Writes `verifications/verification_<round>.md`, records `pass`/`fail`
+  on the verifier role row, marks that row complete, resets the verifier
+  to idle tools, emits `verification_report_submitted`, and wakes Coach.
+- `verdict='fail'` does not auto-revert, auto-create follow-up work, or
+  archive. Coach reads the report and decides whether to archive, create
+  a follow-up, roll back, reroute to execute, or re-ship.
 
 `coord_set_task_trajectory(task_id, trajectory)`
 
@@ -2552,6 +2563,9 @@ Current implementation gap:
     `pr_number`, `pr_url`, `executor_sha`.
   - Wakes Coach via `_wake_coach_for_completion`.
 - **Return:** `ok=True` text with `pr_url`, `pr_number`, dev HEAD SHA.
+  If the trajectory includes `verify`, the response reminds Coach to
+  approve the optional post-ship verification stage; it does not
+  transition automatically.
 - Raw `git push origin ...:dev` bypasses this gate and is a pb-005
   violation; use `coord_ship_to_dev` instead.
 
@@ -3270,6 +3284,11 @@ shown as a preview (first 120 chars) below the card title, with a "more" /
 backlog") also includes an optional description textarea. The two bus events
 (`backlog_entry_updated`, `backlog_entry_deleted`) are in the `backlogWatched`
 set so the board auto-refreshes on remote changes.
+Backlog promotion also emits the normal task creation/stage/role events
+and the Kanban pane treats `backlog_task_promoted` as a board refresh
+trigger, so a promoted entry disappears from Backlog and appears in its
+initial active column without the operator pressing Refresh or reloading.
+Rejection emits `backlog_task_rejected`, which refreshes the Backlog list.
 
 ### 14.6 Messages
 
@@ -4555,6 +4574,13 @@ project repo URL, future config fields. The store wins over `os.environ`
 on name collision so a UI-stored secret transparently overrides any
 matching env var.
 
+This interpolation scope is intentionally narrower than process
+environment. Creating a stored secret named `HARNESS_TOKEN` does not
+set the FastAPI/UI bearer token and does not make that token visible to
+Coach or Player subprocesses. Configure API/WS auth through deployment
+process env; keep external-service credentials in the secrets store and
+reference them from the specific config field that consumes them.
+
 Values max 32,768 chars through API.
 
 ### 18.3 Telegram Bridge
@@ -4644,6 +4670,9 @@ on next boot. The EnvPane still surfaces it on reconnect.
 - If set:
   - all `/api/*` except `/api/health` require `Authorization: Bearer <token>`
   - WebSocket requires `?token=<token>`
+- It is deployment process env only. Storing a UI-managed encrypted
+  secret named `HARNESS_TOKEN` does not configure the API auth gate and
+  does not export that value to Coach or Player runtimes.
 
 This is single-user security, not a multi-user auth system.
 
@@ -4677,7 +4706,11 @@ They are not exposed through API beyond enabled/reason/url status.
 ### 19.4 MCP/Telegram Secrets
 
 UI-managed secrets are encrypted in SQLite. API never returns plaintext. The
-runtime interpolator can read them for MCP/Telegram use.
+runtime interpolator can read them for MCP/Telegram use, repo URL
+interpolation, and other explicit `${VAR}` expansion sites. The
+secrets table is not a general environment-injection mechanism for
+agents. Agents do not receive arbitrary stored secrets; Codex coord
+access uses its own per-slot `HARNESS_COORD_PROXY_TOKEN`.
 
 ### 19.4.1 Secret-path agent guard
 
@@ -4837,8 +4870,9 @@ Before each Codex Player spawn, the dispatcher also refreshes
 to the newest active current-stage role row. When the stored JSON no
 longer matches that role allowlist, existing shipper or executor
 assignments pick up newly-added completion tools without a same-stage
-reassignment, and pending ship rows cannot leak `coord_ship_to_dev`
-into an executor turn for another current task.
+reassignment. Pending ship rows cannot leak `coord_ship_to_dev` into an
+executor turn for another current task, and pending verifier rows only
+expose `coord_submit_verification_report` once the task is in `verify`.
 
 **Transient-error retry (2026-05-13)**: `CoordProxyClient.call_tool`
 retries on transport errors (`httpx.ConnectError`, `ReadTimeout`,
@@ -4869,7 +4903,7 @@ implementation):
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `HARNESS_TOKEN` | unset | Optional API/WS bearer token |
+| `HARNESS_TOKEN` | unset | Optional API/WS bearer token. Deployment process env only; not resolved from the encrypted secrets table and not exported to agent runtimes. |
 | `CLAUDE_CONFIG_DIR` | `/data/claude` | Claude OAuth/session dir |
 | `CODEX_HOME` | `/data/codex` | Codex CLI auth dir (`auth.json`). Must point at persistent storage; after deploy run `CODEX_HOME=/data/codex codex login --device-auth` in the container to create the ChatGPT OAuth session. |
 | `HARNESS_CODEX_ENABLED` | unset | Codex runtime feature gate. Must be truthy (`true`, `1`, `yes`, `on`) before `PUT /api/agents/{id}/runtime` or the UI runtime controls can select `runtime=codex`. |

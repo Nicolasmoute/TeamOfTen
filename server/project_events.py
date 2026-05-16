@@ -78,6 +78,7 @@ _LOGGABLE_BUS_TYPES: frozenset[str] = frozenset({
     "task_spec_written",
     "task_role_completed",
     "audit_report_submitted",
+    "verification_report_submitted",
     "audit_fail_notification",
     "task_stage_changed",
     "task_role_assigned",
@@ -85,6 +86,7 @@ _LOGGABLE_BUS_TYPES: frozenset[str] = frozenset({
     "task_trajectory_changed",
     "task_blocked_changed",
     "task_archived",
+    "task_shipped_to_dev",
     "commit_without_task_id_warning",
     "task_stage_stale",
     "task_stall_persisting",
@@ -129,6 +131,8 @@ def _extract_pointer(log_type: str, payload: dict[str, Any]) -> str | None:
         return payload.get("artifact_path") or None
     if log_type == "audit_report_submitted":
         return payload.get("report_path") or None
+    if log_type == "verification_report_submitted":
+        return payload.get("report_path") or None
     if log_type == "coord_send_message":
         body = payload.get("body") or payload.get("text") or ""
         if not body:
@@ -156,6 +160,8 @@ def _extract_pointer(log_type: str, payload: dict[str, Any]) -> str | None:
         if not summary:
             return None
         return summary[:500]
+    if log_type == "task_shipped_to_dev":
+        return payload.get("ship_sha") or payload.get("pr_url") or None
     if log_type == "kanban_board_stalled":
         # Body is the human-readable framing; let the dashboard show it.
         body = payload.get("body") or ""
