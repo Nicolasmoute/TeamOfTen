@@ -3035,13 +3035,13 @@ def _model_from_rollout(rollout_path: Path) -> str | None:
 def _extract_compact_summary(raw: Any) -> str:
     mapped = _to_mapping(raw)
     if mapped is not None:
-        for key in ("summary", "text", "content", "message"):
+        for key in ("summary", "text", "content", "message", "result"):
             value = mapped.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
         nested = _find_first_mapping_by_key(mapped, "summary")
         if nested is not None:
-            for key in ("text", "content", "message"):
+            for key in ("text", "content", "message", "result"):
                 value = nested.get(key)
                 if isinstance(value, str) and value.strip():
                     return value.strip()
@@ -3925,37 +3925,27 @@ class CodexRuntime:
                 )
                 tc.turn_ctx["auto_compact_skipped"] = True
                 return
-            # No prior thread → nothing to compact. Treat as no-op success
-            # so the dispatcher's /compact slash command doesn't loop.
-            # If a transfer was requested, the endpoint should have
-            # short-circuited to a bare flip; reaching this branch with
-            # transfer_to_runtime set means we lost that race (e.g. the
-            # thread id was cleared between endpoint check and turn
-            # start). Fall back to flipping here so the user's intent
-            # still completes.
+            # No prior thread means there is no compact summary or
+            # durable handoff to report. Do not emit
+            # session_compacted/session_transferred here; the UI renders
+            # those as successful handoffs.
             _xfer_to = (
                 (tc.turn_ctx.get("transfer_to_runtime") or "").strip().lower()
             )
+            reason = (
+                "No stored Codex thread was available to compact; "
+                "no handoff was written."
+            )
             if _xfer_to in ("claude", "codex"):
-                from server.agents import (
-                    _perform_runtime_transfer_flip, _resolve_runtime_for,
-                )
-                _xfer_from = await _resolve_runtime_for(tc.agent_id)
-                await _perform_runtime_transfer_flip(tc.agent_id, _xfer_to)
                 await _emit(
                     tc.agent_id,
-                    "session_transferred",
-                    from_runtime=_xfer_from,
+                    "session_transfer_failed",
                     to_runtime=_xfer_to,
-                    note="no codex thread to compact (fresh session)",
+                    reason=reason,
                 )
             else:
-                await _emit(
-                    tc.agent_id,
-                    "session_compacted",
-                    note="no codex thread to compact (fresh session)",
-                )
-            tc.turn_ctx["got_result"] = True
+                await _emit(tc.agent_id, "error", error=reason)
+            await _set_status(tc.agent_id, "error")
             return
 
         try:
@@ -3978,6 +3968,7 @@ class CodexRuntime:
             await _set_status(tc.agent_id, "error")
             return
 
+        used_synthetic_summary = False
         try:
             raw = client.compact_thread(thread_id)
             if hasattr(raw, "__await__"):
@@ -3992,53 +3983,57 @@ class CodexRuntime:
             await close_client(tc.agent_id)
 
             # Stale-thread detection: Codex backend already dropped this
-            # thread (CodexProtocolError "thread not found"). Without
-            # clearing the stored id, every retry hits the same dead
-            # thread and loops. Mirror open_thread's auto-heal: null the
-            # id and, in transfer mode, complete the flip — the thread
-            # is gone server-side, there's nothing to salvage by staying.
+            # thread (CodexProtocolError "thread not found"). We can
+            # recover only by building a synthetic handoff and passing
+            # through the normal durable handoff path below.
             sdk = _import_codex_sdk()
             protocol_cls = getattr(sdk, "CodexProtocolError", None)
             is_stale_thread = (
                 "thread not found" in str(exc).lower()
                 or (protocol_cls is not None and isinstance(exc, protocol_cls))
             )
-            _xfer_to = (
-                (tc.turn_ctx.get("transfer_to_runtime") or "").strip().lower()
-            )
             if is_stale_thread:
-                await _clear_codex_thread_id(tc.agent_id)
-                if _xfer_to in ("claude", "codex"):
-                    from server.agents import (
-                        _perform_runtime_transfer_flip, _resolve_runtime_for,
+                try:
+                    recent = _valid_recent_exchanges(
+                        await _get_recent_exchanges(tc.agent_id)
                     )
-                    _xfer_from = await _resolve_runtime_for(tc.agent_id)
-                    await _perform_runtime_transfer_flip(tc.agent_id, _xfer_to)
-                    await _emit(
+                    used_synthetic_summary = True
+                    raw = {
+                        "summary": _synthetic_compact_summary_from_recent(
+                            thread_id=thread_id,
+                            recent=recent,
+                        )
+                    }
+                except Exception:
+                    logger.exception(
+                        "CodexRuntime: stale-thread fallback read failed for slot=%s",
                         tc.agent_id,
-                        "session_transferred",
-                        from_runtime=_xfer_from,
-                        to_runtime=_xfer_to,
-                        note=(
-                            "codex thread no longer existed; transferred "
-                            "without compact summary"
-                        ),
                     )
-                else:
-                    await _emit(
-                        tc.agent_id,
-                        "session_compacted",
-                        note=(
-                            "codex thread no longer existed; reset to "
-                            "fresh session"
-                        ),
+                    _xfer_to = (
+                        (tc.turn_ctx.get("transfer_to_runtime") or "")
+                        .strip()
+                        .lower()
                     )
-                tc.turn_ctx["got_result"] = True
+                    reason = (
+                        "Codex compact thread no longer existed and no "
+                        "fallback handoff could be built; "
+                        "codex_thread_id preserved."
+                    )
+                    if _xfer_to in ("claude", "codex"):
+                        await _emit(
+                            tc.agent_id,
+                            "session_transfer_failed",
+                            to_runtime=_xfer_to,
+                            reason=reason,
+                        )
+                    else:
+                        await _emit(tc.agent_id, "error", error=reason)
+                    await _set_status(tc.agent_id, "error")
+                    return
+            else:
+                await _emit(tc.agent_id, "error", error=f"compact failed: {exc}")
+                await _set_status(tc.agent_id, "error")
                 return
-
-            await _emit(tc.agent_id, "error", error=f"compact failed: {exc}")
-            await _set_status(tc.agent_id, "error")
-            return
 
         summary = _extract_compact_summary(raw)
         if not summary:
@@ -4052,7 +4047,6 @@ class CodexRuntime:
                     "thread=%s",
                     tc.agent_id, thread_id,
                 )
-        used_synthetic_summary = False
         if not summary:
             used_synthetic_summary = True
             recent = _valid_recent_exchanges(
@@ -4068,29 +4062,38 @@ class CodexRuntime:
             tc.agent_id,
             summary_with_footer,
         )
-        if handoff_file:
-            pointer = (
-                f"_This handoff is also saved to handoffs/{handoff_file} "
-                f"for audit + cross-agent reference; the text below is "
-                f"the full content._\n\n"
-            ) + summary_with_footer
-        else:
-            pointer = summary_with_footer
+        if not handoff_file:
+            _xfer_to = (
+                (tc.turn_ctx.get("transfer_to_runtime") or "").strip().lower()
+            )
+            reason = (
+                "Codex compact handoff file write failed; "
+                "codex_thread_id preserved."
+            )
+            if _xfer_to in ("claude", "codex"):
+                await _emit(
+                    tc.agent_id,
+                    "session_transfer_failed",
+                    to_runtime=_xfer_to,
+                    reason=reason,
+                )
+            else:
+                await _emit(tc.agent_id, "error", error=reason)
+            await _set_status(tc.agent_id, "error")
+            return
+        pointer = (
+            f"_This handoff is also saved to handoffs/{handoff_file} "
+            f"for audit + cross-agent reference; the text below is "
+            f"the full content._\n\n"
+        ) + summary_with_footer
         await _set_continuity_note(tc.agent_id, pointer)
         await _clear_codex_thread_id(tc.agent_id)
         await _clear_exchange_log(tc.agent_id)
 
         # Transfer-mode (compact + flip): apply the runtime change now
-        # that compaction succeeded. The continuity_note we just wrote
-        # is the handoff the new runtime's first turn will read. We
-        # still flip when summary is empty here because (a) the
-        # compact_thread call itself succeeded — Codex returned without
-        # raising, the only reason summary is empty is the SDK's opaque
-        # return shape — and (b) we already cleared codex_thread_id, so
-        # not flipping would leave the agent on Codex with no thread to
-        # resume, which is strictly worse than flipping with thin
-        # context. Symmetry-with-Claude is broken intentionally here:
-        # Claude detects empty summary BEFORE clearing, Codex can't.
+        # that compaction succeeded and the handoff is durable. The
+        # continuity_note we just wrote is the handoff the new runtime's
+        # first turn will read.
         _xfer_to = (
             (tc.turn_ctx.get("transfer_to_runtime") or "").strip().lower()
         )
