@@ -2837,7 +2837,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     @tool(
         "coord_ship_to_dev",
         (
-            "Ship an audited task to dev via cherry-pick + PR. "
+            "Ship an audited task to dev via resumable cherry-pick + PR. "
             "Player-only (Coach uses coord_approve_stage).\n"
             "\n"
             "Guards (fail-fast, in order):\n"
@@ -2850,14 +2850,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- every audit stage in the task's trajectory must have a "
             "PASS verdict (no un-superseded FAIL allowed)\n"
             "\n"
-            "On success: cherry-picks the executor commit onto a temp "
-            "branch off origin/dev, opens a GitHub PR, squash-merges "
-            "it, deletes the remote branch, closes the shipper role "
-            "row, emits task_shipped_to_dev, and wakes Coach.\n"
+            "On success: cherry-picks or resumes the executor commit "
+            "onto a temp branch off origin/dev, opens/reuses a GitHub "
+            "PR, squash-merges it, deletes the remote branch, closes "
+            "the shipper role row, emits task_shipped_to_dev, and "
+            "wakes Coach. Replays are idempotent when ship evidence "
+            "already exists or the patch is already present on dev.\n"
             "\n"
             "Cherry-pick conflicts return an error and leave the "
             "worktree on the temp branch so the Player can resolve "
-            "manually.\n"
+            "manually, then rerun this tool after "
+            "`git cherry-pick --continue`.\n"
             "\n"
             "Params:\n"
             "- task_id: the kanban task id to ship (required)"
@@ -3035,34 +3038,266 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
 
             return await asyncio.to_thread(_do)
 
+        async def _latest_ship_evidence() -> dict[str, Any] | None:
+            c = await configured_conn()
+            try:
+                cur = await c.execute(
+                    "SELECT payload_json FROM project_events "
+                    "WHERE task_id = ? AND type = 'task_shipped_to_dev' "
+                    "ORDER BY ts DESC, id DESC LIMIT 1",
+                    (task_id,),
+                )
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                raw = dict(row).get("payload_json") or "{}"
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    payload = {}
+                return payload if isinstance(payload, dict) else {}
+            finally:
+                await c.close()
+
+        async def _complete_shipper_role() -> None:
+            c = await configured_conn()
+            try:
+                await c.execute(
+                    "UPDATE task_role_assignments SET completed_at = "
+                    "COALESCE(completed_at, ?) WHERE id = ?",
+                    (_now_iso(), shipper_row_id),
+                )
+                await c.commit()
+            finally:
+                await c.close()
+
+        async def _complete_with_evidence(
+            *,
+            ship_sha: str,
+            pr_number: Any,
+            pr_url: str,
+            ship_method: str,
+            idempotent: bool,
+            emit_event: bool = True,
+        ) -> dict[str, Any]:
+            await _complete_shipper_role()
+            if emit_event:
+                await bus.publish(
+                    {
+                        "ts": _now_iso(),
+                        "agent_id": caller_id,
+                        "type": "task_shipped_to_dev",
+                        "task_id": task_id,
+                        "ship_sha": ship_sha,
+                        "pr_number": pr_number,
+                        "pr_url": pr_url,
+                        "executor_sha": executor_sha,
+                        "deploy_target": "dev",
+                        "ship_method": ship_method,
+                        "idempotent": idempotent,
+                        "to": "coach",
+                    }
+                )
+            pr_label = f"PR #{pr_number}" if pr_number else "no PR"
+            await _wake_coach_for_completion(
+                caller_id=caller_id,
+                task_id=task_id,
+                role="shipper",
+                message_to_coach=None,
+                artifact_path=None,
+                extra_hint=(
+                    f"Shipped to dev ({ship_method}) — {pr_label}, "
+                    f"dev now at {(ship_sha or '')[:8]}."
+                ),
+            )
+            if pr_number:
+                return _ok(
+                    f"Task {task_id} shipped to dev.\n"
+                    f"PR: {pr_url} (#{pr_number}) — squash-merged.\n"
+                    f"Dev HEAD: {ship_sha}.\n"
+                    f"Shipper role complete. Coach has been woken."
+                )
+            return _ok(
+                f"Task {task_id} already present on dev.\n"
+                f"Dev HEAD: {ship_sha}.\n"
+                f"Shipper role complete. Coach has been woken."
+            )
+
+        existing_evidence = await _latest_ship_evidence()
+        if existing_evidence is not None:
+            return await _complete_with_evidence(
+                ship_sha=(existing_evidence.get("ship_sha") or ""),
+                pr_number=existing_evidence.get("pr_number"),
+                pr_url=(existing_evidence.get("pr_url") or ""),
+                ship_method=(
+                    existing_evidence.get("ship_method")
+                    or "existing_evidence"
+                ),
+                idempotent=True,
+                emit_event=False,
+            )
+
+        async def _git_stdout(cmd: list[str]) -> str:
+            rc, out, err = await _git(cmd)
+            if rc != 0:
+                raise RuntimeError(err.strip() or out.strip())
+            return out.strip()
+
+        async def _origin_dev_sha() -> str:
+            return await _git_stdout(["git", "rev-parse", "origin/dev"])
+
+        async def _current_branch() -> str:
+            rc, out, _ = await _git(["git", "branch", "--show-current"])
+            return out.strip() if rc == 0 else ""
+
+        async def _local_branch_exists(branch: str) -> bool:
+            rc, _, _ = await _git(
+                ["git", "rev-parse", "--verify", f"refs/heads/{branch}"]
+            )
+            return rc == 0
+
+        async def _status_porcelain() -> str:
+            rc, out, err = await _git(["git", "status", "--porcelain=v1"])
+            if rc != 0:
+                raise RuntimeError(err.strip() or out.strip())
+            return out
+
+        async def _worktree_dirty() -> bool:
+            return bool((await _status_porcelain()).strip())
+
+        async def _has_unmerged_paths() -> bool:
+            rc, out, _ = await _git(
+                ["git", "diff", "--name-only", "--diff-filter=U"]
+            )
+            return rc == 0 and bool(out.strip())
+
+        async def _cherry_pick_in_progress() -> bool:
+            rc, _, _ = await _git(
+                ["git", "rev-parse", "--verify", "CHERRY_PICK_HEAD"]
+            )
+            return rc == 0
+
+        async def _executor_patch_on_dev() -> bool:
+            rc, _, _ = await _git(
+                ["git", "merge-base", "--is-ancestor", executor_sha, "origin/dev"]
+            )
+            if rc == 0:
+                return True
+            rc, out, _ = await _git(
+                [
+                    "git",
+                    "cherry",
+                    "origin/dev",
+                    executor_sha,
+                    f"{executor_sha}^",
+                ]
+            )
+            if rc != 0:
+                return False
+            return any(
+                line.strip().startswith(f"- {executor_sha}")
+                for line in out.splitlines()
+            )
+
+        def _looks_empty_cherry_pick(out: str, err: str) -> bool:
+            text = f"{out}\n{err}".lower()
+            needles = (
+                "previous cherry-pick is now empty",
+                "nothing to commit",
+                "patch is empty",
+                "the previous cherry-pick is empty",
+                "empty commit set passed",
+            )
+            return any(n in text for n in needles)
+
         rc, _, err = await _git(["git", "fetch", "origin"])
         if rc != 0:
             return _err(f"git fetch failed: {err.strip()}")
 
-        rc, _, err = await _git(
-            ["git", "checkout", "-b", branch_name, "origin/dev"]
-        )
-        if rc != 0:
-            return _err(
-                f"git checkout ship branch failed: {err.strip()}"
+        if await _executor_patch_on_dev():
+            return await _complete_with_evidence(
+                ship_sha=await _origin_dev_sha(),
+                pr_number=None,
+                pr_url="",
+                ship_method="already_present",
+                idempotent=True,
             )
 
-        rc, out, err = await _git(
-            ["git", "cherry-pick", executor_sha]
-        )
-        if rc != 0:
-            # Leave the worktree on the temp branch for manual resolution
-            conflict_detail = (err.strip() or out.strip())[:300]
-            return _err(
-                f"cherry-pick of {executor_sha} onto origin/dev "
-                f"conflicted: {conflict_detail}\n"
-                f"Resolve manually: fix conflicts, then "
-                f"`git cherry-pick --continue`.\n"
-                f"To abort and clean up: "
-                f"`git cherry-pick --abort && "
-                f"git checkout {caller_branch} && "
-                f"git branch -D {branch_name}`."
+        branch_exists = await _local_branch_exists(branch_name)
+        resumed_branch = False
+        if branch_exists:
+            current = await _current_branch()
+            if current != branch_name:
+                try:
+                    dirty = await _worktree_dirty()
+                except RuntimeError as exc:
+                    return _err(f"git status failed: {exc}")
+                if dirty:
+                    return _err(
+                        f"local ship branch {branch_name} exists, but "
+                        f"current branch {current or '(detached)'} has "
+                        f"uncommitted changes. Finish/clean the current "
+                        f"worktree, then rerun coord_ship_to_dev."
+                    )
+                rc, _, err = await _git(["git", "checkout", branch_name])
+                if rc != 0:
+                    return _err(
+                        f"git checkout existing ship branch failed: "
+                        f"{err.strip()}"
+                    )
+            if await _cherry_pick_in_progress() or await _has_unmerged_paths():
+                return _err(
+                    f"ship branch {branch_name} still has unresolved "
+                    f"cherry-pick conflicts. Resolve them, run "
+                    f"`git cherry-pick --continue`, then rerun "
+                    f"coord_ship_to_dev. To abandon: "
+                    f"`git cherry-pick --abort && "
+                    f"git checkout {caller_branch}`."
+                )
+            resumed_branch = True
+        else:
+            rc, _, err = await _git(
+                ["git", "checkout", "-b", branch_name, "origin/dev"]
             )
+            if rc != 0:
+                return _err(
+                    f"git checkout ship branch failed: {err.strip()}"
+                )
+
+            rc, out, err = await _git(
+                ["git", "cherry-pick", "-x", executor_sha]
+            )
+            if rc != 0:
+                if _looks_empty_cherry_pick(out, err):
+                    await _git(["git", "cherry-pick", "--abort"])
+                    if await _executor_patch_on_dev():
+                        return await _complete_with_evidence(
+                            ship_sha=await _origin_dev_sha(),
+                            pr_number=None,
+                            pr_url="",
+                            ship_method="already_present",
+                            idempotent=True,
+                        )
+                    empty_detail = (err.strip() or out.strip())[:300]
+                    return _err(
+                        f"cherry-pick of {executor_sha} produced an "
+                        f"empty/no-op patch, but the patch was not "
+                        f"confirmed on origin/dev: {empty_detail}. "
+                        f"Shipper role remains open; inspect "
+                        f"{branch_name} before retrying."
+                    )
+                # Leave the worktree on the temp branch for manual resolution
+                conflict_detail = (err.strip() or out.strip())[:300]
+                return _err(
+                    f"cherry-pick of {executor_sha} onto origin/dev "
+                    f"conflicted: {conflict_detail}\n"
+                    f"Resolve manually: fix conflicts, then "
+                    f"`git cherry-pick --continue`.\n"
+                    f"To abort and clean up: "
+                    f"`git cherry-pick --abort && "
+                    f"git checkout {caller_branch} && "
+                    f"git branch -D {branch_name}`."
+                )
 
         rc, _, err = await _git(
             ["git", "push", "origin", f"{branch_name}:{branch_name}"]
@@ -3094,23 +3329,44 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                # Create PR
-                r = await client.post(
-                    f"{api_base}/pulls",
-                    headers=gh_headers,
-                    json={
-                        "title": pr_title,
-                        "head": branch_name,
-                        "base": "dev",
-                        "body": pr_body,
-                    },
-                )
-                if r.status_code not in (200, 201):
-                    return _err(
-                        f"GitHub API {r.status_code} on PR create: "
-                        f"{r.text[:200]}"
+                async def _find_open_pr() -> dict[str, Any] | None:
+                    r = await client.get(
+                        f"{api_base}/pulls",
+                        headers=gh_headers,
+                        params={
+                            "head": f"{gh_owner}:{branch_name}",
+                            "base": "dev",
+                            "state": "open",
+                        },
                     )
-                pr_data = r.json()
+                    if r.status_code != 200:
+                        return None
+                    data = r.json()
+                    if isinstance(data, list) and data:
+                        return data[0]
+                    return None
+
+                pr_data = await _find_open_pr()
+                if pr_data is None:
+                    r = await client.post(
+                        f"{api_base}/pulls",
+                        headers=gh_headers,
+                        json={
+                            "title": pr_title,
+                            "head": branch_name,
+                            "base": "dev",
+                            "body": pr_body,
+                        },
+                    )
+                    if r.status_code == 422:
+                        pr_data = await _find_open_pr()
+                    if pr_data is None:
+                        if r.status_code not in (200, 201):
+                            return _err(
+                                f"GitHub API {r.status_code} on PR "
+                                f"create: {r.text[:200]}"
+                            )
+                        pr_data = r.json()
                 pr_number = pr_data.get("number")
                 pr_url = pr_data.get("html_url", "")
 
@@ -3129,7 +3385,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                         f"{r.text[:200]}"
                     )
                 merge_data = r.json()
-                merge_sha = merge_data.get("sha", "")
+                merge_sha = (
+                    merge_data.get("sha")
+                    or pr_data.get("merge_commit_sha")
+                    or ""
+                )
 
                 # Delete remote ship branch (best-effort; non-fatal)
                 try:
@@ -3150,59 +3410,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         except Exception:
             pass
 
-        # Close the shipper role row
-        c = await configured_conn()
-        try:
-            await c.execute(
-                "UPDATE task_role_assignments SET completed_at = ? "
-                "WHERE id = ?",
-                (_now_iso(), shipper_row_id),
-            )
-            await c.commit()
-        finally:
-            await c.close()
-
-        # Emit event + wake Coach
-        await bus.publish(
-            {
-                "ts": _now_iso(),
-                "agent_id": caller_id,
-                "type": "task_shipped_to_dev",
-                "task_id": task_id,
-                "ship_sha": merge_sha,
-                "pr_number": pr_number,
-                "pr_url": pr_url,
-                "deploy_target": "dev",
-                "executor_sha": executor_sha,
-                "to": "coach",
-            }
-        )
-
-        await _wake_coach_for_completion(
-            caller_id=caller_id,
-            task_id=task_id,
-            role="shipper",
-            message_to_coach=None,
-            artifact_path=None,
-            extra_hint=(
-                f"Shipped to dev — PR #{pr_number} merged, "
-                f"dev now at {(merge_sha or '')[:8]}."
-            ),
-        )
-
-        verify_hint = (
-            "\nTrajectory includes verify; Coach may approve verify with "
-            "coord_approve_stage(next_stage='verify', assignee=<slot>, "
-            "note=<verification brief>) after reading this ship result."
-            if trajectory_has_verify else ""
-        )
-        return _ok(
-            f"Task {task_id} shipped to dev.\n"
-            f"PR: {pr_url} (#{pr_number}) — squash-merged.\n"
-            f"Deploy target: dev.\n"
-            f"Ship SHA: {merge_sha}.\n"
-            f"Shipper role complete. Coach has been woken."
-            f"{verify_hint}"
+        return await _complete_with_evidence(
+            ship_sha=merge_sha,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            ship_method="resumed_pr" if resumed_branch else "pr",
+            idempotent=resumed_branch,
         )
 
     @tool(
