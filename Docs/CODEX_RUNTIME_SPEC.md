@@ -898,11 +898,20 @@ Native compact is available on the SDK: `ThreadHandle.compact() -> Any`
 (also `client.compact_thread(thread_id) -> Any`). Return shape is
 SDK-internal `Any` -- the implementation must treat it as opaque and
 extract a summary string defensively (try common shapes: dict with
-`summary` / `text` / `content` / `message` keys, plus nested
+`summary` / `text` / `content` / `message` / `result` keys, plus nested
 `summary` objects). If the response is only an acknowledgement, do not
 use a dict/object repr as the handoff: read the thread once for any
 materialized summary, then synthesize a non-empty handoff from the
 rolling recent-exchange log.
+
+If there is no stored `codex_thread_id` at compact time, CodexRuntime
+does not emit `session_compacted` / `session_transferred` and does
+not set success semantics. It emits `error` for ordinary compact or
+`session_transfer_failed` for transfer mode because no handoff file can
+be written. If `client.compact_thread(thread_id)` raises stale/thread-
+not-found, CodexRuntime may continue only by building a synthetic
+handoff and writing it through the durable handoff path; if that path
+fails, it preserves `codex_thread_id` and the current runtime.
 
 Sketch:
 
@@ -920,6 +929,9 @@ if tc.compact_mode:
         slot,
         summary + "\n\n" + _build_codex_compact_footer(thread_id),
     )
+    if not handoff_file:
+        await fail_without_clearing_thread_or_flipping_runtime()
+        return
     await _set_continuity_note(slot, project_id, pointer_to(handoff_file, summary))
     await _clear_codex_thread_id(slot, project_id)
     await _clear_exchange_log(slot, project_id)
@@ -1083,10 +1095,13 @@ each runtime's message handler reads the flag:
 - CodexRuntime (`server/runtimes/codex.py:run_manual_compact`) calls
   `client.compact_thread(thread_id)`, extracts a readable summary if
   the SDK returns one, and otherwise writes a synthetic handoff from
-  the rolling recent-exchange log. It persists the full handoff file,
-  stores a continuity pointer, clears `codex_thread_id`, clears the
-  exchange log, then performs the same flip + emits
-  `session_transferred`. The event carries
+  the rolling recent-exchange log (including stale/thread-not-found
+  compact failures). It persists the full handoff file, stores a
+  continuity pointer, clears `codex_thread_id`, clears the exchange
+  log, then performs the same flip + emits `session_transferred`. If
+  there is no stored thread, or if the durable handoff file cannot be
+  written, Codex emits `session_transfer_failed` and preserves the
+  current runtime and `codex_thread_id`. The event carries
   `synthetic_summary=true` when the fallback handoff was used.
 
 **Event vocabulary additions.** The bus carries three new event
@@ -1097,7 +1112,7 @@ compact:
 |--------------------------------|-----------------------------------------------------------------------------------------------------|
 | `session_transfer_requested`   | Fired by the entry point when a compact is queued (replaces `session_compact_requested`).           |
 | `session_transferred`          | Fired by the compact handler on success after the flip (replaces `session_compacted`).              |
-| `session_transfer_failed`      | Claude path only - fired when compact yields no summary so the runtime stays put. UI shows reason.  |
+| `session_transfer_failed`      | Fired when compact/transfer cannot produce a durable handoff, so the runtime stays put. UI shows reason. |
 
 The pane's runtime selector in
 [server/static/app.js](server/static/app.js) routes through this
