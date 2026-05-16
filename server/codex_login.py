@@ -411,8 +411,8 @@ async def start_login() -> dict:
             )
             sess._monitor_task = monitor_task
             logger.info(
-                "codex_login: session %s started, url=%s device_code=%s",
-                sid, sess.url, sess.device_code,
+                "codex_login: session %s started, url=%s device_code_len=%d",
+                sid, sess.url, len(sess.device_code),
             )
             return {
                 "session_id": sid,

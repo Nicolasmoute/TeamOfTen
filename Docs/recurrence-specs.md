@@ -1107,6 +1107,22 @@ from `_DEFER_LATCH`, and emits `recurrence_expired`.
 Each row now includes `end_date`, `max_fires`, and `fire_count`
 alongside the existing fields.
 
+### Recurrence pane display
+
+The recurrence pane renders row-level chips for expiry and successful
+fire counts:
+
+- `fire_count` appears as a compact fires chip, using `fire_count /
+  max_fires` when a max-fire limit exists.
+- `end_date` appears as a relative expiry chip (`expires in ...` or
+  `expired ... ago`) with the ISO timestamp in the tooltip.
+- Disabled rows that have crossed `end_date` or reached `max_fires`
+  also show an `expired` chip.
+
+The pane refreshes on `recurrence_expired` websocket events, in
+addition to the existing recurrence add/change/delete/fire/skip/defer/
+disable events.
+
 ---
 
 ## 18. Implementation order (suggested)

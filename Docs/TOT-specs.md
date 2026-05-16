@@ -4787,6 +4787,13 @@ app-server tree in its own process group and closes that group
 explicitly. The 2026-05-16 production incident showed stale Codex
 process pairs reparented under PID 1 and accumulating per Player slot;
 closing only the SDK client or wrapper process is insufficient.
+The patched transport also raises the subprocess StreamReader line
+limit above Python's 64 KiB default (`HARNESS_CODEX_STDIO_LIMIT_BYTES`,
+default 8 MiB, clamped 256 KiB..64 MiB). Codex app-server uses
+newline-delimited JSON, so a single large Bash output, file-read result,
+or post-turn thread-read payload can otherwise look like a stdio
+receiver-loop failure even though the app-server process is still alive
+and has no stderr.
 Before each Codex Player spawn, the dispatcher also refreshes
 `agents.allowed_tools` from any active kanban role row when the stored
 JSON no longer matches the current role allowlist, so existing shipper
@@ -4829,6 +4836,7 @@ implementation):
 | `HARNESS_CODEX_EXTERNAL_MCP` | unset / false | When truthy, CodexRuntime ambient-starts UI/file-configured external MCP servers. Default false: only `coord` starts unless a slot's explicit `agents.allowed_tools` override names an external `mcp__<server>__...` tool. |
 | `HARNESS_CODEX_RUNTIME_HOME` | `$CODEX_HOME/harness-runtime` | Optional root for per-slot Codex app-server homes. Runtime homes copy `$CODEX_HOME/auth.json` but use a clean config without inherited `mcp_servers`, preventing operator/test MCP config from poisoning harness Codex sessions. |
 | `HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS` | `120` | Codex app-server JSON-RPC request timeout passed to `CodexClient.connect_stdio`; clamped to at least 30s. Covers `initialize`, `thread/start`, `thread/resume`, and similar request/response calls. |
+| `HARNESS_CODEX_STDIO_LIMIT_BYTES` | `8388608` | Codex app-server subprocess stdout/stderr StreamReader line limit for newline-delimited JSON-RPC. Clamped to 256 KiB..64 MiB; prevents large tool/result messages from tripping Python's 64 KiB default and surfacing as false stdio transport failures. |
 | `HARNESS_DB_PATH` | `/data/harness.db` | SQLite path |
 | `HARNESS_DATA_ROOT` | `/data` | Global/project data root |
 | `HARNESS_WEBDAV_URL` | unset | WebDAV base folder URL |
