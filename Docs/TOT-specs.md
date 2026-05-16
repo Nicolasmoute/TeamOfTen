@@ -1782,18 +1782,26 @@ Manual compact:
 
 - UI slash command `/compact`.
 - API `POST /api/agents/{id}/compact`.
-- Runs the agent with `COMPACT_PROMPT`.
+- Claude runs the agent with `COMPACT_PROMPT`; Codex calls native
+  `client.compact_thread(thread_id)`.
 - Captures the summary as `agent_sessions.continuity_note`.
 - Writes full handoff file under active project's `working/handoffs/`.
-- Clears session id so the next turn starts fresh.
-- Emits `session_compacted`.
+- Clears the source runtime session id (`session_id` for Claude,
+  `codex_thread_id` for Codex) so the next turn starts fresh.
+- Emits `session_compacted` with `chars` and `handoff_file`.
+- If Codex native compact returns only an acknowledgement instead of a
+  readable summary, the harness writes a synthetic handoff from the
+  rolling recent-exchange log and marks the event with
+  `synthetic_summary=true`.
 
 Auto-compact:
 
 - Controlled by `HARNESS_AUTO_COMPACT_THRESHOLD`, default 0.65 (lowered from 0.7 on 2026-05-09, then raised from 0.5 on 2026-05-15 after 0.5 proved too aggressive).
 - Estimates session context from Claude CLI JSONL files under
-  `CLAUDE_CONFIG_DIR/projects/`.
-- If over threshold, runs a compact turn first.
+  `CLAUDE_CONFIG_DIR/projects/`, or from Codex rollout JSONL files
+  under `CODEX_HOME/sessions` / the default `~/.codex/sessions`.
+- If over threshold, runs a compact turn first (Claude) or native
+  compact with handoff persistence (Codex).
 - The preflight resolves the same effective model the turn will use (pane
   override, Coach-set slot override, role default, alias-to-concrete), so the
   threshold window matches the pane `ctx` bar.
@@ -1855,10 +1863,9 @@ Failure modes:
   emits and the runtime stays put. The intent of transfer is "carry
   forward via summary"; a flip with empty context is a destructive
   blind switch.
-- Compact yields no summary on Codex → flip still proceeds because
-  `client.compact_thread()` already cleared the thread; not flipping
-  would leave the agent on Codex with no thread to resume, strictly
-  worse than flipping with thin context. Asymmetry intentional.
+- Compact yields no summary on Codex -> the handler writes a synthetic
+  handoff from recent exchanges, then flips with
+  `synthetic_summary=true`.
 - Helper failure on `_clear_codex_thread_id` is logged but doesn't
   abort; `runtime_updated` still emits so the UI doesn't silently
   miss the change.
