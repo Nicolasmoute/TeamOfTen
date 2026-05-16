@@ -1174,10 +1174,10 @@ export function KanbanPane({
     ]);
     return kanbanEvents.subscribe((evt) => {
       if (!evt) return;
-      if (watched.has(evt.type)) refresh();
+      if (watched.has(evt.type) || evt.type === "backlog_task_promoted") refresh();
       if (backlogWatched.has(evt.type)) refreshBacklog();
     });
-  }, [kanbanEvents, refresh]);
+  }, [kanbanEvents, refresh, refreshBacklog]);
 
   const loadHistory = useCallback(async (taskId, force = false) => {
     if (!force && historyByTask[taskId]) return;
