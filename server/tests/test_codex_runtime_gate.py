@@ -1011,6 +1011,31 @@ async def test_captured_stdio_transport_includes_stderr_on_close() -> None:
     assert "codex app-server boom" in message
 
 
+async def test_captured_stdio_transport_reads_large_json_line() -> None:
+    import sys
+    from server.runtimes.codex import _CapturedStdioTransport
+
+    # Regression for CodexTransportError with a live app-server process:
+    # asyncio's default subprocess StreamReader line limit is 64 KiB, but
+    # app-server JSON-RPC messages can exceed that when a tool returns a
+    # large file/command result.
+    payload_size = 128 * 1024
+    script = (
+        "import json, sys\n"
+        f"sys.stdout.write(json.dumps({{'id': 1, 'result': 'x' * {payload_size}}}) + '\\n')\n"
+        "sys.stdout.flush()\n"
+    )
+    transport = _CapturedStdioTransport([sys.executable, "-c", script])
+    await transport.connect()
+    try:
+        message = await transport.recv()
+    finally:
+        await transport.close()
+
+    assert message["id"] == 1
+    assert len(message["result"]) == payload_size
+
+
 @pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is POSIX-only")
 async def test_captured_stdio_transport_close_kills_child_process(
     tmp_path,

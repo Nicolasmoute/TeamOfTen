@@ -101,6 +101,24 @@ def _codex_request_timeout_seconds() -> float:
     return max(30.0, value)
 
 
+def _codex_stdio_stream_limit_bytes() -> int:
+    """Subprocess StreamReader line limit for Codex app-server JSON-RPC.
+
+    `asyncio.create_subprocess_exec` defaults to a 64 KiB stream limit.
+    Codex app-server speaks newline-delimited JSON, so one large tool
+    result or thread-read response can exceed that while the process
+    remains healthy. Keep the limit bounded but comfortably above normal
+    tool payloads so the transport does not masquerade as a receiver-loop
+    failure.
+    """
+    raw = os.environ.get("HARNESS_CODEX_STDIO_LIMIT_BYTES", "").strip()
+    try:
+        value = int(raw) if raw else 8 * 1024 * 1024
+    except ValueError:
+        value = 8 * 1024 * 1024
+    return min(max(value, 256 * 1024), 64 * 1024 * 1024)
+
+
 def reset_codex_worktree_sandbox_probe_for_tests() -> None:
     global _CODEX_WORKTREE_SANDBOX_PROBE_CACHE
     _CODEX_WORKTREE_SANDBOX_PROBE_CACHE = None
@@ -210,6 +228,7 @@ class _CapturedStdioTransport:
         connect_timeout: float = 30.0,
         transport_error_cls: type[Exception] = RuntimeError,
         stderr_limit: int = 12000,
+        stdio_stream_limit: int | None = None,
     ) -> None:
         if not command:
             raise ValueError("stdio command must not be empty")
@@ -219,6 +238,11 @@ class _CapturedStdioTransport:
         self._connect_timeout = connect_timeout
         self._transport_error_cls = transport_error_cls
         self._stderr_limit = stderr_limit
+        self._stdio_stream_limit = (
+            stdio_stream_limit
+            if stdio_stream_limit is not None
+            else _codex_stdio_stream_limit_bytes()
+        )
         self._proc: asyncio.subprocess.Process | None = None
         self._pgid: int | None = None
         self._stderr_tail = ""
@@ -247,6 +271,7 @@ class _CapturedStdioTransport:
                     stderr=asyncio.subprocess.PIPE,
                     cwd=self._cwd,
                     env=self._env,
+                    limit=self._stdio_stream_limit,
                     **popen_kwargs,
                 ),
                 timeout=self._connect_timeout,

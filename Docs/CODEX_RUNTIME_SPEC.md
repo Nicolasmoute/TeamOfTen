@@ -591,6 +591,14 @@ The harness patches the SDK stdio transport to pipe a bounded
 `codex app-server` stderr tail into `CodexTransportError` messages;
 the stock SDK transport discards stderr and otherwise leaves only
 opaque "failed reading from stdio transport" diagnostics.
+The same patched transport raises the subprocess StreamReader limit
+above Python's 64 KiB default (`HARNESS_CODEX_STDIO_LIMIT_BYTES`,
+default 8 MiB, clamped 256 KiB..64 MiB). Codex app-server speaks
+newline-delimited JSON; one large Bash/Edit/file-read result can
+produce a single JSON-RPC line over 64 KiB while the app-server remains
+healthy. Without this larger bounded line limit, the harness reports a
+misleading receiver-loop/stdio read failure with `returncode=None` and
+no stderr.
 The patched transport also starts the Node wrapper/native app-server
 tree in its own process group and closes that group explicitly. This is
 required because production incident review on 2026-05-16 found old
