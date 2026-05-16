@@ -7,6 +7,8 @@ artifacts under each task's folder:
         spec.md                                         # Coach's plan
         audits/
             audit_<round>_<kind>.md                     # Player auditor reports
+        verifications/
+            verification_<round>.md                     # post-ship verifier reports
 
 These are mirrored to the configured cloud drive at the same relative
 path under `projects/<project_id>/tasks/...` so the human can browse
@@ -74,6 +76,11 @@ def audits_dir(project_id: str, task_id: str) -> Path:
     return task_dir(project_id, task_id) / "audits"
 
 
+def verifications_dir(project_id: str, task_id: str) -> Path:
+    """Per-task post-ship verification reports folder."""
+    return task_dir(project_id, task_id) / "verifications"
+
+
 def audit_report_filename(round_num: int, kind: str) -> str:
     """`audit_<round>_<kind>.md`. Round counts up from 1; kind is
     `'syntax'` or `'semantics'`."""
@@ -86,6 +93,16 @@ def audit_report_filename(round_num: int, kind: str) -> str:
 
 def audit_report_path(project_id: str, task_id: str, round_num: int, kind: str) -> Path:
     return audits_dir(project_id, task_id) / audit_report_filename(round_num, kind)
+
+
+def verification_report_filename(round_num: int) -> str:
+    if round_num < 1:
+        raise ValueError(f"round must be >= 1, got {round_num}")
+    return f"verification_{round_num}.md"
+
+
+def verification_report_path(project_id: str, task_id: str, round_num: int) -> Path:
+    return verifications_dir(project_id, task_id) / verification_report_filename(round_num)
 
 
 def spec_relative_path(project_id: str, task_id: str) -> str:
@@ -104,6 +121,13 @@ def audit_report_relative_path(
     return f"projects/{project_id}/working/tasks/{task_id}/audits/{fname}"
 
 
+def verification_report_relative_path(
+    project_id: str, task_id: str, round_num: int
+) -> str:
+    fname = verification_report_filename(round_num)
+    return f"projects/{project_id}/working/tasks/{task_id}/verifications/{fname}"
+
+
 def kdrive_spec_path(project_id: str, task_id: str) -> str:
     """The path used for the cloud-drive mirror. Same shape as decisions
     / knowledge — `projects/<id>/...` relative to the WebDAV base URL.
@@ -117,6 +141,11 @@ def kdrive_audit_path(
 ) -> str:
     fname = audit_report_filename(round_num, kind)
     return f"projects/{project_id}/tasks/{task_id}/audits/{fname}"
+
+
+def kdrive_verification_path(project_id: str, task_id: str, round_num: int) -> str:
+    fname = verification_report_filename(round_num)
+    return f"projects/{project_id}/tasks/{task_id}/verifications/{fname}"
 
 
 def _atomic_write(target: Path, content: str) -> None:
@@ -182,6 +211,28 @@ def _audit_frontmatter(
         f"audit_round: {round_num}\n"
         f"auditor: {auditor}\n"
         f"verdict: {verdict}\n"
+        f"submitted_at: {submitted_at}\n"
+        f"---\n\n"
+    )
+
+
+def _verification_frontmatter(
+    *,
+    task_id: str,
+    round_num: int,
+    verifier: str,
+    verdict: str,
+    submitted_at: str,
+    evidence: str,
+) -> str:
+    evidence_line = f"evidence: {evidence}\n" if evidence else ""
+    return (
+        f"---\n"
+        f"task_id: {task_id}\n"
+        f"verification_round: {round_num}\n"
+        f"verifier: {verifier}\n"
+        f"verdict: {verdict}\n"
+        f"{evidence_line}"
         f"submitted_at: {submitted_at}\n"
         f"---\n\n"
     )
@@ -285,6 +336,52 @@ async def write_audit_report(
     return target, rel, submitted_at
 
 
+async def write_verification_report(
+    *,
+    project_id: str,
+    task_id: str,
+    round_num: int,
+    body: str,
+    verifier: str,
+    verdict: str,
+    evidence: str = "",
+) -> tuple[Path, str, str]:
+    """Write a Player verifier's report to
+    `<task_dir>/verifications/verification_<round>.md` + cloud-drive mirror.
+
+    Returns `(local_path, relative_path, submitted_at_iso)`. Caller updates
+    the role-assignment row.
+    """
+    if verdict not in ("pass", "fail"):
+        raise ValueError(f"invalid verdict: {verdict!r}")
+    if round_num < 1:
+        raise ValueError(f"round must be >= 1, got {round_num}")
+    submitted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    frontmatter = _verification_frontmatter(
+        task_id=task_id,
+        round_num=round_num,
+        verifier=verifier,
+        verdict=verdict,
+        submitted_at=submitted_at,
+        evidence=evidence,
+    )
+    body_clean = body.rstrip() + "\n"
+    content = frontmatter + body_clean
+
+    target = verification_report_path(project_id, task_id, round_num)
+    _atomic_write(target, content)
+    rel = verification_report_relative_path(project_id, task_id, round_num)
+
+    if webdav.enabled:
+        asyncio.create_task(
+            webdav.write_text(
+                kdrive_verification_path(project_id, task_id, round_num),
+                content,
+            )
+        )
+    return target, rel, submitted_at
+
+
 def read_task_spec(project_id: str, task_id: str) -> str | None:
     """Best-effort spec read. Returns None if the file doesn't exist
     or can't be read; logs the failure (callers should NOT propagate
@@ -305,12 +402,18 @@ __all__ = [
     "spec_path",
     "spec_relative_path",
     "audits_dir",
+    "verifications_dir",
     "audit_report_filename",
     "audit_report_path",
     "audit_report_relative_path",
+    "verification_report_filename",
+    "verification_report_path",
+    "verification_report_relative_path",
     "kdrive_spec_path",
     "kdrive_audit_path",
+    "kdrive_verification_path",
     "write_task_spec",
     "write_audit_report",
+    "write_verification_report",
     "read_task_spec",
 ]

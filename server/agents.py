@@ -2570,6 +2570,7 @@ _STAGE_TO_ROLE = {
     "audit_syntax": "auditor_syntax",
     "audit_semantics": "auditor_semantics",
     "ship": "shipper",
+    "verify": "verifier",
 }
 
 
@@ -4097,7 +4098,8 @@ async def _get_agent_allowed_tools_override(
                 "  (t.status = 'execute' AND r.role = 'executor') OR "
                 "  (t.status = 'audit_syntax' AND r.role = 'auditor_syntax') OR "
                 "  (t.status = 'audit_semantics' AND r.role = 'auditor_semantics') OR "
-                "  (t.status = 'ship' AND r.role = 'shipper')"
+                "  (t.status = 'ship' AND r.role = 'shipper') OR "
+                "  (t.status = 'verify' AND r.role = 'verifier')"
                 ") "
                 "ORDER BY "
                 "  CASE WHEN a.current_task_id = r.task_id THEN 0 ELSE 1 END, "

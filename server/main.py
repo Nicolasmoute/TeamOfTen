@@ -743,7 +743,7 @@ class TaskApproveStageRequest(BaseModel):
     `coord_approve_stage` — single transition tool that authorizes the
     next stage, names the assignee, and provides the wake prompt."""
     next_stage: str = Field(
-        pattern=r"^(plan|execute|audit_syntax|audit_semantics|ship|archive)$"
+        pattern=r"^(plan|execute|audit_syntax|audit_semantics|ship|verify|archive)$"
     )
     # Required for any non-archive next_stage; rejected on archive.
     assignee: str | None = Field(default=None, max_length=10)
@@ -4295,6 +4295,7 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
         "audit_syntax": "auditor_syntax",
         "audit_semantics": "auditor_semantics",
         "ship": "shipper",
+        "verify": "verifier",
     }
 
     c = await configured_conn()
@@ -4576,6 +4577,7 @@ async def get_tasks_board() -> dict[str, Any]:
         "audit_syntax": [],
         "audit_semantics": [],
         "ship": [],
+        "verify": [],
     }
     for row in rows:
         row["assignments"] = role_map.get(row["id"], [])
@@ -4670,6 +4672,7 @@ async def get_task_assignments(task_id: str) -> dict[str, Any]:
 # through the same validator as Coach's MCP-tool override.
 from server.tools import (  # noqa: E402
     ALL_KANBAN_STAGES,
+    _ship_verify_context_or_error,
     _valid_transition,
     _validate_trajectory,
 )
@@ -4746,6 +4749,7 @@ async def post_task_approve_stage(
     old_status: str | None = None
     old_owner: str | None = None
     new_role_id: int | None = None
+    ship_verify_context = ""
     try:
         cur = await c.execute(
             "SELECT status, owner FROM tasks "
@@ -4802,6 +4806,14 @@ async def post_task_approve_stage(
                 400,
                 detail=f"invalid transition: {old_status} → {next_stage}",
             )
+
+        if old_status == "ship" and next_stage == "verify":
+            context, error = await _ship_verify_context_or_error(
+                c, task_id, req.note or "",
+            )
+            if error:
+                raise HTTPException(400, detail=error)
+            ship_verify_context = context or ""
 
         now = datetime.now(timezone.utc).isoformat()
         if next_stage == "archive":
@@ -4929,10 +4941,13 @@ async def post_task_approve_stage(
     if next_stage != "archive" and assignee:
         from server.agents import maybe_wake_agent
         from server.tools import _with_player_reminder
-        wake_body = _with_player_reminder(req.note or (
+        base_wake = req.note or (
             f"Human approved task {task_id} → stage "
             f"{next_stage!r} ({target_role})."
-        ))
+        )
+        if ship_verify_context:
+            base_wake = f"{base_wake}\n\n{ship_verify_context}"
+        wake_body = _with_player_reminder(base_wake)
         try:
             await maybe_wake_agent(
                 assignee, wake_body,
@@ -4948,6 +4963,7 @@ async def post_task_approve_stage(
         "from": old_status,
         "to": next_stage,
         "assignee": assignee,
+        "ship_verify_context": ship_verify_context or None,
     }
 
 
@@ -5222,7 +5238,9 @@ async def get_tasks_flow_health() -> dict[str, Any]:
     actually moving' without scraping events."""
     from server import kanban as kanban_mod
     project_id = await resolve_active_project()
-    stages = ["plan", "execute", "audit_syntax", "audit_semantics", "ship"]
+    stages = [
+        "plan", "execute", "audit_syntax", "audit_semantics", "ship", "verify",
+    ]
     out_stages: dict[str, dict[str, Any]] = {}
     stalled_count = 0
 
