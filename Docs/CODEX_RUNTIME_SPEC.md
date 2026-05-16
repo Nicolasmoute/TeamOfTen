@@ -126,23 +126,22 @@ The dispatcher delegates **both** flows to the runtime:
   dispatcher proceeds to run the user's original prompt on the fresh
   session; if False, dispatcher runs the original prompt directly.
   Both runtimes share the `HARNESS_AUTO_COMPACT_THRESHOLD` env (default
-  0.65 — lowered from 0.7 on 2026-05-09, then raised from 0.5 on
-  2026-05-15). ClaudeRuntime uses the
+  0.5 — lowered from 0.7 on 2026-05-09). ClaudeRuntime uses the
   Claude-shaped trip-wire (session JSONL
   probe + threshold check, then a `COMPACT_PROMPT` turn).
   CodexRuntime reads `_codex_session_context_estimate(thread_id)` —
   the latest `turns` row for the resumed Codex thread, summed as
   `input + cache_read + cache_creation + output` — and when the ratio
   trips, delegates to its own `run_manual_compact` so the compact uses
-  the native `client.compact_thread(thread_id)` endpoint (cheaper than
-  a full LLM round-trip). On failure both runtimes emit
-  `auto_compact_failed` and the dispatcher proceeds with the original
-  session.
+  a silent generated handoff turn on the stored Codex thread. On
+  failure both runtimes emit `auto_compact_failed` and the dispatcher
+  proceeds with the original session.
 - **Manual `/compact` (or `POST /api/agents/{id}/compact`)**:
   dispatcher calls `runtime.run_manual_compact(...)`. ClaudeRuntime
-  runs the existing COMPACT_PROMPT turn. CodexRuntime uses the native
-  compact endpoint and clears `codex_thread_id` after storing the
-  returned summary.
+  runs the existing COMPACT_PROMPT turn. CodexRuntime generates
+  COMPACT_PROMPT-style markdown through a silent Codex thread chat,
+  persists a non-empty handoff file plus `continuity_note`, and only
+  then clears `codex_thread_id`.
 
 ### A.6 Tests
 `server/tests/test_runtime_dispatch.py` builds a `FakeRuntime` and
@@ -888,67 +887,84 @@ a fallback for any future SDK that ships usage directly on `Turn`.
 
 ### E.6 Compact
 
-Native compact is available on the SDK: `ThreadHandle.compact() -> Any`
-(also `client.compact_thread(thread_id) -> Any`). Return shape is
-SDK-internal `Any` — the implementation must treat it as opaque and
-extract a summary string defensively (try common shapes: dict with
-`summary` / `text` / `result` keys, or fall back to repr).
+Codex compact does not use the SDK's native `compact_thread` return as
+the handoff source. The primary path resumes the stored
+`codex_thread_id`, sends a COMPACT_PROMPT-style markdown generation
+prompt through `thread.chat(...)`, and collects assistant
+`agentMessage` text into a local buffer. That generation stream is
+silent: it does not call `handle_step`, and handoff text is never
+emitted as UI text, event payload, status text, logs, or previews.
+
+A successful compact boundary requires non-empty continuity material:
+generated markdown must be meaningfully non-empty and include expected
+COMPACT_PROMPT section headings. If generation fails, returns empty or
+invalid markdown, or stale/thread-not-found prevents generation,
+CodexRuntime may build a fallback from
+`agent_sessions.last_exchange_json`. That fallback is explicitly
+synthetic; if it is also empty, compact fails without clearing
+`codex_thread_id` or flipping runtime.
 
 If there is no stored `codex_thread_id` at compact time, CodexRuntime
 does not emit `session_compacted` / `session_transferred` and does
-not set success semantics. It emits `error` for ordinary compact or
-`session_transfer_failed` for transfer mode because no handoff file can
-be written. If `client.compact_thread(thread_id)` raises stale/thread-
-not-found, the same durable-handoff gate applies: CodexRuntime may
-continue only by building a non-empty recent-exchange fallback and
-writing the handoff file; otherwise it preserves `codex_thread_id` and
-the current runtime.
+not set success semantics. It emits `session_compact_skipped` for
+ordinary compact or `session_transfer_failed` for transfer mode because
+no handoff file can be written. If compact generation raises stale/thread-not-found, the
+same durable-handoff gate applies: CodexRuntime may continue only by
+building a non-empty recent-exchange fallback and writing the handoff
+file; otherwise it preserves `codex_thread_id` and the current runtime.
 
 Sketch:
 
 ```python
 if tc.compact_mode:
-    raw = await thread.compact()
-    summary = (
-        raw.get("summary") if isinstance(raw, dict)
-        else getattr(raw, "summary", None)
-        or getattr(raw, "text", None)
-        or str(raw)
+    thread = await client.resume_thread(thread_id, overrides=config)
+    summary = await silent_collect_agent_messages(
+        thread.chat(CODEX_COMPACT_PROMPT, ...)
     )
-    await _set_continuity_note(slot, project_id, summary)
+    source = "generated"
+    synthetic = False
+    if not valid_generated_handoff(summary):
+        summary = recent_exchange_fallback(slot)
+        source = "recent_exchange_fallback"
+        synthetic = True
+    if not summary:
+        await _emit(tc.agent_id, "error", error="compact produced no handoff")
+        return
+    handoff_file = await _write_handoff_file(slot, summary)
+    await _set_continuity_note(slot, pointer_plus(summary, handoff_file))
     await _clear_codex_thread_id(slot, project_id)
-    await _emit(tc.agent_id, "session_compacted")
+    await _emit(
+        tc.agent_id,
+        "session_compacted",
+        chars=len(summary),
+        handoff_file=handoff_file,
+        summary_source=source,
+        synthetic_summary=synthetic,
+    )
     tc.turn_ctx["got_result"] = True
     return
 ```
+
+`session_compacted` / `session_transferred` events carry compact
+metadata only (`chars`, `handoff_file`, `summary_source`,
+`synthetic_summary`, optional section counts); they must not include
+handoff contents, previews, secrets, or other live transcript text.
+`summary_source='generated'` means a normal generated markdown handoff
+and `synthetic_summary=false`; `summary_source='recent_exchange_fallback'`
+means the fallback was used and `synthetic_summary=true`.
 
 **Auto-compact for Codex agents** (added 2026-05-02 — see §A.5)
 mirrors Claude's threshold semantics but takes a structurally
 different path through the dispatcher.
 `CodexRuntime.maybe_auto_compact` reads the shared
-`HARNESS_AUTO_COMPACT_THRESHOLD` env (default 0.65), short-circuits on
+`HARNESS_AUTO_COMPACT_THRESHOLD` env (default 0.5), short-circuits on
 `tc.compact_mode` / unparseable threshold / threshold ∉ (0.0, 1.0) /
 no `codex_thread_id` / `used / window < threshold`, and computes
 `used / window` from `_codex_session_context_estimate(thread_id)`
 (falls back to 0 if no `turns` row exists yet) and
-`_context_window_for(tc.model)`. The dispatcher resolves `tc.model`
-with the same effective model chain used by the real turn before
-calling `maybe_auto_compact`, so auto-wakes without a pane-level model
-still check against the concrete role-default or slot-override model
-instead of the generic unknown-model fallback.
-
-Important Codex-specific detail: `token_count.info.model_context_window`
-from the Codex rollout JSONL is treated as an exact runtime-reported
-window and is allowed to override the static model table downward. This
-matters for Codex `gpt-5.5`: the generic public model id may have a
-larger API max than the effective window Codex app-server is actually
-using. `CodexRuntime` records the reported value after successful
-turns, and `maybe_auto_compact` opportunistically reads the existing
-rollout for `codex_thread_id` before calculating the ratio. Unknown
-models still fall back to 1M only until Codex reports a concrete
-`model_context_window`.
-
-When the ratio trips, it:
+`_context_window_for(tc.model)` (1M floor for unknown models, so
+Codex auto-compact errs on the conservative side rather than
+firing prematurely). When the ratio trips, it:
 
 1. Emits `auto_compact_triggered` with the same payload shape Claude
    emits (`used_tokens`, `context_window`, `ratio`, `threshold`,
@@ -957,14 +973,15 @@ When the ratio trips, it:
    throwaway dispatcher TurnContext (so a re-entry via
    `run_manual_compact` doesn't recurse) and mirrors them into
    `tc.turn_ctx` for any downstream reader.
-3. Delegates to its own `run_manual_compact(tc)` — i.e. the
-   **native** `client.compact_thread(thread_id)` path above, not a
-   `COMPACT_PROMPT` LLM turn.
+3. Delegates to its own `run_manual_compact(tc)`, which silently
+   resumes the stored Codex thread and asks for COMPACT_PROMPT-style
+   markdown without routing the generated handoff through normal UI
+   events.
 4. After `run_manual_compact` returns, checks
    `tc.turn_ctx.get("got_result")` as the success signal.
    `run_manual_compact` swallows its own auth / ImportError /
-   `compact_thread` exceptions (it emits `error` + sets status=error
-   and returns silently), so an unraised-but-failed compact is
+   generation exceptions (it emits `error` + sets status=error and
+   returns silently), so an unraised-but-failed compact is
    detected by the absence of `got_result`. Both the explicit raise
    path and the silent-failure path emit `auto_compact_failed` and
    return False — symmetric with Claude's failure posture.
@@ -990,19 +1007,18 @@ documented for future maintainers):
   → `session_compacted` → the user's `agent_started` (single cycle).
 - Claude's recursive path goes through `_check_cost_caps`, so an
   over-budget compact is rejected with `cost_capped` (no compact AND
-  no user turn). Codex's path bypasses the cap because
-  `client.compact_thread` is a server-side operation that doesn't
-  show up in the harness's `turns`/cost ledger. Net effect on
-  over-budget Codex: compact still happens, then the user's turn is
-  rejected with `cost_capped`. When budget frees up, the next user
-  turn lands on the already-compacted fresh thread with the
-  continuity note in place.
+  no user turn). Codex's direct runtime path currently bypasses that
+  dispatcher cap even though it performs a model generation turn inside
+  the SDK; the compact can succeed, then the user's turn may be
+  rejected with `cost_capped`. When budget frees up, the next user turn
+  lands on the already-compacted fresh thread with the continuity note
+  in place.
 - Both runtimes share the spawn-lock-after-`maybe_auto_compact` race
   window: two concurrent `run_agent` calls for the same slot can
   both enter `maybe_auto_compact` before either claims the spawn
   lock. Claude's recursive path serializes via the inner spawn
-  lock; Codex's direct path can fire two `compact_thread` calls
-  back-to-back. In practice, the second one may see a cleared
+  lock; Codex's direct path can fire two silent compact-generation
+  chats back-to-back. In practice, the second one may see a cleared
   `codex_thread_id` if the first finished before the second's
   `_get_codex_thread_id` re-read inside `run_manual_compact`; that
   second compact fails closed without emitting `session_compacted` or
@@ -1072,15 +1088,18 @@ each runtime's message handler reads the flag:
   no summary, the runtime is **not** flipped — `session_transfer_failed`
   fires and the agent stays put.
 - CodexRuntime (`server/runtimes/codex.py:run_manual_compact`) calls
-  `client.compact_thread(thread_id)`, extracts a non-empty summary or
-  falls back to the recent-exchange log (including stale/thread-not-
-  found compact failures), writes a durable handoff file plus
-  `continuity_note`, clears `codex_thread_id`, then performs the same
-  flip + emits `session_transferred(from_runtime, to_runtime, chars,
-  handoff_file)`. If no stored thread exists, or if neither native
-  compact nor the fallback yields continuity material, Codex emits
+  `resume_thread(thread_id)` and runs a silent COMPACT_PROMPT-style
+  `thread.chat(...)` to generate markdown. It writes a durable handoff
+  file plus `continuity_note`, clears `codex_thread_id`, then performs
+  the same flip + emits `session_transferred(from_runtime, to_runtime,
+  chars, handoff_file, summary_source, synthetic_summary)`. If no
+  stored thread exists, generation fails, or stale/thread-not-found
+  occurs without a recent-exchange fallback, Codex emits
   `session_transfer_failed` and preserves both the runtime override
-  and `codex_thread_id`.
+  and `codex_thread_id`. Fallback success is marked
+  `summary_source='recent_exchange_fallback'` and
+  `synthetic_summary=true`; generated success is marked
+  `summary_source='generated'` and `synthetic_summary=false`.
 
 **Event vocabulary additions.** The bus carries three new event
 types so the UI can label the timeline as a transfer rather than a
@@ -1090,7 +1109,7 @@ compact:
 |--------------------------------|-----------------------------------------------------------------------------------------------------|
 | `session_transfer_requested`   | Fired by the entry point when a compact is queued (replaces `session_compact_requested`).           |
 | `session_transferred`          | Fired by the compact handler on success after the flip (replaces `session_compacted`).              |
-| `session_transfer_failed`      | Claude path only — fired when compact yields no summary so the runtime stays put. UI shows reason.  |
+| `session_transfer_failed`      | Fired when compact yields no summary/fallback so the runtime stays put. UI shows reason.            |
 
 The pane's runtime selector in
 [server/static/app.js](server/static/app.js) routes through this
