@@ -98,6 +98,28 @@ async def _seed_task(
         await c.close()
 
 
+async def _seed_backlog(
+    *,
+    title: str = "demo backlog",
+    proposed_by: str = "p1",
+    status: str = "pending",
+    priority: str = "normal",
+    proposed_at: str = "2026-05-14T10:00:00.000Z",
+) -> int:
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "INSERT INTO backlog_tasks "
+            "(title, proposed_by, proposed_at, status, priority) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (title, proposed_by, proposed_at, status, priority),
+        )
+        await c.commit()
+        return int(cur.lastrowid)
+    finally:
+        await c.close()
+
+
 async def _plant_role(
     *,
     task_id: str,
@@ -773,6 +795,114 @@ async def test_list_tasks_stage_role_four_state_transitions(
     assert "stage_role=complete:p5:fail" in text, (
         f"(d) expected stage_role=complete:p5:fail; got:\n{text}"
     )
+
+
+async def test_list_tasks_stage_role_verify_transitions(
+    fresh_db: str,
+) -> None:
+    """Verify-stage rows render the verifier role and completed state."""
+    async def _list_text(slot: str) -> str:
+        server = _server_for(slot)
+        return _ok_text(await _handler(server, "list_tasks")({}))
+
+    await init_db()
+
+    task_id = "t-2026-05-13-aabbcc04"
+    await _seed_task(task_id=task_id, status="verify")
+    text = await _list_text("coach")
+    assert "stage_role=verifier:-" in text, (
+        f"expected stage_role=verifier:-; got:\n{text}"
+    )
+
+    await _plant_role(task_id=task_id, role="verifier", owner="p6")
+    text = await _list_text("coach")
+    assert "stage_role=verifier:p6" in text, (
+        f"expected stage_role=verifier:p6; got:\n{text}"
+    )
+
+    await _complete_role(task_id=task_id, role="verifier", verdict="pass")
+    text = await _list_text("coach")
+    assert "stage_role=verified:p6:pass" in text, (
+        f"expected stage_role=verified:p6:pass; got:\n{text}"
+    )
+
+
+async def test_list_tasks_status_verify_matches_verify_stage(
+    fresh_db: str,
+) -> None:
+    """coord_list_tasks(status='verify') is a first-class board filter."""
+    await init_db()
+    await _seed_task(
+        task_id="t-2026-05-13-verify01",
+        title="verify me",
+        status="verify",
+    )
+    await _seed_task(
+        task_id="t-2026-05-13-ship0001",
+        title="ship me",
+        status="ship",
+    )
+
+    server = _server_for("coach")
+    text = _ok_text(await _handler(server, "list_tasks")({
+        "status": "verify",
+        "include_backlog": True,
+    }))
+
+    assert "t-2026-05-13-verify01  kind=task  [verify]" in text
+    assert "verify me" in text
+    assert "t-2026-05-13-ship0001" not in text
+    assert "stage_role=verifier:-" in text
+
+
+async def test_list_tasks_include_backlog_shows_active_board_not_archive(
+    fresh_db: str,
+) -> None:
+    """Full board starts at pending Backlog and excludes archive by default."""
+    await init_db()
+    backlog_id = await _seed_backlog(
+        title="pending board idea",
+        priority="high",
+        proposed_at="2026-05-16T10:00:00.000Z",
+    )
+    await _seed_backlog(
+        title="promoted old idea",
+        status="promoted",
+        proposed_at="2026-05-16T09:00:00.000Z",
+    )
+    await _seed_task(
+        task_id="t-2026-05-13-arch0001",
+        title="archived history",
+        status="archive",
+    )
+    await _seed_task(
+        task_id="t-2026-05-13-plan0001",
+        title="active plan",
+        status="plan",
+    )
+    await _seed_task(
+        task_id="t-2026-05-13-verify02",
+        title="active verify",
+        status="verify",
+    )
+
+    server = _server_for("coach")
+    text = _ok_text(await _handler(server, "list_tasks")({}))
+
+    assert f"#{backlog_id}  kind=backlog  [pending]" in text
+    assert "pri=high  pending board idea" in text
+    assert "promoted old idea" not in text
+    assert "t-2026-05-13-plan0001  kind=task  [plan]" in text
+    assert "t-2026-05-13-verify02  kind=task  [verify]" in text
+    assert "t-2026-05-13-arch0001" not in text
+    assert "archived history" not in text
+    assert text.index(f"#{backlog_id}") < text.index("t-2026-05-13-plan0001")
+
+    no_backlog = _ok_text(await _handler(server, "list_tasks")({
+        "include_backlog": False,
+    }))
+    assert "pending board idea" not in no_backlog
+    assert "t-2026-05-13-plan0001  kind=task  [plan]" in no_backlog
 
 
 async def test_update_task_cancel_stamps_last_stage_change_at(

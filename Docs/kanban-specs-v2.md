@@ -161,6 +161,16 @@ task rows marked `kind=task`. Concrete kanban stage filters remain task-only.
 
 Rejected entries append `  reason: <reject_reason>`; promoted entries append `  → task <promoted_task_id>`. Titles are never truncated.
 
+### 4.0.7 Full board view: `coord_list_tasks`
+
+`coord_list_tasks` defaults to the active board range (pending Backlog,
+then `plan` through `verify`) and excludes archived history unless
+`status='archive'` is passed. `status='verify'` is a first-class
+filter. `include_backlog=false` suppresses pending Backlog rows;
+`include_backlog=true` still explicitly prepends pending Backlog before
+active task rows, so Coach can inspect the whole current board from
+Backlog through Verify without archived tasks burying pending ideas.
+
 ---
 
 ## 5 · Trajectory (FYI contract)
@@ -285,7 +295,7 @@ These are the rationale for keeping the `## Recent events` rollup in §13: it ba
 | `coord_write_task_spec` | `task_id, body, on_behalf_of?, message_to_coach?` | Writes `spec.md` with frontmatter to the task's working dir; mirrors to kDrive. Marks the planner role row complete. `on_behalf_of` Coach override (v1.3.5) carries over for Codex-runtime Players who can't reach the tool. Emits `task_spec_written{task_id, spec_path, message_to_coach, on_behalf_of?, ...}`. |
 | `coord_submit_audit_report` | `task_id, kind, body, verdict, on_behalf_of?, message_to_coach?` | Writes `audits/audit_<round>_<kind>.md` with frontmatter; records the verdict on the auditor role row; marks the role row complete. `on_behalf_of` carries over. Emits `audit_report_submitted{task_id, kind, verdict, report_path, message_to_coach, on_behalf_of?, ...}`. **Verdict='fail' does NOT auto-revert** (R2) — surfaces to Coach via event log; Coach decides. |
 | `coord_submit_verification_report` | `task_id, verdict, body, message_to_coach?, evidence?` | Verifier-only completion for the optional `verify` stage. Writes `verifications/verification_<round>.md` with frontmatter; records `pass`/`fail` on the active verifier role row; marks the role row complete; resets the verifier to idle tools. Emits `verification_report_submitted{task_id, verdict, report_path, round, verifier_id, evidence?, message_to_coach?}` plus `task_role_completed{role='verifier', artifact_path=report_path}`. **Verdict='fail' does NOT auto-revert, auto-create follow-up work, or archive** — Coach reads the report and decides whether to archive, create a follow-up task, roll back, reroute to execute, or re-ship. |
-| `coord_role_complete` (NEW — collapses v1 `coord_complete_execution` + `coord_mark_shipped`) | `task_id, message_to_coach, artifact_path?` | Generic completion for roles whose real work happens via other tools (non-git executors who wrote a file via `Write` / `coord_save_output` / `coord_write_knowledge`; shippers who merged/published/sent via Bash / external CLIs). Verifies `artifact_path` exists on disk under the project root if passed (v1.3.14 gate); rejects with role row left open if missing. Marks the caller's current-stage role row complete. Emits `task_role_completed{task_id, role, artifact_path?, message_to_coach, ...}`. The role is inferred from the caller's current active role row at the task's current stage — no `role` parameter. Rejects with a clear error when the caller has no active role row on the task ("you have no active role on this task — Coach hasn't assigned you, or your role was already completed/superseded"). |
+| `coord_role_complete` (NEW — collapses v1 `coord_complete_execution` + `coord_mark_shipped`) | `task_id, message_to_coach, artifact_path?` | Generic completion for roles whose real work happens via other tools (non-git executors who wrote a file via `Write` / `coord_save_output` / `coord_write_knowledge`; shippers who merged/published/sent via Bash / external CLIs). Verifies `artifact_path` exists on disk under the project root if passed (v1.3.14 gate); rejects with role row left open if missing. Marks the caller's current-stage role row complete. Emits `task_role_completed{task_id, role, artifact_path?, message_to_coach, ...}`. Verifier roles use `coord_submit_verification_report`, not this generic tool. The role is inferred from the caller's current active role row at the task's current stage — no `role` parameter. Rejects with a clear error when the caller has no active role row on the task ("you have no active role on this task — Coach hasn't assigned you, or your role was already completed/superseded"). |
 | `coord_my_assignments` | (none) | Returns current actionable work for the caller. Same shape as v1. |
 
 ### 7.3 Removed in v2

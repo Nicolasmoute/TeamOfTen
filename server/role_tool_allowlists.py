@@ -123,7 +123,6 @@ ROLE_TOOL_ALLOWLISTS: Final[dict[str, list[str]]] = {
         + COORD_WRITE_CONTEXT
         + [
             _coord("coord_submit_verification_report"),
-            _coord("coord_role_complete"),
         ]
         + INTERACTIVE_TOOLS
     ),

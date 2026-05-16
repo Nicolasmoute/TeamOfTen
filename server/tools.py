@@ -682,6 +682,20 @@ async def _check_kanban_role_gate(
         return None
 
     if old == "verify" and new == "archive":
+        if not await _has_completed_verifier(c, task_id):
+            return (
+                f"verify → archive requires the verifier to call "
+                f"coord_submit_verification_report(task_id={task_id!r}, "
+                f"verdict='pass' or 'fail', body=...). Coach then "
+                f"archives with a user-facing summary via "
+                f"coord_archive_task(task_id={task_id!r}, summary=...)."
+            )
+        if new != expected_next:
+            return (
+                f"task {task_id} trajectory expects {expected_next!r} "
+                f"after verify completion. Update via "
+                f"coord_set_task_trajectory, then coord_approve_stage."
+            )
         return None
 
     # audit_* → execute (manual revert) is allowed: it mirrors the
@@ -711,6 +725,20 @@ async def _has_completed_shipper(c: Any, task_id: str) -> bool:
     cur = await c.execute(
         "SELECT completed_at FROM task_role_assignments "
         "WHERE task_id = ? AND role = 'shipper' AND superseded_by IS NULL "
+        "ORDER BY assigned_at DESC LIMIT 1",
+        (task_id,),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return False
+    return bool(dict(row).get("completed_at"))
+
+
+async def _has_completed_verifier(c: Any, task_id: str) -> bool:
+    """True if the active verifier assignment has `completed_at` set."""
+    cur = await c.execute(
+        "SELECT completed_at FROM task_role_assignments "
+        "WHERE task_id = ? AND role = 'verifier' AND superseded_by IS NULL "
         "ORDER BY assigned_at DESC LIMIT 1",
         (task_id,),
     )
@@ -971,12 +999,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "Legacy values (open/claimed/in_progress/blocked/done/cancelled) "
             "are translated to their kanban equivalent for back-compat.\n"
             "- owner: agent id ('coach', 'p1'..'p10'), or 'null' for unassigned\n"
-            "- include_backlog: optional boolean; no-args and status='pending' "
-            "views include pending Backlog entries by default.\n"
-            "Returns up to 100 most recent tasks. Each task row shows kind, stage, "
-            "trajectory ([P,E,AY,AE,S] tokens), blocked flag, owner, "
-            "priority, and title. "
-            "Pending Backlog rows are shown with kind=backlog."
+            "- include_backlog: optional boolean; no-arg board views include "
+            "pending Backlog by default. Pass false to suppress it.\n"
+            "By default, returns the active board range (Backlog, then plan "
+            "through verify) and excludes archived history. "
+            "Pass status='archive' for archived tasks. Each task row shows "
+            "kind, stage, trajectory ([P,E,AY,AE,S] tokens), blocked flag, "
+            "stage_role, owner, priority, and title."
         ),
         {"status": str, "owner": str, "include_backlog": str},
     )
@@ -1011,6 +1040,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             normalized = _normalize_status_alias(status)
             where_parts.append("status = ?")
             params.append(normalized)
+        elif not status:
+            where_parts.append("status != 'archive'")
         if owner is not None and owner != "":
             if owner.lower() in ("null", "none", "unassigned"):
                 # Mirror the UI's "unassigned" classifier (kanban v2): a task
@@ -1095,7 +1126,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 rows = []
             if include_backlog:
                 cur = await c.execute(
-                    "SELECT id, title, proposed_by, proposed_at, status "
+                    "SELECT id, title, proposed_by, proposed_at, status, priority "
                     "FROM backlog_tasks WHERE status = 'pending' "
                     "ORDER BY proposed_at DESC LIMIT 100"
                 )
@@ -1119,6 +1150,30 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         }
 
         lines = []
+        now = datetime.now(timezone.utc)
+        for r in backlog_rows:
+            d = dict(r)
+            age = "?"
+            try:
+                ts_str = d.get("proposed_at") or ""
+                if ts_str:
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                    secs = int((now - ts).total_seconds())
+                    if secs < 60:
+                        age = f"{secs}s"
+                    elif secs < 3600:
+                        age = f"{secs // 60}m"
+                    elif secs < 86400:
+                        age = f"{secs // 3600}h"
+                    else:
+                        age = f"{secs // 86400}d"
+            except Exception:
+                pass
+            lines.append(
+                f"#{d['id']}  kind=backlog  [{d['status']}]  "
+                f"pri={d.get('priority') or 'normal'}  {d['title']}  "
+                f"by {d['proposed_by']}, {age} ago"
+            )
         for r in rows:
             d = dict(r)
             parent = f" sub-of:{d['parent_id']}" if d["parent_id"] else ""
@@ -1151,6 +1206,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                             f" stage_role=complete:{d['role_done_owner']}:"
                             f"{d['role_done_verdict']}"
                         )
+                    elif d["status"] == "verify" and d.get("role_done_verdict"):
+                        stage_role = (
+                            f" stage_role=verified:{d['role_done_owner']}:"
+                            f"{d['role_done_verdict']}"
+                        )
                     else:
                         stage_role = f" stage_role={role_label}:done"
                 else:
@@ -1161,29 +1221,6 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"{d['id']}  kind=task  [{d['status']}]{traj}{blocked}{stage_role}  "
                 f"owner={display_owner}  pri={d['priority']}  "
                 f"{d['title']}{parent}"
-            )
-        now = datetime.now(timezone.utc)
-        for r in backlog_rows:
-            d = dict(r)
-            age = "?"
-            try:
-                ts_str = d.get("proposed_at") or ""
-                if ts_str:
-                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    secs = int((now - ts).total_seconds())
-                    if secs < 60:
-                        age = f"{secs}s"
-                    elif secs < 3600:
-                        age = f"{secs // 60}m"
-                    elif secs < 86400:
-                        age = f"{secs // 3600}h"
-                    else:
-                        age = f"{secs // 86400}d"
-            except Exception:
-                pass
-            lines.append(
-                f"#{d['id']}  kind=backlog  [{d['status']}]  "
-                f"\"{d['title']}\"  by {d['proposed_by']}, {age} ago"
             )
         return _ok("\n".join(lines))
 
@@ -8178,6 +8215,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 )
             t = dict(row)
             current_stage = t.get("status")
+            if current_stage == "verify":
+                return _err(
+                    "verifier roles must call "
+                    "coord_submit_verification_report(task_id=..., "
+                    "verdict='pass' or 'fail', body=...) instead of "
+                    "coord_role_complete so the verification verdict "
+                    "and report artifact are recorded."
+                )
             # 2026-05-12 graceful post-archive completion: a Player who
             # polls a long-running deploy (ship stage on Zeabur takes
             # 30-35 min) can finish verification AFTER Coach (or the
