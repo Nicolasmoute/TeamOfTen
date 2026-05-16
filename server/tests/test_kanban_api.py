@@ -22,6 +22,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+import server.agents as agents_mod
 from server.db import configured_conn, init_db
 
 
@@ -69,6 +70,62 @@ async def _seed(
             "VALUES (?, 'misc', ?, ?, ?, 'human', ?, ?, ?, ?, ?)",
             (task_id, title, status, owner, trajectory, priority,
              archived_at, cancelled_at, spec_path),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+
+async def _plant_role(
+    *,
+    task_id: str,
+    role: str,
+    owner: str | None = None,
+    completed: bool = False,
+) -> None:
+    c = await configured_conn()
+    try:
+        completed_sql = (
+            "strftime('%Y-%m-%dT%H:%M:%fZ','now')" if completed else "NULL"
+        )
+        await c.execute(
+            "INSERT INTO task_role_assignments "
+            "(task_id, role, eligible_owners, owner, assigned_at, "
+            "claimed_at, completed_at) "
+            "VALUES (?, ?, '[]', ?, "
+            "strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
+            "strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
+            f"{completed_sql})",
+            (task_id, role, owner),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+
+async def _seed_ship_event(
+    *,
+    task_id: str,
+    ship_sha: str = "aabbccdd11223344556677889900aabbccdd1122",
+    pr_number: int = 42,
+    pr_url: str = "https://github.com/owner/repo/pull/42",
+    deploy_target: str = "dev",
+) -> None:
+    payload = {
+        "task_id": task_id,
+        "ship_sha": ship_sha,
+        "pr_number": pr_number,
+        "pr_url": pr_url,
+        "deploy_target": deploy_target,
+        "executor_sha": "ffee00112233445566778899aabbccddeeff0011",
+    }
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO project_events "
+            "(project_id, actor, type, task_id, payload_json, payload_pointer) "
+            "VALUES ('misc', 'p3', 'task_shipped_to_dev', ?, ?, ?)",
+            (task_id, json.dumps(payload), ship_sha),
         )
         await c.commit()
     finally:
@@ -360,6 +417,117 @@ def test_approve_stage_post_requires_assignee_for_non_archive(
     )
     assert r.status_code == 400
     assert "assignee" in r.json()["detail"].lower()
+
+
+def test_approve_stage_post_ship_to_verify_rejects_without_ship_evidence(
+    client: TestClient,
+) -> None:
+    import asyncio
+    task_id = "t-2026-05-03-verify00"
+    asyncio.run(_seed(task_id=task_id, status="ship", owner="p2"))
+    asyncio.run(_plant_role(task_id=task_id, role="shipper", owner="p2"))
+
+    r = client.post(
+        f"/api/tasks/{task_id}/approve_stage",
+        json={
+            "next_stage": "verify",
+            "assignee": "p4",
+            "note": "verify dev deployment",
+        },
+    )
+    assert r.status_code == 400
+    assert "ship → verify requires post-ship evidence" in r.json()["detail"]
+    assert "task_shipped_to_dev" in r.json()["detail"]
+
+    async def read_state() -> tuple[str, int]:
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            )
+            status = dict(await cur.fetchone())["status"]
+            cur = await c.execute(
+                "SELECT COUNT(*) AS n FROM task_role_assignments "
+                "WHERE task_id = ? AND role = 'verifier'",
+                (task_id,),
+            )
+            verifier_count = int(dict(await cur.fetchone())["n"])
+            return status, verifier_count
+        finally:
+            await c.close()
+
+    status, verifier_count = asyncio.run(read_state())
+    assert status == "ship"
+    assert verifier_count == 0
+
+
+def test_approve_stage_post_ship_to_verify_requires_manual_override_tag(
+    client: TestClient,
+) -> None:
+    import asyncio
+    task_id = "t-2026-05-03-verify02"
+    asyncio.run(_seed(task_id=task_id, status="ship", owner="p2"))
+    asyncio.run(_plant_role(
+        task_id=task_id, role="shipper", owner="p2", completed=True,
+    ))
+
+    r = client.post(
+        f"/api/tasks/{task_id}/approve_stage",
+        json={
+            "next_stage": "verify",
+            "assignee": "p4",
+            "note": "verify manual deployment",
+        },
+    )
+    assert r.status_code == 400
+    assert "completed shipper role but no task_shipped_to_dev event" in (
+        r.json()["detail"]
+    )
+    assert "[manual verify override]" in r.json()["detail"]
+
+
+def test_approve_stage_post_ship_to_verify_includes_ship_context(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    task_id = "t-2026-05-03-verify01"
+    asyncio.run(_seed(task_id=task_id, status="ship", owner="p2"))
+    asyncio.run(_plant_role(
+        task_id=task_id, role="shipper", owner="p2", completed=True,
+    ))
+    asyncio.run(_seed_ship_event(task_id=task_id))
+    wakes: list[tuple[str, str]] = []
+
+    async def _rec(slot: str, prompt: str = "", **kw: object) -> bool:
+        wakes.append((slot, prompt))
+        return True
+
+    monkeypatch.setattr(agents_mod, "maybe_wake_agent", _rec)
+
+    r = client.post(
+        f"/api/tasks/{task_id}/approve_stage",
+        json={
+            "next_stage": "verify",
+            "assignee": "p4",
+            "note": "verify dev deployment",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["to"] == "verify"
+    assert body["ship_verify_context"]
+    assert "deploy_target=dev" in body["ship_verify_context"]
+    assert (
+        "ship_sha=aabbccdd11223344556677889900aabbccdd1122"
+        in body["ship_verify_context"]
+    )
+    assert "PR #42 https://github.com/owner/repo/pull/42" in (
+        body["ship_verify_context"]
+    )
+    assert wakes and wakes[-1][0] == "p4"
+    assert "deploy_target=dev" in wakes[-1][1]
+    assert "ship_sha=aabbccdd11223344556677889900aabbccdd1122" in wakes[-1][1]
+    assert "PR #42 https://github.com/owner/repo/pull/42" in wakes[-1][1]
 
 
 # ----------------------------------------------------------------- /workflow / /blocked

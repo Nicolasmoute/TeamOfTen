@@ -800,6 +800,39 @@ def _format_ship_verify_context(
     )
 
 
+async def _ship_verify_context_or_error(
+    c: Any, task_id: str, note: str,
+) -> tuple[str | None, str | None]:
+    """Shared ship→verify gate for MCP + human/API approval surfaces."""
+    evidence = await _latest_ship_to_dev_evidence(c, task_id)
+    shipper_complete = await _has_completed_shipper(c, task_id)
+    manual_override = _ship_verify_manual_override_requested(note)
+    if not evidence and not shipper_complete:
+        return None, (
+            f"ship → verify requires post-ship evidence before "
+            f"verifier work is dispatched. No latest "
+            f"task_shipped_to_dev event was found for {task_id}, "
+            f"and the active shipper role is not complete. Have the "
+            f"shipper call coord_ship_to_dev(task_id={task_id!r}) "
+            f"first (preferred), or complete the shipper role and "
+            f"retry with note starting [manual verify override] only "
+            f"for a documented manual ship."
+        )
+    if not evidence and not manual_override:
+        return None, (
+            f"ship → verify found a completed shipper role but no "
+            f"task_shipped_to_dev event for {task_id}. To avoid silent "
+            f"verification before post-ship evidence exists, retry only "
+            f"after coord_ship_to_dev emits ship evidence, or use an "
+            f"explicit manual path: start note with "
+            f"[manual verify override] and include the PR URL/number, "
+            f"ship SHA, and deploy target for the verifier."
+        )
+    return _format_ship_verify_context(
+        evidence, manual_override=manual_override and bool(evidence),
+    ), None
+
+
 # Auditor / shipper / planner roles that Coach can assign. Mirror of
 # the task_role_assignments.role CHECK constraint.
 ROLE_NAMES: frozenset[str] = frozenset({
@@ -7552,37 +7585,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 )
 
             if old_status == "ship" and next_stage == "verify":
-                evidence = await _latest_ship_to_dev_evidence(c, task_id)
-                shipper_complete = await _has_completed_shipper(c, task_id)
-                manual_override = _ship_verify_manual_override_requested(note)
-                if not evidence and not shipper_complete:
-                    return _err(
-                        f"ship → verify requires post-ship evidence before "
-                        f"verifier work is dispatched. No latest "
-                        f"task_shipped_to_dev event was found for "
-                        f"{task_id}, and the active shipper role is not "
-                        f"complete. Have the shipper call "
-                        f"coord_ship_to_dev(task_id={task_id!r}) first "
-                        f"(preferred), or complete the shipper role and "
-                        f"retry with note starting "
-                        f"[manual verify override] only for a documented "
-                        f"manual ship."
-                    )
-                if not evidence and not manual_override:
-                    return _err(
-                        f"ship → verify found a completed shipper role but "
-                        f"no task_shipped_to_dev event for {task_id}. To "
-                        f"avoid silent verification before post-ship "
-                        f"evidence exists, retry only after "
-                        f"coord_ship_to_dev emits ship evidence, or use an "
-                        f"explicit manual path: start note with "
-                        f"[manual verify override] and include the PR URL/"
-                        f"number, ship SHA, and deploy target for the "
-                        f"verifier."
-                    )
-                ship_verify_context = _format_ship_verify_context(
-                    evidence, manual_override=manual_override and bool(evidence),
+                context, error = await _ship_verify_context_or_error(
+                    c, task_id, note,
                 )
+                if error:
+                    return _err(error)
+                ship_verify_context = context or ""
 
             now = _now_iso()
             new_role_id: int | None = None
