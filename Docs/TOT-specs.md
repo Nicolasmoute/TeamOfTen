@@ -1558,6 +1558,18 @@ The WebDAV client:
 - Uses SQLite `VACUUM INTO` into bytes, then writes to WebDAV.
 - Snapshot path: `snapshots/<timestamp>.db`.
 
+### 9.1a Top-Level Uploads Pull
+
+`server/sync.py` also keeps the human-drop uploads lane live:
+
+- Interval: `HARNESS_UPLOADS_PULL_INTERVAL`, default 60 seconds.
+- Remote path: `uploads/<filename>` at the WebDAV root, e.g.
+  `TOT/uploads/<filename>` on kDrive.
+- Local path: `HARNESS_UPLOADS_DIR`, default `/data/uploads`.
+- The app ensures the remote `uploads/` directory exists before polling.
+- The pull is inbound only: deleting a file remotely removes the local copy;
+  new remote files are downloaded by basename.
+
 ### 9.2 Active Project Sync
 
 `server/project_sync.py` active-project loop:
