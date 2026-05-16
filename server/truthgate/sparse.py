@@ -17,7 +17,8 @@ def sparse_pass_result(
 ) -> dict[str, Any]:
     warning = (
         "TruthGate sparse mode: truth corpus has "
-        f"{len(corpus.files)} file(s), below minimum {cfg.min_corpus_files}; "
+        f"{corpus.eligible_files} eligible file(s), below minimum "
+        f"{cfg.min_corpus_files}; "
         "permissive pass recorded without LLM call."
     )
     return {
@@ -34,6 +35,7 @@ def sparse_pass_result(
         "classified_at": datetime.now(timezone.utc).isoformat(),
         "task_id": task_id,
         "corpus_files": list(corpus.files),
+        "corpus_eligible_files": corpus.eligible_files,
         "corpus_chars": corpus.chars,
         "warning": warning,
     }

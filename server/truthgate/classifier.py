@@ -75,8 +75,15 @@ async def classify_task(
         project_id,
         total_budget_chars=cfg.truth_budget_chars,
         per_file_chars=cfg.truth_per_file_chars,
+        query_text=" ".join([
+            task.title,
+            task.description,
+            task.success_criteria,
+            task.workflow,
+            task.trajectory,
+        ]),
     )
-    if len(corpus.files) < cfg.min_corpus_files:
+    if corpus.eligible_files < cfg.min_corpus_files:
         return sparse_pass_result(task_id=task.task_id, corpus=corpus, cfg=cfg)
 
     await _check_cost_cap()
@@ -101,6 +108,7 @@ async def classify_task(
         "classified_at": _now_iso(),
         "task_id": task.task_id,
         "corpus_files": list(corpus.files),
+        "corpus_eligible_files": corpus.eligible_files,
         "corpus_chars": corpus.chars,
     })
     return parsed
