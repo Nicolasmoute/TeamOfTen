@@ -113,6 +113,29 @@ def test_parse_invalid_json_fails_closed(fresh_db: str) -> None:
         parse_classifier_output("not json", project_id=project_id, corpus=corpus)
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        'prefix {"verdict":"truthgate_pass"}',
+        '{"verdict":"truthgate_pass"} trailing',
+        '```json\n{"verdict":"truthgate_pass"}\n```',
+    ],
+)
+def test_parse_rejects_non_whole_response_json(
+    fresh_db: str,
+    raw: str,
+) -> None:
+    project_id = "strictparse"
+    _write_truth(project_id, "a.md", "A")
+    corpus = gather_truth_corpus(
+        project_id,
+        total_budget_chars=32_000,
+        per_file_chars=16_000,
+    )
+    with pytest.raises(TruthGateClassificationError, match="invalid JSON"):
+        parse_classifier_output(raw, project_id=project_id, corpus=corpus)
+
+
 def test_parse_rejects_basis_outside_truth(fresh_db: str) -> None:
     project_id = "badbasis"
     _write_truth(project_id, "a.md", "A")

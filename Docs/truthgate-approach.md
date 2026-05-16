@@ -1,6 +1,19 @@
 # Truthgate - Spec-Compliance Stage for the Kanban Lifecycle
 
-Status: implementation approach. Phase 1 is implemented: `truthgate` is a real task status/board column, backlog promotion enters it without planting or waking a Player role, task rows carry TruthGate scalar fields, and `truthgate → plan|execute` is rejected until a pass/override verdict is recorded. The classifier, amendment wrapper, targeted audit helper, and provisional closure tooling are later phases.
+Status: implementation approach. Phase 1 is implemented: `truthgate` is a real task status/board column, backlog promotion enters it without planting or waking a Player role, task rows carry TruthGate scalar fields, and `truthgate -> plan|execute` is rejected until a pass/override verdict is recorded. Phase 2 classifier core is implemented as a library-only package under `server/truthgate/`. Amendment wrapper, targeted audit integration, and provisional closure tooling are later phases.
+
+## Implementation status - Phase 2 classifier core
+
+Implemented classifier-core pieces:
+
+- `config.py`: TruthGate environment parsing, budget knobs, and strict classifier model validation. Defaults are `latest_sonnet` primary and `latest_mini` fallback. `latest_opus`, `latest_gpt`, and their current concrete model targets are rejected for classifier use.
+- `corpus.py`: capped `truth/**/*.{md,txt}` corpus slicing. It prioritizes core truth files, then task-keyword-relevant files, then alphabetical fallback. It does not read `Docs/`, repo source, uploads, conversation logs, or secrets.
+- `prompts.py`: strict JSON classifier prompt and amendment-draft prompt helper.
+- `llm.py`: one-shot primary/fallback wrapper with `agent_id="truthgate"` and classifier ledger attribution.
+- `classifier.py`: per-project lock, cost-cap preflight, sparse-mode routing, strict whole-response JSON parsing, verdict normalization, and truth-basis validation.
+- `sparse.py`, `targeted.py`, and `amendments.py`: sparse pass result, targeted truth-basis reads, and amendment metadata helpers for later phases.
+
+Current mocked-LLM tests cover sparse mode, dense-corpus prompt-budget truncation, slicer ordering, strict parser failure, model validation, basis validation, and per-project concurrency locking. Protected truth mirror tests are temporarily waived by human directive; the matching `truth/` projection should be proposed through the protected flow after the waiver lifts.
 
 ## Core idea
 
