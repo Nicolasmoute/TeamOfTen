@@ -1,6 +1,6 @@
 # Truthgate - Spec-Compliance Stage for the Kanban Lifecycle
 
-Status: design description (not an implementation plan yet). This file is standalone: it defines the truthgate lifecycle stage, the truth amendment mechanism truthgate needs, emergency/provisional reconciliation, and the relationship to Compass, TruthScore, and `Docs/`.
+Status: implementation approach. Phase 1 is implemented: `truthgate` is a real task status/board column, backlog promotion enters it without planting or waking a Player role, task rows carry TruthGate scalar fields, and `truthgate → plan|execute` is rejected until a pass/override verdict is recorded. The classifier, amendment wrapper, targeted audit helper, and provisional closure tooling are later phases.
 
 ## Core idea
 

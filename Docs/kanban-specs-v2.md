@@ -58,7 +58,7 @@ Contrast with v1: every step between "Player produces" and "next Player wakes" w
 
 ## 3 · Stage state machine
 
-The stages themselves are unchanged from v1: `plan` → `execute` → `audit_syntax` → `audit_semantics` → `ship` → `archive`. The product language remains **Formal Review** (audit_syntax) / **Semantic Review** (audit_semantics).
+The live stages are `truthgate` → `plan` → `execute` → `audit_syntax` → `audit_semantics` → `ship` → optional `verify` → `archive`. `truthgate` is a real board column but not a Player role; it authorizes the task against protected truth before Coach dispatches the first planned stage. The product language remains **Formal Review** (audit_syntax) / **Semantic Review** (audit_semantics).
 
 What changes is **who triggers transitions**:
 
@@ -68,15 +68,17 @@ What changes is **who triggers transitions**:
 ### 3.1 Valid transitions (universe)
 
 ```
+truthgate       → {plan, execute, archive}
 plan            → {execute, archive}
 execute         → {audit_syntax, audit_semantics, ship, archive}
 audit_syntax    → {audit_semantics, ship, archive, execute}
 audit_semantics → {ship, archive, execute}
-ship            → {archive}
+ship            → {verify, archive}
+verify          → {archive, execute, ship}
 archive         → {}
 ```
 
-The actual path a task walks is the trajectory Coach defines on `coord_create_task` (§4) — but the trajectory is **FYI only**. Coach can advance to any valid next stage at any point regardless of what the trajectory says. The trajectory documents the planned path; Coach's `coord_approve_stage` calls drive the actual path.
+The actual path a task walks after TruthGate is the trajectory Coach defines on `coord_create_task` (§4) — but the trajectory is **FYI only** and does not include `truthgate`. Coach can advance to any valid next stage at any point regardless of what the trajectory says. The trajectory documents the planned post-gate path; Coach's `coord_approve_stage` calls drive the actual path. `truthgate → plan|execute` is additionally gated by a recorded TruthGate pass/override verdict.
 
 ### 3.2 Audit FAIL no longer auto-reverts
 
@@ -125,7 +127,7 @@ coord_triage_backlog(id, action, trajectory?, modified_title?, reason?)
 
 | `action` | Effect |
 |---|---|
-| `promote` | Atomically: UPDATE `backlog_tasks.status='promoted'`, INSERT into `tasks` (title = `modified_title ?? title`, `trajectory` required), plant the first-stage role row, and switch the assignee's runtime tool allowlist to that role. Execute-stage promotions also set `agents.current_task_id`. Emits `task_created`, `task_stage_changed{from=null, to=<first_stage>, reason='backlog_promoted'}`, `task_role_assigned`, and `backlog_task_promoted {backlog_id, task_id, title}` so open Kanban panes update both the Backlog and active board without manual refresh. |
+| `promote` | Atomically: UPDATE `backlog_tasks.status='promoted'`, INSERT into `tasks` with `status='truthgate'` (title = `modified_title ?? title`, `trajectory` required and preserved as the post-gate path), and **do not** plant a Player role or wake a Player. Emits `task_created`, `task_stage_changed{from=null, to='truthgate', reason='backlog_promoted'}`, `task_truthgate_started`, and `backlog_task_promoted {backlog_id, task_id, title}` so open Kanban panes update both the Backlog and active board without manual refresh. |
 | `reject` | UPDATE `backlog_tasks.status='rejected', reject_reason=reason`. Emits `backlog_task_rejected {id, title, reason}`. |
 
 ### 4.0.4 Rejection notification (human-proposed)
@@ -183,12 +185,13 @@ Backlog through Verify without archived tasks burying pending ideas.
 
 - Non-empty list.
 - Each `stage` ∈ `{plan, execute, audit_syntax, audit_semantics, ship, verify}` (no `archive` — implicit/terminal).
+- `truthgate` is not a trajectory stage. Top-level backlog promotion inserts it automatically before the first trajectory stage.
 - No duplicate stages.
 - Stages appear in canonical order.
 - `execute` is mandatory.
 - Each `to` resolves to a `list[str]` of valid Player slots — **advisory only**: Coach reads as a hint when picking an assignee in `coord_approve_stage`. There is no first-claim-wins; pools never auto-resolve from a Player claim. (The lone exception is stall-ladder rung 3 (§10.2), where the harness picks an alternative from `eligible_owners` because Coach has been silent on the rung-2 wake for ≥1h — see §21.4.)
-- **`trajectory[0].to` MUST name exactly one Player** (single-element list, e.g. `['p3']`). The kanban is a log of work Coach has fired at a specific Player; tasks without an assignee aren't on the kanban yet, they're pre-task reasoning. Pool/empty first-stage `to` is rejected at validation. (v2.0.1 tightening, 2026-05-08 — earlier drafts allowed pool/empty first-stage and required a follow-up `coord_approve_stage(next_stage=<same>, assignee=...)` to plant; that two-step shape produced an "unassigned" orphan window on the board and was the wrong UX.)
-- Subsequent entries' `to` may still be a single name, a list (pool), or empty — they remain FYI only. Coach picks each later stage's assignee at `coord_approve_stage` time, which already requires a single named slot.
+- `trajectory[0].to` may be a single name, a list (pool), or empty. It remains FYI only: top-level task creation lands in Backlog, backlog promotion inserts the task into `truthgate` with no Player role/wake, and Coach picks the first real assignee when explicitly approving `truthgate → plan|execute`.
+- Subsequent entries' `to` follow the same advisory shape. Coach picks each later stage's assignee at `coord_approve_stage` time, which requires a single named slot for every non-archive transition.
 - `focus` (optional on audit and verify stages) is a free-text string for what the reviewer/verifier should check. **REQUIRED for `audit_semantics`** (rejected if missing or empty regardless of `to` shape — the focus is part of the trajectory contract, not the assignment). Optional for `audit_syntax` (defaults to "match the contract and verify internal soundness") and `verify`.
 
 The v1.3.13 `coach_review` plan-stage flag is **removed**: v2 makes Coach review every stage transition by default, so the per-stage opt-in is redundant.
@@ -220,7 +223,7 @@ Six roles: `planner`, `executor`, `auditor_syntax`, `auditor_semantics`, `shippe
 ### 5.1 Strict separation
 
 - **Coach** plans, delegates, reviews, advances, archives. Coach never executes, audits, or ships.
-- **Players** execute, review, ship, and verify. Coach can also delegate planning to a Player — Coach assigns the planner role via `coord_approve_stage(stage='plan', assignee=<slot>)` when creating the task.
+- **Players** execute, review, ship, and verify. Coach can also delegate planning to a Player — after Backlog promotion and a TruthGate pass/override, Coach assigns the planner role via `coord_approve_stage(stage='plan', assignee=<slot>)`.
 
 ### 5.2 Pools are FYI only
 
@@ -256,8 +259,9 @@ All registered in [server/tools.py](server/tools.py)'s `_tools` map and `ALLOWED
 
 | Tool | Params | Purpose |
 |---|---|---|
-| `coord_create_task` | `title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?, success_criteria?` | Creates a top-level or child task. Sets `tasks.status` to the trajectory's first stage (or `plan` if no trajectory). **`trajectory[0].to` MUST name exactly one Player** (v2.0.1 tightening, 2026-05-08); pool/empty first-stage `to` is rejected at trajectory validation. The role row plants at create time with that slot as `owner` and the assignee's runtime tool allowlist is switched to the first-stage role, matching `coord_approve_stage` behavior. Subsequent stages' `to` lists never auto-plant — they're FYI only until Coach approves into that stage via `coord_approve_stage`. Emits `task_created` + `task_role_assigned` + `task_stage_changed{from=null, to=<first_stage>}`. The first-stage role row is the only auto-plant; semantically this is "Coach-via-the-trajectory" picking, not the harness picking. **`success_criteria`** is the optional Coach-authored "definition of done" — see §17.3. |
+| `coord_create_task` | `title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?, success_criteria?` | Creates a top-level Backlog item or a child task. For top-level tasks (`parent_id` omitted), records the title/description/trajectory as a pending Backlog entry and does **not** create an active task row, plant a role, change a Player tool allowlist, or wake a Player. `trajectory[0].to` may be a single name, pool, or empty list because it is advisory until Coach dispatches work. When Coach promotes the Backlog item, the active task enters `truthgate` with the trajectory preserved as its post-gate plan; no Player role is planted/woken while in `truthgate`. After a TruthGate pass/override, Coach explicitly calls `coord_approve_stage(task_id, next_stage='plan'|'execute', assignee=<slot>, note=...)` to plant the first role and wake that Player. Subsequent trajectory entries also remain FYI only until Coach approves into that stage. **`success_criteria`** is the optional Coach-authored "definition of done" — see §17.3. |
 | `coord_approve_stage` (NEW — N2) | `task_id, next_stage, assignee, note?, success_criteria?` | The single transition tool. Coach authorizes the next stage transition, names the assignee, and provides the wake prompt. `assignee` is required for any non-archive `next_stage`; pass a single slot. `note` is included verbatim in the assignee's wake prompt. Stamps `last_stage_change_at`, deactivates any prior active role row at the target stage (with `task_role_stand_down` wake to displaced Player if any), plants a fresh role row with the named assignee, emits `task_stage_changed` and `task_role_assigned`, fires the wake. The source-stage role row is normally already complete (Player called the appropriate completion tool, which is why Coach is now reviewing); when Coach overrides without source completion (e.g. abandoning a stuck executor), the source role row is also deactivated with stand-down. The same tool covers all transitions: plan→execute, execute→audit_syntax, audit_syntax→execute (re-do), audit_syntax→ship (Coach overrides a FAIL), execute→ship, ship→verify, ship→archive (skip optional verification), verify→archive, verify→execute/ship (manual follow-up routing), and any-stage→archive (cancellation, with `assignee=null` since archive has no role). Replaces v1's `coord_advance_task_stage` and absorbs all `coord_assign_*` responsibility. **`success_criteria`** is consumed only at plan→execute (refines/replaces the value set at `coord_create_task`); ignored on other transitions. The stored value is echoed back in the tool result on advance to ship. See §17.3. |
+| TruthGate exit rule | `truthgate → plan|execute` | Coach cannot approve a task out of `truthgate` into `plan` or `execute` until `tasks.truthgate_verdict` is one of `truthgate_pass`, `truthgate_coach_override`, or `truthgate_emergency_override`. `truthgate → archive` remains available for rejection/cancellation. `coord_approve_stage(next_stage='truthgate')` is invalid; only backlog promotion enters the gate. |
 | `coord_archive_task` (NEW — R3) | `task_id, summary` | Coach-only deliberate archive. Writes the user-facing summary, transitions to archive, marks any active role rows complete. The summary lands as a `.sys` row in Coach's pane and is forwarded to Telegram if the originating turn was user-triggered. Use this when a task wraps via natural completion (work delivered) or explicit cancellation (Coach decides not to ship); v1's auto-archive on trajectory-end is gone. |
 | `coord_set_task_trajectory` | `task_id, trajectory` | Mid-flight reroute. v2 semantics per §4.3 — loose constraints, normal Coach operation. |
 | `coord_request_plan_review` (NEW — N3) | `task_id, slot` | When Coach decides plan-mode is useful for a Player's turn, this wakes the Player with plan-mode enabled. The Player produces an ExitPlanMode artifact; on submission a `pending_plan{route='coach'}` event surfaces it to Coach for review before tools are touched. Coach approves (Player proceeds with the plan) or rewrites (Coach calls `coord_approve_stage` with a Coach-composed note instead). |
@@ -320,8 +324,8 @@ All under `/api/tasks` or `/api/tasks/*`, gated by `HARNESS_TOKEN`.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/tasks` | List view. Unchanged from v1. |
-| POST | `/api/tasks` | Human task composer. Body `{title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?}`. Creates a top-level or child task in the trajectory's first stage (or `plan` if no trajectory) with `created_by='human'`. The composer omits `trajectory` for the default `[{"stage":"execute","to":[]}]`. |
-| GET | `/api/tasks/board` | Active 6 buckets (`plan` / `execute` / `audit_syntax` / `audit_semantics` / `ship` / `verify`), priority-sorted then by `created_at`. |
+| POST | `/api/tasks` | Human task composer. Body `{title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?}`. Creates a pending Backlog item with `created_by='human'`; promotion later creates the active task in `truthgate`. The composer omits `trajectory` for the default `[{"stage":"execute","to":[]}]`. |
+| GET | `/api/tasks/board` | Active 7 buckets (`truthgate` / `plan` / `execute` / `audit_syntax` / `audit_semantics` / `ship` / `verify`), priority-sorted then by `created_at`. |
 | GET | `/api/tasks/archive` | Paginated archive view. Unchanged. |
 | GET | `/api/tasks/flow_health` | Stage counts + subscriber liveness. Unchanged. |
 | GET | `/api/tasks/{id}/assignments` | Role-assignment history. Unchanged. |
@@ -660,7 +664,7 @@ The `## Lifecycle policy` block in v2 names:
 
 ### 15.1 Kanban pane (`__kanban`)
 
-Carried from v1 §11 — four active columns (Plan / Execute / Review / Ship) + Archive drawer; trajectory marker on cards; assignee avatars; status flag badges; markdown links to `[spec]` / `[audit (kind, verdict)]` / `[compass]`. Drift banner on cards in `execute` post-audit-fail.
+Carried from v1 §11, with active columns Backlog / TruthGate / Plan / Execute / Review / Ship / Verify + Archive drawer. Cards show trajectory marker, assignee avatars, status flag badges, TruthGate verdict/method basics, and markdown links to `[spec]` / `[audit (kind, verdict)]` / `[compass]`. Drift banner on cards in `execute` post-audit-fail.
 
 ### 15.2 Event log surface (NEW — N1)
 
@@ -727,7 +731,7 @@ The kanban lifecycle paragraph in the canonical template at [server/templates/ap
 ```markdown
 ### Task lifecycle (kanban)
 
-Every Coach delegation goes through the kanban. Stages: plan → execute → audit_syntax (Formal Review) → audit_semantics (Semantic Review) → ship → optional verify → archive. Coach defines an upfront trajectory on `coord_create_task` (`{stage, to, focus?}` list) — it documents the planned path and the candidate slots, but it's FYI only. Coach drives advances explicitly via `coord_approve_stage(task_id, next_stage, assignee, note?)`. There is no auto-routing, no auto-wake on stage change, and no auto-revert on audit or verification fail.
+Every Coach delegation goes through the kanban. Stages: truthgate → plan → execute → audit_syntax (Formal Review) → audit_semantics (Semantic Review) → ship → optional verify → archive. Coach defines an upfront post-gate trajectory on `coord_create_task` (`{stage, to, focus?}` list) — it documents the planned path and the candidate slots, but it's FYI only. Backlog promotion inserts `truthgate` first and does not wake a Player. Coach drives advances explicitly via `coord_approve_stage(task_id, next_stage, assignee, note?)`; `truthgate → plan|execute` requires a recorded pass/override verdict. There is no auto-routing, no auto-wake on stage change, and no auto-revert on audit or verification fail.
 
 **For Players:**
 
@@ -823,7 +827,7 @@ A behavioral rollback to v1 (auto-routing) is **not supported**. The implementat
 
 End-to-end on a deployed Zeabur instance after the implementation PR ships:
 
-1. Full code-and-review pipeline with explicit Coach approvals: `coord_create_task` → `coord_approve_stage(plan, p5)` → `coord_write_task_spec` → `coord_approve_stage(execute, p2)` → `coord_commit_push` → `coord_approve_stage(audit_syntax, p4)` → `coord_submit_audit_report(pass)` → `coord_approve_stage(ship, p2)` → `coord_ship_to_dev(task_id)` producing `task_shipped_to_dev` evidence → optional `coord_approve_stage(verify, p6, note=<ship evidence context>)` → `coord_submit_verification_report(pass|fail)` → `coord_archive_task(summary)`. For manual/non-Git ship paths, the shipper must first complete the shipper role with `coord_role_complete(task_id, message_to_coach)` and Coach must include `[manual verify override]` or `[manual ship verify override]` in the verify note; otherwise `ship→verify` is rejected.
+1. Full code-and-review pipeline with explicit Coach approvals: `coord_create_task` (Backlog) → `coord_triage_backlog(promote)` (TruthGate, no Player wake) → TruthGate pass/override recorded → `coord_approve_stage(plan, p5)` → `coord_write_task_spec` → `coord_approve_stage(execute, p2)` → `coord_commit_push` → `coord_approve_stage(audit_syntax, p4)` → `coord_submit_audit_report(pass)` → `coord_approve_stage(ship, p2)` → `coord_ship_to_dev(task_id)` producing `task_shipped_to_dev` evidence → optional `coord_approve_stage(verify, p6, note=<ship evidence context>)` → `coord_submit_verification_report(pass|fail)` → `coord_archive_task(summary)`. For manual/non-Git ship paths, the shipper must first complete the shipper role with `coord_role_complete(task_id, message_to_coach)` and Coach must include `[manual verify override]` or `[manual ship verify override]` in the verify note; otherwise `ship→verify` is rejected.
 2. Audit FAIL → event log → Coach reads → Coach calls `coord_approve_stage(execute, p2, note=<composed>)` → executor wakes with Coach's prompt.
 3. Pool discipline: trajectory has `to: [p3, p7]`; Coach assigns p3 explicitly; p7 never gets a wake; the kanban refuses any claim path.
 4. Compass `aligned` verdict surfaces in `project_events`; Coach can read the WHY in the next tick.
