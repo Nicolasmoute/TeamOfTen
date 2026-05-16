@@ -376,7 +376,7 @@ class ClaudeRuntime:
     async def maybe_auto_compact(self, tc: TurnContext) -> bool:
         """Auto-compact trip-wire — Claude shape.
 
-        Reads `HARNESS_AUTO_COMPACT_THRESHOLD` (default 0.5). If the
+        Reads `HARNESS_AUTO_COMPACT_THRESHOLD` (default 0.65). If the
         prior session's estimated context exceeds that fraction of the
         model's window, run a COMPACT_PROMPT turn first (which writes
         the continuity note and nulls session_id), then return True so
