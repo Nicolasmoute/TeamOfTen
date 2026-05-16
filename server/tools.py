@@ -483,6 +483,23 @@ def _parse_boolish(raw: Any, *, default: bool) -> bool:
     return default
 
 
+def _string_list_arg(raw: Any) -> list[str]:
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    text = str(raw).strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
 def _trajectory_stages_from_row(row: Any) -> list[str]:
     """Return the ordered list of stage names from a task row's
     `trajectory` JSON column. Defensive against malformed JSON / wrong
@@ -3721,6 +3738,82 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     # harness-wide instructions. All these files are read fresh on
     # every agent turn (server/context.py).
 
+    async def _validate_truth_proposal_path(rel: str) -> str | None:
+        # Defensive strip: Coach is told to pass paths relative to
+        # truth/ (e.g. "specs.md", not "truth/specs.md"), but accept
+        # the prefixed form too rather than fail confusingly.
+        if rel.startswith("truth/"):
+            rel = rel[len("truth/"):]
+        if rel.startswith("/") or ".." in rel.split("/"):
+            return None
+        first_seg = rel.split("/", 1)[0]
+        if first_seg == "projects":
+            return None
+        c_slug_check = await configured_conn()
+        try:
+            cur = await c_slug_check.execute(
+                "SELECT 1 FROM projects WHERE id = ? LIMIT 1",
+                (first_seg,),
+            )
+            slug_match = await cur.fetchone()
+        finally:
+            await c_slug_check.close()
+        if slug_match:
+            return None
+        return rel
+
+    async def _queue_file_write_proposal(
+        *,
+        project_id: str,
+        scope: str,
+        rel: str,
+        content: str,
+        summary: str,
+        metadata: dict[str, Any] | None = None,
+        originating_task_id: str | None = None,
+    ) -> tuple[int, list[int], str]:
+        now_iso = _now_iso()
+        metadata_json = json.dumps(metadata or {}, separators=(",", ":"))
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id FROM file_write_proposals "
+                "WHERE project_id = ? AND scope = ? AND path = ? "
+                "AND status = 'pending'",
+                (project_id, scope, rel),
+            )
+            superseded_ids = [row[0] for row in await cur.fetchall()]
+            cur = await c.execute(
+                "INSERT INTO file_write_proposals "
+                "(project_id, proposer_id, scope, path, "
+                "proposed_content, summary, metadata_json, "
+                "originating_task_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    project_id, caller_id, scope, rel, content, summary,
+                    metadata_json, originating_task_id,
+                ),
+            )
+            proposal_id = cur.lastrowid
+            for sid in superseded_ids:
+                await c.execute(
+                    "UPDATE file_write_proposals SET status = 'superseded', "
+                    "resolved_at = ?, resolved_by = 'system', "
+                    "resolved_note = ? "
+                    "WHERE id = ? AND status = 'pending'",
+                    (now_iso, f"superseded by #{proposal_id}", sid),
+                )
+            if originating_task_id and scope == "truth":
+                await c.execute(
+                    "UPDATE tasks SET truthgate_pending_proposal_id = ? "
+                    "WHERE id = ? AND project_id = ?",
+                    (proposal_id, originating_task_id, project_id),
+                )
+            await c.commit()
+        finally:
+            await c.close()
+        return int(proposal_id), superseded_ids, now_iso
+
     @tool(
         "coord_propose_file_write",
         (
@@ -3900,35 +3993,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         # duplicates. The scope filter is load-bearing: a hypothetical
         # truth/CLAUDE.md and a project_claude_md proposal at path
         # 'CLAUDE.md' must not supersede each other.
-        now_iso = _now_iso()
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT id FROM file_write_proposals "
-                "WHERE project_id = ? AND scope = ? AND path = ? "
-                "AND status = 'pending'",
-                (project_id, scope, rel),
-            )
-            superseded_ids = [row[0] for row in await cur.fetchall()]
-            cur = await c.execute(
-                "INSERT INTO file_write_proposals "
-                "(project_id, proposer_id, scope, path, "
-                "proposed_content, summary) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (project_id, caller_id, scope, rel, content, summary),
-            )
-            proposal_id = cur.lastrowid
-            for sid in superseded_ids:
-                await c.execute(
-                    "UPDATE file_write_proposals SET status = 'superseded', "
-                    "resolved_at = ?, resolved_by = 'system', "
-                    "resolved_note = ? "
-                    "WHERE id = ? AND status = 'pending'",
-                    (now_iso, f"superseded by #{proposal_id}", sid),
-                )
-            await c.commit()
-        finally:
-            await c.close()
+        proposal_id, superseded_ids, now_iso = await _queue_file_write_proposal(
+            project_id=project_id,
+            scope=scope,
+            rel=rel,
+            content=content,
+            summary=summary,
+        )
 
         for sid in superseded_ids:
             await bus.publish(
@@ -3972,6 +4043,154 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             f"({len(content)} chars, scope={scope}){note}. The user "
             f"will review and approve or deny in the UI; you'll see "
             f"`file_write_proposal_resolved` on your next turn."
+        )
+
+    @tool(
+        "coord_propose_truth_amendment",
+        (
+            "Coach-only. Convenience wrapper for proposing a protected "
+            "truth/ amendment tied to a TruthGate task. This does not "
+            "write truth/ directly and does not create a separate "
+            "registry; it queues a normal file_write_proposals row with "
+            "scope='truth', metadata_json, and originating_task_id. The "
+            "human approval/denial flow is unchanged.\n\n"
+            "Params:\n"
+            "- task_id: originating task id (required).\n"
+            "- path: path relative under truth/ (required).\n"
+            "- content: full new truth file body (required).\n"
+            "- summary: one-line user-facing reason, max 200 chars "
+            "(required).\n"
+            "- rationale: why current truth is missing/stale/"
+            "contradictory (required).\n"
+            "- evidence: optional links, task ids, commits, file paths, "
+            "or event ids.\n"
+            "- affected_docs: optional list/JSON/comma-separated Docs/ "
+            "projection paths.\n"
+            "- provisional_impl: optional boolean/string.\n"
+            "- rejection_consequence: optional consequence if denied.\n"
+            "- draft_model: optional model alias used to draft content.\n"
+            "- drafted: optional boolean/string."
+        ),
+        {
+            "task_id": str,
+            "path": str,
+            "content": str,
+            "summary": str,
+            "rationale": str,
+            "evidence": str,
+            "affected_docs": Any,
+            "provisional_impl": Any,
+            "rejection_consequence": str,
+            "draft_model": str,
+            "drafted": Any,
+        },
+    )
+    async def propose_truth_amendment(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("coord_propose_truth_amendment is Coach-only.")
+        task_id = (args.get("task_id") or "").strip()
+        rel = (args.get("path") or "").strip()
+        content = args.get("content")
+        summary = (args.get("summary") or "").strip()
+        rationale = (args.get("rationale") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+        if not rel:
+            return _err("path is required")
+        normalized = await _validate_truth_proposal_path(rel)
+        if normalized is None:
+            return _err(
+                "path must be relative under the active project's truth/ "
+                "folder, no leading slash, no '..' segments, and no "
+                "projects/<slug>/ prefix"
+            )
+        rel = normalized
+        if not isinstance(content, str):
+            return _err("content is required (string)")
+        if len(content) > FILE_WRITE_PROPOSAL_MAX_CHARS:
+            return _err(
+                f"content too long ({len(content)} chars, "
+                f"max {FILE_WRITE_PROPOSAL_MAX_CHARS})"
+            )
+        if not summary:
+            return _err("summary is required (one-line 'why' the user reads)")
+        if len(summary) > 200:
+            return _err(f"summary too long ({len(summary)} chars, max 200)")
+        if not rationale:
+            return _err("rationale is required")
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            task = await cur.fetchone()
+        finally:
+            await c.close()
+        if not task:
+            return _err(f"task {task_id} not found")
+
+        from server.truthgate.amendments import (  # noqa: PLC0415
+            build_amendment_metadata,
+        )
+
+        try:
+            metadata = build_amendment_metadata(
+                originating_task_id=task_id,
+                rationale=rationale,
+                evidence=args.get("evidence"),
+                affected_docs=_string_list_arg(args.get("affected_docs")),
+                provisional_impl=_parse_boolish(
+                    args.get("provisional_impl"), default=False,
+                ),
+                rejection_consequence=args.get("rejection_consequence"),
+                draft_model=args.get("draft_model"),
+                drafted=_parse_boolish(args.get("drafted"), default=False),
+            )
+        except ValueError as exc:
+            return _err(str(exc))
+        metadata["kind"] = "truthgate_truth_amendment"
+        metadata["proposal_wrapper"] = "coord_propose_truth_amendment"
+
+        proposal_id, superseded_ids, now_iso = await _queue_file_write_proposal(
+            project_id=project_id,
+            scope="truth",
+            rel=rel,
+            content=content,
+            summary=summary,
+            metadata=metadata,
+            originating_task_id=task_id,
+        )
+
+        for sid in superseded_ids:
+            await bus.publish({
+                "ts": now_iso,
+                "agent_id": "system",
+                "type": "file_write_proposal_superseded",
+                "proposal_id": sid,
+                "superseded_by": proposal_id,
+                "scope": "truth",
+                "path": rel,
+            })
+        await bus.publish({
+            "ts": now_iso,
+            "agent_id": caller_id,
+            "type": "file_write_proposal_created",
+            "proposal_id": proposal_id,
+            "scope": "truth",
+            "path": rel,
+            "summary": summary,
+            "size": len(content),
+            "superseded": superseded_ids,
+            "originating_task_id": task_id,
+            "metadata": metadata,
+        })
+        return _ok(
+            f"truth amendment proposal #{proposal_id} queued for "
+            f"truth/{rel} from task {task_id}; human approval/denial "
+            "uses the existing file-write proposal flow."
         )
 
     @tool(
@@ -9801,6 +10020,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         ship_to_dev,
         write_decision,
         propose_file_write,
+        propose_truth_amendment,
         read_file,
         write_knowledge,
         read_knowledge,
@@ -10077,6 +10297,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_submit_verification_report",
     "mcp__coord__coord_write_decision",
     "mcp__coord__coord_propose_file_write",
+    "mcp__coord__coord_propose_truth_amendment",
     "mcp__coord__coord_read_file",
     "mcp__coord__coord_write_knowledge",
     "mcp__coord__coord_read_knowledge",
