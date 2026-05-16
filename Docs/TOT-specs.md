@@ -4804,10 +4804,13 @@ or post-turn thread-read payload can otherwise look like a stdio
 receiver-loop failure even though the app-server process is still alive
 and has no stderr.
 Before each Codex Player spawn, the dispatcher also refreshes
-`agents.allowed_tools` from any active kanban role row when the stored
-JSON no longer matches the current role allowlist, so existing shipper
-or executor assignments pick up newly-added completion tools without a
-same-stage reassignment.
+`agents.allowed_tools` from the active kanban role row for
+`agents.current_task_id` when that row exists; otherwise it falls back
+to the newest active current-stage role row. When the stored JSON no
+longer matches that role allowlist, existing shipper or executor
+assignments pick up newly-added completion tools without a same-stage
+reassignment, and pending ship rows cannot leak `coord_ship_to_dev`
+into an executor turn for another current task.
 
 **Transient-error retry (2026-05-13)**: `CoordProxyClient.call_tool`
 retries on transport errors (`httpx.ConnectError`, `ReadTimeout`,
