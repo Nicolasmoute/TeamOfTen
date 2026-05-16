@@ -42,6 +42,7 @@ const KANBAN_FORWARD_TYPES = new Set([
   "task_role_completed", "task_drift_detected",
   "task_stage_stale", "task_workflow_set",
   "audit_report_submitted", "audit_fail_notification",
+  "verification_report_submitted",
   "compass_audit_logged",
   "commit_pushed", "project_switched", "socket_connected",
   "backlog_task_proposed", "backlog_task_promoted", "backlog_task_rejected",
@@ -60,6 +61,7 @@ const KANBAN_STAGE_SHORT = {
   audit_syntax: "syn",
   audit_semantics: "sem",
   ship: "ship",
+  verify: "ver",
 };
 
 // markdown rendering: parse / sanitise / math / mermaid pipeline lives

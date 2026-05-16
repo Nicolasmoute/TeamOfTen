@@ -4506,7 +4506,7 @@ async def _load_active_role_assignments(
         cur = await c.execute(
             f"SELECT id, task_id, role, eligible_owners, owner, "
             f"assigned_at, claimed_at, started_at, completed_at, "
-            f"report_path, verdict "
+            f"report_path, verdict, focus "
             f"FROM task_role_assignments "
             f"WHERE task_id IN ({placeholders}) "
             f"AND completed_at IS NULL AND superseded_by IS NULL "
@@ -4538,7 +4538,7 @@ async def _load_role_assignment_history(
         cur = await c.execute(
             f"SELECT id, task_id, role, eligible_owners, owner, "
             f"assigned_at, claimed_at, started_at, completed_at, "
-            f"report_path, verdict, superseded_by "
+            f"report_path, verdict, focus, superseded_by "
             f"FROM task_role_assignments "
             f"WHERE task_id IN ({placeholders}) "
             f"ORDER BY assigned_at",
@@ -4547,6 +4547,70 @@ async def _load_role_assignment_history(
         for row in await cur.fetchall():
             d = dict(row)
             out.setdefault(d["task_id"], []).append(d)
+    finally:
+        await c.close()
+    return out
+
+
+async def _load_postship_context(
+    task_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Attach latest ship evidence and verification verdict/report.
+
+    This is read-only UI enrichment over the existing project_events log;
+    no schema changes are needed for the Verify column to show PR/SHA and
+    report links.
+    """
+    if not task_ids:
+        return {}
+    placeholders = ",".join("?" * len(task_ids))
+    out: dict[str, dict[str, Any]] = {tid: {} for tid in task_ids}
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            f"SELECT task_id, type, ts, payload_json, payload_pointer "
+            f"FROM project_events "
+            f"WHERE task_id IN ({placeholders}) "
+            f"AND type IN ('task_shipped_to_dev', 'verification_report_submitted') "
+            f"ORDER BY ts ASC",
+            task_ids,
+        )
+        for row in await cur.fetchall():
+            d = dict(row)
+            task_id = d.get("task_id")
+            if not task_id:
+                continue
+            try:
+                payload = json.loads(d.get("payload_json") or "{}")
+                if not isinstance(payload, dict):
+                    payload = {}
+            except Exception:
+                payload = {}
+            ctx = out.setdefault(task_id, {})
+            if d.get("type") == "task_shipped_to_dev":
+                ctx["latest_ship_evidence"] = {
+                    "ts": d.get("ts"),
+                    "pr_number": payload.get("pr_number"),
+                    "pr_url": payload.get("pr_url") or "",
+                    "ship_sha": payload.get("ship_sha") or "",
+                    "executor_sha": payload.get("executor_sha") or "",
+                    "deploy_target": payload.get("deploy_target") or "dev",
+                    "pointer": d.get("payload_pointer") or "",
+                }
+            elif d.get("type") == "verification_report_submitted":
+                ctx["latest_verification"] = {
+                    "ts": d.get("ts"),
+                    "verdict": payload.get("verdict") or "",
+                    "report_path": (
+                        payload.get("report_path")
+                        or d.get("payload_pointer")
+                        or ""
+                    ),
+                    "round": payload.get("round"),
+                    "verifier_id": payload.get("verifier_id") or "",
+                    "evidence": payload.get("evidence"),
+                    "message_to_coach": payload.get("message_to_coach") or "",
+                }
     finally:
         await c.close()
     return out
@@ -4569,7 +4633,9 @@ async def get_tasks_board() -> dict[str, Any]:
     finally:
         await c.close()
 
-    role_map = await _load_active_role_assignments([r["id"] for r in rows])
+    task_ids = [r["id"] for r in rows]
+    role_map = await _load_active_role_assignments(task_ids)
+    postship_map = await _load_postship_context(task_ids)
 
     buckets: dict[str, list[dict[str, Any]]] = {
         "plan": [],
@@ -4581,6 +4647,7 @@ async def get_tasks_board() -> dict[str, Any]:
     }
     for row in rows:
         row["assignments"] = role_map.get(row["id"], [])
+        row.update(postship_map.get(row["id"], {}))
         buckets.setdefault(row["status"], []).append(row)
     for stage in buckets:
         buckets[stage].sort(key=_priority_sort_key)
@@ -4627,8 +4694,10 @@ async def get_tasks_archive(
     finally:
         await c.close()
     role_map = await _load_role_assignment_history([r["id"] for r in rows])
+    postship_map = await _load_postship_context([r["id"] for r in rows])
     for row in rows:
         row["assignments"] = role_map.get(row["id"], [])
+        row.update(postship_map.get(row["id"], {}))
     return {"tasks": rows, "total": total, "limit": limit, "offset": offset}
 
 

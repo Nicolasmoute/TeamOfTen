@@ -44,6 +44,7 @@ const STAGE_LABELS = {
   audit_syntax: "FORMAL",
   audit_semantics: "SEMANTIC",
   ship: "SHIP",
+  verify: "VERIFY",
   archive: "ARCHIVE",
 };
 
@@ -53,6 +54,7 @@ const TRAJECTORY_TOKENS = {
   audit_syntax: "AY",
   audit_semantics: "AE",
   ship: "S",
+  verify: "V",
 };
 
 // Render a compact trajectory marker like `P → [E] → AY → S` with the
@@ -128,6 +130,7 @@ const ROLE_LABELS = {
   auditor_syntax: "formal reviewer",
   auditor_semantics: "semantic reviewer",
   shipper: "shipper",
+  verifier: "verifier",
 };
 
 const ARCHIVE_STORAGE = "tot-kanban-archive";
@@ -170,6 +173,7 @@ function roleForStage(status) {
   if (status === "audit_syntax") return "auditor_syntax";
   if (status === "audit_semantics") return "auditor_semantics";
   if (status === "ship") return "shipper";
+  if (status === "verify") return "verifier";
   return null;
 }
 
@@ -216,7 +220,7 @@ function primaryAssignee(task) {
 
 function archiveAssignee(task) {
   const assignments = task.assignments || [];
-  const candidates = ["shipper", "executor", "auditor_semantics", "auditor_syntax", "planner"];
+  const candidates = ["verifier", "shipper", "executor", "auditor_semantics", "auditor_syntax", "planner"];
   for (const role of candidates) {
     const found = [...assignments].reverse().find((a) => a.role === role && a.owner);
     if (found) return { role, assignment: found };
@@ -234,6 +238,60 @@ function statusFlag(task) {
 
 function dateOnly(iso) {
   return (iso || "").slice(0, 10);
+}
+
+
+function shortSha(sha) {
+  return sha ? String(sha).slice(0, 8) : "";
+}
+
+
+function latestVerification(task) {
+  if (task.latest_verification) return task.latest_verification;
+  const rows = task.assignments || [];
+  return [...rows].reverse().find((a) => a.role === "verifier" && a.verdict) || null;
+}
+
+
+function activeFocus(task) {
+  const role = roleForStage(task.status);
+  if (!role) return "";
+  return assignmentForRole(task, role)?.focus || "";
+}
+
+
+function evidenceItems(task) {
+  const ev = task.latest_ship_evidence || {};
+  const items = [];
+  if (ev.deploy_target) items.push({ label: "deploy", value: ev.deploy_target });
+  if (ev.ship_sha) items.push({ label: "sha", value: shortSha(ev.ship_sha) });
+  if (ev.executor_sha) items.push({ label: "exec", value: shortSha(ev.executor_sha) });
+  if (ev.pr_number) items.push({ label: "PR", value: `#${ev.pr_number}`, href: ev.pr_url || "" });
+  else if (ev.pr_url) items.push({ label: "PR", value: "link", href: ev.pr_url });
+  return items;
+}
+
+
+function followUpDraft(task) {
+  const verification = latestVerification(task) || {};
+  const ev = task.latest_ship_evidence || {};
+  const reportPath = verification.report_path || "";
+  const title = `Follow up: ${task.title || task.id}`;
+  const lines = [
+    `Verification follow-up for ${task.id}.`,
+    "",
+    `Original task: ${task.title || "(untitled)"}`,
+  ];
+  if (verification.verdict) lines.push(`Verification verdict: ${String(verification.verdict).toUpperCase()}`);
+  if (reportPath) lines.push(`Verification report: ${reportPath}`);
+  if (ev.ship_sha) lines.push(`Ship SHA: ${ev.ship_sha}`);
+  if (ev.pr_url || ev.pr_number) lines.push(`PR: ${ev.pr_url || `#${ev.pr_number}`}`);
+  if (ev.deploy_target) lines.push(`Deploy target: ${ev.deploy_target}`);
+  if (verification.message_to_coach) {
+    lines.push("", "Verifier note:", verification.message_to_coach);
+  }
+  lines.push("", "Requested follow-up:", "");
+  return { title, description: lines.join("\n"), priority: "high" };
 }
 
 
@@ -342,11 +400,70 @@ function AssignmentHistory({ history }) {
 }
 
 
+function VerdictBadge({ verification }) {
+  const verdict = (verification?.verdict || "").toLowerCase();
+  if (!verdict) return null;
+  const label = verdict === "pass" ? "Verified PASS" : "Verify FAIL";
+  return html`<span class=${`kbn-verdict-badge kbn-verdict-${verdict}`}>${label}</span>`;
+}
+
+
+function ShipEvidence({ task, compact = false }) {
+  const items = evidenceItems(task);
+  if (!items.length) return null;
+  return html`
+    <div class=${`kbn-evidence ${compact ? "compact" : ""}`}>
+      ${items.map((item) => item.href
+        ? html`<a class="kbn-evidence-chip" href=${item.href} target="_blank" rel="noreferrer">
+            <span>${item.label}</span>${item.value}
+          </a>`
+        : html`<span class="kbn-evidence-chip"><span>${item.label}</span>${item.value}</span>`
+      )}
+    </div>
+  `;
+}
+
+
+function CardActions({ task, onStageAction, onFollowUp }) {
+  if (task.status === "ship") {
+    const hasEvidence = Boolean(task.latest_ship_evidence);
+    return html`
+      <div class="kbn-task-actions">
+        <button
+          type="button"
+          class="kbn-btn kbn-btn-sm kbn-btn-primary"
+          disabled=${!hasEvidence}
+          title=${hasEvidence ? "Send shipped task to post-ship verification" : "Ship evidence is required before verification"}
+          onClick=${(e) => { e.stopPropagation(); onStageAction(task, "verify"); }}
+        >Send to Verify</button>
+        <button
+          type="button"
+          class="kbn-btn kbn-btn-sm"
+          onClick=${(e) => { e.stopPropagation(); onStageAction(task, "archive"); }}
+        >Archive</button>
+      </div>
+    `;
+  }
+  if (task.status === "verify") {
+    return html`
+      <div class="kbn-task-actions">
+        <button type="button" class="kbn-btn kbn-btn-sm" onClick=${(e) => { e.stopPropagation(); onStageAction(task, "archive"); }}>Archive</button>
+        <button type="button" class="kbn-btn kbn-btn-sm" onClick=${(e) => { e.stopPropagation(); onStageAction(task, "execute"); }}>Back to Execute</button>
+        <button type="button" class="kbn-btn kbn-btn-sm" onClick=${(e) => { e.stopPropagation(); onStageAction(task, "ship"); }}>Back to Ship</button>
+        <button type="button" class="kbn-btn kbn-btn-sm kbn-btn-primary" onClick=${(e) => { e.stopPropagation(); onFollowUp(task); }}>Create Follow-up</button>
+      </div>
+    `;
+  }
+  return null;
+}
+
+
 // ---------------------------------------------------------------- card
 
 
 function Card({
   task, expanded, history, historyBusy, onExpand, onAssignRole,
+  onStageAction, onFollowUp,
 }) {
   const flag = statusFlag(task);
   const primary = primaryAssignee(task);
@@ -361,6 +478,8 @@ function Card({
   else if (compassPip === "confident_drift") compassTone = "var(--err)";
 
   const priClass = `kbn-pri-${task.priority || "normal"}`;
+  const verification = latestVerification(task);
+  const focus = activeFocus(task);
   const doAssign = (ev) => {
     ev.stopPropagation();
     if (primary.missingRole && onAssignRole) {
@@ -387,6 +506,7 @@ function Card({
       <div class="kbn-stage-label">${stageLabel}</div>
       <div class="kbn-card-row">
         <${Avatar} primary=${primary} onAssign=${doAssign} />
+        <${VerdictBadge} verification=${verification} />
         ${flag
           ? html`<span class="kbn-flag" style=${`color:${flag.tone}`}>${flag.label}</span>`
           : null}
@@ -409,7 +529,12 @@ function Card({
         ${task.compass_audit_report_path
           ? html`<${MdLink} path=${task.compass_audit_report_path} label="compass" />`
           : null}
+        ${verification?.report_path
+          ? html`<${MdLink} path=${verification.report_path} label="verification" />`
+          : null}
       </div>
+      <${ShipEvidence} task=${task} compact=${true} />
+      ${focus ? html`<div class="kbn-focus-line">${focus}</div>` : null}
       ${driftBanner
         ? html`<div class="kbn-drift-banner">${task.latest_audit_kind || "audit"} failed</div>`
         : null}
@@ -422,10 +547,17 @@ function Card({
               <div class="kbn-card-facts">
                 <span>${task.id}</span>
                 <span>${task.created_at ? `created ${timeAgo(task.created_at)}` : "created unknown"}</span>
+                ${task.last_stage_change_at ? html`<span>stage ${timeAgo(task.last_stage_change_at)}</span>` : null}
                 ${task.workflow ? html`<span>${task.workflow}</span>` : null}
                 ${task.required_reviews ? html`<span>reviews ${task.required_reviews}</span>` : null}
                 ${task.blocked_reason ? html`<span>${task.blocked_reason}</span>` : null}
               </div>
+              <${ShipEvidence} task=${task} />
+              <${CardActions}
+                task=${task}
+                onStageAction=${onStageAction}
+                onFollowUp=${onFollowUp}
+              />
               <div class="kbn-expanded-head">Role history</div>
               ${historyBusy
                 ? html`<div class="kbn-empty">loading history...</div>`
@@ -441,7 +573,10 @@ function Card({
 // ---------------------------------------------------------------- columns
 
 
-function Column({ stage, label, tasks, expandedId, historyByTask, historyBusy, onExpand, onAssignRole }) {
+function Column({
+  stage, label, tasks, expandedId, historyByTask, historyBusy, onExpand,
+  onAssignRole, onStageAction, onFollowUp,
+}) {
   const displayed = tasks || [];
   return html`
     <section class="kbn-column">
@@ -460,6 +595,8 @@ function Column({ stage, label, tasks, expandedId, historyByTask, historyBusy, o
                 historyBusy=${historyBusy === t.id}
                 onExpand=${onExpand}
                 onAssignRole=${onAssignRole}
+                onStageAction=${onStageAction}
+                onFollowUp=${onFollowUp}
               />
             `)}
       </div>
@@ -468,7 +605,10 @@ function Column({ stage, label, tasks, expandedId, historyByTask, historyBusy, o
 }
 
 
-function AuditBand({ label, tasks, expandedId, historyByTask, historyBusy, onExpand, onAssignRole }) {
+function AuditBand({
+  label, tasks, expandedId, historyByTask, historyBusy, onExpand,
+  onAssignRole, onStageAction, onFollowUp,
+}) {
   const displayed = tasks || [];
   return html`
     <div class="kbn-audit-band">
@@ -487,6 +627,8 @@ function AuditBand({ label, tasks, expandedId, historyByTask, historyBusy, onExp
                 historyBusy=${historyBusy === t.id}
                 onExpand=${onExpand}
                 onAssignRole=${onAssignRole}
+                onStageAction=${onStageAction}
+                onFollowUp=${onFollowUp}
               />
             `)}
       </div>
@@ -511,6 +653,8 @@ function AuditColumn(props) {
         historyBusy=${props.historyBusy}
         onExpand=${props.onExpand}
         onAssignRole=${props.onAssignRole}
+        onStageAction=${props.onStageAction}
+        onFollowUp=${props.onFollowUp}
       />
       <${AuditBand}
         label="Semantic"
@@ -520,6 +664,8 @@ function AuditColumn(props) {
         historyBusy=${props.historyBusy}
         onExpand=${props.onExpand}
         onAssignRole=${props.onAssignRole}
+        onStageAction=${props.onStageAction}
+        onFollowUp=${props.onFollowUp}
       />
     </section>
   `;
@@ -679,6 +825,181 @@ function AssignRoleModal({ target, onClose, onAssign }) {
 }
 
 
+function StageActionModal({ target, onClose, onSubmit }) {
+  const [assignee, setAssignee] = useState("");
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    setAssignee("");
+    setNote(target?.nextStage === "verify" ? "Verify the shipped change against the recorded post-ship evidence." : "");
+    setErr(null);
+  }, [target?.task?.id, target?.nextStage]);
+
+  if (!target) return null;
+  const { task, nextStage } = target;
+  const needsAssignee = nextStage !== "archive";
+  const title = nextStage === "verify"
+    ? "Send to Verify"
+    : nextStage === "execute"
+      ? "Back to Execute"
+      : nextStage === "ship"
+        ? "Back to Ship"
+        : "Archive";
+
+  const submit = async (ev) => {
+    ev.preventDefault();
+    if (needsAssignee && !assignee.trim()) {
+      setErr("assignee is required");
+      return;
+    }
+    if (!note.trim()) {
+      setErr("note is required");
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      await onSubmit(task, nextStage, needsAssignee ? assignee.trim() : "", note.trim());
+      onClose();
+    } catch (e) {
+      setErr(e.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return html`
+    <div class="kbn-modal-backdrop" onClick=${onClose}>
+      <div class="kbn-modal" onClick=${(e) => e.stopPropagation()}>
+        <div class="kbn-modal-head">${title}</div>
+        <form onSubmit=${submit}>
+          <div class="kbn-modal-task">${task.title || task.id}</div>
+          <${ShipEvidence} task=${task} />
+          ${needsAssignee ? html`
+            <label class="kbn-label">Assignee</label>
+            <input
+              class="kbn-input"
+              type="text"
+              value=${assignee}
+              placeholder="p3"
+              onInput=${(e) => setAssignee(e.target.value)}
+              autoFocus
+              disabled=${busy}
+            />
+          ` : null}
+          <label class="kbn-label" style="margin-top:8px">Note</label>
+          <textarea
+            class="kbn-textarea"
+            value=${note}
+            rows="5"
+            onInput=${(e) => setNote(e.target.value)}
+            disabled=${busy}
+          ></textarea>
+          ${nextStage === "archive"
+            ? html`<div class="kbn-help-mini">This uses the existing UI transition path and does not write a user-facing archive summary.</div>`
+            : null}
+          ${err ? html`<div class="kbn-error">${err}</div>` : null}
+          <div class="kbn-modal-actions">
+            <button type="button" class="kbn-btn" onClick=${onClose} disabled=${busy}>Cancel</button>
+            <button type="submit" class="kbn-btn kbn-btn-primary" disabled=${busy}>
+              ${busy ? "Submitting..." : title}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+
+function FollowUpDraftModal({ task, onClose, onCreate }) {
+  const draft = useMemo(() => task ? followUpDraft(task) : null, [task]);
+  const [title, setTitle] = useState(draft?.title || "");
+  const [desc, setDesc] = useState(draft?.description || "");
+  const [priority, setPriority] = useState(draft?.priority || "high");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    const next = task ? followUpDraft(task) : null;
+    setTitle(next?.title || "");
+    setDesc(next?.description || "");
+    setPriority(next?.priority || "high");
+    setErr(null);
+  }, [task?.id]);
+
+  if (!task) return null;
+
+  const submit = async (ev) => {
+    ev.preventDefault();
+    if (!title.trim()) {
+      setErr("title is required");
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      await onCreate({
+        title: title.trim(),
+        description: desc.trim(),
+        priority,
+      });
+      onClose();
+    } catch (e) {
+      setErr(e.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return html`
+    <div class="kbn-modal-backdrop" onClick=${onClose}>
+      <div class="kbn-modal" onClick=${(e) => e.stopPropagation()}>
+        <div class="kbn-modal-head">Create Follow-up Draft</div>
+        <form onSubmit=${submit}>
+          <label class="kbn-label">Title</label>
+          <textarea
+            class="kbn-input kbn-backlog-input"
+            rows="2"
+            value=${title}
+            onInput=${(e) => setTitle(e.target.value)}
+            autoFocus
+            disabled=${busy}
+          ></textarea>
+          <label class="kbn-label" style="margin-top:8px">Description</label>
+          <textarea
+            class="kbn-input kbn-backlog-desc-input"
+            rows="10"
+            value=${desc}
+            onInput=${(e) => setDesc(e.target.value)}
+            disabled=${busy}
+          ></textarea>
+          <div class="kbn-modal-priority-row">
+            <label class="kbn-label kbn-priority-label">Priority</label>
+            <select class="kbn-priority-select" value=${priority} onChange=${(e) => setPriority(e.target.value)} disabled=${busy}>
+              <option value="low">low</option>
+              <option value="normal">normal</option>
+              <option value="high">high</option>
+              <option value="urgent">urgent</option>
+            </select>
+          </div>
+          <div class="kbn-help-mini">Creates a pending backlog draft for Coach review; it does not promote or assign work.</div>
+          ${err ? html`<div class="kbn-error">${err}</div>` : null}
+          <div class="kbn-modal-actions">
+            <button type="button" class="kbn-btn" onClick=${onClose} disabled=${busy}>Cancel</button>
+            <button type="submit" class="kbn-btn kbn-btn-primary" disabled=${busy}>
+              ${busy ? "Creating..." : "Create Draft"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+
 // ---------------------------------------------------------------- archive drawer
 
 
@@ -773,6 +1094,7 @@ function ArchiveDrawer({ open, onClose, authedFetch }) {
           : visibleRows.map((t) => {
               const expanded = expandedId === t.id;
               const primary = archiveAssignee(t);
+              const verification = latestVerification(t);
               return html`
                 <article
                   class=${`kbn-archive-row ${expanded ? "expanded" : ""}`}
@@ -783,6 +1105,7 @@ function ArchiveDrawer({ open, onClose, authedFetch }) {
                     <${Avatar} primary=${primary} />
                     <span>${t.title || "(untitled)"}</span>
                     ${t.cancelled_at ? html`<span class="kbn-cancelled-chip">CANCELLED</span>` : null}
+                    <${VerdictBadge} verification=${verification} />
                     ${renderTrajectoryMarker(t.trajectory, "archive")}
                   </div>
                   <div class="kbn-archive-row-meta">
@@ -795,11 +1118,15 @@ function ArchiveDrawer({ open, onClose, authedFetch }) {
                     ${t.latest_audit_report_path
                       ? html`<${MdLink} path=${t.latest_audit_report_path} label="audit" />`
                       : null}
+                    ${verification?.report_path
+                      ? html`<${MdLink} path=${verification.report_path} label="verification" />`
+                      : null}
                   </div>
                   ${expanded
                     ? html`
                         <div class="kbn-card-expanded">
                           ${t.description ? html`<div class="kbn-card-description">${t.description}</div>` : null}
+                          <${ShipEvidence} task=${t} />
                           <div class="kbn-expanded-head">Role history</div>
                           <${AssignmentHistory} history=${t.assignments || []} />
                         </div>
@@ -1115,6 +1442,7 @@ export function KanbanPane({
   const saved = savedArchiveState();
   const [board, setBoard] = useState({
     plan: [], execute: [], audit_syntax: [], audit_semantics: [], ship: [],
+    verify: [],
   });
   const [backlogEntries, setBacklogEntries] = useState([]);
   const [composerOpen, setComposerOpen] = useState(false);
@@ -1123,6 +1451,8 @@ export function KanbanPane({
   const [historyByTask, setHistoryByTask] = useState({});
   const [historyBusy, setHistoryBusy] = useState(null);
   const [assignTarget, setAssignTarget] = useState(null);
+  const [stageTarget, setStageTarget] = useState(null);
+  const [followUpTask, setFollowUpTask] = useState(null);
   const [error, setError] = useState(null);
 
   const refresh = useCallback(async () => {
@@ -1166,6 +1496,7 @@ export function KanbanPane({
       "task_workflow_set", "task_drift_detected",
       "task_stage_stale", "audit_report_submitted",
       "audit_fail_notification", "compass_audit_logged",
+      "verification_report_submitted", "task_shipped_to_dev",
       "commit_pushed", "project_switched", "socket_connected",
     ]);
     const backlogWatched = new Set([
@@ -1224,6 +1555,7 @@ export function KanbanPane({
     auditor_syntax: "audit_syntax",
     auditor_semantics: "audit_semantics",
     shipper: "ship",
+    verifier: "verify",
   };
   const onAssign = async (task, role, to) => {
     const next_stage = ROLE_TO_STAGE[role] || role;
@@ -1239,6 +1571,28 @@ export function KanbanPane({
     });
     await refresh();
     if (expandedId === task.id) await loadHistory(task.id, true);
+  };
+
+  const onStageSubmit = async (task, next_stage, assignee, note) => {
+    const payload = { next_stage, note };
+    if (next_stage !== "archive") payload.assignee = assignee;
+    await apiPost(
+      authedFetch,
+      `/${encodeURIComponent(task.id)}/approve_stage`,
+      payload,
+    );
+    setHistoryByTask((prev) => {
+      const next = { ...prev };
+      delete next[task.id];
+      return next;
+    });
+    await refresh();
+    if (expandedId === task.id) await loadHistory(task.id, true);
+  };
+
+  const onCreateFollowUp = async (payload) => {
+    await onCreate(payload);
+    await refreshBacklog();
   };
 
   const paneClass = [
@@ -1296,6 +1650,8 @@ export function KanbanPane({
             historyBusy=${historyBusy}
             onExpand=${toggleExpand}
             onAssignRole=${(task, role) => setAssignTarget({ task, role })}
+            onStageAction=${(task, nextStage) => setStageTarget({ task, nextStage })}
+            onFollowUp=${setFollowUpTask}
           />
           <${Column}
             stage="execute"
@@ -1306,6 +1662,8 @@ export function KanbanPane({
             historyBusy=${historyBusy}
             onExpand=${toggleExpand}
             onAssignRole=${(task, role) => setAssignTarget({ task, role })}
+            onStageAction=${(task, nextStage) => setStageTarget({ task, nextStage })}
+            onFollowUp=${setFollowUpTask}
           />
           <${AuditColumn}
             syntax=${board.audit_syntax || []}
@@ -1315,6 +1673,8 @@ export function KanbanPane({
             historyBusy=${historyBusy}
             onExpand=${toggleExpand}
             onAssignRole=${(task, role) => setAssignTarget({ task, role })}
+            onStageAction=${(task, nextStage) => setStageTarget({ task, nextStage })}
+            onFollowUp=${setFollowUpTask}
           />
           <${Column}
             stage="ship"
@@ -1325,6 +1685,20 @@ export function KanbanPane({
             historyBusy=${historyBusy}
             onExpand=${toggleExpand}
             onAssignRole=${(task, role) => setAssignTarget({ task, role })}
+            onStageAction=${(task, nextStage) => setStageTarget({ task, nextStage })}
+            onFollowUp=${setFollowUpTask}
+          />
+          <${Column}
+            stage="verify"
+            label="Verify"
+            tasks=${board.verify || []}
+            expandedId=${expandedId}
+            historyByTask=${historyByTask}
+            historyBusy=${historyBusy}
+            onExpand=${toggleExpand}
+            onAssignRole=${(task, role) => setAssignTarget({ task, role })}
+            onStageAction=${(task, nextStage) => setStageTarget({ task, nextStage })}
+            onFollowUp=${setFollowUpTask}
           />
         </div>
         <${ArchiveDrawer}
@@ -1346,6 +1720,16 @@ export function KanbanPane({
         target=${assignTarget}
         onClose=${() => setAssignTarget(null)}
         onAssign=${onAssign}
+      />
+      <${StageActionModal}
+        target=${stageTarget}
+        onClose=${() => setStageTarget(null)}
+        onSubmit=${onStageSubmit}
+      />
+      <${FollowUpDraftModal}
+        task=${followUpTask}
+        onClose=${() => setFollowUpTask(null)}
+        onCreate=${onCreateFollowUp}
       />
     </div>
   `;
