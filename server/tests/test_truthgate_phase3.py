@@ -294,6 +294,54 @@ async def test_coord_record_truthgate_override_allows_exit_and_sets_provisional(
 
 
 @pytest.mark.asyncio
+async def test_truthgate_pass_preserves_unrelated_blocked_reason(
+    fresh_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await init_db()
+    task_id = await _promote_truthgate_task()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE tasks SET blocked = 1, blocked_reason = ? WHERE id = ?",
+            ("External deployment hold", task_id),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    async def fake_run(project_id: str, task: Any) -> dict[str, Any]:
+        return {
+            "verdict": "truthgate_pass",
+            "truth_basis": ["truth/truth-index.md"],
+            "truth_concerns": [],
+            "rationale": "covered",
+            "method": "classifier",
+            "model_alias": "latest_sonnet",
+            "warning": None,
+        }
+
+    import server.truthgate.classifier as classifier
+
+    monkeypatch.setattr(classifier, "run_truthgate_classifier", fake_run)
+    coach = _server_for("coach")
+    _ok(await _handler(coach, "run_truthgate")({"task_id": task_id}))
+
+    c = await configured_conn()
+    try:
+        row = dict(await (await c.execute(
+            "SELECT truthgate_verdict, blocked, blocked_reason "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        )).fetchone())
+    finally:
+        await c.close()
+    assert row["truthgate_verdict"] == "truthgate_pass"
+    assert row["blocked"] == 1
+    assert row["blocked_reason"] == "External deployment hold"
+
+
+@pytest.mark.asyncio
 async def test_truthgate_tools_are_coach_only(fresh_db: str) -> None:
     await init_db()
     task_id = await _promote_truthgate_task()
