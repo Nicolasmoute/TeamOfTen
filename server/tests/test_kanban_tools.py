@@ -1,7 +1,7 @@
 """Audit tests for surviving kanban MCP tools after the v2 cutover.
 
 Covers the behaviors of:
-  - coord_create_task (first-stage-only role-row planting per v2 §7.1)
+  - coord_create_task / coord_triage_backlog TruthGate pre-dispatch
   - coord_write_task_spec (with planner-row planted directly)
   - coord_submit_audit_report (records-only, no auto-revert)
   - coord_set_task_blocked
@@ -76,6 +76,20 @@ async def _create_and_promote(server: Any, args: dict[str, Any]) -> str:
     return _extract_task_id(promote_text)
 
 
+async def _mark_truthgate_pass(task_id: str) -> None:
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE tasks SET truthgate_verdict = 'truthgate_pass', "
+            "truthgate_method = 'manual_record', truth_basis = '[]' "
+            "WHERE id = ?",
+            (task_id,),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+
 async def _seed_task(
     *,
     task_id: str = "t-2026-05-03-abc12345",
@@ -148,10 +162,10 @@ async def _plant_role(
 
 
 # ----------------------------------------------------------------
-# coord_create_task — v2 first-stage-only planting
+# coord_create_task / coord_triage_backlog — TruthGate pre-dispatch
 # ----------------------------------------------------------------
 
-async def test_create_task_single_name_first_stage_plants_role_row(
+async def test_create_task_single_name_first_stage_does_not_plant_role_row(
     fresh_db: str,
 ) -> None:
     await init_db()
@@ -163,8 +177,8 @@ async def test_create_task_single_name_first_stage_plants_role_row(
             {"stage": "audit_syntax", "to": ["p4", "p5"]},
         ],
     })
-    # Role row exists for the first stage's named owner; NOT for the
-    # second stage (pool — auto-plant skipped per v2 §7.1).
+    # Promotion enters TruthGate. Even a single-name first `to` is only
+    # advisory until Coach approves the post-gate transition.
     c = await configured_conn()
     try:
         cur = await c.execute(
@@ -174,12 +188,10 @@ async def test_create_task_single_name_first_stage_plants_role_row(
         rows = [dict(r) for r in await cur.fetchall()]
     finally:
         await c.close()
-    assert len(rows) == 1
-    assert rows[0]["role"] == "executor"
-    assert rows[0]["owner"] == "p2"
+    assert rows == []
 
 
-async def test_create_task_first_stage_assignment_sets_role_tools(
+async def test_post_gate_first_stage_assignment_sets_role_tools(
     fresh_db: str,
 ) -> None:
     await init_db()
@@ -208,6 +220,13 @@ async def test_create_task_first_stage_assignment_sets_role_tools(
         "action": "promote",
     }))
     task_id = _extract_task_id(promote_text)
+    await _mark_truthgate_pass(task_id)
+    _ok_text(await _handler(server, "approve_stage")({
+        "task_id": task_id,
+        "next_stage": "execute",
+        "assignee": "p2",
+        "note": "dispatch after gate",
+    }))
 
     c = await configured_conn()
     try:
@@ -258,33 +277,34 @@ async def test_set_agent_role_tools_evicts_codex_client(
     assert "p3" in evicted, "evict_client must be called after role change"
 
 
-async def test_create_task_pool_first_stage_rejected(
+async def test_create_task_pool_first_stage_goes_to_backlog(
     fresh_db: str,
 ) -> None:
-    """v2.0.1 (2026-05-08): pool first-stage `to` rejected at create."""
+    """TruthGate flow: pool first-stage `to` is allowed pre-dispatch."""
     await init_db()
     server = _server_for("coach")
-    err = _err_text(await _handler(server, "create_task")({
+    text = _ok_text(await _handler(server, "create_task")({
         "title": "demo",
         "trajectory": [
             {"stage": "execute", "to": ["p2", "p3"]},
         ],
     }))
-    assert "trajectory[0].to" in err
-    assert "exactly one Player" in err
+    assert "Backlog entry #" in text
+    assert "Task is NOT yet on the kanban" in text
 
 
-async def test_create_task_empty_first_stage_rejected(
+async def test_create_task_empty_first_stage_goes_to_backlog(
     fresh_db: str,
 ) -> None:
-    """v2.0.1: empty first-stage `to` rejected at create."""
+    """TruthGate flow: empty first-stage `to` is allowed pre-dispatch."""
     await init_db()
     server = _server_for("coach")
-    err = _err_text(await _handler(server, "create_task")({
+    text = _ok_text(await _handler(server, "create_task")({
         "title": "demo",
         "trajectory": [{"stage": "execute", "to": []}],
     }))
-    assert "trajectory[0].to" in err
+    assert "Backlog entry #" in text
+    assert "Task is NOT yet on the kanban" in text
 
 
 # ----------------------------------------------------------------

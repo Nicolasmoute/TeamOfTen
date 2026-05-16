@@ -353,13 +353,11 @@ async def test_audit_fail_does_not_auto_revert(
 # ---------------------------------------------------------------- pool discipline
 
 
-async def test_pool_first_stage_rejected_at_create(
+async def test_pool_first_stage_allowed_for_backlog_truthgate_create(
     fresh_db: str, monkeypatch,
 ) -> None:
-    """v2.0.1 (2026-05-08): pool/empty first-stage `to` is rejected at
-    `coord_create_task` — the kanban is a log of dispatched work, so
-    every task must name its first-stage Player. Pool/empty subsequent
-    stages remain FYI and are accepted."""
+    """TruthGate flow: pool first-stage `to` is advisory at Backlog
+    creation time. Coach dispatches a single assignee after the gate."""
     await init_db()
     await _stub_wake(monkeypatch)
 
@@ -372,8 +370,7 @@ async def test_pool_first_stage_rejected_at_create(
             '{"stage":"execute","to":[]}]'
         ),
     })
-    # Pool first-stage → rejected with the v2.0.1 error.
-    assert res.get("is_error"), f"expected rejection, got {res}"
+    assert not res.get("is_error"), f"expected backlog entry, got {res}"
     text = res["content"][0]["text"]
-    assert "trajectory[0].to" in text
-    assert "exactly one Player" in text
+    assert "Backlog entry #" in text
+    assert "Task is NOT yet on the kanban" in text

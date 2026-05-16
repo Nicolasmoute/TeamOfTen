@@ -530,36 +530,25 @@ def _validate_trajectory(
     if "execute" not in seen_stages:
         return None, "trajectory must include 'execute'"
 
-    # v2.0.1 (2026-05-08): the first trajectory entry's `to` must name
-    # exactly one Player AT CREATION TIME. The kanban is a log of work
-    # Coach has fired at Players — tasks without an assignee aren't on
-    # the kanban yet, they're pre-task reasoning. Pool/empty
-    # first-stage `to` is rejected at the trajectory-validation
-    # boundary so both MCP (`coord_create_task`) and HTTP
-    # (`POST /api/tasks`) layers honor the rule. Subsequent entries
-    # can still be pool/empty (FYI only; Coach picks each later
-    # stage's assignee at coord_approve_stage time, which already
-    # enforces single-named).
+    # Direct-dispatch callers can still require the first trajectory
+    # entry's `to` to name exactly one Player. TruthGate-backed top-level
+    # task creation and Backlog promotion deliberately opt out: those
+    # paths are pre-dispatch, so the first `to` remains advisory until
+    # Coach approves the post-gate transition.
     #
-    # `enforce_first_stage_assigned=False` is set by
+    # `enforce_first_stage_assigned=False` is also set by
     # `coord_set_task_trajectory` callers — mid-flight reroute happens
-    # AFTER the task already has role rows planted; the original
-    # first-stage assignment is in the role-row table, not the
-    # trajectory's first entry. So a reroute can rewrite the first
-    # entry to empty/pool without violating the create-time invariant.
+    # after the task already has role rows planted; the original stage
+    # assignment lives in task_role_assignments, not the trajectory.
     if enforce_first_stage_assigned:
         first_to = normalized[0].get("to") or []
         if len(first_to) != 1:
             return None, (
                 "trajectory[0].to must name exactly one Player (e.g. "
-                "['p3']) — coord_create_task fires a piece of work AT "
-                "someone. Pool/empty first-stage `to` is rejected: an "
-                "undispatched task isn't on the kanban yet, it's "
-                "pre-task reasoning. If you haven't decided who, decide "
-                "now (look at coord_get_player_settings, ## Player "
-                "health, and ## Recent events) and put their slot in "
-                "the trajectory. Subsequent stages can be FYI / empty; "
-                "only the first must be named."
+                "['p3']) for this direct-dispatch path. Pool/empty "
+                "first-stage `to` is valid only for pre-dispatch "
+                "TruthGate/Backlog flows where Coach later calls "
+                "coord_approve_stage with a single assignee."
             )
 
     return normalized, None
@@ -1286,7 +1275,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "(same table as coord_propose_task). No kanban row is created "
             "yet, no Player is woken. Coach must then call "
             "coord_triage_backlog(id, action='promote', trajectory=[...]) "
-            "to promote it to the kanban and fire it at a Player. This "
+            "to promote it into TruthGate. This "
             "enforces FIFO priority ordering: items are triaged in the "
             "order they arrived, not in the order Coach happened to type "
             "them (LIFO). Use the `priority` param to flag urgency at "
@@ -1308,16 +1297,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "Backlog entry so coord_triage_backlog promote can read it. "
             "Ordered list of {stage, to, focus?} objects. `stage` ∈ "
             "{plan, execute, audit_syntax, audit_semantics, ship, verify}; canonical "
-            "order; execute is mandatory. **trajectory[0].to MUST name "
-            "exactly one Player** (single-element list like ['p3']). "
-            "Subsequent stages' `to` may be a single name, list, or empty "
-            "— FYI only; Coach picks each later stage's assignee at "
-            "coord_approve_stage time. `focus` is required on every "
+            "order; execute is mandatory. Every `to`, including "
+            "trajectory[0].to, may be empty, a pool, or a single Player "
+            "— FYI only while the task is in Backlog/TruthGate. Coach "
+            "picks the real assignee at coord_approve_stage time after "
+            "the TruthGate pass/override. `focus` is required on every "
             "audit_semantics entry. Players inherit the parent's trajectory "
             "when subtasking.\n"
             "- note: optional brief — stored with the Backlog entry for "
-            "  Coach top-level tasks; becomes the first-stage assignee's "
-            "  wake prompt at promote time.\n"
+            "  Coach top-level tasks.\n"
             "- success_criteria: optional 1-3 line statement of what "
             "  'done' looks like. Stored on the Backlog entry; promoted "
             "  to the task row at triage time."
@@ -1373,7 +1361,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         trajectory_raw = args.get("trajectory")
         trajectory: list[dict[str, Any]] | None = None
         if trajectory_raw not in (None, "", []):
-            trajectory, traj_err = _validate_trajectory(trajectory_raw)
+            trajectory, traj_err = _validate_trajectory(
+                trajectory_raw,
+                enforce_first_stage_assigned=not (
+                    caller_is_coach and parent_id is None
+                ),
+            )
             if traj_err:
                 return _err(f"invalid trajectory: {traj_err}")
         if trajectory is None and caller_is_coach and parent_id is None:
@@ -1433,7 +1426,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "Task is NOT yet on the kanban — call "
                 f"coord_triage_backlog(id={backlog_id}, "
                 "action='promote', trajectory=[...]) when you're ready "
-                "to fire it at a Player. This enforces FIFO ordering: "
+                "to start TruthGate. This enforces FIFO ordering: "
                 "triage from oldest to newest, not by creation recency."
             )
 
@@ -8942,8 +8935,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- action: 'promote' or 'reject'.\n"
             "- trajectory: required when action='promote'. Same format "
             "  as coord_create_task — ordered list of {stage, to} "
-            "  objects. 'to' must name exactly one Player slot per "
-            "  the v2 first-stage rule.\n"
+            "  objects. The first `to` may be empty, a pool, or a single "
+            "  Player because promotion enters TruthGate and does not "
+            "  dispatch work. Coach later calls coord_approve_stage with "
+            "  one assignee after a TruthGate pass/override.\n"
             "- modified_title: optional. Rename the idea on promote.\n"
             "- reason: recommended when action='reject'. Short phrase "
             "  explaining why (stored; surfaces to human if the idea "
@@ -9056,7 +9051,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             except Exception:
                 return _err("trajectory must be a JSON list of {stage, to} objects")
 
-        trajectory, traj_err = _validate_trajectory(trajectory)
+        trajectory, traj_err = _validate_trajectory(
+            trajectory,
+            enforce_first_stage_assigned=False,
+        )
         if traj_err:
             return _err(f"invalid trajectory: {traj_err}")
 

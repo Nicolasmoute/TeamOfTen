@@ -18,6 +18,16 @@ _TRAJECTORY = (
     '{"stage":"audit_syntax","to":[]},'
     '{"stage":"ship","to":[]}]'
 )
+_EMPTY_FIRST_TO_TRAJECTORY = (
+    '[{"stage":"execute","to":[]},'
+    '{"stage":"audit_syntax","to":[]},'
+    '{"stage":"ship","to":[]}]'
+)
+_POOL_FIRST_TO_TRAJECTORY = (
+    '[{"stage":"execute","to":["p2","p3"]},'
+    '{"stage":"audit_syntax","to":[]},'
+    '{"stage":"ship","to":[]}]'
+)
 
 
 def _server_for(slot: str) -> Any:
@@ -50,7 +60,10 @@ def _extract_task_id(body: str) -> str:
     return m.group(0)
 
 
-async def _promote_to_truthgate(monkeypatch: pytest.MonkeyPatch) -> str:
+async def _create_and_promote_with_wake_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    trajectory: str = _TRAJECTORY,
+) -> tuple[str, list[tuple[str, str]]]:
     wake_calls: list[tuple[str, str]] = []
 
     async def _wake(slot: str, prompt: str = "", **_: Any) -> bool:
@@ -62,7 +75,7 @@ async def _promote_to_truthgate(monkeypatch: pytest.MonkeyPatch) -> str:
     created = _ok(await _handler(coach, "create_task")({
         "title": "truthgate demo",
         "description": "prove promotion enters the gate",
-        "trajectory": _TRAJECTORY,
+        "trajectory": trajectory,
     }))
     backlog_id = _extract_backlog_id(created)
     promoted = _ok(await _handler(coach, "triage_backlog")({
@@ -71,8 +84,13 @@ async def _promote_to_truthgate(monkeypatch: pytest.MonkeyPatch) -> str:
     }))
     assert "initial stage: truthgate" in promoted
     assert "No Player role was planted" in promoted
+    return _extract_task_id(promoted), wake_calls
+
+
+async def _promote_to_truthgate(monkeypatch: pytest.MonkeyPatch) -> str:
+    task_id, wake_calls = await _create_and_promote_with_wake_capture(monkeypatch)
     assert wake_calls == []
-    return _extract_task_id(promoted)
+    return task_id
 
 
 @pytest.mark.asyncio
@@ -127,6 +145,97 @@ async def test_backlog_promotion_enters_truthgate_without_role_or_wake(
         "execute", "audit_syntax", "ship",
     ]
     assert roles == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("trajectory", "expected_first_to"),
+    [
+        (_EMPTY_FIRST_TO_TRAJECTORY, []),
+        (_POOL_FIRST_TO_TRAJECTORY, ["p2", "p3"]),
+    ],
+)
+async def test_truthgate_create_and_promote_accept_advisory_first_to(
+    fresh_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+    trajectory: str,
+    expected_first_to: list[str],
+) -> None:
+    await init_db()
+    task_id, wake_calls = await _create_and_promote_with_wake_capture(
+        monkeypatch, trajectory,
+    )
+
+    c = await configured_conn()
+    try:
+        task = dict(await (await c.execute(
+            "SELECT status, owner, trajectory FROM tasks WHERE id = ?",
+            (task_id,),
+        )).fetchone())
+        roles = await (await c.execute(
+            "SELECT * FROM task_role_assignments WHERE task_id = ?",
+            (task_id,),
+        )).fetchall()
+    finally:
+        await c.close()
+
+    stored_trajectory = json.loads(task["trajectory"])
+    assert task["status"] == "truthgate"
+    assert task["owner"] is None
+    assert stored_trajectory[0]["to"] == expected_first_to
+    assert roles == []
+    assert wake_calls == []
+
+
+@pytest.mark.asyncio
+async def test_post_gate_approve_assigns_and_wakes_after_pass(
+    fresh_db: str, monkeypatch: pytest.MonkeyPatch,  # noqa: ARG001
+) -> None:
+    await init_db()
+    task_id, wake_calls = await _create_and_promote_with_wake_capture(
+        monkeypatch, _POOL_FIRST_TO_TRAJECTORY,
+    )
+    assert wake_calls == []
+
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE tasks SET truthgate_verdict = 'truthgate_pass', "
+            "truthgate_method = 'manual_record', truth_basis = '[]' "
+            "WHERE id = ?",
+            (task_id,),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    coach = _server_for("coach")
+    ok = _ok(await _handler(coach, "approve_stage")({
+        "task_id": task_id,
+        "next_stage": "execute",
+        "assignee": "p3",
+        "note": "post-gate dispatch",
+    }))
+    assert "truthgate → execute" in ok
+
+    c = await configured_conn()
+    try:
+        task = dict(await (await c.execute(
+            "SELECT status, owner FROM tasks WHERE id = ?",
+            (task_id,),
+        )).fetchone())
+        role = dict(await (await c.execute(
+            "SELECT role, owner FROM task_role_assignments "
+            "WHERE task_id = ? AND completed_at IS NULL "
+            "AND superseded_by IS NULL",
+            (task_id,),
+        )).fetchone())
+    finally:
+        await c.close()
+
+    assert task == {"status": "execute", "owner": "p3"}
+    assert role == {"role": "executor", "owner": "p3"}
+    assert wake_calls and wake_calls[-1][0] == "p3"
 
 
 @pytest.mark.asyncio
