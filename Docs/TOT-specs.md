@@ -3576,6 +3576,9 @@ Agent lifecycle:
 - `runtime_updated` — `agents.runtime_override` changed (carries `runtime_override`; `source=session_transfer` when fired by the transfer flow rather than a blunt PUT)
 - `auto_compact_triggered`
 - `auto_compact_failed`
+- `auto_compact_skipped` - Codex auto-compact preflight found a thread,
+  but the compact handler's re-read found it already cleared; no
+  `session_compacted(0 chars)` event is emitted.
 - `compact_empty_forced`
 - `context_applied`
 - `context_usage`

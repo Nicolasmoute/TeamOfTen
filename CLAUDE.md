@@ -1437,9 +1437,13 @@ OpenAI's Codex safety monitor, which cancelled the subsequent
   LLM round-trip). If the SDK returns only an acknowledgement, the
   handler writes a synthetic handoff from the recent exchange log and
   emits `synthetic_summary=true` instead of a 0-char compact. The
-  dispatcher then runs the user's original prompt on a fresh thread
-  that picks up the continuity note from the system prompt. Failure
-  paths (auth gone, ImportError,
+  dispatcher now claims the Codex slot before this preflight, so
+  parallel wakes cannot all issue `compact_thread` against the same
+  app-server client. If a stale race still finds the thread already
+  cleared, Codex emits `auto_compact_skipped` rather than
+  `session_compacted(0 chars)`. The dispatcher then runs the user's
+  original prompt on a fresh thread that picks up the continuity note
+  from the system prompt. Failure paths (auth gone, ImportError,
   app-server exception) emit `auto_compact_failed` symmetrically with
   Claude. Spec mirror in `Docs/CODEX_RUNTIME_SPEC.md` §A.5 / §E.6.
 
