@@ -6118,10 +6118,11 @@ function MCPServerCard({ server, testing, onToggle, onSaveTools, onSaveConfig, o
 }
 
 function SecretsSection() {
-  // Encrypted UI-managed secrets. These feed ${VAR} interpolation in MCP
-  // configs (and anything else that calls _interpolate) — the store wins
-  // over os.environ on name collision. Plaintext values never round-trip:
-  // once saved you can only replace or delete, not view.
+  // Encrypted UI-managed secrets. These feed explicit ${VAR}
+  // interpolation sites such as MCP configs and repo URLs; they are not
+  // exported as global Coach/Player env. The store wins over
+  // os.environ on interpolation-name collision. Plaintext values never
+  // round-trip: once saved you can only replace or delete, not view.
   const [rows, setRows] = useState([]);
   const [status, setStatus] = useState(null); // {ok, reason?}
   const [loaded, setLoaded] = useState(false);
@@ -6223,8 +6224,10 @@ function SecretsSection() {
       <code>\${...}</code> wrapper — the wrapper is the placeholder
       syntax used in the config files that consume the secret. On
       collision with an env var of the same name, the stored secret
-      wins. Values are write-only — you can replace or delete, but
-      never read back.
+      wins for interpolation only. These values are not exported into
+      Coach or Player runtime environments; configure API auth like
+      <code>HARNESS_TOKEN</code> in deployment env. Values are write-only
+      — you can replace or delete, but never read back.
     </p>
     ${disabled
       ? html`<p style="font-size: 12px; color: var(--err); margin: 0 0 6px 0;">

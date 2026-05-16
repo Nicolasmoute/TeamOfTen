@@ -4552,6 +4552,13 @@ project repo URL, future config fields. The store wins over `os.environ`
 on name collision so a UI-stored secret transparently overrides any
 matching env var.
 
+This interpolation scope is intentionally narrower than process
+environment. Creating a stored secret named `HARNESS_TOKEN` does not
+set the FastAPI/UI bearer token and does not make that token visible to
+Coach or Player subprocesses. Configure API/WS auth through deployment
+process env; keep external-service credentials in the secrets store and
+reference them from the specific config field that consumes them.
+
 Values max 32,768 chars through API.
 
 ### 18.3 Telegram Bridge
@@ -4641,6 +4648,9 @@ on next boot. The EnvPane still surfaces it on reconnect.
 - If set:
   - all `/api/*` except `/api/health` require `Authorization: Bearer <token>`
   - WebSocket requires `?token=<token>`
+- It is deployment process env only. Storing a UI-managed encrypted
+  secret named `HARNESS_TOKEN` does not configure the API auth gate and
+  does not export that value to Coach or Player runtimes.
 
 This is single-user security, not a multi-user auth system.
 
@@ -4674,7 +4684,11 @@ They are not exposed through API beyond enabled/reason/url status.
 ### 19.4 MCP/Telegram Secrets
 
 UI-managed secrets are encrypted in SQLite. API never returns plaintext. The
-runtime interpolator can read them for MCP/Telegram use.
+runtime interpolator can read them for MCP/Telegram use, repo URL
+interpolation, and other explicit `${VAR}` expansion sites. The
+secrets table is not a general environment-injection mechanism for
+agents. Agents do not receive arbitrary stored secrets; Codex coord
+access uses its own per-slot `HARNESS_COORD_PROXY_TOKEN`.
 
 ### 19.4.1 Secret-path agent guard
 
@@ -4867,7 +4881,7 @@ implementation):
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `HARNESS_TOKEN` | unset | Optional API/WS bearer token |
+| `HARNESS_TOKEN` | unset | Optional API/WS bearer token. Deployment process env only; not resolved from the encrypted secrets table and not exported to agent runtimes. |
 | `CLAUDE_CONFIG_DIR` | `/data/claude` | Claude OAuth/session dir |
 | `CODEX_HOME` | `/data/codex` | Codex CLI auth dir (`auth.json`). Must point at persistent storage; after deploy run `CODEX_HOME=/data/codex codex login --device-auth` in the container to create the ChatGPT OAuth session. |
 | `HARNESS_CODEX_ENABLED` | unset | Codex runtime feature gate. Must be truthy (`true`, `1`, `yes`, `on`) before `PUT /api/agents/{id}/runtime` or the UI runtime controls can select `runtime=codex`. |
