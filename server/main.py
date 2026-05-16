@@ -6277,7 +6277,8 @@ async def list_file_write_proposals(
     sql = (
         "SELECT id, project_id, proposer_id, scope, path, "
         "proposed_content, summary, status, created_at, resolved_at, "
-        "resolved_by, resolved_note FROM file_write_proposals WHERE "
+        "resolved_by, resolved_note, metadata_json, originating_task_id "
+        "FROM file_write_proposals WHERE "
         + " AND ".join(where) + " ORDER BY id DESC LIMIT ?"
     )
     params.append(limit)

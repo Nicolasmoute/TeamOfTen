@@ -17,6 +17,7 @@ of the test suite already follows (see comments in
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -56,13 +57,16 @@ def file_write_proposal_row_to_dict(row: Any) -> dict[str, Any]:
         "resolved_at": row[9],
         "resolved_by": row[10],
         "resolved_note": row[11],
+        "metadata_json": row[12] if len(row) > 12 else "{}",
+        "originating_task_id": row[13] if len(row) > 13 else None,
     }
 
 
 SELECT_PROPOSAL_SQL = (
     "SELECT id, project_id, proposer_id, scope, path, proposed_content, "
     "summary, status, created_at, resolved_at, resolved_by, "
-    "resolved_note FROM file_write_proposals WHERE id = ?"
+    "resolved_note, metadata_json, originating_task_id "
+    "FROM file_write_proposals WHERE id = ?"
 )
 
 
@@ -174,6 +178,62 @@ async def resolve_file_write_proposal(
             "WHERE id = ? AND status = 'pending'",
             (new_status, now_iso, "human", note, proposal_id),
         )
+        originating_task_id = (proposal.get("originating_task_id") or "").strip()
+        if originating_task_id:
+            if new_status == "approved":
+                await c.execute(
+                    "UPDATE tasks SET truthgate_pending_proposal_id = NULL, "
+                    "truthgate_verdict = NULL, truthgate_warning = NULL, "
+                    "blocked = CASE "
+                    "WHEN COALESCE(blocked_reason, '') = '' "
+                    "OR blocked_reason LIKE 'TruthGate%' THEN 0 "
+                    "ELSE blocked END, "
+                    "blocked_reason = CASE "
+                    "WHEN COALESCE(blocked_reason, '') = '' "
+                    "OR blocked_reason LIKE 'TruthGate%' THEN NULL "
+                    "ELSE blocked_reason END "
+                    "WHERE id = ? AND project_id = ? "
+                    "AND truthgate_pending_proposal_id = ?",
+                    (
+                        originating_task_id,
+                        proposal["project_id"],
+                        proposal_id,
+                    ),
+                )
+            elif new_status == "denied":
+                meta = {}
+                try:
+                    meta = json.loads(proposal.get("metadata_json") or "{}")
+                except Exception:
+                    meta = {}
+                consequence = (
+                    meta.get("rejection_consequence")
+                    or "truth amendment denied; Coach must rewrite, archive, "
+                    "or request human clarification"
+                )
+                await c.execute(
+                    "UPDATE tasks SET truthgate_pending_proposal_id = NULL, "
+                    "blocked = 1, blocked_reason = ? "
+                    "WHERE id = ? AND project_id = ? "
+                    "AND truthgate_pending_proposal_id = ?",
+                    (
+                        f"TruthGate amendment denied: {consequence}"[:500],
+                        originating_task_id,
+                        proposal["project_id"],
+                        proposal_id,
+                    ),
+                )
+            else:
+                await c.execute(
+                    "UPDATE tasks SET truthgate_pending_proposal_id = NULL "
+                    "WHERE id = ? AND project_id = ? "
+                    "AND truthgate_pending_proposal_id = ?",
+                    (
+                        originating_task_id,
+                        proposal["project_id"],
+                        proposal_id,
+                    ),
+                )
         await c.commit()
     finally:
         await c.close()
@@ -193,11 +253,31 @@ async def resolve_file_write_proposal(
             "path": proposal["path"],
             "summary": proposal["summary"],
             "proposer_id": proposal["proposer_id"],
+            "metadata_json": proposal.get("metadata_json") or "{}",
+            "originating_task_id": proposal.get("originating_task_id"),
             "size": write_size,
             "note": note,
             "actor": actor,
         }
     )
+    if proposal["scope"] == "truth" and proposal.get("originating_task_id"):
+        metadata = _safe_metadata(proposal.get("metadata_json"))
+        await bus.publish({
+            "ts": now_iso,
+            "agent_id": "human",
+            "type": "truth_amendment_resolved",
+            "proposal_id": proposal_id,
+            "task_id": proposal.get("originating_task_id"),
+            "project_id": proposal["project_id"],
+            "path": proposal["path"],
+            "status": new_status,
+            "note": note,
+            "actor": actor,
+            "affected_docs": metadata.get("affected_docs") or [],
+            "provisional_impl": bool(metadata.get("provisional_impl")),
+            "rejection_consequence": metadata.get("rejection_consequence") or "",
+            "to": "coach",
+        })
     return {
         "ok": True,
         "id": proposal_id,
@@ -206,3 +286,14 @@ async def resolve_file_write_proposal(
         "size": write_size,
     }
 
+
+def _safe_metadata(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
