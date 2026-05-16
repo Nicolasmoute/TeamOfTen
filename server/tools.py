@@ -234,6 +234,7 @@ async def _persist_truthgate_result(
     method: str | None = None,
     override_rationale: str | None = None,
     provisional: bool | None = None,
+    closure_reference: str | None = None,
     blocked_reason: str | None = None,
 ) -> dict[str, Any]:
     """Write TruthGate fields onto the task row and return event payload.
@@ -288,8 +289,24 @@ async def _persist_truthgate_result(
             blocked_reason
             or "TruthGate rejected the task or needs human clarification."
         )
+    else:
+        cur = await c.execute(
+            "SELECT blocked, blocked_reason FROM tasks "
+            "WHERE id = ? AND project_id = ?",
+            (task_id, project_id),
+        )
+        row = await cur.fetchone()
+        current = dict(row) if row else {}
+        current_reason = (current.get("blocked_reason") or "").strip()
+        if current_reason and not current_reason.startswith("TruthGate"):
+            blocked = int(current.get("blocked") or 0)
+            final_blocked_reason = current_reason
 
-    provisional_sql = ""
+    provisional_value = 1 if provisional else 0
+    closure_reference_s = (
+        (closure_reference or "").strip()
+        if provisional_value else None
+    )
     params: list[Any] = [
         verdict,
         truth_basis_json,
@@ -300,22 +317,21 @@ async def _persist_truthgate_result(
         rationale_s,
         pending_proposal_id,
         warning_s,
+        closure_reference_s,
         blocked,
         final_blocked_reason,
+        provisional_value,
         task_id,
         project_id,
     ]
-    if provisional is not None:
-        provisional_sql = ", provisional = ?"
-        params.insert(-2, 1 if provisional else 0)
 
     await c.execute(
         "UPDATE tasks SET truthgate_verdict = ?, truth_basis = ?, "
         "truth_concerns = ?, truthgate_at = ?, truthgate_model = ?, "
         "truthgate_method = ?, truthgate_override_rationale = ?, "
         "truthgate_pending_proposal_id = ?, truthgate_warning = ?, "
-        "blocked = ?, blocked_reason = ?"
-        f"{provisional_sql} "
+        "closure_reference = ?, blocked = ?, blocked_reason = ?, "
+        "provisional = ? "
         "WHERE id = ? AND project_id = ?",
         tuple(params),
     )
@@ -332,7 +348,8 @@ async def _persist_truthgate_result(
         "truthgate_warning": warning_s,
         "truthgate_override_rationale": rationale_s,
         "truthgate_pending_proposal_id": pending_proposal_id,
-        "provisional": provisional,
+        "provisional": bool(provisional_value),
+        "closure_reference": closure_reference_s,
         "blocked_reason": final_blocked_reason,
     }
 
@@ -8854,11 +8871,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 )
             existing_verdict = (task.get("truthgate_verdict") or "").strip()
             existing_method = (task.get("truthgate_method") or "").strip()
-            if (
-                existing_verdict in TRUTHGATE_EXIT_VERDICTS
-                and not force
-            ):
-                return _ok(
+            if existing_verdict and not force:
+                return _err(
                     f"Task {task_id} already has TruthGate verdict "
                     f"{existing_verdict} via {existing_method or 'unknown'}; "
                     "use force=true to rerun."
@@ -8897,7 +8911,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         except TruthGateClassificationError as exc:
             classifier_error = str(exc)
             result = {
-                "verdict": "truthgate_rejected_or_needs_human_clarification",
+                "verdict": "",
                 "truth_basis": [],
                 "truth_concerns": [classifier_error],
                 "rationale": classifier_error,
@@ -8908,16 +8922,47 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
 
         c = await configured_conn()
         try:
-            payload = await _persist_truthgate_result(
-                c,
-                project_id=project_id,
-                task_id=task_id,
-                result=result,
-                blocked_reason=(
+            if classifier_error:
+                now = _now_iso()
+                reason = (
                     f"TruthGate classifier failed closed: {classifier_error}"
-                    if classifier_error else None
-                ),
-            )
+                )[:500]
+                await c.execute(
+                    "UPDATE tasks SET truthgate_verdict = NULL, "
+                    "truth_basis = '[]', truth_concerns = '[]', "
+                    "truthgate_at = ?, truthgate_model = NULL, "
+                    "truthgate_method = 'classifier_error', "
+                    "truthgate_override_rationale = NULL, "
+                    "truthgate_pending_proposal_id = NULL, "
+                    "truthgate_warning = ?, closure_reference = NULL, "
+                    "provisional = 0, blocked = 1, blocked_reason = ? "
+                    "WHERE id = ? AND project_id = ?",
+                    (now, reason, reason, task_id, project_id),
+                )
+                payload = {
+                    "ts": now,
+                    "agent_id": "coach",
+                    "task_id": task_id,
+                    "project_id": project_id,
+                    "verdict": None,
+                    "truth_basis": [],
+                    "truth_concerns": [],
+                    "truthgate_method": "classifier_error",
+                    "truthgate_model": None,
+                    "truthgate_warning": reason,
+                    "truthgate_override_rationale": None,
+                    "truthgate_pending_proposal_id": None,
+                    "provisional": False,
+                    "closure_reference": None,
+                    "blocked_reason": reason,
+                }
+            else:
+                payload = await _persist_truthgate_result(
+                    c,
+                    project_id=project_id,
+                    task_id=task_id,
+                    result=result,
+                )
             await c.commit()
         finally:
             await c.close()
@@ -8937,6 +8982,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             })
 
         verdict = payload["verdict"]
+        if classifier_error:
+            return _err(
+                f"TruthGate classifier failed closed for {task_id}; "
+                "task remains blocked in truthgate with no pass/override "
+                "verdict recorded."
+            )
         method = payload["truthgate_method"]
         if verdict in TRUTHGATE_EXIT_VERDICTS:
             try:
@@ -8970,9 +9021,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- kind: 'coach_override' or 'emergency_override'. Full "
             "  verdict strings 'truthgate_coach_override' and "
             "  'truthgate_emergency_override' are also accepted.\n"
-            "- rationale: required non-empty explanation."
+            "- rationale: required non-empty explanation.\n"
+            "- closure_reference: optional for emergency overrides."
         ),
-        {"task_id": str, "kind": str, "rationale": str},
+        {
+            "task_id": str,
+            "kind": str,
+            "rationale": str,
+            "closure_reference": str,
+        },
     )
     async def record_truthgate_override(args: dict[str, Any]) -> dict[str, Any]:
         if not caller_is_coach:
@@ -9001,6 +9058,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             else "emergency_override"
         )
         provisional = verdict == "truthgate_emergency_override"
+        closure_reference = (args.get("closure_reference") or "").strip()
         project_id = await resolve_active_project()
         c = await configured_conn()
         try:
@@ -9030,6 +9088,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 method=method,
                 override_rationale=rationale,
                 provisional=provisional,
+                closure_reference=closure_reference,
             )
             await c.commit()
         finally:
