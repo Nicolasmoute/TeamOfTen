@@ -101,7 +101,30 @@ async def _create_and_promote(coach: Any, args: dict[str, Any]) -> str:
         "id": str(backlog_id),
         "action": "promote",
     }))
-    return _extract_task_id(promote_text)
+    tid = _extract_task_id(promote_text)
+    trajectory = json.loads(args["trajectory"])
+    first = trajectory[0]
+    first_stage = first["stage"]
+    first_to = first.get("to") or []
+    assignee = first_to[0]
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE tasks SET truthgate_verdict = 'truthgate_pass', "
+            "truthgate_method = 'manual_record', truth_basis = '[]' "
+            "WHERE id = ?",
+            (tid,),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    _ok(await _handler(coach, "approve_stage")({
+        "task_id": tid,
+        "next_stage": first_stage,
+        "assignee": assignee,
+        "note": "TruthGate phase-1 test pass; start first stage.",
+    }))
+    return tid
 
 
 async def _project_event_types(project_id: str) -> list[str]:
@@ -158,7 +181,8 @@ async def test_full_v2_lifecycle_smoke(
     p4 = _server_for("p4")
     p5 = _server_for("p5")
 
-    # 1. Coach creates the task. First-stage `to` is single-name → role row plants.
+    # 1. Coach creates/promotes the task. TruthGate pass is recorded,
+    # then Coach approves the first post-gate role.
     tid = await _create_and_promote(coach, {
         "title": "Build feature X",
         "description": "Spec + commit + audit + ship",

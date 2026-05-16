@@ -5045,7 +5045,7 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 /* Columns */
 .kbn-columns {
   display: grid;
-  grid-template-columns: minmax(180px, 0.75fr) repeat(5, minmax(210px, 1fr));
+  grid-template-columns: minmax(180px, 0.75fr) repeat(6, minmax(210px, 1fr));
   gap: 10px;
   flex: 1;
   min-height: 0;
@@ -5345,6 +5345,22 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   padding: 1px 5px;
   border: 1px solid currentColor;
   border-radius: 2px;
+}
+.kbn-truthgate-badge {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  color: var(--warn, #d7a545);
+  background: rgba(215, 165, 69, 0.10);
+}
+.kbn-truthgate-truthgate_pass,
+.kbn-truthgate-truthgate_coach_override,
+.kbn-truthgate-truthgate_emergency_override {
+  color: var(--ok, #5fb86a);
+  background: rgba(95, 184, 106, 0.10);
 }
 .kbn-verdict-pass {
   color: var(--ok, #5fb86a);

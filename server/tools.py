@@ -57,6 +57,7 @@ def _role_token_for_stage(stage: str) -> str:
 # 'archive', 'in_progress' is treated as a no-op for tasks already in
 # 'execute', etc. See `_normalize_status_alias`.
 VALID_TRANSITIONS: dict[str, set[str]] = {
+    "truthgate":       {"plan", "execute", "archive"},
     "plan":            {"execute", "archive"},
     "execute":         {"audit_syntax", "audit_semantics", "ship", "archive"},
     "audit_syntax":    {"audit_semantics", "ship", "archive", "execute"},
@@ -71,6 +72,19 @@ AUDIT_STAGES: frozenset[str] = frozenset({"audit_syntax", "audit_semantics"})
 
 # All valid kanban stages (used by validators that accept any of them).
 ALL_KANBAN_STAGES: frozenset[str] = frozenset(VALID_TRANSITIONS.keys())
+
+TRUTHGATE_VERDICTS: frozenset[str] = frozenset({
+    "truthgate_pass",
+    "truthgate_needs_truth_change",
+    "truthgate_rejected_or_needs_human_clarification",
+    "truthgate_coach_override",
+    "truthgate_emergency_override",
+})
+TRUTHGATE_EXIT_VERDICTS: frozenset[str] = frozenset({
+    "truthgate_pass",
+    "truthgate_coach_override",
+    "truthgate_emergency_override",
+})
 
 
 # Crystallized turn-end discipline reminder. Appended to every wake
@@ -160,6 +174,28 @@ def _normalize_status_alias(status: str) -> str:
 
 def _valid_transition(old: str, new: str) -> bool:
     return new in VALID_TRANSITIONS.get(old, set())
+
+
+async def _truthgate_exit_error(
+    c: Any, task_id: str, old_status: str, new_status: str,
+) -> str | None:
+    """Return an error when a truthgate task is not eligible to proceed."""
+    if old_status != "truthgate" or new_status not in ("plan", "execute"):
+        return None
+    cur = await c.execute(
+        "SELECT truthgate_verdict FROM tasks WHERE id = ?",
+        (task_id,),
+    )
+    row = await cur.fetchone()
+    verdict = (dict(row).get("truthgate_verdict") if row else None) or ""
+    verdict = str(verdict).strip()
+    if verdict in TRUTHGATE_EXIT_VERDICTS:
+        return None
+    return (
+        f"truthgate → {new_status} requires a TruthGate pass or override "
+        f"verdict first (one of {sorted(TRUTHGATE_EXIT_VERDICTS)}). "
+        f"Current verdict: {verdict or 'none'}."
+    )
 
 
 # v2 §7.2.1 — completion-call wake. Each Player completion tool
@@ -1092,7 +1128,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 cur = await c.execute(
                     f"SELECT t.id, t.title, t.status, t.owner, t.created_by, "
                     f"t.parent_id, t.priority, t.trajectory, t.blocked, "
-                    f"t.blocked_reason, t.created_at, "
+                    f"t.blocked_reason, t.created_at, t.truthgate_verdict, "
+                    f"t.truthgate_method, t.truthgate_warning, t.provisional, "
                     # active_owner: owner of the live (non-completed) role row
                     f"(SELECT tra.owner FROM task_role_assignments tra "
                     f" WHERE tra.task_id = t.id "
@@ -1141,6 +1178,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
 
         # Map status → short role label used in stage_role display.
         _STATUS_TO_ROLE_LABEL = {
+            "truthgate": None,
             "plan": "planner",
             "execute": "executor",
             "audit_syntax": "auditor",
@@ -1185,6 +1223,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 blocked = (
                     f" BLOCKED({reason})" if reason else " BLOCKED"
                 )
+            truthgate = ""
+            if d["status"] == "truthgate" or d.get("truthgate_verdict"):
+                verdict = d.get("truthgate_verdict") or "pending"
+                method = d.get("truthgate_method") or "-"
+                warning = " warning" if d.get("truthgate_warning") else ""
+                provisional = " provisional" if d.get("provisional") else ""
+                truthgate = (
+                    f" truthgate={verdict}:{method}{warning}{provisional}"
+                )
             # Prefer active role-assignment owner (kanban v2 source of truth)
             # over tasks.owner; fall back for archive/non-standard stages.
             display_owner = d.get("active_owner") or d["owner"] or "-"
@@ -1218,7 +1265,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             else:
                 stage_role = ""
             lines.append(
-                f"{d['id']}  kind=task  [{d['status']}]{traj}{blocked}{stage_role}  "
+                f"{d['id']}  kind=task  [{d['status']}]{traj}{blocked}{truthgate}{stage_role}  "
                 f"owner={display_owner}  pri={d['priority']}  "
                 f"{d['title']}{parent}"
             )
@@ -1719,6 +1766,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 return _err(
                     f"invalid transition: {old_status} → {new_status}"
                 )
+            truthgate_err = await _truthgate_exit_error(
+                c, task_id, old_status, new_status,
+            )
+            if truthgate_err is not None:
+                return _err(truthgate_err)
 
             # Role-completion gate (Docs/kanban-specs.md §2.3). Rejects
             # manual transitions that should be event-driven (commit /
@@ -7723,6 +7775,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"invalid next_stage '{next_stage}' (must be one of "
                 f"{sorted(ALL_KANBAN_STAGES)})"
             )
+        if next_stage == "truthgate":
+            return _err(
+                "coord_approve_stage cannot assign the truthgate stage. "
+                "Top-level backlog promotion enters truthgate automatically; "
+                "Coach exits it to plan/execute/archive after recording a "
+                "TruthGate verdict."
+            )
         if next_stage == "archive":
             if assignee_raw:
                 return _err(
@@ -7833,6 +7892,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 return _err(
                     f"invalid transition: {old_status} → {next_stage}"
                 )
+            truthgate_err = await _truthgate_exit_error(
+                c, task_id, old_status, next_stage,
+            )
+            if truthgate_err is not None:
+                return _err(truthgate_err)
 
             if old_status == "ship" and next_stage == "verify":
                 context, error = await _ship_verify_context_or_error(
@@ -8908,7 +8972,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT id, title, proposed_by, status, priority, "
+                "SELECT id, title, description, proposed_by, status, priority, "
                 "trajectory_json, note, success_criteria "
                 "FROM backlog_tasks WHERE id = ?",
                 (backlog_id,),
@@ -9003,11 +9067,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
 
         task_id = _new_task_id()
         trajectory_json = json.dumps(trajectory, separators=(",", ":"))
-        initial_status = trajectory[0]["stage"]
+        initial_status = "truthgate"
+        first_post_gate_stage = trajectory[0]["stage"]
         first_to: list[str] = trajectory[0].get("to") or []
         if isinstance(first_to, str):
             first_to = [first_to] if first_to else []
-        initial_owner = first_to[0] if len(first_to) == 1 else None
 
         c = await configured_conn()
         try:
@@ -9015,34 +9079,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "INSERT INTO tasks (id, project_id, title, description, "
                 "priority, workflow, tracking_reason, trajectory, status, "
                 "owner, last_stage_change_at, created_by, success_criteria) "
-                "VALUES (?, ?, ?, '', ?, 'generic', 'backlog', "
+                "VALUES (?, ?, ?, ?, ?, 'generic', 'backlog', "
                 "?, ?, ?, ?, ?, ?)",
-                (task_id, project_id, title,
+                (task_id, project_id, title, entry.get("description") or "",
                  promote_priority,
-                 trajectory_json, initial_status, initial_owner,
+                 trajectory_json, initial_status, None,
                  now_iso, caller_id, promote_sc),
             )
-            # Plant first-stage role row when single named assignee.
-            _role_for_stage_map = {
-                "plan": "planner", "execute": "executor",
-                "audit_syntax": "auditor_syntax",
-                "audit_semantics": "auditor_semantics", "ship": "shipper",
-            }
-            if len(first_to) == 1:
-                first_role = _role_for_stage_map[trajectory[0]["stage"]]
-                eligible_json = json.dumps(first_to, separators=(",", ":"))
-                await c.execute(
-                    "INSERT INTO task_role_assignments "
-                    "(task_id, role, eligible_owners, owner, "
-                    "assigned_at, claimed_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (task_id, first_role, eligible_json, first_to[0],
-                     now_iso, now_iso),
-                )
-                if initial_status == "execute":
-                    await _set_agent_current_task_if_free_or_stale(
-                        c, first_to[0], task_id,
-                    )
-                await _set_agent_role_tools(c, first_to[0], first_role)
             await c.execute(
                 "UPDATE backlog_tasks SET status='promoted', "
                 "promoted_task_id=? WHERE id=?",
@@ -9051,24 +9094,6 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             await c.commit()
         finally:
             await c.close()
-
-        # Wake the first-stage assignee when a single named slot was planted.
-        if initial_owner and len(first_to) == 1:
-            from server.agents import maybe_wake_agent
-            wake_body = promote_note or (
-                f"Coach promoted backlog #{backlog_id} ({title!r}) and "
-                f"assigned you as {_role_for_stage_map[trajectory[0]['stage']]} "
-                f"for the {initial_status} stage."
-            )
-            wake_body = _with_player_reminder(wake_body)
-            try:
-                await maybe_wake_agent(
-                    initial_owner, wake_body,
-                    bypass_debounce=True,
-                    wake_source="kanban_promote",
-                )
-            except Exception:
-                pass
 
         await bus.publish({
             "ts": now_iso,
@@ -9083,30 +9108,26 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "trajectory": trajectory,
             "project_id": project_id,
         })
-        if initial_owner and len(first_to) == 1:
-            first_role = _role_for_stage_map[trajectory[0]["stage"]]
-            await bus.publish({
-                "ts": now_iso,
-                "agent_id": "system",
-                "type": "task_stage_changed",
-                "task_id": task_id,
-                "from": None,
-                "to": initial_status,
-                "reason": "backlog_promoted",
-                "owner": initial_owner,
-                "assignee": initial_owner,
-                "project_id": project_id,
-            })
-            await bus.publish({
-                "ts": now_iso,
-                "agent_id": caller_id,
-                "type": "task_role_assigned",
-                "task_id": task_id,
-                "role": first_role,
-                "owner": initial_owner,
-                "stage": initial_status,
-                "project_id": project_id,
-            })
+        await bus.publish({
+            "ts": now_iso,
+            "agent_id": "system",
+            "type": "task_stage_changed",
+            "task_id": task_id,
+            "from": None,
+            "to": "truthgate",
+            "reason": "backlog_promoted",
+            "owner": None,
+            "project_id": project_id,
+        })
+        await bus.publish({
+            "ts": now_iso,
+            "agent_id": "system",
+            "type": "task_truthgate_started",
+            "task_id": task_id,
+            "from": "backlog",
+            "post_gate_stage": first_post_gate_stage,
+            "project_id": project_id,
+        })
         await bus.publish({
             "ts": now_iso,
             "agent_id": caller_id,
@@ -9119,11 +9140,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         return _ok(
             f"Backlog entry #{backlog_id} promoted → task {task_id} "
             f"(\"{title}\", priority={promote_priority}, "
-            f"initial stage: {initial_status})."
-            + (f" Player {initial_owner} woken." if initial_owner else
-               f" No auto-wake (pool/empty first-stage `to`); "
-               f"drive via coord_approve_stage(task_id={task_id!r}, "
-               f"next_stage={initial_status!r}, assignee=<slot>).")
+            f"initial stage: truthgate; post-gate trajectory starts at "
+            f"{first_post_gate_stage}). No Player role was planted and "
+            f"no Player was woken. Record/run TruthGate, then drive via "
+            f"coord_approve_stage(task_id={task_id!r}, "
+            f"next_stage={first_post_gate_stage!r}, assignee=<slot>)."
         )
 
     @tool(

@@ -4654,6 +4654,7 @@ async def get_tasks_board() -> dict[str, Any]:
     postship_map = await _load_postship_context(task_ids)
 
     buckets: dict[str, list[dict[str, Any]]] = {
+        "truthgate": [],
         "plan": [],
         "execute": [],
         "audit_syntax": [],
@@ -4758,6 +4759,7 @@ async def get_task_assignments(task_id: str) -> dict[str, Any]:
 from server.tools import (  # noqa: E402
     ALL_KANBAN_STAGES,
     _ship_verify_context_or_error,
+    _truthgate_exit_error,
     _valid_transition,
     _validate_trajectory,
 )
@@ -4780,6 +4782,14 @@ async def post_task_approve_stage(
     next_stage = req.next_stage
     if next_stage not in ALL_KANBAN_STAGES:
         raise HTTPException(400, detail=f"invalid stage: {next_stage}")
+    if next_stage == "truthgate":
+        raise HTTPException(
+            400,
+            detail=(
+                "approve_stage cannot assign truthgate; backlog promotion "
+                "enters truthgate automatically."
+            ),
+        )
 
     assignee_raw = (req.assignee or "").strip().lower()
     if next_stage == "archive":
@@ -4891,6 +4901,11 @@ async def post_task_approve_stage(
                 400,
                 detail=f"invalid transition: {old_status} → {next_stage}",
             )
+        truthgate_err = await _truthgate_exit_error(
+            c, task_id, old_status, next_stage,
+        )
+        if truthgate_err is not None:
+            raise HTTPException(400, detail=truthgate_err)
 
         if old_status == "ship" and next_stage == "verify":
             context, error = await _ship_verify_context_or_error(
@@ -5324,7 +5339,8 @@ async def get_tasks_flow_health() -> dict[str, Any]:
     from server import kanban as kanban_mod
     project_id = await resolve_active_project()
     stages = [
-        "plan", "execute", "audit_syntax", "audit_semantics", "ship", "verify",
+        "truthgate", "plan", "execute", "audit_syntax",
+        "audit_semantics", "ship", "verify",
     ]
     out_stages: dict[str, dict[str, Any]] = {}
     stalled_count = 0

@@ -18,7 +18,7 @@ import {
   renderDiffBody,
 } from "/static/tools.js";
 import { CompassPane, createCompassEventRouter } from "/static/compass.js?v=1778671319";
-import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js?v=1778952032";
+import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js?v=1778963008";
 import { PlaybookPane, createPlaybookEventRouter } from "/static/playbook.js";
 
 const html = htm.bind(h);
@@ -41,6 +41,10 @@ const KANBAN_FORWARD_TYPES = new Set([
   "task_role_called", "task_role_stand_down",
   "task_role_completed", "task_drift_detected",
   "task_stage_stale", "task_workflow_set",
+  "task_truthgate_started", "task_truthgate_completed",
+  "task_truthgate_blocked", "task_truthgate_override_recorded",
+  "truth_amendment_proposed", "truth_amendment_resolved",
+  "task_provisional_closure_recorded", "task_truth_basis_stale",
   "audit_report_submitted", "audit_fail_notification",
   "verification_report_submitted",
   "compass_audit_logged",
@@ -56,6 +60,7 @@ const KANBAN_FORWARD_TYPES = new Set([
 // chip from blowing up when a task is in audit_*; archive isn't
 // rendered (the task is gone from current_task_id by then).
 const KANBAN_STAGE_SHORT = {
+  truthgate: "gate",
   plan: "plan",
   execute: "exec",
   audit_syntax: "syn",

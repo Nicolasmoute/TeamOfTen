@@ -41,8 +41,10 @@ Dependent specs (subordinate to this document):
   kanban-specs-v2.md §16.2 + §23). Trajectory Coach defines on
   `coord_create_task` is the planned contract; pools are FYI only
   (Coach explicitly assigns one named Player at each transition).
-  Stages: plan → execute → audit_syntax → audit_semantics → ship →
-  optional verify → archive. A new per-project event log feeds Coach's tick context;
+  Stages: truthgate → plan → execute → audit_syntax → audit_semantics → ship →
+  optional verify → archive. Backlog promotion enters `truthgate`
+  without planting or waking a Player, and `truthgate → plan|execute`
+  requires a recorded pass/override verdict. A new per-project event log feeds Coach's tick context;
   pattern-detection counters (Player health, audit aggregator,
   push-time deviation flag, recent-patterns block) surface drift
   proactively. v1 archive at `Docs/kanban-specs-v1-archived.md`.
@@ -2314,7 +2316,9 @@ so permissions do not depend on the model truthfully passing its identity.
   into `backlog_tasks` (same table as `coord_propose_task`). No kanban
   row is created yet; no Player is woken. Coach must then call
   `coord_triage_backlog(id, action='promote', trajectory=[...])` to
-  promote it to the kanban. This enforces FIFO priority ordering —
+  promote it to the kanban. Promotion creates a `truthgate` task and
+  preserves the requested trajectory as the post-gate path; it does not
+  plant the first Player role or wake anyone. This enforces FIFO priority ordering —
   items are triaged in the order they arrived, not by recency of
   creation (which was LIFO). The `priority`, `trajectory`, `note`, and
   `success_criteria` params are stored on the backlog entry so Coach
@@ -2328,9 +2332,11 @@ so permissions do not depend on the model truthfully passing its identity.
   backlog entry; `coord_triage_backlog promote` reads it automatically
   so Coach can omit it at triage time when it was already set at
   creation time.
-- Emits `backlog_task_proposed` for Coach top-level tasks; emits
+- Emits `backlog_task_proposed` for Coach top-level tasks; promotion emits
+  `task_created`, `task_stage_changed{to='truthgate'}`,
+  `task_truthgate_started`, and `backlog_task_promoted`. Player subtasks emit
   `task_created` + (when first stage planted) `task_role_assigned` +
-  `task_stage_changed{from=null}` for Player subtasks.
+  `task_stage_changed{from=null}`.
 - See `Docs/kanban-specs-v2.md` §7.1 for the canonical contract.
 
 `coord_approve_stage(task_id, next_stage, assignee, note?)`
