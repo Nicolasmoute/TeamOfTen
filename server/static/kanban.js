@@ -418,15 +418,33 @@ function VerdictBadge({ verification }) {
 
 function TruthGateBadge({ task }) {
   const verdict = task.truthgate_verdict || (task.status === "truthgate" ? "pending" : "");
-  if (!verdict) return null;
+  const chips = [];
   const method = task.truthgate_method || "";
-  const label = verdict === "pending" ? "TruthGate pending" : verdict.replace(/^truthgate_/, "TG ");
-  return html`<span
-    class=${`kbn-truthgate-badge kbn-truthgate-${String(verdict).replace(/[^a-z0-9_-]/gi, "_")}`}
-    title=${method ? `method: ${method}` : "TruthGate"}
-  >${label}${method ? ` · ${method}` : ""}</span>`;
+  if (verdict) {
+    const label = verdict === "pending" ? "TruthGate pending" : verdict.replace(/^truthgate_/, "TG ");
+    chips.push(html`<span
+      class=${`kbn-truthgate-badge kbn-truthgate-${String(verdict).replace(/[^a-z0-9_-]/gi, "_")}`}
+      title=${method ? `method: ${method}` : "TruthGate"}
+    >${label}${method ? ` · ${method}` : ""}</span>`);
+  }
+  if (task.truthgate_pending_proposal_id) {
+    chips.push(html`<span class="kbn-truthgate-badge kbn-truthgate-pending-proposal"
+      title="Pending truth amendment"
+    >amend #${task.truthgate_pending_proposal_id}</span>`);
+  }
+  if (task.truthgate_warning) {
+    chips.push(html`<span class="kbn-truthgate-badge kbn-truthgate-warning"
+      title=${task.truthgate_warning}
+    >sparse warning</span>`);
+  }
+  if (task.provisional) {
+    chips.push(html`<span class="kbn-truthgate-badge kbn-truthgate-provisional"
+      title=${task.closure_reference ? `closure: ${task.closure_reference}` : "Provisional: closure required before delivered archive"}
+    >provisional</span>`);
+  }
+  if (!chips.length) return null;
+  return html`${chips}`;
 }
-
 
 function ShipEvidence({ task, compact = false }) {
   const items = evidenceItems(task);

@@ -446,6 +446,65 @@ async def test_coordination_block_section_ordering(fresh_db: str) -> None:
     assert "## Lifecycle policy" not in body
 
 
+async def test_coordination_block_truthgate_attention(fresh_db: str) -> None:
+    await init_db()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO tasks (id, project_id, title, status, created_by, "
+            "trajectory) VALUES "
+            "('tg-await', 'misc', 'needs classifier', 'truthgate', 'coach', '[]')"
+        )
+        await c.execute(
+            "INSERT INTO tasks (id, project_id, title, status, created_by, "
+            "trajectory, truthgate_verdict, truthgate_method, blocked, "
+            "blocked_reason, truthgate_pending_proposal_id) VALUES "
+            "('tg-change', 'misc', 'needs truth', 'truthgate', 'coach', '[]', "
+            "'truthgate_needs_truth_change', 'classifier', 1, "
+            "'truth amendment required', 42)"
+        )
+        await c.execute(
+            "INSERT INTO tasks (id, project_id, title, status, created_by, "
+            "trajectory, truthgate_verdict, truthgate_method, "
+            "truthgate_warning) VALUES "
+            "('tg-sparse', 'misc', 'sparse warning', 'execute', 'coach', '[]', "
+            "'truthgate_pass', 'classifier_sparse', 'sparse corpus')"
+        )
+        await c.execute(
+            "INSERT INTO tasks (id, project_id, title, status, created_by, "
+            "trajectory, truthgate_verdict, truthgate_method, provisional) "
+            "VALUES "
+            "('tg-prov', 'misc', 'provisional task', 'ship', 'coach', '[]', "
+            "'truthgate_emergency_override', 'emergency_override', 1)"
+        )
+        await c.execute(
+            "INSERT INTO file_write_proposals "
+            "(project_id, proposer_id, scope, path, proposed_content, summary, "
+            "metadata_json, originating_task_id) VALUES "
+            "('misc', 'coach', 'truth', 'specs.md', '# Specs', "
+            "'clarify truth', "
+            "'{\"affected_docs\":[\"Docs/TOT-specs.md\"]}', 'tg-change')"
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    body = await _build_coach_coordination_block(surfaced_event_ids=[])
+    assert "## TruthGate attention" in body
+    assert "Awaiting classifier / override" in body
+    assert "tg-await" in body
+    assert "Blocked on truth change" in body
+    assert "proposal #42" in body
+    assert "Pending truth amendments" in body
+    assert "truth/specs.md" in body
+    assert "Stale Docs reminders" in body
+    assert "Docs/TOT-specs.md" in body
+    assert "Sparse TruthGate warnings" in body
+    assert "sparse corpus" in body
+    assert "Provisional tasks missing closure" in body
+    assert "tg-prov" in body
+
+
 # ---------------------------------------------------------------------
 # Long-title round-trip: titles > 80 chars must NOT be truncated
 # (regression for the [:80] truncation removed 2026-05-14)

@@ -44,6 +44,13 @@ class FileWriteProposalBadRequest(Exception):
 
 
 def file_write_proposal_row_to_dict(row: Any) -> dict[str, Any]:
+    metadata_json = row[12] if len(row) > 12 else "{}"
+    try:
+        metadata = json.loads(metadata_json or "{}")
+    except Exception:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
     return {
         "id": row[0],
         "project_id": row[1],
@@ -57,7 +64,8 @@ def file_write_proposal_row_to_dict(row: Any) -> dict[str, Any]:
         "resolved_at": row[9],
         "resolved_by": row[10],
         "resolved_note": row[11],
-        "metadata_json": row[12] if len(row) > 12 else "{}",
+        "metadata_json": metadata_json,
+        "metadata": metadata,
         "originating_task_id": row[13] if len(row) > 13 else None,
     }
 
