@@ -30,6 +30,12 @@ class TargetedTruthAuditCheck:
     violations: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _ParsedStringList:
+    values: list[str]
+    warning: str | None = None
+
+
 _VIOLATION_RE = re.compile(
     r"\b("
     r"truthgate violation|truth violation|violates cited truth|"
@@ -104,7 +110,8 @@ def build_truthgate_context_block(
     """Render the TruthGate context block for auditor wake prompts."""
     verdict = (task.get("truthgate_verdict") or "").strip() or "none"
     method = (task.get("truthgate_method") or "").strip() or "none"
-    basis = _json_string_list(task.get("truth_basis"))
+    parsed_basis = _parse_json_string_list(task.get("truth_basis"), "truth_basis")
+    basis = parsed_basis.values
     concerns = _json_string_list(task.get("truth_concerns"))
     warning = (task.get("truthgate_warning") or "").strip()
     provisional = bool(task.get("provisional"))
@@ -124,6 +131,8 @@ def build_truthgate_context_block(
         lines.append("- Truth concerns: none recorded")
     if warning:
         lines.append(f"- Warning: {warning}")
+    if parsed_basis.warning:
+        lines.append(f"- Warning: {parsed_basis.warning}")
     if provisional:
         lines.append(
             "- Provisional: emergency override is active; audit must "
@@ -132,6 +141,12 @@ def build_truthgate_context_block(
         lines.append(f"- Closure reference: {closure or 'missing'}")
 
     if not basis:
+        if parsed_basis.warning:
+            lines.append(
+                "- Targeted truth check: requires Coach review because "
+                "the recorded truth_basis is unreadable."
+            )
+            return "\n".join(lines)
         lines.append(
             "- Targeted truth check: skipped because no truth_basis was "
             "recorded. Treat sparse/override empty-basis work as a "
@@ -172,9 +187,18 @@ def check_audit_against_truthgate(
     the work violates cited truth. FAIL submissions remain available so
     auditors can report the violation normally.
     """
-    basis = _json_string_list(task.get("truth_basis"))
+    parsed_basis = _parse_json_string_list(task.get("truth_basis"), "truth_basis")
+    basis = parsed_basis.values
     warning = (task.get("truthgate_warning") or "").strip()
     truthgate_at = (task.get("truthgate_at") or "").strip() or None
+    if parsed_basis.warning:
+        blocked = verdict == "pass"
+        return TargetedTruthAuditCheck(
+            blocked=blocked,
+            skipped=False,
+            warnings=(parsed_basis.warning,),
+            violations=(),
+        )
     if not basis:
         warnings = (warning,) if warning else (
             "no truth_basis recorded; targeted truth check skipped",
@@ -209,8 +233,12 @@ def check_audit_against_truthgate(
 
 
 def _json_string_list(raw: Any) -> list[str]:
+    return _parse_json_string_list(raw, "value").values
+
+
+def _parse_json_string_list(raw: Any, field_name: str) -> _ParsedStringList:
     if raw in (None, ""):
-        return []
+        return _ParsedStringList([])
     if isinstance(raw, list):
         parsed = raw
     else:
@@ -218,10 +246,18 @@ def _json_string_list(raw: Any) -> list[str]:
         try:
             parsed = json.loads(str(raw))
         except Exception:
-            return []
+            return _ParsedStringList(
+                [],
+                f"{field_name} is malformed/unparseable; Coach review required",
+            )
     if not isinstance(parsed, list):
-        return []
-    return [str(item).strip() for item in parsed if str(item).strip()]
+        return _ParsedStringList(
+            [],
+            f"{field_name} is not a JSON list; Coach review required",
+        )
+    return _ParsedStringList(
+        [str(item).strip() for item in parsed if str(item).strip()]
+    )
 
 
 def _is_modified_after(path, iso: str) -> bool:

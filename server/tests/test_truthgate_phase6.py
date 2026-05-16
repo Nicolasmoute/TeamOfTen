@@ -34,6 +34,7 @@ async def _seed_audit_task(
     *,
     task_id: str = "t-2026-05-16-a0d10001",
     basis: list[str] | None = None,
+    basis_raw: str | None = None,
     concerns: list[str] | None = None,
     warning: str | None = None,
     method: str = "classifier",
@@ -46,6 +47,7 @@ async def _seed_audit_task(
         encoding="utf-8",
     )
     truth_basis = basis if basis is not None else ["truth/audit.md"]
+    truth_basis_value = basis_raw if basis_raw is not None else json.dumps(truth_basis)
     truth_concerns = concerns if concerns is not None else [
         "preserve the approved lifecycle",
     ]
@@ -64,7 +66,7 @@ async def _seed_audit_task(
             "{\"stage\":\"audit_syntax\",\"to\":[\"p4\"]}]')",
             (
                 task_id,
-                json.dumps(truth_basis),
+                truth_basis_value,
                 json.dumps(truth_concerns),
                 now,
                 method,
@@ -173,3 +175,31 @@ async def test_audit_pass_rejected_when_cited_basis_missing(
     }))
     assert "targeted TruthGate check blocks PASS" in err
     assert "truth_basis file does not exist" in err
+
+
+@pytest.mark.asyncio
+async def test_malformed_truth_basis_flags_review_and_rejects_pass(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    task_id = await _seed_audit_task(basis_raw="{not valid json")
+    p4 = _server_for("p4")
+
+    body = await build_auditor_wake_body(
+        task_id=task_id,
+        role="auditor_syntax",
+        focus="check malformed basis",
+        is_pool=False,
+    )
+    assert "truth_basis is malformed/unparseable" in body
+    assert "requires Coach review" in body
+    assert "Targeted truth check: skipped" not in body
+
+    err = _err(await _handler(p4, "submit_audit_report")({
+        "task_id": task_id,
+        "kind": "syntax",
+        "verdict": "pass",
+        "body": "Looks good.",
+    }))
+    assert "targeted TruthGate check blocks PASS" in err
+    assert "truth_basis is malformed/unparseable" in err
