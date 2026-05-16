@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     title                       TEXT NOT NULL,
     description                 TEXT NOT NULL DEFAULT '',
     status                      TEXT NOT NULL DEFAULT 'plan'
-                                CHECK (status IN ('plan', 'execute', 'audit_syntax', 'audit_semantics', 'ship', 'archive')),
+                                CHECK (status IN ('plan', 'execute', 'audit_syntax', 'audit_semantics', 'ship', 'verify', 'archive')),
     owner                       TEXT REFERENCES agents(id),
     created_by                  TEXT NOT NULL,
     created_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -176,7 +176,8 @@ CREATE INDEX IF NOT EXISTS idx_backlog_status ON backlog_tasks(status, proposed_
 
 -- Task role assignments (Docs/kanban-specs-v2.md §4). A task has multiple
 -- Players involved in different roles across stages: planner (optional —
--- Coach by default), executor, formal reviewer, semantic reviewer, shipper.
+-- Coach by default), executor, formal reviewer, semantic reviewer, shipper,
+-- verifier.
 -- Each role can be hard-assigned to one Player or posted to a pool of
 -- eligible Players (`eligible_owners` JSON array) where the first to
 -- claim wins. Multiple rows per (task, role) accumulate over time — an
@@ -186,7 +187,7 @@ CREATE TABLE IF NOT EXISTS task_role_assignments (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id         TEXT NOT NULL REFERENCES tasks(id),
     role            TEXT NOT NULL CHECK(role IN
-                      ('planner','executor','auditor_syntax','auditor_semantics','shipper')),
+                      ('planner','executor','auditor_syntax','auditor_semantics','shipper','verifier')),
     -- JSON array of slot ids. Empty `[]` = "this row is hard-assigned
     -- (owner must be set at insert time)". Non-empty = posted to a pool;
     -- owner is NULL until a Player claims via coord_claim_task.
@@ -196,10 +197,10 @@ CREATE TABLE IF NOT EXISTS task_role_assignments (
     claimed_at      TEXT,
     started_at      TEXT,
     completed_at    TEXT,
-    -- Auditor roles only: relative path to the audit_<round>_<kind>.md
-    -- this auditor produced. NULL until coord_submit_audit_report fires.
+    -- Auditor/verifier roles only: relative path to the report this
+    -- role produced. NULL until the matching submit tool fires.
     report_path     TEXT,
-    -- Auditor roles only: 'pass' | 'fail'. NULL until submitted.
+    -- Auditor/verifier roles only: 'pass' | 'fail'. NULL until submitted.
     verdict         TEXT CHECK(verdict IS NULL OR verdict IN ('pass','fail')),
     -- Self-reference: when a fail verdict creates a fresh auditor row
     -- on the next round, the previous one points forward via this column.
@@ -926,6 +927,8 @@ async def init_db() -> None:
                     "success_criteria TEXT NOT NULL DEFAULT ''",
                 )],
             )
+            await _rebuild_tasks_for_verify_stage(db)
+            await _rebuild_task_roles_for_verifier(db)
             # Indexes that reference kanban-new columns. Live outside
             # SCHEMA because their columns don't exist on legacy DBs
             # until the migration above runs.
@@ -1692,6 +1695,217 @@ async def _rebuild_tasks_for_kanban_v3(
         await db.execute("PRAGMA foreign_keys = ON")
 
 
+async def _rebuild_tasks_for_verify_stage(db: aiosqlite.Connection) -> None:
+    """Rebuild tasks when its status CHECK predates the verify stage."""
+    cur = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'"
+    )
+    row = await cur.fetchone()
+    sql = row[0] if row else ""
+    if "'verify'" in (sql or ""):
+        return
+
+    logger.info("init_db: rebuilding tasks table to add verify status")
+    await db.execute("PRAGMA foreign_keys = OFF")
+    try:
+        await db.execute("BEGIN")
+        try:
+            await db.execute(
+                """
+                CREATE TABLE tasks_verify (
+                    id                          TEXT PRIMARY KEY,
+                    project_id                  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    title                       TEXT NOT NULL,
+                    description                 TEXT NOT NULL DEFAULT '',
+                    status                      TEXT NOT NULL DEFAULT 'plan'
+                                                CHECK (status IN ('plan', 'execute', 'audit_syntax', 'audit_semantics', 'ship', 'verify', 'archive')),
+                    owner                       TEXT REFERENCES agents(id),
+                    created_by                  TEXT NOT NULL,
+                    created_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    claimed_at                  TEXT,
+                    started_at                  TEXT,
+                    completed_at                TEXT,
+                    archived_at                 TEXT,
+                    cancelled_at                TEXT,
+                    parent_id                   TEXT REFERENCES tasks(id),
+                    priority                    TEXT NOT NULL DEFAULT 'normal'
+                                                CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
+                    trajectory                  TEXT NOT NULL DEFAULT '[{"stage":"execute","to":[]}]',
+                    last_stage_change_at        TEXT,
+                    stale_alert_at              TEXT,
+                    workflow                    TEXT NOT NULL DEFAULT 'generic',
+                    tracking_reason             TEXT,
+                    blocked                     INTEGER NOT NULL DEFAULT 0,
+                    blocked_reason              TEXT,
+                    spec_path                   TEXT,
+                    spec_written_at             TEXT,
+                    latest_audit_report_path    TEXT,
+                    latest_audit_kind           TEXT,
+                    latest_audit_verdict        TEXT,
+                    compass_audit_report_path   TEXT,
+                    compass_audit_verdict       TEXT,
+                    tags                        TEXT NOT NULL DEFAULT '[]',
+                    artifacts                   TEXT NOT NULL DEFAULT '[]',
+                    stall_escalation_level      INTEGER NOT NULL DEFAULT 0,
+                    success_criteria            TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            await db.execute(
+                """
+                INSERT INTO tasks_verify
+                    (id, project_id, title, description, status, owner,
+                     created_by, created_at, claimed_at, started_at,
+                     completed_at, archived_at, cancelled_at, parent_id,
+                     priority, trajectory, last_stage_change_at,
+                     stale_alert_at, workflow, tracking_reason, blocked,
+                     blocked_reason, spec_path, spec_written_at,
+                     latest_audit_report_path, latest_audit_kind,
+                     latest_audit_verdict, compass_audit_report_path,
+                     compass_audit_verdict, tags, artifacts,
+                     stall_escalation_level, success_criteria)
+                SELECT
+                    id, project_id, title, description, status, owner,
+                    created_by, created_at, claimed_at, started_at,
+                    completed_at, archived_at, cancelled_at, parent_id,
+                    priority, trajectory, last_stage_change_at,
+                    stale_alert_at, workflow, tracking_reason, blocked,
+                    blocked_reason, spec_path, spec_written_at,
+                    latest_audit_report_path, latest_audit_kind,
+                    latest_audit_verdict, compass_audit_report_path,
+                    compass_audit_verdict, tags, artifacts,
+                    COALESCE(stall_escalation_level, 0),
+                    COALESCE(success_criteria, '')
+                FROM tasks
+                """
+            )
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_status")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_owner")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_parent")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_project")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_archived")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_stage_change")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_stall_gate")
+            await db.execute("DROP TABLE tasks")
+            await db.execute("ALTER TABLE tasks_verify RENAME TO tasks")
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id)"
+            )
+            cur = await db.execute("PRAGMA foreign_key_check")
+            violations = await cur.fetchall()
+            if violations:
+                raise RuntimeError(
+                    f"tasks verify rebuild left {len(violations)} FK "
+                    f"violations: {violations}"
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    finally:
+        await db.execute("PRAGMA foreign_keys = ON")
+
+
+async def _rebuild_task_roles_for_verifier(db: aiosqlite.Connection) -> None:
+    """Rebuild task_role_assignments when its role CHECK lacks verifier."""
+    cur = await db.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type='table' AND name='task_role_assignments'"
+    )
+    row = await cur.fetchone()
+    sql = row[0] if row else ""
+    if "'verifier'" in (sql or ""):
+        return
+
+    logger.info(
+        "init_db: rebuilding task_role_assignments to add verifier role"
+    )
+    await db.execute("PRAGMA foreign_keys = OFF")
+    try:
+        await db.execute("BEGIN")
+        try:
+            await db.execute(
+                """
+                CREATE TABLE task_role_assignments_verify (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id         TEXT NOT NULL REFERENCES tasks(id),
+                    role            TEXT NOT NULL CHECK(role IN
+                                      ('planner','executor','auditor_syntax','auditor_semantics','shipper','verifier')),
+                    eligible_owners TEXT NOT NULL DEFAULT '[]',
+                    owner           TEXT REFERENCES agents(id),
+                    assigned_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    claimed_at      TEXT,
+                    started_at      TEXT,
+                    completed_at    TEXT,
+                    report_path     TEXT,
+                    verdict         TEXT CHECK(verdict IS NULL OR verdict IN ('pass','fail')),
+                    superseded_by   INTEGER REFERENCES task_role_assignments_verify(id),
+                    focus           TEXT
+                )
+                """
+            )
+            await db.execute(
+                """
+                INSERT INTO task_role_assignments_verify
+                    (id, task_id, role, eligible_owners, owner, assigned_at,
+                     claimed_at, started_at, completed_at, report_path,
+                     verdict, superseded_by, focus)
+                SELECT
+                    id, task_id, role, eligible_owners, owner, assigned_at,
+                    claimed_at, started_at, completed_at, report_path,
+                    verdict, superseded_by, focus
+                FROM task_role_assignments
+                """
+            )
+            await db.execute("DROP INDEX IF EXISTS idx_role_assignments_task")
+            await db.execute("DROP INDEX IF EXISTS idx_role_assignments_owner")
+            await db.execute("DROP INDEX IF EXISTS idx_role_assignments_role")
+            await db.execute("DROP INDEX IF EXISTS idx_role_assignments_active")
+            await db.execute("DROP TABLE task_role_assignments")
+            await db.execute(
+                "ALTER TABLE task_role_assignments_verify "
+                "RENAME TO task_role_assignments"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_role_assignments_task "
+                "ON task_role_assignments(task_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_role_assignments_owner "
+                "ON task_role_assignments(owner)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_role_assignments_role "
+                "ON task_role_assignments(task_id, role)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_role_assignments_active "
+                "ON task_role_assignments(task_id, role, superseded_by, assigned_at)"
+            )
+            cur = await db.execute("PRAGMA foreign_key_check")
+            violations = await cur.fetchall()
+            if violations:
+                raise RuntimeError(
+                    f"role verify rebuild left {len(violations)} FK "
+                    f"violations: {violations}"
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    finally:
+        await db.execute("PRAGMA foreign_keys = ON")
+
+
 # ----------------------------------------------------------------------
 # Kanban v2 migration (Docs/kanban-specs-v2.md §16.4)
 # ----------------------------------------------------------------------
@@ -1737,6 +1951,7 @@ _V2_BACKFILL_TYPES: frozenset[str] = frozenset({
     "task_spec_written",
     "task_role_completed",
     "audit_report_submitted",
+    "verification_report_submitted",
     "audit_fail_notification",
     "task_stage_changed",
     "task_role_assigned",
@@ -1744,6 +1959,7 @@ _V2_BACKFILL_TYPES: frozenset[str] = frozenset({
     "task_trajectory_changed",
     "task_blocked_changed",
     "task_archived",
+    "task_shipped_to_dev",
     "commit_without_task_id_warning",
     "task_stage_stale",
     "task_stall_persisting",
@@ -1777,6 +1993,10 @@ def _v2_backfill_pointer(log_type: str, payload: dict[str, Any]) -> str | None:
         return payload.get("artifact_path") or None
     if log_type == "audit_report_submitted":
         return payload.get("report_path") or None
+    if log_type == "verification_report_submitted":
+        return payload.get("report_path") or None
+    if log_type == "task_shipped_to_dev":
+        return payload.get("ship_sha") or payload.get("pr_url") or None
     if log_type == "coord_send_message":
         body = payload.get("body") or payload.get("text") or ""
         if not body:

@@ -46,6 +46,7 @@ def _role_token_for_stage(stage: str) -> str:
         "audit_syntax": "auditor",
         "audit_semantics": "auditor",
         "ship": "shipper",
+        "verify": "verifier",
     }.get(stage, "task")
 
 
@@ -60,7 +61,8 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
     "execute":         {"audit_syntax", "audit_semantics", "ship", "archive"},
     "audit_syntax":    {"audit_semantics", "ship", "archive", "execute"},
     "audit_semantics": {"ship", "archive", "execute"},
-    "ship":            {"archive"},
+    "ship":            {"verify", "archive"},
+    "verify":          {"archive", "execute", "ship"},
     "archive":         set(),
 }
 
@@ -111,7 +113,7 @@ WORKFLOW_TYPES: frozenset[str] = frozenset({
 # must appear in this order; `execute` is mandatory; `archive` is
 # implicit/terminal and not stored in trajectory rows.
 TRAJECTORY_STAGES: tuple[str, ...] = (
-    "plan", "execute", "audit_syntax", "audit_semantics", "ship",
+    "plan", "execute", "audit_syntax", "audit_semantics", "ship", "verify",
 )
 TRAJECTORY_STAGE_INDEX: dict[str, int] = {
     s: i for i, s in enumerate(TRAJECTORY_STAGES)
@@ -123,6 +125,7 @@ ROLE_STAGE: dict[str, str] = {
     "auditor_syntax": "audit_syntax",
     "auditor_semantics": "audit_semantics",
     "shipper": "ship",
+    "verifier": "verify",
 }
 STAGE_ROLE: dict[str, str] = {
     "plan": "planner",
@@ -130,6 +133,7 @@ STAGE_ROLE: dict[str, str] = {
     "audit_syntax": "auditor_syntax",
     "audit_semantics": "auditor_semantics",
     "ship": "shipper",
+    "verify": "verifier",
 }
 
 # Legacy → kanban status aliases. Accepted for one release so existing
@@ -401,8 +405,8 @@ def _validate_trajectory(
       - stages appear in canonical order
       - `execute` is mandatory
       - `to` is a slot string or list of slot strings
-      - `focus` (optional) must be a string when present; ignored on
-        non-audit stages; REQUIRED on every `audit_semantics` entry
+      - `focus` (optional) must be a string when present; persisted on
+        audit and verify stages; REQUIRED on every `audit_semantics` entry
         regardless of `to` (v2 §5.4 — semantic audits without a
         stated focus are noise; under v2 pools-are-FYI the empty-pool
         case is the normal case, so the focus must be authored at
@@ -475,9 +479,12 @@ def _validate_trajectory(
                 "matches the glossary'). Semantic audits without a "
                 "focus are noise (see kanban-specs-v2.md §5.4)."
             )
-        # Persist focus only on audit stages (silently drop on non-audit
-        # so a Coach paste-mistake doesn't pollute the row).
-        if focus_clean and stage in ("audit_syntax", "audit_semantics"):
+        # Persist focus only on review-like stages (silently drop on
+        # ordinary work stages so a Coach paste-mistake doesn't pollute
+        # the row).
+        if focus_clean and stage in (
+            "audit_syntax", "audit_semantics", "verify",
+        ):
             out_entry["focus"] = focus_clean
         # The v1.3.13 `coach_review` plan-stage flag is removed in v2
         # (§4.1). Silently drop if present in legacy / paste-mistake
@@ -538,6 +545,8 @@ def _normalize_role_alias(role: str) -> str | None:
         "semantic": "auditor_semantics",
         "semantics": "auditor_semantics",
         "semantic_review": "auditor_semantics",
+        "verification": "verifier",
+        "verify": "verifier",
     }
     r = aliases.get(r, r)
     return r if r in ROLE_NAMES else None
@@ -661,15 +670,18 @@ async def _check_kanban_role_gate(
             )
         return None
 
-    if old == "ship" and new == "archive":
+    if old == "ship" and new in ("verify", "archive"):
         if not await _has_completed_shipper(c, task_id):
             return (
-                f"ship → archive requires the shipper to call "
+                f"ship → {new} requires the shipper to call "
                 f"coord_role_complete(task_id={task_id!r}, "
-                f"message_to_coach=...). Coach then archives with a "
-                f"user-facing summary via "
-                f"coord_archive_task(task_id={task_id!r}, summary=...)."
+                f"message_to_coach=...) or coord_ship_to_dev first. "
+                f"Coach then approves verify or archives with a "
+                f"user-facing summary."
             )
+        return None
+
+    if old == "verify" and new == "archive":
         return None
 
     # audit_* → execute (manual revert) is allowed: it mirrors the
@@ -708,10 +720,124 @@ async def _has_completed_shipper(c: Any, task_id: str) -> bool:
     return bool(dict(row).get("completed_at"))
 
 
+def _ship_verify_manual_override_requested(note: str) -> bool:
+    """Explicit escape hatch for manual post-ship evidence.
+
+    Coach must make the override visible in the verifier's wake note; an
+    unadorned ship→verify approval should never dispatch verification
+    when no `task_shipped_to_dev` event exists.
+    """
+    lowered = note.lower()
+    return (
+        "[manual verify override]" in lowered
+        or "[manual ship verify override]" in lowered
+    )
+
+
+async def _latest_ship_to_dev_evidence(
+    c: Any, task_id: str,
+) -> dict[str, Any] | None:
+    """Return the latest task_shipped_to_dev evidence for verifier handoff."""
+    cur = await c.execute(
+        "SELECT ts, payload_json, payload_pointer FROM project_events "
+        "WHERE task_id = ? AND type = 'task_shipped_to_dev' "
+        "ORDER BY ts DESC, id DESC LIMIT 1",
+        (task_id,),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return None
+    raw = dict(row)
+    try:
+        payload = json.loads(raw.get("payload_json") or "{}")
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    ship_sha = (
+        payload.get("ship_sha")
+        or payload.get("merge_sha")
+        or raw.get("payload_pointer")
+        or ""
+    )
+    return {
+        "ts": raw.get("ts"),
+        "pr_url": payload.get("pr_url") or "",
+        "pr_number": payload.get("pr_number"),
+        "ship_sha": ship_sha,
+        "deploy_target": (
+            payload.get("deploy_target")
+            or payload.get("target")
+            or "dev"
+        ),
+    }
+
+
+def _format_ship_verify_context(
+    evidence: dict[str, Any] | None,
+    *,
+    manual_override: bool = False,
+) -> str:
+    if not evidence:
+        return (
+            "Post-ship evidence: [manual verify override] no "
+            "task_shipped_to_dev event was found; shipper role was "
+            "complete and Coach explicitly requested manual verification."
+        )
+    pr_number = evidence.get("pr_number")
+    pr_url = evidence.get("pr_url") or "unrecorded"
+    ship_sha = evidence.get("ship_sha") or "unrecorded"
+    deploy_target = evidence.get("deploy_target") or "dev"
+    pr_part = (
+        f"PR #{pr_number} {pr_url}" if pr_number else f"PR {pr_url}"
+    )
+    prefix = "Post-ship evidence"
+    if manual_override:
+        prefix += " [manual verify override]"
+    return (
+        f"{prefix}: deploy_target={deploy_target}; "
+        f"ship_sha={ship_sha}; {pr_part}."
+    )
+
+
+async def _ship_verify_context_or_error(
+    c: Any, task_id: str, note: str,
+) -> tuple[str | None, str | None]:
+    """Shared ship→verify gate for MCP + human/API approval surfaces."""
+    evidence = await _latest_ship_to_dev_evidence(c, task_id)
+    shipper_complete = await _has_completed_shipper(c, task_id)
+    manual_override = _ship_verify_manual_override_requested(note)
+    if not evidence and not shipper_complete:
+        return None, (
+            f"ship → verify requires post-ship evidence before "
+            f"verifier work is dispatched. No latest "
+            f"task_shipped_to_dev event was found for {task_id}, "
+            f"and the active shipper role is not complete. Have the "
+            f"shipper call coord_ship_to_dev(task_id={task_id!r}) "
+            f"first (preferred), or complete the shipper role and "
+            f"retry with note starting [manual verify override] only "
+            f"for a documented manual ship."
+        )
+    if not evidence and not manual_override:
+        return None, (
+            f"ship → verify found a completed shipper role but no "
+            f"task_shipped_to_dev event for {task_id}. To avoid silent "
+            f"verification before post-ship evidence exists, retry only "
+            f"after coord_ship_to_dev emits ship evidence, or use an "
+            f"explicit manual path: start note with "
+            f"[manual verify override] and include the PR URL/number, "
+            f"ship SHA, and deploy target for the verifier."
+        )
+    return _format_ship_verify_context(
+        evidence, manual_override=manual_override and bool(evidence),
+    ), None
+
+
 # Auditor / shipper / planner roles that Coach can assign. Mirror of
 # the task_role_assignments.role CHECK constraint.
 ROLE_NAMES: frozenset[str] = frozenset({
-    "planner", "executor", "auditor_syntax", "auditor_semantics", "shipper",
+    "planner", "executor", "auditor_syntax", "auditor_semantics",
+    "shipper", "verifier",
 })
 
 
@@ -840,7 +966,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         (
             "List tasks on the team board. Optional filters:\n"
             "- status: kanban stage — one of 'plan', 'execute', "
-            "'audit_syntax', 'audit_semantics', 'ship', 'archive'. "
+            "'audit_syntax', 'audit_semantics', 'ship', 'verify', "
+            "'archive'. "
             "Legacy values (open/claimed/in_progress/blocked/done/cancelled) "
             "are translated to their kanban equivalent for back-compat.\n"
             "- owner: agent id ('coach', 'p1'..'p10'), or 'null' for unassigned\n"
@@ -903,6 +1030,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     "  WHEN 'audit_syntax'     THEN 'auditor_syntax' "
                     "  WHEN 'audit_semantics'  THEN 'auditor_semantics' "
                     "  WHEN 'ship'             THEN 'shipper' "
+                    "  WHEN 'verify'           THEN 'verifier' "
                     "  ELSE NULL END "
                     "AND tra.completed_at IS NULL "
                     "AND tra.superseded_by IS NULL "
@@ -924,6 +1052,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "  WHEN 'audit_syntax'    THEN 'auditor_syntax' "
             "  WHEN 'audit_semantics' THEN 'auditor_semantics' "
             "  WHEN 'ship'            THEN 'shipper' "
+            "  WHEN 'verify'          THEN 'verifier' "
             "  ELSE NULL END"
         )
         c = await configured_conn()
@@ -986,6 +1115,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "audit_syntax": "auditor",
             "audit_semantics": "sem-auditor",
             "ship": "shipper",
+            "verify": "verifier",
         }
 
         lines = []
@@ -1093,7 +1223,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- trajectory: REQUIRED for Coach top-level tasks. Stored on the "
             "Backlog entry so coord_triage_backlog promote can read it. "
             "Ordered list of {stage, to, focus?} objects. `stage` ∈ "
-            "{plan, execute, audit_syntax, audit_semantics, ship}; canonical "
+            "{plan, execute, audit_syntax, audit_semantics, ship, verify}; canonical "
             "order; execute is mandatory. **trajectory[0].to MUST name "
             "exactly one Player** (single-element list like ['p3']). "
             "Subsequent stages' `to` may be a single name, list, or empty "
@@ -1329,6 +1459,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "audit_syntax": "auditor_syntax",
                 "audit_semantics": "auditor_semantics",
                 "ship": "shipper",
+                "verify": "verifier",
             }
             first_entry = trajectory[0]
             first_to: list[str] = first_entry.get("to") or []
@@ -1477,7 +1608,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "  execute → audit_syntax, audit_semantics, ship, archive\n"
             "  audit_syntax → audit_semantics, ship, archive, execute\n"
             "  audit_semantics → ship, archive, execute\n"
-            "  ship → archive\n"
+            "  ship → verify, archive\n"
+            "  verify → archive, execute, ship\n"
             "  archive: terminal\n"
             "\n"
             "Most call sites should use coord_approve_stage instead. "
@@ -2780,6 +2912,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 for s in trajectory
                 if isinstance(s, dict)
             }
+            trajectory_has_verify = "verify" in stages_in_traj
             # Map stage name → role name used in task_role_assignments
             audit_checks = []
             if "audit_syntax" in stages_in_traj:
@@ -3002,6 +3135,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "ship_sha": merge_sha,
                 "pr_number": pr_number,
                 "pr_url": pr_url,
+                "deploy_target": "dev",
                 "executor_sha": executor_sha,
                 "to": "coach",
             }
@@ -3019,11 +3153,19 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             ),
         )
 
+        verify_hint = (
+            "\nTrajectory includes verify; Coach may approve verify with "
+            "coord_approve_stage(next_stage='verify', assignee=<slot>, "
+            "note=<verification brief>) after reading this ship result."
+            if trajectory_has_verify else ""
+        )
         return _ok(
             f"Task {task_id} shipped to dev.\n"
             f"PR: {pr_url} (#{pr_number}) — squash-merged.\n"
-            f"Dev HEAD: {merge_sha}.\n"
+            f"Deploy target: dev.\n"
+            f"Ship SHA: {merge_sha}.\n"
             f"Shipper role complete. Coach has been woken."
+            f"{verify_hint}"
         )
 
     @tool(
@@ -5755,6 +5897,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         "auditor_syntax": "audit_syntax",
         "auditor_semantics": "audit_semantics",
         "shipper": "ship",
+        "verifier": "verify",
     }
 
     async def _mirror_assign_targets_to_trajectory(
@@ -5784,12 +5927,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 and entry.get("stage") == target_stage
             ):
                 entry["to"] = list(targets)
-                # Audit stages: keep `focus` in sync with the role row.
-                # Only audit_* stages carry focus; on non-audit stages
-                # any prior focus is silently dropped (defensive — the
-                # validator wouldn't have allowed it but legacy rows
-                # might exist).
-                if target_stage in ("audit_syntax", "audit_semantics"):
+                # Review stages: keep `focus` in sync with the role row.
+                # Only audit_* / verify stages carry focus; on other
+                # stages any prior focus is silently dropped (defensive).
+                if target_stage in ("audit_syntax", "audit_semantics", "verify"):
                     if focus:
                         entry["focus"] = focus
                     # When focus is None, preserve any prior focus on
@@ -6308,12 +6449,220 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             f"verdict. Wait for Coach's wake."
         )
 
+    @tool(
+        "coord_submit_verification_report",
+        (
+            "**Your message to Coach that post-ship verification is done.** "
+            "Player-only. Verifiers use this after a task reaches the "
+            "optional `verify` stage. Writes a markdown report under the "
+            "task's verifications/ folder, records PASS/FAIL on the "
+            "verifier role row, emits `verification_report_submitted`, "
+            "and wakes Coach in real time.\n"
+            "\n"
+            "Verification is post-ship evidence, not a pre-ship audit. "
+            "FAIL does NOT auto-revert, auto-create a follow-up, or "
+            "auto-archive; Coach reads the report and decides whether "
+            "to archive, create a follow-up, rollback, reroute to "
+            "execute, or send back to ship.\n"
+            "\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- verdict: 'pass' or 'fail' (required)\n"
+            "- body: full markdown report (required, max 40000 chars)\n"
+            "- message_to_coach: optional one-line note delivered to Coach\n"
+            "- evidence: optional object/string with deploy URL, PR/SHA, "
+            "checked_at, service, etc."
+        ),
+        # Raw JSON schema: task_id/verdict/body are required;
+        # message_to_coach/evidence are genuinely optional. The compact
+        # dict-shorthand is treated as all-required by some MCP/SDK
+        # clients before this handler can apply its own defaults.
+        {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "verdict": {"type": "string", "enum": ["pass", "fail"]},
+                "body": {"type": "string"},
+                "message_to_coach": {"type": "string"},
+                "evidence": {
+                    "oneOf": [
+                        {"type": "object", "additionalProperties": True},
+                        {"type": "array"},
+                        {"type": "string"},
+                        {"type": "number"},
+                        {"type": "boolean"},
+                    ]
+                },
+            },
+            "required": ["task_id", "verdict", "body"],
+            "additionalProperties": True,
+        },
+    )
+    async def submit_verification_report(args: dict[str, Any]) -> dict[str, Any]:
+        if caller_is_coach:
+            return _err(
+                "Coach doesn't verify directly. Assign a Player verifier "
+                "via coord_approve_stage(next_stage='verify', assignee=<slot>, "
+                "note=...) and let them submit."
+            )
+        task_id = (args.get("task_id") or "").strip()
+        verdict = (args.get("verdict") or "").strip().lower()
+        body = args.get("body") or ""
+        message_to_coach = (args.get("message_to_coach") or "").strip()
+        evidence_raw = args.get("evidence")
+        if not task_id:
+            return _err("task_id is required")
+        if verdict not in ("pass", "fail"):
+            return _err("verdict must be 'pass' or 'fail'")
+        if not body.strip():
+            return _err("body is required")
+        if len(body) > 40_000:
+            return _err(f"body too long ({len(body)} chars, max 40000)")
+        if len(message_to_coach) > 2000:
+            return _err(
+                f"message_to_coach too long ({len(message_to_coach)} chars, "
+                f"max 2000)"
+            )
+        try:
+            evidence_text = (
+                json.dumps(evidence_raw, ensure_ascii=False, sort_keys=True)
+                if isinstance(evidence_raw, (dict, list)) else
+                (str(evidence_raw).strip() if evidence_raw is not None else "")
+            )
+        except Exception:
+            evidence_text = str(evidence_raw)
+        if len(evidence_text) > 4000:
+            return _err(f"evidence too long ({len(evidence_text)} chars, max 4000)")
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT status, owner FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            task_row = await cur.fetchone()
+            if not task_row:
+                return _err(f"task {task_id} not found")
+            task_data = dict(task_row)
+            actual_stage = task_data.get("status")
+            if actual_stage != "verify":
+                return _err(
+                    f"verification is not active for task {task_id} "
+                    f"(stage={actual_stage}). Coach must approve "
+                    f"ship→verify before verifier work is actionable."
+                )
+            cur = await c.execute(
+                "SELECT id FROM task_role_assignments "
+                "WHERE task_id = ? AND role = 'verifier' AND owner = ? "
+                "AND completed_at IS NULL AND superseded_by IS NULL "
+                "ORDER BY assigned_at DESC LIMIT 1",
+                (task_id, caller_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(
+                    f"no active verifier assignment for {caller_id} on "
+                    f"task {task_id}. Coach must call "
+                    f"coord_approve_stage(next_stage='verify', assignee=<slot>) "
+                    f"before submission."
+                )
+            assignment_id = dict(row)["id"]
+            cur = await c.execute(
+                "SELECT COUNT(*) AS n FROM task_role_assignments "
+                "WHERE task_id = ? AND role = 'verifier'",
+                (task_id,),
+            )
+            count_row = await cur.fetchone()
+            round_num = int(dict(count_row)["n"])
+            executor_owner = task_data.get("owner")
+        finally:
+            await c.close()
+
+        from server.tasks import write_verification_report as _write_verification
+        try:
+            _target, rel, submitted_at = await _write_verification(
+                project_id=project_id,
+                task_id=task_id,
+                round_num=round_num,
+                body=body,
+                verifier=caller_id,
+                verdict=verdict,
+                evidence=evidence_text,
+            )
+        except ValueError as exc:
+            return _err(str(exc))
+        except Exception as exc:
+            return _err(f"verification report write failed: {exc}")
+
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE task_role_assignments "
+                "SET report_path = ?, verdict = ?, completed_at = ? "
+                "WHERE id = ?",
+                (rel, verdict, submitted_at, assignment_id),
+            )
+            await _reset_agent_idle_tools(c, caller_id)
+            await c.commit()
+        finally:
+            await c.close()
+
+        ts = _now_iso()
+        await bus.publish({
+            "ts": ts,
+            "agent_id": caller_id,
+            "type": "task_role_completed",
+            "task_id": task_id,
+            "role": "verifier",
+            "owner": caller_id,
+            "artifact_path": rel,
+            "verdict": verdict,
+            "message_to_coach": message_to_coach or None,
+            "to": "coach",
+        })
+        await bus.publish({
+            "ts": ts,
+            "agent_id": caller_id,
+            "type": "verification_report_submitted",
+            "task_id": task_id,
+            "verdict": verdict,
+            "report_path": rel,
+            "round": round_num,
+            "verifier_id": caller_id,
+            "evidence": evidence_raw if evidence_raw is not None else None,
+            "message_to_coach": message_to_coach or None,
+            "to": executor_owner or "coach",
+        })
+        await _wake_coach_for_completion(
+            caller_id=caller_id,
+            task_id=task_id,
+            role=f"verifier (round {round_num}, verdict={verdict})",
+            message_to_coach=message_to_coach,
+            artifact_path=rel,
+            extra_hint=(
+                "Verification FAIL does NOT auto-revert — read the "
+                "report and decide whether to archive, follow up, "
+                "rollback, reroute to execute, or re-ship."
+                if verdict == "fail" else
+                "Verification PASS — decide whether to archive with "
+                "the verified deployed state."
+            ),
+        )
+        return _ok(
+            f"Submitted verification report (round {round_num}, {verdict}) "
+            f"for {task_id} → {rel}. Your verifier role is now complete. "
+            f"Coach was woken with your message_to_coach as context; "
+            f"FAIL does NOT auto-revert or create follow-up work."
+        )
+
     def _next_action_for_plate(
         *,
         executor_task: dict[str, Any] | None,
         pending_reviews: list[dict[str, Any]],
         pending_plans: list[dict[str, Any]],
         pending_ships: list[dict[str, Any]],
+        pending_verifications: list[dict[str, Any]],
         eligible: list[dict[str, Any]],
     ) -> str | None:
         """Pick the highest-priority actionable item and return the
@@ -6328,8 +6677,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
           2. Pending reviewer assignment — call
              coord_submit_audit_report.
           3. Pending shipper assignment — call coord_role_complete.
-          4. Pending planner assignment — call coord_write_task_spec.
-          5. Eligible-pool entry (FYI in v2) — wait; pools never
+          4. Pending verifier assignment — call
+             coord_submit_verification_report.
+          5. Pending planner assignment — call coord_write_task_spec.
+          6. Eligible-pool entry (FYI in v2) — wait; pools never
              auto-resolve to a Player claim. Coach picks via
              coord_approve_stage.
 
@@ -6394,6 +6745,18 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"reviews and archives via coord_archive_task with "
                 f"a user-facing summary."
             )
+        if pending_verifications:
+            e = pending_verifications[0]
+            tid = e["task_id"]
+            return (
+                f"  Verify the shipped task {tid}, then call "
+                f"coord_submit_verification_report(task_id={tid!r}, "
+                f"verdict='pass' or 'fail', body=<your report>, "
+                f"message_to_coach=...). Coach reviews the post-ship "
+                f"verdict and decides whether to archive, create a "
+                f"follow-up, rollback, or reroute. FAIL does NOT "
+                f"auto-revert."
+            )
         if pending_plans:
             e = pending_plans[0]
             tid = e["task_id"]
@@ -6425,7 +6788,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "  1. Active executor task (the one in agents.current_task_id)\n"
             "  2. Pending reviewer assignments (formal + semantic)\n"
             "  3. Pending shipper assignments\n"
-            "  4. Eligible-pool tasks you could claim\n"
+            "  4. Pending verifier assignments\n"
+            "  5. Eligible-pool tasks you could claim\n"
             "\n"
             "Call at turn start when you're not sure what to do. Returns "
             "an empty plate if nothing is on you (and the idle poller "
@@ -6533,7 +6897,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     await _set_agent_role_tools(c, caller_id, "executor")
                     await c.commit()
 
-            # Bucket 2 + 3: pending planner / reviewer / shipper
+            # Bucket 2 + 3 + 4: pending planner / reviewer / shipper / verifier
             # assignments, filtered to the card's current stage so
             # future-stage reservations do not look actionable early.
             cur = await c.execute(
@@ -6541,7 +6905,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "FROM task_role_assignments r "
                 "JOIN tasks t ON t.id = r.task_id "
                 "WHERE r.owner = ? AND r.role IN "
-                "  ('planner','auditor_syntax','auditor_semantics','shipper') "
+                "  ('planner','auditor_syntax','auditor_semantics','shipper','verifier') "
                 "AND r.completed_at IS NULL AND r.superseded_by IS NULL "
                 "AND t.project_id = ? "
                 "AND ("
@@ -6549,7 +6913,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "  OR "
                 "  (r.role = 'auditor_syntax' AND t.status = 'audit_syntax') "
                 "  OR (r.role = 'auditor_semantics' AND t.status = 'audit_semantics') "
-                "  OR (r.role = 'shipper' AND t.status = 'ship')"
+                "  OR (r.role = 'shipper' AND t.status = 'ship') "
+                "  OR (r.role = 'verifier' AND t.status = 'verify') "
                 ") "
                 "ORDER BY r.assigned_at",
                 (caller_id, project_id),
@@ -6557,6 +6922,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             pending_plans: list[dict[str, Any]] = []
             pending_reviews: list[dict[str, Any]] = []
             pending_ships: list[dict[str, Any]] = []
+            pending_verifications: list[dict[str, Any]] = []
             for r in await cur.fetchall():
                 rd = dict(r)
                 entry = {
@@ -6569,6 +6935,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     pending_plans.append(entry)
                 elif rd["role"] == "shipper":
                     pending_ships.append(entry)
+                elif rd["role"] == "verifier":
+                    pending_verifications.append(entry)
                 else:
                     entry["kind"] = _audit_kind_from_role(rd["role"])
                     pending_reviews.append(entry)
@@ -6591,7 +6959,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "  OR (r.role = 'planner' AND t.status = 'plan') "
                 "  OR (r.role = 'auditor_syntax' AND t.status = 'audit_syntax') "
                 "  OR (r.role = 'auditor_semantics' AND t.status = 'audit_semantics') "
-                "  OR (r.role = 'shipper' AND t.status = 'ship')"
+                "  OR (r.role = 'shipper' AND t.status = 'ship') "
+                "  OR (r.role = 'verifier' AND t.status = 'verify') "
                 ") "
                 "ORDER BY r.assigned_at",
                 (caller_id, project_id),
@@ -6657,6 +7026,16 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             lines.append("  (none)")
 
         lines.append("")
+        lines.append("## Pending verification assignments:")
+        if pending_verifications:
+            for e in pending_verifications:
+                lines.append(
+                    f"  - {e['task_id']} (pri={e['priority']}): {e['title']}"
+                )
+        else:
+            lines.append("  (none)")
+
+        lines.append("")
         lines.append("## Available to claim (eligible pools):")
         if eligible:
             for e in eligible:
@@ -6665,6 +7044,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     "auditor_syntax": "formal reviewer",
                     "auditor_semantics": "semantic reviewer",
                     "shipper": "shipper",
+                    "verifier": "verifier",
                     "planner": "planner",
                 }.get(e["role"], e["role"])
                 stages = e.get("trajectory") or []
@@ -6691,6 +7071,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             pending_reviews=pending_reviews,
             pending_plans=pending_plans,
             pending_ships=pending_ships,
+            pending_verifications=pending_verifications,
             eligible=eligible,
         )
         lines.append("")
@@ -7026,8 +7407,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "in one shape — every stage move is a Coach decision.\n"
             "\n"
             "Validates the transition against the state machine (plan → "
-            "execute → audit_syntax → audit_semantics → ship → archive, "
-            "plus revert audit_*→execute and execute→archive).\n"
+            "execute → audit_syntax → audit_semantics → ship → verify → "
+            "archive, plus skip-verify ship→archive, revert "
+            "audit_*→execute / verify→execute, and execute→archive).\n"
             "\n"
             "ASSIGNEE: required for any non-archive next_stage; pass a "
             "single Player slot ('p3') — v2 has no pool path. For "
@@ -7142,6 +7524,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         displaced_target: list[str] = []
         displaced_source: list[str] = []
         old_status: str | None = None
+        ship_verify_context = ""
         try:
             cur = await c.execute(
                 "SELECT status, owner, success_criteria FROM tasks "
@@ -7200,6 +7583,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 return _err(
                     f"invalid transition: {old_status} → {next_stage}"
                 )
+
+            if old_status == "ship" and next_stage == "verify":
+                context, error = await _ship_verify_context_or_error(
+                    c, task_id, note,
+                )
+                if error:
+                    return _err(error)
+                ship_verify_context = context or ""
 
             now = _now_iso()
             new_role_id: int | None = None
@@ -7457,10 +7848,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         # turn-end reminder is appended in either case.
         if next_stage != "archive" and assignee:
             from server.agents import maybe_wake_agent
-            wake_body = _with_player_reminder(note or (
+            base_wake = note or (
                 f"Coach approved your move on task {task_id} to stage "
                 f"{next_stage!r} as {target_role}."
-            ))
+            )
+            if ship_verify_context:
+                base_wake = f"{base_wake}\n\n{ship_verify_context}"
+            wake_body = _with_player_reminder(base_wake)
             try:
                 await maybe_wake_agent(
                     assignee, wake_body,
@@ -7498,6 +7892,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             criteria_echo = (
                 f" You defined done as: {stored_success_criteria}"
             )
+        ship_verify_echo = (
+            f" {ship_verify_context}" if ship_verify_context else ""
+        )
         return _ok(
             f"Approved {task_id}: {old_status} → {next_stage} "
             f"({target_role} → {assignee}){suffix_note}. "
@@ -7509,7 +7906,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"Planted {assignee}'s role row; woke them with a "
                 f"generic brief — use note= to pass context directly."
             )
-            + f"{criteria_echo}"
+            + f"{criteria_echo}{ship_verify_echo}"
         )
 
     @tool(
@@ -8418,6 +8815,43 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         await bus.publish({
             "ts": now_iso,
             "agent_id": caller_id,
+            "type": "task_created",
+            "task_id": task_id,
+            "title": title,
+            "parent_id": None,
+            "priority": promote_priority,
+            "workflow": "generic",
+            "tracking_reason": "backlog",
+            "trajectory": trajectory,
+            "project_id": project_id,
+        })
+        if initial_owner and len(first_to) == 1:
+            first_role = _role_for_stage_map[trajectory[0]["stage"]]
+            await bus.publish({
+                "ts": now_iso,
+                "agent_id": "system",
+                "type": "task_stage_changed",
+                "task_id": task_id,
+                "from": None,
+                "to": initial_status,
+                "reason": "backlog_promoted",
+                "owner": initial_owner,
+                "assignee": initial_owner,
+                "project_id": project_id,
+            })
+            await bus.publish({
+                "ts": now_iso,
+                "agent_id": caller_id,
+                "type": "task_role_assigned",
+                "task_id": task_id,
+                "role": first_role,
+                "owner": initial_owner,
+                "stage": initial_status,
+                "project_id": project_id,
+            })
+        await bus.publish({
+            "ts": now_iso,
+            "agent_id": caller_id,
             "type": "backlog_task_promoted",
             "backlog_id": backlog_id,
             "task_id": task_id,
@@ -8617,6 +9051,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         update_task,
         write_task_spec,
         submit_audit_report,
+        submit_verification_report,
         my_assignments,
         set_task_trajectory,
         set_task_workflow,
@@ -8908,6 +9343,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_update_memory",
     "mcp__coord__coord_commit_push",
     "mcp__coord__coord_ship_to_dev",
+    "mcp__coord__coord_submit_verification_report",
     "mcp__coord__coord_write_decision",
     "mcp__coord__coord_propose_file_write",
     "mcp__coord__coord_read_file",
@@ -8953,6 +9389,7 @@ ALLOWED_COORD_TOOLS = [
     # the SDK accept the call.
     "mcp__coord__coord_write_task_spec",
     "mcp__coord__coord_submit_audit_report",
+    "mcp__coord__coord_submit_verification_report",
     "mcp__coord__coord_my_assignments",
     "mcp__coord__coord_set_task_trajectory",
     "mcp__coord__coord_set_task_workflow",

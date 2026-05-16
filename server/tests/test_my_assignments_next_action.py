@@ -11,7 +11,7 @@ names the completion tool with the task_id baked in. Mirrors the
 kanban subscriber's stage-entry wake hint pattern.
 
 Priority order: executor > pending reviews > pending ships >
-pending plans > eligible pools. The tool picks the highest-
+pending verifier work > pending plans > eligible pools. The tool picks the highest-
 priority actionable item and surfaces just that one.
 """
 
@@ -33,7 +33,8 @@ _FULL_TRAJECTORY = (
     '{"stage":"execute","to":[]},'
     '{"stage":"audit_syntax","to":[]},'
     '{"stage":"audit_semantics","to":[]},'
-    '{"stage":"ship","to":[]}]'
+    '{"stage":"ship","to":[]},'
+    '{"stage":"verify","to":[]}]'
 )
 
 
@@ -258,6 +259,23 @@ async def test_pending_ship_surfaces_role_complete(
     assert "coord_role_complete" in next_action
     assert "coord_mark_shipped" not in next_action
     assert "t-2026-05-06-00000023" in next_action
+
+
+async def test_pending_verification_surfaces_verification_report(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed_task(task_id="t-2026-05-06-00000026", status="verify")
+    await _seed_role(
+        task_id="t-2026-05-06-00000026", role="verifier", owner="p3",
+    )
+    server = _server_for("p3")
+    text = _ok_text(await _handler(server, "my_assignments")({}))
+    next_action = text.split("## Next action:")[1]
+    assert "Pending verification assignments" in text
+    assert "coord_submit_verification_report" in next_action
+    assert "verdict='pass' or 'fail'" in next_action
+    assert "t-2026-05-06-00000026" in next_action
 
 
 async def test_eligible_pool_surfaces_wait_for_coach(

@@ -18,7 +18,7 @@ import {
   renderDiffBody,
 } from "/static/tools.js";
 import { CompassPane, createCompassEventRouter } from "/static/compass.js?v=1778671319";
-import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js";
+import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js?v=1778924260";
 import { PlaybookPane, createPlaybookEventRouter } from "/static/playbook.js";
 
 const html = htm.bind(h);
@@ -42,6 +42,7 @@ const KANBAN_FORWARD_TYPES = new Set([
   "task_role_completed", "task_drift_detected",
   "task_stage_stale", "task_workflow_set",
   "audit_report_submitted", "audit_fail_notification",
+  "verification_report_submitted",
   "compass_audit_logged",
   "commit_pushed", "project_switched", "socket_connected",
   "backlog_task_proposed", "backlog_task_promoted", "backlog_task_rejected",
@@ -60,6 +61,7 @@ const KANBAN_STAGE_SHORT = {
   audit_syntax: "syn",
   audit_semantics: "sem",
   ship: "ship",
+  verify: "ver",
 };
 
 // markdown rendering: parse / sanitise / math / mermaid pipeline lives
@@ -6116,10 +6118,11 @@ function MCPServerCard({ server, testing, onToggle, onSaveTools, onSaveConfig, o
 }
 
 function SecretsSection() {
-  // Encrypted UI-managed secrets. These feed ${VAR} interpolation in MCP
-  // configs (and anything else that calls _interpolate) — the store wins
-  // over os.environ on name collision. Plaintext values never round-trip:
-  // once saved you can only replace or delete, not view.
+  // Encrypted UI-managed secrets. These feed explicit ${VAR}
+  // interpolation sites such as MCP configs and repo URLs; they are not
+  // exported as global Coach/Player env. The store wins over
+  // os.environ on interpolation-name collision. Plaintext values never
+  // round-trip: once saved you can only replace or delete, not view.
   const [rows, setRows] = useState([]);
   const [status, setStatus] = useState(null); // {ok, reason?}
   const [loaded, setLoaded] = useState(false);
@@ -6221,8 +6224,10 @@ function SecretsSection() {
       <code>\${...}</code> wrapper — the wrapper is the placeholder
       syntax used in the config files that consume the secret. On
       collision with an env var of the same name, the stored secret
-      wins. Values are write-only — you can replace or delete, but
-      never read back.
+      wins for interpolation only. These values are not exported into
+      Coach or Player runtime environments; configure API auth like
+      <code>HARNESS_TOKEN</code> in deployment env. Values are write-only
+      — you can replace or delete, but never read back.
     </p>
     ${disabled
       ? html`<p style="font-size: 12px; color: var(--err); margin: 0 0 6px 0;">

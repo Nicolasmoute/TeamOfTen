@@ -411,3 +411,31 @@ async def test_role_assignments_table_created(fresh_db: str) -> None:
         "report_path", "verdict", "superseded_by",
     }
     assert expected.issubset(cols)
+
+
+async def test_fresh_schema_accepts_verify_status_and_verifier_role(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO tasks (id, project_id, title, status, created_by) "
+            "VALUES ('t-verify', 'misc', 'verify task', 'verify', 'coach')"
+        )
+        await c.execute(
+            "INSERT INTO task_role_assignments "
+            "(task_id, role, eligible_owners, owner) "
+            "VALUES ('t-verify', 'verifier', '[]', 'p1')"
+        )
+        await c.commit()
+        cur = await c.execute(
+            "SELECT t.status, r.role FROM tasks t "
+            "JOIN task_role_assignments r ON r.task_id = t.id "
+            "WHERE t.id = 't-verify'"
+        )
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+
+    assert row == {"status": "verify", "role": "verifier"}

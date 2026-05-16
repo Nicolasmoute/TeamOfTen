@@ -295,6 +295,14 @@ visible in `ps`/`/proc/<pid>/cmdline` to any process on the host, and
 the harness must not leak its own auth secret there. The subprocess
 reads the env var at startup.
 
+`HARNESS_COORD_PROXY_TOKEN` is a runtime-owned loopback credential,
+not the operator's `HARNESS_TOKEN`. It is minted per cached Codex
+app-server client, bound server-side to the caller slot, and injected
+only for the coord MCP proxy. Codex Player subprocesses must not
+receive `HARNESS_TOKEN`; that token gates the public API/WS surface
+from the deployment process env and is intentionally outside the
+agent runtime environment.
+
 Body is a stdio MCP server that:
 
 - Uses the official `mcp` Python stdio server transport. The proxy must
@@ -496,6 +504,12 @@ under `${CODEX_HOME}/harness-runtime/<slot>` (or
 the operator home and writes a minimal trusted-project config with no
 `mcp_servers` table. Harness MCP servers continue to come solely from
 startup `-c mcp_servers...` flags.
+
+The isolated runtime environment is also the secret boundary. Codex
+uses `build_clean_agent_env(extra=env_overrides)` so sensitive
+deployment variables, including `HARNESS_TOKEN`, are not inherited
+from the server process. Only explicit runtime exceptions such as the
+per-slot `HARNESS_COORD_PROXY_TOKEN` are overlaid after scrubbing.
 
 **Deprecated `.mcp.json` path.** `_write_codex_mcp_json` is retained
 only as a reference helper. The runtime no longer relies on workspace
