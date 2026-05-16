@@ -188,7 +188,11 @@ kanban routing. `coord_approve_stage` writes the named assignee's
 current role list from `server/role_tool_allowlists.py`; Player
 completion paths reset the slot to the idle list. NULL or malformed
 JSON falls back to the dispatcher defaults so a bad row cannot brick
-a spawn.
+a spawn. If a Player has an active kanban role row, the Codex
+dispatcher also compares the stored JSON with the current generated
+role list at turn start and refreshes stale rows before spawning; this
+lets already-assigned roles pick up newly-added role tools without
+waiting for a same-stage reassignment.
 
 On `agent_sessions` (per-project per-slot session state) — **separate
 columns per runtime, not a generic field**:
@@ -587,10 +591,17 @@ The harness patches the SDK stdio transport to pipe a bounded
 `codex app-server` stderr tail into `CodexTransportError` messages;
 the stock SDK transport discards stderr and otherwise leaves only
 opaque "failed reading from stdio transport" diagnostics.
+The patched transport also starts the Node wrapper/native app-server
+tree in its own process group and closes that group explicitly. This is
+required because production incident review on 2026-05-16 found old
+Codex app-server pairs reparented under PID 1 after recovery/eviction,
+with p7/p9 accumulating five live process pairs each. Closing only the
+SDK client or wrapper process is not enough; shutdown must reap the
+whole tree.
 The `_SPAWN_LOCK` already enforces sequential turns per slot,
 satisfying the SDK's "one active turn consumer per client" constraint.
-Close (`await client.close()`) and re-open on auth-error / transport
-error.
+Close the SDK client and its underlying transport process tree, then
+re-open on auth-error / transport error.
 
 **Cache invalidation on config/tool-surface change.** MCP config is
 captured at subprocess spawn time through the app-server
@@ -603,7 +614,10 @@ evicted before the turn starts. Two helpers handle explicit eviction:
 
 - `evict_client(slot)` — full close on idle slots; cache-pop only when
   a turn is in flight (lets the live turn finish on its own client
-  reference; next turn rebuilds with current MCP config).
+  reference; next turn rebuilds with current MCP config). The popped
+  client/token pair is queued and closed in the turn's `finally` block
+  so in-flight config changes no longer leak a stale app-server process
+  until container restart.
 - `evict_all_clients()` — same, applied to every cached slot.
 
 `evict_client(slot)` is called from `DELETE /api/agents/{id}/session`

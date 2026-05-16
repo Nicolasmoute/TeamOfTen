@@ -8,6 +8,7 @@ flag is unset.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -29,6 +30,7 @@ def _clean_codex_runtime_state():
         st.revoke(tok)
     codex_mod._codex_client_tokens.clear()
     codex_mod._codex_clients.clear()
+    codex_mod._codex_clients_pending_close.clear()
     codex_mod._codex_client_cwds.clear()
     codex_mod._client_locks.clear()
     codex_mod.reset_codex_worktree_sandbox_probe_for_tests()
@@ -395,6 +397,7 @@ def _install_fake_sdk(monkeypatch):
         st.revoke(tok)
     codex_mod._codex_client_tokens.clear()
     codex_mod._codex_clients.clear()
+    codex_mod._codex_clients_pending_close.clear()
     codex_mod._codex_client_cwds.clear()
     codex_mod._codex_client_allowed_tool_keys.clear()
     codex_mod._client_locks.clear()
@@ -532,6 +535,29 @@ async def test_close_client_drops_and_closes(monkeypatch, tmp_path) -> None:
     assert client.closed == 1
 
 
+async def test_close_client_also_closes_underlying_transport(
+    monkeypatch, tmp_path
+) -> None:
+    _install_fake_sdk(monkeypatch)
+    from server.runtimes.codex import get_client, close_client
+
+    class _Transport:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        async def close(self) -> None:
+            self.closed += 1
+
+    client = await get_client("p1", cwd=str(tmp_path))
+    transport = _Transport()
+    client._transport = transport
+
+    await close_client("p1")
+
+    assert client.closed == 1
+    assert transport.closed == 1
+
+
 async def test_close_client_clears_cwd_cache(monkeypatch, tmp_path) -> None:
     """close_client must remove the cwd entry so a subsequent spawn
     in a different cwd isn't falsely treated as a mismatch."""
@@ -577,6 +603,7 @@ async def test_get_client_allowed_tools_mismatch_respawns(
     c2 = await get_client("p1", cwd=str(tmp_path), allowed_tools=executor_tools)
 
     assert c1 is not c2
+    assert c1.closed == 1
     assert len(_FakeClient.instances) == 2
     assert any(
         "coord_commit_push" in part
@@ -602,6 +629,7 @@ async def test_get_client_cwd_mismatch_evicts_and_respawns(
 
     c2 = await get_client("p1", cwd=cwd_b)
     assert c1 is not c2
+    assert c1.closed == 1
     assert codex_mod._codex_client_cwds.get("p1") == cwd_b
 
 
@@ -636,6 +664,7 @@ async def test_evict_client_in_flight_clears_cwd_cache(
     assert "p1" in codex_mod._codex_client_cwds
     await evict_client("p1")
     assert "p1" not in codex_mod._codex_client_cwds
+    assert len(codex_mod._codex_clients_pending_close["p1"]) == 1
 
 
 async def test_close_all_clients(monkeypatch, tmp_path) -> None:
@@ -648,6 +677,7 @@ async def test_close_all_clients(monkeypatch, tmp_path) -> None:
     await close_all_clients()
     assert a.closed == 1 and b.closed == 1
     assert codex_mod._codex_clients == {}
+    assert codex_mod._codex_clients_pending_close == {}
 
 
 async def test_evict_client_idle_closes_subprocess(monkeypatch, tmp_path) -> None:
@@ -666,7 +696,8 @@ async def test_evict_client_idle_closes_subprocess(monkeypatch, tmp_path) -> Non
 
 async def test_evict_client_running_pops_without_close(monkeypatch, tmp_path) -> None:
     """In-flight turn: evict_client should pop the cache entry but
-    leave the subprocess alive so the live turn can finish."""
+    queue the subprocess for post-turn close so the live turn can finish
+    without leaking a Codex app-server process tree."""
     _install_fake_sdk(monkeypatch)
     monkeypatch.setattr("server.agents.is_agent_running", lambda _slot: True)
     from server.runtimes.codex import get_client, evict_client
@@ -676,6 +707,11 @@ async def test_evict_client_running_pops_without_close(monkeypatch, tmp_path) ->
     await evict_client("p1")
     assert client.closed == 0, "in-flight subprocess must NOT be closed"
     assert "p1" not in codex_mod._codex_clients, "cache entry must be popped"
+    assert len(codex_mod._codex_clients_pending_close["p1"]) == 1
+
+    await codex_mod._close_pending_evicted_clients("p1")
+    assert client.closed == 1
+    assert "p1" not in codex_mod._codex_clients_pending_close
 
 
 async def test_evict_all_clients_mixes_idle_and_running(monkeypatch, tmp_path) -> None:
@@ -694,6 +730,7 @@ async def test_evict_all_clients_mixes_idle_and_running(monkeypatch, tmp_path) -
     assert a.closed == 0, "p1 has a live turn — must stay open"
     assert b.closed == 1, "p2 idle — must close"
     assert codex_mod._codex_clients == {}
+    assert len(codex_mod._codex_clients_pending_close["p1"]) == 1
 
 
 async def test_build_mcp_servers_pre_approves_external_servers() -> None:
@@ -972,6 +1009,62 @@ async def test_captured_stdio_transport_includes_stderr_on_close() -> None:
     assert "stdio transport closed" in message
     assert "process exit code: 7" in message
     assert "codex app-server boom" in message
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group cleanup is POSIX-only")
+async def test_captured_stdio_transport_close_kills_child_process(
+    tmp_path,
+) -> None:
+    import asyncio
+    import contextlib
+    import os
+    import signal
+    import sys
+    from server.runtimes.codex import _CapturedStdioTransport
+
+    marker = tmp_path / "child.pid"
+    script = (
+        "import os, signal, subprocess, sys, time\n"
+        "marker = sys.argv[1]\n"
+        "child = subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(60)'])\n"
+        "with open(marker, 'w', encoding='utf-8') as f:\n"
+        "    f.write(str(child.pid))\n"
+        "    f.flush()\n"
+        "def stop(signum, frame):\n"
+        "    child.terminate()\n"
+        "    try:\n"
+        "        child.wait(timeout=5)\n"
+        "    except subprocess.TimeoutExpired:\n"
+        "        child.kill()\n"
+        "        child.wait(timeout=5)\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "while True:\n"
+        "    time.sleep(1)\n"
+    )
+
+    transport = _CapturedStdioTransport([sys.executable, "-c", script, str(marker)])
+    await transport.connect()
+    deadline = asyncio.get_running_loop().time() + 5
+    while not marker.exists():
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0.05)
+    child_pid = int(marker.read_text(encoding="utf-8"))
+
+    await transport.close()
+
+    deadline = asyncio.get_running_loop().time() + 5
+    while True:
+        try:
+            os.kill(child_pid, 0)
+        except ProcessLookupError:
+            break
+        if asyncio.get_running_loop().time() >= deadline:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child_pid, signal.SIGKILL)
+            raise AssertionError("child process survived transport.close()")
+        await asyncio.sleep(0.05)
 
 
 # Audit item #9 — codex_thread_id persistence + open_thread auto-heal.
