@@ -3787,8 +3787,8 @@ async def get_agent_context(
     # When the UI didn't pass a per-pane model override, fall back to
     # the model recorded on the latest turn for the active session.
     # Without this the window resolves to the global default (1M) for
-    # every agent, which over-reports for Codex's 400K models — the
-    # CTX bar would crawl up to 50% before tripping any UI signal.
+    # every agent, which understates pressure for Codex's smaller
+    # effective app-server windows.
     if not resolved_model:
         latest_session = codex_thread_id or session_id
         if latest_session:

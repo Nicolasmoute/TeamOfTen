@@ -1778,10 +1778,13 @@ Manual compact:
 
 Auto-compact:
 
-- Controlled by `HARNESS_AUTO_COMPACT_THRESHOLD`, default 0.5 (lowered from 0.7 on 2026-05-09).
+- Controlled by `HARNESS_AUTO_COMPACT_THRESHOLD`, default 0.65 (lowered from 0.7 on 2026-05-09, then raised from 0.5 on 2026-05-15 after 0.5 proved too aggressive).
 - Estimates session context from Claude CLI JSONL files under
   `CLAUDE_CONFIG_DIR/projects/`.
 - If over threshold, runs a compact turn first.
+- The preflight resolves the same effective model the turn will use (pane
+  override, Coach-set slot override, role default, alias-to-concrete), so the
+  threshold window matches the pane `ctx` bar.
 - If auto-compact produces no summary, it force-clears the session to escape a
   threshold loop.
 
@@ -1925,7 +1928,10 @@ known limitations: see `Docs/CODEX_RUNTIME_SPEC.md` §E.5.
 
 Window resolution: `_context_window_for(model)` returns the per-model
 max. When the UI doesn't pass `?model=`, the server reads the model
-recorded on the latest turn for the active session. For Codex turns,
+recorded on the latest turn for the active session. Auto-compact uses
+the same effective model resolver before its threshold check, so
+auto-wakes that omit a pane model do not fall back to the generic 1M
+window. For Codex turns,
 `token_count.info.model_context_window` from the rollout JSONL is
 stored as a provider-reported exact window and takes precedence over
 the static table. That lets the CTX bar and auto-compact adapt when
@@ -4875,7 +4881,7 @@ implementation):
 | `HARNESS_STALE_TASK_MINUTES` | `15` | Stale task threshold, 0 disables |
 | `HARNESS_STALE_TASK_NOTIFY_INTERVAL_MINUTES` | `30` | Re-notify cadence |
 | `HARNESS_STALE_TASK_CHECK_INTERVAL_SECONDS` | `60` | Watchdog loop cadence |
-| `HARNESS_AUTO_COMPACT_THRESHOLD` | `0.5` | Context fraction for auto-compact (lowered from 0.7 on 2026-05-09) |
+| `HARNESS_AUTO_COMPACT_THRESHOLD` | `0.65` | Context fraction for auto-compact (lowered from 0.7 on 2026-05-09, then raised from 0.5 on 2026-05-15) |
 | `HARNESS_THINKING_BUDGET_TOKENS` | `8000` | Extended-thinking budget when a Player's `thinking_override` (or per-pane toggle) is on. Claude runtime only; clamped ≥ 1024. |
 | `HARNESS_HANDOFF_TOKEN_BUDGET` | `20000` | Recent exchange budget |
 | `HARNESS_STREAM_TOKENS` | `true` | Token delta streaming. Set to `false`/`0`/`no`/`off` to disable (only needed for the rare CLI build that crashes on the underlying flag). |
