@@ -4514,11 +4514,13 @@ printing non-JSON to MCP stdout and killing the Codex app-server with a
 By default, CodexRuntime does **not** ambient-start UI/file-configured
 external MCP servers. Codex runs MCP servers inside the app-server
 subprocess, so one bad external stdio server can kill unrelated Codex
-turns. Codex starts external MCP servers only when the slot has an
-explicit `agents.allowed_tools` override naming an `mcp__<server>__...`
-tool. Set `HARNESS_CODEX_EXTERNAL_MCP=true` to restore ambient external
-MCP loading for Codex. ClaudeRuntime is unchanged and continues to load
-external MCPs from this section through its normal SDK path.
+turns. Codex starts external MCP servers only when the final spawn
+allowlist contains an `mcp__<server>__...` tool. That
+allowlist can come from a role/slot `agents.allowed_tools` entry or the
+team-wide `extra_tools` setting. Set `HARNESS_CODEX_EXTERNAL_MCP=true`
+to restore ambient external MCP loading for Codex. ClaudeRuntime is
+unchanged and continues to load external MCPs from this section through
+its normal SDK path.
 
 CodexRuntime also isolates app-server from operator-owned
 `$CODEX_HOME/config.toml`. The app-server uses a clean per-slot
@@ -4890,7 +4892,7 @@ implementation):
 | `CLAUDE_CONFIG_DIR` | `/data/claude` | Claude OAuth/session dir |
 | `CODEX_HOME` | `/data/codex` | Codex CLI auth dir (`auth.json`). Must point at persistent storage; after deploy run `CODEX_HOME=/data/codex codex login --device-auth` in the container to create the ChatGPT OAuth session. |
 | `HARNESS_CODEX_ENABLED` | unset | Codex runtime feature gate. Must be truthy (`true`, `1`, `yes`, `on`) before `PUT /api/agents/{id}/runtime` or the UI runtime controls can select `runtime=codex`. |
-| `HARNESS_CODEX_EXTERNAL_MCP` | unset / false | When truthy, CodexRuntime ambient-starts UI/file-configured external MCP servers. Default false: only `coord` starts unless a slot's explicit `agents.allowed_tools` override names an external `mcp__<server>__...` tool. |
+| `HARNESS_CODEX_EXTERNAL_MCP` | unset / false | When truthy, CodexRuntime ambient-starts UI/file-configured external MCP servers. Default false: only `coord` starts unless the final spawn allowlist contains an external `mcp__<server>__...` tool from role/slot `agents.allowed_tools` or team-wide `extra_tools`. |
 | `HARNESS_CODEX_RUNTIME_HOME` | `$CODEX_HOME/harness-runtime` | Optional root for per-slot Codex app-server homes. Runtime homes copy `$CODEX_HOME/auth.json` but use a clean config without inherited `mcp_servers`, preventing operator/test MCP config from poisoning harness Codex sessions. |
 | `HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS` | `120` | Codex app-server JSON-RPC request timeout passed to `CodexClient.connect_stdio`; clamped to at least 30s. Covers `initialize`, `thread/start`, `thread/resume`, and similar request/response calls. |
 | `HARNESS_CODEX_STDIO_LIMIT_BYTES` | `8388608` | Codex app-server subprocess stdout/stderr StreamReader line limit for newline-delimited JSON-RPC. Clamped to 256 KiB..64 MiB; prevents large tool/result messages from tripping Python's 64 KiB default and surfacing as false stdio transport failures. |
