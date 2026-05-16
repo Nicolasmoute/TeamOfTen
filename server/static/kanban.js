@@ -173,6 +173,7 @@ function roleForStage(status) {
   if (status === "audit_syntax") return "auditor_syntax";
   if (status === "audit_semantics") return "auditor_semantics";
   if (status === "ship") return "shipper";
+  if (status === "verify") return "verifier";
   return null;
 }
 

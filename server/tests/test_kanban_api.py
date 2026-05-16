@@ -18,6 +18,7 @@ on those background tasks for their own correctness.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -82,6 +83,7 @@ async def _plant_role(
     role: str,
     owner: str | None = None,
     completed: bool = False,
+    focus: str | None = None,
 ) -> None:
     c = await configured_conn()
     try:
@@ -91,12 +93,12 @@ async def _plant_role(
         await c.execute(
             "INSERT INTO task_role_assignments "
             "(task_id, role, eligible_owners, owner, assigned_at, "
-            "claimed_at, completed_at) "
+            "claimed_at, completed_at, focus) "
             "VALUES (?, ?, '[]', ?, "
             "strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
             "strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
-            f"{completed_sql})",
-            (task_id, role, owner),
+            f"{completed_sql}, ?)",
+            (task_id, role, owner, focus),
         )
         await c.commit()
     finally:
@@ -225,6 +227,36 @@ def test_board_includes_postship_context(client: TestClient) -> None:
     assert task["latest_ship_evidence"]["deploy_target"] == "dev"
     assert task["latest_verification"]["verdict"] == "fail"
     assert task["latest_verification"]["report_path"].endswith("verification_1.md")
+
+
+def test_verify_card_contract_uses_verifier_assignment_not_stale_owner(
+    client: TestClient,
+) -> None:
+    import asyncio
+    task_id = "t-2026-05-03-vowner01"
+    verifier_focus = "Verify dev deployment after PR #42"
+    asyncio.run(_seed(task_id=task_id, status="verify", owner="p2"))
+    asyncio.run(_plant_role(
+        task_id=task_id,
+        role="verifier",
+        owner="p4",
+        focus=verifier_focus,
+    ))
+
+    r = client.get("/api/tasks/board")
+    assert r.status_code == 200
+    task = next(t for t in r.json()["board"]["verify"] if t["id"] == task_id)
+    active = [
+        a for a in task["assignments"]
+        if a["role"] == "verifier" and not a["completed_at"]
+    ]
+    assert task["owner"] == "p2"
+    assert len(active) == 1
+    assert active[0]["owner"] == "p4"
+    assert active[0]["focus"] == verifier_focus
+
+    js = (Path(__file__).parents[1] / "static" / "kanban.js").read_text()
+    assert 'if (status === "verify") return "verifier";' in js
 
 
 # ----------------------------------------------------------------- /archive
