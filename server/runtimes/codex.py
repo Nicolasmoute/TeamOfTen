@@ -3051,10 +3051,14 @@ def _extract_compact_summary(raw: Any) -> str:
     return str(raw).strip() if raw is not None else ""
 
 
-def _valid_recent_exchanges(recent: Any) -> list[dict[str, str]]:
-    if not isinstance(recent, list):
-        return []
-    out: list[dict[str, str]] = []
+def _recent_exchange_compact_fallback(recent: list[dict[str, Any]]) -> str:
+    """Build a compact handoff from the rolling recent-exchange log.
+
+    Used only when generated compact fails or produces invalid
+    markdown, including stale/thread-not-found cases. The text is
+    persisted to the normal handoff stores, never logged.
+    """
+    valid: list[tuple[str, str]] = []
     for entry in recent:
         if not isinstance(entry, dict):
             continue
@@ -3062,107 +3066,105 @@ def _valid_recent_exchanges(recent: Any) -> list[dict[str, str]]:
         response = entry.get("response")
         if not isinstance(prompt, str) or not isinstance(response, str):
             continue
-        if not (prompt.strip() or response.strip()):
-            continue
-        out.append({"prompt": prompt.strip(), "response": response.strip()})
-    return out
+        prompt = prompt.strip()
+        response = response.strip()
+        if prompt or response:
+            valid.append((prompt, response))
 
+    if not valid:
+        return ""
 
-def _synthetic_compact_summary_from_recent(
-    *,
-    thread_id: str,
-    recent: list[dict[str, str]],
-) -> str:
-    """Build a non-empty Codex handoff when native compact is opaque.
-
-    `thread/compact/start` is a server-side operation in the SDK and may
-    return only an ack. If that happens, the harness still needs a
-    durable handoff before clearing `codex_thread_id`; the rolling
-    exchange log is the best local continuity source.
-    """
-    lines: list[str] = [
-        "## Codex Compact Handoff",
+    parts = [
+        "# Codex Compact Fallback",
         "",
-        "Codex native compact completed, but the app-server did not return "
-        "a readable summary to TeamOfTen. This synthetic handoff preserves "
-        "the recent conversation captured by the harness before the Codex "
-        "thread was reset.",
-        "",
-        "## Source Thread",
-        "",
-        f"- Codex thread id: `{thread_id}`",
+        "Codex compact generation did not produce a usable handoff. "
+        "This synthetic handoff was built from the harness "
+        "recent-exchange log so the next session has continuity.",
         "",
         "## Recent Exchanges",
-        "",
     ]
-    if recent:
-        lines.append(
-            f"Verbatim recent turn log, oldest first ({len(recent)} "
-            f"turn{'s' if len(recent) != 1 else ''})."
-        )
-        for i, entry in enumerate(recent, start=1):
-            lines.extend([
-                "",
-                f"### Exchange {i} of {len(recent)}",
-                "",
-                "**User asked:**",
-                "",
-                entry["prompt"] or "(empty)",
-                "",
-                "**Assistant replied:**",
-                "",
-                entry["response"] or "(empty)",
-            ])
-    else:
-        lines.append(
-            "No recent exchange log was recorded before compact. Continue "
-            "from the next user prompt and use the full rollout transcript "
-            "footer below if exact prior context is needed."
-        )
-    return "\n".join(lines).strip()
+    for i, (prompt, response) in enumerate(valid, start=1):
+        parts.extend([
+            "",
+            f"### Exchange {i} of {len(valid)}",
+            "",
+            "**User asked:**",
+            "",
+            prompt,
+            "",
+            "**Assistant answered:**",
+            "",
+            response,
+        ])
+    return "\n".join(parts).strip()
 
 
-def _build_codex_compact_footer(thread_id: str | None) -> str:
-    """Render the Codex-specific handoff footer."""
-    try:
-        retention = int(os.environ.get("HARNESS_SESSION_RETENTION_DAYS", "30"))
-    except ValueError:
-        retention = 30
-    if retention <= 0:
-        retention_note = "kept indefinitely (retention disabled)"
-    else:
-        retention_note = f"auto-pruned after {retention} days"
+_CODEX_COMPACT_EXPECTED_HEADINGS = (
+    "## Primary request and intent",
+    "## Key technical concepts",
+    "## All operator messages (verbatim, in order)",
+    "## How we got here",
+    "## Files touched",
+    "## Errors & fixes",
+    "## Key findings & decisions",
+    "## Open questions",
+    "## References",
+    "## People & roles",
+    "## Context quirks & gotchas",
+    "## In-flight state at compact",
+    "## Pending — concrete checklist",
+)
 
-    rollout = _rollout_path_for_thread_id(thread_id or "")
-    if rollout is not None:
-        transcript_hint = f"`{rollout}`"
-    else:
-        home = _codex_home_candidates()
-        root = home[0] if home else Path("~/.codex").expanduser()
-        if thread_id:
-            transcript_hint = (
-                f"`{root}/sessions/<yyyy>/<mm>/<dd>/"
-                f"rollout-*{thread_id}.jsonl`"
-            )
-        else:
-            transcript_hint = (
-                f"`{root}/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl` "
-                "(thread id was not captured)"
-            )
+
+def _codex_compact_generation_prompt() -> str:
+    from server.agents import COMPACT_PROMPT
 
     return (
-        "---\n"
-        "## Where to find more _(auto-appended by the harness)_\n\n"
-        "The summary above is lossy by design. If you need exact "
-        "strings, tool outputs, URLs, or code that is not preserved "
-        "below, the full record exists:\n\n"
-        f"- **Full Codex rollout transcript**: {transcript_hint}. "
-        f"{retention_note.capitalize()}. Ask the operator to surface it "
-        "if you cannot read it directly from your workspace.\n"
-        "- **This handoff itself** is saved at `handoffs/<agent>-"
-        "<timestamp>.md` (the exact filename is in the one-line "
-        "pointer above, if any)."
+        "Silent compact handoff generation for the TeamOfTen harness.\n\n"
+        "Do not call tools. Do not describe your process. Do not emit a "
+        "preamble or sign-off. Return only the requested markdown handoff; "
+        "the harness will persist it privately and will not stream this "
+        "text to the UI.\n\n"
+        + COMPACT_PROMPT
     )
+
+
+def _agent_message_text_from_step(step: Any) -> str:
+    item_type = getattr(step, "item_type", None) or ""
+    if item_type != "agentMessage":
+        return ""
+    text = getattr(step, "text", None)
+    if isinstance(text, str) and text:
+        return text
+    payload = _step_item_payload(step)
+    for key in ("text", "content", "message"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, Mapping):
+                    nested = item.get("text") or item.get("content")
+                    if nested is not None:
+                        parts.append(str(nested))
+            joined = "".join(parts)
+            if joined:
+                return joined
+    return ""
+
+
+def _compact_section_count(summary: str) -> int:
+    return sum(1 for heading in _CODEX_COMPACT_EXPECTED_HEADINGS if heading in summary)
+
+
+def _valid_generated_compact_summary(summary: str) -> bool:
+    text = summary.strip()
+    if len(text) < 400:
+        return False
+    return _compact_section_count(text) >= 4
 
 
 def is_enabled() -> bool:
@@ -3863,27 +3865,13 @@ class CodexRuntime:
         return True
 
     async def run_manual_compact(self, tc: TurnContext) -> None:
-        """Compact the agent's Codex thread via the native SDK call.
+        """Generate and persist a Codex compact handoff.
 
-        Live spike confirmed `client.compact_thread(thread_id)` exists
-        and `ThreadHandle.compact()` exists. Use the client form so we
-        don't need to materialize a ThreadHandle just to call compact.
-
-        Audit item #14 — Docs/CODEX_RUNTIME_SPEC.md §E.6.
-
-        Flow:
-          1. Auth resolution — if no auth, emit human_attention + error.
-          2. Read codex_thread_id; if null, no-op success (nothing to
-             compact, but the user invoked /compact so flip got_result
-             to keep the dispatcher happy).
-          3. get_client (cached or fresh) and call compact_thread(id).
-          4. Defensively extract a summary from the opaque return shape
-             (dict.summary / .text / repr fallback).
-          5. Persist via `_set_continuity_note`, then null
-             `codex_thread_id` so the next non-compact turn starts a
-             fresh Codex thread that picks up the continuity note from
-             the system prompt.
-          6. Emit `session_compacted` and flip got_result.
+        Codex native compact is not used as the handoff source. The
+        primary path silently resumes the stored thread and asks Codex
+        for a COMPACT_PROMPT-style markdown handoff, collecting only
+        assistant-message text into a local buffer. The buffer is never
+        passed through handle_step or emitted to the UI/event log.
         """
         if not is_enabled():
             await self._emit_disabled_attention(tc)
@@ -3898,6 +3886,109 @@ class CodexRuntime:
             _write_handoff_file,
         )
         from server.workspaces import workspace_dir
+
+        async def _fail_compact(
+            reason: str,
+            *,
+            xfer_to: str,
+            skipped: bool = False,
+        ) -> None:
+            if xfer_to in ("claude", "codex"):
+                await _emit(
+                    tc.agent_id,
+                    "session_transfer_failed",
+                    to_runtime=xfer_to,
+                    reason=reason,
+                )
+            elif skipped:
+                await _emit(tc.agent_id, "session_compact_skipped", reason=reason)
+            else:
+                await _emit(tc.agent_id, "error", error=reason)
+            await _set_status(tc.agent_id, "error")
+
+        async def _recent_fallback() -> str:
+            try:
+                return _recent_exchange_compact_fallback(
+                    await _get_recent_exchanges(tc.agent_id)
+                )
+            except Exception:
+                logger.exception(
+                    "CodexRuntime: compact fallback read failed for slot=%s",
+                    tc.agent_id,
+                )
+                return ""
+
+        async def _persist_handoff_and_finish(
+            summary: str,
+            *,
+            xfer_to: str,
+            summary_source: str,
+            synthetic_summary: bool,
+        ) -> bool:
+            if not summary:
+                await _fail_compact(
+                    "Codex compact produced no handoff; codex_thread_id preserved.",
+                    xfer_to=xfer_to,
+                )
+                return False
+
+            handoff_file = await _write_handoff_file(tc.agent_id, summary)
+            if not handoff_file:
+                await _fail_compact(
+                    "Codex compact handoff file write failed; "
+                    "codex_thread_id preserved.",
+                    xfer_to=xfer_to,
+                )
+                return False
+
+            continuity_note = (
+                f"_This handoff is also saved to handoffs/{handoff_file} "
+                "for audit + cross-agent reference; the text below is the "
+                "full content._\n\n"
+                + summary
+            )
+            try:
+                await _set_continuity_note(tc.agent_id, continuity_note)
+            except Exception:
+                logger.exception(
+                    "CodexRuntime: compact continuity note write failed for slot=%s",
+                    tc.agent_id,
+                )
+                await _fail_compact(
+                    "Codex compact continuity note write failed; "
+                    "codex_thread_id preserved.",
+                    xfer_to=xfer_to,
+                )
+                return False
+
+            await _clear_codex_thread_id(tc.agent_id)
+            await _clear_exchange_log(tc.agent_id)
+
+            event_meta = {
+                "chars": len(summary),
+                "handoff_file": handoff_file,
+                "summary_source": summary_source,
+                "synthetic_summary": synthetic_summary,
+                "section_count": _compact_section_count(summary),
+            }
+            if xfer_to in ("claude", "codex"):
+                from server.agents import (
+                    _perform_runtime_transfer_flip,
+                    _resolve_runtime_for,
+                )
+                xfer_from = await _resolve_runtime_for(tc.agent_id)
+                await _perform_runtime_transfer_flip(tc.agent_id, xfer_to)
+                await _emit(
+                    tc.agent_id,
+                    "session_transferred",
+                    from_runtime=xfer_from,
+                    to_runtime=xfer_to,
+                    **event_meta,
+                )
+            else:
+                await _emit(tc.agent_id, "session_compacted", **event_meta)
+            tc.turn_ctx["got_result"] = True
+            return True
 
         method, env_overrides = await resolve_auth()
         if method == "none":
@@ -3916,39 +4007,18 @@ class CodexRuntime:
             return
 
         thread_id = await _get_codex_thread_id(tc.agent_id)
+        xfer_to = (tc.turn_ctx.get("transfer_to_runtime") or "").strip().lower()
         if not thread_id:
-            if tc.auto_compact or tc.turn_ctx.get("auto_compact"):
-                await _emit(
-                    tc.agent_id,
-                    "auto_compact_skipped",
-                    note="no codex thread to compact after preflight",
-                )
-                tc.turn_ctx["auto_compact_skipped"] = True
-                return
-            # No prior thread means there is no compact summary or
-            # durable handoff to report. Do not emit
-            # session_compacted/session_transferred here; the UI renders
-            # those as successful handoffs.
-            _xfer_to = (
-                (tc.turn_ctx.get("transfer_to_runtime") or "").strip().lower()
-            )
-            reason = (
+            await _fail_compact(
                 "No stored Codex thread was available to compact; "
-                "no handoff was written."
+                "no handoff was written.",
+                xfer_to=xfer_to,
+                skipped=True,
             )
-            if _xfer_to in ("claude", "codex"):
-                await _emit(
-                    tc.agent_id,
-                    "session_transfer_failed",
-                    to_runtime=_xfer_to,
-                    reason=reason,
-                )
-            else:
-                await _emit(tc.agent_id, "error", error=reason)
-            await _set_status(tc.agent_id, "error")
             return
 
         try:
+            sdk = _import_codex_sdk()
             client = await get_client(
                 tc.agent_id,
                 cwd=str(await workspace_dir(tc.agent_id)),
@@ -3968,161 +4038,85 @@ class CodexRuntime:
             await _set_status(tc.agent_id, "error")
             return
 
-        used_synthetic_summary = False
+        config = _build_thread_config(sdk, tc)
+        turn_overrides = _build_turn_overrides(sdk, tc)
+
         try:
-            raw = client.compact_thread(thread_id)
-            if hasattr(raw, "__await__"):
-                raw = await raw
+            resumed = client.resume_thread(thread_id, overrides=config)
+            thread = await _await_if_needed(resumed)
+            stream = thread.chat(
+                _codex_compact_generation_prompt(),
+                user=tc.agent_id,
+                metadata={"project_id": tc.project_id, "purpose": "compact"},
+                turn_overrides=turn_overrides,
+            )
+            stream = await _await_if_needed(stream)
+            parts: list[str] = []
+            async for step in stream:
+                text = _agent_message_text_from_step(step)
+                if text:
+                    parts.append(text)
+            generated = "".join(parts).strip()
         except Exception as exc:
             logger.exception(
-                "CodexRuntime: compact_thread failed for slot=%s thread=%s",
+                "CodexRuntime: compact generation failed for slot=%s thread=%s",
                 tc.agent_id, thread_id,
             )
-            # Drop the cached client — compact failures often correlate
-            # with stale thread state on the subprocess side.
             await close_client(tc.agent_id)
-
-            # Stale-thread detection: Codex backend already dropped this
-            # thread (CodexProtocolError "thread not found"). We can
-            # recover only by building a synthetic handoff and passing
-            # through the normal durable handoff path below.
-            sdk = _import_codex_sdk()
             protocol_cls = getattr(sdk, "CodexProtocolError", None)
             is_stale_thread = (
                 "thread not found" in str(exc).lower()
                 or (protocol_cls is not None and isinstance(exc, protocol_cls))
             )
-            if is_stale_thread:
-                try:
-                    recent = _valid_recent_exchanges(
-                        await _get_recent_exchanges(tc.agent_id)
-                    )
-                    used_synthetic_summary = True
-                    raw = {
-                        "summary": _synthetic_compact_summary_from_recent(
-                            thread_id=thread_id,
-                            recent=recent,
-                        )
-                    }
-                except Exception:
-                    logger.exception(
-                        "CodexRuntime: stale-thread fallback read failed for slot=%s",
-                        tc.agent_id,
-                    )
-                    _xfer_to = (
-                        (tc.turn_ctx.get("transfer_to_runtime") or "")
-                        .strip()
-                        .lower()
-                    )
-                    reason = (
-                        "Codex compact thread no longer existed and no "
-                        "fallback handoff could be built; "
-                        "codex_thread_id preserved."
-                    )
-                    if _xfer_to in ("claude", "codex"):
-                        await _emit(
-                            tc.agent_id,
-                            "session_transfer_failed",
-                            to_runtime=_xfer_to,
-                            reason=reason,
-                        )
-                    else:
-                        await _emit(tc.agent_id, "error", error=reason)
-                    await _set_status(tc.agent_id, "error")
-                    return
-            else:
-                await _emit(tc.agent_id, "error", error=f"compact failed: {exc}")
-                await _set_status(tc.agent_id, "error")
+            fallback = await _recent_fallback()
+            if fallback:
+                await _persist_handoff_and_finish(
+                    fallback,
+                    xfer_to=xfer_to,
+                    summary_source="recent_exchange_fallback",
+                    synthetic_summary=True,
+                )
                 return
-
-        summary = _extract_compact_summary(raw)
-        if not summary:
-            try:
-                thread_state = client.read_thread(thread_id, include_turns=True)
-                thread_state = await _await_if_needed(thread_state)
-                summary = _extract_compact_summary(thread_state)
-            except Exception:
-                logger.exception(
-                    "CodexRuntime: post-compact thread read failed for slot=%s "
-                    "thread=%s",
-                    tc.agent_id, thread_id,
-                )
-        if not summary:
-            used_synthetic_summary = True
-            recent = _valid_recent_exchanges(
-                await _get_recent_exchanges(tc.agent_id)
-            )
-            summary = _synthetic_compact_summary_from_recent(
-                thread_id=thread_id,
-                recent=recent,
-            )
-        footer = _build_codex_compact_footer(thread_id)
-        summary_with_footer = summary.rstrip() + "\n\n" + footer
-        handoff_file = await _write_handoff_file(
-            tc.agent_id,
-            summary_with_footer,
-        )
-        if not handoff_file:
-            _xfer_to = (
-                (tc.turn_ctx.get("transfer_to_runtime") or "").strip().lower()
-            )
-            reason = (
-                "Codex compact handoff file write failed; "
-                "codex_thread_id preserved."
-            )
-            if _xfer_to in ("claude", "codex"):
-                await _emit(
-                    tc.agent_id,
-                    "session_transfer_failed",
-                    to_runtime=_xfer_to,
-                    reason=reason,
+            if is_stale_thread:
+                await _fail_compact(
+                    "Codex compact generation failed because the thread was "
+                    "not found, and no recent-exchange fallback was available; "
+                    "codex_thread_id preserved.",
+                    xfer_to=xfer_to,
                 )
             else:
-                await _emit(tc.agent_id, "error", error=reason)
-            await _set_status(tc.agent_id, "error")
+                await _fail_compact(
+                    "Codex compact generation failed and no recent-exchange "
+                    "fallback was available; codex_thread_id preserved.",
+                    xfer_to=xfer_to,
+                )
             return
-        pointer = (
-            f"_This handoff is also saved to handoffs/{handoff_file} "
-            f"for audit + cross-agent reference; the text below is "
-            f"the full content._\n\n"
-        ) + summary_with_footer
-        await _set_continuity_note(tc.agent_id, pointer)
-        await _clear_codex_thread_id(tc.agent_id)
-        await _clear_exchange_log(tc.agent_id)
 
-        # Transfer-mode (compact + flip): apply the runtime change now
-        # that compaction succeeded and the handoff is durable. The
-        # continuity_note we just wrote is the handoff the new runtime's
-        # first turn will read.
-        _xfer_to = (
-            (tc.turn_ctx.get("transfer_to_runtime") or "").strip().lower()
+        if _valid_generated_compact_summary(generated):
+            await _persist_handoff_and_finish(
+                generated,
+                xfer_to=xfer_to,
+                summary_source="generated",
+                synthetic_summary=False,
+            )
+            return
+
+        fallback = await _recent_fallback()
+        if fallback:
+            await _persist_handoff_and_finish(
+                fallback,
+                xfer_to=xfer_to,
+                summary_source="recent_exchange_fallback",
+                synthetic_summary=True,
+            )
+            return
+
+        await _fail_compact(
+            "Codex compact generation returned invalid handoff markdown and "
+            "no recent-exchange fallback was available; codex_thread_id "
+            "preserved.",
+            xfer_to=xfer_to,
         )
-        if _xfer_to in ("claude", "codex"):
-            from server.agents import (
-                _perform_runtime_transfer_flip, _resolve_runtime_for,
-            )
-            _xfer_from = await _resolve_runtime_for(tc.agent_id)
-            await _perform_runtime_transfer_flip(tc.agent_id, _xfer_to)
-            await _emit(
-                tc.agent_id,
-                "session_transferred",
-                from_runtime=_xfer_from,
-                to_runtime=_xfer_to,
-                chars=len(summary),
-                handoff_file=handoff_file,
-                summary_preview=(summary[:200] if summary else None),
-                synthetic_summary=used_synthetic_summary,
-            )
-        else:
-            await _emit(
-                tc.agent_id,
-                "session_compacted",
-                chars=len(summary),
-                handoff_file=handoff_file,
-                summary_preview=(summary[:200] if summary else None),
-                synthetic_summary=used_synthetic_summary,
-            )
-        tc.turn_ctx["got_result"] = True
 
     async def _emit_disabled_attention(self, tc: TurnContext) -> None:
         from server.agents import _emit, _set_status

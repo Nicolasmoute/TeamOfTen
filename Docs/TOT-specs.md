@@ -1782,17 +1782,15 @@ Manual compact:
 
 - UI slash command `/compact`.
 - API `POST /api/agents/{id}/compact`.
-- Claude runs the agent with `COMPACT_PROMPT`; Codex calls native
-  `client.compact_thread(thread_id)`.
+- Claude runs the agent with `COMPACT_PROMPT`; Codex silently resumes
+  the stored Codex thread and generates COMPACT_PROMPT-style markdown
+  without streaming the handoff text to normal UI/events/logs.
 - Captures the summary as `agent_sessions.continuity_note`.
 - Writes full handoff file under active project's `working/handoffs/`.
-- Clears the source runtime session id (`session_id` for Claude,
-  `codex_thread_id` for Codex) so the next turn starts fresh.
-- Emits `session_compacted` with `chars` and `handoff_file`.
-- If Codex native compact returns only an acknowledgement instead of a
-  readable summary, the harness writes a synthetic handoff from the
-  rolling recent-exchange log and marks the event with
-  `synthetic_summary=true`.
+- Clears session id so the next turn starts fresh.
+- Emits `session_compacted` with metadata only (`chars`,
+  `handoff_file`, and for Codex `summary_source` /
+  `synthetic_summary`).
 
 Auto-compact:
 
@@ -1863,19 +1861,21 @@ Failure modes:
   emits and the runtime stays put. The intent of transfer is "carry
   forward via summary"; a flip with empty context is a destructive
   blind switch.
-- Compact yields no summary on Codex -> the handler writes a synthetic
-  handoff from recent exchanges, then flips with
-  `synthetic_summary=true`.
+- Compact yields no generated summary on Codex → recent-exchange
+  fallback may be used, but it is marked
+  `summary_source='recent_exchange_fallback'` and
+  `synthetic_summary=true`. If neither generated nor fallback handoff
+  can be durably persisted, `session_transfer_failed` emits and the
+  runtime plus `codex_thread_id` stay put.
 - Helper failure on `_clear_codex_thread_id` is logged but doesn't
   abort; `runtime_updated` still emits so the UI doesn't silently
   miss the change.
 
 Why not just `/compact` followed by a blunt PUT: atomicity. The flip
 only happens iff the compact succeeded with a non-empty summary
-(Claude side) or the native `compact_thread` call succeeded (Codex
-side). A user who runs the two operations separately gets the flip
-even when the compact failed, leaving the agent on the new runtime
-with no handoff. The transfer flow also emits the right event
+on both runtimes. A user who runs the two operations separately gets
+the flip even when the compact failed, leaving the agent on the new
+runtime with no handoff. The transfer flow also emits the right event
 vocabulary so timelines read as a single transfer boundary, not as a
 compact plus an unrelated runtime change.
 
@@ -2545,22 +2545,47 @@ Current implementation gap:
      `audit_semantics` → `auditor_semantics`).
 - **Git operations** (in caller's worktree):
   1. `git fetch origin`
-  2. `git checkout -b ship-<task_id> origin/dev`
-  3. `git cherry-pick <executor_sha>`
-  4. `git push origin ship-<task_id>:ship-<task_id>`
+  2. If a prior `task_shipped_to_dev` event exists, treat the call as
+     idempotent: close any still-open shipper role row and return the
+     existing evidence without another GitHub PR or duplicate ship event.
+  3. If the executor commit or equivalent patch is already present on
+     `origin/dev`, close the shipper role row, emit `task_shipped_to_dev`
+     with `ship_method='already_present'`, `idempotent=true`, and
+     `ship_sha=<origin/dev sha>`, then return without opening a PR.
+  4. If local branch `ship-<task_id>` already exists, resume it:
+     - If already on the branch and there is no `CHERRY_PICK_HEAD` or
+       unmerged path, continue to push/PR/merge.
+     - If on another branch, require a clean worktree before checking out
+       `ship-<task_id>`.
+     - If conflicts are still unresolved, fail closed with instructions
+       and do not push, create a PR, emit ship evidence, or complete the
+       role.
+  5. Otherwise, `git checkout -b ship-<task_id> origin/dev`
+  6. `git cherry-pick -x <executor_sha>`
+  7. `git push origin ship-<task_id>:ship-<task_id>`
   - Cherry-pick conflict → returns error with the conflicted SHA and
     instructs the Player to resolve manually or run
-    `git cherry-pick --abort` to clean up.
+    `git cherry-pick --abort` to clean up. After manual resolution and
+    `git cherry-pick --continue`, rerun `coord_ship_to_dev(task_id)` to
+    resume the existing temp branch.
+  - Empty/no-op cherry-pick → re-checks whether the patch is already
+    present on `origin/dev`; if confirmed, uses the already-present
+    success path, otherwise fails closed.
 - **GitHub API** (PAT extracted from `projects.repo_url`):
-  1. `POST /repos/{owner}/{repo}/pulls` → create PR titled
-     `[ship] <task_id>: <title>`
-  2. `PUT /repos/{owner}/{repo}/pulls/{n}/merge` (squash merge)
-  3. `DELETE /repos/{owner}/{repo}/git/refs/heads/ship-<task_id>`
+  1. Query open PRs for `head=<owner>:ship-<task_id>&base=dev`; reuse
+     one if present.
+  2. `POST /repos/{owner}/{repo}/pulls` → create PR titled
+     `[ship] <task_id>: <title>` when no reusable PR exists. A 422
+     collision triggers another open-PR lookup before failing.
+  3. `PUT /repos/{owner}/{repo}/pulls/{n}/merge` (squash merge)
+  4. `DELETE /repos/{owner}/{repo}/git/refs/heads/ship-<task_id>`
      (non-fatal on failure)
 - **Post-success:**
   - Closes shipper role row (`completed_at` stamped).
   - Emits `task_shipped_to_dev` event with `task_id`, `ship_sha`,
-    `pr_number`, `pr_url`, `executor_sha`.
+    `pr_number`, `pr_url`, `executor_sha`, `deploy_target='dev'`,
+    `ship_method` (`'pr'`, `'resumed_pr'`, or `'already_present'`), and
+    `idempotent`.
   - Wakes Coach via `_wake_coach_for_completion`.
 - **Return:** `ok=True` text with `pr_url`, `pr_number`, dev HEAD SHA.
   If the trajectory includes `verify`, the response reminds Coach to
@@ -4531,11 +4556,13 @@ printing non-JSON to MCP stdout and killing the Codex app-server with a
 By default, CodexRuntime does **not** ambient-start UI/file-configured
 external MCP servers. Codex runs MCP servers inside the app-server
 subprocess, so one bad external stdio server can kill unrelated Codex
-turns. Codex starts external MCP servers only when the slot has an
-explicit `agents.allowed_tools` override naming an `mcp__<server>__...`
-tool. Set `HARNESS_CODEX_EXTERNAL_MCP=true` to restore ambient external
-MCP loading for Codex. ClaudeRuntime is unchanged and continues to load
-external MCPs from this section through its normal SDK path.
+turns. Codex starts external MCP servers only when the final spawn
+allowlist contains an `mcp__<server>__...` tool. That
+allowlist can come from a role/slot `agents.allowed_tools` entry or the
+team-wide `extra_tools` setting. Set `HARNESS_CODEX_EXTERNAL_MCP=true`
+to restore ambient external MCP loading for Codex. ClaudeRuntime is
+unchanged and continues to load external MCPs from this section through
+its normal SDK path.
 
 CodexRuntime also isolates app-server from operator-owned
 `$CODEX_HOME/config.toml`. The app-server uses a clean per-slot
@@ -4907,7 +4934,7 @@ implementation):
 | `CLAUDE_CONFIG_DIR` | `/data/claude` | Claude OAuth/session dir |
 | `CODEX_HOME` | `/data/codex` | Codex CLI auth dir (`auth.json`). Must point at persistent storage; after deploy run `CODEX_HOME=/data/codex codex login --device-auth` in the container to create the ChatGPT OAuth session. |
 | `HARNESS_CODEX_ENABLED` | unset | Codex runtime feature gate. Must be truthy (`true`, `1`, `yes`, `on`) before `PUT /api/agents/{id}/runtime` or the UI runtime controls can select `runtime=codex`. |
-| `HARNESS_CODEX_EXTERNAL_MCP` | unset / false | When truthy, CodexRuntime ambient-starts UI/file-configured external MCP servers. Default false: only `coord` starts unless a slot's explicit `agents.allowed_tools` override names an external `mcp__<server>__...` tool. |
+| `HARNESS_CODEX_EXTERNAL_MCP` | unset / false | When truthy, CodexRuntime ambient-starts UI/file-configured external MCP servers. Default false: only `coord` starts unless the final spawn allowlist contains an external `mcp__<server>__...` tool from role/slot `agents.allowed_tools` or team-wide `extra_tools`. |
 | `HARNESS_CODEX_RUNTIME_HOME` | `$CODEX_HOME/harness-runtime` | Optional root for per-slot Codex app-server homes. Runtime homes copy `$CODEX_HOME/auth.json` but use a clean config without inherited `mcp_servers`, preventing operator/test MCP config from poisoning harness Codex sessions. |
 | `HARNESS_CODEX_REQUEST_TIMEOUT_SECONDS` | `120` | Codex app-server JSON-RPC request timeout passed to `CodexClient.connect_stdio`; clamped to at least 30s. Covers `initialize`, `thread/start`, `thread/resume`, and similar request/response calls. |
 | `HARNESS_CODEX_STDIO_LIMIT_BYTES` | `8388608` | Codex app-server subprocess stdout/stderr StreamReader line limit for newline-delimited JSON-RPC. Clamped to 256 KiB..64 MiB; prevents large tool/result messages from tripping Python's 64 KiB default and surfacing as false stdio transport failures. |
