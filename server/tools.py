@@ -6358,12 +6358,29 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- evidence: optional object/string with deploy URL, PR/SHA, "
             "checked_at, service, etc."
         ),
+        # Raw JSON schema: task_id/verdict/body are required;
+        # message_to_coach/evidence are genuinely optional. The compact
+        # dict-shorthand is treated as all-required by some MCP/SDK
+        # clients before this handler can apply its own defaults.
         {
-            "task_id": str,
-            "verdict": str,
-            "body": str,
-            "message_to_coach": str,
-            "evidence": Any,
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "verdict": {"type": "string", "enum": ["pass", "fail"]},
+                "body": {"type": "string"},
+                "message_to_coach": {"type": "string"},
+                "evidence": {
+                    "oneOf": [
+                        {"type": "object", "additionalProperties": True},
+                        {"type": "array"},
+                        {"type": "string"},
+                        {"type": "number"},
+                        {"type": "boolean"},
+                    ]
+                },
+            },
+            "required": ["task_id", "verdict", "body"],
+            "additionalProperties": True,
         },
     )
     async def submit_verification_report(args: dict[str, Any]) -> dict[str, Any]:

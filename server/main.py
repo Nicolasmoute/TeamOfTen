@@ -5224,7 +5224,9 @@ async def get_tasks_flow_health() -> dict[str, Any]:
     actually moving' without scraping events."""
     from server import kanban as kanban_mod
     project_id = await resolve_active_project()
-    stages = ["plan", "execute", "audit_syntax", "audit_semantics", "ship"]
+    stages = [
+        "plan", "execute", "audit_syntax", "audit_semantics", "ship", "verify",
+    ]
     out_stages: dict[str, dict[str, Any]] = {}
     stalled_count = 0
 

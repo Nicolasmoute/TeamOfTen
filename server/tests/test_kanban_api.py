@@ -91,7 +91,9 @@ def test_board_groups_by_stage(client: TestClient) -> None:
     r = client.get("/api/tasks/board")
     assert r.status_code == 200
     board = r.json()["board"]
-    assert {"plan", "execute", "audit_syntax", "audit_semantics", "ship"} == set(board.keys())
+    assert {
+        "plan", "execute", "audit_syntax", "audit_semantics", "ship", "verify",
+    } == set(board.keys())
     assert any(t["id"] == "t-2026-05-03-aaaaaaaa" for t in board["plan"])
     assert any(t["id"] == "t-2026-05-03-bbbbbbbb" for t in board["execute"])
     # Archived task is excluded.
@@ -109,6 +111,20 @@ def test_board_priority_sort(client: TestClient) -> None:
     plan_ids = [t["id"] for t in r.json()["board"]["plan"]]
     assert plan_ids[0] == "t-2026-05-03-22222222"  # urgent first
     assert plan_ids[-1] == "t-2026-05-03-11111111"  # low last
+
+
+def test_flow_health_includes_verify_stage_counts(client: TestClient) -> None:
+    import asyncio
+    asyncio.run(_seed(
+        task_id="t-2026-05-03-vvvvvvvv",
+        status="verify",
+    ))
+
+    r = client.get("/api/tasks/flow_health")
+    assert r.status_code == 200
+    stages = r.json()["stages"]
+    assert "verify" in stages
+    assert stages["verify"]["count"] == 1
 
 
 # ----------------------------------------------------------------- /archive
