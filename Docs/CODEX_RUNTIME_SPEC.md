@@ -894,6 +894,16 @@ SDK-internal `Any` — the implementation must treat it as opaque and
 extract a summary string defensively (try common shapes: dict with
 `summary` / `text` / `result` keys, or fall back to repr).
 
+If there is no stored `codex_thread_id` at compact time, CodexRuntime
+does not emit `session_compacted` / `session_transferred` and does
+not set success semantics. It emits `error` for ordinary compact or
+`session_transfer_failed` for transfer mode because no handoff file can
+be written. If `client.compact_thread(thread_id)` raises stale/thread-
+not-found, the same durable-handoff gate applies: CodexRuntime may
+continue only by building a non-empty recent-exchange fallback and
+writing the handoff file; otherwise it preserves `codex_thread_id` and
+the current runtime.
+
 Sketch:
 
 ```python
@@ -959,10 +969,12 @@ When the ratio trips, it:
    path and the silent-failure path emit `auto_compact_failed` and
    return False — symmetric with Claude's failure posture.
 
-The dispatcher then proceeds with the user's original prompt; the
-subsequent prior-session read at `agents.py` returns None (the
-compact cleared `codex_thread_id`), and the fresh Codex thread picks
-up the just-written continuity note from the system prompt assembly.
+On success, the dispatcher then proceeds with the user's original
+prompt; the subsequent prior-session read at `agents.py` returns None
+(the compact cleared `codex_thread_id`), and the fresh Codex thread
+picks up the just-written continuity note from the system prompt
+assembly. On failure, `maybe_auto_compact` emits `auto_compact_failed`
+and leaves the original user turn on the existing stored thread.
 
 **Structural differences from Claude's auto-compact** (intentional;
 documented for future maintainers):
@@ -990,11 +1002,11 @@ documented for future maintainers):
   both enter `maybe_auto_compact` before either claims the spawn
   lock. Claude's recursive path serializes via the inner spawn
   lock; Codex's direct path can fire two `compact_thread` calls
-  back-to-back. In practice, the second one sees a cleared
-  `codex_thread_id` (the first finished before the second's
-  `_get_codex_thread_id` re-read inside `run_manual_compact`) and
-  no-ops via the existing "no codex thread to compact" branch.
-  Acceptable.
+  back-to-back. In practice, the second one may see a cleared
+  `codex_thread_id` if the first finished before the second's
+  `_get_codex_thread_id` re-read inside `run_manual_compact`; that
+  second compact fails closed without emitting `session_compacted` or
+  clearing/flipping anything.
 
 The original "context-pressure signal isn't exposed yet" caveat
 applied before `_codex_session_context_estimate` shipped (that
@@ -1060,13 +1072,15 @@ each runtime's message handler reads the flag:
   no summary, the runtime is **not** flipped — `session_transfer_failed`
   fires and the agent stays put.
 - CodexRuntime (`server/runtimes/codex.py:run_manual_compact`) calls
-  `client.compact_thread(thread_id)`, writes the returned summary to
+  `client.compact_thread(thread_id)`, extracts a non-empty summary or
+  falls back to the recent-exchange log (including stale/thread-not-
+  found compact failures), writes a durable handoff file plus
   `continuity_note`, clears `codex_thread_id`, then performs the same
-  flip + emits `session_transferred`. Codex flips even on empty
-  summary because `compact_thread` already cleared the thread id;
-  not flipping would leave the agent on Codex with no thread to
-  resume — strictly worse than flipping with thin context. Asymmetry
-  is intentional and noted inline.
+  flip + emits `session_transferred(from_runtime, to_runtime, chars,
+  handoff_file)`. If no stored thread exists, or if neither native
+  compact nor the fallback yields continuity material, Codex emits
+  `session_transfer_failed` and preserves both the runtime override
+  and `codex_thread_id`.
 
 **Event vocabulary additions.** The bus carries three new event
 types so the UI can label the timeline as a transfer rather than a

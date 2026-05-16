@@ -2741,12 +2741,13 @@ async def test_codex_run_turn_consumes_prepared_turn_state(
 
 
 class _CompactFakeClient:
-    def __init__(self) -> None:
+    def __init__(self, raw=None) -> None:
         self.calls: list[str] = []
+        self.raw = {"summary": "compact summary"} if raw is None else raw
 
     def compact_thread(self, thread_id):
         self.calls.append(thread_id)
-        return {"summary": "compact summary"}
+        return self.raw
 
 
 async def test_codex_run_manual_compact_uses_native_compact(
@@ -2762,6 +2763,7 @@ async def test_codex_run_manual_compact_uses_native_compact(
     captured = _capture_emit(monkeypatch)
     notes: list[tuple[str, str | None]] = []
     cleared: list[str] = []
+    order: list[str] = []
     client = _CompactFakeClient()
 
     async def fake_get_client(
@@ -2774,11 +2776,22 @@ async def test_codex_run_manual_compact_uses_native_compact(
     ):
         return client
 
+    async def fake_write_handoff(agent_id, summary):
+        order.append("write_handoff")
+        assert agent_id == "p1"
+        assert summary == "compact summary"
+        return "p1-handoff.md"
+
     async def fake_set_note(agent_id, note):
+        order.append("set_note")
         notes.append((agent_id, note))
 
     async def fake_clear(agent_id):
+        order.append("clear_thread")
         cleared.append(agent_id)
+
+    async def fake_clear_exchange(agent_id):
+        order.append("clear_exchange")
 
     monkeypatch.setattr(
         codex_mod,
@@ -2788,7 +2801,9 @@ async def test_codex_run_manual_compact_uses_native_compact(
     monkeypatch.setattr(codex_mod, "_get_codex_thread_id", lambda agent_id: _async_value("tid_1"))
     monkeypatch.setattr(codex_mod, "get_client", fake_get_client)
     monkeypatch.setattr(codex_mod, "_clear_codex_thread_id", fake_clear)
+    monkeypatch.setattr(agentsmod, "_write_handoff_file", fake_write_handoff)
     monkeypatch.setattr(agentsmod, "_set_continuity_note", fake_set_note)
+    monkeypatch.setattr(agentsmod, "_clear_exchange_log", fake_clear_exchange)
 
     tc = TurnContext(
         agent_id="p1",
@@ -2804,10 +2819,537 @@ async def test_codex_run_manual_compact_uses_native_compact(
     await CodexRuntime().run_manual_compact(tc)
 
     assert client.calls == ["tid_1"]
-    assert notes == [("p1", "compact summary")]
+    assert notes[0][0] == "p1"
+    assert "handoffs/p1-handoff.md" in (notes[0][1] or "")
+    assert "compact summary" in (notes[0][1] or "")
     assert cleared == ["p1"]
+    assert order == [
+        "write_handoff",
+        "set_note",
+        "clear_thread",
+        "clear_exchange",
+    ]
     assert tc.turn_ctx["got_result"] is True
     assert captured[-1]["type"] == "session_compacted"
+    assert captured[-1]["chars"] == len("compact summary")
+    assert captured[-1]["handoff_file"] == "p1-handoff.md"
+    assert "summary_preview" not in captured[-1]
+
+
+async def test_codex_run_manual_compact_empty_native_uses_recent_exchange_fallback(
+    monkeypatch, fresh_db,
+) -> None:
+    import server.agents as agentsmod
+    import server.db as dbmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    await dbmod.init_db()
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    captured = _capture_emit(monkeypatch)
+    notes: list[str | None] = []
+    handoffs: list[str] = []
+    cleared: list[str] = []
+    client = _CompactFakeClient(raw={"summary": ""})
+
+    async def fake_get_client(
+        slot,
+        *,
+        cwd,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
+    ):
+        return client
+
+    async def fake_recent(agent_id):
+        return [
+            {
+                "prompt": "What is next?",
+                "response": "Run the focused compact tests.",
+            }
+        ]
+
+    async def fake_write_handoff(agent_id, summary):
+        handoffs.append(summary)
+        return "p1-fallback.md"
+
+    async def fake_set_note(agent_id, note):
+        notes.append(note)
+
+    async def fake_clear(agent_id):
+        cleared.append(agent_id)
+
+    monkeypatch.setattr(
+        codex_mod,
+        "resolve_auth",
+        lambda: _async_value(("chatgpt", {})),
+    )
+    monkeypatch.setattr(
+        codex_mod,
+        "_get_codex_thread_id",
+        lambda agent_id: _async_value("tid_1"),
+    )
+    monkeypatch.setattr(codex_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(codex_mod, "_clear_codex_thread_id", fake_clear)
+    monkeypatch.setattr(agentsmod, "_get_recent_exchanges", fake_recent)
+    monkeypatch.setattr(agentsmod, "_write_handoff_file", fake_write_handoff)
+    monkeypatch.setattr(agentsmod, "_set_continuity_note", fake_set_note)
+    monkeypatch.setattr(
+        agentsmod,
+        "_clear_exchange_log",
+        lambda agent_id: _async_value(None),
+    )
+
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="/compact",
+        system_prompt="",
+        workspace_cwd="C:/work/p1/project",
+        allowed_tools=[],
+        external_mcp_servers={},
+        turn_ctx={},
+    )
+
+    await CodexRuntime().run_manual_compact(tc)
+
+    assert cleared == ["p1"]
+    assert "Codex native compact returned no summary" in handoffs[0]
+    assert "What is next?" in handoffs[0]
+    assert "Run the focused compact tests." in handoffs[0]
+    assert "handoffs/p1-fallback.md" in (notes[0] or "")
+    assert tc.turn_ctx["got_result"] is True
+    assert captured[-1]["type"] == "session_compacted"
+    assert captured[-1]["chars"] == len(handoffs[0])
+    assert captured[-1]["handoff_file"] == "p1-fallback.md"
+
+
+async def test_codex_run_manual_compact_transfer_emits_handoff_metadata(
+    monkeypatch, fresh_db,
+) -> None:
+    import server.agents as agentsmod
+    import server.db as dbmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    await dbmod.init_db()
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    captured = _capture_emit(monkeypatch)
+    flips: list[tuple[str, str]] = []
+    client = _CompactFakeClient()
+
+    async def fake_get_client(
+        slot,
+        *,
+        cwd,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
+    ):
+        return client
+
+    async def fake_flip(agent_id, runtime):
+        flips.append((agent_id, runtime))
+
+    monkeypatch.setattr(
+        codex_mod,
+        "resolve_auth",
+        lambda: _async_value(("chatgpt", {})),
+    )
+    monkeypatch.setattr(
+        codex_mod,
+        "_get_codex_thread_id",
+        lambda agent_id: _async_value("tid_1"),
+    )
+    monkeypatch.setattr(codex_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(
+        codex_mod,
+        "_clear_codex_thread_id",
+        lambda agent_id: _async_value(None),
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_write_handoff_file",
+        lambda agent_id, summary: _async_value("p1-transfer.md"),
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_set_continuity_note",
+        lambda agent_id, note: _async_value(None),
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_clear_exchange_log",
+        lambda agent_id: _async_value(None),
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_resolve_runtime_for",
+        lambda agent_id: _async_value("codex"),
+    )
+    monkeypatch.setattr(agentsmod, "_perform_runtime_transfer_flip", fake_flip)
+
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="/compact",
+        system_prompt="",
+        workspace_cwd="C:/work/p1/project",
+        allowed_tools=[],
+        external_mcp_servers={},
+        turn_ctx={"transfer_to_runtime": "claude"},
+    )
+
+    await CodexRuntime().run_manual_compact(tc)
+
+    assert flips == [("p1", "claude")]
+    assert captured[-1]["type"] == "session_transferred"
+    assert captured[-1]["from_runtime"] == "codex"
+    assert captured[-1]["to_runtime"] == "claude"
+    assert captured[-1]["chars"] == len("compact summary")
+    assert captured[-1]["handoff_file"] == "p1-transfer.md"
+    assert "summary_preview" not in captured[-1]
+
+
+async def test_codex_run_manual_compact_empty_native_without_recent_fails_closed(
+    monkeypatch, fresh_db,
+) -> None:
+    import server.agents as agentsmod
+    import server.db as dbmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    await dbmod.init_db()
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    captured = _capture_emit(monkeypatch)
+    cleared: list[str] = []
+    statuses: list[tuple[str, str]] = []
+    flips: list[str] = []
+    handoff_writes: list[str] = []
+    client = _CompactFakeClient(raw="")
+
+    async def fake_get_client(
+        slot,
+        *,
+        cwd,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
+    ):
+        return client
+
+    async def fake_set_status(agent_id, status):
+        statuses.append((agent_id, status))
+
+    async def fake_flip(agent_id, runtime):
+        flips.append(runtime)
+
+    async def fake_clear(agent_id):
+        cleared.append(agent_id)
+
+    async def fake_write_handoff(agent_id, summary):
+        handoff_writes.append(summary)
+        return "should-not-write.md"
+
+    monkeypatch.setattr(
+        codex_mod,
+        "resolve_auth",
+        lambda: _async_value(("chatgpt", {})),
+    )
+    monkeypatch.setattr(
+        codex_mod,
+        "_get_codex_thread_id",
+        lambda agent_id: _async_value("tid_1"),
+    )
+    monkeypatch.setattr(codex_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(codex_mod, "_clear_codex_thread_id", fake_clear)
+    monkeypatch.setattr(
+        agentsmod,
+        "_get_recent_exchanges",
+        lambda agent_id: _async_value([]),
+    )
+    monkeypatch.setattr(agentsmod, "_write_handoff_file", fake_write_handoff)
+    monkeypatch.setattr(
+        agentsmod,
+        "_set_continuity_note",
+        lambda agent_id, note: _async_value(None),
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_clear_exchange_log",
+        lambda agent_id: _async_value(None),
+    )
+    monkeypatch.setattr(agentsmod, "_set_status", fake_set_status)
+    monkeypatch.setattr(agentsmod, "_perform_runtime_transfer_flip", fake_flip)
+
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="/compact",
+        system_prompt="",
+        workspace_cwd="C:/work/p1/project",
+        allowed_tools=[],
+        external_mcp_servers={},
+        turn_ctx={"transfer_to_runtime": "claude"},
+    )
+
+    await CodexRuntime().run_manual_compact(tc)
+
+    assert client.calls == ["tid_1"]
+    assert cleared == []
+    assert flips == []
+    assert handoff_writes == []
+    assert "got_result" not in tc.turn_ctx
+    assert statuses == [("p1", "error")]
+    assert captured[-1]["type"] == "session_transfer_failed"
+    assert "codex_thread_id preserved" in captured[-1]["reason"]
+
+
+async def test_codex_run_manual_compact_no_thread_fails_without_success_event(
+    monkeypatch, fresh_db,
+) -> None:
+    import server.agents as agentsmod
+    import server.db as dbmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    await dbmod.init_db()
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    captured = _capture_emit(monkeypatch)
+    statuses: list[tuple[str, str]] = []
+    flips: list[str] = []
+
+    monkeypatch.setattr(
+        codex_mod,
+        "resolve_auth",
+        lambda: _async_value(("chatgpt", {})),
+    )
+    monkeypatch.setattr(
+        codex_mod,
+        "_get_codex_thread_id",
+        lambda agent_id: _async_value(None),
+    )
+    monkeypatch.setattr(agentsmod, "_set_status", lambda a, s: _async_value(statuses.append((a, s))))
+    monkeypatch.setattr(
+        agentsmod,
+        "_perform_runtime_transfer_flip",
+        lambda agent_id, runtime: _async_value(flips.append(runtime)),
+    )
+
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="/compact",
+        system_prompt="",
+        workspace_cwd="C:/work/p1/project",
+        allowed_tools=[],
+        external_mcp_servers={},
+        turn_ctx={"transfer_to_runtime": "claude"},
+    )
+
+    await CodexRuntime().run_manual_compact(tc)
+
+    assert flips == []
+    assert "got_result" not in tc.turn_ctx
+    assert statuses == [("p1", "error")]
+    assert captured[-1]["type"] == "session_transfer_failed"
+    assert "no handoff was written" in captured[-1]["reason"]
+    assert not any(
+        ev["type"] in {"session_compacted", "session_transferred"}
+        for ev in captured
+    )
+
+
+class _ThreadNotFoundCompactClient:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def compact_thread(self, thread_id):
+        self.calls.append(thread_id)
+        raise RuntimeError("thread not found")
+
+
+async def test_codex_run_manual_compact_stale_thread_uses_fallback_handoff(
+    monkeypatch, fresh_db,
+) -> None:
+    import server.agents as agentsmod
+    import server.db as dbmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    await dbmod.init_db()
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    captured = _capture_emit(monkeypatch)
+    client = _ThreadNotFoundCompactClient()
+    handoffs: list[str] = []
+    notes: list[str | None] = []
+    cleared: list[str] = []
+
+    async def fake_get_client(
+        slot,
+        *,
+        cwd,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
+    ):
+        return client
+
+    monkeypatch.setattr(
+        codex_mod,
+        "resolve_auth",
+        lambda: _async_value(("chatgpt", {})),
+    )
+    monkeypatch.setattr(
+        codex_mod,
+        "_get_codex_thread_id",
+        lambda agent_id: _async_value("tid_stale"),
+    )
+    monkeypatch.setattr(codex_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(codex_mod, "close_client", lambda agent_id: _async_value(None))
+    monkeypatch.setattr(
+        codex_mod,
+        "_clear_codex_thread_id",
+        lambda agent_id: _async_value(cleared.append(agent_id)),
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_get_recent_exchanges",
+        lambda agent_id: _async_value([
+            {"prompt": "Recover this thread.", "response": "Write a fallback."}
+        ]),
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_write_handoff_file",
+        lambda agent_id, summary: _async_value(handoffs.append(summary) or "p1-stale.md"),
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_set_continuity_note",
+        lambda agent_id, note: _async_value(notes.append(note)),
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_clear_exchange_log",
+        lambda agent_id: _async_value(None),
+    )
+
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="/compact",
+        system_prompt="",
+        workspace_cwd="C:/work/p1/project",
+        allowed_tools=[],
+        external_mcp_servers={},
+        turn_ctx={},
+    )
+
+    await CodexRuntime().run_manual_compact(tc)
+
+    assert client.calls == ["tid_stale"]
+    assert cleared == ["p1"]
+    assert "Codex native compact returned no summary" in handoffs[0]
+    assert "Recover this thread." in handoffs[0]
+    assert "handoffs/p1-stale.md" in (notes[0] or "")
+    assert tc.turn_ctx["got_result"] is True
+    assert captured[-1]["type"] == "session_compacted"
+    assert captured[-1]["chars"] == len(handoffs[0])
+    assert captured[-1]["handoff_file"] == "p1-stale.md"
+
+
+async def test_codex_run_manual_compact_stale_thread_without_recent_fails_closed(
+    monkeypatch, fresh_db,
+) -> None:
+    import server.agents as agentsmod
+    import server.db as dbmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    await dbmod.init_db()
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    captured = _capture_emit(monkeypatch)
+    client = _ThreadNotFoundCompactClient()
+    statuses: list[tuple[str, str]] = []
+    cleared: list[str] = []
+    flips: list[str] = []
+    handoffs: list[str] = []
+
+    async def fake_get_client(
+        slot,
+        *,
+        cwd,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
+    ):
+        return client
+
+    monkeypatch.setattr(
+        codex_mod,
+        "resolve_auth",
+        lambda: _async_value(("chatgpt", {})),
+    )
+    monkeypatch.setattr(
+        codex_mod,
+        "_get_codex_thread_id",
+        lambda agent_id: _async_value("tid_stale"),
+    )
+    monkeypatch.setattr(codex_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(codex_mod, "close_client", lambda agent_id: _async_value(None))
+    monkeypatch.setattr(
+        codex_mod,
+        "_clear_codex_thread_id",
+        lambda agent_id: _async_value(cleared.append(agent_id)),
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_get_recent_exchanges",
+        lambda agent_id: _async_value([]),
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_write_handoff_file",
+        lambda agent_id, summary: _async_value(handoffs.append(summary) or "bad.md"),
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_set_status",
+        lambda agent_id, status: _async_value(statuses.append((agent_id, status))),
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_perform_runtime_transfer_flip",
+        lambda agent_id, runtime: _async_value(flips.append(runtime)),
+    )
+
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="/compact",
+        system_prompt="",
+        workspace_cwd="C:/work/p1/project",
+        allowed_tools=[],
+        external_mcp_servers={},
+        turn_ctx={"transfer_to_runtime": "claude"},
+    )
+
+    await CodexRuntime().run_manual_compact(tc)
+
+    assert client.calls == ["tid_stale"]
+    assert cleared == []
+    assert flips == []
+    assert handoffs == []
+    assert "got_result" not in tc.turn_ctx
+    assert statuses == [("p1", "error")]
+    assert captured[-1]["type"] == "session_transfer_failed"
+    assert "codex_thread_id preserved" in captured[-1]["reason"]
+    assert not any(
+        ev["type"] in {"session_compacted", "session_transferred"}
+        for ev in captured
+    )
 
 
 async def test_codex_maybe_auto_compact_no_thread_returns_false(
