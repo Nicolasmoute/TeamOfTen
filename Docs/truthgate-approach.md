@@ -1,8 +1,8 @@
 # Truthgate - Spec-Compliance Stage for the Kanban Lifecycle
 
-Status: implementation approach. Phase 1 is implemented: `truthgate` is a real task status/board column, backlog promotion enters it without planting or waking a Player role, task rows carry TruthGate scalar fields, and `truthgate -> plan|execute` is rejected until a pass/override verdict is recorded. Phase 2 classifier core is implemented as a library-only package under `server/truthgate/`. Amendment wrapper, targeted audit integration, and provisional closure tooling are later phases.
+Status: implementation approach. Phase 1 is implemented: `truthgate` is a real task status/board column, backlog promotion enters it without planting or waking a Player role, task rows carry TruthGate scalar fields, and `truthgate -> plan|execute` is rejected until a pass/override verdict is recorded. Phase 2 classifier core is implemented as a library-only package under `server/truthgate/`. Phase 3 manual Coach tooling is implemented with `coord_run_truthgate` and `coord_record_truthgate_override`, including task-row persistence and event recording. Amendment wrapper, targeted audit integration, and provisional closure tooling are later phases.
 
-## Implementation status - Phase 2 classifier core
+## Implementation status - Phase 2 classifier core + Phase 3 manual tools
 
 Implemented classifier-core pieces:
 
@@ -12,8 +12,10 @@ Implemented classifier-core pieces:
 - `llm.py`: one-shot primary/fallback wrapper with `agent_id="truthgate"` and classifier ledger attribution.
 - `classifier.py`: per-project lock, cost-cap preflight, sparse-mode routing, strict whole-response JSON parsing, verdict normalization, and truth-basis validation.
 - `sparse.py`, `targeted.py`, and `amendments.py`: sparse pass result, targeted truth-basis reads, and amendment metadata helpers for later phases.
+- `coord_run_truthgate`: Coach-only tool that runs the classifier for a task in `truthgate`, persists verdict/basis/concerns/method/model fields, emits `task_truthgate_started`, `task_truthgate_completed`, and `task_truthgate_blocked` when the verdict requires amendment or clarification. It does not advance the stage or wake a Player.
+- `coord_record_truthgate_override`: Coach-only tool that records `truthgate_coach_override` or `truthgate_emergency_override` with required rationale, emits override/completed events, and marks emergency overrides provisional. It does not advance the stage or wake a Player.
 
-Current mocked-LLM tests cover sparse mode, dense-corpus prompt-budget truncation, slicer ordering, strict parser failure, model validation, basis validation, and per-project concurrency locking. Protected truth mirror tests are temporarily waived by human directive; the matching `truth/` projection should be proposed through the protected flow after the waiver lifts.
+Current mocked-LLM/tool tests cover sparse mode, dense-corpus prompt-budget truncation, slicer ordering, strict parser failure, model validation, basis validation, per-project concurrency locking, Coach-only Phase 3 tools, verdict persistence, blocked needs-change verdicts, override rationale validation, and post-override exit gating. Protected truth mirror tests are temporarily waived by human directive; the matching `truth/` projection should be proposed through the protected flow after the waiver lifts.
 
 ## Core idea
 
