@@ -172,14 +172,14 @@ Rejected entries append `  reason: <reject_reason>`; promoted entries append `  
 `_validate_trajectory()` enforces:
 
 - Non-empty list.
-- Each `stage` ∈ `{plan, execute, audit_syntax, audit_semantics, ship}` (no `archive` — implicit/terminal).
+- Each `stage` ∈ `{plan, execute, audit_syntax, audit_semantics, ship, verify}` (no `archive` — implicit/terminal).
 - No duplicate stages.
 - Stages appear in canonical order.
 - `execute` is mandatory.
 - Each `to` resolves to a `list[str]` of valid Player slots — **advisory only**: Coach reads as a hint when picking an assignee in `coord_approve_stage`. There is no first-claim-wins; pools never auto-resolve from a Player claim. (The lone exception is stall-ladder rung 3 (§10.2), where the harness picks an alternative from `eligible_owners` because Coach has been silent on the rung-2 wake for ≥1h — see §21.4.)
 - **`trajectory[0].to` MUST name exactly one Player** (single-element list, e.g. `['p3']`). The kanban is a log of work Coach has fired at a specific Player; tasks without an assignee aren't on the kanban yet, they're pre-task reasoning. Pool/empty first-stage `to` is rejected at validation. (v2.0.1 tightening, 2026-05-08 — earlier drafts allowed pool/empty first-stage and required a follow-up `coord_approve_stage(next_stage=<same>, assignee=...)` to plant; that two-step shape produced an "unassigned" orphan window on the board and was the wrong UX.)
 - Subsequent entries' `to` may still be a single name, a list (pool), or empty — they remain FYI only. Coach picks each later stage's assignee at `coord_approve_stage` time, which already requires a single named slot.
-- `focus` (optional, audit stages only) is a free-text string for what the auditor should check. **REQUIRED for `audit_semantics`** (rejected if missing or empty regardless of `to` shape — the focus is part of the trajectory contract, not the assignment). Optional for `audit_syntax` (defaults to "match the contract and verify internal soundness").
+- `focus` (optional on audit and verify stages) is a free-text string for what the reviewer/verifier should check. **REQUIRED for `audit_semantics`** (rejected if missing or empty regardless of `to` shape — the focus is part of the trajectory contract, not the assignment). Optional for `audit_syntax` (defaults to "match the contract and verify internal soundness") and `verify`.
 
 The v1.3.13 `coach_review` plan-stage flag is **removed**: v2 makes Coach review every stage transition by default, so the per-stage opt-in is redundant.
 
@@ -195,7 +195,7 @@ For non-trivial work, the **contract** is one of: truth specs (potentially with 
 - **Can insert stages** between current and any future stage. Example: task in `execute`, Coach inserts `audit_semantics` after seeing the commit and deciding semantic review is now warranted.
 - **Can drop unentered stages** the original trajectory had.
 - **Can change `to` candidates** at any unentered stage.
-- **Canonical-order constraint still applies post-reroute** — the validator rejects a reroute whose result violates `plan < execute < audit_syntax < audit_semantics < ship`. So Coach can insert `audit_syntax` between `execute` and `ship`, but not before `execute`.
+- **Canonical-order constraint still applies post-reroute** — the validator rejects a reroute whose result violates `plan < execute < audit_syntax < audit_semantics < ship < verify`. So Coach can insert `audit_syntax` between `execute` and `ship`, but not before `execute`.
 
 Removed-stage role rows are deactivated; added-stage rows are inserted fresh. Stand-down wakes still fire for displaced assignees (carried from v1.3.6). Emits `task_trajectory_changed`.
 
@@ -205,12 +205,12 @@ Note: in v2, mid-stage insertion is a **normal Coach operation**, not an emergen
 
 ## 5 · Roles
 
-Five roles, same as v1: `planner`, `executor`, `auditor_syntax`, `auditor_semantics`, `shipper`. Stored in `task_role_assignments`.
+Six roles: `planner`, `executor`, `auditor_syntax`, `auditor_semantics`, `shipper`, `verifier`. Stored in `task_role_assignments`. `verifier` is optional post-ship/post-deploy verification work; it is only active when Coach explicitly approves a task into `verify`.
 
 ### 5.1 Strict separation
 
 - **Coach** plans, delegates, reviews, advances, archives. Coach never executes, audits, or ships.
-- **Players** execute, review, ship. Coach can also delegate planning to a Player — Coach assigns the planner role via `coord_approve_stage(stage='plan', assignee=<slot>)` when creating the task.
+- **Players** execute, review, ship, and verify. Coach can also delegate planning to a Player — Coach assigns the planner role via `coord_approve_stage(stage='plan', assignee=<slot>)` when creating the task.
 
 ### 5.2 Pools are FYI only
 
@@ -247,7 +247,7 @@ All registered in [server/tools.py](server/tools.py)'s `_tools` map and `ALLOWED
 | Tool | Params | Purpose |
 |---|---|---|
 | `coord_create_task` | `title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?, success_criteria?` | Creates a top-level or child task. Sets `tasks.status` to the trajectory's first stage (or `plan` if no trajectory). **`trajectory[0].to` MUST name exactly one Player** (v2.0.1 tightening, 2026-05-08); pool/empty first-stage `to` is rejected at trajectory validation. The role row plants at create time with that slot as `owner` and the assignee's runtime tool allowlist is switched to the first-stage role, matching `coord_approve_stage` behavior. Subsequent stages' `to` lists never auto-plant — they're FYI only until Coach approves into that stage via `coord_approve_stage`. Emits `task_created` + `task_role_assigned` + `task_stage_changed{from=null, to=<first_stage>}`. The first-stage role row is the only auto-plant; semantically this is "Coach-via-the-trajectory" picking, not the harness picking. **`success_criteria`** is the optional Coach-authored "definition of done" — see §17.3. |
-| `coord_approve_stage` (NEW — N2) | `task_id, next_stage, assignee, note?, success_criteria?` | The single transition tool. Coach authorizes the next stage transition, names the assignee, and provides the wake prompt. `assignee` is required for any non-archive `next_stage`; pass a single slot. `note` is included verbatim in the assignee's wake prompt. Stamps `last_stage_change_at`, deactivates any prior active role row at the target stage (with `task_role_stand_down` wake to displaced Player if any), plants a fresh role row with the named assignee, emits `task_stage_changed` and `task_role_assigned`, fires the wake. The source-stage role row is normally already complete (Player called the appropriate completion tool, which is why Coach is now reviewing); when Coach overrides without source completion (e.g. abandoning a stuck executor), the source role row is also deactivated with stand-down. The same tool covers all transitions: plan→execute, execute→audit_syntax, audit_syntax→execute (re-do), audit_syntax→ship (Coach overrides a FAIL), execute→ship, ship→archive (delivery), and any-stage→archive (cancellation, with `assignee=null` since archive has no role). Replaces v1's `coord_advance_task_stage` and absorbs all `coord_assign_*` responsibility. **`success_criteria`** is consumed only at plan→execute (refines/replaces the value set at `coord_create_task`); ignored on other transitions. The stored value is echoed back in the tool result on advance to ship. See §17.3. |
+| `coord_approve_stage` (NEW — N2) | `task_id, next_stage, assignee, note?, success_criteria?` | The single transition tool. Coach authorizes the next stage transition, names the assignee, and provides the wake prompt. `assignee` is required for any non-archive `next_stage`; pass a single slot. `note` is included verbatim in the assignee's wake prompt. Stamps `last_stage_change_at`, deactivates any prior active role row at the target stage (with `task_role_stand_down` wake to displaced Player if any), plants a fresh role row with the named assignee, emits `task_stage_changed` and `task_role_assigned`, fires the wake. The source-stage role row is normally already complete (Player called the appropriate completion tool, which is why Coach is now reviewing); when Coach overrides without source completion (e.g. abandoning a stuck executor), the source role row is also deactivated with stand-down. The same tool covers all transitions: plan→execute, execute→audit_syntax, audit_syntax→execute (re-do), audit_syntax→ship (Coach overrides a FAIL), execute→ship, ship→verify, ship→archive (skip optional verification), verify→archive, verify→execute/ship (manual follow-up routing), and any-stage→archive (cancellation, with `assignee=null` since archive has no role). Replaces v1's `coord_advance_task_stage` and absorbs all `coord_assign_*` responsibility. **`success_criteria`** is consumed only at plan→execute (refines/replaces the value set at `coord_create_task`); ignored on other transitions. The stored value is echoed back in the tool result on advance to ship. See §17.3. |
 | `coord_archive_task` (NEW — R3) | `task_id, summary` | Coach-only deliberate archive. Writes the user-facing summary, transitions to archive, marks any active role rows complete. The summary lands as a `.sys` row in Coach's pane and is forwarded to Telegram if the originating turn was user-triggered. Use this when a task wraps via natural completion (work delivered) or explicit cancellation (Coach decides not to ship); v1's auto-archive on trajectory-end is gone. |
 | `coord_set_task_trajectory` | `task_id, trajectory` | Mid-flight reroute. v2 semantics per §4.3 — loose constraints, normal Coach operation. |
 | `coord_request_plan_review` (NEW — N3) | `task_id, slot` | When Coach decides plan-mode is useful for a Player's turn, this wakes the Player with plan-mode enabled. The Player produces an ExitPlanMode artifact; on submission a `pending_plan{route='coach'}` event surfaces it to Coach for review before tools are touched. Coach approves (Player proceeds with the plan) or rewrites (Coach calls `coord_approve_stage` with a Coach-composed note instead). |
@@ -284,6 +284,7 @@ These are the rationale for keeping the `## Recent events` rollup in §13: it ba
 | `coord_commit_push` | `message, task_id?, push?, message_to_coach?` | Runs `git add -A && commit && push` in the Player's worktree. Auto-bind logic + misplaced-work detection (v1.3.7) carried forward. Marks the executor role row complete on success. Emits `commit_pushed{task_id, sha, message, message_to_coach, ...}`. |
 | `coord_write_task_spec` | `task_id, body, on_behalf_of?, message_to_coach?` | Writes `spec.md` with frontmatter to the task's working dir; mirrors to kDrive. Marks the planner role row complete. `on_behalf_of` Coach override (v1.3.5) carries over for Codex-runtime Players who can't reach the tool. Emits `task_spec_written{task_id, spec_path, message_to_coach, on_behalf_of?, ...}`. |
 | `coord_submit_audit_report` | `task_id, kind, body, verdict, on_behalf_of?, message_to_coach?` | Writes `audits/audit_<round>_<kind>.md` with frontmatter; records the verdict on the auditor role row; marks the role row complete. `on_behalf_of` carries over. Emits `audit_report_submitted{task_id, kind, verdict, report_path, message_to_coach, on_behalf_of?, ...}`. **Verdict='fail' does NOT auto-revert** (R2) — surfaces to Coach via event log; Coach decides. |
+| `coord_submit_verification_report` | `task_id, verdict, body, message_to_coach?, evidence?` | Verifier-only completion for the optional `verify` stage. Writes `verifications/verification_<round>.md` with frontmatter; records `pass`/`fail` on the active verifier role row; marks the role row complete; resets the verifier to idle tools. Emits `verification_report_submitted{task_id, verdict, report_path, round, verifier_id, evidence?, message_to_coach?}` plus `task_role_completed{role='verifier', artifact_path=report_path}`. **Verdict='fail' does NOT auto-revert, auto-create follow-up work, or archive** — Coach reads the report and decides whether to archive, create a follow-up task, roll back, reroute to execute, or re-ship. |
 | `coord_role_complete` (NEW — collapses v1 `coord_complete_execution` + `coord_mark_shipped`) | `task_id, message_to_coach, artifact_path?` | Generic completion for roles whose real work happens via other tools (non-git executors who wrote a file via `Write` / `coord_save_output` / `coord_write_knowledge`; shippers who merged/published/sent via Bash / external CLIs). Verifies `artifact_path` exists on disk under the project root if passed (v1.3.14 gate); rejects with role row left open if missing. Marks the caller's current-stage role row complete. Emits `task_role_completed{task_id, role, artifact_path?, message_to_coach, ...}`. The role is inferred from the caller's current active role row at the task's current stage — no `role` parameter. Rejects with a clear error when the caller has no active role row on the task ("you have no active role on this task — Coach hasn't assigned you, or your role was already completed/superseded"). |
 | `coord_my_assignments` | (none) | Returns current actionable work for the caller. Same shape as v1. |
 
@@ -310,12 +311,12 @@ All under `/api/tasks` or `/api/tasks/*`, gated by `HARNESS_TOKEN`.
 |---|---|---|
 | GET | `/api/tasks` | List view. Unchanged from v1. |
 | POST | `/api/tasks` | Human task composer. Body `{title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?}`. Creates a top-level or child task in the trajectory's first stage (or `plan` if no trajectory) with `created_by='human'`. The composer omits `trajectory` for the default `[{"stage":"execute","to":[]}]`. |
-| GET | `/api/tasks/board` | Active 5 buckets (`plan` / `execute` / `audit_syntax` / `audit_semantics` / `ship`), priority-sorted then by `created_at`. Unchanged. |
+| GET | `/api/tasks/board` | Active 6 buckets (`plan` / `execute` / `audit_syntax` / `audit_semantics` / `ship` / `verify`), priority-sorted then by `created_at`. |
 | GET | `/api/tasks/archive` | Paginated archive view. Unchanged. |
 | GET | `/api/tasks/flow_health` | Stage counts + subscriber liveness. Unchanged. |
 | GET | `/api/tasks/{id}/assignments` | Role-assignment history. Unchanged. |
 | GET | `/api/projects/{id}/event_log` (NEW — N1, §9) | Paginated per-project event stream. Coach's tick consumes the unread tail; humans browse via the dashboard. Query params: `actor`, `type`, `task_id`, `since`, `limit` (default 50, max 200), `include_read` (default false). |
-| POST | `/api/tasks/{id}/approve_stage` (NEW — backstop for `coord_approve_stage`) | Body `{next_stage, assignee, note?}`. Human-side equivalent for manual interventions. |
+| POST | `/api/tasks/{id}/approve_stage` (NEW — backstop for `coord_approve_stage`) | Body `{next_stage, assignee, note?}`. Human-side equivalent for manual interventions. `next_stage` accepts `verify`; no UI verify actions are required for this backend-only rollout beyond API compatibility. |
 | POST | `/api/tasks/{id}/cancel` | Human cancellation. Equivalent to `coord_archive_task` from the human side; sets `cancelled_at` so the archive view distinguishes cancellation from delivery. |
 | POST | `/api/tasks/{id}/trajectory` | Body `{trajectory}`. Carried forward. |
 | POST | `/api/tasks/{id}/blocked` | Body `{blocked, reason?}`. Unchanged. |
@@ -358,6 +359,7 @@ Every type below produces exactly one row in `project_events` (in addition to th
 - `task_spec_written` — Planner wrote `spec.md`. `payload_pointer = spec_path`. Includes `message_to_coach?`, `on_behalf_of?`.
 - `task_role_completed` — Player called `coord_role_complete` (non-git executor / shipper / etc.). `payload_pointer = artifact_path?`. Includes `role`, `message_to_coach?`, `post_archive: bool` (true when the task was archived before the Player's completion landed — preserves the verification narrative; no stage advance possible).
 - `audit_report_submitted` — Player submitted an audit. `payload_pointer = report_path`. Includes `verdict ∈ {'pass', 'fail'}`, `kind ∈ {'syntax', 'semantics'}`, `kind_round`, `message_to_coach?`, `on_behalf_of?`.
+- `verification_report_submitted` — Player submitted a post-ship verification report. `payload_pointer = report_path`. Includes `verdict ∈ {'pass', 'fail'}`, `round`, `verifier_id`, `evidence?`, `message_to_coach?`. FAIL is evidence for Coach; it does not auto-route.
 - `audit_fail_notification` — sibling event when audit verdict was fail. Carries `kind_round` + `escalate` (true when same-kind fails ≥ 2). Routes `to: 'coach'`.
 - `task_stage_changed` — emitted by `coord_approve_stage`. Payload includes `from`, `to`, `assignee`, `note?`.
 - `task_role_assigned` — emitted alongside `task_stage_changed` when `coord_approve_stage` plants the new role row.
@@ -458,7 +460,7 @@ Players keep their `session_id` across review-wait windows. A Player whose `coor
 
 #### 10.3.1 Auto-compact carryover
 
-`HARNESS_AUTO_COMPACT_THRESHOLD` (default 0.5, lowered from 0.7 on 2026-05-09) — when the prior session's estimated tokens cross 50% of the model's window, the harness runs a compact turn before the user's prompt. Live observation showed the 0.7 trip-wire fired too late: turns in the 60–70% band were already degrading on quality before compaction kicked in. The lower threshold trades extra compact-call cost for more reliable per-turn quality.
+`HARNESS_AUTO_COMPACT_THRESHOLD` (default 0.65, lowered from 0.7 on 2026-05-09, then raised from 0.5 on 2026-05-15 after 0.5 proved too aggressive) — when the prior session's estimated tokens cross 65% of the effective model window, the harness runs a compact turn before the user's prompt. The preflight resolves the same effective model as the actual turn so the threshold matches the pane context bar.
 
 ### 10.4 Board safety ring (NEW — #6)
 
@@ -715,7 +717,7 @@ The kanban lifecycle paragraph in the canonical template at [server/templates/ap
 ```markdown
 ### Task lifecycle (kanban)
 
-Every Coach delegation goes through the kanban. Stages: plan → execute → audit_syntax (Formal Review) → audit_semantics (Semantic Review) → ship → archive. Coach defines an upfront trajectory on `coord_create_task` (`{stage, to, focus?}` list) — it documents the planned path and the candidate slots, but it's FYI only. Coach drives advances explicitly via `coord_approve_stage(task_id, next_stage, assignee, note?)`. There is no auto-routing, no auto-wake on stage change, and no auto-revert on audit fail.
+Every Coach delegation goes through the kanban. Stages: plan → execute → audit_syntax (Formal Review) → audit_semantics (Semantic Review) → ship → optional verify → archive. Coach defines an upfront trajectory on `coord_create_task` (`{stage, to, focus?}` list) — it documents the planned path and the candidate slots, but it's FYI only. Coach drives advances explicitly via `coord_approve_stage(task_id, next_stage, assignee, note?)`. There is no auto-routing, no auto-wake on stage change, and no auto-revert on audit or verification fail.
 
 **For Players:**
 
@@ -727,6 +729,7 @@ Every Coach delegation goes through the kanban. Stages: plan → execute → aud
   - auditor → `coord_submit_audit_report(task_id, kind, body, verdict, message_to_coach?)`
   - shipper (GitHub-backed repo) → `coord_ship_to_dev(task_id)` — exposed in shipper role allowlists, enforces the audit-pass gate, cherry-picks the executor commit onto a temp branch off `origin/dev`, opens a GitHub PR, squash-merges it, closes the shipper role row, and wakes Coach. **Recommended tool for all ship-stage work.** Raw `git push origin ...:dev` bypasses the audit gate and is a pb-005 violation.
   - shipper (no GitHub / manual) → `coord_role_complete(task_id, message_to_coach)` — for environments without a GitHub PAT-in-URL repo_url.
+  - verifier → `coord_submit_verification_report(task_id, verdict, body, message_to_coach?, evidence?)` — for optional post-ship verification. FAIL is reported to Coach only; it does not auto-revert or create follow-up work.
 - **`message_to_coach` is your response.** What you noticed, any caveats, what the next person should know. Write it like you're talking to Coach — because you are.
 - **The kanban does NOT advance until Coach reviews and approves.** Your turn ends when you've called the completion tool. Coach reads on the next tick.
 - **NEVER finish a turn without a `coord_*` update message to Coach.** Even if you called one earlier in the turn — if you did anything since (file read, Bash, more reasoning), call one more; Coach reads your LAST signal. If you have nothing material to add, `coord_send_message(to='coach', body='ack — <one line>')` is the right answer.
@@ -810,7 +813,7 @@ A behavioral rollback to v1 (auto-routing) is **not supported**. The implementat
 
 End-to-end on a deployed Zeabur instance after the implementation PR ships:
 
-1. Full code-and-review pipeline with explicit Coach approvals: `coord_create_task` → `coord_approve_stage(plan, p5)` → `coord_write_task_spec` → `coord_approve_stage(execute, p2)` → `coord_commit_push` → `coord_approve_stage(audit_syntax, p4)` → `coord_submit_audit_report(pass)` → `coord_approve_stage(ship, p2)` → `coord_role_complete` → `coord_archive_task(summary)`.
+1. Full code-and-review pipeline with explicit Coach approvals: `coord_create_task` → `coord_approve_stage(plan, p5)` → `coord_write_task_spec` → `coord_approve_stage(execute, p2)` → `coord_commit_push` → `coord_approve_stage(audit_syntax, p4)` → `coord_submit_audit_report(pass)` → `coord_approve_stage(ship, p2)` → `coord_role_complete` → optional `coord_approve_stage(verify, p6)` → `coord_submit_verification_report(pass|fail)` → `coord_archive_task(summary)`.
 2. Audit FAIL → event log → Coach reads → Coach calls `coord_approve_stage(execute, p2, note=<composed>)` → executor wakes with Coach's prompt.
 3. Pool discipline: trajectory has `to: [p3, p7]`; Coach assigns p3 explicitly; p7 never gets a wake; the kanban refuses any claim path.
 4. Compass `aligned` verdict surfaces in `project_events`; Coach can read the WHY in the next tick.

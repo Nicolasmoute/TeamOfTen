@@ -42,7 +42,7 @@ Dependent specs (subordinate to this document):
   `coord_create_task` is the planned contract; pools are FYI only
   (Coach explicitly assigns one named Player at each transition).
   Stages: plan → execute → audit_syntax → audit_semantics → ship →
-  archive. A new per-project event log feeds Coach's tick context;
+  optional verify → archive. A new per-project event log feeds Coach's tick context;
   pattern-detection counters (Player health, audit aggregator,
   push-time deviation flag, recent-patterns block) surface drift
   proactively. v1 archive at `Docs/kanban-specs-v1-archived.md`.
@@ -1778,10 +1778,13 @@ Manual compact:
 
 Auto-compact:
 
-- Controlled by `HARNESS_AUTO_COMPACT_THRESHOLD`, default 0.5 (lowered from 0.7 on 2026-05-09).
+- Controlled by `HARNESS_AUTO_COMPACT_THRESHOLD`, default 0.65 (lowered from 0.7 on 2026-05-09, then raised from 0.5 on 2026-05-15 after 0.5 proved too aggressive).
 - Estimates session context from Claude CLI JSONL files under
   `CLAUDE_CONFIG_DIR/projects/`.
 - If over threshold, runs a compact turn first.
+- The preflight resolves the same effective model the turn will use (pane
+  override, Coach-set slot override, role default, alias-to-concrete), so the
+  threshold window matches the pane `ctx` bar.
 - If auto-compact produces no summary, it force-clears the session to escape a
   threshold loop.
 
@@ -1925,7 +1928,10 @@ known limitations: see `Docs/CODEX_RUNTIME_SPEC.md` §E.5.
 
 Window resolution: `_context_window_for(model)` returns the per-model
 max. When the UI doesn't pass `?model=`, the server reads the model
-recorded on the latest turn for the active session. For Codex turns,
+recorded on the latest turn for the active session. Auto-compact uses
+the same effective model resolver before its threshold check, so
+auto-wakes that omit a pane model do not fall back to the generic 1M
+window. For Codex turns,
 `token_count.info.model_context_window` from the rollout JSONL is
 stored as a provider-reported exact window and takes precedence over
 the static table. That lets the CTX bar and auto-compact adapt when
@@ -2282,7 +2288,7 @@ so permissions do not depend on the model truthfully passing its identity.
   `task_role_assignments` (the kanban v2 source of truth), falling back to
   `tasks.owner` for archive/non-standard stages where no role row exists.
 - Each task row includes `kind=task`; each row for an active kanban stage
-  (plan/execute/audit_syntax/audit_semantics/ship) includes a
+  (plan/execute/audit_syntax/audit_semantics/ship/verify) includes a
   `stage_role=<role>:<state>` field:
   - `executor:p3` — live assignment with named owner
   - `executor:done` — non-audit role row completed (awaiting Coach advance)
@@ -2328,7 +2334,7 @@ so permissions do not depend on the model truthfully passing its identity.
 - THE single stage-transition tool in v2. Replaces v1's
   `coord_advance_task_stage` and the four `coord_assign_*` variants.
 - `next_stage` ∈ {plan, execute, audit_syntax, audit_semantics, ship,
-  archive}; transition validated against the §3.1 state machine.
+  verify, archive}; transition validated against the §3.1 state machine.
 - `assignee` is required for any non-archive `next_stage`; pass a
   single Player slot. Pools are FYI only — pick one explicit name.
 - Atomically: stamps `last_stage_change_at`; deactivates any prior
@@ -2351,6 +2357,17 @@ so permissions do not depend on the model truthfully passing its identity.
   with the summary in the payload.
 - v2 has NO auto-archive on trajectory completion — every task ends
   with this Coach-written wrap-up.
+
+`coord_submit_verification_report(task_id, verdict, body, message_to_coach?, evidence?)`
+
+- Players only; requires task status `verify` and an active verifier role
+  row for the caller.
+- Writes `verifications/verification_<round>.md`, records `pass`/`fail`
+  on the verifier role row, marks that row complete, resets the verifier
+  to idle tools, emits `verification_report_submitted`, and wakes Coach.
+- `verdict='fail'` does not auto-revert, auto-create follow-up work, or
+  archive. Coach reads the report and decides whether to archive, create
+  a follow-up, roll back, reroute to execute, or re-ship.
 
 `coord_set_task_trajectory(task_id, trajectory)`
 
@@ -2527,6 +2544,9 @@ Current implementation gap:
     `pr_number`, `pr_url`, `executor_sha`.
   - Wakes Coach via `_wake_coach_for_completion`.
 - **Return:** `ok=True` text with `pr_url`, `pr_number`, dev HEAD SHA.
+  If the trajectory includes `verify`, the response reminds Coach to
+  approve the optional post-ship verification stage; it does not
+  transition automatically.
 - Raw `git push origin ...:dev` bypasses this gate and is a pb-005
   violation; use `coord_ship_to_dev` instead.
 
@@ -4814,8 +4834,9 @@ Before each Codex Player spawn, the dispatcher also refreshes
 to the newest active current-stage role row. When the stored JSON no
 longer matches that role allowlist, existing shipper or executor
 assignments pick up newly-added completion tools without a same-stage
-reassignment, and pending ship rows cannot leak `coord_ship_to_dev`
-into an executor turn for another current task.
+reassignment. Pending ship rows cannot leak `coord_ship_to_dev` into an
+executor turn for another current task, and pending verifier rows only
+expose `coord_submit_verification_report` once the task is in `verify`.
 
 **Transient-error retry (2026-05-13)**: `CoordProxyClient.call_tool`
 retries on transport errors (`httpx.ConnectError`, `ReadTimeout`,
@@ -4880,7 +4901,7 @@ implementation):
 | `HARNESS_STALE_TASK_MINUTES` | `15` | Stale task threshold, 0 disables |
 | `HARNESS_STALE_TASK_NOTIFY_INTERVAL_MINUTES` | `30` | Re-notify cadence |
 | `HARNESS_STALE_TASK_CHECK_INTERVAL_SECONDS` | `60` | Watchdog loop cadence |
-| `HARNESS_AUTO_COMPACT_THRESHOLD` | `0.5` | Context fraction for auto-compact (lowered from 0.7 on 2026-05-09) |
+| `HARNESS_AUTO_COMPACT_THRESHOLD` | `0.65` | Context fraction for auto-compact (lowered from 0.7 on 2026-05-09, then raised from 0.5 on 2026-05-15) |
 | `HARNESS_THINKING_BUDGET_TOKENS` | `8000` | Extended-thinking budget when a Player's `thinking_override` (or per-pane toggle) is on. Claude runtime only; clamped ≥ 1024. |
 | `HARNESS_HANDOFF_TOKEN_BUDGET` | `20000` | Recent exchange budget |
 | `HARNESS_STREAM_TOKENS` | `true` | Token delta streaming. Set to `false`/`0`/`no`/`off` to disable (only needed for the rare CLI build that crashes on the underlying flag). |

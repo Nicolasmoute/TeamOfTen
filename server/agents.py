@@ -1927,6 +1927,32 @@ async def _get_agent_model_override(agent_id: str) -> str | None:
     return v if v else None
 
 
+async def _resolve_effective_model_for_turn(
+    agent_id: str,
+    runtime_name: str,
+    requested_model: str | None,
+) -> str | None:
+    """Resolve the model id a turn will use.
+
+    This is intentionally shared by the auto-compact preflight and the
+    actual SDK turn. The context bar also falls back to the latest turn's
+    concrete model, so using the same resolver here keeps "ctx %" and the
+    auto-compact threshold aligned for auto-wakes that do not pass a
+    per-pane model argument.
+    """
+    model = (requested_model or "").strip()
+    if not model:
+        slot_override = await _get_agent_model_override(agent_id)
+        if slot_override and _model_fits_runtime(slot_override, runtime_name):
+            model = slot_override
+    if not model:
+        model = await _get_role_default_model(agent_id, runtime_name) or ""
+    if model:
+        from server.models_catalog import resolve_model_alias
+        model = resolve_model_alias(model)
+    return model or None
+
+
 async def _get_agent_effort_override(agent_id: str) -> int | None:
     """Read agent_project_roles.effort_override (1..4) for the active project.
 
@@ -2544,6 +2570,7 @@ _STAGE_TO_ROLE = {
     "audit_syntax": "auditor_syntax",
     "audit_semantics": "auditor_semantics",
     "ship": "shipper",
+    "verify": "verifier",
 }
 
 
@@ -4071,7 +4098,8 @@ async def _get_agent_allowed_tools_override(
                 "  (t.status = 'execute' AND r.role = 'executor') OR "
                 "  (t.status = 'audit_syntax' AND r.role = 'auditor_syntax') OR "
                 "  (t.status = 'audit_semantics' AND r.role = 'auditor_semantics') OR "
-                "  (t.status = 'ship' AND r.role = 'shipper')"
+                "  (t.status = 'ship' AND r.role = 'shipper') OR "
+                "  (t.status = 'verify' AND r.role = 'verifier')"
                 ") "
                 "ORDER BY "
                 "  CASE WHEN a.current_task_id = r.task_id THEN 0 ELSE 1 END, "
@@ -5475,6 +5503,11 @@ async def run_agent(
 
     _runtime_name = await _resolve_runtime_for(agent_id)
     _runtime = get_runtime(_runtime_name)
+    model = await _resolve_effective_model_for_turn(
+        agent_id,
+        _runtime_name,
+        model,
+    )
     _tc_compact = TurnContext(
         agent_id=agent_id,
         project_id="",  # not consumed by maybe_auto_compact
@@ -5896,28 +5929,15 @@ async def run_agent(
     #      `coord_set_player_model`)
     #   3. runtime-aware per-role team default, set in Settings
     #   4. SDK default (no kwarg)
-    # Resolved here in the dispatcher because the turn ledger row
-    # (turns.model) records what we actually told the SDK to use.
+    # Resolved near the top of the dispatcher before auto-compact so
+    # the trip-wire, ContextBar, and turn ledger all use the same model
+    # window. `model` is already concrete here.
     # The Coach override is silently dropped if it doesn't fit the
     # current runtime — protects against the case where Coach picked a
     # Claude model and the player later flipped to Codex.
-    #
-    # The fit-check happens BEFORE alias resolution because aliases
-    # carry runtime info (`latest_opus` is unambiguously Claude); the
-    # SDK call below sees the post-resolution concrete id.
-    if not model:
-        slot_override = await _get_agent_model_override(agent_id)
-        if slot_override and _model_fits_runtime(slot_override, _runtime_name):
-            model = slot_override
-    if not model:
-        model = await _get_role_default_model(agent_id, _runtime_name)
-    # Resolve tier alias → concrete id. No-op for concrete inputs and
-    # for None/empty (returns "" which the SDK reads as "no override").
-    # All downstream consumers — turns ledger, runtime fit checks,
-    # context-window estimates — see the concrete id.
-    from server.models_catalog import resolve_model_alias
-    if model:
-        model = resolve_model_alias(model)
+    # The fit-check happens inside `_resolve_effective_model_for_turn`
+    # BEFORE alias resolution because aliases carry runtime info
+    # (`latest_opus` is unambiguously Claude).
 
     # plan_mode / effort resolution mirror the model chain:
     #   1. per-pane explicit value (the request kwarg, or None for "no
@@ -5982,11 +6002,8 @@ async def run_agent(
     # query loop, and stale-session retry. The dispatcher's outer
     # try/except below owns post-result exception suppression and
     # the auto-retry counter (universal to all runtimes).
-    from server.runtimes import get_runtime
-    from server.runtimes.base import TurnContext
-
-    runtime_name = await _resolve_runtime_for(agent_id)
-    runtime = get_runtime(runtime_name)
+    runtime_name = _runtime_name
+    runtime = _runtime
     # Pre-flight: refuse to spawn when the workspace dir doesn't exist
     # (and `workspace_dir`'s self-heal mkdir failed — typically a
     # /data volume mount issue, FS read-only, or a path collision).

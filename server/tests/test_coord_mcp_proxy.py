@@ -68,6 +68,20 @@ def test_coord_tool_descriptors_preserve_coach_catalog_semantics() -> None:
     assert objectives["input_schema"]["properties"]["text"]["type"] == "string"
 
 
+def test_submit_verification_report_schema_marks_only_core_fields_required() -> None:
+    """The verifier report tool has optional evidence/message fields.
+    Keep the proxy/SDK schema from rejecting calls that omit them before
+    the Python handler can apply defaults.
+    """
+    descriptors = coord_tool_descriptors("p4")
+    by_name = {d["name"]: d for d in descriptors}
+
+    schema = by_name["coord_submit_verification_report"]["input_schema"]
+    assert schema["required"] == ["task_id", "verdict", "body"]
+    assert "message_to_coach" in schema["properties"]
+    assert "evidence" in schema["properties"]
+
+
 def test_coord_server_default_has_no_non_json_proxy_metadata() -> None:
     """Claude receives the default coord server; it must not include
     function-valued proxy metadata because Claude serializes MCP config

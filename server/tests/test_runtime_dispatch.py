@@ -391,6 +391,72 @@ async def test_run_agent_uses_codex_prepared_resume_flag_for_started_event(
         bus.unsubscribe(q)
 
 
+async def test_run_agent_resolves_effective_model_before_auto_compact(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_db: str,
+    tmp_path,
+) -> None:
+    """Auto-compact must see the same concrete model as the real turn.
+
+    Auto-wakes call run_agent without a per-pane model argument. If the
+    preflight checks `tc.model is None`, `_context_window_for(None)` uses
+    the generic 1M fallback while the UI context endpoint uses the latest
+    concrete turn model, so a Codex thread can show 90% in the pane and
+    still miss the threshold.
+    """
+    import server.db as dbmod
+    await dbmod.init_db()
+
+    import server.agents as agentsmod
+    import server.runtimes as runtimes_mod
+
+    seen: dict[str, object] = {}
+
+    class _Runtime:
+        name = "codex"
+
+        async def maybe_auto_compact(self, tc):
+            seen["compact_model"] = tc.model
+            return False
+
+        async def prepare_turn_start(self, tc):
+            return False
+
+        async def run_turn(self, tc):
+            seen["turn_model"] = tc.model
+            tc.turn_ctx["got_result"] = True
+
+        async def run_manual_compact(self, tc):
+            tc.turn_ctx["got_result"] = True
+
+    workspace = tmp_path / "p1"
+    workspace.mkdir()
+
+    async def runtime_for(agent_id):
+        return "codex"
+
+    async def no_slot_model(agent_id):
+        return None
+
+    async def codex_role_default(agent_id, runtime_name="claude"):
+        assert runtime_name == "codex"
+        return "latest_gpt"
+
+    async def workspace_for(agent_id):
+        return workspace
+
+    monkeypatch.setattr(agentsmod, "_resolve_runtime_for", runtime_for)
+    monkeypatch.setattr(runtimes_mod, "get_runtime", lambda name: _Runtime())
+    monkeypatch.setattr(agentsmod, "_get_agent_model_override", no_slot_model)
+    monkeypatch.setattr(agentsmod, "_get_role_default_model", codex_role_default)
+    monkeypatch.setattr(agentsmod, "workspace_dir", workspace_for)
+
+    await agentsmod.run_agent("p1", "hello")
+
+    assert seen["compact_model"] == "gpt-5.5"
+    assert seen["turn_model"] == "gpt-5.5"
+
+
 async def test_run_agent_passes_codex_role_allowlist_to_mcp_config(
     monkeypatch: pytest.MonkeyPatch,
     fresh_db: str,
