@@ -18,6 +18,7 @@ on those background tasks for their own correctness.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -82,6 +83,7 @@ async def _plant_role(
     role: str,
     owner: str | None = None,
     completed: bool = False,
+    focus: str | None = None,
 ) -> None:
     c = await configured_conn()
     try:
@@ -91,12 +93,12 @@ async def _plant_role(
         await c.execute(
             "INSERT INTO task_role_assignments "
             "(task_id, role, eligible_owners, owner, assigned_at, "
-            "claimed_at, completed_at) "
+            "claimed_at, completed_at, focus) "
             "VALUES (?, ?, '[]', ?, "
             "strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
             "strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
-            f"{completed_sql})",
-            (task_id, role, owner),
+            f"{completed_sql}, ?)",
+            (task_id, role, owner, focus),
         )
         await c.commit()
     finally:
@@ -126,6 +128,33 @@ async def _seed_ship_event(
             "(project_id, actor, type, task_id, payload_json, payload_pointer) "
             "VALUES ('misc', 'p3', 'task_shipped_to_dev', ?, ?, ?)",
             (task_id, json.dumps(payload), ship_sha),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+
+async def _seed_verification_event(
+    *,
+    task_id: str,
+    verdict: str = "fail",
+    report_path: str = "projects/misc/working/tasks/t-2026-05-03-vvvvvvvv/verifications/verification_1.md",
+) -> None:
+    payload = {
+        "task_id": task_id,
+        "verdict": verdict,
+        "report_path": report_path,
+        "round": 1,
+        "verifier_id": "p4",
+        "message_to_coach": "smoke failed",
+    }
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO project_events "
+            "(project_id, actor, type, task_id, payload_json, payload_pointer) "
+            "VALUES ('misc', 'p4', 'verification_report_submitted', ?, ?, ?)",
+            (task_id, json.dumps(payload), report_path),
         )
         await c.commit()
     finally:
@@ -182,6 +211,52 @@ def test_flow_health_includes_verify_stage_counts(client: TestClient) -> None:
     stages = r.json()["stages"]
     assert "verify" in stages
     assert stages["verify"]["count"] == 1
+
+
+def test_board_includes_postship_context(client: TestClient) -> None:
+    import asyncio
+    task_id = "t-2026-05-03-vvvvvvvv"
+    asyncio.run(_seed(task_id=task_id, status="verify"))
+    asyncio.run(_seed_ship_event(task_id=task_id))
+    asyncio.run(_seed_verification_event(task_id=task_id))
+
+    r = client.get("/api/tasks/board")
+    assert r.status_code == 200
+    task = next(t for t in r.json()["board"]["verify"] if t["id"] == task_id)
+    assert task["latest_ship_evidence"]["pr_number"] == 42
+    assert task["latest_ship_evidence"]["deploy_target"] == "dev"
+    assert task["latest_verification"]["verdict"] == "fail"
+    assert task["latest_verification"]["report_path"].endswith("verification_1.md")
+
+
+def test_verify_card_contract_uses_verifier_assignment_not_stale_owner(
+    client: TestClient,
+) -> None:
+    import asyncio
+    task_id = "t-2026-05-03-vowner01"
+    verifier_focus = "Verify dev deployment after PR #42"
+    asyncio.run(_seed(task_id=task_id, status="verify", owner="p2"))
+    asyncio.run(_plant_role(
+        task_id=task_id,
+        role="verifier",
+        owner="p4",
+        focus=verifier_focus,
+    ))
+
+    r = client.get("/api/tasks/board")
+    assert r.status_code == 200
+    task = next(t for t in r.json()["board"]["verify"] if t["id"] == task_id)
+    active = [
+        a for a in task["assignments"]
+        if a["role"] == "verifier" and not a["completed_at"]
+    ]
+    assert task["owner"] == "p2"
+    assert len(active) == 1
+    assert active[0]["owner"] == "p4"
+    assert active[0]["focus"] == verifier_focus
+
+    js = (Path(__file__).parents[1] / "static" / "kanban.js").read_text()
+    assert 'if (status === "verify") return "verifier";' in js
 
 
 # ----------------------------------------------------------------- /archive
