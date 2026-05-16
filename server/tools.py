@@ -720,6 +720,86 @@ async def _has_completed_shipper(c: Any, task_id: str) -> bool:
     return bool(dict(row).get("completed_at"))
 
 
+def _ship_verify_manual_override_requested(note: str) -> bool:
+    """Explicit escape hatch for manual post-ship evidence.
+
+    Coach must make the override visible in the verifier's wake note; an
+    unadorned ship→verify approval should never dispatch verification
+    when no `task_shipped_to_dev` event exists.
+    """
+    lowered = note.lower()
+    return (
+        "[manual verify override]" in lowered
+        or "[manual ship verify override]" in lowered
+    )
+
+
+async def _latest_ship_to_dev_evidence(
+    c: Any, task_id: str,
+) -> dict[str, Any] | None:
+    """Return the latest task_shipped_to_dev evidence for verifier handoff."""
+    cur = await c.execute(
+        "SELECT ts, payload_json, payload_pointer FROM project_events "
+        "WHERE task_id = ? AND type = 'task_shipped_to_dev' "
+        "ORDER BY ts DESC, id DESC LIMIT 1",
+        (task_id,),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return None
+    raw = dict(row)
+    try:
+        payload = json.loads(raw.get("payload_json") or "{}")
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    ship_sha = (
+        payload.get("ship_sha")
+        or payload.get("merge_sha")
+        or raw.get("payload_pointer")
+        or ""
+    )
+    return {
+        "ts": raw.get("ts"),
+        "pr_url": payload.get("pr_url") or "",
+        "pr_number": payload.get("pr_number"),
+        "ship_sha": ship_sha,
+        "deploy_target": (
+            payload.get("deploy_target")
+            or payload.get("target")
+            or "dev"
+        ),
+    }
+
+
+def _format_ship_verify_context(
+    evidence: dict[str, Any] | None,
+    *,
+    manual_override: bool = False,
+) -> str:
+    if not evidence:
+        return (
+            "Post-ship evidence: [manual verify override] no "
+            "task_shipped_to_dev event was found; shipper role was "
+            "complete and Coach explicitly requested manual verification."
+        )
+    pr_number = evidence.get("pr_number")
+    pr_url = evidence.get("pr_url") or "unrecorded"
+    ship_sha = evidence.get("ship_sha") or "unrecorded"
+    deploy_target = evidence.get("deploy_target") or "dev"
+    pr_part = (
+        f"PR #{pr_number} {pr_url}" if pr_number else f"PR {pr_url}"
+    )
+    prefix = "Post-ship evidence"
+    if manual_override:
+        prefix += " [manual verify override]"
+    return (
+        f"{prefix}: deploy_target={deploy_target}; "
+        f"ship_sha={ship_sha}; {pr_part}."
+    )
+
+
 # Auditor / shipper / planner roles that Coach can assign. Mirror of
 # the task_role_assignments.role CHECK constraint.
 ROLE_NAMES: frozenset[str] = frozenset({
@@ -3022,6 +3102,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "ship_sha": merge_sha,
                 "pr_number": pr_number,
                 "pr_url": pr_url,
+                "deploy_target": "dev",
                 "executor_sha": executor_sha,
                 "to": "coach",
             }
@@ -3048,7 +3129,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         return _ok(
             f"Task {task_id} shipped to dev.\n"
             f"PR: {pr_url} (#{pr_number}) — squash-merged.\n"
-            f"Dev HEAD: {merge_sha}.\n"
+            f"Deploy target: dev.\n"
+            f"Ship SHA: {merge_sha}.\n"
             f"Shipper role complete. Coach has been woken."
             f"{verify_hint}"
         )
@@ -7409,6 +7491,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         displaced_target: list[str] = []
         displaced_source: list[str] = []
         old_status: str | None = None
+        ship_verify_context = ""
         try:
             cur = await c.execute(
                 "SELECT status, owner, success_criteria FROM tasks "
@@ -7466,6 +7549,39 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             ):
                 return _err(
                     f"invalid transition: {old_status} → {next_stage}"
+                )
+
+            if old_status == "ship" and next_stage == "verify":
+                evidence = await _latest_ship_to_dev_evidence(c, task_id)
+                shipper_complete = await _has_completed_shipper(c, task_id)
+                manual_override = _ship_verify_manual_override_requested(note)
+                if not evidence and not shipper_complete:
+                    return _err(
+                        f"ship → verify requires post-ship evidence before "
+                        f"verifier work is dispatched. No latest "
+                        f"task_shipped_to_dev event was found for "
+                        f"{task_id}, and the active shipper role is not "
+                        f"complete. Have the shipper call "
+                        f"coord_ship_to_dev(task_id={task_id!r}) first "
+                        f"(preferred), or complete the shipper role and "
+                        f"retry with note starting "
+                        f"[manual verify override] only for a documented "
+                        f"manual ship."
+                    )
+                if not evidence and not manual_override:
+                    return _err(
+                        f"ship → verify found a completed shipper role but "
+                        f"no task_shipped_to_dev event for {task_id}. To "
+                        f"avoid silent verification before post-ship "
+                        f"evidence exists, retry only after "
+                        f"coord_ship_to_dev emits ship evidence, or use an "
+                        f"explicit manual path: start note with "
+                        f"[manual verify override] and include the PR URL/"
+                        f"number, ship SHA, and deploy target for the "
+                        f"verifier."
+                    )
+                ship_verify_context = _format_ship_verify_context(
+                    evidence, manual_override=manual_override and bool(evidence),
                 )
 
             now = _now_iso()
@@ -7724,10 +7840,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         # turn-end reminder is appended in either case.
         if next_stage != "archive" and assignee:
             from server.agents import maybe_wake_agent
-            wake_body = _with_player_reminder(note or (
+            base_wake = note or (
                 f"Coach approved your move on task {task_id} to stage "
                 f"{next_stage!r} as {target_role}."
-            ))
+            )
+            if ship_verify_context:
+                base_wake = f"{base_wake}\n\n{ship_verify_context}"
+            wake_body = _with_player_reminder(base_wake)
             try:
                 await maybe_wake_agent(
                     assignee, wake_body,
@@ -7765,6 +7884,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             criteria_echo = (
                 f" You defined done as: {stored_success_criteria}"
             )
+        ship_verify_echo = (
+            f" {ship_verify_context}" if ship_verify_context else ""
+        )
         return _ok(
             f"Approved {task_id}: {old_status} → {next_stage} "
             f"({target_role} → {assignee}){suffix_note}. "
@@ -7776,7 +7898,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"Planted {assignee}'s role row; woke them with a "
                 f"generic brief — use note= to pass context directly."
             )
-            + f"{criteria_echo}"
+            + f"{criteria_echo}{ship_verify_echo}"
         )
 
     @tool(

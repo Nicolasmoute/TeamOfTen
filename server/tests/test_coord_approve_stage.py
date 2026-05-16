@@ -19,6 +19,7 @@ import asyncio
 import json
 from typing import Any
 
+import server.agents as agents_mod
 from server.db import configured_conn, init_db
 from server.events import bus
 from server.tools import build_coord_server
@@ -96,6 +97,49 @@ async def _plant_role(
         )
         await c.commit()
         return cur.lastrowid
+    finally:
+        await c.close()
+
+
+async def _complete_role(*, task_id: str, role: str) -> None:
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE task_role_assignments SET completed_at = "
+            "strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            "WHERE task_id = ? AND role = ? AND superseded_by IS NULL",
+            (task_id, role),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+
+async def _seed_ship_event(
+    *,
+    task_id: str = "t-2026-05-07-aaaa1111",
+    ship_sha: str = "aabbccdd11223344556677889900aabbccdd1122",
+    pr_number: int = 42,
+    pr_url: str = "https://github.com/owner/repo/pull/42",
+    deploy_target: str = "dev",
+) -> None:
+    payload = {
+        "task_id": task_id,
+        "ship_sha": ship_sha,
+        "pr_number": pr_number,
+        "pr_url": pr_url,
+        "deploy_target": deploy_target,
+        "executor_sha": "ffee00112233445566778899aabbccddeeff0011",
+    }
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "INSERT INTO project_events "
+            "(project_id, actor, type, task_id, payload_json, payload_pointer) "
+            "VALUES ('misc', 'p3', 'task_shipped_to_dev', ?, ?, ?)",
+            (task_id, json.dumps(payload), ship_sha),
+        )
+        await c.commit()
     finally:
         await c.close()
 
@@ -422,7 +466,7 @@ async def test_approve_stage_ship_sets_ship_gate_allowed_tool(
     assert "mcp__coord__coord_approve_stage" not in tools
 
 
-async def test_approve_stage_ship_to_verify_sets_verifier_tools(
+async def test_approve_stage_ship_to_verify_rejects_without_ship_evidence(
     fresh_db: str,
 ) -> None:
     await init_db()
@@ -430,7 +474,54 @@ async def test_approve_stage_ship_to_verify_sets_verifier_tools(
     await _plant_role(task_id="t-2026-05-07-aaaa1111", role="shipper", owner="p2")
 
     server = _server_for("coach")
-    _ok_text(await _handler(server, "approve_stage")({
+    err = _err_text(await _handler(server, "approve_stage")({
+        "task_id": "t-2026-05-07-aaaa1111",
+        "next_stage": "verify",
+        "assignee": "p4",
+        "note": "verify dev deployment",
+    }))
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            ("t-2026-05-07-aaaa1111",),
+        )
+        task = dict(await cur.fetchone())
+        cur = await c.execute(
+            "SELECT role, owner, completed_at, superseded_by "
+            "FROM task_role_assignments WHERE task_id = ? "
+            "ORDER BY id",
+            ("t-2026-05-07-aaaa1111",),
+        )
+        roles = [dict(r) for r in await cur.fetchall()]
+    finally:
+        await c.close()
+
+    assert "ship → verify requires post-ship evidence" in err
+    assert "task_shipped_to_dev" in err
+    assert task["status"] == "ship"
+    assert not any(r["role"] == "verifier" for r in roles)
+
+
+async def test_approve_stage_ship_to_verify_sets_verifier_tools_and_evidence(
+    fresh_db: str, monkeypatch,
+) -> None:
+    await init_db()
+    await _seed_task(status="ship", owner="p2")
+    await _plant_role(task_id="t-2026-05-07-aaaa1111", role="shipper", owner="p2")
+    await _complete_role(task_id="t-2026-05-07-aaaa1111", role="shipper")
+    await _seed_ship_event()
+    wakes: list[tuple[str, str]] = []
+
+    async def _rec(slot: str, prompt: str = "", **kw: Any) -> bool:
+        wakes.append((slot, prompt))
+        return True
+
+    monkeypatch.setattr(agents_mod, "maybe_wake_agent", _rec)
+
+    server = _server_for("coach")
+    text = _ok_text(await _handler(server, "approve_stage")({
         "task_id": "t-2026-05-07-aaaa1111",
         "next_stage": "verify",
         "assignee": "p4",
@@ -464,6 +555,13 @@ async def test_approve_stage_ship_to_verify_sets_verifier_tools(
         and r["superseded_by"] is None
         for r in roles
     )
+    assert "deploy_target=dev" in text
+    assert "ship_sha=aabbccdd11223344556677889900aabbccdd1122" in text
+    assert "PR #42 https://github.com/owner/repo/pull/42" in text
+    assert wakes and wakes[-1][0] == "p4"
+    assert "deploy_target=dev" in wakes[-1][1]
+    assert "ship_sha=aabbccdd11223344556677889900aabbccdd1122" in wakes[-1][1]
+    assert "PR #42 https://github.com/owner/repo/pull/42" in wakes[-1][1]
     tools = set(json.loads(agent["allowed_tools"]))
     assert "mcp__coord__coord_submit_verification_report" in tools
     assert "mcp__coord__coord_ship_to_dev" not in tools
