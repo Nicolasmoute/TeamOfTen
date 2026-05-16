@@ -1,8 +1,8 @@
 # Truthgate - Spec-Compliance Stage for the Kanban Lifecycle
 
-Status: implementation approach. Phase 1 is implemented: `truthgate` is a real task status/board column, backlog promotion enters it without planting or waking a Player role, task rows carry TruthGate scalar fields, and `truthgate -> plan|execute` is rejected until a pass/override verdict is recorded. Phase 2 classifier core is implemented as a library-only package under `server/truthgate/`. Phase 3 manual Coach tooling is implemented with `coord_run_truthgate` and `coord_record_truthgate_override`, including task-row persistence and event recording. Phase 4 protected amendment wrapper is implemented with `coord_propose_truth_amendment` over the existing file-write proposal flow. Phase 5 attention surfaces are implemented for Kanban card chips, Coach coordination-block rollups, EnvPane pending-action visibility, and compact timeline events. Phase 6 targeted audit integration is implemented: auditor wakes include targeted TruthGate context and audit PASS fails closed when the cited basis is violated or cannot be checked. Provisional closure tooling remains a later phase.
+Status: implementation approach. Phase 1 is implemented: `truthgate` is a real task status/board column, backlog promotion enters it without planting or waking a Player role, task rows carry TruthGate scalar fields, and `truthgate -> plan|execute` is rejected until a pass/override verdict is recorded. Phase 2 classifier core is implemented as a library-only package under `server/truthgate/`. Phase 3 manual Coach tooling is implemented with `coord_run_truthgate` and `coord_record_truthgate_override`, including task-row persistence and event recording. Phase 4 protected amendment wrapper is implemented with `coord_propose_truth_amendment` over the existing file-write proposal flow. Phase 5 attention surfaces are implemented for Kanban card chips, Coach coordination-block rollups, EnvPane pending-action visibility, and compact timeline events. Phase 6 targeted audit integration is implemented: auditor wakes include targeted TruthGate context and audit PASS fails closed when the cited basis is violated or cannot be checked. Phase 7 provisional closure is implemented with `coord_record_provisional_closure` and delivered-archive gates.
 
-## Implementation status - Phase 2 classifier core + Phase 3 manual tools + Phase 6 targeted audit
+## Implementation status - implemented phases
 
 Implemented classifier-core pieces:
 
@@ -15,8 +15,9 @@ Implemented classifier-core pieces:
 - `coord_run_truthgate`: Coach-only tool that runs the classifier for a task in `truthgate`, persists verdict/basis/concerns/method/model fields, emits `task_truthgate_started`, `task_truthgate_completed`, and `task_truthgate_blocked` when the verdict requires amendment or clarification. Existing verdicts are preserved unless Coach passes `force=true`; classifier failures fail closed by blocking the task without recording a pass/override verdict. It does not advance the stage or wake a Player.
 - `coord_record_truthgate_override`: Coach-only tool that records `truthgate_coach_override` or `truthgate_emergency_override` with required rationale, emits override/completed events, and marks emergency overrides provisional. Emergency overrides may store an optional `closure_reference` for later reconciliation. It does not advance the stage or wake a Player.
 - `coord_propose_truth_amendment`: Coach and active-Player-role wrapper that queues a normal protected `file_write_proposals` row with `scope="truth"`, `metadata_json`, and `originating_task_id`. It does not write `truth/` directly and preserves the existing human approve/deny flow. `draft_instruction` / LLM amendment drafting remains deferred.
+- `coord_record_provisional_closure`: Coach-only tool that validates and stores a provisional task's `closure_reference`, emits `task_provisional_closure_recorded`, and does not advance the stage or wake a Player. Delivered archive through `coord_archive_task` or `approve_stage(next_stage="archive")` rejects provisional tasks until closure is valid; human cancellation remains available and is recorded as cancellation.
 
-Current mocked-LLM/tool tests cover sparse mode, dense-corpus prompt-budget truncation, slicer ordering, strict parser failure, model validation, basis validation, per-project concurrency locking, Coach-only Phase 3 tools, verdict persistence, blocked needs-change verdicts, force-rerun protection, classifier-error fail-closed behavior, override rationale validation, post-override exit gating, Phase 4 amendment proposal approval/denial correlation, and Phase 6 targeted audit wake/PASS-guard behavior. Protected truth mirror tests are temporarily waived by human directive; the matching `truth/` projection should be proposed through the protected flow after the waiver lifts.
+Current mocked-LLM/tool tests cover sparse mode, dense-corpus prompt-budget truncation, slicer ordering, strict parser failure, model validation, basis validation, per-project concurrency locking, Coach-only Phase 3 tools, verdict persistence, blocked needs-change verdicts, force-rerun protection, classifier-error fail-closed behavior, override rationale validation, post-override exit gating, Phase 4 amendment proposal approval/denial correlation, Phase 6 targeted audit wake/PASS-guard behavior, and Phase 7 provisional closure/archive gating. Protected truth mirror tests are temporarily waived by human directive; the matching `truth/` projection should be proposed through the protected flow after the waiver lifts.
 
 ## Core idea
 
@@ -234,12 +235,12 @@ The override decision piggybacks on Coach's normal backlog-promotion turn. It sh
 Emergency overrides and mid-execute truth discoveries may allow work to proceed provisionally. Provisional tasks cannot fully archive until Coach records a `closure_reference` with one of these forms:
 
 ```text
-amendment:<proposal_id>        # links to an approved or still-pending truth amendment proposal
+amendment:<proposal_id>        # links to a truth amendment proposal; delivered archive requires approved status
 none_needed:<rationale>        # non-empty rationale explaining why no truth change is warranted
 rollback:<task_id>             # follow-up task that will undo or neutralize the provisional work
 ```
 
-This preserves the ability to fix urgent issues without letting emergency work silently rewrite project truth.
+This preserves the ability to fix urgent issues without letting emergency work silently rewrite project truth. The closure tool accepts pending amendment proposals for tracking, but final delivered archive requires `amendment:<proposal_id>` to reference an approved `truth/` proposal. Cancellation can still archive a task with `cancelled_at`; that path is not a delivered closure.
 
 ## Relationship to existing systems
 

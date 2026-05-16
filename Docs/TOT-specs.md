@@ -2366,8 +2366,24 @@ so permissions do not depend on the model truthfully passing its identity.
 - Deliberate archive with a user-facing summary. Marks every active
   role row complete, transitions to archive, emits `task_archived`
   with the summary in the payload.
+- Delivered archive rejects provisional TruthGate emergency-override
+  tasks until Coach records a valid `closure_reference` with
+  `coord_record_provisional_closure`. `amendment:<proposal_id>`
+  closures must reference an approved `truth/` proposal before archive;
+  `none_needed:<rationale>` and `rollback:<task_id>` are accepted when
+  their references validate.
 - v2 has NO auto-archive on trajectory completion — every task ends
   with this Coach-written wrap-up.
+
+`coord_record_provisional_closure(task_id, closure_reference)`
+
+- Coach only.
+- Records the reconciliation reference required before a provisional
+  task can be delivered to archive. Accepted forms:
+  `amendment:<proposal_id>`, `none_needed:<rationale>`, and
+  `rollback:<task_id>`.
+- Emits `task_provisional_closure_recorded`. Does not move the task or
+  wake a Player.
 
 `coord_submit_verification_report(task_id, verdict, body, message_to_coach?, evidence?)`
 
