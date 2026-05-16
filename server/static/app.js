@@ -18,7 +18,7 @@ import {
   renderDiffBody,
 } from "/static/tools.js";
 import { CompassPane, createCompassEventRouter } from "/static/compass.js?v=1778671319";
-import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js?v=1778952032";
+import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js?v=1778973038";
 import { PlaybookPane, createPlaybookEventRouter } from "/static/playbook.js";
 
 const html = htm.bind(h);
@@ -41,6 +41,10 @@ const KANBAN_FORWARD_TYPES = new Set([
   "task_role_called", "task_role_stand_down",
   "task_role_completed", "task_drift_detected",
   "task_stage_stale", "task_workflow_set",
+  "task_truthgate_started", "task_truthgate_completed",
+  "task_truthgate_blocked", "task_truthgate_override_recorded",
+  "truth_amendment_proposed", "truth_amendment_resolved",
+  "task_provisional_closure_recorded", "task_truth_basis_stale",
   "audit_report_submitted", "audit_fail_notification",
   "verification_report_submitted",
   "compass_audit_logged",
@@ -56,6 +60,7 @@ const KANBAN_FORWARD_TYPES = new Set([
 // chip from blowing up when a task is in audit_*; archive isn't
 // rendered (the task is gone from current_task_id by then).
 const KANBAN_STAGE_SHORT = {
+  truthgate: "gate",
   plan: "plan",
   execute: "exec",
   audit_syntax: "syn",
@@ -7324,6 +7329,7 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, active
         <button class="env-close" onClick=${onClose} title="Collapse">×</button>
       </header>
       <div class="env-body">
+        <${EnvTruthGateAttentionSection} conversations=${conversations} />
         <${EnvAttentionSection}
           open=${attentionOpen}
           onDismiss=${onDismissAttention}
@@ -7457,6 +7463,106 @@ function saveDismissedAttention(ids) {
   } catch (_) {
     // disabled localStorage — silent no-op.
   }
+}
+
+function EnvTruthGateAttentionSection({ conversations }) {
+  const [items, setItems] = useState({
+    amendments: [],
+    provisional: [],
+    sparse: [],
+  });
+  const refresh = useCallback(async () => {
+    try {
+      const [boardRes, proposalRes] = await Promise.all([
+        authFetch("/api/tasks/board"),
+        authFetch("/api/file-write-proposals?status=pending&scope=truth"),
+      ]);
+      const next = { amendments: [], provisional: [], sparse: [] };
+      if (proposalRes.ok) {
+        const data = await proposalRes.json();
+        next.amendments = Array.isArray(data.proposals) ? data.proposals : [];
+      }
+      if (boardRes.ok) {
+        const data = await boardRes.json();
+        const board = data.board || data || {};
+        const tasks = [];
+        for (const arr of Object.values(board)) {
+          if (Array.isArray(arr)) tasks.push(...arr);
+        }
+        next.provisional = tasks.filter((t) =>
+          t && t.provisional && !(t.closure_reference || "").trim()
+        );
+        next.sparse = tasks.filter((t) => t && t.truthgate_warning);
+      }
+      setItems(next);
+    } catch (e) {
+      console.error("TruthGate attention load failed", e);
+    }
+  }, []);
+
+  useEffect(() => { refresh(); }, [refresh]);
+  const eventCount = useMemo(() => {
+    let n = 0;
+    const watched = new Set([
+      "task_truthgate_started", "task_truthgate_completed",
+      "task_truthgate_blocked", "task_truthgate_override_recorded",
+      "truth_amendment_proposed", "truth_amendment_resolved",
+      "file_write_proposal_created", "file_write_proposal_approved",
+      "file_write_proposal_denied", "file_write_proposal_cancelled",
+      "file_write_proposal_superseded",
+      "task_provisional_closure_recorded", "task_truth_basis_stale",
+      "task_updated",
+    ]);
+    for (const list of conversations.values()) {
+      for (const ev of list) if (watched.has(ev.type)) n++;
+    }
+    return n;
+  }, [conversations]);
+  useEffect(() => {
+    if (eventCount > 0) refresh();
+  }, [eventCount, refresh]);
+
+  const count = items.amendments.length + items.provisional.length + items.sparse.length;
+  if (count === 0) return null;
+  return html`
+    <section class="env-section env-attention env-truthgate-attention">
+      <h3 class="env-section-title">
+        TruthGate attention <span class="env-count">${count}</span>
+      </h3>
+      <div class="env-attention-list">
+        ${items.amendments.map((p) => html`
+          <div class="env-attention-item normal" key=${"tg-prop-" + p.id}>
+            <div class="env-attention-head">
+              <span class="env-attention-who">truth</span>
+              <span class="env-attention-ts">proposal #${p.id}</span>
+            </div>
+            <div class="env-attention-subject">Pending amendment: truth/${p.path}</div>
+            <div class="env-attention-body">${p.summary || ""}</div>
+          </div>
+        `)}
+        ${items.provisional.map((t) => html`
+          <div class="env-attention-item blocker" key=${"tg-prov-" + t.id}>
+            <div class="env-attention-head">
+              <span class="env-attention-who">task</span>
+              <span class="env-attention-pill">PROVISIONAL</span>
+            </div>
+            <div class="env-attention-subject">${t.id}: ${t.title || "(untitled)"}</div>
+            <div class="env-attention-body">Closure reference required before delivered archive.</div>
+          </div>
+        `)}
+        ${items.sparse.map((t) => html`
+          <div class="env-attention-item normal" key=${"tg-sparse-" + t.id}>
+            <div class="env-attention-head">
+              <span class="env-attention-who">gate</span>
+              <span class="env-attention-ts">${t.id}</span>
+            </div>
+            <div class="env-attention-subject">${t.title || "(untitled)"}</div>
+            <div class="env-attention-body">${t.truthgate_warning}</div>
+          </div>
+        `)}
+      </div>
+    </section>
+  `;
 }
 
 // v2 §15.3 — Player health counters surfaced for the human alongside
@@ -9293,6 +9399,14 @@ const TIMELINE_TYPES = new Set([
   "commit_pushed",
   "decision_written",
   "human_attention",
+  "task_truthgate_started",
+  "task_truthgate_completed",
+  "task_truthgate_blocked",
+  "task_truthgate_override_recorded",
+  "truth_amendment_proposed",
+  "truth_amendment_resolved",
+  "task_provisional_closure_recorded",
+  "task_truth_basis_stale",
   "player_assigned",
   "agent_model_set",
   "agent_effort_set",
@@ -9440,6 +9554,48 @@ function EnvTimelineItem({ event }) {
       <span class="env-tl-ts">${ts}</span>
       <span class="env-tl-who">${who}</span>
       <span class="env-tl-body">${urgency} ${subj}</span>
+    </div>`;
+  }
+  if (event.type && event.type.startsWith("task_truthgate")) {
+    const tid = event.task_id || "";
+    const verdict = event.verdict || event.truthgate_verdict || "";
+    const method = event.truthgate_method || event.method || "";
+    const suffix = verdict ? ` — ${verdict}${method ? " · " + method : ""}` : "";
+    const label = event.type === "task_truthgate_started"
+      ? "TruthGate started"
+      : event.type === "task_truthgate_blocked"
+      ? "TruthGate blocked"
+      : event.type === "task_truthgate_override_recorded"
+      ? "TruthGate override"
+      : "TruthGate completed";
+    return html`<div class="env-tl-item env-tl-truthgate">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">◇ ${label} ${tid}${suffix}</span>
+    </div>`;
+  }
+  if (event.type === "truth_amendment_proposed" || event.type === "truth_amendment_resolved") {
+    const pid = event.proposal_id ? `#${event.proposal_id}` : "";
+    const status = event.status || (event.type.endsWith("resolved") ? "resolved" : "pending");
+    const path = event.path ? ` truth/${event.path}` : "";
+    return html`<div class="env-tl-item env-tl-truthgate">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">◇ truth amendment ${pid} ${status}${path}</span>
+    </div>`;
+  }
+  if (event.type === "task_provisional_closure_recorded") {
+    return html`<div class="env-tl-item env-tl-truthgate">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">◇ provisional closure ${event.task_id || ""}: ${event.closure_reference || ""}</span>
+    </div>`;
+  }
+  if (event.type === "task_truth_basis_stale") {
+    return html`<div class="env-tl-item env-tl-truthgate">
+      <span class="env-tl-ts">${ts}</span>
+      <span class="env-tl-who">${who}</span>
+      <span class="env-tl-body">◇ stale truth basis ${event.task_id || ""}: ${event.path || ""}</span>
     </div>`;
   }
   if (event.type === "paused") {

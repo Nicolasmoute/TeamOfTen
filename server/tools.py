@@ -57,6 +57,7 @@ def _role_token_for_stage(stage: str) -> str:
 # 'archive', 'in_progress' is treated as a no-op for tasks already in
 # 'execute', etc. See `_normalize_status_alias`.
 VALID_TRANSITIONS: dict[str, set[str]] = {
+    "truthgate":       {"plan", "execute", "archive"},
     "plan":            {"execute", "archive"},
     "execute":         {"audit_syntax", "audit_semantics", "ship", "archive"},
     "audit_syntax":    {"audit_semantics", "ship", "archive", "execute"},
@@ -71,6 +72,19 @@ AUDIT_STAGES: frozenset[str] = frozenset({"audit_syntax", "audit_semantics"})
 
 # All valid kanban stages (used by validators that accept any of them).
 ALL_KANBAN_STAGES: frozenset[str] = frozenset(VALID_TRANSITIONS.keys())
+
+TRUTHGATE_VERDICTS: frozenset[str] = frozenset({
+    "truthgate_pass",
+    "truthgate_needs_truth_change",
+    "truthgate_rejected_or_needs_human_clarification",
+    "truthgate_coach_override",
+    "truthgate_emergency_override",
+})
+TRUTHGATE_EXIT_VERDICTS: frozenset[str] = frozenset({
+    "truthgate_pass",
+    "truthgate_coach_override",
+    "truthgate_emergency_override",
+})
 
 
 # Crystallized turn-end discipline reminder. Appended to every wake
@@ -160,6 +174,287 @@ def _normalize_status_alias(status: str) -> str:
 
 def _valid_transition(old: str, new: str) -> bool:
     return new in VALID_TRANSITIONS.get(old, set())
+
+
+async def _truthgate_exit_error(
+    c: Any, task_id: str, old_status: str, new_status: str,
+) -> str | None:
+    """Return an error when a truthgate task is not eligible to proceed."""
+    if old_status != "truthgate" or new_status not in ("plan", "execute"):
+        return None
+    cur = await c.execute(
+        "SELECT truthgate_verdict FROM tasks WHERE id = ?",
+        (task_id,),
+    )
+    row = await cur.fetchone()
+    verdict = (dict(row).get("truthgate_verdict") if row else None) or ""
+    verdict = str(verdict).strip()
+    if verdict in TRUTHGATE_EXIT_VERDICTS:
+        return None
+    return (
+        f"truthgate → {new_status} requires a TruthGate pass or override "
+        f"verdict first (one of {sorted(TRUTHGATE_EXIT_VERDICTS)}). "
+        f"Current verdict: {verdict or 'none'}."
+    )
+
+
+def _normalize_provisional_closure_reference(raw: Any) -> tuple[str | None, str | None]:
+    """Validate the closure reference grammar for provisional tasks."""
+    ref = str(raw or "").strip()
+    if not ref:
+        return None, "closure_reference is required"
+    if ref.startswith("none_needed:"):
+        rationale = ref.removeprefix("none_needed:").strip()
+        if not rationale:
+            return None, "none_needed closure requires a non-empty rationale"
+        return ref, None
+    if ref.startswith("amendment:"):
+        proposal_id = ref.removeprefix("amendment:").strip()
+        if not proposal_id.isdigit() or int(proposal_id) <= 0:
+            return None, "amendment closure must be amendment:<positive proposal_id>"
+        return f"amendment:{int(proposal_id)}", None
+    if ref.startswith("rollback:"):
+        rollback_task_id = ref.removeprefix("rollback:").strip()
+        if not rollback_task_id:
+            return None, "rollback closure requires rollback:<task_id>"
+        return f"rollback:{rollback_task_id}", None
+    return None, (
+        "closure_reference must be one of amendment:<proposal_id>, "
+        "none_needed:<rationale>, or rollback:<task_id>"
+    )
+
+
+async def _validate_provisional_closure_reference(
+    c: Any,
+    *,
+    project_id: str,
+    closure_reference: str,
+    require_approved_amendment: bool = False,
+) -> str | None:
+    """Return an operator-readable error when a closure reference is invalid."""
+    normalized, err = _normalize_provisional_closure_reference(closure_reference)
+    if err is not None:
+        return err
+    assert normalized is not None
+    if normalized.startswith("none_needed:"):
+        return None
+    if normalized.startswith("rollback:"):
+        rollback_task_id = normalized.removeprefix("rollback:")
+        cur = await c.execute(
+            "SELECT id FROM tasks WHERE id = ? AND project_id = ?",
+            (rollback_task_id, project_id),
+        )
+        if await cur.fetchone():
+            return None
+        return f"rollback closure references unknown task {rollback_task_id!r}"
+    proposal_id = int(normalized.removeprefix("amendment:"))
+    cur = await c.execute(
+        "SELECT scope, status FROM file_write_proposals "
+        "WHERE id = ? AND project_id = ?",
+        (proposal_id, project_id),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return f"amendment closure references unknown proposal #{proposal_id}"
+    proposal = dict(row)
+    if proposal.get("scope") != "truth":
+        return f"amendment closure proposal #{proposal_id} does not target truth/"
+    if require_approved_amendment and proposal.get("status") != "approved":
+        return (
+            f"amendment closure proposal #{proposal_id} must be approved "
+            "before delivered archive"
+        )
+    return None
+
+
+async def _provisional_archive_error(
+    c: Any,
+    *,
+    project_id: str,
+    task_id: str,
+) -> str | None:
+    """Delivered archive gate for emergency/provisional TruthGate tasks."""
+    cur = await c.execute(
+        "SELECT provisional, closure_reference FROM tasks "
+        "WHERE id = ? AND project_id = ?",
+        (task_id, project_id),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return None
+    task = dict(row)
+    if not int(task.get("provisional") or 0):
+        return None
+    ref = (task.get("closure_reference") or "").strip()
+    if not ref:
+        return (
+            "provisional task cannot be delivered to archive until "
+            "coord_record_provisional_closure records a closure_reference"
+        )
+    err = await _validate_provisional_closure_reference(
+        c,
+        project_id=project_id,
+        closure_reference=ref,
+        require_approved_amendment=True,
+    )
+    if err:
+        return f"provisional closure_reference is not archive-ready: {err}"
+    return None
+
+
+def _truthgate_json_list(value: Any) -> str:
+    """Serialize a classifier/override list field for task storage."""
+    if not isinstance(value, list):
+        value = []
+    cleaned: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            cleaned.append(item.strip())
+    return json.dumps(cleaned, separators=(",", ":"))
+
+
+async def _fetch_truthgate_task_for_classifier(
+    c: Any,
+    *,
+    project_id: str,
+    task_id: str,
+) -> dict[str, Any] | None:
+    cur = await c.execute(
+        "SELECT id, title, description, status, workflow, trajectory, "
+        "success_criteria, truthgate_verdict, truthgate_method "
+        "FROM tasks WHERE id = ? AND project_id = ?",
+        (task_id, project_id),
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def _persist_truthgate_result(
+    c: Any,
+    *,
+    project_id: str,
+    task_id: str,
+    result: dict[str, Any],
+    method: str | None = None,
+    override_rationale: str | None = None,
+    provisional: bool | None = None,
+    closure_reference: str | None = None,
+    blocked_reason: str | None = None,
+) -> dict[str, Any]:
+    """Write TruthGate fields onto the task row and return event payload.
+
+    The classifier module deliberately stays DB-free. This helper is the
+    coord-layer bridge: normalize arrays, stamp scalar task fields, and
+    set the orthogonal blocked flag for verdicts that require Coach/human
+    action before work can begin.
+    """
+    now = _now_iso()
+    verdict = str(result.get("verdict") or "").strip()
+    truth_basis_json = _truthgate_json_list(result.get("truth_basis"))
+    truth_concerns_json = _truthgate_json_list(result.get("truth_concerns"))
+    truthgate_method = (
+        method
+        or str(result.get("method") or "").strip()
+        or "manual_record"
+    )
+    model = (
+        result.get("model_alias")
+        or result.get("model")
+        or result.get("fallback_model")
+    )
+    model_s = str(model).strip() if model else None
+    warning = result.get("warning")
+    warning_s = str(warning).strip() if warning else None
+    rationale_s = (
+        (override_rationale or "").strip()
+        or str(result.get("rationale") or "").strip()
+        or None
+    )
+    pending_proposal_id = result.get("pending_proposal_id")
+    if isinstance(pending_proposal_id, bool):
+        pending_proposal_id = None
+    if pending_proposal_id is not None:
+        try:
+            pending_proposal_id = int(pending_proposal_id)
+        except (TypeError, ValueError):
+            pending_proposal_id = None
+
+    blocked = 0
+    final_blocked_reason = None
+    if verdict == "truthgate_needs_truth_change":
+        blocked = 1
+        final_blocked_reason = (
+            blocked_reason
+            or "TruthGate requires a protected truth amendment before work begins."
+        )
+    elif verdict == "truthgate_rejected_or_needs_human_clarification":
+        blocked = 1
+        final_blocked_reason = (
+            blocked_reason
+            or "TruthGate rejected the task or needs human clarification."
+        )
+    else:
+        cur = await c.execute(
+            "SELECT blocked, blocked_reason FROM tasks "
+            "WHERE id = ? AND project_id = ?",
+            (task_id, project_id),
+        )
+        row = await cur.fetchone()
+        current = dict(row) if row else {}
+        current_reason = (current.get("blocked_reason") or "").strip()
+        if current_reason and not current_reason.startswith("TruthGate"):
+            blocked = int(current.get("blocked") or 0)
+            final_blocked_reason = current_reason
+
+    provisional_value = 1 if provisional else 0
+    closure_reference_s = None
+    if provisional_value:
+        closure_reference_s = (closure_reference or "").strip() or None
+    params: list[Any] = [
+        verdict,
+        truth_basis_json,
+        truth_concerns_json,
+        now,
+        model_s,
+        truthgate_method,
+        rationale_s,
+        pending_proposal_id,
+        warning_s,
+        closure_reference_s,
+        blocked,
+        final_blocked_reason,
+        provisional_value,
+        task_id,
+        project_id,
+    ]
+
+    await c.execute(
+        "UPDATE tasks SET truthgate_verdict = ?, truth_basis = ?, "
+        "truth_concerns = ?, truthgate_at = ?, truthgate_model = ?, "
+        "truthgate_method = ?, truthgate_override_rationale = ?, "
+        "truthgate_pending_proposal_id = ?, truthgate_warning = ?, "
+        "closure_reference = ?, blocked = ?, blocked_reason = ?, "
+        "provisional = ? "
+        "WHERE id = ? AND project_id = ?",
+        tuple(params),
+    )
+    return {
+        "ts": now,
+        "agent_id": "coach",
+        "task_id": task_id,
+        "project_id": project_id,
+        "verdict": verdict,
+        "truth_basis": json.loads(truth_basis_json),
+        "truth_concerns": json.loads(truth_concerns_json),
+        "truthgate_method": truthgate_method,
+        "truthgate_model": model_s,
+        "truthgate_warning": warning_s,
+        "truthgate_override_rationale": rationale_s,
+        "truthgate_pending_proposal_id": pending_proposal_id,
+        "provisional": bool(provisional_value),
+        "closure_reference": closure_reference_s,
+        "blocked_reason": final_blocked_reason,
+    }
 
 
 # v2 §7.2.1 — completion-call wake. Each Player completion tool
@@ -289,6 +584,23 @@ def _parse_boolish(raw: Any, *, default: bool) -> bool:
     if text in ("0", "false", "no", "off"):
         return False
     return default
+
+
+def _string_list_arg(raw: Any) -> list[str]:
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    text = str(raw).strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    return [part.strip() for part in text.split(",") if part.strip()]
 
 
 def _trajectory_stages_from_row(row: Any) -> list[str]:
@@ -494,36 +806,25 @@ def _validate_trajectory(
     if "execute" not in seen_stages:
         return None, "trajectory must include 'execute'"
 
-    # v2.0.1 (2026-05-08): the first trajectory entry's `to` must name
-    # exactly one Player AT CREATION TIME. The kanban is a log of work
-    # Coach has fired at Players — tasks without an assignee aren't on
-    # the kanban yet, they're pre-task reasoning. Pool/empty
-    # first-stage `to` is rejected at the trajectory-validation
-    # boundary so both MCP (`coord_create_task`) and HTTP
-    # (`POST /api/tasks`) layers honor the rule. Subsequent entries
-    # can still be pool/empty (FYI only; Coach picks each later
-    # stage's assignee at coord_approve_stage time, which already
-    # enforces single-named).
+    # Direct-dispatch callers can still require the first trajectory
+    # entry's `to` to name exactly one Player. TruthGate-backed top-level
+    # task creation and Backlog promotion deliberately opt out: those
+    # paths are pre-dispatch, so the first `to` remains advisory until
+    # Coach approves the post-gate transition.
     #
-    # `enforce_first_stage_assigned=False` is set by
+    # `enforce_first_stage_assigned=False` is also set by
     # `coord_set_task_trajectory` callers — mid-flight reroute happens
-    # AFTER the task already has role rows planted; the original
-    # first-stage assignment is in the role-row table, not the
-    # trajectory's first entry. So a reroute can rewrite the first
-    # entry to empty/pool without violating the create-time invariant.
+    # after the task already has role rows planted; the original stage
+    # assignment lives in task_role_assignments, not the trajectory.
     if enforce_first_stage_assigned:
         first_to = normalized[0].get("to") or []
         if len(first_to) != 1:
             return None, (
                 "trajectory[0].to must name exactly one Player (e.g. "
-                "['p3']) — coord_create_task fires a piece of work AT "
-                "someone. Pool/empty first-stage `to` is rejected: an "
-                "undispatched task isn't on the kanban yet, it's "
-                "pre-task reasoning. If you haven't decided who, decide "
-                "now (look at coord_get_player_settings, ## Player "
-                "health, and ## Recent events) and put their slot in "
-                "the trajectory. Subsequent stages can be FYI / empty; "
-                "only the first must be named."
+                "['p3']) for this direct-dispatch path. Pool/empty "
+                "first-stage `to` is valid only for pre-dispatch "
+                "TruthGate/Backlog flows where Coach later calls "
+                "coord_approve_stage with a single assignee."
             )
 
     return normalized, None
@@ -1092,7 +1393,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 cur = await c.execute(
                     f"SELECT t.id, t.title, t.status, t.owner, t.created_by, "
                     f"t.parent_id, t.priority, t.trajectory, t.blocked, "
-                    f"t.blocked_reason, t.created_at, "
+                    f"t.blocked_reason, t.created_at, t.truthgate_verdict, "
+                    f"t.truthgate_method, t.truthgate_warning, t.provisional, "
                     # active_owner: owner of the live (non-completed) role row
                     f"(SELECT tra.owner FROM task_role_assignments tra "
                     f" WHERE tra.task_id = t.id "
@@ -1141,6 +1443,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
 
         # Map status → short role label used in stage_role display.
         _STATUS_TO_ROLE_LABEL = {
+            "truthgate": None,
             "plan": "planner",
             "execute": "executor",
             "audit_syntax": "auditor",
@@ -1185,6 +1488,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 blocked = (
                     f" BLOCKED({reason})" if reason else " BLOCKED"
                 )
+            truthgate = ""
+            if d["status"] == "truthgate" or d.get("truthgate_verdict"):
+                verdict = d.get("truthgate_verdict") or "pending"
+                method = d.get("truthgate_method") or "-"
+                warning = " warning" if d.get("truthgate_warning") else ""
+                provisional = " provisional" if d.get("provisional") else ""
+                truthgate = (
+                    f" truthgate={verdict}:{method}{warning}{provisional}"
+                )
             # Prefer active role-assignment owner (kanban v2 source of truth)
             # over tasks.owner; fall back for archive/non-standard stages.
             display_owner = d.get("active_owner") or d["owner"] or "-"
@@ -1218,7 +1530,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             else:
                 stage_role = ""
             lines.append(
-                f"{d['id']}  kind=task  [{d['status']}]{traj}{blocked}{stage_role}  "
+                f"{d['id']}  kind=task  [{d['status']}]{traj}{blocked}{truthgate}{stage_role}  "
                 f"owner={display_owner}  pri={d['priority']}  "
                 f"{d['title']}{parent}"
             )
@@ -1239,7 +1551,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "(same table as coord_propose_task). No kanban row is created "
             "yet, no Player is woken. Coach must then call "
             "coord_triage_backlog(id, action='promote', trajectory=[...]) "
-            "to promote it to the kanban and fire it at a Player. This "
+            "to promote it into TruthGate. This "
             "enforces FIFO priority ordering: items are triaged in the "
             "order they arrived, not in the order Coach happened to type "
             "them (LIFO). Use the `priority` param to flag urgency at "
@@ -1261,16 +1573,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "Backlog entry so coord_triage_backlog promote can read it. "
             "Ordered list of {stage, to, focus?} objects. `stage` ∈ "
             "{plan, execute, audit_syntax, audit_semantics, ship, verify}; canonical "
-            "order; execute is mandatory. **trajectory[0].to MUST name "
-            "exactly one Player** (single-element list like ['p3']). "
-            "Subsequent stages' `to` may be a single name, list, or empty "
-            "— FYI only; Coach picks each later stage's assignee at "
-            "coord_approve_stage time. `focus` is required on every "
+            "order; execute is mandatory. Every `to`, including "
+            "trajectory[0].to, may be empty, a pool, or a single Player "
+            "— FYI only while the task is in Backlog/TruthGate. Coach "
+            "picks the real assignee at coord_approve_stage time after "
+            "the TruthGate pass/override. `focus` is required on every "
             "audit_semantics entry. Players inherit the parent's trajectory "
             "when subtasking.\n"
             "- note: optional brief — stored with the Backlog entry for "
-            "  Coach top-level tasks; becomes the first-stage assignee's "
-            "  wake prompt at promote time.\n"
+            "  Coach top-level tasks.\n"
             "- success_criteria: optional 1-3 line statement of what "
             "  'done' looks like. Stored on the Backlog entry; promoted "
             "  to the task row at triage time."
@@ -1326,7 +1637,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         trajectory_raw = args.get("trajectory")
         trajectory: list[dict[str, Any]] | None = None
         if trajectory_raw not in (None, "", []):
-            trajectory, traj_err = _validate_trajectory(trajectory_raw)
+            trajectory, traj_err = _validate_trajectory(
+                trajectory_raw,
+                enforce_first_stage_assigned=not (
+                    caller_is_coach and parent_id is None
+                ),
+            )
             if traj_err:
                 return _err(f"invalid trajectory: {traj_err}")
         if trajectory is None and caller_is_coach and parent_id is None:
@@ -1386,7 +1702,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "Task is NOT yet on the kanban — call "
                 f"coord_triage_backlog(id={backlog_id}, "
                 "action='promote', trajectory=[...]) when you're ready "
-                "to fire it at a Player. This enforces FIFO ordering: "
+                "to start TruthGate. This enforces FIFO ordering: "
                 "triage from oldest to newest, not by creation recency."
             )
 
@@ -1719,6 +2035,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 return _err(
                     f"invalid transition: {old_status} → {new_status}"
                 )
+            truthgate_err = await _truthgate_exit_error(
+                c, task_id, old_status, new_status,
+            )
+            if truthgate_err is not None:
+                return _err(truthgate_err)
 
             # Role-completion gate (Docs/kanban-specs.md §2.3). Rejects
             # manual transitions that should be event-driven (commit /
@@ -3177,6 +3498,40 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             )
             return rc == 0
 
+        async def _validate_existing_ship_branch() -> str | None:
+            rc, _, err = await _git(
+                ["git", "merge-base", "--is-ancestor", "origin/dev", "HEAD"]
+            )
+            if rc != 0:
+                detail = (err.strip() or "not based on origin/dev")[:200]
+                return (
+                    f"existing ship branch {branch_name} is not based on "
+                    f"current origin/dev ({detail}). Recreate it with "
+                    f"`git checkout {caller_branch} && "
+                    f"git branch -D {branch_name}`, then rerun "
+                    f"coord_ship_to_dev."
+                )
+            rc, out, err = await _git(
+                ["git", "log", "--format=%B", "origin/dev..HEAD"]
+            )
+            if rc != 0:
+                detail = (err.strip() or out.strip())[:200]
+                return (
+                    f"could not inspect existing ship branch {branch_name}: "
+                    f"{detail}"
+                )
+            if executor_sha not in out:
+                return (
+                    f"existing ship branch {branch_name} is clean, but it "
+                    f"does not contain the recorded executor commit "
+                    f"{executor_sha[:12]} in its cherry-pick metadata. "
+                    f"If you already resolved the conflict, run "
+                    f"`git cherry-pick --continue` on {branch_name}; "
+                    f"otherwise delete the temp branch and rerun "
+                    f"coord_ship_to_dev."
+                )
+            return None
+
         async def _executor_patch_on_dev() -> bool:
             rc, _, _ = await _git(
                 ["git", "merge-base", "--is-ancestor", executor_sha, "origin/dev"]
@@ -3254,6 +3609,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"`git cherry-pick --abort && "
                     f"git checkout {caller_branch}`."
                 )
+            invalid_reason = await _validate_existing_ship_branch()
+            if invalid_reason:
+                return _err(invalid_reason)
             resumed_branch = True
         else:
             rc, _, err = await _git(
@@ -3520,6 +3878,113 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
     # harness-wide instructions. All these files are read fresh on
     # every agent turn (server/context.py).
 
+    async def _validate_truth_proposal_path(rel: str) -> str | None:
+        # Defensive strip: Coach is told to pass paths relative to
+        # truth/ (e.g. "specs.md", not "truth/specs.md"), but accept
+        # the prefixed form too rather than fail confusingly.
+        if rel.startswith("truth/"):
+            rel = rel[len("truth/"):]
+        if rel.startswith("/") or ".." in rel.split("/"):
+            return None
+        first_seg = rel.split("/", 1)[0]
+        if first_seg == "projects":
+            return None
+        c_slug_check = await configured_conn()
+        try:
+            cur = await c_slug_check.execute(
+                "SELECT 1 FROM projects WHERE id = ? LIMIT 1",
+                (first_seg,),
+            )
+            slug_match = await cur.fetchone()
+        finally:
+            await c_slug_check.close()
+        if slug_match:
+            return None
+        return rel
+
+    async def _queue_file_write_proposal(
+        *,
+        project_id: str,
+        scope: str,
+        rel: str,
+        content: str,
+        summary: str,
+        metadata: dict[str, Any] | None = None,
+        originating_task_id: str | None = None,
+    ) -> tuple[int, list[int], str]:
+        now_iso = _now_iso()
+        metadata_json = json.dumps(metadata or {}, separators=(",", ":"))
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id, metadata_json, originating_task_id "
+                "FROM file_write_proposals "
+                "WHERE project_id = ? AND scope = ? AND path = ? "
+                "AND status = 'pending'",
+                (project_id, scope, rel),
+            )
+            superseded_rows = [dict(row) for row in await cur.fetchall()]
+            superseded_ids = [row["id"] for row in superseded_rows]
+            cur = await c.execute(
+                "INSERT INTO file_write_proposals "
+                "(project_id, proposer_id, scope, path, "
+                "proposed_content, summary, metadata_json, "
+                "originating_task_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    project_id, caller_id, scope, rel, content, summary,
+                    metadata_json, originating_task_id,
+                ),
+            )
+            proposal_id = cur.lastrowid
+            for old in superseded_rows:
+                sid = old["id"]
+                try:
+                    old_metadata = json.loads(old.get("metadata_json") or "{}")
+                    if not isinstance(old_metadata, dict):
+                        old_metadata = {}
+                except Exception:
+                    old_metadata = {}
+                old_metadata["superseded_by"] = proposal_id
+                old_metadata["superseded_at"] = now_iso
+                await c.execute(
+                    "UPDATE file_write_proposals SET status = 'superseded', "
+                    "resolved_at = ?, resolved_by = 'system', "
+                    "resolved_note = ?, metadata_json = ? "
+                    "WHERE id = ? AND status = 'pending'",
+                    (
+                        now_iso,
+                        f"superseded by #{proposal_id}",
+                        json.dumps(old_metadata, separators=(",", ":")),
+                        sid,
+                    ),
+                )
+                old_task_id = (old.get("originating_task_id") or "").strip()
+                if old_task_id:
+                    await c.execute(
+                        "UPDATE tasks SET truthgate_pending_proposal_id = NULL, "
+                        "blocked = 1, blocked_reason = ? "
+                        "WHERE id = ? AND project_id = ? "
+                        "AND truthgate_pending_proposal_id = ?",
+                        (
+                            f"TruthGate amendment proposal #{sid} superseded "
+                            f"by #{proposal_id}; Coach decision required.",
+                            old_task_id,
+                            project_id,
+                            sid,
+                        ),
+                    )
+            if originating_task_id and scope == "truth":
+                await c.execute(
+                    "UPDATE tasks SET truthgate_pending_proposal_id = ? "
+                    "WHERE id = ? AND project_id = ?",
+                    (proposal_id, originating_task_id, project_id),
+                )
+            await c.commit()
+        finally:
+            await c.close()
+        return int(proposal_id), superseded_ids, now_iso
+
     @tool(
         "coord_propose_file_write",
         (
@@ -3699,35 +4164,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         # duplicates. The scope filter is load-bearing: a hypothetical
         # truth/CLAUDE.md and a project_claude_md proposal at path
         # 'CLAUDE.md' must not supersede each other.
-        now_iso = _now_iso()
-        c = await configured_conn()
-        try:
-            cur = await c.execute(
-                "SELECT id FROM file_write_proposals "
-                "WHERE project_id = ? AND scope = ? AND path = ? "
-                "AND status = 'pending'",
-                (project_id, scope, rel),
-            )
-            superseded_ids = [row[0] for row in await cur.fetchall()]
-            cur = await c.execute(
-                "INSERT INTO file_write_proposals "
-                "(project_id, proposer_id, scope, path, "
-                "proposed_content, summary) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (project_id, caller_id, scope, rel, content, summary),
-            )
-            proposal_id = cur.lastrowid
-            for sid in superseded_ids:
-                await c.execute(
-                    "UPDATE file_write_proposals SET status = 'superseded', "
-                    "resolved_at = ?, resolved_by = 'system', "
-                    "resolved_note = ? "
-                    "WHERE id = ? AND status = 'pending'",
-                    (now_iso, f"superseded by #{proposal_id}", sid),
-                )
-            await c.commit()
-        finally:
-            await c.close()
+        proposal_id, superseded_ids, now_iso = await _queue_file_write_proposal(
+            project_id=project_id,
+            scope=scope,
+            rel=rel,
+            content=content,
+            summary=summary,
+        )
 
         for sid in superseded_ids:
             await bus.publish(
@@ -3771,6 +4214,152 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             f"({len(content)} chars, scope={scope}){note}. The user "
             f"will review and approve or deny in the UI; you'll see "
             f"`file_write_proposal_resolved` on your next turn."
+        )
+
+    @tool(
+        "coord_propose_truth_amendment",
+        (
+            "Coach + active Player roles. Convenience wrapper for proposing a protected "
+            "truth/ amendment tied to a TruthGate task. This does not "
+            "write truth/ directly and does not create a separate "
+            "registry; it queues a normal file_write_proposals row with "
+            "scope='truth', metadata_json, and originating_task_id. The "
+            "human approval/denial flow is unchanged.\n\n"
+            "Params:\n"
+            "- task_id: originating task id (required).\n"
+            "- path: path relative under truth/ (required).\n"
+            "- content: full new truth file body (required).\n"
+            "- summary: one-line user-facing reason, max 200 chars "
+            "(required).\n"
+            "- rationale: why current truth is missing/stale/"
+            "contradictory (required).\n"
+            "- evidence: optional links, task ids, commits, file paths, "
+            "or event ids.\n"
+            "- affected_docs: optional list/JSON/comma-separated Docs/ "
+            "projection paths.\n"
+            "- provisional_impl: optional boolean/string.\n"
+            "- rejection_consequence: optional consequence if denied.\n"
+            "- draft_model: optional model alias used to draft content.\n"
+            "- drafted: optional boolean/string."
+        ),
+        {
+            "task_id": str,
+            "path": str,
+            "content": str,
+            "summary": str,
+            "rationale": str,
+            "evidence": str,
+            "affected_docs": Any,
+            "provisional_impl": Any,
+            "rejection_consequence": str,
+            "draft_model": str,
+            "drafted": Any,
+        },
+    )
+    async def propose_truth_amendment(args: dict[str, Any]) -> dict[str, Any]:
+        task_id = (args.get("task_id") or "").strip()
+        rel = (args.get("path") or "").strip()
+        content = args.get("content")
+        summary = (args.get("summary") or "").strip()
+        rationale = (args.get("rationale") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+        if not rel:
+            return _err("path is required")
+        normalized = await _validate_truth_proposal_path(rel)
+        if normalized is None:
+            return _err(
+                "path must be relative under the active project's truth/ "
+                "folder, no leading slash, no '..' segments, and no "
+                "projects/<slug>/ prefix"
+            )
+        rel = normalized
+        if not isinstance(content, str):
+            return _err("content is required (string)")
+        if len(content) > FILE_WRITE_PROPOSAL_MAX_CHARS:
+            return _err(
+                f"content too long ({len(content)} chars, "
+                f"max {FILE_WRITE_PROPOSAL_MAX_CHARS})"
+            )
+        if not summary:
+            return _err("summary is required (one-line 'why' the user reads)")
+        if len(summary) > 200:
+            return _err(f"summary too long ({len(summary)} chars, max 200)")
+        if not rationale:
+            return _err("rationale is required")
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            task = await cur.fetchone()
+        finally:
+            await c.close()
+        if not task:
+            return _err(f"task {task_id} not found")
+
+        from server.truthgate.amendments import (  # noqa: PLC0415
+            build_amendment_metadata,
+        )
+
+        try:
+            metadata = build_amendment_metadata(
+                originating_task_id=task_id,
+                rationale=rationale,
+                evidence=args.get("evidence"),
+                affected_docs=_string_list_arg(args.get("affected_docs")),
+                provisional_impl=_parse_boolish(
+                    args.get("provisional_impl"), default=False,
+                ),
+                rejection_consequence=args.get("rejection_consequence"),
+                draft_model=args.get("draft_model"),
+                drafted=_parse_boolish(args.get("drafted"), default=False),
+            )
+        except ValueError as exc:
+            return _err(str(exc))
+        metadata["kind"] = "truthgate_truth_amendment"
+        metadata["proposal_wrapper"] = "coord_propose_truth_amendment"
+
+        proposal_id, superseded_ids, now_iso = await _queue_file_write_proposal(
+            project_id=project_id,
+            scope="truth",
+            rel=rel,
+            content=content,
+            summary=summary,
+            metadata=metadata,
+            originating_task_id=task_id,
+        )
+
+        for sid in superseded_ids:
+            await bus.publish({
+                "ts": now_iso,
+                "agent_id": "system",
+                "type": "file_write_proposal_superseded",
+                "proposal_id": sid,
+                "superseded_by": proposal_id,
+                "scope": "truth",
+                "path": rel,
+            })
+        await bus.publish({
+            "ts": now_iso,
+            "agent_id": caller_id,
+            "type": "file_write_proposal_created",
+            "proposal_id": proposal_id,
+            "scope": "truth",
+            "path": rel,
+            "summary": summary,
+            "size": len(content),
+            "superseded": superseded_ids,
+            "originating_task_id": task_id,
+            "metadata": metadata,
+        })
+        return _ok(
+            f"truth amendment proposal #{proposal_id} queued for "
+            f"truth/{rel} from task {task_id}; human approval/denial "
+            "uses the existing file-write proposal flow."
         )
 
     @tool(
@@ -6509,14 +7098,18 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT status FROM tasks WHERE id = ? AND project_id = ?",
+                "SELECT status, truthgate_verdict, truth_basis, "
+                "truth_concerns, truthgate_at, truthgate_method, "
+                "truthgate_warning, provisional, closure_reference "
+                "FROM tasks WHERE id = ? AND project_id = ?",
                 (task_id, project_id),
             )
             task_row = await cur.fetchone()
             if not task_row:
                 return _err(f"task {task_id} not found")
+            task_data = dict(task_row)
             expected_stage = "audit_syntax" if role == "auditor_syntax" else "audit_semantics"
-            actual_stage = dict(task_row).get("status")
+            actual_stage = task_data.get("status")
             if actual_stage != expected_stage:
                 return _err(
                     f"{review_label} review is not active for task {task_id} "
@@ -6543,6 +7136,40 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"assignee=<slot>) before submission."
                 )
             assignment_id = dict(row)["id"]
+
+            try:
+                from server.truthgate.targeted import (
+                    check_audit_against_truthgate,
+                )
+                targeted_check = check_audit_against_truthgate(
+                    project_id=project_id,
+                    task=task_data,
+                    audit_body=body,
+                    verdict=verdict,
+                )
+            except Exception as exc:
+                return _err(
+                    "targeted TruthGate check failed; ask Coach to review "
+                    f"the cited truth basis before submitting PASS: {exc}"
+                )
+            if targeted_check.blocked:
+                details: list[str] = []
+                if targeted_check.violations:
+                    details.append(
+                        "audit body reports a truth violation: "
+                        + ", ".join(targeted_check.violations)
+                    )
+                if targeted_check.warnings:
+                    details.append(
+                        "truth basis warning: "
+                        + "; ".join(targeted_check.warnings)
+                    )
+                return _err(
+                    "targeted TruthGate check blocks PASS. Submit FAIL "
+                    "citing the violated or unverifiable truth clause, or "
+                    "message Coach for rerouting. "
+                    + " ".join(details)
+                )
 
             # Compute round number = count of prior assignments for this
             # (task, kind) PLUS 1. Includes this one (we just SELECTed it).
@@ -7723,6 +8350,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"invalid next_stage '{next_stage}' (must be one of "
                 f"{sorted(ALL_KANBAN_STAGES)})"
             )
+        if next_stage == "truthgate":
+            return _err(
+                "coord_approve_stage cannot assign the truthgate stage. "
+                "Top-level backlog promotion enters truthgate automatically; "
+                "Coach exits it to plan/execute/archive after recording a "
+                "TruthGate verdict."
+            )
         if next_stage == "archive":
             if assignee_raw:
                 return _err(
@@ -7833,6 +8467,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 return _err(
                     f"invalid transition: {old_status} → {next_stage}"
                 )
+            truthgate_err = await _truthgate_exit_error(
+                c, task_id, old_status, next_stage,
+            )
+            if truthgate_err is not None:
+                return _err(truthgate_err)
 
             if old_status == "ship" and next_stage == "verify":
                 context, error = await _ship_verify_context_or_error(
@@ -7845,6 +8484,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             now = _now_iso()
             new_role_id: int | None = None
             if next_stage == "archive":
+                archive_err = await _provisional_archive_error(
+                    c, project_id=project_id, task_id=task_id,
+                )
+                if archive_err is not None:
+                    return _err(archive_err)
                 # Mark every active role row complete on archive — no
                 # roles persist into archive. Capture nothing for stand-
                 # down (archive isn't a reassignment). The user-facing
@@ -8102,6 +8746,31 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"Coach approved your move on task {task_id} to stage "
                 f"{next_stage!r} as {target_role}."
             )
+            if target_role in ("auditor_syntax", "auditor_semantics"):
+                try:
+                    cctx = await configured_conn()
+                    try:
+                        cur = await cctx.execute(
+                            "SELECT project_id, truthgate_verdict, "
+                            "truth_basis, truth_concerns, truthgate_at, "
+                            "truthgate_method, truthgate_warning, "
+                            "provisional, closure_reference "
+                            "FROM tasks WHERE id = ? AND project_id = ?",
+                            (task_id, project_id),
+                        )
+                        tg_row = await cur.fetchone()
+                    finally:
+                        await cctx.close()
+                    if tg_row:
+                        from server.truthgate.targeted import (
+                            build_truthgate_context_block,
+                        )
+                        base_wake = (
+                            f"{base_wake}\n\n"
+                            f"{build_truthgate_context_block(project_id=project_id, task=dict(tg_row))}"
+                        )
+                except Exception:
+                    pass
             if ship_verify_context:
                 base_wake = f"{base_wake}\n\n{ship_verify_context}"
             wake_body = _with_player_reminder(base_wake)
@@ -8229,6 +8898,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"task {task_id} is already archived; archived "
                     f"tasks are read-only."
                 )
+            archive_err = await _provisional_archive_error(
+                c, project_id=project_id, task_id=task_id,
+            )
+            if archive_err is not None:
+                return _err(archive_err)
             now = _now_iso()
             await c.execute(
                 "UPDATE task_role_assignments "
@@ -8610,6 +9284,396 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         )
 
     @tool(
+        "coord_run_truthgate",
+        (
+            "Coach-only. Run the TruthGate classifier for a task currently "
+            "in the truthgate stage and persist the verdict onto the task. "
+            "This records `truthgate_verdict`, `truth_basis`, "
+            "`truth_concerns`, method/model metadata, emits "
+            "`task_truthgate_completed`, and blocks the task when the "
+            "verdict requires a truth amendment or human clarification. "
+            "It does NOT move the task or wake a Player; after a pass, "
+            "Coach still drives truthgate→plan/execute via "
+            "coord_approve_stage.\n\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- force: optional boolean/string. When false, an existing "
+            "  TruthGate verdict is preserved and rerun is rejected. "
+            "  force=true intentionally reruns and overwrites prior "
+            "  TruthGate verdict state."
+        ),
+        {"task_id": str, "force": Any},
+    )
+    async def run_truthgate(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("coord_run_truthgate is Coach-only.")
+        task_id = (args.get("task_id") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+        force_raw = args.get("force")
+        force = False
+        if isinstance(force_raw, bool):
+            force = force_raw
+        elif isinstance(force_raw, str):
+            force = force_raw.strip().lower() in ("1", "true", "yes", "on")
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            task = await _fetch_truthgate_task_for_classifier(
+                c, project_id=project_id, task_id=task_id,
+            )
+            if not task:
+                return _err(f"task {task_id} not found")
+            if task["status"] != "truthgate":
+                return _err(
+                    f"task {task_id} is in stage {task['status']!r}; "
+                    "coord_run_truthgate only runs while status='truthgate'."
+                )
+            existing_verdict = (task.get("truthgate_verdict") or "").strip()
+            existing_method = (task.get("truthgate_method") or "").strip()
+            if existing_verdict and not force:
+                return _err(
+                    f"Task {task_id} already has TruthGate verdict "
+                    f"{existing_verdict} via {existing_method or 'unknown'}; "
+                    "use force=true to rerun."
+                )
+            await bus.publish({
+                "ts": _now_iso(),
+                "agent_id": caller_id,
+                "type": "task_truthgate_started",
+                "task_id": task_id,
+                "project_id": project_id,
+                "method": "classifier",
+                "force": force,
+            })
+        finally:
+            await c.close()
+
+        from server.truthgate.classifier import (  # noqa: PLC0415
+            TruthGateClassificationError,
+            TruthGateTaskInput,
+            run_truthgate_classifier,
+        )
+
+        try:
+            result = await run_truthgate_classifier(
+                project_id,
+                TruthGateTaskInput(
+                    task_id=task_id,
+                    title=task.get("title") or "",
+                    description=task.get("description") or "",
+                    success_criteria=task.get("success_criteria") or "",
+                    workflow=task.get("workflow") or "generic",
+                    trajectory=task.get("trajectory") or "[]",
+                ),
+            )
+            classifier_error: str | None = None
+        except TruthGateClassificationError as exc:
+            classifier_error = str(exc)
+            result = {
+                "verdict": "",
+                "truth_basis": [],
+                "truth_concerns": [classifier_error],
+                "rationale": classifier_error,
+                "method": "classifier_error",
+                "model": None,
+                "warning": classifier_error,
+            }
+
+        c = await configured_conn()
+        try:
+            if classifier_error:
+                now = _now_iso()
+                reason = (
+                    f"TruthGate classifier failed closed: {classifier_error}"
+                )[:500]
+                await c.execute(
+                    "UPDATE tasks SET truthgate_verdict = NULL, "
+                    "truth_basis = '[]', truth_concerns = '[]', "
+                    "truthgate_at = ?, truthgate_model = NULL, "
+                    "truthgate_method = 'classifier_error', "
+                    "truthgate_override_rationale = NULL, "
+                    "truthgate_pending_proposal_id = NULL, "
+                    "truthgate_warning = ?, closure_reference = NULL, "
+                    "provisional = 0, blocked = 1, blocked_reason = ? "
+                    "WHERE id = ? AND project_id = ?",
+                    (now, reason, reason, task_id, project_id),
+                )
+                payload = {
+                    "ts": now,
+                    "agent_id": "coach",
+                    "task_id": task_id,
+                    "project_id": project_id,
+                    "verdict": None,
+                    "truth_basis": [],
+                    "truth_concerns": [],
+                    "truthgate_method": "classifier_error",
+                    "truthgate_model": None,
+                    "truthgate_warning": reason,
+                    "truthgate_override_rationale": None,
+                    "truthgate_pending_proposal_id": None,
+                    "provisional": False,
+                    "closure_reference": None,
+                    "blocked_reason": reason,
+                }
+            else:
+                payload = await _persist_truthgate_result(
+                    c,
+                    project_id=project_id,
+                    task_id=task_id,
+                    result=result,
+                )
+            await c.commit()
+        finally:
+            await c.close()
+
+        completed_event = {
+            **payload,
+            "agent_id": caller_id,
+            "type": "task_truthgate_completed",
+        }
+        await bus.publish(completed_event)
+        if payload.get("blocked_reason"):
+            await bus.publish({
+                **payload,
+                "agent_id": caller_id,
+                "type": "task_truthgate_blocked",
+                "reason": payload.get("blocked_reason"),
+            })
+
+        verdict = payload["verdict"]
+        if classifier_error:
+            return _err(
+                f"TruthGate classifier failed closed for {task_id}; "
+                "task remains blocked in truthgate with no pass/override "
+                "verdict recorded."
+            )
+        method = payload["truthgate_method"]
+        if verdict in TRUTHGATE_EXIT_VERDICTS:
+            try:
+                stages = _trajectory_stages_from_row(task)
+                next_hint = stages[0] if stages else "execute"
+            except Exception:
+                next_hint = "execute"
+            return _ok(
+                f"TruthGate recorded {verdict} for {task_id} "
+                f"(method={method}). Coach may now approve "
+                f"truthgate → {next_hint} with coord_approve_stage."
+            )
+        return _ok(
+            f"TruthGate recorded {verdict} for {task_id} "
+            f"(method={method}); task remains blocked in truthgate. "
+            f"Reason: {payload.get('blocked_reason') or payload.get('truthgate_warning') or 'review required'}"
+        )
+
+    @tool(
+        "coord_record_truthgate_override",
+        (
+            "Coach-only. Record an explicit TruthGate override for a task "
+            "in the truthgate stage. This is the visible fast path for "
+            "trivial/no-truth-contact work or human-approved emergency "
+            "bypass. Rationale is required. The tool records the verdict "
+            "and emits `task_truthgate_override_recorded` plus "
+            "`task_truthgate_completed`; it does NOT move the task or "
+            "wake a Player.\n\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- kind: 'coach_override' or 'emergency_override'. Full "
+            "  verdict strings 'truthgate_coach_override' and "
+            "  'truthgate_emergency_override' are also accepted.\n"
+            "- rationale: required non-empty explanation.\n"
+            "- closure_reference: optional for emergency overrides."
+        ),
+        {
+            "task_id": str,
+            "kind": str,
+            "rationale": str,
+            "closure_reference": str,
+        },
+    )
+    async def record_truthgate_override(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("coord_record_truthgate_override is Coach-only.")
+        task_id = (args.get("task_id") or "").strip()
+        raw_kind = (args.get("kind") or "").strip().lower()
+        rationale = (args.get("rationale") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+        if not rationale:
+            return _err("rationale is required for TruthGate override")
+        kind_map = {
+            "coach_override": "truthgate_coach_override",
+            "truthgate_coach_override": "truthgate_coach_override",
+            "emergency_override": "truthgate_emergency_override",
+            "truthgate_emergency_override": "truthgate_emergency_override",
+        }
+        verdict = kind_map.get(raw_kind)
+        if verdict is None:
+            return _err(
+                "kind must be 'coach_override' or 'emergency_override'"
+            )
+        method = (
+            "coach_override"
+            if verdict == "truthgate_coach_override"
+            else "emergency_override"
+        )
+        provisional = verdict == "truthgate_emergency_override"
+        closure_reference = (args.get("closure_reference") or "").strip()
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            task = await _fetch_truthgate_task_for_classifier(
+                c, project_id=project_id, task_id=task_id,
+            )
+            if not task:
+                return _err(f"task {task_id} not found")
+            if task["status"] != "truthgate":
+                return _err(
+                    f"task {task_id} is in stage {task['status']!r}; "
+                    "override can only be recorded while status='truthgate'."
+                )
+            if provisional and closure_reference:
+                normalized, normalize_err = (
+                    _normalize_provisional_closure_reference(closure_reference)
+                )
+                if normalize_err is not None:
+                    return _err(normalize_err)
+                assert normalized is not None
+                validate_err = await _validate_provisional_closure_reference(
+                    c,
+                    project_id=project_id,
+                    closure_reference=normalized,
+                    require_approved_amendment=False,
+                )
+                if validate_err is not None:
+                    return _err(validate_err)
+                closure_reference = normalized
+            payload = await _persist_truthgate_result(
+                c,
+                project_id=project_id,
+                task_id=task_id,
+                result={
+                    "verdict": verdict,
+                    "truth_basis": [],
+                    "truth_concerns": [],
+                    "rationale": rationale,
+                    "method": method,
+                    "model": None,
+                    "warning": None,
+                },
+                method=method,
+                override_rationale=rationale,
+                provisional=provisional,
+                closure_reference=closure_reference,
+            )
+            await c.commit()
+        finally:
+            await c.close()
+
+        override_event = {
+            **payload,
+            "agent_id": caller_id,
+            "type": "task_truthgate_override_recorded",
+            "rationale": rationale,
+        }
+        await bus.publish(override_event)
+        await bus.publish({
+            **payload,
+            "agent_id": caller_id,
+            "type": "task_truthgate_completed",
+        })
+        try:
+            stages = _trajectory_stages_from_row(task)
+            next_hint = stages[0] if stages else "execute"
+        except Exception:
+            next_hint = "execute"
+        provisional_note = " Task is provisional." if provisional else ""
+        return _ok(
+            f"Recorded {verdict} for {task_id} "
+            f"(method={method}).{provisional_note} Coach may now approve "
+            f"truthgate → {next_hint} with coord_approve_stage."
+        )
+
+    @tool(
+        "coord_record_provisional_closure",
+        (
+            "Coach-only. Record the closure reference required before a "
+            "provisional TruthGate emergency-override task can be delivered "
+            "to archive. The task must already be marked provisional. This "
+            "does not move the task or wake a Player; it only persists "
+            "`tasks.closure_reference` and emits "
+            "`task_provisional_closure_recorded`.\n\n"
+            "Accepted closure_reference forms:\n"
+            "- amendment:<proposal_id> (proposal must exist and target truth/; "
+            "  delivered archive later requires it to be approved)\n"
+            "- none_needed:<non-empty rationale>\n"
+            "- rollback:<task_id> (referenced task must exist)"
+        ),
+        {"task_id": str, "closure_reference": str},
+    )
+    async def record_provisional_closure(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("coord_record_provisional_closure is Coach-only.")
+        task_id = (args.get("task_id") or "").strip()
+        raw_ref = (args.get("closure_reference") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+        normalized, normalize_err = _normalize_provisional_closure_reference(raw_ref)
+        if normalize_err is not None:
+            return _err(normalize_err)
+        assert normalized is not None
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id, provisional FROM tasks "
+                "WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"task {task_id} not found")
+            task = dict(row)
+            if not int(task.get("provisional") or 0):
+                return _err(
+                    f"task {task_id} is not provisional; closure_reference "
+                    "is only required for emergency-override tasks."
+                )
+            validate_err = await _validate_provisional_closure_reference(
+                c,
+                project_id=project_id,
+                closure_reference=normalized,
+                require_approved_amendment=False,
+            )
+            if validate_err is not None:
+                return _err(validate_err)
+            await c.execute(
+                "UPDATE tasks SET closure_reference = ? "
+                "WHERE id = ? AND project_id = ?",
+                (normalized, task_id, project_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+
+        ts = _now_iso()
+        await bus.publish({
+            "ts": ts,
+            "agent_id": caller_id,
+            "type": "task_provisional_closure_recorded",
+            "task_id": task_id,
+            "project_id": project_id,
+            "closure_reference": normalized,
+        })
+        return _ok(
+            f"Recorded provisional closure for {task_id}: {normalized}. "
+            "Delivered archive is now eligible if the reference remains "
+            "valid (amendment closures require approved truth proposals)."
+        )
+
+    @tool(
         "coord_request_plan_review",
         (
             "Coach-only. Wake a Player with plan-mode enabled so they "
@@ -8878,8 +9942,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- action: 'promote' or 'reject'.\n"
             "- trajectory: required when action='promote'. Same format "
             "  as coord_create_task — ordered list of {stage, to} "
-            "  objects. 'to' must name exactly one Player slot per "
-            "  the v2 first-stage rule.\n"
+            "  objects. The first `to` may be empty, a pool, or a single "
+            "  Player because promotion enters TruthGate and does not "
+            "  dispatch work. Coach later calls coord_approve_stage with "
+            "  one assignee after a TruthGate pass/override.\n"
             "- modified_title: optional. Rename the idea on promote.\n"
             "- reason: recommended when action='reject'. Short phrase "
             "  explaining why (stored; surfaces to human if the idea "
@@ -8908,7 +9974,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT id, title, proposed_by, status, priority, "
+                "SELECT id, title, description, proposed_by, status, priority, "
                 "trajectory_json, note, success_criteria "
                 "FROM backlog_tasks WHERE id = ?",
                 (backlog_id,),
@@ -8992,7 +10058,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             except Exception:
                 return _err("trajectory must be a JSON list of {stage, to} objects")
 
-        trajectory, traj_err = _validate_trajectory(trajectory)
+        trajectory, traj_err = _validate_trajectory(
+            trajectory,
+            enforce_first_stage_assigned=False,
+        )
         if traj_err:
             return _err(f"invalid trajectory: {traj_err}")
 
@@ -9003,11 +10072,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
 
         task_id = _new_task_id()
         trajectory_json = json.dumps(trajectory, separators=(",", ":"))
-        initial_status = trajectory[0]["stage"]
+        initial_status = "truthgate"
+        first_post_gate_stage = trajectory[0]["stage"]
         first_to: list[str] = trajectory[0].get("to") or []
         if isinstance(first_to, str):
             first_to = [first_to] if first_to else []
-        initial_owner = first_to[0] if len(first_to) == 1 else None
 
         c = await configured_conn()
         try:
@@ -9015,34 +10084,13 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "INSERT INTO tasks (id, project_id, title, description, "
                 "priority, workflow, tracking_reason, trajectory, status, "
                 "owner, last_stage_change_at, created_by, success_criteria) "
-                "VALUES (?, ?, ?, '', ?, 'generic', 'backlog', "
+                "VALUES (?, ?, ?, ?, ?, 'generic', 'backlog', "
                 "?, ?, ?, ?, ?, ?)",
-                (task_id, project_id, title,
+                (task_id, project_id, title, entry.get("description") or "",
                  promote_priority,
-                 trajectory_json, initial_status, initial_owner,
+                 trajectory_json, initial_status, None,
                  now_iso, caller_id, promote_sc),
             )
-            # Plant first-stage role row when single named assignee.
-            _role_for_stage_map = {
-                "plan": "planner", "execute": "executor",
-                "audit_syntax": "auditor_syntax",
-                "audit_semantics": "auditor_semantics", "ship": "shipper",
-            }
-            if len(first_to) == 1:
-                first_role = _role_for_stage_map[trajectory[0]["stage"]]
-                eligible_json = json.dumps(first_to, separators=(",", ":"))
-                await c.execute(
-                    "INSERT INTO task_role_assignments "
-                    "(task_id, role, eligible_owners, owner, "
-                    "assigned_at, claimed_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (task_id, first_role, eligible_json, first_to[0],
-                     now_iso, now_iso),
-                )
-                if initial_status == "execute":
-                    await _set_agent_current_task_if_free_or_stale(
-                        c, first_to[0], task_id,
-                    )
-                await _set_agent_role_tools(c, first_to[0], first_role)
             await c.execute(
                 "UPDATE backlog_tasks SET status='promoted', "
                 "promoted_task_id=? WHERE id=?",
@@ -9051,24 +10099,6 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             await c.commit()
         finally:
             await c.close()
-
-        # Wake the first-stage assignee when a single named slot was planted.
-        if initial_owner and len(first_to) == 1:
-            from server.agents import maybe_wake_agent
-            wake_body = promote_note or (
-                f"Coach promoted backlog #{backlog_id} ({title!r}) and "
-                f"assigned you as {_role_for_stage_map[trajectory[0]['stage']]} "
-                f"for the {initial_status} stage."
-            )
-            wake_body = _with_player_reminder(wake_body)
-            try:
-                await maybe_wake_agent(
-                    initial_owner, wake_body,
-                    bypass_debounce=True,
-                    wake_source="kanban_promote",
-                )
-            except Exception:
-                pass
 
         await bus.publish({
             "ts": now_iso,
@@ -9083,30 +10113,26 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "trajectory": trajectory,
             "project_id": project_id,
         })
-        if initial_owner and len(first_to) == 1:
-            first_role = _role_for_stage_map[trajectory[0]["stage"]]
-            await bus.publish({
-                "ts": now_iso,
-                "agent_id": "system",
-                "type": "task_stage_changed",
-                "task_id": task_id,
-                "from": None,
-                "to": initial_status,
-                "reason": "backlog_promoted",
-                "owner": initial_owner,
-                "assignee": initial_owner,
-                "project_id": project_id,
-            })
-            await bus.publish({
-                "ts": now_iso,
-                "agent_id": caller_id,
-                "type": "task_role_assigned",
-                "task_id": task_id,
-                "role": first_role,
-                "owner": initial_owner,
-                "stage": initial_status,
-                "project_id": project_id,
-            })
+        await bus.publish({
+            "ts": now_iso,
+            "agent_id": "system",
+            "type": "task_stage_changed",
+            "task_id": task_id,
+            "from": None,
+            "to": "truthgate",
+            "reason": "backlog_promoted",
+            "owner": None,
+            "project_id": project_id,
+        })
+        await bus.publish({
+            "ts": now_iso,
+            "agent_id": "system",
+            "type": "task_truthgate_started",
+            "task_id": task_id,
+            "from": "backlog",
+            "post_gate_stage": first_post_gate_stage,
+            "project_id": project_id,
+        })
         await bus.publish({
             "ts": now_iso,
             "agent_id": caller_id,
@@ -9119,11 +10145,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         return _ok(
             f"Backlog entry #{backlog_id} promoted → task {task_id} "
             f"(\"{title}\", priority={promote_priority}, "
-            f"initial stage: {initial_status})."
-            + (f" Player {initial_owner} woken." if initial_owner else
-               f" No auto-wake (pool/empty first-stage `to`); "
-               f"drive via coord_approve_stage(task_id={task_id!r}, "
-               f"next_stage={initial_status!r}, assignee=<slot>).")
+            f"initial stage: truthgate; post-gate trajectory starts at "
+            f"{first_post_gate_stage}). No Player role was planted and "
+            f"no Player was woken. Record/run TruthGate, then drive via "
+            f"coord_approve_stage(task_id={task_id!r}, "
+            f"next_stage={first_post_gate_stage!r}, assignee=<slot>)."
         )
 
     @tool(
@@ -9317,6 +10343,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         approve_stage,
         archive_task,
         role_complete,
+        run_truthgate,
+        record_truthgate_override,
+        record_provisional_closure,
         request_plan_review,
         set_task_blocked,
         send_message,
@@ -9328,6 +10357,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         ship_to_dev,
         write_decision,
         propose_file_write,
+        propose_truth_amendment,
         read_file,
         write_knowledge,
         read_knowledge,
@@ -9604,6 +10634,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_submit_verification_report",
     "mcp__coord__coord_write_decision",
     "mcp__coord__coord_propose_file_write",
+    "mcp__coord__coord_propose_truth_amendment",
     "mcp__coord__coord_read_file",
     "mcp__coord__coord_write_knowledge",
     "mcp__coord__coord_read_knowledge",
@@ -9655,6 +10686,9 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_approve_stage",
     "mcp__coord__coord_archive_task",
     "mcp__coord__coord_role_complete",
+    "mcp__coord__coord_run_truthgate",
+    "mcp__coord__coord_record_truthgate_override",
+    "mcp__coord__coord_record_provisional_closure",
     "mcp__coord__coord_request_plan_review",
     # Backlog (Docs/kanban-specs-v2.md §4.0). coord_propose_task and
     # coord_list_backlog are open to Coach + Players; coord_triage_backlog

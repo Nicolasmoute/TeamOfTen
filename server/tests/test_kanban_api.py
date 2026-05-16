@@ -178,7 +178,7 @@ def test_board_groups_by_stage(client: TestClient) -> None:
     assert r.status_code == 200
     board = r.json()["board"]
     assert {
-        "plan", "execute", "audit_syntax", "audit_semantics", "ship", "verify",
+        "truthgate", "plan", "execute", "audit_syntax", "audit_semantics", "ship", "verify",
     } == set(board.keys())
     assert any(t["id"] == "t-2026-05-03-aaaaaaaa" for t in board["plan"])
     assert any(t["id"] == "t-2026-05-03-bbbbbbbb" for t in board["execute"])

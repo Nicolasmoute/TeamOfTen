@@ -1156,6 +1156,8 @@ body {
 .env-tl-commit .env-tl-body { color: var(--accent); }
 .env-tl-attention { border-left-color: var(--err); background: #2c1a22; }
 .env-tl-attention .env-tl-body { color: var(--err); font-weight: 600; }
+.env-tl-truthgate { border-left-color: var(--warn); background: rgba(227, 160, 58, 0.08); }
+.env-tl-truthgate .env-tl-body { color: var(--fg); }
 .env-tl-assigned { border-left-color: var(--coach); }
 .env-tl-assigned .env-tl-body { color: var(--fg); }
 .env-tl-cancelled { border-left-color: var(--warn); }
@@ -1285,6 +1287,10 @@ body {
   border-radius: 6px;
   padding: 8px 10px 10px;
   margin-bottom: 10px;
+}
+.env-section.env-truthgate-attention {
+  background: rgba(143, 212, 255, 0.06);
+  border-color: rgba(143, 212, 255, 0.35);
 }
 .env-section.env-attention .env-section-title {
   color: #e3a03a;
@@ -5045,7 +5051,7 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 /* Columns */
 .kbn-columns {
   display: grid;
-  grid-template-columns: minmax(180px, 0.75fr) repeat(5, minmax(210px, 1fr));
+  grid-template-columns: minmax(180px, 0.75fr) repeat(6, minmax(210px, 1fr));
   gap: 10px;
   flex: 1;
   min-height: 0;
@@ -5345,6 +5351,31 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   padding: 1px 5px;
   border: 1px solid currentColor;
   border-radius: 2px;
+}
+.kbn-truthgate-badge {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  color: var(--warn, #d7a545);
+  background: rgba(215, 165, 69, 0.10);
+}
+.kbn-truthgate-truthgate_pass,
+.kbn-truthgate-truthgate_coach_override,
+.kbn-truthgate-truthgate_emergency_override {
+  color: var(--ok, #5fb86a);
+  background: rgba(95, 184, 106, 0.10);
+}
+.kbn-truthgate-pending-proposal,
+.kbn-truthgate-warning {
+  color: var(--err, #d05050);
+  background: rgba(208, 80, 80, 0.10);
+}
+.kbn-truthgate-provisional {
+  color: #8fd4ff;
+  background: rgba(143, 212, 255, 0.10);
 }
 .kbn-verdict-pass {
   color: var(--ok, #5fb86a);

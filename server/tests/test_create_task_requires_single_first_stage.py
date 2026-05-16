@@ -1,12 +1,13 @@
-"""v2.0.1 (2026-05-08) — `trajectory[0].to` must name exactly one Player.
+"""Trajectory first-stage assignment validation boundaries.
 
-The kanban is a log of work Coach has fired AT a specific Player.
-Pool/empty first-stage `to` is rejected at trajectory-validation time
-so both `coord_create_task` (MCP) and `POST /api/tasks` (HTTP) honor
-the rule. Subsequent stages' `to` may still be pool/empty (FYI only).
+The strict validator mode still requires `trajectory[0].to` to name
+exactly one Player for direct-dispatch paths. Coach top-level
+`coord_create_task` is now Backlog/TruthGate pre-dispatch, so it opts
+out and accepts empty or pool first-stage `to` values. Subsequent
+stages' `to` may also be pool/empty (FYI only).
 
-This test pins the boundary: pool/empty first-stage rejected, single-
-name accepted, MCP and HTTP layers behave identically.
+This test pins the boundary between strict validation and the
+Backlog/TruthGate MCP path.
 """
 
 from __future__ import annotations
@@ -118,33 +119,34 @@ async def _stub_wake(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(agents_mod, "maybe_wake_agent", _rec)
 
 
-async def test_mcp_create_task_rejects_pool_first_stage(
+async def test_mcp_create_task_accepts_pool_first_stage_for_backlog(
     fresh_db: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await init_db()
     await _stub_wake(monkeypatch)
     coach = _server_for("coach")
-    err = _err(await _handler(coach, "create_task")({
+    body = _ok(await _handler(coach, "create_task")({
         "title": "pool first",
         "description": "x",
         "trajectory": '[{"stage":"execute","to":["p2","p3"]}]',
     }))
-    assert "trajectory[0].to" in err
-    assert "exactly one Player" in err
+    assert _extract_backlog_id(body)
+    assert "Task is NOT yet on the kanban" in body
 
 
-async def test_mcp_create_task_rejects_empty_first_stage(
+async def test_mcp_create_task_accepts_empty_first_stage_for_backlog(
     fresh_db: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await init_db()
     await _stub_wake(monkeypatch)
     coach = _server_for("coach")
-    err = _err(await _handler(coach, "create_task")({
+    body = _ok(await _handler(coach, "create_task")({
         "title": "empty first",
         "description": "x",
         "trajectory": '[{"stage":"execute","to":[]}]',
     }))
-    assert "trajectory[0].to" in err
+    assert _extract_backlog_id(body)
+    assert "Task is NOT yet on the kanban" in body
 
 
 async def test_mcp_create_task_accepts_single_name_first_stage(

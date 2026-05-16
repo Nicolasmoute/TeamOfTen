@@ -39,6 +39,7 @@ async function apiPost(authedFetch, path, body) {
 
 
 const STAGE_LABELS = {
+  truthgate: "TRUTHGATE",
   plan: "PLAN",
   execute: "EXECUTE",
   audit_syntax: "FORMAL",
@@ -168,6 +169,7 @@ function saveArchiveState(next) {
 
 
 function roleForStage(status) {
+  if (status === "truthgate") return null;
   if (status === "plan") return "planner";
   if (status === "execute") return "executor";
   if (status === "audit_syntax") return "auditor_syntax";
@@ -203,6 +205,7 @@ function assignmentOwners(assignment) {
 
 function primaryAssignee(task) {
   const role = roleForStage(task.status);
+  if (task.status === "truthgate") return { role: null, truthgate: true };
   if (!role) return { role: null, fallbackOwner: task.owner || null };
 
   const active = assignmentForRole(task, role);
@@ -230,6 +233,9 @@ function archiveAssignee(task) {
 
 
 function statusFlag(task) {
+  if (task.status === "truthgate" && !task.truthgate_verdict) {
+    return { label: "NEEDS GATE", tone: "var(--warn)" };
+  }
   if (task.blocked) return { label: "BLOCKED", tone: "var(--err)" };
   if (task.priority === "urgent") return { label: "URGENT", tone: "var(--err)" };
   return null;
@@ -329,6 +335,9 @@ function MdLink({ path, label }) {
 
 
 function Avatar({ primary, onAssign }) {
+  if (primary?.truthgate) {
+    return html`<span class="kbn-coach-chip">Gate</span>`;
+  }
   if (primary?.coach) {
     return html`<span class="kbn-coach-chip">Coach</span>`;
   }
@@ -407,6 +416,35 @@ function VerdictBadge({ verification }) {
   return html`<span class=${`kbn-verdict-badge kbn-verdict-${verdict}`}>${label}</span>`;
 }
 
+function TruthGateBadge({ task }) {
+  const verdict = task.truthgate_verdict || (task.status === "truthgate" ? "pending" : "");
+  const chips = [];
+  const method = task.truthgate_method || "";
+  if (verdict) {
+    const label = verdict === "pending" ? "TruthGate pending" : verdict.replace(/^truthgate_/, "TG ");
+    chips.push(html`<span
+      class=${`kbn-truthgate-badge kbn-truthgate-${String(verdict).replace(/[^a-z0-9_-]/gi, "_")}`}
+      title=${method ? `method: ${method}` : "TruthGate"}
+    >${label}${method ? ` · ${method}` : ""}</span>`);
+  }
+  if (task.truthgate_pending_proposal_id) {
+    chips.push(html`<span class="kbn-truthgate-badge kbn-truthgate-pending-proposal"
+      title="Pending truth amendment"
+    >amend #${task.truthgate_pending_proposal_id}</span>`);
+  }
+  if (task.truthgate_warning) {
+    chips.push(html`<span class="kbn-truthgate-badge kbn-truthgate-warning"
+      title=${task.truthgate_warning}
+    >sparse warning</span>`);
+  }
+  if (task.provisional) {
+    chips.push(html`<span class="kbn-truthgate-badge kbn-truthgate-provisional"
+      title=${task.closure_reference ? `closure: ${task.closure_reference}` : "Provisional: closure required before delivered archive"}
+    >provisional</span>`);
+  }
+  if (!chips.length) return null;
+  return html`${chips}`;
+}
 
 function ShipEvidence({ task, compact = false }) {
   const items = evidenceItems(task);
@@ -506,6 +544,7 @@ function Card({
       <div class="kbn-stage-label">${stageLabel}</div>
       <div class="kbn-card-row">
         <${Avatar} primary=${primary} onAssign=${doAssign} />
+        <${TruthGateBadge} task=${task} />
         <${VerdictBadge} verification=${verification} />
         ${flag
           ? html`<span class="kbn-flag" style=${`color:${flag.tone}`}>${flag.label}</span>`
@@ -551,6 +590,9 @@ function Card({
                 ${task.workflow ? html`<span>${task.workflow}</span>` : null}
                 ${task.required_reviews ? html`<span>reviews ${task.required_reviews}</span>` : null}
                 ${task.blocked_reason ? html`<span>${task.blocked_reason}</span>` : null}
+                ${task.truthgate_warning ? html`<span>${task.truthgate_warning}</span>` : null}
+                ${task.provisional ? html`<span>provisional</span>` : null}
+                ${task.closure_reference ? html`<span>closure ${task.closure_reference}</span>` : null}
               </div>
               <${ShipEvidence} task=${task} />
               <${CardActions}
@@ -1441,8 +1483,8 @@ export function KanbanPane({
 }) {
   const saved = savedArchiveState();
   const [board, setBoard] = useState({
-    plan: [], execute: [], audit_syntax: [], audit_semantics: [], ship: [],
-    verify: [],
+    truthgate: [], plan: [], execute: [], audit_syntax: [], audit_semantics: [],
+    ship: [], verify: [],
   });
   const [backlogEntries, setBacklogEntries] = useState([]);
   const [composerOpen, setComposerOpen] = useState(false);
@@ -1495,6 +1537,10 @@ export function KanbanPane({
       "task_role_called", "task_role_stand_down", "task_role_completed",
       "task_workflow_set", "task_drift_detected",
       "task_stage_stale", "audit_report_submitted",
+      "task_truthgate_started", "task_truthgate_completed",
+      "task_truthgate_blocked", "task_truthgate_override_recorded",
+      "truth_amendment_proposed", "truth_amendment_resolved",
+      "task_provisional_closure_recorded", "task_truth_basis_stale",
       "audit_fail_notification", "compass_audit_logged",
       "verification_report_submitted", "task_shipped_to_dev",
       "commit_pushed", "project_switched", "socket_connected",
@@ -1640,6 +1686,18 @@ export function KanbanPane({
             entries=${backlogEntries}
             onRefresh=${refreshBacklog}
             authedFetch=${authedFetch}
+          />
+          <${Column}
+            stage="truthgate"
+            label="TruthGate"
+            tasks=${board.truthgate || []}
+            expandedId=${expandedId}
+            historyByTask=${historyByTask}
+            historyBusy=${historyBusy}
+            onExpand=${toggleExpand}
+            onAssignRole=${(task, role) => setAssignTarget({ task, role })}
+            onStageAction=${(task, nextStage) => setStageTarget({ task, nextStage })}
+            onFollowUp=${setFollowUpTask}
           />
           <${Column}
             stage="plan"
