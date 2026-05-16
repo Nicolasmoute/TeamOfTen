@@ -4058,23 +4058,68 @@ async def _get_agent_allowed_tools_override(
                 (agent_id,),
             )
             row = await cur.fetchone()
+            cur = await c.execute(
+                "SELECT r.role "
+                "FROM task_role_assignments r "
+                "JOIN tasks t ON t.id = r.task_id "
+                "WHERE r.owner = ? "
+                "AND r.completed_at IS NULL "
+                "AND r.superseded_by IS NULL "
+                "AND ("
+                "  (t.status = 'plan' AND r.role = 'planner') OR "
+                "  (t.status = 'execute' AND r.role = 'executor') OR "
+                "  (t.status = 'audit_syntax' AND r.role = 'auditor_syntax') OR "
+                "  (t.status = 'audit_semantics' AND r.role = 'auditor_semantics') OR "
+                "  (t.status = 'ship' AND r.role = 'shipper')"
+                ") "
+                "ORDER BY r.assigned_at DESC, r.id DESC "
+                "LIMIT 1",
+                (agent_id,),
+            )
+            role_row = await cur.fetchone()
+            active_role = dict(role_row).get("role") if role_row else None
         finally:
             await c.close()
     except Exception:
         logger.exception("get_agent_allowed_tools_override failed: agent=%s", agent_id)
         return None
     raw = (dict(row).get("allowed_tools") if row else None) or ""
-    if not raw:
-        return None
+    parsed: Any = []
     try:
-        parsed = json.loads(raw)
+        if raw:
+            parsed = json.loads(raw)
     except Exception:
         logger.exception("invalid agents.allowed_tools JSON for agent=%s", agent_id)
-        return None
     if not isinstance(parsed, list):
-        return None
+        parsed = []
     tools = [t for t in parsed if isinstance(t, str) and t]
-    return list(dict.fromkeys(tools)) or None
+    tools = list(dict.fromkeys(tools))
+    if active_role:
+        from server.role_tool_allowlists import tools_for_role, tools_json_for_role
+        expected = tools_for_role(active_role)
+        if set(tools) != set(expected):
+            try:
+                c = await configured_conn()
+                try:
+                    await c.execute(
+                        "UPDATE agents SET allowed_tools = ? WHERE id = ?",
+                        (tools_json_for_role(active_role), agent_id),
+                    )
+                    await c.commit()
+                finally:
+                    await c.close()
+            except Exception:
+                logger.exception(
+                    "refresh agent allowed_tools failed: agent=%s role=%s",
+                    agent_id, active_role,
+                )
+            else:
+                logger.info(
+                    "refreshed stale allowed_tools for agent=%s role=%s",
+                    agent_id, active_role,
+                )
+            return expected
+    return tools or None
 
 
 async def _get_team_extra_tools() -> list[str]:

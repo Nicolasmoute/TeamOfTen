@@ -3462,6 +3462,10 @@ single + batch `DELETE /api/agents/{id}/session` endpoints also call
 `evict_client(slot)` for the same reason — clearing a session and
 clearing the cached Codex subprocess are two faces of the same
 "start fresh" intent.
+If an eviction happens while a Codex turn is still in flight, the
+runtime cache-pops the client immediately but queues the old
+client/token pair for close in that turn's `finally` block; this lets
+the live stream finish without leaking an orphaned app-server process.
 
 `PATCH /api/mcp/servers/{name}` runs its SQLite read/merge/update
 section in a worker thread with a 30 s busy timeout. The route is
@@ -4743,8 +4747,8 @@ remains read-only. `/api/health/detail` exposes
 
 Token lifetime, MCP cache invalidation on config change or
 `agents.allowed_tools` mismatch, `default_tools_approval_mode`
-injection, and the stdio error-shape contract are CodexRuntime concerns
-— see
+injection, process-tree cleanup, and the stdio error-shape contract are
+CodexRuntime concerns — see
 `Docs/CODEX_RUNTIME_SPEC.md` §C.4 and §E.1.
 The proxy also implements empty MCP `resources/list`,
 `resources/templates/list`, and `prompts/list`; Codex app-server
@@ -4778,6 +4782,16 @@ recent exchanges are salvaged into `continuity_note`, and
 shape has correlated with an unresumable Codex thread, so clearing it
 immediately prevents the next auto-wake from burning retry attempts on
 the same dead stdio receiver.
+The patched stdio transport starts the Codex Node wrapper/native
+app-server tree in its own process group and closes that group
+explicitly. The 2026-05-16 production incident showed stale Codex
+process pairs reparented under PID 1 and accumulating per Player slot;
+closing only the SDK client or wrapper process is insufficient.
+Before each Codex Player spawn, the dispatcher also refreshes
+`agents.allowed_tools` from any active kanban role row when the stored
+JSON no longer matches the current role allowlist, so existing shipper
+or executor assignments pick up newly-added completion tools without a
+same-stage reassignment.
 
 **Transient-error retry (2026-05-13)**: `CoordProxyClient.call_tool`
 retries on transport errors (`httpx.ConnectError`, `ReadTimeout`,

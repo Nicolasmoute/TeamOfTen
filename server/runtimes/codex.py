@@ -22,6 +22,7 @@ import contextlib
 import json
 import logging
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -63,6 +64,11 @@ _codex_client_allowed_tool_keys: dict[str, tuple[str, ...] | None] = {}
 # the subprocess instead of the turn.
 _codex_client_tokens: dict[str, str] = {}
 
+# Clients popped while a turn is still in flight cannot be closed
+# immediately without killing the active stream. Queue them here so the
+# runtime can close them in its per-turn finally block.
+_codex_clients_pending_close: dict[str, list[tuple[Any, str | None]]] = {}
+
 # Per-slot async locks to serialize get-or-create. The dispatcher's
 # _SPAWN_LOCK already serializes whole turns per slot, but a defensive
 # lock here lets `get_client` / `close_client` be safely called from
@@ -71,7 +77,7 @@ _client_locks: dict[str, asyncio.Lock] = {}
 
 # Bump when the Codex-visible coord tool contract changes in a way that
 # old persisted Codex threads might not pick up on resume.
-_CODEX_TOOL_CONTRACT_VERSION = "2026-05-15.coach-coord-descriptors"
+_CODEX_TOOL_CONTRACT_VERSION = "2026-05-16.shipper-gate-process-reap"
 _CODEX_WORKTREE_SANDBOX_PROBE_CACHE: dict[str, Any] | None = None
 _RECOVERY_LOG_KEY = "codex_recovery_log"
 _RECOVERY_LOG_MAX_EVENTS = 24
@@ -214,6 +220,7 @@ class _CapturedStdioTransport:
         self._transport_error_cls = transport_error_cls
         self._stderr_limit = stderr_limit
         self._proc: asyncio.subprocess.Process | None = None
+        self._pgid: int | None = None
         self._stderr_tail = ""
         self._stderr_last_at_monotonic: float | None = None
         self._stderr_last_at_wall: float | None = None
@@ -222,6 +229,15 @@ class _CapturedStdioTransport:
     async def connect(self) -> None:
         if self._proc is not None:
             return
+        popen_kwargs: dict[str, Any] = {}
+        if os.name == "posix":
+            # `codex` is a Node wrapper that spawns the native app-server.
+            # Put the whole tree in its own process group so close() can
+            # kill both parent and child; otherwise the native child can
+            # survive as a reparented orphan after transport recovery.
+            popen_kwargs["start_new_session"] = True
+        elif os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         try:
             self._proc = await asyncio.wait_for(
                 asyncio.create_subprocess_exec(
@@ -231,6 +247,7 @@ class _CapturedStdioTransport:
                     stderr=asyncio.subprocess.PIPE,
                     cwd=self._cwd,
                     env=self._env,
+                    **popen_kwargs,
                 ),
                 timeout=self._connect_timeout,
             )
@@ -238,6 +255,9 @@ class _CapturedStdioTransport:
             raise self._transport_error_cls(
                 f"failed to start stdio transport command: {self._command!r}"
             ) from exc
+        if os.name == "posix":
+            with contextlib.suppress(Exception):
+                self._pgid = os.getpgid(self._proc.pid)
         if self._proc.stderr is not None:
             self._stderr_task = asyncio.create_task(self._drain_stderr())
 
@@ -320,13 +340,37 @@ class _CapturedStdioTransport:
         if proc.stdin is not None:
             with contextlib.suppress(Exception):
                 proc.stdin.close()
+        pgid = self._pgid
+        own_pgid: int | None = None
+        if os.name == "posix":
+            with contextlib.suppress(Exception):
+                own_pgid = os.getpgrp()
+
+        def _signal_process_tree(sig: int) -> bool:
+            if (
+                os.name == "posix"
+                and pgid is not None
+                and pgid != own_pgid
+            ):
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(pgid, sig)
+                    return True
+            return False
+
         if proc.returncode is None:
-            proc.terminate()
+            if not _signal_process_tree(signal.SIGTERM):
+                proc.terminate()
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
             except asyncio.TimeoutError:
-                proc.kill()
+                if not _signal_process_tree(signal.SIGKILL):
+                    proc.kill()
                 await proc.wait()
+        elif os.name == "posix" and pgid is not None and pgid != own_pgid:
+            # The Node wrapper can exit while leaving the native child in
+            # the same process group. Sweep the group anyway; ignore ESRCH
+            # when the group is already empty.
+            _signal_process_tree(signal.SIGTERM)
         if self._stderr_task is not None:
             try:
                 await asyncio.wait_for(self._stderr_task, timeout=0.5)
@@ -520,14 +564,14 @@ async def get_client(
                 }))
                 # Inline evict (we already hold the slot lock — can't call
                 # evict_client which would deadlock on _slot_lock).
-                _codex_clients.pop(slot, None)
+                stale_client = _codex_clients.pop(slot, None)
                 _codex_client_cwds.pop(slot, None)
-                # Leave _codex_client_tokens in place: the subprocess is
-                # now gone (we won't use it), and close_client will revoke
-                # the token when it's called by the caller on error. If
-                # the subprocess is still alive, the token will expire
-                # naturally when the caller doesn't call it again.
-                # Fall through to spawn a fresh client below.
+                stale_token = _codex_client_tokens.pop(slot, None)
+                if stale_client is not None:
+                    await _close_codex_client_object(slot, stale_client)
+                if stale_token:
+                    from server.spawn_tokens import revoke as _revoke_proxy_token
+                    _revoke_proxy_token(stale_token)
                 _codex_client_allowed_tool_keys.pop(slot, None)
             elif cached_tool_key != requested_tool_key:
                 logger.info(
@@ -535,8 +579,14 @@ async def get_client(
                     "for slot=%s — evicting stale client",
                     slot,
                 )
-                _codex_clients.pop(slot, None)
+                stale_client = _codex_clients.pop(slot, None)
                 _codex_client_cwds.pop(slot, None)
+                stale_token = _codex_client_tokens.pop(slot, None)
+                if stale_client is not None:
+                    await _close_codex_client_object(slot, stale_client)
+                if stale_token:
+                    from server.spawn_tokens import revoke as _revoke_proxy_token
+                    _revoke_proxy_token(stale_token)
                 _codex_client_allowed_tool_keys.pop(slot, None)
             else:
                 return cached
@@ -613,9 +663,7 @@ async def get_client(
             # just minted (the subprocess that would have used it never
             # came up), and re-raise.
             try:
-                close = client.close()
-                if hasattr(close, "__await__"):
-                    await close
+                await _close_codex_client_object(slot, client)
             except Exception:
                 logger.exception(
                     "CodexRuntime: close() during failed handshake raised "
@@ -634,6 +682,56 @@ async def get_client(
         return client
 
 
+async def _close_codex_client_object(slot: str, client: Any) -> None:
+    """Close a CodexClient and its stdio transport process tree.
+
+    The SDK close path can leave the Node wrapper/native app-server
+    subprocess alive when the transport has already failed or when the
+    client was cache-popped during an in-flight eviction. Always call the
+    underlying patched transport close as a second line of defense.
+    """
+    transport = getattr(client, "_transport", None)
+    close = getattr(client, "close", None)
+    if close is not None:
+        r = close()
+        if hasattr(r, "__await__"):
+            await r
+    if transport is not None:
+        transport_close = getattr(transport, "close", None)
+        if transport_close is not None:
+            r = transport_close()
+            if hasattr(r, "__await__"):
+                await r
+
+
+async def _close_pending_evicted_clients(slot: str) -> None:
+    pending = _codex_clients_pending_close.pop(slot, [])
+    if not pending:
+        return
+    for client, token in pending:
+        try:
+            await _close_codex_client_object(slot, client)
+        except Exception:
+            logger.exception(
+                "CodexRuntime: close pending evicted client failed for slot %s",
+                slot,
+            )
+        if token:
+            try:
+                from server.spawn_tokens import revoke as _revoke_proxy_token
+                _revoke_proxy_token(token)
+            except Exception:
+                logger.exception(
+                    "CodexRuntime: revoke pending evicted token failed for slot %s",
+                    slot,
+                )
+    logger.info(
+        "CodexRuntime: closed %s pending evicted client(s) for slot=%s",
+        len(pending),
+        slot,
+    )
+
+
 async def close_client(slot: str) -> None:
     """Close + drop the cached client for `slot`. Safe if no client is
     cached. Called on auth-error / transport-error / shutdown."""
@@ -648,11 +746,10 @@ async def close_client(slot: str) -> None:
             from server.spawn_tokens import revoke as _revoke_proxy_token
             _revoke_proxy_token(token)
         if client is None:
+            await _close_pending_evicted_clients(slot)
             return
         try:
-            r = client.close()
-            if hasattr(r, "__await__"):
-                await r
+            await _close_codex_client_object(slot, client)
         except Exception as exc:
             logger.exception(
                 "CodexRuntime: close() raised for slot %s — dropping "
@@ -660,13 +757,15 @@ async def close_client(slot: str) -> None:
             )
         else:
             logger.info("CodexRuntime: closed client for slot=%s", slot)
+        await _close_pending_evicted_clients(slot)
 
 
 async def close_all_clients() -> None:
     """Close every cached client. Called on harness shutdown."""
-    slots = list(_codex_clients.keys())
+    slots = sorted(set(_codex_clients.keys()) | set(_codex_clients_pending_close.keys()))
     for slot in slots:
         await close_client(slot)
+        await _close_pending_evicted_clients(slot)
 
 
 async def evict_client(slot: str) -> None:
@@ -679,12 +778,11 @@ async def evict_client(slot: str) -> None:
 
     Behavior splits on whether a turn is in flight:
     - Idle slot → full `close_client` (closes subprocess, revokes token).
-    - In-flight turn → pop from `_codex_clients` only; leave the running
-      subprocess + its token intact so the live turn can complete. The
-      next turn's `get_client` lookup creates a fresh subprocess that
-      picks up current MCP config. The orphaned subprocess is a small
-      leak until container restart — acceptable trade-off vs killing a
-      live turn from an admin-side config change.
+    - In-flight turn → pop from `_codex_clients` and queue the running
+      subprocess + token for the turn's finally block. The live turn can
+      complete on its existing client reference, while the next turn's
+      `get_client` lookup creates a fresh subprocess that picks up
+      current MCP config.
     """
     try:
         from server.agents import is_agent_running
@@ -693,12 +791,17 @@ async def evict_client(slot: str) -> None:
 
     if is_agent_running(slot):
         async with _slot_lock(slot):
-            _codex_clients.pop(slot, None)
+            client = _codex_clients.pop(slot, None)
             _codex_client_cwds.pop(slot, None)
             _codex_client_allowed_tool_keys.pop(slot, None)
+            token = _codex_client_tokens.pop(slot, None)
+            if client is not None:
+                _codex_clients_pending_close.setdefault(slot, []).append(
+                    (client, token)
+                )
         logger.info(
             "CodexRuntime: evicted cache entry for slot=%s "
-            "(turn in flight; subprocess kept alive)", slot,
+            "(turn in flight; subprocess queued for post-turn close)", slot,
         )
         return
     await close_client(slot)
@@ -3438,6 +3541,13 @@ class CodexRuntime:
                         "CodexRuntime: clearing approval handler failed for %s",
                         tc.agent_id,
                     )
+            try:
+                await _close_pending_evicted_clients(tc.agent_id)
+            except Exception:
+                logger.exception(
+                    "CodexRuntime: pending evicted client cleanup failed for %s",
+                    tc.agent_id,
+                )
 
     async def maybe_auto_compact(self, tc: TurnContext) -> bool:
         """Auto-compact trip-wire — Codex shape.
