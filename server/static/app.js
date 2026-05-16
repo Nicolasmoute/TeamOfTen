@@ -18,7 +18,7 @@ import {
   renderDiffBody,
 } from "/static/tools.js";
 import { CompassPane, createCompassEventRouter } from "/static/compass.js?v=1778671319";
-import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js?v=1778971958";
+import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js?v=1778973038";
 import { PlaybookPane, createPlaybookEventRouter } from "/static/playbook.js";
 
 const html = htm.bind(h);

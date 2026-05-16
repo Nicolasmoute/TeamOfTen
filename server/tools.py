@@ -198,6 +198,110 @@ async def _truthgate_exit_error(
     )
 
 
+def _normalize_provisional_closure_reference(raw: Any) -> tuple[str | None, str | None]:
+    """Validate the closure reference grammar for provisional tasks."""
+    ref = str(raw or "").strip()
+    if not ref:
+        return None, "closure_reference is required"
+    if ref.startswith("none_needed:"):
+        rationale = ref.removeprefix("none_needed:").strip()
+        if not rationale:
+            return None, "none_needed closure requires a non-empty rationale"
+        return ref, None
+    if ref.startswith("amendment:"):
+        proposal_id = ref.removeprefix("amendment:").strip()
+        if not proposal_id.isdigit() or int(proposal_id) <= 0:
+            return None, "amendment closure must be amendment:<positive proposal_id>"
+        return f"amendment:{int(proposal_id)}", None
+    if ref.startswith("rollback:"):
+        rollback_task_id = ref.removeprefix("rollback:").strip()
+        if not rollback_task_id:
+            return None, "rollback closure requires rollback:<task_id>"
+        return f"rollback:{rollback_task_id}", None
+    return None, (
+        "closure_reference must be one of amendment:<proposal_id>, "
+        "none_needed:<rationale>, or rollback:<task_id>"
+    )
+
+
+async def _validate_provisional_closure_reference(
+    c: Any,
+    *,
+    project_id: str,
+    closure_reference: str,
+    require_approved_amendment: bool = False,
+) -> str | None:
+    """Return an operator-readable error when a closure reference is invalid."""
+    normalized, err = _normalize_provisional_closure_reference(closure_reference)
+    if err is not None:
+        return err
+    assert normalized is not None
+    if normalized.startswith("none_needed:"):
+        return None
+    if normalized.startswith("rollback:"):
+        rollback_task_id = normalized.removeprefix("rollback:")
+        cur = await c.execute(
+            "SELECT id FROM tasks WHERE id = ? AND project_id = ?",
+            (rollback_task_id, project_id),
+        )
+        if await cur.fetchone():
+            return None
+        return f"rollback closure references unknown task {rollback_task_id!r}"
+    proposal_id = int(normalized.removeprefix("amendment:"))
+    cur = await c.execute(
+        "SELECT scope, status FROM file_write_proposals "
+        "WHERE id = ? AND project_id = ?",
+        (proposal_id, project_id),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return f"amendment closure references unknown proposal #{proposal_id}"
+    proposal = dict(row)
+    if proposal.get("scope") != "truth":
+        return f"amendment closure proposal #{proposal_id} does not target truth/"
+    if require_approved_amendment and proposal.get("status") != "approved":
+        return (
+            f"amendment closure proposal #{proposal_id} must be approved "
+            "before delivered archive"
+        )
+    return None
+
+
+async def _provisional_archive_error(
+    c: Any,
+    *,
+    project_id: str,
+    task_id: str,
+) -> str | None:
+    """Delivered archive gate for emergency/provisional TruthGate tasks."""
+    cur = await c.execute(
+        "SELECT provisional, closure_reference FROM tasks "
+        "WHERE id = ? AND project_id = ?",
+        (task_id, project_id),
+    )
+    row = await cur.fetchone()
+    if not row:
+        return None
+    task = dict(row)
+    if not int(task.get("provisional") or 0):
+        return None
+    ref = (task.get("closure_reference") or "").strip()
+    if not ref:
+        return (
+            "provisional task cannot be delivered to archive until "
+            "coord_record_provisional_closure records a closure_reference"
+        )
+    err = await _validate_provisional_closure_reference(
+        c,
+        project_id=project_id,
+        closure_reference=ref,
+        require_approved_amendment=True,
+    )
+    if err:
+        return f"provisional closure_reference is not archive-ready: {err}"
+    return None
+
+
 def _truthgate_json_list(value: Any) -> str:
     """Serialize a classifier/override list field for task storage."""
     if not isinstance(value, list):
@@ -303,10 +407,9 @@ async def _persist_truthgate_result(
             final_blocked_reason = current_reason
 
     provisional_value = 1 if provisional else 0
-    closure_reference_s = (
-        (closure_reference or "").strip()
-        if provisional_value else None
-    )
+    closure_reference_s = None
+    if provisional_value:
+        closure_reference_s = (closure_reference or "").strip() or None
     params: list[Any] = [
         verdict,
         truth_basis_json,
@@ -8344,6 +8447,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             now = _now_iso()
             new_role_id: int | None = None
             if next_stage == "archive":
+                archive_err = await _provisional_archive_error(
+                    c, project_id=project_id, task_id=task_id,
+                )
+                if archive_err is not None:
+                    return _err(archive_err)
                 # Mark every active role row complete on archive — no
                 # roles persist into archive. Capture nothing for stand-
                 # down (archive isn't a reassignment). The user-facing
@@ -8753,6 +8861,11 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"task {task_id} is already archived; archived "
                     f"tasks are read-only."
                 )
+            archive_err = await _provisional_archive_error(
+                c, project_id=project_id, task_id=task_id,
+            )
+            if archive_err is not None:
+                return _err(archive_err)
             now = _now_iso()
             await c.execute(
                 "UPDATE task_role_assignments "
@@ -9383,6 +9496,22 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"task {task_id} is in stage {task['status']!r}; "
                     "override can only be recorded while status='truthgate'."
                 )
+            if provisional and closure_reference:
+                normalized, normalize_err = (
+                    _normalize_provisional_closure_reference(closure_reference)
+                )
+                if normalize_err is not None:
+                    return _err(normalize_err)
+                assert normalized is not None
+                validate_err = await _validate_provisional_closure_reference(
+                    c,
+                    project_id=project_id,
+                    closure_reference=normalized,
+                    require_approved_amendment=False,
+                )
+                if validate_err is not None:
+                    return _err(validate_err)
+                closure_reference = normalized
             payload = await _persist_truthgate_result(
                 c,
                 project_id=project_id,
@@ -9427,6 +9556,84 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             f"Recorded {verdict} for {task_id} "
             f"(method={method}).{provisional_note} Coach may now approve "
             f"truthgate → {next_hint} with coord_approve_stage."
+        )
+
+    @tool(
+        "coord_record_provisional_closure",
+        (
+            "Coach-only. Record the closure reference required before a "
+            "provisional TruthGate emergency-override task can be delivered "
+            "to archive. The task must already be marked provisional. This "
+            "does not move the task or wake a Player; it only persists "
+            "`tasks.closure_reference` and emits "
+            "`task_provisional_closure_recorded`.\n\n"
+            "Accepted closure_reference forms:\n"
+            "- amendment:<proposal_id> (proposal must exist and target truth/; "
+            "  delivered archive later requires it to be approved)\n"
+            "- none_needed:<non-empty rationale>\n"
+            "- rollback:<task_id> (referenced task must exist)"
+        ),
+        {"task_id": str, "closure_reference": str},
+    )
+    async def record_provisional_closure(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("coord_record_provisional_closure is Coach-only.")
+        task_id = (args.get("task_id") or "").strip()
+        raw_ref = (args.get("closure_reference") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+        normalized, normalize_err = _normalize_provisional_closure_reference(raw_ref)
+        if normalize_err is not None:
+            return _err(normalize_err)
+        assert normalized is not None
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id, provisional FROM tasks "
+                "WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"task {task_id} not found")
+            task = dict(row)
+            if not int(task.get("provisional") or 0):
+                return _err(
+                    f"task {task_id} is not provisional; closure_reference "
+                    "is only required for emergency-override tasks."
+                )
+            validate_err = await _validate_provisional_closure_reference(
+                c,
+                project_id=project_id,
+                closure_reference=normalized,
+                require_approved_amendment=False,
+            )
+            if validate_err is not None:
+                return _err(validate_err)
+            await c.execute(
+                "UPDATE tasks SET closure_reference = ? "
+                "WHERE id = ? AND project_id = ?",
+                (normalized, task_id, project_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+
+        ts = _now_iso()
+        await bus.publish({
+            "ts": ts,
+            "agent_id": caller_id,
+            "type": "task_provisional_closure_recorded",
+            "task_id": task_id,
+            "project_id": project_id,
+            "closure_reference": normalized,
+        })
+        return _ok(
+            f"Recorded provisional closure for {task_id}: {normalized}. "
+            "Delivered archive is now eligible if the reference remains "
+            "valid (amendment closures require approved truth proposals)."
         )
 
     @tool(
@@ -10101,6 +10308,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         role_complete,
         run_truthgate,
         record_truthgate_override,
+        record_provisional_closure,
         request_plan_review,
         set_task_blocked,
         send_message,
@@ -10443,6 +10651,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_role_complete",
     "mcp__coord__coord_run_truthgate",
     "mcp__coord__coord_record_truthgate_override",
+    "mcp__coord__coord_record_provisional_closure",
     "mcp__coord__coord_request_plan_review",
     # Backlog (Docs/kanban-specs-v2.md §4.0). coord_propose_task and
     # coord_list_backlog are open to Coach + Players; coord_triage_backlog

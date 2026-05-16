@@ -592,6 +592,7 @@ function Card({
                 ${task.blocked_reason ? html`<span>${task.blocked_reason}</span>` : null}
                 ${task.truthgate_warning ? html`<span>${task.truthgate_warning}</span>` : null}
                 ${task.provisional ? html`<span>provisional</span>` : null}
+                ${task.closure_reference ? html`<span>closure ${task.closure_reference}</span>` : null}
               </div>
               <${ShipEvidence} task=${task} />
               <${CardActions}

@@ -4758,6 +4758,7 @@ async def get_task_assignments(task_id: str) -> dict[str, Any]:
 # through the same validator as Coach's MCP-tool override.
 from server.tools import (  # noqa: E402
     ALL_KANBAN_STAGES,
+    _provisional_archive_error,
     _ship_verify_context_or_error,
     _truthgate_exit_error,
     _valid_transition,
@@ -4917,6 +4918,11 @@ async def post_task_approve_stage(
 
         now = datetime.now(timezone.utc).isoformat()
         if next_stage == "archive":
+            archive_err = await _provisional_archive_error(
+                c, project_id=project_id, task_id=task_id,
+            )
+            if archive_err is not None:
+                raise HTTPException(400, detail=archive_err)
             await c.execute(
                 "UPDATE task_role_assignments SET completed_at = ? "
                 "WHERE task_id = ? "
