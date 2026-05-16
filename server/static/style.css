@@ -2826,8 +2826,17 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   gap: 8px;
   margin-bottom: 6px;
   align-items: center;
+  min-width: 0;
 }
 .rec-card-row:last-child { margin-bottom: 0; }
+.rec-card-head {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+.rec-card-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .rec-card-row label {
   width: 70px;
   flex-shrink: 0;
@@ -2844,10 +2853,42 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   font-size: 12px;
   padding: 4px 6px;
   border-radius: 3px;
+  min-width: 0;
 }
 .rec-card-row textarea {
   min-height: 36px;
   resize: vertical;
+}
+.rec-card-chips {
+  margin-left: auto;
+  display: flex;
+  justify-content: flex-end;
+  gap: 4px;
+  flex: 1 1 120px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.rec-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-height: 18px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+.rec-chip.expiry {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+  color: var(--fg);
+}
+.rec-chip.expired {
+  border-color: color-mix(in srgb, var(--danger, #c64) 45%, var(--border));
+  color: var(--danger, #c64);
 }
 .rec-card-meta {
   font-size: 11px;
@@ -2871,6 +2912,7 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   gap: 6px;
   margin-top: 6px;
   justify-content: flex-end;
+  flex-wrap: wrap;
 }
 .rec-actions button {
   background: var(--bg);
@@ -2899,6 +2941,33 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   color: var(--danger, #c64);
   font-size: 11px;
   padding: 4px 0;
+}
+@media (max-width: 700px) {
+  .rec-card-row {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .rec-card-row label {
+    width: 100%;
+  }
+  .rec-card-row input,
+  .rec-card-row textarea {
+    flex-basis: 100%;
+  }
+  .rec-card-chips {
+    margin-left: 0;
+    justify-content: flex-start;
+    flex-basis: 100%;
+  }
+  .rec-chip {
+    white-space: normal;
+  }
+  .rec-actions {
+    justify-content: stretch;
+  }
+  .rec-actions button {
+    flex: 1 1 88px;
+  }
 }
 
 .pane-gear, .pane-export, .pane-search-toggle, .pane-pop-out, .pane-maximize {
