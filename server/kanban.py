@@ -1097,11 +1097,15 @@ async def build_auditor_wake_body(
     # Empty string = unset = no injection.
     success_criteria: str = ""
     project_id: str | None = None
+    truthgate_task: dict[str, Any] | None = None
     try:
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT project_id, success_criteria FROM tasks WHERE id = ?",
+                "SELECT project_id, success_criteria, truthgate_verdict, "
+                "truth_basis, truth_concerns, truthgate_at, "
+                "truthgate_method, truthgate_warning, provisional, "
+                "closure_reference FROM tasks WHERE id = ?",
                 (task_id,),
             )
             row = await cur.fetchone()
@@ -1111,6 +1115,7 @@ async def build_auditor_wake_body(
             d = dict(row)
             project_id = d.get("project_id")
             success_criteria = (d.get("success_criteria") or "").strip()
+            truthgate_task = d
     except Exception:
         logger.exception(
             "kanban: failed reading task row for auditor wake on %s",
@@ -1121,6 +1126,21 @@ async def build_auditor_wake_body(
         sections.append(
             f"## Coach's acceptance criteria\n\n{success_criteria}"
         )
+
+    if project_id and truthgate_task:
+        try:
+            from server.truthgate.targeted import build_truthgate_context_block
+            sections.append(
+                build_truthgate_context_block(
+                    project_id=project_id,
+                    task=truthgate_task,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "kanban: failed building TruthGate audit context for %s",
+                task_id,
+            )
 
     if role == "auditor_syntax":
         contract = await _build_audit_contract_block(task_id)

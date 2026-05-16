@@ -6958,14 +6958,18 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT status FROM tasks WHERE id = ? AND project_id = ?",
+                "SELECT status, truthgate_verdict, truth_basis, "
+                "truth_concerns, truthgate_at, truthgate_method, "
+                "truthgate_warning, provisional, closure_reference "
+                "FROM tasks WHERE id = ? AND project_id = ?",
                 (task_id, project_id),
             )
             task_row = await cur.fetchone()
             if not task_row:
                 return _err(f"task {task_id} not found")
+            task_data = dict(task_row)
             expected_stage = "audit_syntax" if role == "auditor_syntax" else "audit_semantics"
-            actual_stage = dict(task_row).get("status")
+            actual_stage = task_data.get("status")
             if actual_stage != expected_stage:
                 return _err(
                     f"{review_label} review is not active for task {task_id} "
@@ -6992,6 +6996,40 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"assignee=<slot>) before submission."
                 )
             assignment_id = dict(row)["id"]
+
+            try:
+                from server.truthgate.targeted import (
+                    check_audit_against_truthgate,
+                )
+                targeted_check = check_audit_against_truthgate(
+                    project_id=project_id,
+                    task=task_data,
+                    audit_body=body,
+                    verdict=verdict,
+                )
+            except Exception as exc:
+                return _err(
+                    "targeted TruthGate check failed; ask Coach to review "
+                    f"the cited truth basis before submitting PASS: {exc}"
+                )
+            if targeted_check.blocked:
+                details: list[str] = []
+                if targeted_check.violations:
+                    details.append(
+                        "audit body reports a truth violation: "
+                        + ", ".join(targeted_check.violations)
+                    )
+                if targeted_check.warnings:
+                    details.append(
+                        "truth basis warning: "
+                        + "; ".join(targeted_check.warnings)
+                    )
+                return _err(
+                    "targeted TruthGate check blocks PASS. Submit FAIL "
+                    "citing the violated or unverifiable truth clause, or "
+                    "message Coach for rerouting. "
+                    + " ".join(details)
+                )
 
             # Compute round number = count of prior assignments for this
             # (task, kind) PLUS 1. Includes this one (we just SELECTed it).
@@ -8563,6 +8601,31 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 f"Coach approved your move on task {task_id} to stage "
                 f"{next_stage!r} as {target_role}."
             )
+            if target_role in ("auditor_syntax", "auditor_semantics"):
+                try:
+                    cctx = await configured_conn()
+                    try:
+                        cur = await cctx.execute(
+                            "SELECT project_id, truthgate_verdict, "
+                            "truth_basis, truth_concerns, truthgate_at, "
+                            "truthgate_method, truthgate_warning, "
+                            "provisional, closure_reference "
+                            "FROM tasks WHERE id = ? AND project_id = ?",
+                            (task_id, project_id),
+                        )
+                        tg_row = await cur.fetchone()
+                    finally:
+                        await cctx.close()
+                    if tg_row:
+                        from server.truthgate.targeted import (
+                            build_truthgate_context_block,
+                        )
+                        base_wake = (
+                            f"{base_wake}\n\n"
+                            f"{build_truthgate_context_block(project_id=project_id, task=dict(tg_row))}"
+                        )
+                except Exception:
+                    pass
             if ship_verify_context:
                 base_wake = f"{base_wake}\n\n{ship_verify_context}"
             wake_body = _with_player_reminder(base_wake)

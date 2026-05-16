@@ -1,8 +1,8 @@
 # Truthgate - Spec-Compliance Stage for the Kanban Lifecycle
 
-Status: implementation approach. Phase 1 is implemented: `truthgate` is a real task status/board column, backlog promotion enters it without planting or waking a Player role, task rows carry TruthGate scalar fields, and `truthgate -> plan|execute` is rejected until a pass/override verdict is recorded. Phase 2 classifier core is implemented as a library-only package under `server/truthgate/`. Phase 3 manual Coach tooling is implemented with `coord_run_truthgate` and `coord_record_truthgate_override`, including task-row persistence and event recording. Phase 4 protected amendment wrapper is implemented with `coord_propose_truth_amendment` over the existing file-write proposal flow. Phase 5 attention surfaces are implemented for Kanban card chips, Coach coordination-block rollups, EnvPane pending-action visibility, and compact timeline events. Targeted audit integration and provisional closure tooling are later phases.
+Status: implementation approach. Phase 1 is implemented: `truthgate` is a real task status/board column, backlog promotion enters it without planting or waking a Player role, task rows carry TruthGate scalar fields, and `truthgate -> plan|execute` is rejected until a pass/override verdict is recorded. Phase 2 classifier core is implemented as a library-only package under `server/truthgate/`. Phase 3 manual Coach tooling is implemented with `coord_run_truthgate` and `coord_record_truthgate_override`, including task-row persistence and event recording. Phase 4 protected amendment wrapper is implemented with `coord_propose_truth_amendment` over the existing file-write proposal flow. Phase 5 attention surfaces are implemented for Kanban card chips, Coach coordination-block rollups, EnvPane pending-action visibility, and compact timeline events. Phase 6 targeted audit integration is implemented: auditor wakes include targeted TruthGate context and audit PASS fails closed when the cited basis is violated or cannot be checked. Provisional closure tooling remains a later phase.
 
-## Implementation status - Phase 2 classifier core + Phase 3 manual tools
+## Implementation status - Phase 2 classifier core + Phase 3 manual tools + Phase 6 targeted audit
 
 Implemented classifier-core pieces:
 
@@ -11,12 +11,12 @@ Implemented classifier-core pieces:
 - `prompts.py`: strict JSON classifier prompt and amendment-draft prompt helper.
 - `llm.py`: one-shot primary/fallback wrapper with `agent_id="truthgate"` and classifier ledger attribution.
 - `classifier.py`: per-project lock, cost-cap preflight, sparse-mode routing, strict whole-response JSON parsing, verdict normalization, and truth-basis validation.
-- `sparse.py`, `targeted.py`, and `amendments.py`: sparse pass result, targeted truth-basis reads, and amendment metadata helpers for later phases.
+- `sparse.py`, `targeted.py`, and `amendments.py`: sparse pass result, targeted truth-basis reads/audit guards, and amendment metadata helpers for later phases.
 - `coord_run_truthgate`: Coach-only tool that runs the classifier for a task in `truthgate`, persists verdict/basis/concerns/method/model fields, emits `task_truthgate_started`, `task_truthgate_completed`, and `task_truthgate_blocked` when the verdict requires amendment or clarification. Existing verdicts are preserved unless Coach passes `force=true`; classifier failures fail closed by blocking the task without recording a pass/override verdict. It does not advance the stage or wake a Player.
 - `coord_record_truthgate_override`: Coach-only tool that records `truthgate_coach_override` or `truthgate_emergency_override` with required rationale, emits override/completed events, and marks emergency overrides provisional. Emergency overrides may store an optional `closure_reference` for later reconciliation. It does not advance the stage or wake a Player.
 - `coord_propose_truth_amendment`: Coach and active-Player-role wrapper that queues a normal protected `file_write_proposals` row with `scope="truth"`, `metadata_json`, and `originating_task_id`. It does not write `truth/` directly and preserves the existing human approve/deny flow. `draft_instruction` / LLM amendment drafting remains deferred.
 
-Current mocked-LLM/tool tests cover sparse mode, dense-corpus prompt-budget truncation, slicer ordering, strict parser failure, model validation, basis validation, per-project concurrency locking, Coach-only Phase 3 tools, verdict persistence, blocked needs-change verdicts, force-rerun protection, classifier-error fail-closed behavior, override rationale validation, post-override exit gating, and Phase 4 amendment proposal approval/denial correlation. Protected truth mirror tests are temporarily waived by human directive; the matching `truth/` projection should be proposed through the protected flow after the waiver lifts.
+Current mocked-LLM/tool tests cover sparse mode, dense-corpus prompt-budget truncation, slicer ordering, strict parser failure, model validation, basis validation, per-project concurrency locking, Coach-only Phase 3 tools, verdict persistence, blocked needs-change verdicts, force-rerun protection, classifier-error fail-closed behavior, override rationale validation, post-override exit gating, Phase 4 amendment proposal approval/denial correlation, and Phase 6 targeted audit wake/PASS-guard behavior. Protected truth mirror tests are temporarily waived by human directive; the matching `truth/` projection should be proposed through the protected flow after the waiver lifts.
 
 ## Core idea
 
@@ -197,7 +197,7 @@ Audit's existing v2 checks (implementation matches task spec) extend with two ad
 1. **Implementation respects `truth_basis`** - read the cited truth files, verify no clause is violated. Targeted, not corpus-wide. Cheap because the slice is already known.
 2. **No load-bearing claim exists only in `Docs/`** - any rule the implementation depends on must trace to `truth/` (via `truth_basis`) or be flagged for amendment.
 
-The targeted truth check reuses TruthScore's parsing machinery without running a full TruthScore - it's a focused check, not a corpus audit. A separate `truthscore_targeted(task_id)` helper or a flag on the existing TruthScore module is the natural shape.
+The implemented targeted truth check is a focused guard, not a corpus audit or full TruthScore run. It reads only the task's cited `truth_basis` files for auditor wake context. Missing, stale, unreadable, or malformed cited basis metadata is surfaced for Coach review; audit PASS is rejected when the report identifies a cited-truth violation or when the cited basis cannot be checked. Empty-basis sparse/override tasks skip the file read with a visible warning.
 
 ## Docs projection - record only, don't auto-render in v1
 
