@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from server.compass.llm import parse_json_safe
 import server.truthgate.config as config
 from server.truthgate.classifier_types import TaskFields
 from server.truthgate.corpus import (
@@ -112,7 +112,12 @@ def parse_classifier_output(
     project_id: str,
     corpus: TruthCorpus,
 ) -> dict[str, Any]:
-    parsed = parse_json_safe(text)
+    try:
+        parsed = json.loads(text.strip())
+    except json.JSONDecodeError as exc:
+        raise TruthGateClassificationError(
+            "TruthGate classifier returned invalid JSON"
+        ) from exc
     if not isinstance(parsed, dict):
         raise TruthGateClassificationError(
             "TruthGate classifier returned invalid JSON"
