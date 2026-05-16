@@ -2803,24 +2803,46 @@ def _rollout_path_from_thread_state(thread_state: Any) -> Path | None:
     return p if p.is_file() else None
 
 
+def _codex_home_candidates() -> list[Path]:
+    """Return Codex home directories the CLI may use.
+
+    Codex defaults to ``~/.codex`` when CODEX_HOME is unset. The harness
+    previously looked only at CODEX_HOME, which made rollout discovery
+    disappear on default installs even though the CLI was writing
+    sessions normally.
+    """
+    candidates: list[Path] = []
+    raw = os.environ.get("CODEX_HOME", "").strip()
+    if raw:
+        try:
+            candidates.append(Path(raw).expanduser())
+        except (TypeError, ValueError):
+            pass
+    try:
+        default_home = Path.home() / ".codex"
+        if default_home not in candidates:
+            candidates.append(default_home)
+    except Exception:
+        pass
+    return candidates
+
+
 def _rollout_path_for_thread_id(thread_id: str) -> Path | None:
     """Best-effort lookup for an existing Codex rollout JSONL by thread id."""
     if not thread_id:
         return None
-    codex_home = os.environ.get("CODEX_HOME", "").strip()
-    if not codex_home:
-        return None
-    sessions = Path(codex_home) / "sessions"
-    try:
-        if not sessions.is_dir():
-            return None
-        matches = list(sessions.rglob(f"rollout-*{thread_id}.jsonl"))
-    except OSError:
-        return None
+    matches: list[Path] = []
+    for codex_home in _codex_home_candidates():
+        sessions = codex_home / "sessions"
+        try:
+            if sessions.is_dir():
+                matches.extend(sessions.rglob(f"rollout-*{thread_id}.jsonl"))
+        except OSError:
+            continue
     if not matches:
         return None
     try:
-        return max(matches, key=lambda p: p.stat().st_mtime)
+        return max(matches, key=lambda p: p.stat().st_mtime_ns)
     except OSError:
         return matches[-1]
 
@@ -2924,6 +2946,21 @@ def _codex_context_window_from_rollout_info(info: Mapping[str, Any]) -> int | No
     return window if window > 0 else None
 
 
+def _codex_context_tokens_from_rollout_info(info: Mapping[str, Any]) -> int:
+    """Estimate current prompt footprint from a Codex token_count event.
+
+    `last_token_usage.input_tokens` is the actual prompt sent for the
+    latest model call, including cached tokens. Adding latest output
+    mirrors the DB estimate used before a resume: prior output becomes
+    part of the next prompt.
+    """
+    usage = _codex_usage_from_rollout_info(info)
+    return sum(
+        int(usage.get(k) or 0)
+        for k in ("input", "cache_read", "cache_creation", "output")
+    )
+
+
 def _model_from_rollout(rollout_path: Path) -> str | None:
     """Last-resort model lookup for turns where `tc.model` was None.
 
@@ -2972,9 +3009,124 @@ def _extract_compact_summary(raw: Any) -> str:
                 value = nested.get(key)
                 if isinstance(value, str) and value.strip():
                     return value.strip()
+        return ""
     if isinstance(raw, str):
         return raw.strip()
     return str(raw).strip() if raw is not None else ""
+
+
+def _valid_recent_exchanges(recent: Any) -> list[dict[str, str]]:
+    if not isinstance(recent, list):
+        return []
+    out: list[dict[str, str]] = []
+    for entry in recent:
+        if not isinstance(entry, dict):
+            continue
+        prompt = entry.get("prompt")
+        response = entry.get("response")
+        if not isinstance(prompt, str) or not isinstance(response, str):
+            continue
+        if not (prompt.strip() or response.strip()):
+            continue
+        out.append({"prompt": prompt.strip(), "response": response.strip()})
+    return out
+
+
+def _synthetic_compact_summary_from_recent(
+    *,
+    thread_id: str,
+    recent: list[dict[str, str]],
+) -> str:
+    """Build a non-empty Codex handoff when native compact is opaque.
+
+    `thread/compact/start` is a server-side operation in the SDK and may
+    return only an ack. If that happens, the harness still needs a
+    durable handoff before clearing `codex_thread_id`; the rolling
+    exchange log is the best local continuity source.
+    """
+    lines: list[str] = [
+        "## Codex Compact Handoff",
+        "",
+        "Codex native compact completed, but the app-server did not return "
+        "a readable summary to TeamOfTen. This synthetic handoff preserves "
+        "the recent conversation captured by the harness before the Codex "
+        "thread was reset.",
+        "",
+        "## Source Thread",
+        "",
+        f"- Codex thread id: `{thread_id}`",
+        "",
+        "## Recent Exchanges",
+        "",
+    ]
+    if recent:
+        lines.append(
+            f"Verbatim recent turn log, oldest first ({len(recent)} "
+            f"turn{'s' if len(recent) != 1 else ''})."
+        )
+        for i, entry in enumerate(recent, start=1):
+            lines.extend([
+                "",
+                f"### Exchange {i} of {len(recent)}",
+                "",
+                "**User asked:**",
+                "",
+                entry["prompt"] or "(empty)",
+                "",
+                "**Assistant replied:**",
+                "",
+                entry["response"] or "(empty)",
+            ])
+    else:
+        lines.append(
+            "No recent exchange log was recorded before compact. Continue "
+            "from the next user prompt and use the full rollout transcript "
+            "footer below if exact prior context is needed."
+        )
+    return "\n".join(lines).strip()
+
+
+def _build_codex_compact_footer(thread_id: str | None) -> str:
+    """Render the Codex-specific handoff footer."""
+    try:
+        retention = int(os.environ.get("HARNESS_SESSION_RETENTION_DAYS", "30"))
+    except ValueError:
+        retention = 30
+    if retention <= 0:
+        retention_note = "kept indefinitely (retention disabled)"
+    else:
+        retention_note = f"auto-pruned after {retention} days"
+
+    rollout = _rollout_path_for_thread_id(thread_id or "")
+    if rollout is not None:
+        transcript_hint = f"`{rollout}`"
+    else:
+        home = _codex_home_candidates()
+        root = home[0] if home else Path("~/.codex").expanduser()
+        if thread_id:
+            transcript_hint = (
+                f"`{root}/sessions/<yyyy>/<mm>/<dd>/"
+                f"rollout-*{thread_id}.jsonl`"
+            )
+        else:
+            transcript_hint = (
+                f"`{root}/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl` "
+                "(thread id was not captured)"
+            )
+
+    return (
+        "---\n"
+        "## Where to find more _(auto-appended by the harness)_\n\n"
+        "The summary above is lossy by design. If you need exact "
+        "strings, tool outputs, URLs, or code that is not preserved "
+        "below, the full record exists:\n\n"
+        f"- **Full Codex rollout transcript**: {transcript_hint}. "
+        f"{retention_note.capitalize()}. Ask the operator to surface it "
+        "if you cannot read it directly from your workspace.\n"
+        "- **This handoff itself** is saved at `handoffs/<agent>-"
+        "<timestamp>.md` (the exact filename is in the one-line "
+        "pointer above, if any)."
+    )
 
 
 def is_enabled() -> bool:
@@ -3618,6 +3770,8 @@ class CodexRuntime:
         prior_thread = await _get_codex_thread_id(tc.agent_id)
         if not prior_thread:
             return False
+        rollout_info: Mapping[str, Any] | None = None
+        rollout_used = 0
         rollout_path = _rollout_path_for_thread_id(prior_thread)
         if rollout_path is not None:
             rollout_info = _read_codex_token_count_from_rollout(rollout_path)
@@ -3626,7 +3780,9 @@ class CodexRuntime:
                     tc.model,
                     _codex_context_window_from_rollout_info(rollout_info),
                 )
+                rollout_used = _codex_context_tokens_from_rollout_info(rollout_info)
         used = await _codex_session_context_estimate(prior_thread)
+        used = max(used, rollout_used)
         ctx_max = _context_window_for(tc.model)
         if ctx_max <= 0 or used / ctx_max < threshold:
             return False
@@ -3695,7 +3851,14 @@ class CodexRuntime:
             await self._emit_disabled_attention(tc)
             return
 
-        from server.agents import _emit, _set_status, _set_continuity_note
+        from server.agents import (
+            _clear_exchange_log,
+            _emit,
+            _get_recent_exchanges,
+            _set_continuity_note,
+            _set_status,
+            _write_handoff_file,
+        )
         from server.workspaces import workspace_dir
 
         method, env_overrides = await resolve_auth()
@@ -3832,9 +3995,44 @@ class CodexRuntime:
             return
 
         summary = _extract_compact_summary(raw)
-        if summary:
-            await _set_continuity_note(tc.agent_id, summary)
+        if not summary:
+            try:
+                thread_state = client.read_thread(thread_id, include_turns=True)
+                thread_state = await _await_if_needed(thread_state)
+                summary = _extract_compact_summary(thread_state)
+            except Exception:
+                logger.exception(
+                    "CodexRuntime: post-compact thread read failed for slot=%s "
+                    "thread=%s",
+                    tc.agent_id, thread_id,
+                )
+        used_synthetic_summary = False
+        if not summary:
+            used_synthetic_summary = True
+            recent = _valid_recent_exchanges(
+                await _get_recent_exchanges(tc.agent_id)
+            )
+            summary = _synthetic_compact_summary_from_recent(
+                thread_id=thread_id,
+                recent=recent,
+            )
+        footer = _build_codex_compact_footer(thread_id)
+        summary_with_footer = summary.rstrip() + "\n\n" + footer
+        handoff_file = await _write_handoff_file(
+            tc.agent_id,
+            summary_with_footer,
+        )
+        if handoff_file:
+            pointer = (
+                f"_This handoff is also saved to handoffs/{handoff_file} "
+                f"for audit + cross-agent reference; the text below is "
+                f"the full content._\n\n"
+            ) + summary_with_footer
+        else:
+            pointer = summary_with_footer
+        await _set_continuity_note(tc.agent_id, pointer)
         await _clear_codex_thread_id(tc.agent_id)
+        await _clear_exchange_log(tc.agent_id)
 
         # Transfer-mode (compact + flip): apply the runtime change now
         # that compaction succeeded. The continuity_note we just wrote
@@ -3861,13 +4059,19 @@ class CodexRuntime:
                 "session_transferred",
                 from_runtime=_xfer_from,
                 to_runtime=_xfer_to,
+                chars=len(summary),
+                handoff_file=handoff_file,
                 summary_preview=(summary[:200] if summary else None),
+                synthetic_summary=used_synthetic_summary,
             )
         else:
             await _emit(
                 tc.agent_id,
                 "session_compacted",
+                chars=len(summary),
+                handoff_file=handoff_file,
                 summary_preview=(summary[:200] if summary else None),
+                synthetic_summary=used_synthetic_summary,
             )
         tc.turn_ctx["got_result"] = True
 

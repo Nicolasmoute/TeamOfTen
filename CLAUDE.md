@@ -1428,14 +1428,18 @@ OpenAI's Codex safety monitor, which cancelled the subsequent
   context bar already used it). Trip-wire now mirrors Claude's:
   honors the shared `HARNESS_AUTO_COMPACT_THRESHOLD` env (default
   0.65), short-circuits on `compact_mode` / unparseable threshold /
-  no `codex_thread_id`, computes `used / window` against
-  `_context_window_for(tc.model)`, emits `auto_compact_triggered`
-  with the same payload shape, then delegates to `run_manual_compact`
-  so the actual compaction goes through the **native**
+  no `codex_thread_id`, computes `used / window` from the DB estimate
+  plus Codex rollout token_count fallback (`CODEX_HOME/sessions` or
+  default `~/.codex/sessions`), emits `auto_compact_triggered` with
+  the same payload shape, then delegates to `run_manual_compact` so
+  the actual compaction goes through the **native**
   `client.compact_thread(thread_id)` endpoint (not a `COMPACT_PROMPT`
-  LLM round-trip). The dispatcher then runs the user's original
-  prompt on a fresh thread that picks up the continuity note from
-  the system prompt. Failure paths (auth gone, ImportError,
+  LLM round-trip). If the SDK returns only an acknowledgement, the
+  handler writes a synthetic handoff from the recent exchange log and
+  emits `synthetic_summary=true` instead of a 0-char compact. The
+  dispatcher then runs the user's original prompt on a fresh thread
+  that picks up the continuity note from the system prompt. Failure
+  paths (auth gone, ImportError,
   app-server exception) emit `auto_compact_failed` symmetrically with
   Claude. Spec mirror in `Docs/CODEX_RUNTIME_SPEC.md` §A.5 / §E.6.
 
@@ -1495,9 +1499,9 @@ first, then flip, and remember the order.
 - **Prior session exists** → schedule a transfer-mode compact on the
   current runtime; on success the runtime flips and
   `session_transferred(from_runtime, to_runtime, ...)` fires; on
-  empty-summary failure (Claude only — Codex's `compact_thread` has
-  already cleared the thread) `session_transfer_failed` fires and
-  the runtime stays put.
+  empty-summary failure Claude emits `session_transfer_failed` and
+  stays put, while Codex writes a synthetic recent-exchange handoff
+  and flips with `synthetic_summary=true`.
 - **Same target runtime** → 200 noop.
 - **Mid-turn (status='working')** → 409 (cancel first).
 

@@ -2413,6 +2413,43 @@ def test_codex_rollout_context_window_parser() -> None:
     }) is None
 
 
+def test_codex_rollout_path_falls_back_to_default_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    import server.runtimes.codex as codex_mod
+
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(
+        codex_mod.Path,
+        "home",
+        classmethod(lambda cls: tmp_path),
+    )
+    sessions = tmp_path / ".codex" / "sessions" / "2026" / "05" / "16"
+    sessions.mkdir(parents=True)
+    rollout = sessions / "rollout-abc-tid_default.jsonl"
+    rollout.write_text("{}", encoding="utf-8")
+
+    assert codex_mod._rollout_path_for_thread_id("tid_default") == rollout
+
+
+def test_codex_rollout_context_token_estimate_uses_latest_prompt() -> None:
+    from server.runtimes.codex import _codex_context_tokens_from_rollout_info
+
+    assert _codex_context_tokens_from_rollout_info({
+        "last_token_usage": {
+            "input_tokens": 800_000,
+            "cached_input_tokens": 200_000,
+            "output_tokens": 12_000,
+            "reasoning_output_tokens": 3_000,
+        },
+        "total_token_usage": {
+            "input_tokens": 9_000_000,
+            "output_tokens": 9_000_000,
+        },
+    }) == 815_000
+
+
 def test_codex_worktree_sandbox_probe_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2749,6 +2786,20 @@ class _CompactFakeClient:
         return {"summary": "compact summary"}
 
 
+class _EmptyCompactFakeClient:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.read_calls: list[tuple[str, bool]] = []
+
+    def compact_thread(self, thread_id):
+        self.calls.append(thread_id)
+        return {}
+
+    def read_thread(self, thread_id, *, include_turns=True):
+        self.read_calls.append((thread_id, include_turns))
+        return {"thread": {"id": thread_id, "turns": []}}
+
+
 async def test_codex_run_manual_compact_uses_native_compact(
     monkeypatch, fresh_db,
 ) -> None:
@@ -2762,6 +2813,8 @@ async def test_codex_run_manual_compact_uses_native_compact(
     captured = _capture_emit(monkeypatch)
     notes: list[tuple[str, str | None]] = []
     cleared: list[str] = []
+    exchange_cleared: list[str] = []
+    handoffs: list[tuple[str, str]] = []
     client = _CompactFakeClient()
 
     async def fake_get_client(
@@ -2780,6 +2833,13 @@ async def test_codex_run_manual_compact_uses_native_compact(
     async def fake_clear(agent_id):
         cleared.append(agent_id)
 
+    async def fake_clear_exchange(agent_id):
+        exchange_cleared.append(agent_id)
+
+    async def fake_write_handoff(agent_id, body):
+        handoffs.append((agent_id, body))
+        return "p1-compact.md"
+
     monkeypatch.setattr(
         codex_mod,
         "resolve_auth",
@@ -2789,6 +2849,8 @@ async def test_codex_run_manual_compact_uses_native_compact(
     monkeypatch.setattr(codex_mod, "get_client", fake_get_client)
     monkeypatch.setattr(codex_mod, "_clear_codex_thread_id", fake_clear)
     monkeypatch.setattr(agentsmod, "_set_continuity_note", fake_set_note)
+    monkeypatch.setattr(agentsmod, "_clear_exchange_log", fake_clear_exchange)
+    monkeypatch.setattr(agentsmod, "_write_handoff_file", fake_write_handoff)
 
     tc = TurnContext(
         agent_id="p1",
@@ -2804,10 +2866,118 @@ async def test_codex_run_manual_compact_uses_native_compact(
     await CodexRuntime().run_manual_compact(tc)
 
     assert client.calls == ["tid_1"]
-    assert notes == [("p1", "compact summary")]
+    assert len(notes) == 1
+    assert notes[0][0] == "p1"
+    assert "compact summary" in (notes[0][1] or "")
+    assert "handoffs/p1-compact.md" in (notes[0][1] or "")
+    assert len(handoffs) == 1
+    assert handoffs[0][0] == "p1"
+    assert "compact summary" in handoffs[0][1]
+    assert "Full Codex rollout transcript" in handoffs[0][1]
     assert cleared == ["p1"]
+    assert exchange_cleared == ["p1"]
     assert tc.turn_ctx["got_result"] is True
     assert captured[-1]["type"] == "session_compacted"
+    assert captured[-1]["chars"] == len("compact summary")
+    assert captured[-1]["handoff_file"] == "p1-compact.md"
+
+
+async def test_codex_run_manual_compact_writes_synthetic_handoff_when_native_empty(
+    monkeypatch, fresh_db,
+) -> None:
+    import server.agents as agentsmod
+    import server.db as dbmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    await dbmod.init_db()
+    monkeypatch.setenv("HARNESS_CODEX_ENABLED", "true")
+    captured = _capture_emit(monkeypatch)
+    notes: list[tuple[str, str | None]] = []
+    cleared: list[str] = []
+    exchange_cleared: list[str] = []
+    handoffs: list[tuple[str, str]] = []
+    client = _EmptyCompactFakeClient()
+
+    async def fake_get_client(
+        slot,
+        *,
+        cwd,
+        env_overrides=None,
+        external_mcp_servers=None,
+        allowed_tools=None,
+    ):
+        return client
+
+    async def fake_set_note(agent_id, note):
+        notes.append((agent_id, note))
+
+    async def fake_clear(agent_id):
+        cleared.append(agent_id)
+
+    async def fake_clear_exchange(agent_id):
+        exchange_cleared.append(agent_id)
+
+    async def fake_recent(agent_id):
+        return [
+            {
+                "prompt": "what broke?",
+                "response": "compact returned no readable summary",
+            }
+        ]
+
+    async def fake_write_handoff(agent_id, body):
+        handoffs.append((agent_id, body))
+        return "p1-synthetic.md"
+
+    monkeypatch.setattr(
+        codex_mod,
+        "resolve_auth",
+        lambda: _async_value(("chatgpt", {})),
+    )
+    monkeypatch.setattr(
+        codex_mod,
+        "_get_codex_thread_id",
+        lambda agent_id: _async_value("tid_empty"),
+    )
+    monkeypatch.setattr(codex_mod, "get_client", fake_get_client)
+    monkeypatch.setattr(codex_mod, "_clear_codex_thread_id", fake_clear)
+    monkeypatch.setattr(agentsmod, "_set_continuity_note", fake_set_note)
+    monkeypatch.setattr(agentsmod, "_clear_exchange_log", fake_clear_exchange)
+    monkeypatch.setattr(agentsmod, "_get_recent_exchanges", fake_recent)
+    monkeypatch.setattr(agentsmod, "_write_handoff_file", fake_write_handoff)
+
+    tc = TurnContext(
+        agent_id="p1",
+        project_id="default",
+        prompt="/compact",
+        system_prompt="",
+        workspace_cwd="C:/work/p1/project",
+        allowed_tools=[],
+        external_mcp_servers={},
+        turn_ctx={},
+    )
+
+    await CodexRuntime().run_manual_compact(tc)
+
+    assert client.calls == ["tid_empty"]
+    assert client.read_calls == [("tid_empty", True)]
+    assert len(handoffs) == 1
+    assert handoffs[0][0] == "p1"
+    assert "Codex Compact Handoff" in handoffs[0][1]
+    assert "what broke?" in handoffs[0][1]
+    assert "compact returned no readable summary" in handoffs[0][1]
+    assert "Full Codex rollout transcript" in handoffs[0][1]
+    assert len(notes) == 1
+    assert "handoffs/p1-synthetic.md" in (notes[0][1] or "")
+    assert "Codex Compact Handoff" in (notes[0][1] or "")
+    assert cleared == ["p1"]
+    assert exchange_cleared == ["p1"]
+    assert tc.turn_ctx["got_result"] is True
+    compacted = [ev for ev in captured if ev["type"] == "session_compacted"]
+    assert compacted[-1]["chars"] > 0
+    assert compacted[-1]["handoff_file"] == "p1-synthetic.md"
+    assert compacted[-1]["synthetic_summary"] is True
 
 
 async def test_codex_maybe_auto_compact_no_thread_returns_false(
@@ -2948,6 +3118,80 @@ async def test_codex_maybe_auto_compact_uses_reported_rollout_window(
             agentsmod._REPORTED_CONTEXT_WINDOWS["gpt-5.5"] = previous
 
 
+async def test_codex_maybe_auto_compact_uses_rollout_tokens_when_db_empty(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import json
+    import server.agents as agentsmod
+    import server.runtimes.codex as codex_mod
+    from server.runtimes.base import TurnContext
+
+    previous = agentsmod._REPORTED_CONTEXT_WINDOWS.pop("gpt-5.4-mini", None)
+    try:
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+        monkeypatch.setenv("HARNESS_AUTO_COMPACT_THRESHOLD", "0.7")
+        sessions = tmp_path / "sessions" / "2026" / "05" / "16"
+        sessions.mkdir(parents=True)
+        (sessions / "rollout-abc-tid_rollout_tokens.jsonl").write_text(
+            json.dumps({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": 800_000,
+                            "cached_input_tokens": 125_000,
+                            "output_tokens": 20_000,
+                        },
+                        "model_context_window": 1_000_000,
+                    },
+                },
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(
+            codex_mod,
+            "_get_codex_thread_id",
+            lambda agent_id: _async_value("tid_rollout_tokens"),
+        )
+        monkeypatch.setattr(
+            agentsmod,
+            "_codex_session_context_estimate",
+            lambda thread_id: _async_value(0),
+        )
+
+        async def fake_compact(self, tc):
+            tc.turn_ctx["got_result"] = True
+
+        monkeypatch.setattr(codex_mod.CodexRuntime, "run_manual_compact", fake_compact)
+        captured = _capture_emit(monkeypatch)
+
+        tc = TurnContext(
+            agent_id="p1",
+            project_id="default",
+            prompt="deferred",
+            system_prompt="",
+            workspace_cwd="C:/work/p1/project",
+            allowed_tools=[],
+            external_mcp_servers={},
+            model="gpt-5.4-mini",
+            turn_ctx={},
+        )
+
+        assert await CodexRuntime().maybe_auto_compact(tc) is True
+        triggered = [ev for ev in captured if ev["type"] == "auto_compact_triggered"]
+        assert triggered[0]["used_tokens"] == 820_000
+        assert triggered[0]["context_window"] == 1_000_000
+        assert triggered[0]["ratio"] == 0.82
+    finally:
+        if previous is None:
+            agentsmod._REPORTED_CONTEXT_WINDOWS.pop("gpt-5.4-mini", None)
+        else:
+            agentsmod._REPORTED_CONTEXT_WINDOWS["gpt-5.4-mini"] = previous
+
+
 async def test_codex_maybe_auto_compact_trips_native_compact(
     monkeypatch, fresh_db,
 ) -> None:
@@ -2967,6 +3211,8 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
     client = _CompactFakeClient()
     notes: list[tuple[str, str | None]] = []
     cleared: list[str] = []
+    exchange_cleared: list[str] = []
+    handoffs: list[tuple[str, str]] = []
 
     async def fake_get_client(
         slot,
@@ -2984,6 +3230,13 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
     async def fake_clear(agent_id):
         cleared.append(agent_id)
 
+    async def fake_clear_exchange(agent_id):
+        exchange_cleared.append(agent_id)
+
+    async def fake_write_handoff(agent_id, body):
+        handoffs.append((agent_id, body))
+        return "p1-auto.md"
+
     monkeypatch.setattr(
         codex_mod, "_get_codex_thread_id",
         lambda agent_id: _async_value("tid_full"),
@@ -2995,6 +3248,8 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
     monkeypatch.setattr(codex_mod, "get_client", fake_get_client)
     monkeypatch.setattr(codex_mod, "_clear_codex_thread_id", fake_clear)
     monkeypatch.setattr(agentsmod, "_set_continuity_note", fake_set_note)
+    monkeypatch.setattr(agentsmod, "_clear_exchange_log", fake_clear_exchange)
+    monkeypatch.setattr(agentsmod, "_write_handoff_file", fake_write_handoff)
     # 800k of 1M = 80% — well above the 70% threshold.
     monkeypatch.setattr(
         agentsmod,
@@ -3029,8 +3284,14 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
 
     # Native compact ran on the right thread id.
     assert client.calls == ["tid_full"]
-    assert notes == [("p1", "compact summary")]
+    assert len(notes) == 1
+    assert notes[0][0] == "p1"
+    assert "compact summary" in (notes[0][1] or "")
+    assert "handoffs/p1-auto.md" in (notes[0][1] or "")
+    assert len(handoffs) == 1
+    assert "compact summary" in handoffs[0][1]
     assert cleared == ["p1"]
+    assert exchange_cleared == ["p1"]
     # session_compacted is the run_manual_compact tail event.
     assert any(ev["type"] == "session_compacted" for ev in captured)
     # got_result is the success signal the trip-wire reads.
