@@ -1770,11 +1770,15 @@ Manual compact:
 
 - UI slash command `/compact`.
 - API `POST /api/agents/{id}/compact`.
-- Runs the agent with `COMPACT_PROMPT`.
+- Claude runs the agent with `COMPACT_PROMPT`; Codex silently resumes
+  the stored Codex thread and generates COMPACT_PROMPT-style markdown
+  without streaming the handoff text to normal UI/events/logs.
 - Captures the summary as `agent_sessions.continuity_note`.
 - Writes full handoff file under active project's `working/handoffs/`.
 - Clears session id so the next turn starts fresh.
-- Emits `session_compacted`.
+- Emits `session_compacted` with metadata only (`chars`,
+  `handoff_file`, and for Codex `summary_source` /
+  `synthetic_summary`).
 
 Auto-compact:
 
@@ -1843,20 +1847,21 @@ Failure modes:
   emits and the runtime stays put. The intent of transfer is "carry
   forward via summary"; a flip with empty context is a destructive
   blind switch.
-- Compact yields no summary on Codex → flip still proceeds because
-  `client.compact_thread()` already cleared the thread; not flipping
-  would leave the agent on Codex with no thread to resume, strictly
-  worse than flipping with thin context. Asymmetry intentional.
+- Compact yields no generated summary on Codex → recent-exchange
+  fallback may be used, but it is marked
+  `summary_source='recent_exchange_fallback'` and
+  `synthetic_summary=true`. If neither generated nor fallback handoff
+  can be durably persisted, `session_transfer_failed` emits and the
+  runtime plus `codex_thread_id` stay put.
 - Helper failure on `_clear_codex_thread_id` is logged but doesn't
   abort; `runtime_updated` still emits so the UI doesn't silently
   miss the change.
 
 Why not just `/compact` followed by a blunt PUT: atomicity. The flip
 only happens iff the compact succeeded with a non-empty summary
-(Claude side) or the native `compact_thread` call succeeded (Codex
-side). A user who runs the two operations separately gets the flip
-even when the compact failed, leaving the agent on the new runtime
-with no handoff. The transfer flow also emits the right event
+on both runtimes. A user who runs the two operations separately gets
+the flip even when the compact failed, leaving the agent on the new
+runtime with no handoff. The transfer flow also emits the right event
 vocabulary so timelines read as a single transfer boundary, not as a
 compact plus an unrelated runtime change.
 
