@@ -4062,6 +4062,7 @@ async def _get_agent_allowed_tools_override(
                 "SELECT r.role "
                 "FROM task_role_assignments r "
                 "JOIN tasks t ON t.id = r.task_id "
+                "JOIN agents a ON a.id = ? "
                 "WHERE r.owner = ? "
                 "AND r.completed_at IS NULL "
                 "AND r.superseded_by IS NULL "
@@ -4072,9 +4073,11 @@ async def _get_agent_allowed_tools_override(
                 "  (t.status = 'audit_semantics' AND r.role = 'auditor_semantics') OR "
                 "  (t.status = 'ship' AND r.role = 'shipper')"
                 ") "
-                "ORDER BY r.assigned_at DESC, r.id DESC "
+                "ORDER BY "
+                "  CASE WHEN a.current_task_id = r.task_id THEN 0 ELSE 1 END, "
+                "  r.assigned_at DESC, r.id DESC "
                 "LIMIT 1",
-                (agent_id,),
+                (agent_id, agent_id),
             )
             role_row = await cur.fetchone()
             active_role = dict(role_row).get("role") if role_row else None
