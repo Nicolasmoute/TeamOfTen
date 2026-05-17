@@ -824,22 +824,40 @@ async def run_daily_reflection(*, manual: bool = False, force_through_no_activit
             operations.append({**op, "op": "adjust"})
 
     # --- Apply ops + relevant_ids (§5.6)
+    engine_actions: list[dict[str, Any]] = []
     applied, rejected, hard_cap_hit = apply_coach_proposals(
         lattice, archive, operations,
         creation_weight=config.COACH_CREATION_WEIGHT,
+        engine_actions=engine_actions,
     )
     relevance_increments = increment_relevant_ids(
         lattice, parsed.get("relevant_ids"),
     )
 
-    # --- Engine sweep (§5.8)
-    engine_actions = sweep_engine_actions(lattice, archive)
+    # --- Final pressure sweep (§5.7.1)
+    engine_actions.extend(
+        sweep_engine_actions(lattice, archive, include_hygiene=False, include_pressure=True)
+    )
 
     if hard_cap_hit:
+        hard_rejected = [
+            r for r in rejected if r.get("reason") == "hard_cap_pressure"
+        ]
         await _publish({
             "type": "playbook_soft_cap_exceeded",
-            "count": len(lattice.statements) + sum(1 for op in operations if op.get("op") == "create"),
-            "dropped": sum(1 for r in rejected if r.get("reason") in ("hard_cap_pressure", "soft_cap_pressure")),
+            "count": hard_rejected[0].get("pressure") if hard_rejected else config.HARD_STATEMENT_CAP + 1,
+            "dropped": len(hard_rejected),
+        })
+        await _publish({
+            "type": "human_attention",
+            "agent_id": "playbook",
+            "subject": "Playbook hard cap pressure",
+            "body": (
+                "Playbook proposal pressure exceeded the hard cap; all "
+                "creations from the run were rejected. Review the lattice "
+                "for merges, downward adjustments, or deletions."
+            ),
+            "urgency": "high",
         })
 
     # --- Persist

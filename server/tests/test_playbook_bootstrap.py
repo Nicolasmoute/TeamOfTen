@@ -180,7 +180,7 @@ def test_bootstrap_cost_cap_skip_no_retry_increment(pb_env: Path, monkeypatch: p
 
 
 def test_bootstrap_soft_cap_drops_excess_seeds(pb_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """LLM returns >100 seeds → drop from end down to soft cap (G4)."""
+    """LLM returns >60 seeds → drop from end down to soft cap (G4)."""
     _set_template(pb_env / "templates" / "app_dev_playbook.md", "prose")
     monkeypatch.setattr(bootstrap_mod, "_PROSE_TEMPLATE_PATH",
                         pb_env / "templates" / "app_dev_playbook.md")
@@ -190,12 +190,27 @@ def test_bootstrap_soft_cap_drops_excess_seeds(pb_env: Path, monkeypatch: pytest
         for i in range(120)
     ]
     _stub_llm_call(monkeypatch, json.dumps(too_many))
+    events: list[dict[str, Any]] = []
+
+    async def _capture_event(payload: dict[str, Any]) -> None:
+        events.append(payload)
+
+    monkeypatch.setattr(bootstrap_mod, "_publish", _capture_event)
 
     row = asyncio.run(bootstrap_mod.run_bootstrap())
 
-    # Hard cap branch: 120 > 110 → drop to soft cap (100)
-    assert row["seeds_inserted"] <= config.SOFT_STATEMENT_CAP
+    # Hard cap branch: 120 > 80 → drop to soft cap (60)
+    assert row["seeds_inserted"] == config.SOFT_STATEMENT_CAP
     assert row["outcome"] == "applied"
+    overflow_events = [
+        e for e in events
+        if e.get("type") == "playbook_soft_cap_exceeded"
+    ]
+    assert overflow_events == [{
+        "type": "playbook_soft_cap_exceeded",
+        "count": len(too_many),
+        "dropped": len(too_many) - config.SOFT_STATEMENT_CAP,
+    }]
 
 
 def test_bootstrap_source_boot_vs_reset(pb_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:

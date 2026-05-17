@@ -3,7 +3,7 @@
 Three on-disk files (spec §2):
   /data/playbook/lattice.json   active statements
   /data/playbook/archived.json  settled / stale_low / stale_unused / merged
-                                / superseded / deleted
+                                / superseded / deleted / pressure_cap
   /data/playbook/runs.jsonl     one line per reflection / bootstrap run
 
 Atomic writes via tempfile + os.replace. Synchronous cloud-drive
@@ -132,7 +132,7 @@ class ArchivedStatement:
     text: str
     final_weight: float
     archived_at: str
-    archive_reason: str  # "settled" | "stale_low" | "stale_unused" | "merged" | "superseded" | "deleted"
+    archive_reason: str  # "settled" | "stale_low" | "stale_unused" | "merged" | "superseded" | "deleted" | "pressure_cap"
     merged_into: str | None = None
     history: list[WeightHistoryEntry] = field(default_factory=list)
     created_at: str = ""

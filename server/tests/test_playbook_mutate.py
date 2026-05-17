@@ -179,6 +179,27 @@ def test_resolve_cap_pressure_branch_c_hard_cap() -> None:
     assert hard
 
 
+@pytest.mark.parametrize(
+    ("active", "creations", "survivors", "dropped", "hard"),
+    [
+        (59, 2, 1, 1, False),
+        (60, 1, 0, 1, False),
+        (79, 1, 0, 1, False),
+        (79, 2, 0, 2, True),
+        (80, 1, 0, 1, True),
+    ],
+)
+def test_resolve_cap_pressure_boundaries(
+    active: int,
+    creations: int,
+    survivors: int,
+    dropped: int,
+    hard: bool,
+) -> None:
+    got = resolve_cap_pressure(active_count=active, creation_count=creations)
+    assert got == (survivors, dropped, hard)
+
+
 # ---------------------------------------------------------------- proposals (§5.6)
 
 
@@ -239,6 +260,66 @@ def test_apply_coach_proposals_creation_with_duplicate_text() -> None:
     )
     assert applied == []
     assert any(r.get("reason") == "near_duplicate" for r in rejected)
+
+
+def test_apply_coach_proposals_branch_b_drops_creations_from_end() -> None:
+    lat, arch = _empty_pair()
+    lat.statements.extend(_seed(sid=f"pb-{i:03d}") for i in range(1, 60))
+    operations = [
+        {"op": "create", "text": f"new branch b pattern {i}", "weight": 0.6, "reason": "x"}
+        for i in range(3)
+    ]
+    applied, rejected, hard = apply_coach_proposals(
+        lat, arch, operations, creation_weight=0.6,
+    )
+    assert hard is False
+    assert [op["text"] for op in applied if op.get("op") == "create"] == [
+        "new branch b pattern 0",
+    ]
+    assert [op["text"] for op in rejected if op.get("reason") == "soft_cap_pressure"] == [
+        "new branch b pattern 1",
+        "new branch b pattern 2",
+    ]
+
+
+def test_apply_coach_proposals_branch_c_rejects_all_creations() -> None:
+    lat, arch = _empty_pair()
+    lat.statements.extend(_seed(sid=f"pb-{i:03d}") for i in range(1, 80))
+    operations = [
+        {"op": "create", "text": "first hard pressure creation", "weight": 0.6, "reason": "x"},
+        {"op": "create", "text": "second hard pressure creation", "weight": 0.6, "reason": "x"},
+    ]
+    applied, rejected, hard = apply_coach_proposals(
+        lat, arch, operations, creation_weight=0.6,
+    )
+    assert hard is True
+    assert not [op for op in applied if op.get("op") == "create"]
+    assert [op.get("reason") for op in rejected] == [
+        "hard_cap_pressure",
+        "hard_cap_pressure",
+    ]
+
+
+def test_pre_creation_hygiene_frees_capacity_before_trimming() -> None:
+    lat, arch = _empty_pair()
+    old = (datetime.now(timezone.utc) - timedelta(days=config.STALE_UNUSED_DAYS + 1)).isoformat()
+    lat.statements.append(_seed(sid="pb-001", created_at=old))
+    lat.statements.extend(_seed(sid=f"pb-{i:03d}") for i in range(2, 61))
+    engine_actions: list[dict[str, Any]] = []
+
+    applied, rejected, hard = apply_coach_proposals(
+        lat,
+        arch,
+        [{"op": "create", "text": "capacity freed by stale hygiene", "weight": 0.6, "reason": "x"}],
+        creation_weight=0.6,
+        engine_actions=engine_actions,
+    )
+
+    assert hard is False
+    assert not rejected
+    assert [a["action"] for a in engine_actions] == ["stale_unused"]
+    assert applied[0]["op"] == "create"
+    assert len(lat.statements) == config.SOFT_STATEMENT_CAP
 
 
 def test_apply_coach_proposals_unknown_op_rejected() -> None:

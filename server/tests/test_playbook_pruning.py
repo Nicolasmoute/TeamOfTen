@@ -195,6 +195,16 @@ def test_pressure_sweep_fires_above_hard_cap():
     assert len(lattice.statements) == config.SOFT_STATEMENT_CAP
 
 
+def test_pressure_sweep_can_be_deferred_for_pre_creation_hygiene():
+    """Pre-creation hygiene pass must not pressure-archive before creations."""
+    lattice, archive = _build_lattice_n(81)
+    actions = sweep_engine_actions(lattice, archive, include_pressure=False)
+
+    pressure_actions = [a for a in actions if a["action"] == "pressure_cap"]
+    assert pressure_actions == []
+    assert len(lattice.statements) == 81
+
+
 def test_pressure_sweep_skips_at_hard_cap():
     """80 active statements (== HARD_STATEMENT_CAP=80) → NO pressure_cap actions."""
     lattice, archive = _build_lattice_n(80)

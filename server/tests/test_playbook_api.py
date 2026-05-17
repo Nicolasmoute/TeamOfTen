@@ -195,3 +195,78 @@ def test_override_weight_rejects_immutable(api_client: TestClient, tmp_path: Pat
 def test_override_weight_rejects_out_of_range(api_client: TestClient) -> None:
     r = api_client.post("/api/playbook/statements/pb-001/weight", json={"weight": 1.5})
     assert r.status_code == 400
+
+
+def _stmt(sid: str, text: str, *, weight: float = 0.5) -> "Statement":
+    from server.playbook.store import Statement, WeightHistoryEntry
+
+    return Statement(
+        id=sid,
+        text=text,
+        weight=weight,
+        weight_history=[WeightHistoryEntry(ts="2026-04-01T00:00:00Z",
+                                           from_=None, to=weight, reason="seed")],
+        created_at="2026-04-01T00:00:00Z",
+        created_by="test",
+        last_validated_at="2026-04-01T00:00:00Z",
+        applied_count=1,
+        immutable=False,
+    )
+
+
+def test_manual_merge_endpoint_persists_lattice_and_archive(api_client: TestClient) -> None:
+    from server.playbook.store import Lattice, load_archive, load_lattice, save_lattice
+
+    asyncio.run(save_lattice(Lattice(
+        schema_version=1,
+        updated_at="now",
+        statements=[
+            _stmt("pb-001", "keep this merge target", weight=0.5),
+            _stmt("pb-002", "drop this merge source", weight=0.7),
+        ],
+    )))
+
+    r = api_client.post(
+        "/api/playbook/proposals/merge/pb-001",
+        json={"keep_id": "pb-001", "drop_id": "pb-002"},
+    )
+
+    assert r.status_code == 200
+    lattice = load_lattice()
+    archive = load_archive()
+    assert [s.id for s in lattice.statements] == ["pb-001"]
+    assert lattice.statements[0].weight == pytest.approx(0.7)
+    assert archive.statements[0].id == "pb-002"
+    assert archive.statements[0].archive_reason == "merged"
+    assert archive.statements[0].merged_into == "pb-001"
+
+
+def test_manual_batch_create_preserves_order_and_reports_soft_rejections(
+    api_client: TestClient,
+) -> None:
+    from server.playbook.store import Lattice, load_lattice, save_lattice
+
+    asyncio.run(save_lattice(Lattice(
+        schema_version=1,
+        updated_at="now",
+        statements=[_stmt(f"pb-{i:03d}", f"existing {i}") for i in range(1, 59)],
+    )))
+    operations = [
+        {"op": "create", "text": f"ordered dashboard creation {i}", "weight": 0.6}
+        for i in range(4)
+    ]
+
+    r = api_client.post("/api/playbook/proposals/batch", json={"operations": operations})
+
+    assert r.status_code == 200
+    data = r.json()
+    assert [op["text"] for op in data["applied"]] == [
+        "ordered dashboard creation 0",
+        "ordered dashboard creation 1",
+    ]
+    assert [op["text"] for op in data["rejected"]] == [
+        "ordered dashboard creation 2",
+        "ordered dashboard creation 3",
+    ]
+    assert {op["reason"] for op in data["rejected"]} == {"soft_cap_pressure"}
+    assert len(load_lattice().statements) == config.SOFT_STATEMENT_CAP
