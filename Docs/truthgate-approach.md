@@ -10,7 +10,7 @@ Implemented classifier-core pieces:
 - `corpus.py`: capped `truth/**/*.{md,txt}` corpus slicing. It prioritizes core truth files, then task-keyword-relevant files, then alphabetical fallback. It does not read `Docs/`, repo source, uploads, conversation logs, or secrets.
 - `prompts.py`: strict JSON classifier prompt and amendment-draft prompt helper.
 - `llm.py`: one-shot primary/fallback wrapper with `agent_id="truthgate"` and classifier ledger attribution.
-- `classifier.py`: per-project lock, cost-cap preflight, sparse-mode routing, strict whole-response JSON parsing, verdict normalization, and truth-basis validation.
+- `classifier.py`: per-project lock, cost-cap preflight, sparse-mode routing, strict whole-response JSON parsing, deterministic acceptance of a single whole-response markdown `json` fence around the classifier object, verdict normalization, and truth-basis validation.
 - `sparse.py`, `targeted.py`, and `amendments.py`: sparse pass result, targeted truth-basis reads/audit guards, and amendment metadata helpers for later phases.
 - `coord_run_truthgate`: Coach-only tool that runs the classifier for a task in `truthgate`, persists verdict/basis/concerns/method/model fields, emits `task_truthgate_started`, `task_truthgate_completed`, and `task_truthgate_blocked` when the verdict requires amendment or clarification. Existing verdicts are preserved unless Coach passes `force=true`; classifier failures fail closed by blocking the task without recording a pass/override verdict. It does not advance the stage or wake a Player.
 - `coord_record_truthgate_override`: Coach-only tool that records `truthgate_coach_override` or `truthgate_emergency_override` with required rationale, emits override/completed events, and marks emergency overrides provisional. Emergency overrides may store an optional `closure_reference` for later reconciliation. It does not advance the stage or wake a Player.
@@ -85,7 +85,7 @@ When Coach explicitly promotes a task from `backlog` to the live trajectory, the
 
 1. **Inputs**: task title + description + objective, plus a curated slice of the project's `truth/**/*.{md,txt}` corpus (always-include core truth files + keyword-relevant files + alphabetical fallback, capped at ~32 KB - same pattern as TruthScore's truth-budget). Sparse-mode eligibility is based on the actual eligible truth file count before prompt-budget slicing, not on how many files fit in the prompt.
 2. **Model**: dedicated one-shot LLM call. `latest_sonnet` is the preferred default; `latest_mini` is the automatic fallback when Sonnet is unavailable, rate-limited, or out of credit. `latest_opus` and `latest_gpt` are excluded from classifier use because this is structural pattern-matching, not deep reasoning. This restriction applies to the truthgate classifier only; drafting protected truth/spec changes uses top models, defined below.
-3. **Output**: strict JSON with verdict + truth_basis (list of truth files/sections the task is authorized against) + optional truth_concerns (specific clauses the task should respect during implementation).
+3. **Output**: strict JSON with verdict + truth_basis (list of truth files/sections the task is authorized against) + optional truth_concerns (specific clauses the task should respect during implementation). The parser also accepts the same JSON object when it is the only content inside one markdown `json` fence; malformed fenced JSON, multiple snippets, partial snippets, or extra prose still fail closed.
 
 The five verdicts:
 

@@ -121,12 +121,13 @@ def parse_classifier_output(
     corpus: TruthCorpus,
 ) -> dict[str, Any]:
     stripped = text.strip()
+    parse_text = _strip_single_json_fence(stripped)
     try:
-        parsed = json.loads(stripped)
+        parsed = json.loads(parse_text)
     except json.JSONDecodeError as exc:
-        detail = "empty response" if not stripped else f"decode error at char {exc.pos}"
+        detail = "empty response" if not parse_text else f"decode error at char {exc.pos}"
         if stripped.startswith("```"):
-            detail = "markdown-fenced response"
+            detail = f"markdown-fenced response inner {detail}"
         raise TruthGateClassificationError(
             "TruthGate classifier returned invalid JSON "
             f"({detail}; excerpt={_response_excerpt(stripped)!r})"
@@ -180,6 +181,32 @@ def parse_classifier_output(
         "confidence": confidence,
         "warning": None,
     }
+
+
+def _strip_single_json_fence(stripped: str) -> str:
+    """Accept only a whole-response markdown fence containing JSON.
+
+    This is intentionally not JSON extraction: any prose outside the
+    fence, multiple fences, non-json fence language, or inline fence stays
+    untouched and will fail the normal JSON parser.
+    """
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if len(lines) < 3:
+        return stripped
+    opener = lines[0].strip()
+    if not opener.startswith("```"):
+        return stripped
+    lang = opener[3:].strip().lower()
+    if lang not in ("", "json"):
+        return stripped
+    if lines[-1].strip() != "```":
+        return stripped
+    inner_lines = lines[1:-1]
+    if any("```" in line for line in inner_lines):
+        return stripped
+    return "\n".join(inner_lines).strip()
 
 
 async def _check_cost_cap() -> None:
