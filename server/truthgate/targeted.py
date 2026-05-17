@@ -28,6 +28,7 @@ class TargetedTruthAuditCheck:
     skipped: bool
     warnings: tuple[str, ...]
     violations: tuple[str, ...]
+    stale_basis: bool = False
 
 
 @dataclass(frozen=True)
@@ -218,6 +219,10 @@ def check_audit_against_truthgate(
         w for w in warnings
         if not w.startswith("truncated at ")
     )
+    stale_basis = any(
+        "truth basis file changed after the recorded TruthGate run" in w
+        for w in blocking_warnings
+    )
     body_violations = tuple(
         sorted({m.group(0).lower() for m in _VIOLATION_RE.finditer(audit_body)})
     )
@@ -229,6 +234,7 @@ def check_audit_against_truthgate(
         skipped=False,
         warnings=blocking_warnings if blocked else warnings,
         violations=body_violations,
+        stale_basis=stale_basis,
     )
 
 
