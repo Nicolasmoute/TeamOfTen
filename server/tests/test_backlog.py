@@ -406,7 +406,7 @@ async def test_triage_backlog_promote() -> None:
     assert task is not None
     d = dict(task)
     assert d["title"] == "Ship v2"
-    assert d["status"] == "execute"
+    assert d["status"] == "truthgate"
 
     promoted = [e for e in events if e.get("type") == "backlog_task_promoted"]
     assert len(promoted) == 1
@@ -419,13 +419,10 @@ async def test_triage_backlog_promote() -> None:
     assert len(stage_changed) == 1
     assert stage_changed[0]["task_id"] == promoted_task_id
     assert stage_changed[0]["from"] is None
-    assert stage_changed[0]["to"] == "execute"
+    assert stage_changed[0]["to"] == "truthgate"
     assert stage_changed[0]["reason"] == "backlog_promoted"
     role_assigned = [e for e in events if e.get("type") == "task_role_assigned"]
-    assert len(role_assigned) == 1
-    assert role_assigned[0]["task_id"] == promoted_task_id
-    assert role_assigned[0]["role"] == "executor"
-    assert role_assigned[0]["owner"] == "p1"
+    assert role_assigned == []
 
 
 @pytest.mark.asyncio
