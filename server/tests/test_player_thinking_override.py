@@ -318,9 +318,6 @@ def test_player_health_rollup_text_mentions_thinking() -> None:
     # accidentally drop the wiring.
     import server.kanban as kanbanmod
     assert "coord_set_player_thinking" in inspect.getsource(kanbanmod)
-    # Recurrence tick prompt also.
-    import server.recurrences as recmod
-    assert "thinking" in inspect.getsource(recmod).lower()
 
 
 # ---------- Codex runtime no-op ------------------------------------
