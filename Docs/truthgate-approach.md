@@ -287,7 +287,7 @@ Rough sizing: amendment wrapper ~= 2-4 working days if needed; truthgate 2a ~= 5
 ## Acceptance criteria (when the truthgate work is "done")
 
 1. Every task promoted out of backlog gets a recorded `truth_basis` (possibly empty) and a `truthgate_verdict` before entering `plan`.
-2. Tasks blocked on `needs_truth_change` surface in Coach's coordination block and in the EnvPane attention strip.
+2. Tasks blocked on `needs_truth_change` surface in Coach's coordination block and in the EnvPane attention strip; pending amendment entries include a clear review action that opens the existing EnvPane file-write proposal diff/approve/deny/comment surface for that proposal. Approve still writes only through the protected proposal resolver, while deny/drop and request-changes outcomes require a human note and notify Coach with the next step.
 3. Emergency overrides exist, are marked provisional, and require a closure reference to archive.
 4. Audit stage performs the targeted truth-basis check; failures surface as `audit_report_submitted{fail}` events with the violated clause cited.
 5. Per-gate cost stays under $0.05 average across realistic task corpora (`latest_sonnet` config); usage rolls into the existing daily cap.

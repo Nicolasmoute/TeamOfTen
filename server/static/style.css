@@ -1041,6 +1041,23 @@ body {
   color: var(--ok, #56d364);
   font-variant-numeric: tabular-nums;
 }
+.env-fw-outcome {
+  margin: 4px 0 8px 0;
+  padding: 6px 10px;
+  font-size: 11px;
+  line-height: 1.45;
+  border-left: 3px solid var(--border);
+  background: var(--card);
+  border-radius: 0 3px 3px 0;
+}
+.env-fw-outcome-ok {
+  border-left-color: var(--ok, #56d364);
+  color: var(--ok, #56d364);
+}
+.env-fw-outcome-warn {
+  border-left-color: var(--warn, #d29922);
+  color: var(--warn, #d29922);
+}
 .env-decision-body {
   margin: 4px 0 8px 16px;
   padding: 8px 10px;
@@ -1066,13 +1083,44 @@ body {
   color: var(--muted);
   font-style: italic;
 }
+.env-truth-note {
+  margin: 6px 0 4px 16px;
+}
+.env-truth-note-label {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.env-truth-note-input {
+  width: 100%;
+  min-height: 54px;
+  box-sizing: border-box;
+  resize: vertical;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 6px 8px;
+}
+.env-truth-note-input:focus {
+  outline: none;
+  border-color: var(--coach);
+}
 .env-truth-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin: 4px 0 8px 16px;
 }
 .env-truth-approve,
-.env-truth-deny {
+.env-truth-deny,
+.env-truth-comment {
   font: inherit;
   font-size: 11px;
   padding: 3px 10px;
@@ -1093,8 +1141,17 @@ body {
 .env-truth-deny:hover:not(:disabled) {
   background: var(--border);
 }
+.env-truth-comment {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.env-truth-comment:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--bg);
+}
 .env-truth-approve:disabled,
-.env-truth-deny:disabled {
+.env-truth-deny:disabled,
+.env-truth-comment:disabled {
   opacity: 0.5;
   cursor: default;
 }
@@ -1504,6 +1561,26 @@ body {
   word-break: break-word;
   max-height: 140px;
   overflow-y: auto;
+}
+.env-attention-actions {
+  margin-top: 6px;
+  display: flex;
+  justify-content: flex-end;
+}
+.env-attention-action {
+  font: inherit;
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 3px;
+  border: 1px solid rgba(143, 212, 255, 0.55);
+  background: rgba(143, 212, 255, 0.08);
+  color: #8fd4ff;
+  cursor: pointer;
+}
+.env-attention-action:hover,
+.env-attention-action:focus-visible {
+  background: rgba(143, 212, 255, 0.16);
+  outline: none;
 }
 
 /* Structured-question answer form rendered inside an attention item
