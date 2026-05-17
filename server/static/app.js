@@ -1141,6 +1141,10 @@ function App() {
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [serverStatus, setServerStatus] = useState(null);
+  const runningSlotIds = useMemo(
+    () => new Set(serverStatus?.running_slots || []),
+    [serverStatus]
+  );
   const [paused, setPaused] = useState(false);
   const [authChallenge, setAuthChallenge] = useState(false);
   // Live count of pending file-write proposals across the active
@@ -2116,6 +2120,14 @@ function App() {
         refreshStatus();
       }
       if (
+        ev.type === "agent_started" ||
+        ev.type === "agent_stopped" ||
+        ev.type === "agent_cancelled" ||
+        ev.type === "error"
+      ) {
+        refreshStatus();
+      }
+      if (
         ev.type === "task_created" ||
         ev.type === "task_claimed" ||
         ev.type === "task_assigned" ||
@@ -2306,7 +2318,11 @@ function App() {
   // first render (const hoisting only reserves the binding, not the
   // value).
   useEffect(() => {
-    const working = agents.filter((a) => a.status === "working").length;
+    const workingIds = new Set(
+      agents.filter((a) => a.status === "working").map((a) => a.id)
+    );
+    for (const id of runningSlotIds) workingIds.add(id);
+    const working = workingIds.size;
     const unread = unreadSlots.size;
     let parts = [];
     if (paused) parts.push("⏸");
@@ -2314,7 +2330,7 @@ function App() {
     if (unread > 0 && !paused) parts.push(`${unread}●`);
     const prefix = parts.length > 0 ? parts.join(" ") + " " : "";
     document.title = `${prefix}TeamOfTen`;
-  }, [paused, agents, unreadSlots]);
+  }, [paused, agents, runningSlotIds, unreadSlots]);
 
   // Open a slot as a new standalone column on the right. Also marks
   // the slot as seen so any prior unread badge clears. If the slot is
@@ -2878,6 +2894,7 @@ function App() {
     <div class=${"app" + (envOpen ? " env-open" : "")} style=${appStyle}>
       <${LeftRail}
         agents=${agents}
+        runningSlotIds=${runningSlotIds}
         openSlots=${openSlots}
         dotStates=${dotStates}
         problemSlots=${problemSlots}
@@ -2905,10 +2922,16 @@ function App() {
         onTogglePause=${togglePause}
         onLayoutPreset=${applyLayoutPreset}
         onCancelAll=${async () => {
-          const working = agents.filter((a) => a.status === "working").length;
+          const workingIds = new Set(
+            agents.filter((a) => a.status === "working").map((a) => a.id)
+          );
+          for (const id of runningSlotIds) workingIds.add(id);
+          const working = workingIds.size;
           if (working === 0) return;
           if (!confirm(`Cancel ${working} running agent${working === 1 ? "" : "s"}?`)) return;
           await authedFetch("/api/agents/cancel-all", { method: "POST" });
+          loadAgents();
+          loadStatus();
         }}
       />
       <main class=${"panes" + (isMaximized ? " maximized" : "")}>
@@ -2998,6 +3021,7 @@ function App() {
                         liveEvents=${conversations.get(slot) || EMPTY_EVENTS}
                         streaming=${streamingText.get(slot)}
                         projectEpoch=${projectEpoch}
+                        runtimeRunning=${runningSlotIds.has(slot)}
                         openSlots=${openSlots}
                         onClose=${() => closePane(slot)}
                         onDropEdge=${dropOnPaneEdge}
@@ -3509,8 +3533,12 @@ function ProjectSwitchBusyModal({ busy, onDismiss, onRetry }) {
   `;
 }
 
-function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, activeProjectId, switchingProject, onActivateProject, onCreateProject, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, envPendingCount = 0, recurrenceOpen, onToggleRecurrence, onOpenSettings, paused, onTogglePause, onLayoutPreset, onCancelAll }) {
-  const workingCount = agents.filter((a) => a.status === "working").length;
+function LeftRail({ agents, runningSlotIds, openSlots, dotStates, problemSlots, projects, activeProjectId, switchingProject, onActivateProject, onCreateProject, onOpen, onStackInLast, wsConnected, envOpen, onToggleEnv, envPendingCount = 0, recurrenceOpen, onToggleRecurrence, onOpenSettings, paused, onTogglePause, onLayoutPreset, onCancelAll }) {
+  const workingIds = new Set(
+    agents.filter((a) => a.status === "working").map((a) => a.id)
+  );
+  for (const id of runningSlotIds || []) workingIds.add(id);
+  const workingCount = workingIds.size;
   const grouped = useMemo(() => {
     const coach = agents.find((a) => a.kind === "coach");
     const players = agents
@@ -3531,10 +3559,13 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
   //       per `dotStates` Map computed in App.
   const renderSlot = (a) => {
     if (!a) return null;
+    const runtimeRunning = Boolean(runningSlotIds && runningSlotIds.has(a.id));
+    const isActuallyWorking = a.status === "working" || runtimeRunning;
     const hasSession =
       Boolean(a.session_id) || Boolean(a.codex_thread_id) ||
-      a.status === "working" || a.status === "waiting";
+      isActuallyWorking || a.status === "waiting";
     const status = a.status || "idle";
+    const displayStatus = isActuallyWorking ? "working" : status;
     // Visual work-state class. `state-problem` collects three things
     // surfaced via the problemSlots Set computed in App: hard errors
     // (status === "error"), cost-cap exhaustion (derived from caps +
@@ -3543,7 +3574,7 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
     // doesn't read as a problem.
     let stateClass = "";
     if (hasSession) {
-      if (status === "working") stateClass = "state-working";
+      if (isActuallyWorking) stateClass = "state-working";
       else if (problemSlots && problemSlots.has(a.id)) stateClass = "state-problem";
       else stateClass = "state-idle";
     }
@@ -3562,15 +3593,18 @@ function LeftRail({ agents, openSlots, dotStates, problemSlots, projects, active
       showLocked ? "locked" : "",
     ].filter(Boolean).join(" ");
     const baseTip = a.name
-      ? `${a.id} — ${a.name}${a.role ? " — " + a.role : ""} (${status})`
-      : `${a.id} — unassigned (${status})`;
+      ? `${a.id} — ${a.name}${a.role ? " — " + a.role : ""} (${displayStatus})`
+      : `${a.id} — unassigned (${displayStatus})`;
+    const runtimeHint = runtimeRunning && status !== "working"
+      ? ` — runtime running; database says ${status}`
+      : "";
     const dotHint = dot === "blue"
       ? " — has unread inbox"
       : dot === "orange"
       ? " — waiting for a reply"
       : "";
     const lockHint = showLocked ? " — LOCKED (Coach can't assign / message)" : "";
-    const tooltip = baseTip + dotHint + lockHint + " — shift-click to stack in last column";
+    const tooltip = baseTip + runtimeHint + dotHint + lockHint + " — shift-click to stack in last column";
     return html`
       <button
         key=${a.id}
@@ -9445,12 +9479,17 @@ function EnvCostSection({ agents, serverStatus }) {
   // endpoint doesn't break agents down by project). For a project
   // view, show that project's pre-reset spend separately so the user
   // sees what was zeroed.
-  const working = agents.filter((a) => a.status === "working").length;
+  const workingIds = new Set(
+    agents.filter((a) => a.status === "working").map((a) => a.id)
+  );
+  for (const id of serverStatus?.running_slots || []) workingIds.add(id);
+  const working = workingIds.size;
   const active = agents
     .filter(
       (a) =>
         (a.cost_estimate_usd || 0) > 0 ||
         a.status === "working" ||
+        workingIds.has(a.id) ||
         a.status === "error"
     )
     .sort(
@@ -10600,7 +10639,7 @@ function ContextBar({ slot, liveEvents, model }) {
 // agent pane
 // ------------------------------------------------------------------
 
-function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpoch, onClose, onDropEdge, onPopOut, stacked, isMaximized, onToggleMaximize }) {
+function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpoch, runtimeRunning = false, onClose, onDropEdge, onPopOut, stacked, isMaximized, onToggleMaximize }) {
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState([]); // {id, url, path, filename}
   const [submitting, setSubmitting] = useState(false);
@@ -10658,6 +10697,12 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
   const [lockedOptimistic, setLockedOptimistic] = useState(null);
   const [lockBusy, setLockBusy] = useState(false);
   const lockedEffective = lockedOptimistic !== null ? lockedOptimistic : !!agent?.locked;
+  const status = agent?.status || "stopped";
+  const isActuallyWorking = status === "working" || runtimeRunning;
+  const displayStatus = isActuallyWorking ? "working" : status;
+  const paneStatusTitle = runtimeRunning && status !== "working"
+    ? `${statusTooltip(displayStatus, agent)}; database status: ${status}`
+    : statusTooltip(displayStatus, agent);
   useEffect(() => {
     if (lockedOptimistic === null) return;
     if (!!agent?.locked === lockedOptimistic) setLockedOptimistic(null);
@@ -11195,7 +11240,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
   // timeline while the user waits for the current turn to finish. The
   // queued-state UI already shows the user that the prompt is parked.
   useEffect(() => {
-    if (agent?.status === "working") return;
+    if (isActuallyWorking) return;
     const next = pending.find((p) => p.status === "queued");
     if (!next) return;
     if (next.rejectedAt) {
@@ -11234,7 +11279,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
       // if the lock raced and the agent was busy again.
     })();
     return () => { cancelled = true; };
-  }, [agent?.status, pending, postStart, allEvents]);
+  }, [isActuallyWorking, pending, postStart, allEvents]);
 
   // Auto-scroll to bottom as new content arrives. Two modes:
   //   - Normal (between turns): respect user scroll position — if they
@@ -12041,7 +12086,6 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
   const rawName = agent?.name || (agent?.kind === "player" ? "unassigned" : slot);
   const displayName =
     rawName.toLowerCase() === slot.toLowerCase() ? "" : rawName;
-  const status = agent?.status || "stopped";
 
   return html`
     <section
@@ -12059,8 +12103,8 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
           title="Drag to reorder — drop on another pane to move before it"
         >
           <span
-            class=${"pane-dot " + status}
-            title=${statusTooltip(status, agent)}
+            class=${"pane-dot " + displayStatus}
+            title=${paneStatusTitle}
           ></span>
           <span class="pane-id">${slotShortLabel(slot)}</span>
           ${displayName
@@ -12124,7 +12168,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
               title="Clear session — next run starts fresh"
             >🗑</button>`
           : null}
-        ${status === "working"
+        ${isActuallyWorking
           ? html`<button
               class="pane-cancel"
               onClick=${async () => {
@@ -12284,7 +12328,7 @@ function AgentPane({ slot, agent, currentTask, liveEvents, streaming, projectEpo
           //     supersede this placeholder the moment tokens arrive)
           //   • the most recent event is a start-of-turn meta event
           //     that emits before any real work shows
-          if (agent?.status !== "working") return null;
+          if (!isActuallyWorking) return null;
           if (streaming && (streaming.thinking || streaming.text)) return null;
           const last = allEvents.length > 0 ? allEvents[allEvents.length - 1] : null;
           if (!last) return null;

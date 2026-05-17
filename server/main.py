@@ -55,6 +55,7 @@ from server.sync import (
     sessions_trim_loop,
     events_trim_loop,
     snapshot_loop,
+    uploads_pull_loop,
 )
 from server.project_sync import (
     global_sync_loop,
@@ -210,11 +211,10 @@ def _attachments_dir_for(project_id: str) -> Path:
 # `project_paths(active).outputs`.
 OUTPUTS_DIR = Path(os.environ.get("HARNESS_OUTPUTS_DIR", "/data/outputs"))
 
-# Uploads + handoffs are per-project under
-# `/data/projects/<active>/uploads/` and
-# `/data/projects/<active>/working/handoffs/`. The /api/attachments
-# handler resolves the active project at request time; agents reach
-# uploads/handoffs via absolute paths documented in CLAUDE.md.
+# Top-level `/data/uploads/` is the human-drop inbound lane pulled from
+# WebDAV `uploads/` every HARNESS_UPLOADS_PULL_INTERVAL seconds. Project
+# handoffs live under `/data/projects/<active>/working/handoffs/`. The
+# /api/attachments handler resolves the active project at request time.
 
 
 @asynccontextmanager
@@ -297,12 +297,9 @@ async def lifespan(app: FastAPI):
     if _att_override:
         Path(_att_override).mkdir(parents=True, exist_ok=True)
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    # uploads/ and handoffs/ are per-project under
-    # `/data/projects/<active>/uploads/` and
-    # `/data/projects/<active>/working/handoffs/`. Agents reach
-    # them via the absolute paths documented in the global CLAUDE.md
-    # template. A future workspaces.py refactor to per-project
-    # worktrees can re-introduce relative symlinks.
+    # Top-level uploads/ is created by the pull loop when WebDAV has
+    # inbound files. Handoffs are per-project under
+    # `/data/projects/<active>/working/handoffs/`.
     # Claude CLI credential dir. Set via CLAUDE_CONFIG_DIR in the image
     # so OAuth tokens written by `claude /login` land on the /data
     # volume and survive Zeabur redeploys. We mkdir at runtime (not in
@@ -356,11 +353,11 @@ async def lifespan(app: FastAPI):
     from server.events import start_event_writer
     await start_event_writer()
     # Background tasks: cloud-drive snapshot + project / global file sync
-    # (PROJECTS_SPEC.md §5). The legacy flush_loop / uploads_pull_loop /
-    # outputs_push_loop are retired — per-project sync covers the same
-    # surface under the spec's `projects/<slug>/` layout (relative to
-    # the WebDAV base URL).
+    # (PROJECTS_SPEC.md §5). Top-level uploads/ remains a live inbound
+    # lane for human-dropped reference material; project/global sync cover
+    # durable project state under `projects/<slug>/`.
     snapshot_task = asyncio.create_task(snapshot_loop())
+    uploads_pull_task = asyncio.create_task(uploads_pull_loop())
     project_sync_task = asyncio.create_task(project_sync_loop())
     global_sync_task = asyncio.create_task(global_sync_loop())
     recurrence_task = asyncio.create_task(recurrence_scheduler_loop())
@@ -490,7 +487,18 @@ async def lifespan(app: FastAPI):
         logger.exception(
             "project_claude_md: boot update scheduling failed (non-fatal)"
         )
-    bg_tasks = (snapshot_task, project_sync_task, global_sync_task, recurrence_task, stale_task_task, trim_task, att_trim_task, sessions_trim_task, compass_task)
+    bg_tasks = (
+        snapshot_task,
+        uploads_pull_task,
+        project_sync_task,
+        global_sync_task,
+        recurrence_task,
+        stale_task_task,
+        trim_task,
+        att_trim_task,
+        sessions_trim_task,
+        compass_task,
+    )
     try:
         yield
     finally:

@@ -538,6 +538,25 @@ def _prepare_runtime_codex_home(slot: str, cwd: str) -> str | None:
     return str(home)
 
 
+def _codex_client_closed_or_closing(client: Any) -> bool:
+    """Best-effort check for a cached SDK client that cannot be reused."""
+    for attr in ("_closed", "_closing", "closed", "closing"):
+        try:
+            if bool(getattr(client, attr, False)):
+                return True
+        except Exception:
+            return True
+    transport = getattr(client, "_transport", None)
+    if transport is not None:
+        for attr in ("_closed", "_closing", "closed", "closing"):
+            try:
+                if bool(getattr(transport, attr, False)):
+                    return True
+            except Exception:
+                return True
+    return False
+
+
 async def get_client(
     slot: str,
     *,
@@ -565,6 +584,23 @@ async def get_client(
             tuple(allowed_tools) if allowed_tools is not None else None
         )
         cached = _codex_clients.get(slot)
+        if cached is not None:
+            if _codex_client_closed_or_closing(cached):
+                logger.info(
+                    "CodexRuntime: cached client already closing for slot=%s "
+                    "-- evicting before reuse",
+                    slot,
+                )
+                stale_client = _codex_clients.pop(slot, None)
+                _codex_client_cwds.pop(slot, None)
+                stale_token = _codex_client_tokens.pop(slot, None)
+                if stale_client is not None:
+                    await _close_codex_client_object(slot, stale_client)
+                if stale_token:
+                    from server.spawn_tokens import revoke as _revoke_proxy_token
+                    _revoke_proxy_token(stale_token)
+                _codex_client_allowed_tool_keys.pop(slot, None)
+                cached = None
         if cached is not None:
             cached_cwd = _codex_client_cwds.get(slot)
             cached_tool_key = _codex_client_allowed_tool_keys.get(slot)
@@ -2803,24 +2839,46 @@ def _rollout_path_from_thread_state(thread_state: Any) -> Path | None:
     return p if p.is_file() else None
 
 
+def _codex_home_candidates() -> list[Path]:
+    """Return Codex home directories the CLI may use.
+
+    Codex defaults to ``~/.codex`` when CODEX_HOME is unset. The harness
+    previously looked only at CODEX_HOME, which made rollout discovery
+    disappear on default installs even though the CLI was writing
+    sessions normally.
+    """
+    candidates: list[Path] = []
+    raw = os.environ.get("CODEX_HOME", "").strip()
+    if raw:
+        try:
+            candidates.append(Path(raw).expanduser())
+        except (TypeError, ValueError):
+            pass
+    try:
+        default_home = Path.home() / ".codex"
+        if default_home not in candidates:
+            candidates.append(default_home)
+    except Exception:
+        pass
+    return candidates
+
+
 def _rollout_path_for_thread_id(thread_id: str) -> Path | None:
     """Best-effort lookup for an existing Codex rollout JSONL by thread id."""
     if not thread_id:
         return None
-    codex_home = os.environ.get("CODEX_HOME", "").strip()
-    if not codex_home:
-        return None
-    sessions = Path(codex_home) / "sessions"
-    try:
-        if not sessions.is_dir():
-            return None
-        matches = list(sessions.rglob(f"rollout-*{thread_id}.jsonl"))
-    except OSError:
-        return None
+    matches: list[Path] = []
+    for codex_home in _codex_home_candidates():
+        sessions = codex_home / "sessions"
+        try:
+            if sessions.is_dir():
+                matches.extend(sessions.rglob(f"rollout-*{thread_id}.jsonl"))
+        except OSError:
+            continue
     if not matches:
         return None
     try:
-        return max(matches, key=lambda p: p.stat().st_mtime)
+        return max(matches, key=lambda p: p.stat().st_mtime_ns)
     except OSError:
         return matches[-1]
 
@@ -2922,6 +2980,21 @@ def _codex_context_window_from_rollout_info(info: Mapping[str, Any]) -> int | No
     except (TypeError, ValueError):
         return None
     return window if window > 0 else None
+
+
+def _codex_context_tokens_from_rollout_info(info: Mapping[str, Any]) -> int:
+    """Estimate current prompt footprint from a Codex token_count event.
+
+    `last_token_usage.input_tokens` is the actual prompt sent for the
+    latest model call, including cached tokens. Adding latest output
+    mirrors the DB estimate used before a resume: prior output becomes
+    part of the next prompt.
+    """
+    usage = _codex_usage_from_rollout_info(info)
+    return sum(
+        int(usage.get(k) or 0)
+        for k in ("input", "cache_read", "cache_creation", "output")
+    )
 
 
 def _model_from_rollout(rollout_path: Path) -> str | None:
@@ -3735,6 +3808,8 @@ class CodexRuntime:
         prior_thread = await _get_codex_thread_id(tc.agent_id)
         if not prior_thread:
             return False
+        rollout_info: Mapping[str, Any] | None = None
+        rollout_used = 0
         rollout_path = _rollout_path_for_thread_id(prior_thread)
         if rollout_path is not None:
             rollout_info = _read_codex_token_count_from_rollout(rollout_path)
@@ -3743,7 +3818,9 @@ class CodexRuntime:
                     tc.model,
                     _codex_context_window_from_rollout_info(rollout_info),
                 )
+                rollout_used = _codex_context_tokens_from_rollout_info(rollout_info)
         used = await _codex_session_context_estimate(prior_thread)
+        used = max(used, rollout_used)
         ctx_max = _context_window_for(tc.model)
         if ctx_max <= 0 or used / ctx_max < threshold:
             return False
@@ -3781,6 +3858,8 @@ class CodexRuntime:
         # return. Use got_result as the success signal to surface the
         # symmetric `auto_compact_failed` event in those cases too.
         if not tc.turn_ctx.get("got_result"):
+            if tc.turn_ctx.get("auto_compact_skipped"):
+                return False
             await _emit(tc.agent_id, "auto_compact_failed")
             return False
         return True

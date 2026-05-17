@@ -1569,6 +1569,18 @@ The WebDAV client:
 - Uses SQLite `VACUUM INTO` into bytes, then writes to WebDAV.
 - Snapshot path: `snapshots/<timestamp>.db`.
 
+### 9.1a Top-Level Uploads Pull
+
+`server/sync.py` also keeps the human-drop uploads lane live:
+
+- Interval: `HARNESS_UPLOADS_PULL_INTERVAL`, default 60 seconds.
+- Remote path: `uploads/<filename>` at the WebDAV root, e.g.
+  `TOT/uploads/<filename>` on kDrive.
+- Local path: `HARNESS_UPLOADS_DIR`, default `/data/uploads`.
+- The app ensures the remote `uploads/` directory exists before polling.
+- The pull is inbound only: deleting a file remotely removes the local copy;
+  new remote files are downloaded by basename.
+
 ### 9.2 Active Project Sync
 
 `server/project_sync.py` active-project loop:
@@ -1795,8 +1807,10 @@ Auto-compact:
 
 - Controlled by `HARNESS_AUTO_COMPACT_THRESHOLD`, default 0.65 (lowered from 0.7 on 2026-05-09, then raised from 0.5 on 2026-05-15 after 0.5 proved too aggressive).
 - Estimates session context from Claude CLI JSONL files under
-  `CLAUDE_CONFIG_DIR/projects/`.
-- If over threshold, runs a compact turn first.
+  `CLAUDE_CONFIG_DIR/projects/`, or from Codex rollout JSONL files
+  under `CODEX_HOME/sessions` / the default `~/.codex/sessions`.
+- If over threshold, runs a compact turn first (Claude) or native
+  compact with handoff persistence (Codex).
 - The preflight resolves the same effective model the turn will use (pane
   override, Coach-set slot override, role default, alias-to-concrete), so the
   threshold window matches the pane `ctx` bar.
@@ -3642,6 +3656,9 @@ Agent lifecycle:
 - `runtime_updated` — `agents.runtime_override` changed (carries `runtime_override`; `source=session_transfer` when fired by the transfer flow rather than a blunt PUT)
 - `auto_compact_triggered`
 - `auto_compact_failed`
+- `auto_compact_skipped` - Codex auto-compact preflight found a thread,
+  but the compact handler's re-read found it already cleared; no
+  `session_compacted(0 chars)` event is emitted.
 - `compact_empty_forced`
 - `context_applied`
 - `context_usage`

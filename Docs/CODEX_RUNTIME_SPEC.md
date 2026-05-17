@@ -44,7 +44,10 @@ plus the latest `turns` row for that thread (via
 `_codex_session_context_estimate`). The dispatcher calls
 `runtime.maybe_auto_compact(tc)` before the main turn; if it returns
 True, the dispatcher proceeds to run the user's original prompt on
-the now-fresh session.
+the now-fresh session. Codex claims the slot before this preflight
+because its compact path is an inline app-server mutation; Claude
+keeps the legacy pre-claim shape because its compact path recursively
+uses `run_agent(COMPACT_PROMPT, auto_compact=True)`.
 
 ### A.3 ClaudeRuntime responsibilities
 `coord_server` build, allowed-tools assembly, external MCP load,

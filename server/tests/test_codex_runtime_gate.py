@@ -2415,6 +2415,56 @@ def test_codex_rollout_context_window_parser() -> None:
     }) is None
 
 
+def test_codex_rollout_path_falls_back_to_default_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    import server.runtimes.codex as codex_mod
+
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setattr(
+        codex_mod.Path,
+        "home",
+        classmethod(lambda cls: tmp_path),
+    )
+    sessions = tmp_path / ".codex" / "sessions" / "2026" / "05" / "16"
+    sessions.mkdir(parents=True)
+    rollout = sessions / "rollout-abc-tid_default.jsonl"
+    rollout.write_text("{}", encoding="utf-8")
+
+    assert codex_mod._rollout_path_for_thread_id("tid_default") == rollout
+
+
+def test_codex_rollout_context_token_estimate_uses_latest_prompt() -> None:
+    from server.runtimes.codex import _codex_context_tokens_from_rollout_info
+
+    assert _codex_context_tokens_from_rollout_info({
+        "last_token_usage": {
+            "input_tokens": 800_000,
+            "cached_input_tokens": 200_000,
+            "output_tokens": 12_000,
+            "reasoning_output_tokens": 3_000,
+        },
+        "total_token_usage": {
+            "input_tokens": 9_000_000,
+            "output_tokens": 9_000_000,
+        },
+    }) == 815_000
+
+
+def test_codex_client_closed_or_closing_detects_client_and_transport_flags() -> None:
+    from types import SimpleNamespace
+    from server.runtimes.codex import _codex_client_closed_or_closing
+
+    assert _codex_client_closed_or_closing(SimpleNamespace(_closed=True)) is True
+    assert _codex_client_closed_or_closing(
+        SimpleNamespace(_transport=SimpleNamespace(_closing=True))
+    ) is True
+    assert _codex_client_closed_or_closing(
+        SimpleNamespace(_transport=SimpleNamespace())
+    ) is False
+
+
 def test_codex_worktree_sandbox_probe_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

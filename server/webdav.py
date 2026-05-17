@@ -291,6 +291,23 @@ class WebDAVClient:
             logger.exception("WebDAV list_dir failed: %s", full_path)
             return []
 
+    async def ensure_dir(self, relative_path: str) -> bool:
+        """Create `{HARNESS_WEBDAV_URL}/{relative_path}` if missing.
+
+        Returns True on success, False on disabled mirror or any failure.
+        Safe for background loops that want a human-visible drop folder
+        without writing a placeholder file.
+        """
+        if not self._enabled:
+            return False
+        full_path = self._resolve(relative_path)
+        try:
+            await asyncio.to_thread(self._ensure_dir_sync, full_path)
+            return True
+        except Exception:
+            logger.exception("WebDAV ensure_dir failed: %s", full_path)
+            return False
+
     async def walk_files(self, relative_path: str) -> list[str]:
         """Recursive PROPFIND of `{HARNESS_WEBDAV_URL}/{relative_path}`
         returning every file path beneath it as a posix-style relative

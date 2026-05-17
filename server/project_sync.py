@@ -33,9 +33,11 @@ The pull primitive `pull_project_tree(project_id)` is exposed for the
 Phase 3 project-switch flow ("pull on open"); the loops do not pull
 on cadence — sole-writer assumption per §5.
 
-The legacy `flush_loop` / `uploads_pull_loop` / `outputs_push_loop` in
-server/sync.py are superseded by these and should be retired by the
-caller (lifespan in server/main.py).
+The legacy `flush_loop` / `outputs_push_loop` in server/sync.py are
+superseded by these and should be retired by the caller (lifespan in
+server/main.py). `uploads_pull_loop` remains live: top-level WebDAV
+`uploads/` is the inbound human-drop lane and is pulled into the
+container independently of project-state sync.
 """
 
 from __future__ import annotations

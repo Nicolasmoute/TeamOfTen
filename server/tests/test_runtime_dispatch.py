@@ -8,6 +8,7 @@ lands once the run_agent carve-out completes.
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -455,6 +456,85 @@ async def test_run_agent_resolves_effective_model_before_auto_compact(
 
     assert seen["compact_model"] == "gpt-5.5"
     assert seen["turn_model"] == "gpt-5.5"
+
+
+async def test_codex_run_agent_claims_slot_before_auto_compact(
+    monkeypatch: pytest.MonkeyPatch,
+    fresh_db: str,
+    tmp_path,
+) -> None:
+    """Parallel Codex wakes must not all enter auto-compact.
+
+    Codex auto-compact calls native `compact_thread` inline. If
+    run_agent waits until after maybe_auto_compact to claim the slot,
+    several concurrent wakes can compact the same thread and race the
+    cached app-server client into "client is closing".
+    """
+    import server.db as dbmod
+    await dbmod.init_db()
+
+    import server.agents as agentsmod
+    import server.runtimes as runtimes_mod
+
+    workspace = tmp_path / "p1"
+    workspace.mkdir()
+    entered_compact = asyncio.Event()
+    release_compact = asyncio.Event()
+    calls: list[tuple[str, str]] = []
+    events: list[dict[str, object]] = []
+
+    class _Runtime:
+        name = "codex"
+
+        async def maybe_auto_compact(self, tc):
+            calls.append(("maybe_auto_compact", tc.prompt))
+            entered_compact.set()
+            await release_compact.wait()
+            return False
+
+        async def prepare_turn_start(self, tc):
+            calls.append(("prepare_turn_start", tc.prompt))
+            return False
+
+        async def run_turn(self, tc):
+            calls.append(("run_turn", tc.prompt))
+            tc.turn_ctx["got_result"] = True
+
+        async def run_manual_compact(self, tc):
+            calls.append(("run_manual_compact", tc.prompt))
+            tc.turn_ctx["got_result"] = True
+
+    runtime = _Runtime()
+
+    async def runtime_for(agent_id):
+        return "codex"
+
+    async def workspace_for(agent_id):
+        return workspace
+
+    async def fake_emit(agent_id, event_type, **payload):
+        events.append({"agent_id": agent_id, "type": event_type, **payload})
+
+    monkeypatch.setattr(agentsmod, "_resolve_runtime_for", runtime_for)
+    monkeypatch.setattr(runtimes_mod, "get_runtime", lambda name: runtime)
+    monkeypatch.setattr(agentsmod, "workspace_dir", workspace_for)
+    monkeypatch.setattr(agentsmod, "_emit", fake_emit)
+
+    first = asyncio.create_task(agentsmod.run_agent("p1", "first"))
+    await asyncio.wait_for(entered_compact.wait(), timeout=1)
+    second = asyncio.create_task(agentsmod.run_agent("p1", "second"))
+    await asyncio.sleep(0)
+    release_compact.set()
+    await asyncio.gather(first, second)
+
+    assert calls == [
+        ("maybe_auto_compact", "first"),
+        ("prepare_turn_start", "first"),
+        ("run_turn", "first"),
+    ]
+    rejected = [ev for ev in events if ev["type"] == "spawn_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0]["prompt"] == "second"
 
 
 async def test_run_agent_passes_codex_role_allowlist_to_mcp_config(
