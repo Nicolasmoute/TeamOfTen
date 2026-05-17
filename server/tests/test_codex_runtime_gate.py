@@ -7,6 +7,7 @@ flag is unset.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 
@@ -2840,6 +2841,26 @@ class _CompactFakeThread:
             )
 
 
+class _HangingCompactThread:
+    thread_id = "tid_1"
+
+    def __init__(self) -> None:
+        self.chat_calls: list[dict] = []
+
+    async def chat(self, text, *, user=None, metadata=None, turn_overrides=None):
+        self.chat_calls.append(
+            {
+                "text": text,
+                "user": user,
+                "metadata": metadata,
+                "turn_overrides": turn_overrides,
+            }
+        )
+        await asyncio.Event().wait()
+        if False:
+            yield None
+
+
 class _CompactFakeClient:
     def __init__(
         self,
@@ -2861,6 +2882,12 @@ class _CompactFakeClient:
     def compact_thread(self, thread_id):
         self.compact_calls.append(thread_id)
         raise AssertionError("native compact must not be used")
+
+
+class _HangingCompactClient(_CompactFakeClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.thread = _HangingCompactThread()
 
 
 def _install_compact_harness(
@@ -3312,6 +3339,7 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
     cleared: list[str] = []
     exchange_cleared: list[str] = []
     handoffs: list[str] = []
+    durable_order: list[str] = []
 
     async def fake_get_client(
         slot,
@@ -3324,16 +3352,20 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
         return client
 
     async def fake_write_handoff(agent_id, summary):
+        durable_order.append("write_handoff")
         handoffs.append(summary)
         return "p1-auto.md"
 
     async def fake_set_note(agent_id, note):
+        durable_order.append("set_continuity_note")
         notes.append((agent_id, note))
 
     async def fake_clear(agent_id):
+        durable_order.append("clear_codex_thread_id")
         cleared.append(agent_id)
 
     async def fake_clear_exchange(agent_id):
+        durable_order.append("clear_exchange_log")
         exchange_cleared.append(agent_id)
 
     monkeypatch.setattr(
@@ -3400,6 +3432,12 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
     assert COMPACT_GENERATED_BODY in (notes[0][1] or "")
     assert cleared == ["p1"]
     assert exchange_cleared == ["p1"]
+    assert durable_order == [
+        "write_handoff",
+        "set_continuity_note",
+        "clear_codex_thread_id",
+        "clear_exchange_log",
+    ]
     # session_compacted is the run_manual_compact tail event.
     compacted = [ev for ev in captured if ev["type"] == "session_compacted"]
     assert compacted
@@ -3409,6 +3447,110 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
     assert compacted[-1]["synthetic_summary"] is False
     # got_result is the success signal the trip-wire reads.
     assert tc.turn_ctx["got_result"] is True
+
+
+async def test_codex_maybe_auto_compact_timeout_emits_failed_and_preserves_thread(
+    monkeypatch, fresh_db,
+) -> None:
+    import server.db as dbmod
+    import server.agents as agentsmod
+
+    await dbmod.init_db()
+    monkeypatch.setenv("HARNESS_CODEX_COMPACT_TIMEOUT_SECONDS", "0.01")
+
+    client = _HangingCompactClient()
+    state = _install_compact_harness(monkeypatch, client, recent="raise")
+
+    monkeypatch.setattr(
+        agentsmod,
+        "_codex_session_context_estimate",
+        lambda thread_id: _async_value(900_000),
+    )
+    monkeypatch.setattr(agentsmod, "_context_window_for", lambda model: 1_000_000)
+
+    tc = _compact_tc()
+    tc.prompt = "deferred user prompt"
+    result = await CodexRuntime().maybe_auto_compact(tc)
+
+    assert result is False
+    assert state["cleared"] == []
+    assert state["cleared_exchange"] == []
+    assert "got_result" not in tc.turn_ctx
+    types = [ev["type"] for ev in state["captured"]]
+    assert types.count("auto_compact_triggered") == 1
+    assert types.count("auto_compact_failed") == 1
+    assert "session_compacted" not in types
+    assert "session_transferred" not in types
+    failed = [ev for ev in state["captured"] if ev["type"] == "auto_compact_failed"][-1]
+    assert "timed out" in failed["error"]
+    assert "codex_thread_id preserved" in failed["error"]
+
+
+async def test_codex_auto_compact_continuity_failure_preserves_thread_and_emits_failed(
+    monkeypatch, fresh_db,
+) -> None:
+    import server.db as dbmod
+    import server.agents as agentsmod
+
+    await dbmod.init_db()
+    client = _CompactFakeClient()
+    state = _install_compact_harness(monkeypatch, client, note_raises=True)
+
+    monkeypatch.setattr(
+        agentsmod,
+        "_codex_session_context_estimate",
+        lambda thread_id: _async_value(900_000),
+    )
+    monkeypatch.setattr(agentsmod, "_context_window_for", lambda model: 1_000_000)
+
+    tc = _compact_tc()
+    result = await CodexRuntime().maybe_auto_compact(tc)
+
+    assert result is False
+    assert state["handoffs"] == [COMPACT_GENERATED_BODY]
+    assert state["cleared"] == []
+    assert "got_result" not in tc.turn_ctx
+    types = [ev["type"] for ev in state["captured"]]
+    assert "auto_compact_triggered" in types
+    assert "auto_compact_failed" in types
+    assert "session_compacted" not in types
+    failed = [ev for ev in state["captured"] if ev["type"] == "auto_compact_failed"][-1]
+    assert "continuity note write failed" in failed["error"]
+    assert "codex_thread_id preserved" in failed["error"]
+
+
+async def test_codex_auto_compact_handoff_write_failure_preserves_thread_and_emits_failed(
+    monkeypatch, fresh_db,
+) -> None:
+    import server.db as dbmod
+    import server.agents as agentsmod
+
+    await dbmod.init_db()
+    client = _CompactFakeClient()
+    state = _install_compact_harness(monkeypatch, client, write_returns=False)
+
+    monkeypatch.setattr(
+        agentsmod,
+        "_codex_session_context_estimate",
+        lambda thread_id: _async_value(900_000),
+    )
+    monkeypatch.setattr(agentsmod, "_context_window_for", lambda model: 1_000_000)
+
+    tc = _compact_tc()
+    result = await CodexRuntime().maybe_auto_compact(tc)
+
+    assert result is False
+    assert state["handoffs"] == [COMPACT_GENERATED_BODY]
+    assert state["notes"] == []
+    assert state["cleared"] == []
+    assert "got_result" not in tc.turn_ctx
+    types = [ev["type"] for ev in state["captured"]]
+    assert "auto_compact_triggered" in types
+    assert "auto_compact_failed" in types
+    assert "session_compacted" not in types
+    failed = [ev for ev in state["captured"] if ev["type"] == "auto_compact_failed"][-1]
+    assert "handoff file write failed" in failed["error"]
+    assert "codex_thread_id preserved" in failed["error"]
 
 
 class _RaisingCompactClient:
@@ -3438,7 +3580,7 @@ async def test_codex_maybe_auto_compact_emits_failed_on_compact_error(
         external_mcp_servers=None,
         allowed_tools=None,
     ):
-        return _RaisingCompactClient()
+        return _CompactFakeClient(resume_exc=RuntimeError("app-server died mid-compact"))
 
     async def fake_close_client(slot):
         return None
@@ -3466,6 +3608,11 @@ async def test_codex_maybe_auto_compact_emits_failed_on_compact_error(
         "_codex_session_context_estimate",
         lambda thread_id: _async_value(900_000),
     )
+    monkeypatch.setattr(
+        agentsmod,
+        "_get_recent_exchanges",
+        lambda agent_id: _async_value([]),
+    )
     monkeypatch.setattr(agentsmod, "_context_window_for", lambda model: 1_000_000)
 
     # _set_status is reached by run_manual_compact's error path.
@@ -3491,6 +3638,9 @@ async def test_codex_maybe_auto_compact_emits_failed_on_compact_error(
     types = [ev["type"] for ev in captured]
     assert "auto_compact_triggered" in types
     assert "auto_compact_failed" in types
+    failed = [ev for ev in captured if ev["type"] == "auto_compact_failed"][-1]
+    assert failed.get("error")
+    assert "codex_thread_id preserved" in failed["error"]
     # got_result must NOT be set — it's the failure signal the trip-wire reads.
     assert tc.turn_ctx.get("got_result") is not True
 
