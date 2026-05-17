@@ -49,7 +49,21 @@ async def _promote_truthgate_task() -> str:
         "id": backlog_id,
         "action": "promote",
     }))
-    return _extract_id(r"(t-\d{4}-\d{2}-\d{2}-[a-f0-9]{8})", promoted)
+    task_id = _extract_id(r"(t-\d{4}-\d{2}-\d{2}-[a-f0-9]{8})", promoted)
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE tasks SET truthgate_verdict = NULL, truth_basis = '[]', "
+            "truth_concerns = '[]', truthgate_at = NULL, "
+            "truthgate_method = NULL, truthgate_model = NULL, "
+            "truthgate_warning = NULL, blocked = 0, blocked_reason = NULL "
+            "WHERE id = ?",
+            (task_id,),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    return task_id
 
 
 @pytest.mark.asyncio
