@@ -3400,25 +3400,27 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             ship_method: str,
             idempotent: bool,
             emit_event: bool = True,
+            extra_evidence: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
             await _complete_shipper_role()
             if emit_event:
-                await bus.publish(
-                    {
-                        "ts": _now_iso(),
-                        "agent_id": caller_id,
-                        "type": "task_shipped_to_dev",
-                        "task_id": task_id,
-                        "ship_sha": ship_sha,
-                        "pr_number": pr_number,
-                        "pr_url": pr_url,
-                        "executor_sha": executor_sha,
-                        "deploy_target": "dev",
-                        "ship_method": ship_method,
-                        "idempotent": idempotent,
-                        "to": "coach",
-                    }
-                )
+                payload = {
+                    "ts": _now_iso(),
+                    "agent_id": caller_id,
+                    "type": "task_shipped_to_dev",
+                    "task_id": task_id,
+                    "ship_sha": ship_sha,
+                    "pr_number": pr_number,
+                    "pr_url": pr_url,
+                    "executor_sha": executor_sha,
+                    "deploy_target": "dev",
+                    "ship_method": ship_method,
+                    "idempotent": idempotent,
+                    "to": "coach",
+                }
+                if extra_evidence:
+                    payload.update(extra_evidence)
+                await bus.publish(payload)
             pr_label = f"PR #{pr_number}" if pr_number else "no PR"
             await _wake_coach_for_completion(
                 caller_id=caller_id,
@@ -3438,9 +3440,14 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"Dev HEAD: {ship_sha}.\n"
                     f"Shipper role complete. Coach has been woken."
                 )
+            verification = (
+                (extra_evidence or {}).get("already_present_verification")
+                or "recorded ship evidence"
+            )
             return _ok(
                 f"Task {task_id} already present on dev.\n"
                 f"Dev HEAD: {ship_sha}.\n"
+                f"Verification: {verification}.\n"
                 f"Shipper role complete. Coach has been woken."
             )
 
@@ -3542,12 +3549,16 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 )
             return None
 
-        async def _executor_patch_on_dev() -> bool:
+        async def _executor_patch_on_dev_evidence() -> dict[str, Any] | None:
             rc, _, _ = await _git(
                 ["git", "merge-base", "--is-ancestor", executor_sha, "origin/dev"]
             )
             if rc == 0:
-                return True
+                return {
+                    "already_present_verification": "executor_sha_is_ancestor_of_origin_dev",
+                    "already_present_ref": "origin/dev",
+                    "already_present_executor_sha": executor_sha,
+                }
             rc, out, _ = await _git(
                 [
                     "git",
@@ -3558,11 +3569,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 ]
             )
             if rc != 0:
-                return False
-            return any(
-                line.strip().startswith(f"- {executor_sha}")
-                for line in out.splitlines()
-            )
+                return None
+            for line in out.splitlines():
+                clean = line.strip()
+                if clean == f"- {executor_sha}":
+                    return {
+                        "already_present_verification": "git_cherry_patch_id_match",
+                        "already_present_ref": "origin/dev",
+                        "already_present_executor_sha": executor_sha,
+                        "already_present_git_cherry": clean,
+                    }
+            return None
 
         def _looks_empty_cherry_pick(out: str, err: str) -> bool:
             text = f"{out}\n{err}".lower()
@@ -3579,13 +3596,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         if rc != 0:
             return _err(f"git fetch failed: {err.strip()}")
 
-        if await _executor_patch_on_dev():
+        already_present_evidence = await _executor_patch_on_dev_evidence()
+        if already_present_evidence:
             return await _complete_with_evidence(
                 ship_sha=await _origin_dev_sha(),
                 pr_number=None,
                 pr_url="",
                 ship_method="already_present",
                 idempotent=True,
+                extra_evidence=already_present_evidence,
             )
 
         branch_exists = await _local_branch_exists(branch_name)
@@ -3638,21 +3657,26 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             if rc != 0:
                 if _looks_empty_cherry_pick(out, err):
                     await _git(["git", "cherry-pick", "--abort"])
-                    if await _executor_patch_on_dev():
+                    already_present_evidence = (
+                        await _executor_patch_on_dev_evidence()
+                    )
+                    if already_present_evidence:
                         return await _complete_with_evidence(
                             ship_sha=await _origin_dev_sha(),
                             pr_number=None,
                             pr_url="",
                             ship_method="already_present",
                             idempotent=True,
+                            extra_evidence=already_present_evidence,
                         )
                     empty_detail = (err.strip() or out.strip())[:300]
                     return _err(
                         f"cherry-pick of {executor_sha} produced an "
                         f"empty/no-op patch, but the patch was not "
                         f"confirmed on origin/dev: {empty_detail}. "
-                        f"Shipper role remains open; inspect "
-                        f"{branch_name} before retrying."
+                        f"Shipper role remains open; create formal ship "
+                        f"evidence via a non-empty PR/marker commit or ask "
+                        f"Coach to reroute before retrying."
                     )
                 # Leave the worktree on the temp branch for manual resolution
                 conflict_detail = (err.strip() or out.strip())[:300]
