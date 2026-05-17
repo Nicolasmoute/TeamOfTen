@@ -12721,7 +12721,26 @@ function EventItem({ event, onReply, viewerSlot = null }) {
   }
 
   if (type === "text") {
+    const sender = event.agent_id || viewerSlot;
+    const replyBtn = onReply && sender
+      ? html`<button
+          class="msg-reply-btn"
+          title="Reply"
+          onClick=${(e) => {
+            e.stopPropagation();
+            onReply(buildReplyQuote("message", sender, _coerceContentToString(event.content)));
+          }}
+        >
+          <svg width="13" height="13" viewBox="0 0 13 13" fill="none"
+               stroke="currentColor" stroke-width="1.6" stroke-linecap="round"
+               stroke-linejoin="round">
+            <polyline points="4,2 1,5 4,8" />
+            <path d="M1 5 H8 Q12 5 12 9 V12" />
+          </svg>
+        </button>`
+      : null;
     return html`<div class="event text">
+      ${replyBtn}
       <div class="event-meta">${ts}</div>
       <div
         class="event-body markdown"
