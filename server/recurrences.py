@@ -388,54 +388,26 @@ async def _emit(event: dict[str, Any]) -> None:
     await bus.publish(event)
 
 
-# Spec §4 priority orientation. Short by design — the system prompt
-# already contains project objectives + open coach todos, so the user
-# prompt just tells Coach the priority order. Step (3) is intentionally
-# directive: when inbox/todos are empty BUT objectives exist, Coach
-# must still pick a concrete action grounded in the objectives — the
-# whole point of a recurring tick is forward motion. The end-quietly
-# branch is gated on objectives being absent or empty (nothing to
-# anchor invented work to), not on inbox/todos being empty.
+# Spec §4 priority orientation. Short by design: the system prompt
+# already contains project objectives + open Coach todos, so the user
+# prompt tells Coach the live-work order and the idle standard.
 TICK_BASE_PROMPT = (
-    "Routine tick. Walk the priority list, act on the first "
-    "non-empty rung, then stop.\n"
+    "Routine tick.\n"
     "\n"
-    "(1) Inbox — call coord_read_inbox; respond to anything "
-    "pending from the human or teammates.\n"
-    "(2) Kanban — scan \"## Active task health\", \"## Stalled "
-    "tasks\", and the open-task list in your system prompt above. "
-    "Move things forward: approve stage transitions with "
-    "coord_approve_stage, nudge silent assignees, reassign past "
-    "the stall threshold, claim unassigned stages, bump effort, then "
-    "thinking (Claude only), then model on the 2nd same-kind audit "
-    "fail. Auto-reassign fires at "
-    "2h and auto-archive at 4h — beat the safety net.\n"
-    "(3) coach-todos — pick exactly ONE open todo and act to "
-    "CLOSE it. The branch goal is coord_complete_todo. If a single "
-    "turn is enough, finish and complete now; otherwise the action "
-    "must materially advance the SAME todo toward closure (assign "
-    "with a clear deliverable, draft and send the deliverable, "
-    "write the decision, schedule the dependency). Probes, pings, "
-    "and observations are legitimate ONLY when they directly enable "
-    "the next closure step on the same todo. Skimming many todos "
-    "with micro-touches is the antipattern. Reject \"everything is "
-    "gated\" — rationalization.\n"
-    "(4) Objectives — if (1)–(3) are empty, pick ONE concrete "
-    "action grounded in project-objectives.md (assign a Player, "
-    "send a coordination message, capture a new coach-todo, audit "
-    "Player work, propose-and-execute a next step). Don't end idle "
-    "when objectives exist.\n"
+    "Work the first live item in this order, then stop:\n"
     "\n"
-    "End the turn without acting in one of two cases: (a) no \"## "
-    "Project objectives\" section appears in your system prompt "
-    "above (file absent or whitespace-only); (b) rungs (1)-(3) are "
-    "all empty AND nothing has changed in kanban / inbox / coach-"
-    "todos / Player health since your last turn. In case (b), "
-    "acknowledge explicitly with a brief text note (\"steady-state "
-    "idle — nothing changed since <prior-turn-ts>; no action this "
-    "tick\") so the timeline shows you observed the steady state "
-    "rather than silently skipping. Nothing else licenses an idle "
-    "end."
+    "1. Read inbox. Respond to any human or teammate message.\n"
+    "2. Move kanban forward. Advance active tasks, handle stalls, "
+    "assign next stages, and promote the next eligible Backlog item "
+    "when capacity is available.\n"
+    "3. Close one Coach todo. Pick one open todo and materially "
+    "advance it toward completion, preferably completing it now.\n"
+    "4. If nothing above is live, choose one concrete action that "
+    "advances project objectives.\n"
+    "\n"
+    "Do not end idle unless inbox, kanban, backlog, todos, and "
+    "objectives have no actionable next step. If idle, say so "
+    "explicitly."
 )
 
 
