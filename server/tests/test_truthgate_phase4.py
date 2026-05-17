@@ -108,8 +108,18 @@ async def _call_with_events(
 @pytest.mark.asyncio
 async def test_coord_propose_truth_amendment_records_metadata_and_approval(
     fresh_db: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await _seed_truthgate_task()
+    import server.agents as agents_mod
+
+    wake_calls: list[tuple[str, str]] = []
+
+    async def fake_wake(agent_id: str, reason: str = "", **_: Any) -> bool:
+        wake_calls.append((agent_id, reason))
+        return True
+
+    monkeypatch.setattr(agents_mod, "maybe_wake_agent", fake_wake)
     pp = ensure_project_scaffold("misc")
     target = pp.truth / "phase4-approval.md"
     if target.exists():
@@ -169,6 +179,20 @@ async def test_coord_propose_truth_amendment_records_metadata_and_approval(
     assert task["truthgate_verdict"] is None
     assert task["blocked"] == 0
     assert task["blocked_reason"] is None
+    c = await configured_conn()
+    try:
+        message = dict(await (await c.execute(
+            "SELECT from_id, to_id, subject, body, priority FROM messages "
+            "WHERE to_id = 'coach' ORDER BY id DESC LIMIT 1",
+        )).fetchone())
+    finally:
+        await c.close()
+    assert message["from_id"] == "truthgate"
+    assert message["priority"] == "interrupt"
+    assert f"rerun TruthGate for {TASK_ID}" in message["subject"]
+    assert "Approved truth proposal" in message["body"]
+    assert "coord_run_truthgate(force=true)" in message["body"]
+    assert wake_calls and wake_calls[-1][0] == "coach"
 
 
 @pytest.mark.asyncio

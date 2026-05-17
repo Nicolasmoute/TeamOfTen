@@ -16,6 +16,7 @@ Docs, source code, chat logs, secrets, or unstated project history.
 Allowed verdicts:
 - truthgate_pass
 - truthgate_needs_truth_change
+- truthgate_needs_human_clarification
 - truthgate_rejected_or_needs_human_clarification
 
 Basis rules:

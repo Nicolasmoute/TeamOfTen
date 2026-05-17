@@ -121,13 +121,22 @@ async def test_coord_run_truthgate_needs_change_blocks_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     await init_db()
+    import server.agents as agents_mod
+
+    wake_calls: list[tuple[str, str]] = []
+
+    async def fake_wake(agent_id: str, reason: str = "", **_: Any) -> bool:
+        wake_calls.append((agent_id, reason))
+        return True
+
+    monkeypatch.setattr(agents_mod, "maybe_wake_agent", fake_wake)
     task_id = await _promote_truthgate_task()
 
     async def fake_run(project_id: str, task: Any) -> dict[str, Any]:
         return {
-            "verdict": "truthgate_needs_truth_change",
-            "truth_basis": [],
-            "truth_concerns": ["truth is missing"],
+            "verdict": "truthgate_needs_human_clarification",
+            "truth_basis": ["truth/truth-index.md"],
+            "truth_concerns": ["human must clarify scope"],
             "rationale": "needs new spec",
             "method": "classifier",
             "model_alias": "latest_sonnet",
@@ -157,11 +166,25 @@ async def test_coord_run_truthgate_needs_change_blocks_exit(
             "FROM tasks WHERE id = ?",
             (task_id,),
         )).fetchone())
+        message = dict(await (await c.execute(
+            "SELECT from_id, to_id, subject, body, priority FROM messages "
+            "WHERE to_id = 'coach' ORDER BY id DESC LIMIT 1",
+        )).fetchone())
     finally:
         await c.close()
-    assert row["truthgate_verdict"] == "truthgate_needs_truth_change"
+    assert row["truthgate_verdict"] == "truthgate_needs_human_clarification"
     assert row["blocked"] == 1
-    assert "truth amendment" in row["blocked_reason"]
+    assert "human clarification" in row["blocked_reason"]
+    assert message["from_id"] == "truthgate"
+    assert message["priority"] == "interrupt"
+    assert f"TruthGate action needed: {task_id}" in message["subject"]
+    assert "phase 3 truthgate" in message["body"]
+    assert "truthgate_needs_human_clarification" in message["body"]
+    assert "human must clarify scope" in message["body"]
+    assert "truth/truth-index.md" in message["body"]
+    assert "Expected Coach action" in message["body"]
+    assert wake_calls and wake_calls[-1][0] == "coach"
+    assert all(call[0] == "coach" for call in wake_calls)
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,7 @@ from server.truthgate.sparse import sparse_pass_result
 ALLOWED_CLASSIFIER_VERDICTS = frozenset({
     "truthgate_pass",
     "truthgate_needs_truth_change",
+    "truthgate_needs_human_clarification",
     "truthgate_rejected_or_needs_human_clarification",
 })
 

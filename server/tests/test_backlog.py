@@ -442,7 +442,14 @@ async def test_triage_backlog_promote() -> None:
 async def test_triage_backlog_promote_classifier_error_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import server.agents as agents_mod
     import server.truthgate.classifier as classifier
+
+    wake_calls: list[tuple[str, str]] = []
+
+    async def fake_wake(agent_id: str, reason: str = "", **_: Any) -> bool:
+        wake_calls.append((agent_id, reason))
+        return True
 
     async def fake_run(project_id: str, task: Any) -> dict[str, Any]:
         raise classifier.TruthGateClassificationError(
@@ -450,6 +457,7 @@ async def test_triage_backlog_promote_classifier_error_fails_closed(
             "(decode error at char 0; excerpt='not json')"
         )
 
+    monkeypatch.setattr(agents_mod, "maybe_wake_agent", fake_wake)
     monkeypatch.setattr(classifier, "run_truthgate_classifier", fake_run)
 
     q = bus.subscribe()
@@ -477,6 +485,10 @@ async def test_triage_backlog_promote_classifier_error_fails_closed(
             "blocked_reason, truthgate_warning FROM tasks WHERE id = ?",
             (task_id,),
         )).fetchone())
+        message = dict(await (await c.execute(
+            "SELECT from_id, to_id, subject, body, priority FROM messages "
+            "WHERE to_id = 'coach' ORDER BY id DESC LIMIT 1",
+        )).fetchone())
     finally:
         await c.close()
 
@@ -490,6 +502,14 @@ async def test_triage_backlog_promote_classifier_error_fails_closed(
     assert len(blocked) == 1
     assert blocked[0]["task_id"] == task_id
     assert blocked[0]["trigger"] == "backlog_promoted"
+    assert message["from_id"] == "truthgate"
+    assert message["priority"] == "interrupt"
+    assert f"TruthGate action needed: {task_id}" in message["subject"]
+    assert "classifier_error" in message["body"]
+    assert "invalid JSON" in message["body"]
+    assert "Expected Coach action" in message["body"]
+    assert wake_calls and wake_calls[-1][0] == "coach"
+    assert all(call[0] == "coach" for call in wake_calls)
 
     err = await _handler("coach", "coord_approve_stage")({
         "task_id": task_id,
@@ -499,6 +519,74 @@ async def test_triage_backlog_promote_classifier_error_fails_closed(
     })
     assert _is_err(err)
     assert "requires a TruthGate pass or override" in _text(err)
+
+
+@pytest.mark.asyncio
+async def test_triage_backlog_promote_blocked_verdict_notifies_coach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import server.agents as agents_mod
+    import server.truthgate.classifier as classifier
+
+    wake_calls: list[tuple[str, str]] = []
+
+    async def fake_wake(agent_id: str, reason: str = "", **_: Any) -> bool:
+        wake_calls.append((agent_id, reason))
+        return True
+
+    async def fake_run(project_id: str, task: Any) -> dict[str, Any]:
+        return {
+            "verdict": "truthgate_needs_truth_change",
+            "truth_basis": ["truth/truth-index.md"],
+            "truth_concerns": ["workflow contract missing"],
+            "rationale": "needs approved workflow truth",
+            "method": "classifier",
+            "model_alias": "latest_sonnet",
+            "warning": None,
+        }
+
+    monkeypatch.setattr(agents_mod, "maybe_wake_agent", fake_wake)
+    monkeypatch.setattr(classifier, "run_truthgate_classifier", fake_run)
+
+    backlog_id = await _insert_backlog("Needs workflow truth")
+    result = await _handler("coach", "coord_triage_backlog")({
+        "id": str(backlog_id),
+        "action": "promote",
+        "trajectory": [{"stage": "execute", "to": ["p1"]}],
+    })
+    assert _is_ok(result), _text(result)
+    backlog = await _get_backlog(backlog_id)
+    assert backlog is not None
+    task_id = backlog["promoted_task_id"]
+
+    c = await configured_conn()
+    try:
+        task = dict(await (await c.execute(
+            "SELECT status, truthgate_verdict, blocked FROM tasks WHERE id = ?",
+            (task_id,),
+        )).fetchone())
+        message = dict(await (await c.execute(
+            "SELECT from_id, to_id, subject, body, priority FROM messages "
+            "WHERE to_id = 'coach' ORDER BY id DESC LIMIT 1",
+        )).fetchone())
+    finally:
+        await c.close()
+
+    assert task == {
+        "status": "truthgate",
+        "truthgate_verdict": "truthgate_needs_truth_change",
+        "blocked": 1,
+    }
+    assert message["from_id"] == "truthgate"
+    assert message["priority"] == "interrupt"
+    assert f"TruthGate action needed: {task_id}" in message["subject"]
+    assert "Needs workflow truth" in message["body"]
+    assert "truthgate_needs_truth_change" in message["body"]
+    assert "workflow contract missing" in message["body"]
+    assert "truth/truth-index.md" in message["body"]
+    assert "Expected Coach action" in message["body"]
+    assert wake_calls and wake_calls[-1][0] == "coach"
+    assert all(call[0] == "coach" for call in wake_calls)
 
 
 @pytest.mark.asyncio
