@@ -10,9 +10,9 @@ Two locations matter:
 Layout (per spec §2):
 
     /data/playbook/
-      lattice.json    active statements (cap soft 100, hard 110)
+      lattice.json    active statements (cap soft 60, hard 80)
       archived.json   settled / stale_low / stale_unused / merged
-                      / superseded / deleted
+                      / superseded / deleted / pressure_cap
       runs.jsonl      one line per reflection / bootstrap run
 
 Functions are sync (no DB lookup, no cloud-drive I/O). Lazy `mkdir` on

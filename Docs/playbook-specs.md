@@ -89,7 +89,7 @@ The playbook is simpler than Compass by design:
 | Compass has | Playbook has | Why simpler |
 |---|---|---|
 | Per-project lattices | Single harness-wide lattice | Patterns generalize; no scoping needed |
-| Region tags + auto-merge of regions | Flat list (no regions) | ≤ 100 statements; flat is readable |
+| Region tags + auto-merge of regions | Flat list (no regions) | Soft 60 / hard 80 active statements; flat is readable |
 | Truth corpus (truth/, project-objectives.md, wiki/) | None | No external constraint layer; reflection IS the truth |
 | Truth-derive (Stage 0a) | Bootstrap from `app_dev_playbook.md` once | Single seeding event, not continuous |
 | Reconciliation proposals (Stage 0b) | None | No truth corpus to reconcile against |
@@ -189,7 +189,7 @@ Field notes:
 }
 ```
 
-`archive_reason ∈ {"settled", "stale_low", "stale_unused", "merged", "superseded", "deleted"}`.
+`archive_reason ∈ {"settled", "stale_low", "stale_unused", "merged", "superseded", "deleted", "pressure_cap"}`.
 
 - `settled` — weight ≥ 0.90 stable for ≥ 5 days (§5.8). Statement is team consensus; no longer needs surfacing in the active lattice but readable for history.
 - `stale_low` — weight ≤ 0.30 stable for ≥ 5 days. Pattern was tried and didn't pan out.
@@ -197,6 +197,7 @@ Field notes:
 - `merged` — collapsed into another statement; `merged_into` carries the target id.
 - `superseded` — replaced by a reformulated statement (e.g. Coach proposes a clearer wording).
 - `deleted` — human deletion via dashboard.
+- `pressure_cap` — hard-cap backstop archived a low-weight non-immutable statement to reduce active pressure toward the soft cap.
 
 ### 3.3 `runs.jsonl`
 
@@ -495,8 +496,9 @@ The runner parses the JSON tolerantly (same first-balanced-JSON-object extractio
 Op apply order is **fixed**:
 
 1. **Merges first.** Each merge: validate both ids exist in active lattice, neither immutable. `keep_id` retains its weight (max of the two). `drop_id` moves to `archived.json` with `archive_reason="merged"`, `merged_into=keep_id`. `keep_id`'s `weight_history` records the merge; `keep_id.applied_count += dropped.applied_count`; `keep_id.last_validated_at = max(keep_id.last_validated_at, dropped.last_validated_at)` (NULL-safe — NULL participates as "older than any timestamp").
-2. **Creations next** (against post-merge state). Each create: validate `text` length ≤ `STATEMENT_MAX_CHARS` (default 160; rejection reason includes the cap, the form rule "one line, imperative, no enumerated sub-items", and a pointer to the prose corpus for rationale), weight ∈ [0, 1], no near-duplicate of existing statement. **Near-duplicate algorithm:** Jaccard similarity over lowercased whitespace-tokenized word sets, after stripping ASCII punctuation and a small English stopword list (`a, an, the, and, or, of, to, for, in, on, at, with, is, are, be`). Threshold: Jaccard ≥ 0.7. Embedding-based dedup deferred to v2. Mint new id `pb-NNN`, persist with `created_by="reflection"`. Soft cap (§5.7) checked first.
-3. **Adjustments last** (against post-merge, post-creation state). Each adjust: validate `id` exists, not immutable, |delta| ≤ 0.25, target weight stays in [0, 1] after clamp. Apply: update `weight`, append to `weight_history`, update `last_validated_at`. Reject silently otherwise (logged in `proposals_rejected`).
+2. **Settle/stale/stale-unused hygiene next, without pressure sweep.** These archives run before creation budgeting so natural cleanup frees capacity before any new statement is dropped.
+3. **Creations next** (against post-merge, post-hygiene state). Each create: validate `text` length ≤ `STATEMENT_MAX_CHARS` (default 160; rejection reason includes the cap, the form rule "one line, imperative, no enumerated sub-items", and a pointer to the prose corpus for rationale), weight ∈ [0, 1], no near-duplicate of existing statement. **Near-duplicate algorithm:** Jaccard similarity over lowercased whitespace-tokenized word sets, after stripping ASCII punctuation and a small English stopword list (`a, an, the, and, or, of, to, for, in, on, at, with, is, are, be`). Threshold: Jaccard ≥ 0.7. Embedding-based dedup deferred to v2. Mint new id `pb-NNN`, persist with `created_by="reflection"`. Soft cap (§5.7) checked first.
+4. **Adjustments last** (against post-merge, post-creation state). Each adjust: validate `id` exists, not immutable, |delta| ≤ 0.25, target weight stays in [0, 1] after clamp. Apply: update `weight`, append to `weight_history`, update `last_validated_at`. Reject silently otherwise (logged in `proposals_rejected`).
 
 **Cross-op conflict:** any op targeting an id that an earlier op archived (via merge in step 1) is rejected with reason `"id_archived_in_same_run"`. Adjusts and creations referencing freshly-merged ids fall through to this rule.
 
@@ -514,7 +516,7 @@ The same cap logic applies to the `coord_propose_playbook_changes` MCP tool path
 
 ### 5.7.1 Pressure sweep (auto-archive at hard cap)
 
-After Coach's proposals and §5.8 sweeps are applied (`sweep_engine_actions` is the combined four-pass function in `mutate.py`), a fourth pass fires when `active > HARD_STATEMENT_CAP` (default 80):
+After Coach's proposals and §5.8 hygiene are applied, the final pressure pass fires when `active > HARD_STATEMENT_CAP` (default 80). In code, `sweep_engine_actions` keeps hygiene and pressure separately switchable so pressure never runs before creation budgeting:
 
 - Walk active (non-immutable) statements sorted by weight ascending (lowest weight first — the weakest evidence gets archived first).
 - Archive each as `archive_reason="pressure_cap"` until `active ≤ SOFT_STATEMENT_CAP` (default 60) or the eligible list is exhausted.
@@ -555,7 +557,7 @@ After Coach's proposals are applied, the runner sweeps for engine-driven archive
 
 The "≥ 5 days old history entry" requirement prevents brand-new high-confidence statements from immediately settling (e.g. Coach creates a new pattern at 0.6 then bumps to 0.90 the next day — that's not 5 days of stable confidence).
 
-**Threshold rationale (2026-05-14):** The original thresholds (settle ≥ 0.95, stale ≤ 0.15, stale-unused ≥ 30 days, stable ≥ 7 days) were unreachable given the live lattice: max weight 0.93, min weight 0.60, lattice age 6 days, 58 active statements (no cap pressure at old 100/110). Tuned to reachable values: settle ≥ 0.90 (current max 0.93 → first statement settles within ~5 days of hitting this threshold), stale ≤ 0.30 (0.15 was below any statement in the wild), stale-unused 14 days (30 would never fire for a 6-day-old lattice; 14 prunes genuinely dormant patterns), stable days 7 → 5 (faster discipline cycle while retaining the protection against single-run spikes).
+**Threshold rationale (2026-05-14):** The original thresholds (settle ≥ 0.95, stale ≤ 0.15, stale-unused ≥ 30 days, stable ≥ 7 days) were unreachable given the live lattice: max weight 0.93, min weight 0.60, lattice age 6 days, 58 active statements. Tuned to reachable values: settle ≥ 0.90 (current max 0.93 → first statement settles within ~5 days of hitting this threshold), stale ≤ 0.30 (0.15 was below any statement in the wild), stale-unused 14 days (30 would never fire for a 6-day-old lattice; 14 prunes genuinely dormant patterns), stable days 7 → 5 (faster discipline cycle while retaining the protection against single-run spikes).
 
 ### 5.9 Run finalization
 
@@ -695,6 +697,7 @@ All endpoints under `/api/playbook/*`, gated by `HARNESS_TOKEN`. CRUD for the da
 | POST | `/api/playbook/run` | Manually trigger a reflection run. Bypasses the daily schedule but enforces the activity gate + cost gate by default. Body: `{force_through_no_activity?: bool}` (default false). Returns 409 if `playbook_bootstrap_done` is unset (run bootstrap first). |
 | POST | `/api/playbook/bootstrap` | Manually trigger bootstrap immediately, bypassing the 5-min scheduler tick wait. Useful after `/api/playbook/reset` when the operator doesn't want to wait. Returns 409 when `playbook_bootstrap_done` is already set (use reset first), when `playbook_bootstrap_blocked` is set (reset first to clear), or when `_run_lock` cannot be acquired within 5s. Cost gate + soft cap (§4.3) still apply. Body: `{}` (no parameters). |
 | POST | `/api/playbook/proposals/{adjust\|create\|merge}/{id}` | Apply an individual proposal that was logged but not auto-applied (e.g. soft-cap rejected, human wants to apply manually). Body for adjust: `{delta: float}`; create: `{text, weight}`; merge: `{keep_id, drop_id}`. |
+| POST | `/api/playbook/proposals/batch` | Apply an ordered batch of dashboard proposals through the same validation/order/cap path as the runner and MCP tool. Used for multi-create ordering; returns applied/rejected arrays with `soft_cap_pressure` / `hard_cap_pressure` reasons. |
 | POST | `/api/playbook/statements/{id}/weight` | Direct human override. Body: `{weight: 0.0 \| 0.5 \| 1.0}`. Mirrors Compass's NO/½/YES override. Records `weight_history` entry with `reason="human_override"`. Rejects when `immutable=true`. |
 | POST | `/api/playbook/statements/{id}/restore` | Move an archived statement back to active. Body: `{weight?: float}` (default = the value at archive time). |
 | DELETE | `/api/playbook/statements/{id}` | Soft delete — moves to `archived.json` with `archive_reason="deleted"`. Rejects when `immutable=true`. |
@@ -763,8 +766,8 @@ LLM_FALLBACK_ENABLED = True
 BOOTSTRAP_WEIGHT = 0.75
 COACH_CREATION_WEIGHT = 0.60
 ADJUST_DELTA_CAP = 0.25
-SOFT_STATEMENT_CAP = 60       # was 100; tuned 2026-05-14 (live lattice had 58 active, old cap unreachable)
-HARD_STATEMENT_CAP = 80       # was 110
+SOFT_STATEMENT_CAP = 60       # active growth budget and target after hard pressure sweep
+HARD_STATEMENT_CAP = 80       # operator-review trigger; creations above this are rejected
 PRESSURE_CAP = 60             # triggers §5.5 pressure directive + §5.7.1 pressure sweep; env: HARNESS_PLAYBOOK_PRESSURE_CAP
 STATEMENT_MAX_CHARS = 160     # per-statement char cap; env: HARNESS_PLAYBOOK_STATEMENT_MAX_CHARS
 SETTLE_THRESHOLD = 0.90       # was 0.95; tuned 2026-05-14 (live max weight 0.93 — 0.95 was unreachable)
@@ -954,7 +957,7 @@ Measured against a representative ~30-day window after the engine ships. Pre-dep
 
 (b) **Weights actually move.** Across the 30-day window, ≥ 50% of active statements should have at least one `weight_history` entry from a reflection run (i.e. the daily runner is finding signal, not just no-op'ing). If < 30% move, the activity gate or evidence bundle is not surfacing enough for Coach to reason about — sharpen the bundle composition (§5.4).
 
-(c) **Soft cap holds.** Active statement count stays ≤ 100 across the window without manual deletion. If the count routinely pushes the cap, raise the cap or tighten the duplicate-detection heuristic.
+(c) **Cap discipline holds.** Active statement count trends toward the 60-statement soft cap and stays at or below the 80-statement hard cap except when immutable statements make full pressure reduction impossible. If the count routinely pushes the hard cap, tighten merge/dedup hygiene before raising caps.
 
 (d) **Cost stays trivial.** Total playbook cost (bootstrap + 30 daily runs) ≤ $1 over the window. If costs run higher, the evidence bundle is bloating; tighten the per-section caps in §5.4.
 
@@ -976,9 +979,9 @@ End-to-end on a deployed Zeabur instance after the implementation PR ships:
 8. **Player reads the lattice.** Compose a Player turn after a daily run; verify the same `## Orchestration playbook` appears in their system prompt (universal load path).
 9. **Coach mid-turn proposal.** Coach calls `coord_propose_playbook_changes` from a normal coordination turn; engine applies; lattice updates; next Coach turn sees the change. Verify Players cannot call the tool (rejected with Coach-only error).
 10. **Settle / stale.** Manually push a statement to weight 0.97 via the dashboard, leave 7 days of history, verify the runner archives it as settled. Same for low-weight statement. Confirm a brand-new statement at 0.97 (no 7-day history yet) does NOT settle.
-11. **Stale-unused.** Create a statement; leave it unmentioned by Coach for 30 days; verify auto-archive with `archive_reason="stale_unused"`.
-12. **Soft cap pressure.** Force the lattice to 99 statements; daily runner with ≥ 2 creations forces engine to apply pending settles/stales first, drops over-cap creations into rejected.
-13. **Hard cap.** Force the lattice to 109 statements with a runner producing 5 creations; verify all 5 dropped, only adjusts/merges apply, `human_attention` fires.
+11. **Stale-unused.** Create a statement; leave it unmentioned by Coach for 14 days; verify auto-archive with `archive_reason="stale_unused"`.
+12. **Soft cap pressure.** Force the lattice to 59 statements; daily runner with ≥ 2 creations applies pending settles/stales first, keeps earlier creations up to 60, and drops later over-cap creations into rejected.
+13. **Hard cap.** Force the lattice to 79 statements with a runner producing 2 creations; verify both creations drop, only adjusts/merges apply, and `human_attention` fires.
 14. **Cross-op conflict.** Coach proposes merge pb-A → pb-B AND adjust pb-A in same call; verify adjust rejected with `id_archived_in_same_run`.
 15. **Codex fallback.** Disable Claude credentials; verify the runner uses the Codex fallback and produces an applicable reflection. Cost-basis row reflects `runtime="codex"`.
 16. **Override + restore.** Click NO on a high-weight statement; weight drops to 0.0; click restore via dashboard archive view; statement comes back at original weight.
@@ -1001,9 +1004,9 @@ The §15 test files must cover the following surface — these are the edge case
 - Adjust on immutable rejected.
 - Merge: `keep_id` weight = max; `applied_count` summed; `last_validated_at` = max (NULL-safe).
 - Merge with immutable target rejected.
-- Settle predicate: requires ≥7-day-old history entry (rejects same-day-created statements).
-- Stale-low predicate: same 7-day requirement; immutable skipped.
-- Stale-unused predicate: 30-day age + applied_count==0; immutable skipped.
+- Settle predicate: requires ≥5-day-old history entry (rejects same-day-created statements).
+- Stale-low predicate: same 5-day requirement; immutable skipped.
+- Stale-unused predicate: 14-day age + applied_count==0; immutable skipped.
 - Override (NO/½/YES): rejects when immutable.
 
 **`test_playbook_bootstrap.py`:**
@@ -1014,8 +1017,8 @@ The §15 test files must cover the following surface — these are the edge case
 - 3rd consecutive failure → `_failed{blocked: true}` + `human_attention` + `playbook_bootstrap_blocked` set.
 - Scheduler tick with `playbook_bootstrap_blocked` set → no bootstrap attempted (G1 infinite-loop test).
 - Cost cap exceeded: `outcome="skipped_cost_cap"` row, no LLM call, no retry counter increment (G3).
-- Soft cap at bootstrap: LLM returns 120 → 100 inserted, 20 dropped from end (G4).
-- Hard cap at bootstrap: LLM returns 130 → 100 inserted, `playbook_soft_cap_exceeded` event fires.
+- Soft cap at bootstrap: LLM returns 70 → 60 inserted, 10 dropped from end (G4).
+- Hard cap at bootstrap: LLM returns 90 → 60 inserted, `playbook_soft_cap_exceeded` event fires.
 - `source` field: first-deploy bootstrap → `"boot"`; post-reset bootstrap → `"reset"` (with `playbook_reset_at` set then cleared on success).
 
 **`test_playbook_runner.py`:**
@@ -1023,7 +1026,7 @@ The §15 test files must cover the following surface — these are the edge case
 - Cost gate: over cap → skip; cost-skip doesn't increment retry counter or update `last_run_at`.
 - Evidence bundle composition: archived task buckets (clean/friction/failed/cancelled) computed correctly from kanban-v2 fixtures.
 - Median window fallback when trajectory shape has < 5 samples; `median_cost_fallback_fired` flagged.
-- Op apply order: merges → creates → adjusts; cross-op conflict (adjust on freshly-merged id) rejected with `id_archived_in_same_run`.
+- Op apply order: merges → settle/stale hygiene → creates → adjusts → final pressure sweep; cross-op conflict (adjust on freshly-merged id) rejected with `id_archived_in_same_run`.
 - `relevant_ids` increment: valid ids increment; malformed entries skipped per regex (N5); duplicates deduped.
 - Soft cap pressure: drops from end of input list; survivors apply.
 - Hard cap pressure: drops ALL creations; `human_attention` fires; adjusts/merges still apply.
@@ -1046,6 +1049,8 @@ The §15 test files must cover the following surface — these are the edge case
 - `POST /reset`: blocking lock acquisition with 60s timeout; 503 on timeout (G2). Confirm flag clears (`done`, `retries`, `blocked`) + `reset_at` set.
 - `POST /statements/{id}/weight`: rejects when immutable.
 - `POST /statements/{id}/restore`: round-trips an archived statement.
+- `POST /proposals/merge/{keep_id}`: persists merge lattice/archive changes and emits `playbook_changes_applied`.
+- `POST /proposals/batch`: preserves input creation order and returns soft/hard rejection details.
 
 **`test_playbook_render.py`:**
 - Empty lattice → empty string.
@@ -1058,7 +1063,7 @@ The §15 test files must cover the following surface — these are the edge case
 **`test_playbook_mcp_tool.py`:**
 - Coach-only enforcement (Player call rejected).
 - Cap of 5 ops per call enforced.
-- Same op apply order as runner (merges → creates → adjusts).
+- Same op apply order as runner (merges → hygiene → creates → adjusts → final pressure sweep).
 - Lock contention: returns string starting with `"playbook engine busy"` (G8 + N9); no mutation.
 - Codex Coach reaches the tool via the proxy path (smoke test against the runtime dispatch fixture).
 

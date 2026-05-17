@@ -270,11 +270,12 @@ async def run_bootstrap() -> dict[str, Any]:
         creation_count=len(seeds),
     )
     if hard_cap_hit:
-        # Drop from end down to soft cap (100). Bootstrap doesn't fail.
+        # Drop from end down to soft cap (60). Bootstrap doesn't fail.
+        returned_count = len(seeds)
         await _publish({
             "type": "playbook_soft_cap_exceeded",
-            "count": len(seeds),
-            "dropped": dropped_n,
+            "count": returned_count,
+            "dropped": returned_count - config.SOFT_STATEMENT_CAP,
         })
         seeds = seeds[: config.SOFT_STATEMENT_CAP]
     elif dropped_n > 0:

@@ -310,8 +310,8 @@ def resolve_cap_pressure(
     (survivor_count, dropped_count, hard_cap_hit).
 
     Branches:
-      A: pressure ≤ SOFT (100) — apply all creations, survivor=creation_count.
-      B: SOFT < pressure ≤ HARD (110) — drop from end until at SOFT;
+      A: pressure ≤ SOFT (60) — apply all creations, survivor=creation_count.
+      B: SOFT < pressure ≤ HARD (80) — drop from end until at SOFT;
          survivor = SOFT - active_count (clamped to ≥0).
       C: pressure > HARD — drop ALL creations; survivor=0; hard_cap_hit=True.
 
@@ -339,6 +339,7 @@ def apply_coach_proposals(
     operations: list[dict[str, Any]],
     *,
     creation_weight: float,
+    engine_actions: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
     """Apply Coach-side proposals (from MCP tool or daily reflection).
 
@@ -349,9 +350,14 @@ def apply_coach_proposals(
 
     Op apply order (spec §5.6 — fixed):
       1. Merges first.
-      2. Creations next (against post-merge state). Soft/hard cap
-         enforced here per §5.7.
-      3. Adjustments last (against post-merge, post-creation state).
+      2. Settle/stale/stale-unused hygiene, without pressure sweep.
+      3. Creations next (against post-merge, post-hygiene state).
+         Soft/hard cap enforced here per §5.7.
+      4. Adjustments last (against post-merge, post-creation state).
+
+    The optional `engine_actions` list is extended with pre-creation
+    hygiene actions so runner/API/MCP callers can persist and report the
+    engine work that freed creation capacity.
 
     Cross-op conflict (spec §5.6): any op targeting an id archived by
     an earlier merge is rejected with reason `"id_archived_in_same_run"`.
@@ -390,7 +396,17 @@ def apply_coach_proposals(
         else:
             rejected.append({**op, "reason": err or "merge_failed"})
 
-    # ---- Step 2: creations (soft/hard cap)
+    # ---- Step 2: settle/stale hygiene before creation capacity.
+    pre_creation_actions = sweep_engine_actions(
+        lattice,
+        archive,
+        include_hygiene=True,
+        include_pressure=False,
+    )
+    if engine_actions is not None:
+        engine_actions.extend(pre_creation_actions)
+
+    # ---- Step 3: creations (soft/hard cap)
     valid_creations: list[dict[str, Any]] = []
     for op in creations:
         text = str(op.get("text") or "").strip()
@@ -423,8 +439,10 @@ def apply_coach_proposals(
             continue
         valid_creations.append({**op, "_text": text, "_weight": weight})
 
+    active_before_creations = len(lattice.statements)
+    pressure = active_before_creations + len(valid_creations)
     survivors_n, dropped_n, hard_cap_hit = resolve_cap_pressure(
-        active_count=len(lattice.statements),
+        active_count=active_before_creations,
         creation_count=len(valid_creations),
     )
 
@@ -434,12 +452,14 @@ def apply_coach_proposals(
         # Drop ALL valid creations atomically (§5.7 branch C).
         for op in valid_creations:
             rejected.append({**{k: v for k, v in op.items() if not k.startswith("_")},
-                             "reason": "hard_cap_pressure"})
+                             "reason": "hard_cap_pressure",
+                             "pressure": pressure})
         valid_creations = []
     elif dropped_n > 0:
         for op in valid_creations[survivors_n:]:
             rejected.append({**{k: v for k, v in op.items() if not k.startswith("_")},
-                             "reason": "soft_cap_pressure"})
+                             "reason": "soft_cap_pressure",
+                             "pressure": pressure})
         valid_creations = valid_creations[:survivors_n]
 
     for op in valid_creations:
@@ -453,7 +473,7 @@ def apply_coach_proposals(
         clean = {k: v for k, v in op.items() if not k.startswith("_")}
         applied.append({**clean, "new_id": stmt.id, "weight": stmt.weight})
 
-    # ---- Step 3: adjusts
+    # ---- Step 4: adjusts
     for op in adjusts:
         sid = str(op.get("id") or "")
         if not _PB_ID_RE.match(sid):
@@ -617,39 +637,48 @@ def is_stale_unused_eligible(stmt: Statement) -> bool:
 def sweep_engine_actions(
     lattice: Lattice,
     archive: Archive,
+    *,
+    include_hygiene: bool = True,
+    include_pressure: bool = True,
 ) -> list[dict[str, Any]]:
-    """Run all four engine-driven archive predicates (§5.8 + §5.7.1).
+    """Run engine-driven archive predicates (§5.8 + §5.7.1).
     Returns a list of action records for the runs.jsonl `engine_actions`
     field. Mutates lattice + archive in place.
+
+    `include_hygiene` runs settle/stale/stale-unused. `include_pressure`
+    runs the hard-cap pressure sweep. Keeping them independently
+    switchable preserves the spec order: hygiene before creation budget,
+    pressure sweep only after proposal application.
     """
     actions: list[dict[str, Any]] = []
 
-    # Settle pass
-    settled = [s for s in lattice.statements if is_settle_eligible(s)]
-    for s in settled:
-        _archive(archive, s, reason="settled")
-        actions.append({"action": "settle", "id": s.id, "final_weight": s.weight})
-    if settled:
-        kept_ids = {s.id for s in settled}
-        lattice.statements = [s for s in lattice.statements if s.id not in kept_ids]
+    if include_hygiene:
+        # Settle pass
+        settled = [s for s in lattice.statements if is_settle_eligible(s)]
+        for s in settled:
+            _archive(archive, s, reason="settled")
+            actions.append({"action": "settle", "id": s.id, "final_weight": s.weight})
+        if settled:
+            kept_ids = {s.id for s in settled}
+            lattice.statements = [s for s in lattice.statements if s.id not in kept_ids]
 
-    # Stale-low pass
-    stale_low = [s for s in lattice.statements if is_stale_low_eligible(s)]
-    for s in stale_low:
-        _archive(archive, s, reason="stale_low")
-        actions.append({"action": "stale_low", "id": s.id, "final_weight": s.weight})
-    if stale_low:
-        kept_ids = {s.id for s in stale_low}
-        lattice.statements = [s for s in lattice.statements if s.id not in kept_ids]
+        # Stale-low pass
+        stale_low = [s for s in lattice.statements if is_stale_low_eligible(s)]
+        for s in stale_low:
+            _archive(archive, s, reason="stale_low")
+            actions.append({"action": "stale_low", "id": s.id, "final_weight": s.weight})
+        if stale_low:
+            kept_ids = {s.id for s in stale_low}
+            lattice.statements = [s for s in lattice.statements if s.id not in kept_ids]
 
-    # Stale-unused pass
-    stale_unused = [s for s in lattice.statements if is_stale_unused_eligible(s)]
-    for s in stale_unused:
-        _archive(archive, s, reason="stale_unused")
-        actions.append({"action": "stale_unused", "id": s.id, "final_weight": s.weight})
-    if stale_unused:
-        kept_ids = {s.id for s in stale_unused}
-        lattice.statements = [s for s in lattice.statements if s.id not in kept_ids]
+        # Stale-unused pass
+        stale_unused = [s for s in lattice.statements if is_stale_unused_eligible(s)]
+        for s in stale_unused:
+            _archive(archive, s, reason="stale_unused")
+            actions.append({"action": "stale_unused", "id": s.id, "final_weight": s.weight})
+        if stale_unused:
+            kept_ids = {s.id for s in stale_unused}
+            lattice.statements = [s for s in lattice.statements if s.id not in kept_ids]
 
     # Pressure sweep (§5.7.1): when active count exceeds HARD_STATEMENT_CAP,
     # archive lowest-weight non-immutable statements until active count
@@ -657,7 +686,7 @@ def sweep_engine_actions(
     # confident patterns in play. Fires AFTER the normal three passes so
     # natural settle/stale exits run first.
     active_count = len(lattice.statements)
-    if active_count > config.HARD_STATEMENT_CAP:
+    if include_pressure and active_count > config.HARD_STATEMENT_CAP:
         eligible = sorted(
             [s for s in lattice.statements if not s.immutable],
             key=lambda s: s.weight,  # ascending — lowest weight first
