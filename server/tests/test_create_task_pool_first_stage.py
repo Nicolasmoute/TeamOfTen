@@ -1,18 +1,9 @@
-"""v2.0.1 (2026-05-08) — same-stage approve_stage allowance is now
-defensive-only.
+"""TruthGate-backed first-stage assignment behavior.
 
-The original premise of this file (pool/empty first-stage create →
-follow-up same-stage approve_stage to plant the role row) is gone:
-v2.0.1 rejects pool/empty first-stage at create time so the
-two-step shape can't happen on the create path. Coverage of the
-rejection lives in
-[test_create_task_requires_single_first_stage.py](test_create_task_requires_single_first_stage.py).
-
-What remains: the same-stage allowance in `coord_approve_stage` is
-kept as defensive code for the (rare) edge where a `coord_set_task_trajectory`
-rewrite inserts a stage with no active role row. We test the
-single-name first-stage happy path here so the rejection logic is
-exercised against a known-good trajectory.
+Backlog promotion enters `truthgate` without planting a Player role,
+even when the first trajectory entry names a single candidate. The first
+real assignment happens only after a TruthGate pass/override and an
+explicit `coord_approve_stage` call.
 """
 
 from __future__ import annotations
@@ -96,11 +87,24 @@ async def _active_role_owner(task_id: str, role: str) -> str | None:
         await c.close()
 
 
-async def test_single_name_first_stage_plants_role_at_create(
+async def _mark_truthgate_pass(task_id: str) -> None:
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE tasks SET truthgate_verdict = 'truthgate_pass', "
+            "truthgate_method = 'manual_record', truth_basis = '[]' "
+            "WHERE id = ?",
+            (task_id,),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+
+async def test_single_name_first_stage_does_not_plant_before_truthgate_exit(
     fresh_db: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """v2.0.1: trajectory[0].to=['p2'] plants the executor role row when
-    the backlog entry is promoted. tasks.owner is set."""
+    """A single-name first `to` remains advisory while in TruthGate."""
     await init_db()
     await _stub_wake(monkeypatch)
     coach = _server_for("coach")
@@ -110,16 +114,13 @@ async def test_single_name_first_stage_plants_role_at_create(
         "description": "x",
         "trajectory": '[{"stage":"execute","to":["p2"]}]',
     })
-    assert await _active_role_owner(tid, "executor") == "p2"
+    assert await _active_role_owner(tid, "executor") is None
 
 
 async def test_same_stage_approve_rejected_when_role_active(
     fresh_db: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The Phase 1 same-stage allowance only fires when no active row
-    exists at the target. After a single-name first-stage create
-    plants the executor row, a same-stage approve_stage call must be
-    rejected — the role is already filled."""
+    """After post-gate dispatch, duplicate same-stage approve is rejected."""
     await init_db()
     await _stub_wake(monkeypatch)
     coach = _server_for("coach")
@@ -129,6 +130,13 @@ async def test_same_stage_approve_rejected_when_role_active(
         "description": "x",
         "trajectory": '[{"stage":"execute","to":["p2"]}]',
     })
+    await _mark_truthgate_pass(tid)
+    _ok(await _handler(coach, "approve_stage")({
+        "task_id": tid,
+        "next_stage": "execute",
+        "assignee": "p2",
+        "note": "dispatch",
+    }))
 
     err = _err(await _handler(coach, "approve_stage")({
         "task_id": tid,
@@ -142,9 +150,7 @@ async def test_same_stage_approve_rejected_when_role_active(
 async def test_normal_next_stage_after_create(
     fresh_db: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression: the normal next-stage transition path
-    (`execute → audit_syntax`) still works after a single-name
-    first-stage create."""
+    """Regression: normal next-stage transition works after dispatch."""
     await init_db()
     await _stub_wake(monkeypatch)
     coach = _server_for("coach")
@@ -157,6 +163,13 @@ async def test_normal_next_stage_after_create(
             '{"stage":"audit_syntax","to":["p4"]}]'
         ),
     })
+    await _mark_truthgate_pass(tid)
+    _ok(await _handler(coach, "approve_stage")({
+        "task_id": tid,
+        "next_stage": "execute",
+        "assignee": "p2",
+        "note": "dispatch",
+    }))
 
     _ok(await _handler(coach, "approve_stage")({
         "task_id": tid,

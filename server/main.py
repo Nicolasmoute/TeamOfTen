@@ -4662,6 +4662,7 @@ async def get_tasks_board() -> dict[str, Any]:
     postship_map = await _load_postship_context(task_ids)
 
     buckets: dict[str, list[dict[str, Any]]] = {
+        "truthgate": [],
         "plan": [],
         "execute": [],
         "audit_syntax": [],
@@ -4765,7 +4766,9 @@ async def get_task_assignments(task_id: str) -> dict[str, Any]:
 # through the same validator as Coach's MCP-tool override.
 from server.tools import (  # noqa: E402
     ALL_KANBAN_STAGES,
+    _provisional_archive_error,
     _ship_verify_context_or_error,
+    _truthgate_exit_error,
     _valid_transition,
     _validate_trajectory,
 )
@@ -4788,6 +4791,14 @@ async def post_task_approve_stage(
     next_stage = req.next_stage
     if next_stage not in ALL_KANBAN_STAGES:
         raise HTTPException(400, detail=f"invalid stage: {next_stage}")
+    if next_stage == "truthgate":
+        raise HTTPException(
+            400,
+            detail=(
+                "approve_stage cannot assign truthgate; backlog promotion "
+                "enters truthgate automatically."
+            ),
+        )
 
     assignee_raw = (req.assignee or "").strip().lower()
     if next_stage == "archive":
@@ -4899,6 +4910,11 @@ async def post_task_approve_stage(
                 400,
                 detail=f"invalid transition: {old_status} → {next_stage}",
             )
+        truthgate_err = await _truthgate_exit_error(
+            c, task_id, old_status, next_stage,
+        )
+        if truthgate_err is not None:
+            raise HTTPException(400, detail=truthgate_err)
 
         if old_status == "ship" and next_stage == "verify":
             context, error = await _ship_verify_context_or_error(
@@ -4910,6 +4926,11 @@ async def post_task_approve_stage(
 
         now = datetime.now(timezone.utc).isoformat()
         if next_stage == "archive":
+            archive_err = await _provisional_archive_error(
+                c, project_id=project_id, task_id=task_id,
+            )
+            if archive_err is not None:
+                raise HTTPException(400, detail=archive_err)
             await c.execute(
                 "UPDATE task_role_assignments SET completed_at = ? "
                 "WHERE task_id = ? "
@@ -5332,7 +5353,8 @@ async def get_tasks_flow_health() -> dict[str, Any]:
     from server import kanban as kanban_mod
     project_id = await resolve_active_project()
     stages = [
-        "plan", "execute", "audit_syntax", "audit_semantics", "ship", "verify",
+        "truthgate", "plan", "execute", "audit_syntax",
+        "audit_semantics", "ship", "verify",
     ]
     out_stages: dict[str, dict[str, Any]] = {}
     stalled_count = 0
@@ -6269,7 +6291,8 @@ async def list_file_write_proposals(
     sql = (
         "SELECT id, project_id, proposer_id, scope, path, "
         "proposed_content, summary, status, created_at, resolved_at, "
-        "resolved_by, resolved_note FROM file_write_proposals WHERE "
+        "resolved_by, resolved_note, metadata_json, originating_task_id "
+        "FROM file_write_proposals WHERE "
         + " AND ".join(where) + " ORDER BY id DESC LIMIT ?"
     )
     params.append(limit)

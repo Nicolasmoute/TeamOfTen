@@ -156,7 +156,7 @@ async def test_start_login_extracts_url_and_code(tmp_path, monkeypatch, caplog):
     assert result["device_code"] == "Z7MT-0V759"
     assert result["session_id"] in caplog.text
     assert result["url"] in caplog.text
-    assert "device_code_len=10" in caplog.text
+    assert "device_code=<10 chars>" in caplog.text
     assert "Z7MT-0V759" not in caplog.text
 
 

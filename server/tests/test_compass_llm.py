@@ -178,6 +178,9 @@ async def test_call_raises_on_error_before_result(
     monkeypatch.setattr(sdk, "ResultMessage", _StubResultMessage)
     monkeypatch.setattr(sdk, "TextBlock", _StubTextBlock)
 
+    from server.compass import config as cmp_config
+    monkeypatch.setattr(cmp_config, "LLM_FALLBACK_ENABLED", False)
+
     with pytest.raises(llm.CompassLLMError):
         await llm.call("s", "u")
 

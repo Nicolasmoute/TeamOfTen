@@ -74,8 +74,8 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 
 -- Kanban-shaped task lifecycle (Docs/kanban-specs-v2.md). Status enum is
--- the kanban stage (`plan` / `execute` / `audit_syntax` / `audit_semantics`
--- / `ship` / `archive`). The legacy enum (open/claimed/in_progress/
+-- the kanban stage (`truthgate` / `plan` / `execute` / `audit_syntax`
+-- / `audit_semantics` / `ship` / `archive`). The legacy enum (open/claimed/in_progress/
 -- blocked/done/cancelled) was migrated to this shape via a one-shot
 -- table rebuild in `_rebuild_tasks_if_kanban_outdated` — see that
 -- function for the mapping. `blocked` is now an orthogonal flag, not a
@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     title                       TEXT NOT NULL,
     description                 TEXT NOT NULL DEFAULT '',
     status                      TEXT NOT NULL DEFAULT 'plan'
-                                CHECK (status IN ('plan', 'execute', 'audit_syntax', 'audit_semantics', 'ship', 'verify', 'archive')),
+                                CHECK (status IN ('truthgate', 'plan', 'execute', 'audit_syntax', 'audit_semantics', 'ship', 'verify', 'archive')),
     owner                       TEXT REFERENCES agents(id),
     created_by                  TEXT NOT NULL,
     created_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -146,6 +146,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Format: `projects/<id>/working/compass/audit_reports/<audit_id>.md`.
     compass_audit_report_path   TEXT,
     compass_audit_verdict       TEXT,
+    truthgate_verdict           TEXT,
+    truth_basis                 TEXT NOT NULL DEFAULT '[]',
+    truth_concerns              TEXT NOT NULL DEFAULT '[]',
+    truthgate_at                TEXT,
+    truthgate_model             TEXT,
+    truthgate_method            TEXT,
+    truthgate_override_rationale TEXT,
+    truthgate_pending_proposal_id INTEGER,
+    truthgate_warning           TEXT,
+    provisional                 INTEGER NOT NULL DEFAULT 0,
+    closure_reference           TEXT,
     tags                        TEXT NOT NULL DEFAULT '[]',
     artifacts                   TEXT NOT NULL DEFAULT '[]'
 );
@@ -542,7 +553,9 @@ CREATE TABLE IF NOT EXISTS file_write_proposals (
     created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     resolved_at       TEXT,
     resolved_by       TEXT,                          -- 'human' (only legal value today)
-    resolved_note     TEXT
+    resolved_note     TEXT,
+    metadata_json     TEXT NOT NULL DEFAULT '{}',
+    originating_task_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_file_write_proposals_project_status
@@ -844,7 +857,11 @@ async def init_db() -> None:
             await _ensure_columns(
                 db,
                 "file_write_proposals",
-                [("scope", "scope TEXT NOT NULL DEFAULT 'truth'")],
+                [
+                    ("scope", "scope TEXT NOT NULL DEFAULT 'truth'"),
+                    ("metadata_json", "metadata_json TEXT NOT NULL DEFAULT '{}'"),
+                    ("originating_task_id", "originating_task_id TEXT"),
+                ],
             )
             # CHECK-constraint upgrade for file_write_proposals:
             # the old `truth_proposals` table shipped with a 4-value
@@ -928,6 +945,24 @@ async def init_db() -> None:
                 )],
             )
             await _rebuild_tasks_for_verify_stage(db)
+            await _ensure_columns(
+                db,
+                "tasks",
+                [
+                    ("truthgate_verdict", "truthgate_verdict TEXT"),
+                    ("truth_basis", "truth_basis TEXT NOT NULL DEFAULT '[]'"),
+                    ("truth_concerns", "truth_concerns TEXT NOT NULL DEFAULT '[]'"),
+                    ("truthgate_at", "truthgate_at TEXT"),
+                    ("truthgate_model", "truthgate_model TEXT"),
+                    ("truthgate_method", "truthgate_method TEXT"),
+                    ("truthgate_override_rationale", "truthgate_override_rationale TEXT"),
+                    ("truthgate_pending_proposal_id", "truthgate_pending_proposal_id INTEGER"),
+                    ("truthgate_warning", "truthgate_warning TEXT"),
+                    ("provisional", "provisional INTEGER NOT NULL DEFAULT 0"),
+                    ("closure_reference", "closure_reference TEXT"),
+                ],
+            )
+            await _rebuild_tasks_for_truthgate_stage(db)
             await _rebuild_task_roles_for_verifier(db)
             # Indexes that reference kanban-new columns. Live outside
             # SCHEMA because their columns don't exist on legacy DBs
@@ -1104,7 +1139,9 @@ async def _rebuild_file_write_proposals_if_check_outdated(
                     created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                     resolved_at       TEXT,
                     resolved_by       TEXT,
-                    resolved_note     TEXT
+                    resolved_note     TEXT,
+                    metadata_json     TEXT NOT NULL DEFAULT '{}',
+                    originating_task_id TEXT
                 )
                 """
             )
@@ -1113,10 +1150,12 @@ async def _rebuild_file_write_proposals_if_check_outdated(
                 INSERT INTO file_write_proposals_new
                     (id, project_id, proposer_id, scope, path,
                      proposed_content, summary, status, created_at,
-                     resolved_at, resolved_by, resolved_note)
+                     resolved_at, resolved_by, resolved_note,
+                     metadata_json, originating_task_id)
                 SELECT id, project_id, proposer_id, scope, path,
                        proposed_content, summary, status, created_at,
-                       resolved_at, resolved_by, resolved_note
+                       resolved_at, resolved_by, resolved_note,
+                       COALESCE(metadata_json, '{}'), originating_task_id
                   FROM file_write_proposals
                 """
             )
@@ -1815,6 +1854,149 @@ async def _rebuild_tasks_for_verify_stage(db: aiosqlite.Connection) -> None:
         await db.execute("PRAGMA foreign_keys = ON")
 
 
+async def _rebuild_tasks_for_truthgate_stage(db: aiosqlite.Connection) -> None:
+    """Rebuild tasks when its status CHECK predates the truthgate stage."""
+    cur = await db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'"
+    )
+    row = await cur.fetchone()
+    sql = row[0] if row else ""
+    if "'truthgate'" in (sql or ""):
+        return
+
+    logger.info("init_db: rebuilding tasks table to add truthgate status")
+    await db.execute("PRAGMA foreign_keys = OFF")
+    try:
+        await db.execute("BEGIN")
+        try:
+            await db.execute(
+                """
+                CREATE TABLE tasks_truthgate (
+                    id                          TEXT PRIMARY KEY,
+                    project_id                  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                    title                       TEXT NOT NULL,
+                    description                 TEXT NOT NULL DEFAULT '',
+                    status                      TEXT NOT NULL DEFAULT 'plan'
+                                                CHECK (status IN ('truthgate', 'plan', 'execute', 'audit_syntax', 'audit_semantics', 'ship', 'verify', 'archive')),
+                    owner                       TEXT REFERENCES agents(id),
+                    created_by                  TEXT NOT NULL,
+                    created_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    claimed_at                  TEXT,
+                    started_at                  TEXT,
+                    completed_at                TEXT,
+                    archived_at                 TEXT,
+                    cancelled_at                TEXT,
+                    parent_id                   TEXT REFERENCES tasks(id),
+                    priority                    TEXT NOT NULL DEFAULT 'normal'
+                                                CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
+                    trajectory                  TEXT NOT NULL DEFAULT '[{"stage":"execute","to":[]}]',
+                    last_stage_change_at        TEXT,
+                    stale_alert_at              TEXT,
+                    workflow                    TEXT NOT NULL DEFAULT 'generic',
+                    tracking_reason             TEXT,
+                    blocked                     INTEGER NOT NULL DEFAULT 0,
+                    blocked_reason              TEXT,
+                    spec_path                   TEXT,
+                    spec_written_at             TEXT,
+                    latest_audit_report_path    TEXT,
+                    latest_audit_kind           TEXT,
+                    latest_audit_verdict        TEXT,
+                    compass_audit_report_path   TEXT,
+                    compass_audit_verdict       TEXT,
+                    tags                        TEXT NOT NULL DEFAULT '[]',
+                    artifacts                   TEXT NOT NULL DEFAULT '[]',
+                    stall_escalation_level      INTEGER NOT NULL DEFAULT 0,
+                    success_criteria            TEXT NOT NULL DEFAULT '',
+                    truthgate_verdict           TEXT,
+                    truth_basis                 TEXT NOT NULL DEFAULT '[]',
+                    truth_concerns              TEXT NOT NULL DEFAULT '[]',
+                    truthgate_at                TEXT,
+                    truthgate_model             TEXT,
+                    truthgate_method            TEXT,
+                    truthgate_override_rationale TEXT,
+                    truthgate_pending_proposal_id INTEGER,
+                    truthgate_warning           TEXT,
+                    provisional                 INTEGER NOT NULL DEFAULT 0,
+                    closure_reference           TEXT
+                )
+                """
+            )
+            await db.execute(
+                """
+                INSERT INTO tasks_truthgate
+                    (id, project_id, title, description, status, owner,
+                     created_by, created_at, claimed_at, started_at,
+                     completed_at, archived_at, cancelled_at, parent_id,
+                     priority, trajectory, last_stage_change_at,
+                     stale_alert_at, workflow, tracking_reason, blocked,
+                     blocked_reason, spec_path, spec_written_at,
+                     latest_audit_report_path, latest_audit_kind,
+                     latest_audit_verdict, compass_audit_report_path,
+                     compass_audit_verdict, tags, artifacts,
+                     stall_escalation_level, success_criteria,
+                     truthgate_verdict, truth_basis, truth_concerns,
+                     truthgate_at, truthgate_model, truthgate_method,
+                     truthgate_override_rationale,
+                     truthgate_pending_proposal_id, truthgate_warning,
+                     provisional, closure_reference)
+                SELECT
+                    id, project_id, title, description, status, owner,
+                    created_by, created_at, claimed_at, started_at,
+                    completed_at, archived_at, cancelled_at, parent_id,
+                    priority, trajectory, last_stage_change_at,
+                    stale_alert_at, workflow, tracking_reason, blocked,
+                    blocked_reason, spec_path, spec_written_at,
+                    latest_audit_report_path, latest_audit_kind,
+                    latest_audit_verdict, compass_audit_report_path,
+                    compass_audit_verdict, tags, artifacts,
+                    COALESCE(stall_escalation_level, 0),
+                    COALESCE(success_criteria, ''),
+                    truthgate_verdict,
+                    COALESCE(truth_basis, '[]'),
+                    COALESCE(truth_concerns, '[]'),
+                    truthgate_at, truthgate_model, truthgate_method,
+                    truthgate_override_rationale,
+                    truthgate_pending_proposal_id, truthgate_warning,
+                    COALESCE(provisional, 0), closure_reference
+                FROM tasks
+                """
+            )
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_status")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_owner")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_parent")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_project")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_archived")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_stage_change")
+            await db.execute("DROP INDEX IF EXISTS idx_tasks_stall_gate")
+            await db.execute("DROP TABLE tasks")
+            await db.execute("ALTER TABLE tasks_truthgate RENAME TO tasks")
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id)"
+            )
+            cur = await db.execute("PRAGMA foreign_key_check")
+            violations = await cur.fetchall()
+            if violations:
+                raise RuntimeError(
+                    f"tasks truthgate rebuild left {len(violations)} FK "
+                    f"violations: {violations}"
+                )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    finally:
+        await db.execute("PRAGMA foreign_keys = ON")
+
+
 async def _rebuild_task_roles_for_verifier(db: aiosqlite.Connection) -> None:
     """Rebuild task_role_assignments when its role CHECK lacks verifier."""
     cur = await db.execute(
@@ -1974,6 +2156,14 @@ _V2_BACKFILL_TYPES: frozenset[str] = frozenset({
     "auto_compact_triggered",
     "session_compacted",
     "kanban_board_stalled",
+    "task_truthgate_started",
+    "task_truthgate_completed",
+    "task_truthgate_blocked",
+    "task_truthgate_override_recorded",
+    "truth_amendment_proposed",
+    "truth_amendment_resolved",
+    "task_provisional_closure_recorded",
+    "task_truth_basis_stale",
     # Renamed (key = v1 bus type, value = v2 log type) — see _V2_BACKFILL_RENAMES
     "message_sent",
     "knowledge_written",

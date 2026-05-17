@@ -39,6 +39,7 @@ COORD_WRITE_CONTEXT: Final[list[str]] = [
     _coord("coord_write_knowledge"),
     _coord("coord_save_output"),
     _coord("coord_set_task_blocked"),
+    _coord("coord_propose_truth_amendment"),
 ]
 
 COORD_SELF_CHECK: Final[list[str]] = [

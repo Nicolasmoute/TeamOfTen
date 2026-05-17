@@ -286,6 +286,7 @@ async def test_team_codex_put_rejects_empty(
 async def test_team_codex_put_then_get_then_delete_round_trip(
     fresh_db: str,
     monkeypatch,
+    tmp_path,
 ) -> None:
     import pytest
     pytest.importorskip("fastapi")
@@ -295,6 +296,7 @@ async def test_team_codex_put_then_get_then_delete_round_trip(
 
     monkeypatch.delenv("HARNESS_TOKEN", raising=False)
     monkeypatch.setenv("HARNESS_SECRETS_KEY", "GsTLxlpTvgYFjJxkhBcGWpXFkHjMVlkJxmJgJmBtmJ8=")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
     await dbmod.init_db()
     with TestClient(mainmod.app) as c:
         r_put = c.put("/api/team/codex", json={"api_key": "sk-test-fake-key-1234"})
@@ -3357,6 +3359,11 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
         agentsmod,
         "_codex_session_context_estimate",
         lambda thread_id: _async_value(800_000),
+    )
+    monkeypatch.setattr(
+        agentsmod,
+        "_get_recent_exchanges",
+        lambda agent_id: _async_value([]),
     )
     monkeypatch.setattr(agentsmod, "_context_window_for", lambda model: 1_000_000)
 

@@ -3532,6 +3532,109 @@ async def _stamp_events_read_by_coach(event_ids: list[int]) -> None:
         )
 
 
+async def _build_truthgate_attention_block(project_id: str) -> str:
+    """TruthGate pending-action rollup for Coach's coordination block."""
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT id, title, status, blocked, blocked_reason, "
+            "truthgate_verdict, truthgate_method, truthgate_warning, "
+            "truthgate_pending_proposal_id, provisional, closure_reference "
+            "FROM tasks WHERE project_id = ? AND status != 'archive' "
+            "AND (status = 'truthgate' OR truthgate_verdict IS NOT NULL "
+            "OR truthgate_warning IS NOT NULL OR provisional = 1) "
+            "ORDER BY created_at DESC LIMIT 100",
+            (project_id,),
+        )
+        tasks = [dict(r) for r in await cur.fetchall()]
+        cur = await c.execute(
+            "SELECT id, proposer_id, scope, path, summary, created_at, "
+            "metadata_json, originating_task_id "
+            "FROM file_write_proposals WHERE project_id = ? "
+            "AND status = 'pending' AND scope = 'truth' "
+            "ORDER BY id DESC LIMIT 50",
+            (project_id,),
+        )
+        proposals = [dict(r) for r in await cur.fetchall()]
+    finally:
+        await c.close()
+
+    awaiting = [
+        t for t in tasks
+        if t.get("status") == "truthgate" and not t.get("truthgate_verdict")
+    ]
+    blocked_needs = [
+        t for t in tasks
+        if t.get("truthgate_verdict") == "truthgate_needs_truth_change"
+    ]
+    sparse = [t for t in tasks if t.get("truthgate_warning")]
+    provisional = [
+        t for t in tasks
+        if t.get("provisional") and not (t.get("closure_reference") or "").strip()
+    ]
+
+    docs_reminders: list[tuple[int, str, list[str]]] = []
+    for p in proposals:
+        try:
+            meta = json.loads(p.get("metadata_json") or "{}")
+        except Exception:
+            meta = {}
+        affected = meta.get("affected_docs") if isinstance(meta, dict) else None
+        docs = (
+            [str(x) for x in affected if str(x).strip()][:5]
+            if isinstance(affected, list)
+            else []
+        )
+        if docs:
+            docs_reminders.append((int(p["id"]), p.get("path") or "", docs))
+
+    if not (awaiting or blocked_needs or proposals or docs_reminders or sparse or provisional):
+        return ""
+
+    lines = ["## TruthGate attention", ""]
+
+    def task_line(t: dict[str, Any]) -> str:
+        return f"- {t['id']} — {(t.get('title') or '').strip()}"
+
+    if awaiting:
+        lines.append("Awaiting classifier / override:")
+        lines.extend(task_line(t) for t in awaiting[:10])
+        lines.append("")
+    if blocked_needs:
+        lines.append("Blocked on truth change:")
+        for t in blocked_needs[:10]:
+            proposal = t.get("truthgate_pending_proposal_id")
+            suffix = f" (proposal #{proposal})" if proposal else ""
+            reason = t.get("blocked_reason") or t.get("truthgate_warning") or ""
+            lines.append(f"- {t['id']} — {t.get('title') or ''}{suffix} — {reason}")
+        lines.append("")
+    if proposals:
+        lines.append("Pending truth amendments:")
+        for p in proposals[:10]:
+            origin = p.get("originating_task_id")
+            origin_s = f" from {origin}" if origin else ""
+            lines.append(
+                f"- proposal #{p['id']}{origin_s}: truth/{p['path']} — "
+                f"{p.get('summary') or ''}"
+            )
+        lines.append("")
+    if docs_reminders:
+        lines.append("Stale Docs reminders from truth amendments:")
+        for pid, path, docs in docs_reminders[:10]:
+            lines.append(f"- proposal #{pid} truth/{path} affects {', '.join(docs)}")
+        lines.append("")
+    if sparse:
+        lines.append("Sparse TruthGate warnings:")
+        for t in sparse[:10]:
+            lines.append(f"- {t['id']} — {t.get('truthgate_warning')}")
+        lines.append("")
+    if provisional:
+        lines.append("Provisional tasks missing closure:")
+        lines.extend(task_line(t) for t in provisional[:10])
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 async def _build_coach_coordination_block(
     surfaced_event_ids: list[int] | None = None,
 ) -> str:
@@ -3819,6 +3922,10 @@ async def _build_coach_coordination_block(
     else:
         lines.append("Open tasks: (none)")
     lines.append("")
+    truthgate_attention = await _build_truthgate_attention_block(active)
+    if truthgate_attention:
+        lines.append(truthgate_attention.rstrip())
+        lines.append("")
     lines.append(
         f"Inbox: {unread} unread.  Last decision: {last_decision_line}"
     )

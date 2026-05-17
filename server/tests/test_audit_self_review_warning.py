@@ -12,6 +12,7 @@ specialist scarcity); no rejection.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -67,7 +68,29 @@ async def _create_and_promote(coach: Any, args: dict[str, Any]) -> str:
         "id": str(backlog_id),
         "action": "promote",
     }))
-    return _extract_task_id(promoted)
+    tid = _extract_task_id(promoted)
+    trajectory = json.loads(args["trajectory"])
+    first = trajectory[0]
+    first_to = first.get("to") or []
+    assignee = first_to[0]
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE tasks SET truthgate_verdict = 'truthgate_pass', "
+            "truthgate_method = 'manual_record', truth_basis = '[]' "
+            "WHERE id = ?",
+            (tid,),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+    _ok(await _handler(coach, "approve_stage")({
+        "task_id": tid,
+        "next_stage": first["stage"],
+        "assignee": assignee,
+        "note": "test fixture TruthGate pass; dispatch first stage",
+    }))
+    return tid
 
 
 async def _stub_wake(monkeypatch: pytest.MonkeyPatch) -> None:

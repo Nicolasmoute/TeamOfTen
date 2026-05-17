@@ -297,8 +297,13 @@ class RecordingGit:
         unmerged: bool = False,
         cherry_pick_head: bool = False,
         patch_on_dev: bool = False,
+        patch_equivalent_on_dev: bool | None = None,
         empty_cherry_pick: bool = False,
+        empty_cherry_pick_confirms_patch: bool = True,
         origin_dev_sha: str = "devsha1234567890",
+        branch_based_on_dev: bool = True,
+        branch_contains_executor: bool = True,
+        branch_mentions_executor_without_marker: bool = False,
     ) -> None:
         self.branch_exists = branch_exists
         self.current_branch = current_branch
@@ -306,10 +311,22 @@ class RecordingGit:
         self.unmerged = unmerged
         self.cherry_pick_head = cherry_pick_head
         self.patch_on_dev = patch_on_dev
+        self.patch_equivalent_on_dev = (
+            patch_on_dev
+            if patch_equivalent_on_dev is None
+            else patch_equivalent_on_dev
+        )
         self.empty_cherry_pick = empty_cherry_pick
+        self.empty_cherry_pick_confirms_patch = empty_cherry_pick_confirms_patch
         self.origin_dev_sha = origin_dev_sha
+        self.branch_based_on_dev = branch_based_on_dev
+        self.branch_contains_executor = branch_contains_executor
+        self.branch_mentions_executor_without_marker = (
+            branch_mentions_executor_without_marker
+        )
         self.commands: list[list[str]] = []
         self.patch_checks = 0
+        self.cherry_checks = 0
 
     def __call__(self, cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
         self.commands.append(cmd)
@@ -320,8 +337,24 @@ class RecordingGit:
             rc = 0 if self.patch_on_dev else 1
             return subprocess.CompletedProcess(cmd, rc, "", "")
         if cmd == ["git", "cherry", "origin/dev", EXECUTOR_SHA, f"{EXECUTOR_SHA}^"]:
-            sign = "-" if self.patch_on_dev else "+"
+            self.cherry_checks += 1
+            sign = "-" if self.patch_equivalent_on_dev else "+"
             return subprocess.CompletedProcess(cmd, 0, f"{sign} {EXECUTOR_SHA}\n", "")
+        if cmd == ["git", "merge-base", "--is-ancestor", "origin/dev", "HEAD"]:
+            rc = 0 if self.branch_based_on_dev else 1
+            err = "" if rc == 0 else "not ancestor"
+            return subprocess.CompletedProcess(cmd, rc, "", err)
+        if cmd == ["git", "log", "--format=%B", "origin/dev..HEAD"]:
+            if self.branch_contains_executor:
+                out = (
+                    "Ship resolved conflicts\n\n"
+                    f"(cherry picked from commit {EXECUTOR_SHA})\n"
+                )
+            elif self.branch_mentions_executor_without_marker:
+                out = f"unrelated temp branch mentions {EXECUTOR_SHA}\n"
+            else:
+                out = "unrelated temp branch commit\n"
+            return subprocess.CompletedProcess(cmd, 0, out, "")
         if cmd == ["git", "rev-parse", "origin/dev"]:
             return subprocess.CompletedProcess(cmd, 0, f"{self.origin_dev_sha}\n", "")
         if cmd == [
@@ -352,7 +385,8 @@ class RecordingGit:
             return subprocess.CompletedProcess(cmd, 0, "", "")
         if cmd == ["git", "cherry-pick", "-x", EXECUTOR_SHA]:
             if self.empty_cherry_pick:
-                self.patch_on_dev = True
+                if self.empty_cherry_pick_confirms_patch:
+                    self.patch_equivalent_on_dev = True
                 return subprocess.CompletedProcess(
                     cmd,
                     1,
@@ -567,6 +601,8 @@ async def test_ship_to_dev_resumes_existing_clean_temp_branch_after_manual_resol
 
     assert ["git", "checkout", "-b", f"ship-{TASK_ID}", "origin/dev"] not in git.commands
     assert ["git", "cherry-pick", "-x", EXECUTOR_SHA] not in git.commands
+    assert ["git", "merge-base", "--is-ancestor", "origin/dev", "HEAD"] in git.commands
+    assert ["git", "log", "--format=%B", "origin/dev..HEAD"] in git.commands
     assert ["git", "push", "origin", f"ship-{TASK_ID}:ship-{TASK_ID}"] in git.commands
     assert any(call[0] == "post" for call in github.calls)
     shipped = [e for e in captured if e.get("type") == "task_shipped_to_dev"]
@@ -607,6 +643,96 @@ async def test_ship_to_dev_existing_temp_branch_with_unresolved_conflicts_stays_
         assert dict(await cur.fetchone())["completed_at"] is None
     finally:
         await c.close()
+
+
+async def test_ship_to_dev_existing_clean_temp_branch_without_executor_metadata_errors(
+    fresh_db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await init_db()
+    await _seed_ready_ship_task()
+    _stub_workspace(monkeypatch, tmp_path)
+    git = RecordingGit(
+        branch_exists=True,
+        current_branch=f"ship-{TASK_ID}",
+        branch_contains_executor=False,
+    )
+    monkeypatch.setattr(subprocess, "run", git)
+    github = RecordingGitHub().install(monkeypatch)
+
+    server = _server_for("p2")
+    result = await _handler(server, "ship_to_dev")({"task_id": TASK_ID})
+    err = _err_text(result)
+    assert "does not contain the recorded executor commit" in err
+    assert "git cherry-pick --continue" in err
+    assert ["git", "push", "origin", f"ship-{TASK_ID}:ship-{TASK_ID}"] not in git.commands
+    assert github.calls == []
+
+
+async def test_ship_to_dev_existing_clean_temp_branch_rejects_message_only_sha(
+    fresh_db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await init_db()
+    await _seed_ready_ship_task()
+    _stub_workspace(monkeypatch, tmp_path)
+    git = RecordingGit(
+        branch_exists=True,
+        current_branch=f"ship-{TASK_ID}",
+        branch_contains_executor=False,
+        branch_mentions_executor_without_marker=True,
+    )
+    monkeypatch.setattr(subprocess, "run", git)
+    github = RecordingGitHub().install(monkeypatch)
+
+    server = _server_for("p2")
+    result = await _handler(server, "ship_to_dev")({"task_id": TASK_ID})
+    err = _err_text(result)
+    assert "cherry-pick metadata" in err
+    assert ["git", "push", "origin", f"ship-{TASK_ID}:ship-{TASK_ID}"] not in git.commands
+    assert github.calls == []
+
+
+async def test_ship_to_dev_existing_current_dirty_temp_branch_errors(
+    fresh_db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await init_db()
+    await _seed_ready_ship_task()
+    _stub_workspace(monkeypatch, tmp_path)
+    git = RecordingGit(
+        branch_exists=True,
+        current_branch=f"ship-{TASK_ID}",
+        dirty=True,
+    )
+    monkeypatch.setattr(subprocess, "run", git)
+    github = RecordingGitHub().install(monkeypatch)
+
+    server = _server_for("p2")
+    result = await _handler(server, "ship_to_dev")({"task_id": TASK_ID})
+    err = _err_text(result)
+    assert "has uncommitted changes" in err
+    assert ["git", "push", "origin", f"ship-{TASK_ID}:ship-{TASK_ID}"] not in git.commands
+    assert github.calls == []
+
+
+async def test_ship_to_dev_existing_clean_temp_branch_not_based_on_dev_errors(
+    fresh_db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await init_db()
+    await _seed_ready_ship_task()
+    _stub_workspace(monkeypatch, tmp_path)
+    git = RecordingGit(
+        branch_exists=True,
+        current_branch=f"ship-{TASK_ID}",
+        branch_based_on_dev=False,
+    )
+    monkeypatch.setattr(subprocess, "run", git)
+    github = RecordingGitHub().install(monkeypatch)
+
+    server = _server_for("p2")
+    result = await _handler(server, "ship_to_dev")({"task_id": TASK_ID})
+    err = _err_text(result)
+    assert "not based on current origin/dev" in err
+    assert ["git", "push", "origin", f"ship-{TASK_ID}:ship-{TASK_ID}"] not in git.commands
+    assert github.calls == []
 
 
 async def test_ship_to_dev_checks_out_existing_temp_branch_when_current_worktree_clean(
@@ -663,6 +789,10 @@ async def test_ship_to_dev_already_present_patch_completes_without_pr(
     assert shipped[0]["ship_method"] == "already_present"
     assert shipped[0]["idempotent"] is True
     assert shipped[0]["ship_sha"] == "devheadalready"
+    assert (
+        shipped[0]["already_present_verification"]
+        == "executor_sha_is_ancestor_of_origin_dev"
+    )
 
 
 async def test_ship_to_dev_empty_cherry_pick_rechecks_already_present_and_completes(
@@ -675,15 +805,73 @@ async def test_ship_to_dev_empty_cherry_pick_rechecks_already_present_and_comple
     monkeypatch.setattr(subprocess, "run", git)
     github = RecordingGitHub().install(monkeypatch)
 
-    server = _server_for("p2")
-    result = await _handler(server, "ship_to_dev")({"task_id": TASK_ID})
-    text = _ok_text(result)
-    assert "already present on dev" in text
+    q = bus.subscribe()
+    captured: list[dict[str, Any]] = []
+    try:
+        server = _server_for("p2")
+        result = await _handler(server, "ship_to_dev")({"task_id": TASK_ID})
+        text = _ok_text(result)
+        assert "already present on dev" in text
+        assert "git_cherry_patch_id_match" in text
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        while True:
+            try:
+                captured.append(q.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+    finally:
+        bus.unsubscribe(q)
 
     assert ["git", "cherry-pick", "-x", EXECUTOR_SHA] in git.commands
     assert ["git", "cherry-pick", "--abort"] in git.commands
     assert git.patch_checks >= 2
+    assert git.cherry_checks >= 2
     assert github.calls == []
+    shipped = [e for e in captured if e.get("type") == "task_shipped_to_dev"]
+    assert shipped
+    assert shipped[0]["ship_method"] == "already_present"
+    assert (
+        shipped[0]["already_present_verification"]
+        == "git_cherry_patch_id_match"
+    )
+    assert shipped[0]["already_present_git_cherry"] == f"- {EXECUTOR_SHA}"
+
+
+async def test_ship_to_dev_empty_cherry_pick_without_dev_proof_errors(
+    fresh_db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await init_db()
+    await _seed_ready_ship_task()
+    _stub_workspace(monkeypatch, tmp_path)
+    git = RecordingGit(
+        empty_cherry_pick=True,
+        empty_cherry_pick_confirms_patch=False,
+    )
+    monkeypatch.setattr(subprocess, "run", git)
+    github = RecordingGitHub().install(monkeypatch)
+
+    q = bus.subscribe()
+    captured: list[dict[str, Any]] = []
+    try:
+        server = _server_for("p2")
+        result = await _handler(server, "ship_to_dev")({"task_id": TASK_ID})
+        text = _err_text(result)
+        assert "empty/no-op patch" in text
+        assert "not confirmed on origin/dev" in text
+        assert "formal ship evidence" in text
+        await asyncio.sleep(0)
+        while True:
+            try:
+                captured.append(q.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+    finally:
+        bus.unsubscribe(q)
+
+    assert ["git", "cherry-pick", "--abort"] in git.commands
+    assert github.calls == []
+    assert not [e for e in captured if e.get("type") == "task_shipped_to_dev"]
 
 
 async def test_ship_to_dev_existing_ship_event_is_idempotent(

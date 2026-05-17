@@ -41,8 +41,10 @@ Dependent specs (subordinate to this document):
   kanban-specs-v2.md §16.2 + §23). Trajectory Coach defines on
   `coord_create_task` is the planned contract; pools are FYI only
   (Coach explicitly assigns one named Player at each transition).
-  Stages: plan → execute → audit_syntax → audit_semantics → ship →
-  optional verify → archive. A new per-project event log feeds Coach's tick context;
+  Stages: truthgate → plan → execute → audit_syntax → audit_semantics → ship →
+  optional verify → archive. Backlog promotion enters `truthgate`
+  without planting or waking a Player, and `truthgate → plan|execute`
+  requires a recorded pass/override verdict. A new per-project event log feeds Coach's tick context;
   pattern-detection counters (Player health, audit aggregator,
   push-time deviation flag, recent-patterns block) surface drift
   proactively. v1 archive at `Docs/kanban-specs-v1-archived.md`.
@@ -2328,7 +2330,9 @@ so permissions do not depend on the model truthfully passing its identity.
   into `backlog_tasks` (same table as `coord_propose_task`). No kanban
   row is created yet; no Player is woken. Coach must then call
   `coord_triage_backlog(id, action='promote', trajectory=[...])` to
-  promote it to the kanban. This enforces FIFO priority ordering —
+  promote it to the kanban. Promotion creates a `truthgate` task and
+  preserves the requested trajectory as the post-gate path; it does not
+  plant the first Player role or wake anyone. This enforces FIFO priority ordering —
   items are triaged in the order they arrived, not by recency of
   creation (which was LIFO). The `priority`, `trajectory`, `note`, and
   `success_criteria` params are stored on the backlog entry so Coach
@@ -2342,9 +2346,11 @@ so permissions do not depend on the model truthfully passing its identity.
   backlog entry; `coord_triage_backlog promote` reads it automatically
   so Coach can omit it at triage time when it was already set at
   creation time.
-- Emits `backlog_task_proposed` for Coach top-level tasks; emits
+- Emits `backlog_task_proposed` for Coach top-level tasks; promotion emits
+  `task_created`, `task_stage_changed{to='truthgate'}`,
+  `task_truthgate_started`, and `backlog_task_promoted`. Player subtasks emit
   `task_created` + (when first stage planted) `task_role_assigned` +
-  `task_stage_changed{from=null}` for Player subtasks.
+  `task_stage_changed{from=null}`.
 - See `Docs/kanban-specs-v2.md` §7.1 for the canonical contract.
 
 `coord_approve_stage(task_id, next_stage, assignee, note?)`
@@ -2374,8 +2380,24 @@ so permissions do not depend on the model truthfully passing its identity.
 - Deliberate archive with a user-facing summary. Marks every active
   role row complete, transitions to archive, emits `task_archived`
   with the summary in the payload.
+- Delivered archive rejects provisional TruthGate emergency-override
+  tasks until Coach records a valid `closure_reference` with
+  `coord_record_provisional_closure`. `amendment:<proposal_id>`
+  closures must reference an approved `truth/` proposal before archive;
+  `none_needed:<rationale>` and `rollback:<task_id>` are accepted when
+  their references validate.
 - v2 has NO auto-archive on trajectory completion — every task ends
   with this Coach-written wrap-up.
+
+`coord_record_provisional_closure(task_id, closure_reference)`
+
+- Coach only.
+- Records the reconciliation reference required before a provisional
+  task can be delivered to archive. Accepted forms:
+  `amendment:<proposal_id>`, `none_needed:<rationale>`, and
+  `rollback:<task_id>`.
+- Emits `task_provisional_closure_recorded`. Does not move the task or
+  wake a Player.
 
 `coord_submit_verification_report(task_id, verdict, body, message_to_coach?, evidence?)`
 
@@ -2550,8 +2572,10 @@ Current implementation gap:
      existing evidence without another GitHub PR or duplicate ship event.
   3. If the executor commit or equivalent patch is already present on
      `origin/dev`, close the shipper role row, emit `task_shipped_to_dev`
-     with `ship_method='already_present'`, `idempotent=true`, and
-     `ship_sha=<origin/dev sha>`, then return without opening a PR.
+     with `ship_method='already_present'`, `idempotent=true`,
+     `ship_sha=<origin/dev sha>`, and explicit
+     `already_present_verification` evidence (`executor_sha_is_ancestor_of_origin_dev`
+     or `git_cherry_patch_id_match`), then return without opening a PR.
   4. If local branch `ship-<task_id>` already exists, resume it:
      - If already on the branch and there is no `CHERRY_PICK_HEAD` or
        unmerged path, continue to push/PR/merge.
@@ -2568,9 +2592,12 @@ Current implementation gap:
     `git cherry-pick --abort` to clean up. After manual resolution and
     `git cherry-pick --continue`, rerun `coord_ship_to_dev(task_id)` to
     resume the existing temp branch.
-  - Empty/no-op cherry-pick → re-checks whether the patch is already
-    present on `origin/dev`; if confirmed, uses the already-present
-    success path, otherwise fails closed.
+  - Empty/no-op cherry-pick → aborts the cherry-pick, re-checks whether
+    the patch is already present on `origin/dev`, and if confirmed uses
+    the already-present success path with explicit verification evidence.
+    If not confirmed, fail closed without emitting ship evidence or
+    completing the shipper role; the shipper must create formal ship
+    evidence through a non-empty PR/marker commit or ask Coach to reroute.
 - **GitHub API** (PAT extracted from `projects.repo_url`):
   1. Query open PRs for `head=<owner>:ship-<task_id>&base=dev`; reuse
      one if present.

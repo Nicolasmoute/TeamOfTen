@@ -1,6 +1,23 @@
 # Truthgate - Spec-Compliance Stage for the Kanban Lifecycle
 
-Status: design description (not an implementation plan yet). This file is standalone: it defines the truthgate lifecycle stage, the truth amendment mechanism truthgate needs, emergency/provisional reconciliation, and the relationship to Compass, TruthScore, and `Docs/`.
+Status: implementation approach. Phase 1 is implemented: `truthgate` is a real task status/board column, backlog promotion enters it without planting or waking a Player role, task rows carry TruthGate scalar fields, and `truthgate -> plan|execute` is rejected until a pass/override verdict is recorded. Phase 2 classifier core is implemented as a library-only package under `server/truthgate/`. Phase 3 manual Coach tooling is implemented with `coord_run_truthgate` and `coord_record_truthgate_override`, including task-row persistence and event recording. Phase 4 protected amendment wrapper is implemented with `coord_propose_truth_amendment` over the existing file-write proposal flow. Phase 5 attention surfaces are implemented for Kanban card chips, Coach coordination-block rollups, EnvPane pending-action visibility, and compact timeline events. Phase 6 targeted audit integration is implemented: auditor wakes include targeted TruthGate context and audit PASS fails closed when the cited basis is violated or cannot be checked. Phase 7 provisional closure is implemented with `coord_record_provisional_closure` and delivered-archive gates.
+
+## Implementation status - implemented phases
+
+Implemented classifier-core pieces:
+
+- `config.py`: TruthGate environment parsing, budget knobs, and strict classifier model validation. Defaults are `latest_sonnet` primary and `latest_mini` fallback. `latest_opus`, `latest_gpt`, and their current concrete model targets are rejected for classifier use.
+- `corpus.py`: capped `truth/**/*.{md,txt}` corpus slicing. It prioritizes core truth files, then task-keyword-relevant files, then alphabetical fallback. It does not read `Docs/`, repo source, uploads, conversation logs, or secrets.
+- `prompts.py`: strict JSON classifier prompt and amendment-draft prompt helper.
+- `llm.py`: one-shot primary/fallback wrapper with `agent_id="truthgate"` and classifier ledger attribution.
+- `classifier.py`: per-project lock, cost-cap preflight, sparse-mode routing, strict whole-response JSON parsing, verdict normalization, and truth-basis validation.
+- `sparse.py`, `targeted.py`, and `amendments.py`: sparse pass result, targeted truth-basis reads/audit guards, and amendment metadata helpers for later phases.
+- `coord_run_truthgate`: Coach-only tool that runs the classifier for a task in `truthgate`, persists verdict/basis/concerns/method/model fields, emits `task_truthgate_started`, `task_truthgate_completed`, and `task_truthgate_blocked` when the verdict requires amendment or clarification. Existing verdicts are preserved unless Coach passes `force=true`; classifier failures fail closed by blocking the task without recording a pass/override verdict. It does not advance the stage or wake a Player.
+- `coord_record_truthgate_override`: Coach-only tool that records `truthgate_coach_override` or `truthgate_emergency_override` with required rationale, emits override/completed events, and marks emergency overrides provisional. Emergency overrides may store an optional `closure_reference` for later reconciliation. It does not advance the stage or wake a Player.
+- `coord_propose_truth_amendment`: Coach and active-Player-role wrapper that queues a normal protected `file_write_proposals` row with `scope="truth"`, `metadata_json`, and `originating_task_id`. It does not write `truth/` directly and preserves the existing human approve/deny flow. `draft_instruction` / LLM amendment drafting remains deferred.
+- `coord_record_provisional_closure`: Coach-only tool that validates and stores a provisional task's `closure_reference`, emits `task_provisional_closure_recorded`, and does not advance the stage or wake a Player. Delivered archive through `coord_archive_task` or `approve_stage(next_stage="archive")` rejects provisional tasks until closure is valid; human cancellation remains available and is recorded as cancellation.
+
+Current mocked-LLM/tool tests cover sparse mode, dense-corpus prompt-budget truncation, slicer ordering, strict parser failure, model validation, basis validation, per-project concurrency locking, Coach-only Phase 3 tools, verdict persistence, blocked needs-change verdicts, force-rerun protection, classifier-error fail-closed behavior, override rationale validation, post-override exit gating, Phase 4 amendment proposal approval/denial correlation, Phase 6 targeted audit wake/PASS-guard behavior, and Phase 7 provisional closure/archive gating. Protected truth mirror tests are temporarily waived by human directive; the matching `truth/` projection should be proposed through the protected flow after the waiver lifts.
 
 ## Core idea
 
@@ -66,7 +83,7 @@ The truthgate stage is **mandatory** for every task promoted out of backlog. It 
 
 When Coach explicitly promotes a task from `backlog` to the live trajectory, the task enters the `truthgate` column. Coach first decides whether the task is trivial enough for an override; otherwise the harness runs a dedicated classifier call:
 
-1. **Inputs**: task title + description + objective, plus a curated slice of the project's `truth/**/*.{md,txt}` corpus (always-include set + keyword-relevant files + alphabetical fallback, capped at ~32 KB - same pattern as TruthScore's truth-budget).
+1. **Inputs**: task title + description + objective, plus a curated slice of the project's `truth/**/*.{md,txt}` corpus (always-include core truth files + keyword-relevant files + alphabetical fallback, capped at ~32 KB - same pattern as TruthScore's truth-budget). Sparse-mode eligibility is based on the actual eligible truth file count before prompt-budget slicing, not on how many files fit in the prompt.
 2. **Model**: dedicated one-shot LLM call. `latest_sonnet` is the preferred default; `latest_mini` is the automatic fallback when Sonnet is unavailable, rate-limited, or out of credit. `latest_opus` and `latest_gpt` are excluded from classifier use because this is structural pattern-matching, not deep reasoning. This restriction applies to the truthgate classifier only; drafting protected truth/spec changes uses top models, defined below.
 3. **Output**: strict JSON with verdict + truth_basis (list of truth files/sections the task is authorized against) + optional truth_concerns (specific clauses the task should respect during implementation).
 
@@ -181,7 +198,7 @@ Audit's existing v2 checks (implementation matches task spec) extend with two ad
 1. **Implementation respects `truth_basis`** - read the cited truth files, verify no clause is violated. Targeted, not corpus-wide. Cheap because the slice is already known.
 2. **No load-bearing claim exists only in `Docs/`** - any rule the implementation depends on must trace to `truth/` (via `truth_basis`) or be flagged for amendment.
 
-The targeted truth check reuses TruthScore's parsing machinery without running a full TruthScore - it's a focused check, not a corpus audit. A separate `truthscore_targeted(task_id)` helper or a flag on the existing TruthScore module is the natural shape.
+The implemented targeted truth check is a focused guard, not a corpus audit or full TruthScore run. It reads only the task's cited `truth_basis` files for auditor wake context. Missing, stale, unreadable, or malformed cited basis metadata is surfaced for Coach review; audit PASS is rejected when the report identifies a cited-truth violation or when the cited basis cannot be checked. Empty-basis sparse/override tasks skip the file read with a visible warning.
 
 ## Docs projection - record only, don't auto-render in v1
 
@@ -197,7 +214,7 @@ The recorded `affected_docs` surface as a coordination-block reminder for Coach 
 
 For new projects, `truth/` is mostly empty. Truthgate gracefully degrades:
 
-- If `truth/` has fewer than `HARNESS_TRUTHGATE_MIN_CORPUS_FILES` (default 3), truthgate returns `truthgate_pass` with `truth_basis: []` and a warning surfaced in the coordination block: "Truth corpus is sparse; truthgate is permissive until you populate it."
+- If `truth/` has fewer than `HARNESS_TRUTHGATE_MIN_CORPUS_FILES` (default 3) eligible `.md`/`.txt` files before budget slicing, truthgate returns `truthgate_pass` with `truth_basis: []` and a warning surfaced in the coordination block: "Truth corpus is sparse; truthgate is permissive until you populate it."
 - The first amendments filed on a new project bootstrap the corpus.
 - After the threshold is crossed, truthgate engages with full classifier behavior.
 
@@ -218,12 +235,12 @@ The override decision piggybacks on Coach's normal backlog-promotion turn. It sh
 Emergency overrides and mid-execute truth discoveries may allow work to proceed provisionally. Provisional tasks cannot fully archive until Coach records a `closure_reference` with one of these forms:
 
 ```text
-amendment:<proposal_id>        # links to an approved or still-pending truth amendment proposal
+amendment:<proposal_id>        # links to a truth amendment proposal; delivered archive requires approved status
 none_needed:<rationale>        # non-empty rationale explaining why no truth change is warranted
 rollback:<task_id>             # follow-up task that will undo or neutralize the provisional work
 ```
 
-This preserves the ability to fix urgent issues without letting emergency work silently rewrite project truth.
+This preserves the ability to fix urgent issues without letting emergency work silently rewrite project truth. The closure tool accepts pending amendment proposals for tracking, but final delivered archive requires `amendment:<proposal_id>` to reference an approved `truth/` proposal. Cancellation can still archive a task with `cancelled_at`; that path is not a delivered closure.
 
 ## Relationship to existing systems
 
