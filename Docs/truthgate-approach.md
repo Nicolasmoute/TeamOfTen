@@ -1,3 +1,11 @@
+---
+schema: teamoften-spec/v1
+title: 'Truthgate Spec-Compliance Stage'
+status: canonical
+spec_group: truthgate
+source_index: truth-index.md
+last_reorganized: 2026-05-17
+---
 # Truthgate - Spec-Compliance Stage for the Kanban Lifecycle
 
 Status: implementation approach. Phase 1 is implemented: `truthgate` is a real task status/board column, backlog promotion enters it without planting or waking a Player role, task rows carry TruthGate scalar fields, and `truthgate -> plan|execute` is rejected until a pass/override verdict is recorded. Phase 2 classifier core is implemented as a library-only package under `server/truthgate/`. Phase 3 manual Coach tooling is implemented with `coord_run_truthgate` and `coord_record_truthgate_override`, including task-row persistence and event recording. Phase 4 protected amendment wrapper is implemented with `coord_propose_truth_amendment` over the existing file-write proposal flow. Phase 5 attention surfaces are implemented for Kanban card chips, Coach coordination-block rollups, EnvPane pending-action visibility, and compact timeline events. Phase 6 targeted audit integration is implemented: auditor wakes include targeted TruthGate context and audit PASS fails closed when the cited basis is violated or cannot be checked. Phase 7 provisional closure is implemented with `coord_record_provisional_closure` and delivered-archive gates. Action-needed TruthGate verdicts and classifier failures also create an interrupt Coach inbox message/wake without waking Players or advancing the task.
@@ -17,7 +25,7 @@ Implemented classifier-core pieces:
 - `coord_propose_truth_amendment`: Coach and active-Player-role wrapper that queues a normal protected `file_write_proposals` row with `scope="truth"`, `metadata_json`, and `originating_task_id`. It does not write `truth/` directly and preserves the existing human approve/deny flow. `draft_instruction` / LLM amendment drafting remains deferred.
 - `coord_record_provisional_closure`: Coach-only tool that validates and stores a provisional task's `closure_reference`, emits `task_provisional_closure_recorded`, and does not advance the stage or wake a Player. Delivered archive through `coord_archive_task` or `approve_stage(next_stage="archive")` rejects provisional tasks until closure is valid; human cancellation remains available and is recorded as cancellation.
 
-Current mocked-LLM/tool tests cover sparse mode, dense-corpus prompt-budget truncation, slicer ordering, strict parser failure, model validation, basis validation, per-project concurrency locking, Coach-only Phase 3 tools, verdict persistence, blocked needs-change verdicts, force-rerun protection, classifier-error fail-closed behavior, override rationale validation, post-override exit gating, Phase 4 amendment proposal approval/denial correlation, Phase 6 targeted audit wake/PASS-guard behavior, and Phase 7 provisional closure/archive gating. Protected truth mirror tests are temporarily waived by human directive; the matching `truth/` projection should be proposed through the protected flow after the waiver lifts.
+Current mocked-LLM/tool tests cover sparse mode, dense-corpus prompt-budget truncation, slicer ordering, strict parser failure, model validation, basis validation, per-project concurrency locking, Coach-only Phase 3 tools, verdict persistence, blocked needs-change verdicts, force-rerun protection, classifier-error fail-closed behavior, override rationale validation, post-override exit gating, Phase 4 amendment proposal approval/denial correlation, Phase 6 targeted audit wake/PASS-guard behavior, and Phase 7 provisional closure/archive gating. Protected truth parity tests are temporarily waived by human directive; the matching `truth/` projection should be proposed through the protected flow after the waiver lifts.
 
 ## Core idea
 

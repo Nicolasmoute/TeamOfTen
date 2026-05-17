@@ -27,7 +27,7 @@ Basis rules:
 JSON schema:
 {
   "verdict": "truthgate_pass",
-  "truth_basis": ["truth/TOT-specs.md"],
+  "truth_basis": ["truth/truth-index.md"],
   "truth_concerns": ["short concern"],
   "rationale": "short explanation",
   "suggested_amendment": null,

@@ -10,7 +10,7 @@ Coverage:
   - No silent dismiss: pending_question attention items must NOT have a
     plain dismiss (×) button available — only the cancel (skip) button.
 
-Spec: TOT-specs.md §16 EnvPane attention strip.
+Spec: truth-index.md §16 EnvPane attention strip.
 """
 
 from __future__ import annotations

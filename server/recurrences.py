@@ -1153,7 +1153,7 @@ async def upsert_tick(
             else:
                 # Spec: `/tick N` (and the equivalent `PUT {minutes: N}`)
                 # auto-enables a disabled tick — see recurrence-specs.md §351
-                # and TOT-specs.md §1784. Validation above guarantees
+                # and truth-index.md §1784. Validation above guarantees
                 # minutes is not None on this branch.
                 new_enabled = 1
             new_cadence = (

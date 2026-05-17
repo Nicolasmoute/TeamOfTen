@@ -1,12 +1,20 @@
+---
+schema: teamoften-spec/v1
+title: 'Claude Code CLI Runtime Specification'
+status: canonical
+spec_group: runtime
+source_index: truth-index.md
+last_reorganized: 2026-05-17
+---
 # Claude Code CLI Runtime — Specification (v2)
 
-> **Subordinate to `Docs/TOT-specs.md`.** When this doc and TOT-specs
-> disagree, TOT-specs wins. This file is the source of truth for
+> **Subordinate to `Docs/truth-index.md`.** When this doc and truth-index
+> disagree, truth-index wins. This file is the source of truth for
 > Claude-Code-CLI-specific behavior — runtime lifecycle, pty
 > management, screen-flicker idle detection, prompt injection,
 > bubblewrap envelope, the two-CLAUDE.md file model, runtime-transfer
 > entry/exit — but cannot redefine fields, endpoints, events, or
-> invariants that TOT-specs declares.
+> invariants that truth-index declares.
 >
 > Sibling spec: `Docs/CODEX_RUNTIME_SPEC.md`. The Codex runtime
 > already proves the "third runtime sitting next to Claude SDK" shape.
@@ -1271,7 +1279,7 @@ sized appropriately.
 
 ## O. Cross-references
 
-- `Docs/TOT-specs.md` — overall harness spec.
+- `Docs/truth-index.md` — overall harness spec.
 - `Docs/CODEX_RUNTIME_SPEC.md` — sibling runtime spec.
 - `server/runtimes/base.py` — `AgentRuntime` protocol +
   `TurnContext`.

@@ -1,4 +1,4 @@
-"""Regression guard for the chat reply feature (Docs/TOT-specs.md §16.3).
+"""Regression guard for the chat reply feature (Docs/truth-index.md §16.3).
 
 The reply button is a pure UI affordance — no new HTTP endpoints, no new
 DB columns. These tests verify the existing GET /api/messages endpoint

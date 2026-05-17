@@ -1,13 +1,21 @@
+---
+schema: teamoften-spec/v1
+title: 'Codex Runtime Specification'
+status: canonical
+spec_group: runtime
+source_index: truth-index.md
+last_reorganized: 2026-05-17
+---
 # Codex Runtime — Specification
 
-> **Subordinate to `Docs/TOT-specs.md`.** When this doc and TOT-specs
-> disagree, TOT-specs wins. This file is the source of truth for
+> **Subordinate to `Docs/truth-index.md`.** When this doc and truth-index
+> disagree, truth-index wins. This file is the source of truth for
 > Codex-specific behavior — runtime lifecycle, thread/resume semantics,
 > rollout JSONL parsing, cost basis, MCP proxy details, error handling
 > — but cannot redefine fields, endpoints, events, or invariants that
-> TOT-specs declares.
+> truth-index declares.
 
-Status: shipped. TOT-specs assumes the Claude runtime everywhere it
+Status: shipped. truth-index assumes the Claude runtime everywhere it
 describes runtime behavior; Codex is the alternate runtime and its
 specifics live here. Per-agent runtime selection is a TOT-level
 concept (slot-level `runtime_override`, role default in `team_config`,
@@ -155,7 +163,7 @@ asserts dispatcher contract (cost-cap rejects before `run_turn`,
 
 ## B. Schema additions
 
-The columns themselves are documented in TOT-specs §6.2 and §6.4 (the
+The columns themselves are documented in truth-index §6.2 and §6.4 (the
 `agents` and `agent_sessions` tables). This section covers the
 rationale for the column shape, which is Codex-specific.
 

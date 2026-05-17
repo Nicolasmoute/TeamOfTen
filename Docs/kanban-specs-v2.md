@@ -1,3 +1,11 @@
+---
+schema: teamoften-spec/v1
+title: 'Kanban v2 Specification'
+status: canonical
+spec_group: kanban
+source_index: truth-index.md
+last_reorganized: 2026-05-17
+---
 # Kanban v2 — Shape-(2) routing through Coach
 
 > **Status:** DRAFT (2026-05-07). Canonical from this point forward.
@@ -9,12 +17,12 @@
 > v1 behavior until the implementation PR ships; this document describes
 > the target state, not what is deployed today.
 
-> **Subordinate to [TOT-specs.md](TOT-specs.md).** When this doc and
-> TOT-specs disagree, TOT-specs wins. This file goes deeper on the
+> **Subordinate to [truth-index.md](truth-index.md).** When this doc and
+> truth-index disagree, truth-index wins. This file goes deeper on the
 > kanban subsystem (stages, roles, artifacts, the event log, the
 > Coach review gate, the pattern-detection layer, the idle-Player
 > poller) but cannot redefine fields, endpoints, events, or invariants
-> that TOT-specs declares.
+> that truth-index declares.
 
 **Target:** TeamOfTen multi-agent harness (Python, Claude Agent SDK, kDrive-backed shared state, single-VPS)
 **Version:** 2.0 (draft)
@@ -980,7 +988,7 @@ The `off_spec_completion_count` Player health counter (§11.1) reads from this t
 
 ## Cross-references
 
-- [TOT-specs.md](TOT-specs.md) — umbrella spec.
+- [truth-index.md](truth-index.md) — umbrella spec.
 - [compass-specs.md](compass-specs.md) — Compass audit watcher writes the new `compass_audit` event log row (§19).
 - [recurrence-specs.md](recurrence-specs.md) — Coach's tick consumes the event log unread tail.
 - [kanban-specs-v1-archived.md](kanban-specs-v1-archived.md) — historical record of the v1 system this spec supersedes.

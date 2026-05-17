@@ -2,9 +2,9 @@
 
 A personal orchestration harness for a **team of 11 Claude Code agents — 1 Coach + 10 Players** — sharing memory and a task board, with a multi-pane web UI, deployed to a single VPS (Zeabur). Max-plan OAuth only — no API keys.
 
-**Full spec**: [Docs/TOT-specs.md](Docs/TOT-specs.md) — read it before touching server code.
+**Full spec**: [Docs/truth-index.md](Docs/truth-index.md) — read it before touching server code.
 
-**Keep the spec in sync.** When you make non-trivial code changes (new feature, behavior change, schema/migration, prompt rewrite, UI subsystem, env var, MCP tool, etc.), reflect them in `Docs/TOT-specs.md` in the same turn. Skip only for genuinely minor tweaks (typos, log-message wording, single-line bug fixes that don't change documented behavior). When in doubt, update the spec — drift is more expensive to repair later than a paragraph is to write now.
+**Keep the spec in sync.** When you make non-trivial code changes (new feature, behavior change, schema/migration, prompt rewrite, UI subsystem, env var, MCP tool, etc.), reflect them in `Docs/truth-index.md` in the same turn. Skip only for genuinely minor tweaks (typos, log-message wording, single-line bug fixes that don't change documented behavior). When in doubt, update the spec — drift is more expensive to repair later than a paragraph is to write now.
 
 **Keep the canonical project CLAUDE.md template current.** When you ship harness functionality that downstream projects need to be aware of (a new MCP tool category, a new lifecycle stage, a renamed concept, a new convention), update [server/templates/app_dev_claude_md.md](server/templates/app_dev_claude_md.md) (and any sibling per-playbook templates) in the same turn. The Coach-driven reconciliation flow at [server/project_claude_md.py:update_claude_md_via_coach](server/project_claude_md.py) propagates the change to existing projects on next activation (and once at boot for the active project), preserving project-specific content. Never edit per-project CLAUDE.md files directly from harness code — the template is the only knob.
 
@@ -1972,7 +1972,7 @@ for git, and Coach's improvisation). Collapsed to one.
   `/data/projects/dynamichypergraph/repo/shared/` get orphaned by
   this refactor; anything unpushed in either must be salvaged on the
   live container before the new image lands.
-- **Spec mirror**: `Docs/TOT-specs.md` §4.6 + §17 rewritten;
+- **Spec mirror**: `Docs/truth-index.md` §4.6 + §17 rewritten;
   `Docs/workspace-refactor-plan.md` is the design doc.
 
 Suite at 1281/1281.
@@ -2062,7 +2062,7 @@ Two related fixes shipped together:
   `browser_snapshot`, `browser_take_screenshot`,
   `browser_evaluate`, `browser_console_messages`,
   `browser_network_requests`, tab controls, etc. — full list in
-  the example file. Spec mirror: `Docs/TOT-specs.md` §3 deployment
+  the example file. Spec mirror: `Docs/truth-index.md` §3 deployment
   bullet list.
 
 - **MCP card gains an edit feature.** Previously the only way to
@@ -2193,7 +2193,7 @@ The current container still runs v1 behavior until the implementation
 PR ships — v2 describes the target, not the deployed system. This
 PR is docs-only: rename `kanban-specs.md` → `kanban-specs-v1-archived.md`
 with a deprecation banner, create `kanban-specs-v2.md`, repoint
-forward-pointer cross-references in TOT-specs / recurrence-specs /
+forward-pointer cross-references in truth-index / recurrence-specs /
 compass-specs to v2. No `server/` changes, no test changes.
 
 The implementation PR (subsequent, after v2 is finalized through
@@ -2894,7 +2894,7 @@ row. Two changes:
   Non-matching rejections (synthetic / external callers) still
   surface for diagnostics.
 
-Spec mirror: [Docs/TOT-specs.md](Docs/TOT-specs.md) "Pending-prompt
+Spec mirror: [Docs/truth-index.md](Docs/truth-index.md) "Pending-prompt
 queue" section.
 
 ## What needs verification (when user is next active)
@@ -3120,7 +3120,7 @@ handles it.
 TeamOfTen/
 ├── CLAUDE.md                    # this file
 ├── Docs/
-│   └── TOT-specs.md             # full spec — source of truth for design decisions
+│   └── truth-index.md             # full spec — source of truth for design decisions
 ├── spike/
 │   ├── zeabur/                  # M-1 spike Dockerfile + shell for Zeabur
 │   │   ├── Dockerfile

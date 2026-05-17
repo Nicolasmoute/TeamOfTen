@@ -483,7 +483,7 @@ async def test_coordination_block_truthgate_attention(fresh_db: str) -> None:
             "metadata_json, originating_task_id) VALUES "
             "('misc', 'coach', 'truth', 'specs.md', '# Specs', "
             "'clarify truth', "
-            "'{\"affected_docs\":[\"Docs/TOT-specs.md\"]}', 'tg-change')"
+            "'{\"affected_docs\":[\"Docs/truth-index.md\"]}', 'tg-change')"
         )
         await c.commit()
     finally:
@@ -498,7 +498,7 @@ async def test_coordination_block_truthgate_attention(fresh_db: str) -> None:
     assert "Pending truth amendments" in body
     assert "truth/specs.md" in body
     assert "Stale Docs reminders" in body
-    assert "Docs/TOT-specs.md" in body
+    assert "Docs/truth-index.md" in body
     assert "Sparse TruthGate warnings" in body
     assert "sparse corpus" in body
     assert "Provisional tasks missing closure" in body

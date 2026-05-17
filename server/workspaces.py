@@ -1,6 +1,6 @@
 """Per-project, per-slot git worktrees.
 
-Layout (canonical — see Docs/TOT-specs.md §4.6 + §17):
+Layout (canonical — see Docs/truth-index.md §4.6 + §17):
 
     /data/projects/<id>/repo/.project   # bare-ish seed clone, one per project
     /data/projects/<id>/repo/<slot>     # per-slot worktree on branch work/<slot>

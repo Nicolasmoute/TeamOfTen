@@ -1,5 +1,5 @@
 {
-  "_comment": "Example HARNESS_MCP_CONFIG file. Set HARNESS_MCP_CONFIG=/data/mcp-servers.json (or wherever you put this) and restart the harness. See TOT-specs.md §8.3 for full semantics. ${VAR} placeholders expand from os.environ at load time so tokens stay out of the file.",
+  "_comment": "Example HARNESS_MCP_CONFIG file. Set HARNESS_MCP_CONFIG=/data/mcp-servers.json (or wherever you put this) and restart the harness. See truth-index.md §8.3 for full semantics. ${VAR} placeholders expand from os.environ at load time so tokens stay out of the file.",
 
   "servers": {
     "github": {

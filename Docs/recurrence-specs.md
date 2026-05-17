@@ -1,13 +1,21 @@
+---
+schema: teamoften-spec/v1
+title: 'Coach Recurrence v2 Specification'
+status: canonical
+spec_group: recurrence
+source_index: truth-index.md
+last_reorganized: 2026-05-17
+---
 # Coach Recurrence v2 — Specification
 # Coach Recurrence v2 — Specification
 
-> **Subordinate to `Docs/TOT-specs.md`.** When this doc and TOT-specs
-> disagree, TOT-specs wins. This file goes deeper on Coach recurrences
+> **Subordinate to `Docs/truth-index.md`.** When this doc and truth-index
+> disagree, truth-index wins. This file goes deeper on Coach recurrences
 > (tick / repeat / cron, coach-todos, project-objectives) but cannot
-> redefine fields, endpoints, events, or invariants that TOT-specs
+> redefine fields, endpoints, events, or invariants that truth-index
 > declares.
 
-Status: shipped. TOT-specs §11.3 carries the operational summary; this
+Status: shipped. truth-index §11.3 carries the operational summary; this
 file is the design reference.
 
 This spec replaces today's `/loop`, `/repeat`, and `/tick` with a unified,

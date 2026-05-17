@@ -23,7 +23,7 @@ Two helpers, picked by the spawn site:
     the subprocess env but with empty values — the secret is gone.
 
 This is one defense layer; see the threat-model section in
-`Docs/TOT-specs.md` for the full picture (Files API denylist, tool
+`Docs/truth-index.md` for the full picture (Files API denylist, tool
 path denylist, CSP, etc.).
 """
 
