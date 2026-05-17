@@ -18,7 +18,7 @@ import {
   renderDiffBody,
 } from "/static/tools.js";
 import { CompassPane, createCompassEventRouter } from "/static/compass.js?v=1778671319";
-import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js?v=1778973038";
+import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js?v=1778977352";
 import { PlaybookPane, createPlaybookEventRouter } from "/static/playbook.js";
 
 const html = htm.bind(h);
@@ -7174,6 +7174,7 @@ function RecurrencePane({ rows, error, onClose, onRefresh, onError, onClearError
 
 function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, activeProjectId, attentionOpen, onDismissAttention, onDismissAllAttention, onOpenKanban, onClose, onResizerDown }) {
   const [exporting, setExporting] = useState(false);
+  const [focusedProposal, setFocusedProposal] = useState(null);
 
   const exportTeam = useCallback(async () => {
     if (exporting || !openSlots || openSlots.length === 0) return;
@@ -7363,7 +7364,13 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, active
         <button class="env-close" onClick=${onClose} title="Collapse">×</button>
       </header>
       <div class="env-body">
-        <${EnvTruthGateAttentionSection} conversations=${conversations} />
+        <${EnvTruthGateAttentionSection}
+          conversations=${conversations}
+          onReviewProposal=${(proposal) => setFocusedProposal({
+            id: proposal.id,
+            nonce: Date.now(),
+          })}
+        />
         <${EnvAttentionSection}
           open=${attentionOpen}
           onDismiss=${onDismissAttention}
@@ -7387,7 +7394,10 @@ function EnvPane({ agents, tasks, conversations, openSlots, serverStatus, active
         <${EnvInboxSection} conversations=${conversations} />
         <${EnvMemorySection} conversations=${conversations} />
         <${EnvDecisionsSection} conversations=${conversations} />
-        <${EnvFileWriteProposalsSection} conversations=${conversations} />
+        <${EnvFileWriteProposalsSection}
+          conversations=${conversations}
+          focusProposal=${focusedProposal}
+        />
         <${EnvTimelineSection} conversations=${conversations} />
       </div>
     </aside>
@@ -7499,7 +7509,7 @@ function saveDismissedAttention(ids) {
   }
 }
 
-function EnvTruthGateAttentionSection({ conversations }) {
+function EnvTruthGateAttentionSection({ conversations, onReviewProposal }) {
   const [items, setItems] = useState({
     amendments: [],
     provisional: [],
@@ -7572,6 +7582,14 @@ function EnvTruthGateAttentionSection({ conversations }) {
             </div>
             <div class="env-attention-subject">Pending amendment: truth/${p.path}</div>
             <div class="env-attention-body">${p.summary || ""}</div>
+            <div class="env-attention-actions">
+              <button
+                class="env-attention-action"
+                type="button"
+                aria-label=${`Review truth amendment proposal #${p.id}`}
+                onClick=${() => onReviewProposal && onReviewProposal(p)}
+              >Review proposal</button>
+            </div>
           </div>
         `)}
         ${items.provisional.map((t) => html`
@@ -8993,10 +9011,12 @@ function ProposalDiffView({ proposal }) {
 // writes the file server-side; deny just marks the row. Two scopes
 // today: 'truth' and 'project_claude_md'. Pending proposals are the
 // only ones rendered (resolved ones become events in the timeline).
-function EnvFileWriteProposalsSection({ conversations }) {
+function EnvFileWriteProposalsSection({ conversations, focusProposal }) {
   const [proposals, setProposals] = useState([]);
   const [openId, setOpenId] = useState(null);
-  const [busyId, setBusyId] = useState(null);
+  const [busy, setBusy] = useState(null);
+  const [notes, setNotes] = useState({});
+  const [notice, setNotice] = useState(null);
   const [err, setErr] = useState("");
 
   const load = useCallback(async () => {
@@ -9035,31 +9055,157 @@ function EnvFileWriteProposalsSection({ conversations }) {
     if (eventCount > 0) load();
   }, [eventCount, load]);
 
-  const resolve = useCallback(async (id, action) => {
-    setBusyId(id);
+  useEffect(() => {
+    if (!focusProposal || focusProposal.id === null || focusProposal.id === undefined) {
+      return;
+    }
+    const id = String(focusProposal.id);
+    const target = proposals.find((p) => String(p.id) === id);
+    if (!target) return;
+    setOpenId(target.id);
+    const afterFrame = typeof requestAnimationFrame === "function"
+      ? requestAnimationFrame
+      : (fn) => setTimeout(fn, 0);
+    afterFrame(() => {
+      const row = document.querySelector(`[data-proposal-id="${id}"]`);
+      if (!row) return;
+      const section = row.closest(".env-section");
+      if (section) {
+        section.classList.remove("collapsed");
+        try {
+          const key = "harness_env_collapsed_v2";
+          const stored = JSON.parse(localStorage.getItem(key) || "{}");
+          stored["File-write proposals"] = false;
+          localStorage.setItem(key, JSON.stringify(stored));
+        } catch (_) {}
+      }
+      row.scrollIntoView({ block: "center", behavior: "smooth" });
+      const button = row.querySelector(".env-decision-head");
+      if (button && typeof button.focus === "function") button.focus();
+    });
+  }, [focusProposal, proposals]);
+
+  const notifyCoach = useCallback(async (proposal, outcome, note) => {
+    const path = _proposalDisplayPath(proposal);
+    const nextStep = outcome === "comment"
+      ? "Proposal remains pending. Coach should answer the comment or revise/resubmit if needed."
+      : outcome === "request changes"
+        ? "Proposal was denied as request-changes. Coach should draft and submit a revised proposal, archive the task, or ask a clarifying question."
+        : "Proposal was denied/dropped. Coach should rewrite, archive, or ask a clarifying question.";
+    const body = [
+      `Human ${outcome} for TruthGate proposal #${proposal.id}.`,
+      `Target: ${path}`,
+      `Note: ${note}`,
+      nextStep,
+    ].join("\n\n");
+    const res = await authFetch("/api/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        to: "coach",
+        subject: `TruthGate proposal #${proposal.id}: ${outcome}`,
+        body,
+        priority: "normal",
+      }),
+    });
+    if (!res.ok) {
+      const bodyText = await res.text();
+      throw new Error("HTTP " + res.status + ": " + bodyText.slice(0, 200));
+    }
+  }, []);
+
+  const clearNote = useCallback((id) => {
+    setNotes((prev) => {
+      const next = { ...prev };
+      delete next[String(id)];
+      return next;
+    });
+  }, []);
+
+  const resolve = useCallback(async (proposal, action, outcome) => {
+    const id = proposal.id;
+    const note = (notes[String(id)] || "").trim();
+    if (action === "deny" && !note) {
+      setErr("Add a reason before denying, dropping, or requesting changes.");
+      return;
+    }
+    setBusy({ id, action: outcome });
+    setNotice(null);
     setErr("");
+    let notifyErr = "";
     try {
+      const resolutionNote = action === "deny"
+        ? `${outcome === "request changes" ? "Request changes" : "Denied/dropped"}: ${note}`
+        : (note || null);
       const res = await authFetch(
         "/api/file-write-proposals/" + id + "/" + action,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
+          body: JSON.stringify({ note: resolutionNote }),
         }
       );
       if (!res.ok) {
         const body = await res.text();
         throw new Error("HTTP " + res.status + ": " + body.slice(0, 200));
       }
+      if (action === "deny") {
+        try {
+          await notifyCoach(proposal, outcome, note);
+        } catch (e) {
+          notifyErr = String(e);
+        }
+      }
       // Drop from local list; the next load will reconcile.
       setProposals((prev) => prev.filter((p) => p.id !== id));
       if (openId === id) setOpenId(null);
+      clearNote(id);
+      if (action === "approve") {
+        setNotice({
+          kind: "ok",
+          text: `Proposal #${id} approved and written. Coach will see the approval event.`,
+        });
+      } else if (notifyErr) {
+        setNotice({
+          kind: "warn",
+          text: `Proposal #${id} ${outcome === "request changes" ? "sent back for changes" : "denied/dropped"}, but Coach notification failed. Message Coach with the same note as the next step.`,
+        });
+      } else {
+        setNotice({
+          kind: "ok",
+          text: `Proposal #${id} ${outcome === "request changes" ? "sent back for changes" : "denied/dropped"}. Coach was notified and should revise, archive, or ask a clarifying question.`,
+        });
+      }
     } catch (e) {
       setErr("resolve failed: " + String(e));
     } finally {
-      setBusyId(null);
+      setBusy(null);
     }
-  }, [openId]);
+  }, [clearNote, notifyCoach, notes, openId]);
+
+  const comment = useCallback(async (proposal) => {
+    const id = proposal.id;
+    const note = (notes[String(id)] || "").trim();
+    if (!note) {
+      setErr("Add a note before commenting to Coach.");
+      return;
+    }
+    setBusy({ id, action: "comment" });
+    setNotice(null);
+    setErr("");
+    try {
+      await notifyCoach(proposal, "comment", note);
+      clearNote(id);
+      setNotice({
+        kind: "ok",
+        text: `Comment sent to Coach for proposal #${id}. The proposal remains pending.`,
+      });
+    } catch (e) {
+      setErr("comment failed: " + String(e));
+    } finally {
+      setBusy(null);
+    }
+  }, [clearNote, notifyCoach, notes]);
 
   return html`
     <section
@@ -9069,16 +9215,28 @@ function EnvFileWriteProposalsSection({ conversations }) {
       <h3 class="env-section-title">
         File-write proposals <span class="env-count">${proposals.length}</span>
       </h3>
-      ${err ? html`<div class="env-cost-hint">${err}</div>` : null}
+      ${notice ? html`
+        <div
+          class=${"env-fw-outcome env-fw-outcome-" + notice.kind}
+          role="status"
+          aria-live="polite"
+        >${notice.text}</div>
+      ` : null}
+      ${err ? html`<div class="env-cost-hint" role="alert">${err}</div>` : null}
       ${proposals.length === 0
         ? html`<div class="env-empty">(none pending)</div>`
         : html`<div class="env-decision-list">
             ${proposals.map((p) => {
               const isOpen = openId === p.id;
+              const rowBusy = busy && String(busy.id) === String(p.id);
+              const note = notes[String(p.id)] || "";
+              const hasNote = note.trim().length > 0;
+              const noteId = `proposal-note-${p.id}`;
               return html`
-                <div class="env-decision" key=${p.id}>
+                <div class="env-decision" key=${p.id} data-proposal-id=${String(p.id)}>
                   <button
                     class="env-decision-head"
+                    type="button"
                     onClick=${() => setOpenId(isOpen ? null : p.id)}
                   >
                     <span class="env-decision-arrow">${isOpen ? "▾" : "▸"}</span>
@@ -9091,17 +9249,48 @@ function EnvFileWriteProposalsSection({ conversations }) {
                     ? html`
                         <div class="env-truth-summary">${p.summary}</div>
                         <${ProposalDiffView} proposal=${p} />
+                        <div class="env-truth-note">
+                          <label class="env-truth-note-label" for=${noteId}>
+                            Note to Coach
+                          </label>
+                          <textarea
+                            id=${noteId}
+                            class="env-truth-note-input"
+                            rows="3"
+                            maxlength="400"
+                            value=${note}
+                            placeholder="Required for deny, request changes, or comment"
+                            onInput=${(e) => setNotes((prev) => ({
+                              ...prev,
+                              [String(p.id)]: e.target.value,
+                            }))}
+                          ></textarea>
+                        </div>
                         <div class="env-truth-actions">
                           <button
                             class="env-truth-approve"
-                            disabled=${busyId === p.id}
-                            onClick=${() => resolve(p.id, "approve")}
-                          >${busyId === p.id ? "…" : "approve & write"}</button>
+                            type="button"
+                            disabled=${rowBusy}
+                            onClick=${() => resolve(p, "approve", "approve")}
+                          >${rowBusy && busy.action === "approve" ? "…" : "approve & write"}</button>
                           <button
                             class="env-truth-deny"
-                            disabled=${busyId === p.id}
-                            onClick=${() => resolve(p.id, "deny")}
-                          >${busyId === p.id ? "…" : "deny"}</button>
+                            type="button"
+                            disabled=${rowBusy || !hasNote}
+                            onClick=${() => resolve(p, "deny", "deny")}
+                          >${rowBusy && busy.action === "deny" ? "…" : "deny/drop"}</button>
+                          <button
+                            class="env-truth-deny"
+                            type="button"
+                            disabled=${rowBusy || !hasNote}
+                            onClick=${() => resolve(p, "deny", "request changes")}
+                          >${rowBusy && busy.action === "request changes" ? "…" : "request changes"}</button>
+                          <button
+                            class="env-truth-comment"
+                            type="button"
+                            disabled=${rowBusy || !hasNote}
+                            onClick=${() => comment(p)}
+                          >${rowBusy && busy.action === "comment" ? "…" : "comment to Coach"}</button>
                         </div>
                       `
                     : null}

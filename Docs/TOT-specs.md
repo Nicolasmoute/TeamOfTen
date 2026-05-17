@@ -1278,16 +1278,23 @@ path, content, summary)` with `scope='truth'` selecting this lane:
    content and the proposed content (fetched lazily on expand from
    `GET /api/file-write-proposals/{id}/diff`). New files (no
    `before` content) fall back to a plain proposed-content render.
-4. The user clicks **approve** or **deny**. Approve calls
+4. The user clicks **approve**, **deny/drop**, **request changes**, or
+   **comment to Coach**. Approve calls
    `POST /api/file-write-proposals/{id}/approve` which (a) writes
    the proposed content to `truth/<path>` directly (the truth-scope
    resolver uses its own write — broader extension allowlist +
    512,000-char cap — not the Files-pane write_text endpoint), then (b)
    marks the row `approved` with timestamp + `resolved_by =
-   "human"` + actor metadata. Deny only marks the row.
+   "human"` + actor metadata. Deny/drop requires a human note and
+   marks the row denied. Request-changes is represented as denial
+   with a prefixed note because the backend has no separate
+   request-changes status. Comment to Coach sends a human message and
+   leaves the proposal pending.
 5. Approve emits `file_write_proposal_approved`; deny emits
-   `file_write_proposal_denied`. Either is visible in the agent
-   timeline, so Coach sees the outcome on its next turn.
+   `file_write_proposal_denied`. Deny/drop and request-changes also
+   send a human message to Coach so the next step is explicit:
+   rewrite/resubmit, archive, or ask a clarifying question. The UI
+   shows immediate success/failure feedback for every action.
 
 **Seed file (`truth-index.md`).** Every project's `truth/` is seeded
 on scaffold with a `truth-index.md` template (from
@@ -1318,7 +1325,9 @@ just `truth/`. Replaces the dedicated truth-empty-file endpoint and
 EnvPane checklist of an earlier iteration.
 
 **EnvPane sections.** `EnvFileWriteProposalsSection` lists pending
-proposals with approve/deny buttons. There is no separate
+proposals with approve, deny/drop, request-changes, and comment-to-Coach
+controls. Deny/drop and request-changes require a non-empty note; comment
+requires a note and leaves the proposal pending. There is no separate
 "Expected truth files" section — the Files pane is the canonical
 view of what's actually in `truth/`, and `truth-index.md` (a normal
 truth file edited via the proposal flow or the Files-pane editor)
@@ -4203,7 +4212,16 @@ Shows (top-to-bottom):
   diff between current file content and the proposed content
   (fetched lazily from `GET /api/file-write-proposals/{id}/diff`;
   new files fall back to a plain proposed-content render), and
-  approve / deny buttons.
+  approve, deny/drop, request-changes, and comment-to-Coach buttons.
+  Deny/drop and request-changes require a note; request-changes is
+  represented as denial with a prefixed note because the backend has
+  no separate request-changes status. Comment sends a human message to
+  Coach and leaves the proposal pending.
+  TruthGate attention cards for pending truth amendments do not
+  approve or deny directly; their review action opens this same
+  file-write proposal row, expands the diff, and focuses the row so
+  the existing confirmation/comment controls remain the only
+  resolution path.
   **Discoverability surfaces** for pending proposals (so the user
   doesn't have to remember to check) — **shared by every EnvPane
   notification source**: file-write proposals, AskUserQuestion prompts
