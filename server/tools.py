@@ -329,6 +329,171 @@ async def _fetch_truthgate_task_for_classifier(
     return dict(row) if row else None
 
 
+async def _run_truthgate_assessment(
+    *,
+    task_id: str,
+    project_id: str,
+    actor_id: str,
+    force: bool = False,
+    trigger: str = "manual",
+) -> dict[str, Any]:
+    """Run and persist TruthGate assessment for a task in truthgate.
+
+    Shared by the manual coord tool and automatic backlog promotion.
+    It deliberately does not move the task or plant any Player role.
+    """
+    c = await configured_conn()
+    try:
+        task = await _fetch_truthgate_task_for_classifier(
+            c, project_id=project_id, task_id=task_id,
+        )
+        if not task:
+            return _err(f"task {task_id} not found")
+        if task["status"] != "truthgate":
+            return _err(
+                f"task {task_id} is in stage {task['status']!r}; "
+                "TruthGate assessment only runs while status='truthgate'."
+            )
+        existing_verdict = (task.get("truthgate_verdict") or "").strip()
+        existing_method = (task.get("truthgate_method") or "").strip()
+        if existing_verdict and not force:
+            return _err(
+                f"Task {task_id} already has TruthGate verdict "
+                f"{existing_verdict} via {existing_method or 'unknown'}; "
+                "use force=true to rerun."
+            )
+        await bus.publish({
+            "ts": _now_iso(),
+            "agent_id": actor_id,
+            "type": "task_truthgate_started",
+            "task_id": task_id,
+            "project_id": project_id,
+            "method": "classifier",
+            "force": force,
+            "trigger": trigger,
+        })
+    finally:
+        await c.close()
+
+    from server.truthgate.classifier import (  # noqa: PLC0415
+        TruthGateClassificationError,
+        TruthGateTaskInput,
+        run_truthgate_classifier,
+    )
+
+    try:
+        result = await run_truthgate_classifier(
+            project_id,
+            TruthGateTaskInput(
+                task_id=task_id,
+                title=task.get("title") or "",
+                description=task.get("description") or "",
+                success_criteria=task.get("success_criteria") or "",
+                workflow=task.get("workflow") or "generic",
+                trajectory=task.get("trajectory") or "[]",
+            ),
+        )
+        classifier_error: str | None = None
+    except TruthGateClassificationError as exc:
+        classifier_error = str(exc)
+        result = {
+            "verdict": "",
+            "truth_basis": [],
+            "truth_concerns": [classifier_error],
+            "rationale": classifier_error,
+            "method": "classifier_error",
+            "model": None,
+            "warning": classifier_error,
+        }
+
+    c = await configured_conn()
+    try:
+        if classifier_error:
+            now = _now_iso()
+            reason = (
+                f"TruthGate classifier failed closed: {classifier_error}"
+            )[:500]
+            await c.execute(
+                "UPDATE tasks SET truthgate_verdict = NULL, "
+                "truth_basis = '[]', truth_concerns = '[]', "
+                "truthgate_at = ?, truthgate_model = NULL, "
+                "truthgate_method = 'classifier_error', "
+                "truthgate_override_rationale = NULL, "
+                "truthgate_pending_proposal_id = NULL, "
+                "truthgate_warning = ?, closure_reference = NULL, "
+                "provisional = 0, blocked = 1, blocked_reason = ? "
+                "WHERE id = ? AND project_id = ?",
+                (now, reason, reason, task_id, project_id),
+            )
+            payload = {
+                "ts": now,
+                "task_id": task_id,
+                "project_id": project_id,
+                "verdict": None,
+                "truth_basis": [],
+                "truth_concerns": [],
+                "truthgate_method": "classifier_error",
+                "truthgate_model": None,
+                "truthgate_warning": reason,
+                "truthgate_override_rationale": None,
+                "truthgate_pending_proposal_id": None,
+                "provisional": False,
+                "closure_reference": None,
+                "blocked_reason": reason,
+            }
+        else:
+            payload = await _persist_truthgate_result(
+                c,
+                project_id=project_id,
+                task_id=task_id,
+                result=result,
+            )
+        await c.commit()
+    finally:
+        await c.close()
+
+    completed_event = {
+        **payload,
+        "agent_id": actor_id,
+        "type": "task_truthgate_completed",
+        "trigger": trigger,
+    }
+    await bus.publish(completed_event)
+    if payload.get("blocked_reason"):
+        await bus.publish({
+            **payload,
+            "agent_id": actor_id,
+            "type": "task_truthgate_blocked",
+            "reason": payload.get("blocked_reason"),
+            "trigger": trigger,
+        })
+
+    verdict = payload["verdict"]
+    if classifier_error:
+        return _err(
+            f"TruthGate classifier failed closed for {task_id}; "
+            "task remains blocked in truthgate with no pass/override "
+            "verdict recorded."
+        )
+    method = payload["truthgate_method"]
+    if verdict in TRUTHGATE_EXIT_VERDICTS:
+        try:
+            stages = _trajectory_stages_from_row(task)
+            next_hint = stages[0] if stages else "execute"
+        except Exception:
+            next_hint = "execute"
+        return _ok(
+            f"TruthGate recorded {verdict} for {task_id} "
+            f"(method={method}). Coach may now approve "
+            f"truthgate → {next_hint} with coord_approve_stage."
+        )
+    return _ok(
+        f"TruthGate recorded {verdict} for {task_id} "
+        f"(method={method}); task remains blocked in truthgate. "
+        f"Reason: {payload.get('blocked_reason') or payload.get('truthgate_warning') or 'review required'}"
+    )
+
+
 async def _persist_truthgate_result(
     c: Any,
     *,
@@ -9379,153 +9544,12 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             force = force_raw.strip().lower() in ("1", "true", "yes", "on")
 
         project_id = await resolve_active_project()
-        c = await configured_conn()
-        try:
-            task = await _fetch_truthgate_task_for_classifier(
-                c, project_id=project_id, task_id=task_id,
-            )
-            if not task:
-                return _err(f"task {task_id} not found")
-            if task["status"] != "truthgate":
-                return _err(
-                    f"task {task_id} is in stage {task['status']!r}; "
-                    "coord_run_truthgate only runs while status='truthgate'."
-                )
-            existing_verdict = (task.get("truthgate_verdict") or "").strip()
-            existing_method = (task.get("truthgate_method") or "").strip()
-            if existing_verdict and not force:
-                return _err(
-                    f"Task {task_id} already has TruthGate verdict "
-                    f"{existing_verdict} via {existing_method or 'unknown'}; "
-                    "use force=true to rerun."
-                )
-            await bus.publish({
-                "ts": _now_iso(),
-                "agent_id": caller_id,
-                "type": "task_truthgate_started",
-                "task_id": task_id,
-                "project_id": project_id,
-                "method": "classifier",
-                "force": force,
-            })
-        finally:
-            await c.close()
-
-        from server.truthgate.classifier import (  # noqa: PLC0415
-            TruthGateClassificationError,
-            TruthGateTaskInput,
-            run_truthgate_classifier,
-        )
-
-        try:
-            result = await run_truthgate_classifier(
-                project_id,
-                TruthGateTaskInput(
-                    task_id=task_id,
-                    title=task.get("title") or "",
-                    description=task.get("description") or "",
-                    success_criteria=task.get("success_criteria") or "",
-                    workflow=task.get("workflow") or "generic",
-                    trajectory=task.get("trajectory") or "[]",
-                ),
-            )
-            classifier_error: str | None = None
-        except TruthGateClassificationError as exc:
-            classifier_error = str(exc)
-            result = {
-                "verdict": "",
-                "truth_basis": [],
-                "truth_concerns": [classifier_error],
-                "rationale": classifier_error,
-                "method": "classifier_error",
-                "model": None,
-                "warning": classifier_error,
-            }
-
-        c = await configured_conn()
-        try:
-            if classifier_error:
-                now = _now_iso()
-                reason = (
-                    f"TruthGate classifier failed closed: {classifier_error}"
-                )[:500]
-                await c.execute(
-                    "UPDATE tasks SET truthgate_verdict = NULL, "
-                    "truth_basis = '[]', truth_concerns = '[]', "
-                    "truthgate_at = ?, truthgate_model = NULL, "
-                    "truthgate_method = 'classifier_error', "
-                    "truthgate_override_rationale = NULL, "
-                    "truthgate_pending_proposal_id = NULL, "
-                    "truthgate_warning = ?, closure_reference = NULL, "
-                    "provisional = 0, blocked = 1, blocked_reason = ? "
-                    "WHERE id = ? AND project_id = ?",
-                    (now, reason, reason, task_id, project_id),
-                )
-                payload = {
-                    "ts": now,
-                    "agent_id": "coach",
-                    "task_id": task_id,
-                    "project_id": project_id,
-                    "verdict": None,
-                    "truth_basis": [],
-                    "truth_concerns": [],
-                    "truthgate_method": "classifier_error",
-                    "truthgate_model": None,
-                    "truthgate_warning": reason,
-                    "truthgate_override_rationale": None,
-                    "truthgate_pending_proposal_id": None,
-                    "provisional": False,
-                    "closure_reference": None,
-                    "blocked_reason": reason,
-                }
-            else:
-                payload = await _persist_truthgate_result(
-                    c,
-                    project_id=project_id,
-                    task_id=task_id,
-                    result=result,
-                )
-            await c.commit()
-        finally:
-            await c.close()
-
-        completed_event = {
-            **payload,
-            "agent_id": caller_id,
-            "type": "task_truthgate_completed",
-        }
-        await bus.publish(completed_event)
-        if payload.get("blocked_reason"):
-            await bus.publish({
-                **payload,
-                "agent_id": caller_id,
-                "type": "task_truthgate_blocked",
-                "reason": payload.get("blocked_reason"),
-            })
-
-        verdict = payload["verdict"]
-        if classifier_error:
-            return _err(
-                f"TruthGate classifier failed closed for {task_id}; "
-                "task remains blocked in truthgate with no pass/override "
-                "verdict recorded."
-            )
-        method = payload["truthgate_method"]
-        if verdict in TRUTHGATE_EXIT_VERDICTS:
-            try:
-                stages = _trajectory_stages_from_row(task)
-                next_hint = stages[0] if stages else "execute"
-            except Exception:
-                next_hint = "execute"
-            return _ok(
-                f"TruthGate recorded {verdict} for {task_id} "
-                f"(method={method}). Coach may now approve "
-                f"truthgate → {next_hint} with coord_approve_stage."
-            )
-        return _ok(
-            f"TruthGate recorded {verdict} for {task_id} "
-            f"(method={method}); task remains blocked in truthgate. "
-            f"Reason: {payload.get('blocked_reason') or payload.get('truthgate_warning') or 'review required'}"
+        return await _run_truthgate_assessment(
+            task_id=task_id,
+            project_id=project_id,
+            actor_id=caller_id,
+            force=force,
+            trigger="manual",
         )
 
     @tool(
@@ -10016,9 +10040,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- trajectory: required when action='promote'. Same format "
             "  as coord_create_task — ordered list of {stage, to} "
             "  objects. The first `to` may be empty, a pool, or a single "
-            "  Player because promotion enters TruthGate and does not "
-            "  dispatch work. Coach later calls coord_approve_stage with "
-            "  one assignee after a TruthGate pass/override.\n"
+            "  Player because promotion enters TruthGate, automatically "
+            "  runs the assessment, and does not dispatch work. Coach "
+            "  later calls coord_approve_stage with one assignee after "
+            "  a TruthGate pass/override.\n"
             "- modified_title: optional. Rename the idea on promote.\n"
             "- reason: recommended when action='reject'. Short phrase "
             "  explaining why (stored; surfaces to human if the idea "
@@ -10248,16 +10273,6 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         })
         await bus.publish({
             "ts": now_iso,
-            "agent_id": "system",
-            "type": "task_truthgate_started",
-            "task_id": task_id,
-            "from": "backlog",
-            "post_gate_stage": first_post_gate_stage,
-            "project_id": project_id,
-            "emergency": emergency,
-        })
-        await bus.publish({
-            "ts": now_iso,
             "agent_id": caller_id,
             "type": "backlog_task_promoted",
             "backlog_id": backlog_id,
@@ -10273,15 +10288,26 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             if emergency else
             " Promotion basis: priority/FIFO next eligible item."
         )
+        assessment = await _run_truthgate_assessment(
+            task_id=task_id,
+            project_id=project_id,
+            actor_id="truthgate",
+            force=False,
+            trigger="backlog_promoted",
+        )
+        assessment_text = (
+            assessment.get("content", [{}])[0].get("text", "")
+            if isinstance(assessment, dict)
+            else ""
+        )
         return _ok(
             f"Backlog entry #{backlog_id} promoted → task {task_id} "
             f"(\"{title}\", priority={promote_priority}, "
             f"initial stage: truthgate; post-gate trajectory starts at "
             f"{first_post_gate_stage}).{emergency_text} "
             f"No Player role was planted and "
-            f"no Player was woken. Record/run TruthGate, then drive via "
-            f"coord_approve_stage(task_id={task_id!r}, "
-            f"next_stage={first_post_gate_stage!r}, assignee=<slot>)."
+            f"no Player was woken. TruthGate assessment started automatically. "
+            f"{assessment_text}"
         )
 
     @tool(
