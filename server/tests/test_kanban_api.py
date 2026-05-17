@@ -931,13 +931,16 @@ def test_create_top_level_emergency_enters_truthgate_without_role(
     backlog_id = body["backlog_id"]
     assert body["status"] == "truthgate"
     assert body["emergency"] is True
+    assert body["truthgate_assessment_error"] is False
+    assert "TruthGate recorded truthgate_pass" in body["truthgate_assessment"]
     import asyncio
 
     async def read():
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT status, owner, emergency, emergency_rationale "
+                "SELECT status, owner, emergency, emergency_rationale, "
+                "truthgate_verdict, truthgate_method "
                 "FROM tasks WHERE id = ?",
                 (task_id,),
             )
@@ -964,12 +967,80 @@ def test_create_top_level_emergency_enters_truthgate_without_role(
     assert task["owner"] is None
     assert task["emergency"] == 1
     assert task["emergency_rationale"] == "production outage"
+    assert task["truthgate_verdict"] == "truthgate_pass"
+    assert task["truthgate_method"] == "classifier_sparse"
     assert role_count == 0
     assert backlog["status"] == "promoted"
     assert backlog["promoted_task_id"] == task_id
     assert backlog["emergency"] == 1
     assert backlog["emergency_rationale"] == "production outage"
     assert backlog["promotion_basis"] == "emergency"
+
+
+async def test_create_top_level_emergency_runs_truthgate_events_and_fail_closed(
+    fresh_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.events import bus
+    from server.main import CreateTaskRequest, create_task_from_human
+    import server.truthgate.classifier as classifier
+
+    async def fake_run(project_id: str, task: object) -> dict[str, object]:
+        raise classifier.TruthGateClassificationError(
+            "TruthGate classifier returned invalid JSON "
+            "(decode error at char 0; excerpt='not json')"
+        )
+
+    monkeypatch.setattr(classifier, "run_truthgate_classifier", fake_run)
+
+    q = bus.subscribe()
+    try:
+        body = await create_task_from_human(
+            CreateTaskRequest(
+                title="production fire",
+                trajectory=[{"stage": "execute", "to": ["p2"]}],
+                emergency=True,
+                emergency_rationale="production outage",
+            )
+        )
+        events = []
+        while not q.empty():
+            events.append(q.get_nowait())
+    finally:
+        bus.unsubscribe(q)
+
+    assert body["ok"] is True
+    assert body["status"] == "truthgate"
+    assert body["truthgate_assessment_error"] is True
+    assert "failed closed" in body["truthgate_assessment"]
+    task_id = body["task_id"]
+
+    c = await configured_conn()
+    try:
+        task = dict(await (await c.execute(
+            "SELECT status, truthgate_verdict, truthgate_method, blocked, "
+            "blocked_reason, truthgate_warning FROM tasks WHERE id = ?",
+            (task_id,),
+        )).fetchone())
+    finally:
+        await c.close()
+
+    assert task["status"] == "truthgate"
+    assert task["truthgate_verdict"] is None
+    assert task["truthgate_method"] == "classifier_error"
+    assert task["blocked"] == 1
+    assert "invalid JSON" in task["blocked_reason"]
+    assert "not json" in task["truthgate_warning"]
+
+    started = [e for e in events if e.get("type") == "task_truthgate_started"]
+    assert len(started) == 1
+    assert started[0]["task_id"] == task_id
+    assert started[0]["trigger"] == "api_emergency"
+    assert "from" not in started[0]
+    blocked = [e for e in events if e.get("type") == "task_truthgate_blocked"]
+    assert len(blocked) == 1
+    assert blocked[0]["task_id"] == task_id
+    assert blocked[0]["trigger"] == "api_emergency"
 
 
 def test_create_top_level_emergency_requires_rationale(

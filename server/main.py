@@ -4313,10 +4313,10 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
 
     Top-level non-emergency requests are backlog proposals. Top-level
     emergency requests must include a rationale and enter TruthGate
-    without planting a Player role. Parented child tasks preserve the
-    legacy direct-dispatch behavior.
+    without planting a Player role, then automatically run assessment.
+    Parented child tasks preserve the legacy direct-dispatch behavior.
     """
-    from server.tools import _validate_trajectory
+    from server.tools import _run_truthgate_assessment, _validate_trajectory
     task_id = f"t-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:8]}"
     parent_id = req.parent_id or None
     project_id = await resolve_active_project()
@@ -4453,18 +4453,6 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
             await bus.publish(
                 {
                     "ts": now_iso,
-                    "agent_id": "system",
-                    "type": "task_truthgate_started",
-                    "task_id": task_id,
-                    "from": "api_emergency",
-                    "post_gate_stage": trajectory[0]["stage"],
-                    "project_id": project_id,
-                    "emergency": True,
-                }
-            )
-            await bus.publish(
-                {
-                    "ts": now_iso,
                     "agent_id": "human",
                     "type": "backlog_task_promoted",
                     "backlog_id": backlog_id,
@@ -4476,6 +4464,18 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
                     "emergency_rationale": emergency_rationale,
                 }
             )
+            assessment = await _run_truthgate_assessment(
+                task_id=task_id,
+                project_id=project_id,
+                actor_id="truthgate",
+                force=False,
+                trigger="api_emergency",
+            )
+            assessment_text = (
+                assessment.get("content", [{}])[0].get("text", "")
+                if isinstance(assessment, dict)
+                else ""
+            )
             return {
                 "ok": True,
                 "task_id": task_id,
@@ -4485,6 +4485,10 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
                 "trajectory": trajectory,
                 "emergency": True,
                 "emergency_rationale": emergency_rationale,
+                "truthgate_assessment": assessment_text,
+                "truthgate_assessment_error": bool(
+                    isinstance(assessment, dict) and assessment.get("is_error")
+                ),
             }
 
         event: dict[str, Any] = {
