@@ -33,6 +33,9 @@ def _err(result: dict[str, Any]) -> str:
 async def _seed_audit_task(
     *,
     task_id: str = "t-2026-05-16-a0d10001",
+    status: str = "audit_syntax",
+    role: str = "auditor_syntax",
+    auditor: str = "p4",
     basis: list[str] | None = None,
     basis_raw: str | None = None,
     concerns: list[str] | None = None,
@@ -60,12 +63,13 @@ async def _seed_audit_task(
             "truthgate_verdict, truth_basis, truth_concerns, "
             "truthgate_at, truthgate_method, truthgate_warning, "
             "provisional, closure_reference, trajectory) "
-            "VALUES (?, 'misc', 'audit target', 'audit_syntax', 'p2', "
+            "VALUES (?, 'misc', 'audit target', ?, 'p2', "
             "'coach', 'truthgate_pass', ?, ?, ?, ?, ?, ?, ?, "
             "'[{\"stage\":\"execute\",\"to\":[\"p2\"]},"
             "{\"stage\":\"audit_syntax\",\"to\":[\"p4\"]}]')",
             (
                 task_id,
+                status,
                 truth_basis_value,
                 json.dumps(truth_concerns),
                 now,
@@ -78,8 +82,8 @@ async def _seed_audit_task(
         await c.execute(
             "INSERT INTO task_role_assignments "
             "(task_id, role, eligible_owners, owner, assigned_at, claimed_at) "
-            "VALUES (?, 'auditor_syntax', '[]', 'p4', ?, ?)",
-            (task_id, now, now),
+            "VALUES (?, ?, '[]', ?, ?, ?)",
+            (task_id, role, auditor, now, now),
         )
         await c.commit()
     finally:
@@ -203,3 +207,137 @@ async def test_malformed_truth_basis_flags_review_and_rejects_pass(
     }))
     assert "targeted TruthGate check blocks PASS" in err
     assert "truth_basis is malformed/unparseable" in err
+
+
+@pytest.mark.asyncio
+async def test_stale_truthgate_basis_blocks_audit_pass_with_coach_refresh_path(
+    fresh_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await init_db()
+    task_id = await _seed_audit_task(
+        task_id="t-2026-05-17-5a1e0001",
+        status="audit_semantics",
+        role="auditor_semantics",
+        auditor="p8",
+    )
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE tasks SET truthgate_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", task_id),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    import server.agents as agents_mod
+
+    wake_calls: list[tuple[str, str]] = []
+
+    async def fake_wake(agent_id: str, reason: str = "", **_: Any) -> bool:
+        wake_calls.append((agent_id, reason))
+        return True
+
+    monkeypatch.setattr(agents_mod, "maybe_wake_agent", fake_wake)
+
+    p8 = _server_for("p8")
+    err = _err(await _handler(p8, "submit_audit_report")({
+        "task_id": task_id,
+        "kind": "semantics",
+        "verdict": "pass",
+        "body": "PASS: implementation matches the approved reply affordance contract.",
+    }))
+    assert "targeted TruthGate check blocks PASS" in err
+    assert "truth_basis file changed after the recorded TruthGate run" in err
+    assert "Do not submit FAIL solely for administrative staleness" in err
+    assert "coord_refresh_truthgate_basis" in err
+
+    c = await configured_conn()
+    try:
+        message = dict(await (await c.execute(
+            "SELECT from_id, to_id, subject, body, priority FROM messages "
+            "WHERE to_id = 'coach' ORDER BY id DESC LIMIT 1",
+        )).fetchone())
+        role_row = dict(await (await c.execute(
+            "SELECT completed_at, verdict FROM task_role_assignments "
+            "WHERE task_id = ? AND role = 'auditor_semantics'",
+            (task_id,),
+        )).fetchone())
+    finally:
+        await c.close()
+    assert message["from_id"] == "truthgate"
+    assert message["priority"] == "interrupt"
+    assert f"TruthGate basis stale during audit: {task_id}" in message["subject"]
+    assert "coord_refresh_truthgate_basis" in message["body"]
+    assert wake_calls and wake_calls[-1][0] == "coach"
+    assert not any(call[0] == "p8" for call in wake_calls)
+    assert role_row["completed_at"] is None
+    assert role_row["verdict"] is None
+
+    coach = _server_for("coach")
+    rerun_err = _err(await _handler(coach, "run_truthgate")({
+        "task_id": task_id,
+        "force": "true",
+    }))
+    assert "TruthGate assessment only runs while status='truthgate'" in rerun_err
+
+    refresh = _ok(await _handler(coach, "refresh_truthgate_basis")({
+        "task_id": task_id,
+        "rationale": "truth/reply-affordance.md amendment only clarified the audit refresh workflow.",
+    }))
+    assert "Refreshed TruthGate basis checkpoint" in refresh
+    assert "No audit PASS was recorded" in refresh
+
+    c = await configured_conn()
+    try:
+        task = dict(await (await c.execute(
+            "SELECT status, latest_audit_verdict, truthgate_warning "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        )).fetchone())
+    finally:
+        await c.close()
+    assert task["status"] == "audit_semantics"
+    assert task["latest_audit_verdict"] is None
+    assert "TruthGate basis refreshed by Coach during audit" in task["truthgate_warning"]
+
+    ok = _ok(await _handler(p8, "submit_audit_report")({
+        "task_id": task_id,
+        "kind": "semantics",
+        "verdict": "pass",
+        "body": "PASS: implementation matches the approved reply affordance contract.",
+    }))
+    assert "Submitted semantics audit" in ok
+    assert "pass" in ok
+
+
+@pytest.mark.asyncio
+async def test_refresh_truthgate_basis_is_coach_only_and_audit_stage_only(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    task_id = await _seed_audit_task(task_id="t-2026-05-17-5a1e0002")
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE tasks SET status = 'execute', truthgate_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", task_id),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
+    p4 = _server_for("p4")
+    assert "Coach-only" in _err(await _handler(p4, "refresh_truthgate_basis")({
+        "task_id": task_id,
+        "rationale": "reviewed",
+    }))
+
+    coach = _server_for("coach")
+    err = _err(await _handler(coach, "refresh_truthgate_basis")({
+        "task_id": task_id,
+        "rationale": "reviewed",
+    }))
+    assert "only applies while" in err
+    assert "stage=execute" in err
