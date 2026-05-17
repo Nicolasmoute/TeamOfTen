@@ -2558,8 +2558,10 @@ Current implementation gap:
      existing evidence without another GitHub PR or duplicate ship event.
   3. If the executor commit or equivalent patch is already present on
      `origin/dev`, close the shipper role row, emit `task_shipped_to_dev`
-     with `ship_method='already_present'`, `idempotent=true`, and
-     `ship_sha=<origin/dev sha>`, then return without opening a PR.
+     with `ship_method='already_present'`, `idempotent=true`,
+     `ship_sha=<origin/dev sha>`, and explicit
+     `already_present_verification` evidence (`executor_sha_is_ancestor_of_origin_dev`
+     or `git_cherry_patch_id_match`), then return without opening a PR.
   4. If local branch `ship-<task_id>` already exists, resume it:
      - If already on the branch and there is no `CHERRY_PICK_HEAD` or
        unmerged path, continue to push/PR/merge.
@@ -2576,9 +2578,12 @@ Current implementation gap:
     `git cherry-pick --abort` to clean up. After manual resolution and
     `git cherry-pick --continue`, rerun `coord_ship_to_dev(task_id)` to
     resume the existing temp branch.
-  - Empty/no-op cherry-pick → re-checks whether the patch is already
-    present on `origin/dev`; if confirmed, uses the already-present
-    success path, otherwise fails closed.
+  - Empty/no-op cherry-pick → aborts the cherry-pick, re-checks whether
+    the patch is already present on `origin/dev`, and if confirmed uses
+    the already-present success path with explicit verification evidence.
+    If not confirmed, fail closed without emitting ship evidence or
+    completing the shipper role; the shipper must create formal ship
+    evidence through a non-empty PR/marker commit or ask Coach to reroute.
 - **GitHub API** (PAT extracted from `projects.repo_url`):
   1. Query open PRs for `head=<owner>:ship-<task_id>&base=dev`; reuse
      one if present.
