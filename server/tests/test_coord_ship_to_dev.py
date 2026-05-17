@@ -301,6 +301,7 @@ class RecordingGit:
         origin_dev_sha: str = "devsha1234567890",
         branch_based_on_dev: bool = True,
         branch_contains_executor: bool = True,
+        branch_mentions_executor_without_marker: bool = False,
     ) -> None:
         self.branch_exists = branch_exists
         self.current_branch = current_branch
@@ -312,6 +313,9 @@ class RecordingGit:
         self.origin_dev_sha = origin_dev_sha
         self.branch_based_on_dev = branch_based_on_dev
         self.branch_contains_executor = branch_contains_executor
+        self.branch_mentions_executor_without_marker = (
+            branch_mentions_executor_without_marker
+        )
         self.commands: list[list[str]] = []
         self.patch_checks = 0
 
@@ -331,11 +335,15 @@ class RecordingGit:
             err = "" if rc == 0 else "not ancestor"
             return subprocess.CompletedProcess(cmd, rc, "", err)
         if cmd == ["git", "log", "--format=%B", "origin/dev..HEAD"]:
-            out = (
-                f"Ship resolved conflicts\n\n(cherry picked from commit {EXECUTOR_SHA})\n"
-                if self.branch_contains_executor else
-                "unrelated temp branch commit\n"
-            )
+            if self.branch_contains_executor:
+                out = (
+                    "Ship resolved conflicts\n\n"
+                    f"(cherry picked from commit {EXECUTOR_SHA})\n"
+                )
+            elif self.branch_mentions_executor_without_marker:
+                out = f"unrelated temp branch mentions {EXECUTOR_SHA}\n"
+            else:
+                out = "unrelated temp branch commit\n"
             return subprocess.CompletedProcess(cmd, 0, out, "")
         if cmd == ["git", "rev-parse", "origin/dev"]:
             return subprocess.CompletedProcess(cmd, 0, f"{self.origin_dev_sha}\n", "")
@@ -645,6 +653,51 @@ async def test_ship_to_dev_existing_clean_temp_branch_without_executor_metadata_
     err = _err_text(result)
     assert "does not contain the recorded executor commit" in err
     assert "git cherry-pick --continue" in err
+    assert ["git", "push", "origin", f"ship-{TASK_ID}:ship-{TASK_ID}"] not in git.commands
+    assert github.calls == []
+
+
+async def test_ship_to_dev_existing_clean_temp_branch_rejects_message_only_sha(
+    fresh_db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await init_db()
+    await _seed_ready_ship_task()
+    _stub_workspace(monkeypatch, tmp_path)
+    git = RecordingGit(
+        branch_exists=True,
+        current_branch=f"ship-{TASK_ID}",
+        branch_contains_executor=False,
+        branch_mentions_executor_without_marker=True,
+    )
+    monkeypatch.setattr(subprocess, "run", git)
+    github = RecordingGitHub().install(monkeypatch)
+
+    server = _server_for("p2")
+    result = await _handler(server, "ship_to_dev")({"task_id": TASK_ID})
+    err = _err_text(result)
+    assert "cherry-pick metadata" in err
+    assert ["git", "push", "origin", f"ship-{TASK_ID}:ship-{TASK_ID}"] not in git.commands
+    assert github.calls == []
+
+
+async def test_ship_to_dev_existing_current_dirty_temp_branch_errors(
+    fresh_db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await init_db()
+    await _seed_ready_ship_task()
+    _stub_workspace(monkeypatch, tmp_path)
+    git = RecordingGit(
+        branch_exists=True,
+        current_branch=f"ship-{TASK_ID}",
+        dirty=True,
+    )
+    monkeypatch.setattr(subprocess, "run", git)
+    github = RecordingGitHub().install(monkeypatch)
+
+    server = _server_for("p2")
+    result = await _handler(server, "ship_to_dev")({"task_id": TASK_ID})
+    err = _err_text(result)
+    assert "has uncommitted changes" in err
     assert ["git", "push", "origin", f"ship-{TASK_ID}:ship-{TASK_ID}"] not in git.commands
     assert github.calls == []
 

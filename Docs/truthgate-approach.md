@@ -19,39 +19,6 @@ Implemented classifier-core pieces:
 
 Current mocked-LLM/tool tests cover sparse mode, dense-corpus prompt-budget truncation, slicer ordering, strict parser failure, model validation, basis validation, per-project concurrency locking, Coach-only Phase 3 tools, verdict persistence, blocked needs-change verdicts, force-rerun protection, classifier-error fail-closed behavior, override rationale validation, post-override exit gating, Phase 4 amendment proposal approval/denial correlation, Phase 6 targeted audit wake/PASS-guard behavior, and Phase 7 provisional closure/archive gating. Protected truth mirror tests are temporarily waived by human directive; the matching `truth/` projection should be proposed through the protected flow after the waiver lifts.
 
-## Implementation status - Phase 2 classifier core
-
-Phase 2 has landed as a library-only package under `server/truthgate/`. It
-does not yet wire kanban tools or stage gates; later phases still need to
-connect these APIs to `coord_run_truthgate`, override recording, truthgate
-stage exit gating, amendment proposals, attention surfaces, audit context, and
-provisional closure checks.
-
-Implemented classifier-core pieces:
-
-- `config.py`: env parsing, budget knobs, and strict classifier model
-  validation. Defaults are `latest_sonnet` primary and `latest_mini` fallback.
-  `latest_opus`, `latest_gpt`, and their current concrete model targets are
-  rejected for classifier env vars.
-- `corpus.py`: capped `truth/**/*.{md,txt}` corpus slicing. It prioritizes
-  core truth files, then task-keyword-relevant files, then alphabetical
-  fallback. It does not read `Docs/`, repo source, uploads, conversation logs,
-  or secrets.
-- `prompts.py`: strict JSON classifier prompt and amendment-draft prompt helper.
-- `llm.py`: one-shot primary/fallback wrapper with `agent_id="truthgate"` and
-  classifier ledger attribution.
-- `classifier.py`: per-project lock, cost-cap preflight, sparse-mode routing,
-  strict whole-response JSON parsing, verdict normalization, and truth-basis
-  validation.
-- `sparse.py`, `targeted.py`, and `amendments.py`: sparse pass result,
-  targeted truth-basis reads, and amendment metadata helpers for later phases.
-
-Current mocked-LLM tests cover sparse mode, dense-corpus prompt-budget
-truncation, slicer ordering, strict parser failure, model validation, basis
-validation, and per-project concurrency locking. Protected truth mirror tests
-are temporarily waived by human directive; the matching `truth/` projection
-should be proposed through the protected flow after the waiver lifts.
-
 ## Core idea
 
 `truth/` is authority. `Docs/` is projection or workspace. Tasks must pass a spec-compliance check (truthgate) before implementation begins. Emergency work can bypass the gate but must reconcile afterward.
@@ -182,7 +149,7 @@ One classifier call per non-overridden task on Coach promotion from backlog into
 
 Per call at current `latest_sonnet`-class pricing: roughly **$0.01-0.02** per gate. At 50 tasks/week: ~$0.50-1.00/week. At 200 tasks/week: ~$2-4/week. Negligible against existing Compass + TruthScore + Coach spend.
 
-The classifier runs as a one-shot direct LLM call (mirror Compass's `compass.llm.call` wrapper - write `truthgate.llm.call`). Cost lands in the existing `turns` ledger under `agent_id="truthgate"`, `cost_basis="truthgate:classifier"` so it rolls into team daily caps and the EnvPane meter.
+The classifier runs as a one-shot direct LLM call (mirror Compass's `compass.llm.call` wrapper - write `truthgate.llm.call`). Cost lands in the existing `turns` ledger under `agent_id="truthgate"`, `cost_basis="truthgate:run"` so it rolls into team daily caps and the EnvPane meter.
 
 The classifier does **not** piggyback on a Coach turn - Coach may be running a premium model, and the whole point of the dedicated call is to keep this cheap.
 
