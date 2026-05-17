@@ -18,7 +18,7 @@ import {
   renderDiffBody,
 } from "/static/tools.js";
 import { CompassPane, createCompassEventRouter } from "/static/compass.js?v=1778671319";
-import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js?v=1778977352";
+import { KanbanPane, createKanbanEventRouter } from "/static/kanban.js?v=1779019814";
 import { PlaybookPane, createPlaybookEventRouter } from "/static/playbook.js";
 
 const html = htm.bind(h);
@@ -9790,7 +9790,7 @@ function EnvTimelineItem({ event }) {
     const method = event.truthgate_method || event.method || "";
     const suffix = verdict ? ` — ${verdict}${method ? " · " + method : ""}` : "";
     const label = event.type === "task_truthgate_started"
-      ? "TruthGate started"
+      ? "TruthGate assessment started"
       : event.type === "task_truthgate_blocked"
       ? "TruthGate blocked"
       : event.type === "task_truthgate_override_recorded"

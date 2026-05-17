@@ -199,6 +199,31 @@ def test_board_priority_sort(client: TestClient) -> None:
     assert plan_ids[-1] == "t-2026-05-03-11111111"  # low last
 
 
+def test_board_serializes_emergency_metadata(client: TestClient) -> None:
+    import asyncio
+    task_id = "t-2026-05-03-emergncy"
+    asyncio.run(_seed(task_id=task_id, status="truthgate", priority="urgent"))
+
+    async def mark_emergency() -> None:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE tasks SET emergency = 1, emergency_rationale = ? "
+                "WHERE id = ?",
+                ("production outage", task_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+
+    asyncio.run(mark_emergency())
+    r = client.get("/api/tasks/board")
+    assert r.status_code == 200
+    task = next(t for t in r.json()["board"]["truthgate"] if t["id"] == task_id)
+    assert task["emergency"] == 1
+    assert task["emergency_rationale"] == "production outage"
+
+
 def test_flow_health_includes_verify_stage_counts(client: TestClient) -> None:
     import asyncio
     asyncio.run(_seed(
@@ -257,6 +282,19 @@ def test_verify_card_contract_uses_verifier_assignment_not_stale_owner(
 
     js = (Path(__file__).parents[1] / "static" / "kanban.js").read_text()
     assert 'if (status === "verify") return "verifier";' in js
+
+
+def test_truthgate_classifier_error_ui_labels_are_not_pending() -> None:
+    static_dir = Path(__file__).parents[1] / "static"
+    kanban_js = (static_dir / "kanban.js").read_text(encoding="utf-8")
+    app_js = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    blocked_idx = kanban_js.index('task.truthgate_method === "classifier_error"')
+    pending_idx = kanban_js.index('task.status === "truthgate" && !task.truthgate_verdict')
+    assert blocked_idx < pending_idx
+    assert "TG BLOCKED" in kanban_js
+    assert "TruthGate failed closed" in kanban_js
+    assert "TruthGate assessment started" in app_js
 
 
 # ----------------------------------------------------------------- /archive
@@ -802,13 +840,12 @@ def test_event_log_unknown_project_returns_empty(client: TestClient) -> None:
 
 
 # --------------------------------------------------------------- create
-# v0.3 audit-2026-05-04 item 2: trajectory-driven creation activation
+# Backlog-first top-level creation; parented child tasks stay direct.
 
 
-def test_create_task_starts_in_first_trajectory_stage(client: TestClient) -> None:
-    """Execute-only trajectory must land directly in `execute`, not the
-    schema default `plan`. Otherwise the executor row sits behind the
-    spec gate and can't be claimed."""
+def test_create_top_level_task_lands_in_backlog_not_kanban(
+    client: TestClient,
+) -> None:
     r = client.post(
         "/api/tasks",
         json={
@@ -817,84 +854,263 @@ def test_create_task_starts_in_first_trajectory_stage(client: TestClient) -> Non
         },
     )
     assert r.status_code == 200, r.text
-    task_id = r.json()["task_id"]
+    body = r.json()
+    assert body["kind"] == "backlog"
+    assert body["status"] == "pending"
+    assert "task_id" not in body
+    backlog_id = body["backlog_id"]
     import asyncio
 
     async def read():
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT status, owner, last_stage_change_at "
-                "FROM tasks WHERE id = ?",
-                (task_id,),
+                "SELECT COUNT(*) AS n FROM tasks WHERE title = ?",
+                ("exec-only task",),
+            )
+            task_count = dict(await cur.fetchone())["n"]
+            cur = await c.execute(
+                "SELECT title, status, priority, trajectory_json "
+                "FROM backlog_tasks WHERE id = ?",
+                (backlog_id,),
+            )
+            return task_count, dict(await cur.fetchone())
+        finally:
+            await c.close()
+
+    task_count, row = asyncio.run(read())
+    assert task_count == 0
+    assert row["title"] == "exec-only task"
+    assert row["status"] == "pending"
+    assert row["priority"] == "normal"
+    assert json.loads(row["trajectory_json"]) == [
+        {"stage": "execute", "to": ["p2"]}
+    ]
+
+
+def test_create_top_level_task_without_trajectory_uses_backlog_default(
+    client: TestClient,
+) -> None:
+    r = client.post("/api/tasks", json={"title": "no trajectory"})
+    assert r.status_code == 200, r.text
+    backlog_id = r.json()["backlog_id"]
+
+    import asyncio
+
+    async def read():
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT status, trajectory_json FROM backlog_tasks WHERE id = ?",
+                (backlog_id,),
             )
             return dict(await cur.fetchone())
         finally:
             await c.close()
 
     row = asyncio.run(read())
-    assert row["status"] == "execute"
-    assert row["owner"] == "p2"
-    assert row["last_stage_change_at"] is not None
+    assert row["status"] == "pending"
+    assert json.loads(row["trajectory_json"]) == [{"stage": "execute", "to": []}]
 
 
-def test_create_task_with_plan_starts_in_plan(client: TestClient) -> None:
-    """A trajectory beginning with `plan` must start in `plan`."""
+def test_create_top_level_emergency_enters_truthgate_without_role(
+    client: TestClient,
+) -> None:
     r = client.post(
         "/api/tasks",
         json={
-            "title": "needs spec",
-            "trajectory": [
-                {"stage": "plan", "to": "p3"},
-                {"stage": "execute", "to": "p2"},
-            ],
+            "title": "production fire",
+            "trajectory": [{"stage": "execute", "to": ["p2"]}],
+            "emergency": True,
+            "emergency_rationale": "production outage",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    task_id = body["task_id"]
+    backlog_id = body["backlog_id"]
+    assert body["status"] == "truthgate"
+    assert body["emergency"] is True
+    assert body["truthgate_assessment_error"] is False
+    assert "TruthGate recorded truthgate_pass" in body["truthgate_assessment"]
+    import asyncio
+
+    async def read():
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT status, owner, emergency, emergency_rationale, "
+                "truthgate_verdict, truthgate_method "
+                "FROM tasks WHERE id = ?",
+                (task_id,),
+            )
+            task = dict(await cur.fetchone())
+            cur = await c.execute(
+                "SELECT status, promoted_task_id, emergency, "
+                "emergency_rationale, promotion_basis "
+                "FROM backlog_tasks WHERE id = ?",
+                (backlog_id,),
+            )
+            backlog = dict(await cur.fetchone())
+            cur = await c.execute(
+                "SELECT COUNT(*) AS n FROM task_role_assignments "
+                "WHERE task_id = ?",
+                (task_id,),
+            )
+            role_count = dict(await cur.fetchone())["n"]
+            return task, backlog, role_count
+        finally:
+            await c.close()
+
+    task, backlog, role_count = asyncio.run(read())
+    assert task["status"] == "truthgate"
+    assert task["owner"] is None
+    assert task["emergency"] == 1
+    assert task["emergency_rationale"] == "production outage"
+    assert task["truthgate_verdict"] == "truthgate_pass"
+    assert task["truthgate_method"] == "classifier_sparse"
+    assert role_count == 0
+    assert backlog["status"] == "promoted"
+    assert backlog["promoted_task_id"] == task_id
+    assert backlog["emergency"] == 1
+    assert backlog["emergency_rationale"] == "production outage"
+    assert backlog["promotion_basis"] == "emergency"
+
+
+async def test_create_top_level_emergency_runs_truthgate_events_and_fail_closed(
+    fresh_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.events import bus
+    from server.main import CreateTaskRequest, create_task_from_human
+    import server.truthgate.classifier as classifier
+
+    async def fake_run(project_id: str, task: object) -> dict[str, object]:
+        raise classifier.TruthGateClassificationError(
+            "TruthGate classifier returned invalid JSON "
+            "(decode error at char 0; excerpt='not json')"
+        )
+
+    monkeypatch.setattr(classifier, "run_truthgate_classifier", fake_run)
+
+    q = bus.subscribe()
+    try:
+        body = await create_task_from_human(
+            CreateTaskRequest(
+                title="production fire",
+                trajectory=[{"stage": "execute", "to": ["p2"]}],
+                emergency=True,
+                emergency_rationale="production outage",
+            )
+        )
+        events = []
+        while not q.empty():
+            events.append(q.get_nowait())
+    finally:
+        bus.unsubscribe(q)
+
+    assert body["ok"] is True
+    assert body["status"] == "truthgate"
+    assert body["truthgate_assessment_error"] is True
+    assert "failed closed" in body["truthgate_assessment"]
+    task_id = body["task_id"]
+
+    c = await configured_conn()
+    try:
+        task = dict(await (await c.execute(
+            "SELECT status, truthgate_verdict, truthgate_method, blocked, "
+            "blocked_reason, truthgate_warning FROM tasks WHERE id = ?",
+            (task_id,),
+        )).fetchone())
+    finally:
+        await c.close()
+
+    assert task["status"] == "truthgate"
+    assert task["truthgate_verdict"] is None
+    assert task["truthgate_method"] == "classifier_error"
+    assert task["blocked"] == 1
+    assert "invalid JSON" in task["blocked_reason"]
+    assert "not json" in task["truthgate_warning"]
+
+    started = [e for e in events if e.get("type") == "task_truthgate_started"]
+    assert len(started) == 1
+    assert started[0]["task_id"] == task_id
+    assert started[0]["trigger"] == "api_emergency"
+    assert "from" not in started[0]
+    blocked = [e for e in events if e.get("type") == "task_truthgate_blocked"]
+    assert len(blocked) == 1
+    assert blocked[0]["task_id"] == task_id
+    assert blocked[0]["trigger"] == "api_emergency"
+
+
+def test_create_top_level_emergency_requires_rationale(
+    client: TestClient,
+) -> None:
+    r = client.post(
+        "/api/tasks",
+        json={
+            "title": "missing rationale",
+            "trajectory": [{"stage": "execute", "to": ["p2"]}],
+            "emergency": True,
+        },
+    )
+    assert r.status_code == 400, r.text
+    assert "emergency_rationale" in r.json()["detail"]
+
+
+def test_create_top_level_allows_pool_first_stage_in_backlog(
+    client: TestClient,
+) -> None:
+    r = client.post(
+        "/api/tasks",
+        json={
+            "title": "http-pool-backlog",
+            "trajectory": [{"stage": "execute", "to": ["p2", "p3"]}],
+        },
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "pending"
+
+
+def test_create_child_task_preserves_direct_dispatch(
+    client: TestClient,
+) -> None:
+    import asyncio
+
+    parent_id = "t-2026-05-03-parent01"
+    asyncio.run(_seed(task_id=parent_id, status="execute", owner="p2"))
+
+    r = client.post(
+        "/api/tasks",
+        json={
+            "title": "child task",
+            "parent_id": parent_id,
+            "trajectory": [{"stage": "execute", "to": ["p3"]}],
         },
     )
     assert r.status_code == 200, r.text
     task_id = r.json()["task_id"]
-    import asyncio
 
     async def read():
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT status, owner FROM tasks WHERE id = ?",
+                "SELECT status, owner, parent_id FROM tasks WHERE id = ?",
                 (task_id,),
             )
-            return dict(await cur.fetchone())
+            task = dict(await cur.fetchone())
+            cur = await c.execute(
+                "SELECT role, owner FROM task_role_assignments WHERE task_id = ?",
+                (task_id,),
+            )
+            role = dict(await cur.fetchone())
+            return task, role
         finally:
             await c.close()
 
-    row = asyncio.run(read())
-    assert row["status"] == "plan"
-    assert row["owner"] == "p3"  # planner is the first-stage hard-assignee
-
-
-def test_http_create_rejects_pool_first_stage(client: TestClient) -> None:
-    """v2.0.1 (2026-05-08): pool first-stage `to` rejected at HTTP create.
-    Coach must name the first-stage Player; pool/empty no longer
-    produces an undispatched task on the kanban."""
-    r = client.post(
-        "/api/tasks",
-        json={
-            "title": "http-pool-rejected",
-            "trajectory": [{"stage": "execute", "to": ["p2", "p3"]}],
-        },
-    )
-    assert r.status_code == 400, r.text
-    assert "trajectory[0].to" in r.json()["detail"]
-
-
-def test_http_create_rejects_empty_first_stage(client: TestClient) -> None:
-    r = client.post(
-        "/api/tasks",
-        json={
-            "title": "http-empty-rejected",
-            "trajectory": [{"stage": "execute", "to": []}],
-        },
-    )
-    assert r.status_code == 400, r.text
-    assert "trajectory[0].to" in r.json()["detail"]
+    task, role = asyncio.run(read())
+    assert task == {"status": "execute", "owner": "p3", "parent_id": parent_id}
+    assert role == {"role": "executor", "owner": "p3"}
 
 
 async def test_async_create_single_name_first_stage_emits_stage_changed(
@@ -955,13 +1171,16 @@ async def test_async_create_single_name_first_stage_emits_stage_changed(
 
 
 def test_create_task_pool_first_stage_rejected_at_http(client: TestClient) -> None:
-    """v2.0.1 (2026-05-08): pool first-stage `to` rejected at HTTP
-    create. The kanban is a log of dispatched work; pool/empty no
-    longer creates an undispatched task."""
+    """Direct child dispatch still requires a single first-stage owner."""
+    import asyncio
+
+    parent_id = "t-2026-05-03-parent02"
+    asyncio.run(_seed(task_id=parent_id, status="execute", owner="p2"))
     r = client.post(
         "/api/tasks",
         json={
             "title": "pool exec",
+            "parent_id": parent_id,
             "trajectory": [{"stage": "execute", "to": ["p2", "p3"]}],
         },
     )
@@ -970,21 +1189,30 @@ def test_create_task_pool_first_stage_rejected_at_http(client: TestClient) -> No
 
 
 def test_create_task_no_trajectory_rejected(client: TestClient) -> None:
-    """v2.0.1: omitting `trajectory` is no longer accepted — the
-    legacy [{stage:execute,to:[]}] default is gone. Caller must
-    supply a trajectory whose first stage names a Player."""
-    r = client.post("/api/tasks", json={"title": "no trajectory"})
+    """Direct child dispatch still requires an explicit trajectory."""
+    import asyncio
+
+    parent_id = "t-2026-05-03-parent03"
+    asyncio.run(_seed(task_id=parent_id, status="execute", owner="p2"))
+    r = client.post(
+        "/api/tasks",
+        json={"title": "no trajectory", "parent_id": parent_id},
+    )
     assert r.status_code == 400, r.text
     assert "trajectory is required" in r.json()["detail"]
 
 
 def test_create_task_default_trajectory_starts_in_execute(client: TestClient) -> None:
-    """When the caller supplies a single-name first-stage trajectory,
-    the task lands in execute with that owner."""
+    """Direct child dispatch lands in execute with the single owner."""
+    import asyncio
+
+    parent_id = "t-2026-05-03-parent04"
+    asyncio.run(_seed(task_id=parent_id, status="execute", owner="p2"))
     r = client.post(
         "/api/tasks",
         json={
             "title": "single-name default",
+            "parent_id": parent_id,
             "trajectory": [{"stage": "execute", "to": ["p3"]}],
         },
     )

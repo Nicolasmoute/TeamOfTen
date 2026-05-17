@@ -2339,13 +2339,17 @@ so permissions do not depend on the model truthfully passing its identity.
   into `backlog_tasks` (same table as `coord_propose_task`). No kanban
   row is created yet; no Player is woken. Coach must then call
   `coord_triage_backlog(id, action='promote', trajectory=[...])` to
-  promote it to the kanban. Promotion creates a `truthgate` task and
-  preserves the requested trajectory as the post-gate path; it does not
-  plant the first Player role or wake anyone. This enforces FIFO priority ordering —
-  items are triaged in the order they arrived, not by recency of
-  creation (which was LIFO). The `priority`, `trajectory`, `note`, and
-  `success_criteria` params are stored on the backlog entry so Coach
-  does not need to repeat them at triage time.
+  promote it to the kanban. Promotion creates a `truthgate` task,
+  preserves the requested trajectory as the post-gate path, and
+  automatically runs the TruthGate assessment; it does not plant the
+  first Player role or wake anyone. Normal promotion is allowed only for
+  the next pending entry by explicit priority (`urgent`, `high`,
+  `normal`, `low`) and FIFO within the same priority. Out-of-order
+  promotion requires `emergency=true` and a non-empty
+  `emergency_rationale`; the metadata is stored on the backlog row and
+  promoted task. The `priority`, `trajectory`, `note`, and
+  `success_criteria` params are stored on the backlog entry so Coach does
+  not need to repeat them at triage time.
 - **Player subtasks** (with `parent_id`) are unaffected — they still
   plant directly on the kanban under their parent task.
 - Priority: `low`, `normal`, `high`, `urgent` (default `normal`).
@@ -2357,7 +2361,8 @@ so permissions do not depend on the model truthfully passing its identity.
   creation time.
 - Emits `backlog_task_proposed` for Coach top-level tasks; promotion emits
   `task_created`, `task_stage_changed{to='truthgate'}`,
-  `task_truthgate_started`, and `backlog_task_promoted`. Player subtasks emit
+  `backlog_task_promoted`, `task_truthgate_started`, and
+  `task_truthgate_completed` or `task_truthgate_blocked`. Player subtasks emit
   `task_created` + (when first stage planted) `task_role_assigned` +
   `task_stage_changed{from=null}`.
 - See `Docs/kanban-specs-v2.md` §7.1 for the canonical contract.
@@ -3306,7 +3311,7 @@ and emits the same `objectives_updated` event.
 | Endpoint | Notes |
 | --- | --- |
 | `GET /api/tasks?status=&owner=` | Active project tasks |
-| `POST /api/tasks` | Human creates task |
+| `POST /api/tasks` | Human creates a Backlog proposal, emergency TruthGate task, or child task |
 | `POST /api/tasks/{task_id}/cancel` | Human cancels task |
 
 Human task creation supports:
@@ -3315,19 +3320,29 @@ Human task creation supports:
 - description max 10,000 chars
 - optional parent id
 - priority `low`, `normal`, `high`, `urgent`
+- top-level default behavior: insert a pending Backlog row, not an
+  active task; no Player role is planted
+- top-level emergency behavior: `emergency=true` requires non-empty
+  `emergency_rationale`, records a promoted Backlog row, and inserts
+  the active task into `truthgate` with no Player role, then
+  automatically starts and awaits TruthGate assessment
+- child-task behavior: when `parent_id` is present, the endpoint keeps
+  the direct-dispatch subtask path and requires an explicit trajectory
+  whose first stage names exactly one Player
 
 ### 14.5.5 Backlog
 
 The backlog is the pre-task inbox where agents and humans propose ideas
 before Coach triages them into tasks (see `kanban-specs-v2.md` §4.0).
 
-**Schema.** `backlog_tasks` table columns: `id`, `title`, `description` (TEXT, nullable), `proposed_by`, `proposed_at`, `status`, `reject_reason`, `promoted_task_id`. Existing rows on upgrade get `description = NULL` via `_ensure_columns`.
+**Schema.** `backlog_tasks` table columns: `id`, `title`, `description` (TEXT, nullable), `proposed_by`, `proposed_at`, `priority`, `trajectory_json`, `note`, `success_criteria`, `status`, `reject_reason`, `promoted_task_id`, `emergency`, `emergency_rationale`, `promotion_basis`. Existing rows on upgrade get nullable/default columns via `_ensure_columns`.
 
 | Endpoint | Notes |
 | --- | --- |
 | `POST /api/backlog` | Propose a backlog entry (any caller). Body `{title, description?, priority?}`. `priority` ∈ `low\|normal\|high\|urgent` (default `normal`). Returns `{id, title, description, priority, status}`. `description` max 8000 chars; omit or `null` for none. Emits `backlog_task_proposed{..., priority, description_present: bool}`. The kanban **Add to backlog** modal includes a priority selector; default is `normal`. |
-| `GET /api/backlog?status=` | List backlog entries. `status=pending` (default) / `all`. Returns `{backlog: [...]}` — each entry includes `description` (string or `null`). 400 on unknown status. |
-| `PATCH /api/backlog/{id}` | Edit a **pending** backlog entry. Body `{title?, description?}` (at least one required). `description: ""` clears to `null`. Returns `{id, title, description}`. 400 if title is blank or description exceeds 8000 chars; 404 if not found; 409 if status ≠ `pending`. Emits `backlog_entry_updated{id, old_title, new_title, actor, description_present: bool}`. Token-gated. |
+| `POST /api/tasks` without `parent_id` | Compatibility path for the human task composer. Non-emergency requests write a pending Backlog row and return `{kind: "backlog", backlog_id, status: "pending"}`; they do not create an active `tasks` row or role assignment. Later Backlog promotion creates a `truthgate` task and automatically runs TruthGate assessment. `emergency=true` requires `emergency_rationale`, records a promoted Backlog row, creates a `truthgate` task with emergency metadata and no Player role, and automatically starts and awaits TruthGate assessment before returning. `parent_id` requests are child tasks and keep the direct-dispatch subtask behavior. |
+| `GET /api/backlog?status=` | List backlog entries. `status=pending` (default) / `promoted` / `rejected` / `all`. Returns `{backlog: [...]}` — each entry includes `description` (string or `null`), `priority`, `is_next_eligible`, and emergency metadata when present. Pending rows are priority/FIFO sorted. 400 on unknown status. |
+| `PATCH /api/backlog/{id}` | Edit a **pending** backlog entry. Body `{title?, description?, priority?}` (at least one required). `description: ""` clears to `null`. Returns `{id, title, description, priority}`. 400 if title is blank, description exceeds 8000 chars, or priority is invalid; 404 if not found; 409 if status ≠ `pending`. Emits `backlog_entry_updated{id, old_title, new_title, actor, description_present: bool, old_priority?, new_priority?}`. Token-gated. |
 | `DELETE /api/backlog/{id}` | Delete a **pending** backlog entry. Returns `{id, deleted: true}`. 404 if not found; 409 if status ≠ `pending`. Emits `backlog_entry_deleted{id, title, actor}`. Token-gated. |
 
 **Status restriction.** Both mutating endpoints check `status = 'pending'`

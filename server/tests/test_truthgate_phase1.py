@@ -259,6 +259,20 @@ async def test_truthgate_exit_requires_pass_or_override(
     coach = _server_for("coach")
     approve = _handler(coach, "approve_stage")
 
+    # Promotion now auto-runs TruthGate and can record a sparse pass.
+    # Clear the verdict to keep this test focused on the exit invariant.
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE tasks SET truthgate_verdict = NULL, "
+            "truthgate_method = NULL, truth_basis = '[]' "
+            "WHERE id = ?",
+            (task_id,),
+        )
+        await c.commit()
+    finally:
+        await c.close()
+
     err = _err(await approve({
         "task_id": task_id,
         "next_stage": "execute",

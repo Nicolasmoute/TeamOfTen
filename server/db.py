@@ -146,6 +146,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Format: `projects/<id>/working/compass/audit_reports/<audit_id>.md`.
     compass_audit_report_path   TEXT,
     compass_audit_verdict       TEXT,
+    emergency                   INTEGER NOT NULL DEFAULT 0,
+    emergency_rationale         TEXT,
     truthgate_verdict           TEXT,
     truth_basis                 TEXT NOT NULL DEFAULT '[]',
     truth_concerns              TEXT NOT NULL DEFAULT '[]',
@@ -176,7 +178,10 @@ CREATE TABLE IF NOT EXISTS backlog_tasks (
     status              TEXT NOT NULL DEFAULT 'pending'
                         CHECK (status IN ('pending', 'promoted', 'rejected')),
     reject_reason       TEXT,
-    promoted_task_id    TEXT REFERENCES tasks(id)
+    promoted_task_id    TEXT REFERENCES tasks(id),
+    emergency           INTEGER NOT NULL DEFAULT 0,
+    emergency_rationale TEXT,
+    promotion_basis     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_backlog_status ON backlog_tasks(status, proposed_at);
 -- Note: indexes referencing kanban-new columns (`archived_at`,
@@ -960,6 +965,8 @@ async def init_db() -> None:
                     ("truthgate_warning", "truthgate_warning TEXT"),
                     ("provisional", "provisional INTEGER NOT NULL DEFAULT 0"),
                     ("closure_reference", "closure_reference TEXT"),
+                    ("emergency", "emergency INTEGER NOT NULL DEFAULT 0"),
+                    ("emergency_rationale", "emergency_rationale TEXT"),
                 ],
             )
             await _rebuild_tasks_for_truthgate_stage(db)
@@ -990,6 +997,9 @@ async def init_db() -> None:
                     ("trajectory_json", "trajectory_json TEXT"),
                     ("note", "note TEXT"),
                     ("success_criteria", "success_criteria TEXT"),
+                    ("emergency", "emergency INTEGER NOT NULL DEFAULT 0"),
+                    ("emergency_rationale", "emergency_rationale TEXT"),
+                    ("promotion_basis", "promotion_basis TEXT"),
                 ],
             )
 
@@ -1917,7 +1927,9 @@ async def _rebuild_tasks_for_truthgate_stage(db: aiosqlite.Connection) -> None:
                     truthgate_pending_proposal_id INTEGER,
                     truthgate_warning           TEXT,
                     provisional                 INTEGER NOT NULL DEFAULT 0,
-                    closure_reference           TEXT
+                    closure_reference           TEXT,
+                    emergency                   INTEGER NOT NULL DEFAULT 0,
+                    emergency_rationale         TEXT
                 )
                 """
             )
@@ -1938,7 +1950,8 @@ async def _rebuild_tasks_for_truthgate_stage(db: aiosqlite.Connection) -> None:
                      truthgate_at, truthgate_model, truthgate_method,
                      truthgate_override_rationale,
                      truthgate_pending_proposal_id, truthgate_warning,
-                     provisional, closure_reference)
+                     provisional, closure_reference,
+                     emergency, emergency_rationale)
                 SELECT
                     id, project_id, title, description, status, owner,
                     created_by, created_at, claimed_at, started_at,
@@ -1957,7 +1970,8 @@ async def _rebuild_tasks_for_truthgate_stage(db: aiosqlite.Connection) -> None:
                     truthgate_at, truthgate_model, truthgate_method,
                     truthgate_override_rationale,
                     truthgate_pending_proposal_id, truthgate_warning,
-                    COALESCE(provisional, 0), closure_reference
+                    COALESCE(provisional, 0), closure_reference,
+                    COALESCE(emergency, 0), emergency_rationale
                 FROM tasks
                 """
             )

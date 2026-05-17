@@ -4060,15 +4060,18 @@ async def _build_coach_coordination_block(
     # canonical project template; injecting them here too was pure
     # duplication. See git history for prior content.
 
-    # ---- Backlog (§4.0.5): top-5 oldest pending ideas ---------------
+    # ---- Backlog (§4.0.5): top-5 priority/FIFO pending ideas --------
     # Omit entirely when empty — zero token cost in the common case.
     try:
         bl_conn = await configured_conn()
         try:
             bl_cur = await bl_conn.execute(
-                "SELECT id, title, proposed_by, proposed_at "
+                "SELECT id, title, proposed_by, proposed_at, priority "
                 "FROM backlog_tasks WHERE status='pending' "
-                "ORDER BY proposed_at ASC LIMIT 5"
+                "ORDER BY CASE COALESCE(priority, 'normal') "
+                "WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 "
+                "WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 2 END, "
+                "proposed_at ASC, id ASC LIMIT 5"
             )
             backlog_rows = [dict(r) for r in await bl_cur.fetchall()]
         finally:
@@ -4103,12 +4106,15 @@ async def _build_coach_coordination_block(
                     age = "?"
                 title = (br.get("title") or "").strip()
                 lines.append(
-                    f"[#{br['id']}] \"{title}\" — {proposer_label}, {age} ago"
+                    f"[#{br['id']}] pri={br.get('priority') or 'normal'} "
+                    f"\"{title}\" — {proposer_label}, {age} ago"
                 )
             lines.append("")
             lines.append(
-                "Use coord_triage_backlog(id, action='promote', "
-                "trajectory=[...]) or action='reject'."
+                "Promote the first listed item unless true emergency; "
+                "out-of-order promotion requires emergency=true and "
+                "emergency_rationale. Use coord_triage_backlog(id, "
+                "action='promote', trajectory=[...]) or action='reject'."
             )
             lines.append("")
     except Exception:

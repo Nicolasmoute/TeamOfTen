@@ -233,10 +233,16 @@ function archiveAssignee(task) {
 
 
 function statusFlag(task) {
+  if (
+    task.status === "truthgate" &&
+    (task.truthgate_method === "classifier_error" || task.blocked)
+  ) {
+    return { label: "TG BLOCKED", tone: "var(--err)" };
+  }
+  if (task.blocked) return { label: "BLOCKED", tone: "var(--err)" };
   if (task.status === "truthgate" && !task.truthgate_verdict) {
     return { label: "NEEDS GATE", tone: "var(--warn)" };
   }
-  if (task.blocked) return { label: "BLOCKED", tone: "var(--err)" };
   if (task.priority === "urgent") return { label: "URGENT", tone: "var(--err)" };
   return null;
 }
@@ -421,10 +427,14 @@ function TruthGateBadge({ task }) {
   const chips = [];
   const method = task.truthgate_method || "";
   if (verdict) {
-    const label = verdict === "pending" ? "TruthGate pending" : verdict.replace(/^truthgate_/, "TG ");
+    const label = method === "classifier_error"
+      ? "TruthGate failed closed"
+      : verdict === "pending"
+      ? "TruthGate pending"
+      : verdict.replace(/^truthgate_/, "TG ");
     chips.push(html`<span
       class=${`kbn-truthgate-badge kbn-truthgate-${String(verdict).replace(/[^a-z0-9_-]/gi, "_")}`}
-      title=${method ? `method: ${method}` : "TruthGate"}
+      title=${task.truthgate_warning || (method ? `method: ${method}` : "TruthGate")}
     >${label}${method ? ` · ${method}` : ""}</span>`);
   }
   if (task.truthgate_pending_proposal_id) {
@@ -588,6 +598,7 @@ function Card({
                 <span>${task.created_at ? `created ${timeAgo(task.created_at)}` : "created unknown"}</span>
                 ${task.last_stage_change_at ? html`<span>stage ${timeAgo(task.last_stage_change_at)}</span>` : null}
                 ${task.workflow ? html`<span>${task.workflow}</span>` : null}
+                ${task.emergency ? html`<span>EMERGENCY ${task.emergency_rationale || ""}</span>` : null}
                 ${task.required_reviews ? html`<span>reviews ${task.required_reviews}</span>` : null}
                 ${task.blocked_reason ? html`<span>${task.blocked_reason}</span>` : null}
                 ${task.truthgate_warning ? html`<span>${task.truthgate_warning}</span>` : null}
@@ -1398,6 +1409,8 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
 
   const desc = entry.description || "";
   const pri = entry.priority || "normal";
+  const isNext = Boolean(entry.is_next_eligible);
+  const isEmergency = Boolean(entry.emergency);
 
   return html`
     <div
@@ -1408,6 +1421,8 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
       ${expanded && desc ? html`<div class="kbn-backlog-desc">${desc}</div>` : null}
       <div class="kbn-card-meta">
         <span class="kbn-backlog-priority-chip kbn-backlog-pri-${pri}">${pri.toUpperCase()}</span>
+        ${isNext ? html`<span class="kbn-backlog-priority-chip">NEXT</span>` : html`<span class="kbn-backlog-priority-chip" title="Waiting behind higher-priority or older backlog entries">WAITING</span>`}
+        ${isEmergency ? html`<span class="kbn-backlog-priority-chip kbn-backlog-pri-urgent" title=${entry.emergency_rationale || "Emergency promotion"}>EMERGENCY</span>` : null}
         <span class="kbn-backlog-proposer">${proposerLabel}</span>
         <span class="kbn-card-age">${timeAgo(entry.proposed_at)}</span>
         ${desc && !expanded ? html`<span class="kbn-backlog-has-desc" title="Has description">…</span>` : null}
