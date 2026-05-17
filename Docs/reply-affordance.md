@@ -22,9 +22,9 @@ Existing blue agent-to-agent reply behavior must be preserved. A change that add
 
 ## Agent-to-User Replies
 
-The UI may add a reply affordance to an agent-to-user message when the target agent slot and conversation context are known.
+The UI may add a reply affordance to an agent-to-user message when the target agent slot and conversation context are known. White `.event.text` final agent replies in AgentPane may show the same curved-arrow reply control as coordination messages, but they must route through the existing AgentPane `handleReply` / composer path rather than through a new backend endpoint.
 
-A human reply to an agent-to-user message routes as a human-authored message to the same agent slot and conversation context that produced or owns the original message. The reply should preserve enough context for the receiving agent to understand which prior message is being answered.
+A human reply to an agent-to-user message routes as a human-authored message to the same agent slot and conversation context that produced or owns the original message. For AgentPane `.event.text` rows, the quote sender is `event.agent_id || viewerSlot`; when neither is known, the reply affordance is hidden. The reply should preserve enough context for the receiving agent to understand which prior message is being answered.
 
 If the target slot or conversation context is ambiguous, the UI must not silently guess. It should hide the reply affordance or require a deliberate disambiguation before sending.
 
