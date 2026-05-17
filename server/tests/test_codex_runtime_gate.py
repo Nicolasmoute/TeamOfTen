@@ -286,6 +286,7 @@ async def test_team_codex_put_rejects_empty(
 async def test_team_codex_put_then_get_then_delete_round_trip(
     fresh_db: str,
     monkeypatch,
+    tmp_path,
 ) -> None:
     import pytest
     pytest.importorskip("fastapi")
@@ -295,6 +296,7 @@ async def test_team_codex_put_then_get_then_delete_round_trip(
 
     monkeypatch.delenv("HARNESS_TOKEN", raising=False)
     monkeypatch.setenv("HARNESS_SECRETS_KEY", "GsTLxlpTvgYFjJxkhBcGWpXFkHjMVlkJxmJgJmBtmJ8=")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
     await dbmod.init_db()
     with TestClient(mainmod.app) as c:
         r_put = c.put("/api/team/codex", json={"api_key": "sk-test-fake-key-1234"})
@@ -3258,6 +3260,7 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
     client = _CompactFakeClient()
     notes: list[tuple[str, str | None]] = []
     cleared: list[str] = []
+    exchange_cleared: list[str] = []
     handoffs: list[str] = []
 
     async def fake_get_client(
@@ -3280,6 +3283,9 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
     async def fake_clear(agent_id):
         cleared.append(agent_id)
 
+    async def fake_clear_exchange(agent_id):
+        exchange_cleared.append(agent_id)
+
     monkeypatch.setattr(
         codex_mod, "_get_codex_thread_id",
         lambda agent_id: _async_value("tid_full"),
@@ -3296,7 +3302,7 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
     monkeypatch.setattr(
         agentsmod,
         "_clear_exchange_log",
-        lambda agent_id: _async_value(None),
+        fake_clear_exchange,
     )
     # 800k of 1M = 80% — well above the 70% threshold.
     monkeypatch.setattr(
@@ -3343,6 +3349,7 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
     assert "handoffs/p1-auto.md" in (notes[0][1] or "")
     assert COMPACT_GENERATED_BODY in (notes[0][1] or "")
     assert cleared == ["p1"]
+    assert exchange_cleared == ["p1"]
     # session_compacted is the run_manual_compact tail event.
     compacted = [ev for ev in captured if ev["type"] == "session_compacted"]
     assert compacted
