@@ -121,6 +121,7 @@ Backlog is the default holding area for all non-emergency top-level work. Coach 
 
 - **MCP `coord_propose_task(title)`** — available to Coach and all Players. Inserts a `pending` row; emits `backlog_task_proposed {id, title, proposed_by}`.
 - **HTTP `POST /api/backlog {title}`** — human-facing. Same insert; `proposed_by='human'`; emits same event.
+- **HTTP `POST /api/tasks` without `parent_id`** — legacy human task composer compatibility path. Non-emergency requests insert a `pending` Backlog row, persist the supplied trajectory as advisory post-gate metadata (default `[{"stage":"execute","to":[]}]` when omitted), and do not create a `tasks` row, plant a Player role, or wake a Player. Requests with `emergency=true` must include non-empty `emergency_rationale`; they create a visible promoted Backlog row plus a `tasks` row in `truthgate` with emergency metadata and no Player role/wake. Requests with `parent_id` are child tasks and remain the direct-dispatch exception.
 - **Slash `/newtask <title>`** — UI convenience: calls `POST /api/backlog` directly, no agent turn, no token burn. Renders a `.sys` confirmation row in the pane.
 
 ### 4.0.3 Triage: `coord_triage_backlog`
@@ -338,7 +339,7 @@ All under `/api/tasks` or `/api/tasks/*`, gated by `HARNESS_TOKEN`.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/tasks` | List view. Unchanged from v1. |
-| POST | `/api/tasks` | Human task composer. Body `{title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?}`. Creates a pending Backlog item with `created_by='human'`; promotion later creates the active task in `truthgate`. The composer omits `trajectory` for the default `[{"stage":"execute","to":[]}]`. |
+| POST | `/api/tasks` | Human task composer. Body `{title, description?, parent_id?, priority?, workflow?, tracking_reason?, trajectory?, emergency?, emergency_rationale?}`. Without `parent_id`, non-emergency requests create a pending Backlog item; promotion later creates the active task in `truthgate`. Top-level `emergency=true` requires `emergency_rationale`, records a promoted Backlog row, and creates the active task in `truthgate` with no Player role/wake. With `parent_id`, creates a child task under the parent using the existing direct-dispatch path. The composer may omit `trajectory` for the top-level Backlog default `[{"stage":"execute","to":[]}]`; child tasks require an explicit single-owner first stage. |
 | GET | `/api/tasks/board` | Active 7 buckets (`truthgate` / `plan` / `execute` / `audit_syntax` / `audit_semantics` / `ship` / `verify`), priority-sorted then by `created_at`. |
 | GET | `/api/tasks/archive` | Paginated archive view. Unchanged. |
 | GET | `/api/tasks/flow_health` | Stage counts + subscriber liveness. Unchanged. |
