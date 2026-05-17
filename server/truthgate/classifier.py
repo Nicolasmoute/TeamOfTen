@@ -120,15 +120,21 @@ def parse_classifier_output(
     project_id: str,
     corpus: TruthCorpus,
 ) -> dict[str, Any]:
+    stripped = text.strip()
     try:
-        parsed = json.loads(text.strip())
+        parsed = json.loads(stripped)
     except json.JSONDecodeError as exc:
+        detail = "empty response" if not stripped else f"decode error at char {exc.pos}"
+        if stripped.startswith("```"):
+            detail = "markdown-fenced response"
         raise TruthGateClassificationError(
-            "TruthGate classifier returned invalid JSON"
+            "TruthGate classifier returned invalid JSON "
+            f"({detail}; excerpt={_response_excerpt(stripped)!r})"
         ) from exc
     if not isinstance(parsed, dict):
         raise TruthGateClassificationError(
-            "TruthGate classifier returned invalid JSON"
+            "TruthGate classifier returned invalid JSON "
+            f"(expected object; excerpt={_response_excerpt(stripped)!r})"
         )
     verdict = _required_str(parsed, "verdict")
     if verdict not in ALLOWED_CLASSIFIER_VERDICTS:
@@ -237,6 +243,13 @@ def _confidence(value: Any) -> float:
     if num < 0.0 or num > 1.0:
         raise TruthGateClassificationError("confidence must be between 0 and 1")
     return num
+
+
+def _response_excerpt(text: str, *, limit: int = 240) -> str:
+    collapsed = " ".join((text or "").split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 3] + "..."
 
 
 def _now_iso() -> str:

@@ -284,6 +284,19 @@ def test_verify_card_contract_uses_verifier_assignment_not_stale_owner(
     assert 'if (status === "verify") return "verifier";' in js
 
 
+def test_truthgate_classifier_error_ui_labels_are_not_pending() -> None:
+    static_dir = Path(__file__).parents[1] / "static"
+    kanban_js = (static_dir / "kanban.js").read_text(encoding="utf-8")
+    app_js = (static_dir / "app.js").read_text(encoding="utf-8")
+
+    blocked_idx = kanban_js.index('task.truthgate_method === "classifier_error"')
+    pending_idx = kanban_js.index('task.status === "truthgate" && !task.truthgate_verdict')
+    assert blocked_idx < pending_idx
+    assert "TG BLOCKED" in kanban_js
+    assert "TruthGate failed closed" in kanban_js
+    assert "TruthGate assessment started" in app_js
+
+
 # ----------------------------------------------------------------- /archive
 
 def test_archive_returns_only_archived(client: TestClient) -> None:

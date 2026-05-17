@@ -2,9 +2,10 @@
 
 The strict validator mode still requires `trajectory[0].to` to name
 exactly one Player for direct-dispatch paths. Coach top-level
-`coord_create_task` is now Backlog/TruthGate pre-dispatch, so it opts
-out and accepts empty or pool first-stage `to` values. Subsequent
-stages' `to` may also be pool/empty (FYI only).
+`coord_create_task` and top-level HTTP task creation are now
+Backlog/TruthGate pre-dispatch, so they opt out and accept empty or
+pool first-stage `to` values. Subsequent stages' `to` may also be
+pool/empty (FYI only).
 
 This test pins the boundary between strict validation and the
 Backlog/TruthGate MCP path.
@@ -174,7 +175,7 @@ async def test_mcp_create_task_accepts_single_name_first_stage(
 
 # ---------------------------------------------------------------- HTTP path
 
-async def test_http_create_rejects_pool_first_stage(fresh_db: str) -> None:
+async def test_http_create_pool_first_stage_lands_in_backlog(fresh_db: str) -> None:
     await init_db()
     client = TestClient(app)
     r = client.post(
@@ -184,11 +185,13 @@ async def test_http_create_rejects_pool_first_stage(fresh_db: str) -> None:
             "trajectory": [{"stage": "execute", "to": ["p2", "p3"]}],
         },
     )
-    assert r.status_code == 400, r.text
-    assert "trajectory[0].to" in r.json()["detail"]
+    assert r.status_code == 200, r.text
+    assert r.json()["kind"] == "backlog"
+    assert r.json()["status"] == "pending"
+    assert r.json().get("backlog_id")
 
 
-async def test_http_create_rejects_empty_first_stage(fresh_db: str) -> None:
+async def test_http_create_empty_first_stage_lands_in_backlog(fresh_db: str) -> None:
     await init_db()
     client = TestClient(app)
     r = client.post(
@@ -198,24 +201,29 @@ async def test_http_create_rejects_empty_first_stage(fresh_db: str) -> None:
             "trajectory": [{"stage": "execute", "to": []}],
         },
     )
-    assert r.status_code == 400, r.text
-    assert "trajectory[0].to" in r.json()["detail"]
+    assert r.status_code == 200, r.text
+    assert r.json()["kind"] == "backlog"
+    assert r.json()["status"] == "pending"
 
 
-async def test_http_create_rejects_default_no_trajectory(fresh_db: str) -> None:
-    """HTTP default is `[{stage:execute,to:[]}]` when caller omits
-    trajectory. v2.0.1 requires the caller to supply a single-name
-    first-stage `to` explicitly."""
+async def test_http_create_default_no_trajectory_lands_in_backlog(
+    fresh_db: str,
+) -> None:
+    """Top-level HTTP default is a pre-dispatch Backlog entry."""
     await init_db()
     client = TestClient(app)
     r = client.post(
         "/api/tasks",
         json={"title": "http default"},
     )
-    assert r.status_code == 400, r.text
+    assert r.status_code == 200, r.text
+    assert r.json()["kind"] == "backlog"
+    assert r.json()["status"] == "pending"
 
 
-async def test_http_create_accepts_single_name_first_stage(fresh_db: str) -> None:
+async def test_http_create_single_name_first_stage_lands_in_backlog(
+    fresh_db: str,
+) -> None:
     await init_db()
     client = TestClient(app)
     r = client.post(
@@ -226,4 +234,6 @@ async def test_http_create_accepts_single_name_first_stage(fresh_db: str) -> Non
         },
     )
     assert r.status_code == 200, r.text
-    assert r.json().get("task_id")
+    assert r.json()["kind"] == "backlog"
+    assert r.json()["status"] == "pending"
+    assert r.json().get("backlog_id")

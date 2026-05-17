@@ -233,10 +233,16 @@ function archiveAssignee(task) {
 
 
 function statusFlag(task) {
+  if (
+    task.status === "truthgate" &&
+    (task.truthgate_method === "classifier_error" || task.blocked)
+  ) {
+    return { label: "TG BLOCKED", tone: "var(--err)" };
+  }
+  if (task.blocked) return { label: "BLOCKED", tone: "var(--err)" };
   if (task.status === "truthgate" && !task.truthgate_verdict) {
     return { label: "NEEDS GATE", tone: "var(--warn)" };
   }
-  if (task.blocked) return { label: "BLOCKED", tone: "var(--err)" };
   if (task.priority === "urgent") return { label: "URGENT", tone: "var(--err)" };
   return null;
 }
@@ -421,10 +427,14 @@ function TruthGateBadge({ task }) {
   const chips = [];
   const method = task.truthgate_method || "";
   if (verdict) {
-    const label = verdict === "pending" ? "TruthGate pending" : verdict.replace(/^truthgate_/, "TG ");
+    const label = method === "classifier_error"
+      ? "TruthGate failed closed"
+      : verdict === "pending"
+      ? "TruthGate pending"
+      : verdict.replace(/^truthgate_/, "TG ");
     chips.push(html`<span
       class=${`kbn-truthgate-badge kbn-truthgate-${String(verdict).replace(/[^a-z0-9_-]/gi, "_")}`}
-      title=${method ? `method: ${method}` : "TruthGate"}
+      title=${task.truthgate_warning || (method ? `method: ${method}` : "TruthGate")}
     >${label}${method ? ` · ${method}` : ""}</span>`);
   }
   if (task.truthgate_pending_proposal_id) {

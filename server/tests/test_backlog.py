@@ -410,6 +410,8 @@ async def test_triage_backlog_promote() -> None:
     d = dict(task)
     assert d["title"] == "Ship v2"
     assert d["status"] == "truthgate"
+    assert d["truthgate_verdict"] == "truthgate_pass"
+    assert d["truthgate_method"] == "classifier_sparse"
 
     promoted = [e for e in events if e.get("type") == "backlog_task_promoted"]
     assert len(promoted) == 1
@@ -424,8 +426,79 @@ async def test_triage_backlog_promote() -> None:
     assert stage_changed[0]["from"] is None
     assert stage_changed[0]["to"] == "truthgate"
     assert stage_changed[0]["reason"] == "backlog_promoted"
+    tg_started = [e for e in events if e.get("type") == "task_truthgate_started"]
+    assert len(tg_started) == 1
+    assert tg_started[0]["task_id"] == promoted_task_id
+    assert tg_started[0]["trigger"] == "backlog_promoted"
+    tg_completed = [e for e in events if e.get("type") == "task_truthgate_completed"]
+    assert len(tg_completed) == 1
+    assert tg_completed[0]["task_id"] == promoted_task_id
+    assert tg_completed[0]["verdict"] == "truthgate_pass"
     role_assigned = [e for e in events if e.get("type") == "task_role_assigned"]
     assert role_assigned == []
+
+
+@pytest.mark.asyncio
+async def test_triage_backlog_promote_classifier_error_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import server.truthgate.classifier as classifier
+
+    async def fake_run(project_id: str, task: Any) -> dict[str, Any]:
+        raise classifier.TruthGateClassificationError(
+            "TruthGate classifier returned invalid JSON "
+            "(decode error at char 0; excerpt='not json')"
+        )
+
+    monkeypatch.setattr(classifier, "run_truthgate_classifier", fake_run)
+
+    q = bus.subscribe()
+    backlog_id = await _insert_backlog("Malformed classifier response")
+    try:
+        result = await _handler("coach", "coord_triage_backlog")({
+            "id": str(backlog_id),
+            "action": "promote",
+            "trajectory": [{"stage": "execute", "to": ["p1"]}],
+        })
+        events = _drain(q)
+    finally:
+        bus.unsubscribe(q)
+
+    assert _is_ok(result), _text(result)
+    assert "failed closed" in _text(result)
+    backlog = await _get_backlog(backlog_id)
+    assert backlog is not None
+    task_id = backlog["promoted_task_id"]
+
+    c = await configured_conn()
+    try:
+        task = dict(await (await c.execute(
+            "SELECT status, truthgate_verdict, truthgate_method, blocked, "
+            "blocked_reason, truthgate_warning FROM tasks WHERE id = ?",
+            (task_id,),
+        )).fetchone())
+    finally:
+        await c.close()
+
+    assert task["status"] == "truthgate"
+    assert task["truthgate_verdict"] is None
+    assert task["truthgate_method"] == "classifier_error"
+    assert task["blocked"] == 1
+    assert "invalid JSON" in task["blocked_reason"]
+    assert "not json" in task["truthgate_warning"]
+    blocked = [e for e in events if e.get("type") == "task_truthgate_blocked"]
+    assert len(blocked) == 1
+    assert blocked[0]["task_id"] == task_id
+    assert blocked[0]["trigger"] == "backlog_promoted"
+
+    err = await _handler("coach", "coord_approve_stage")({
+        "task_id": task_id,
+        "next_stage": "execute",
+        "assignee": "p1",
+        "note": "go",
+    })
+    assert _is_err(err)
+    assert "requires a TruthGate pass or override" in _text(err)
 
 
 @pytest.mark.asyncio

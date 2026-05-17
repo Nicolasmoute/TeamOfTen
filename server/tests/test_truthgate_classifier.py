@@ -109,8 +109,26 @@ def test_parse_invalid_json_fails_closed(fresh_db: str) -> None:
         total_budget_chars=32_000,
         per_file_chars=16_000,
     )
-    with pytest.raises(TruthGateClassificationError, match="invalid JSON"):
+    with pytest.raises(TruthGateClassificationError, match="invalid JSON") as exc:
         parse_classifier_output("not json", project_id=project_id, corpus=corpus)
+    assert "decode error" in str(exc.value)
+    assert "not json" in str(exc.value)
+
+
+def test_parse_invalid_json_diagnostic_is_bounded(fresh_db: str) -> None:
+    project_id = "parsebounded"
+    _write_truth(project_id, "a.md", "A")
+    corpus = gather_truth_corpus(
+        project_id,
+        total_budget_chars=32_000,
+        per_file_chars=16_000,
+    )
+    raw = "not json " + ("x" * 1000)
+    with pytest.raises(TruthGateClassificationError, match="invalid JSON") as exc:
+        parse_classifier_output(raw, project_id=project_id, corpus=corpus)
+    message = str(exc.value)
+    assert "excerpt=" in message
+    assert len(message) < 400
 
 
 @pytest.mark.parametrize(
