@@ -177,3 +177,37 @@ async def notify_coach_truth_amendment_resolved(
         body=body,
         wake_source="truthgate_amendment_resolved",
     )
+
+
+async def notify_coach_stale_truthgate_basis(
+    *,
+    project_id: str,
+    task: dict[str, Any],
+    audit_kind: str,
+    auditor: str,
+    warnings: tuple[str, ...] | list[str],
+) -> None:
+    task_id = str(task.get("id") or "").strip()
+    title = str(task.get("title") or "(untitled)").strip()
+    subject = f"TruthGate basis stale during audit: {task_id}"
+    body = "\n".join([
+        f"Task: {task_id} — {title}",
+        f"Audit stage: {audit_kind}",
+        f"Auditor: {auditor}",
+        "Verdict/failure: stale_truthgate_basis",
+        f"Reason: {_clip('; '.join(str(w) for w in warnings) or 'truth basis changed after the recorded TruthGate run')}",
+        f"Truth basis: {_list_text(task.get('truth_basis'))}",
+        "Expected Coach action: inspect the truth change, then call "
+        "coord_refresh_truthgate_basis(task_id=<id>, rationale=<why the "
+        "current cited truth still authorizes this in-flight task>) so the "
+        "auditor can resubmit PASS, or reroute/archive/rework deliberately.",
+        "",
+        "No audit PASS was recorded, no stage was advanced, and no unrelated "
+        "Player was woken.",
+    ])
+    await _insert_coach_message_and_wake(
+        project_id=project_id,
+        subject=subject,
+        body=body,
+        wake_source="truthgate_stale_basis",
+    )

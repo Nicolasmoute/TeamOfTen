@@ -7339,7 +7339,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         c = await configured_conn()
         try:
             cur = await c.execute(
-                "SELECT status, truthgate_verdict, truth_basis, "
+                "SELECT id, title, status, truthgate_verdict, truth_basis, "
                 "truth_concerns, truthgate_at, truthgate_method, "
                 "truthgate_warning, provisional, closure_reference "
                 "FROM tasks WHERE id = ? AND project_id = ?",
@@ -7404,6 +7404,31 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     details.append(
                         "truth basis warning: "
                         + "; ".join(targeted_check.warnings)
+                    )
+                if targeted_check.stale_basis:
+                    try:
+                        from server.truthgate.notifications import (  # noqa: PLC0415
+                            notify_coach_stale_truthgate_basis,
+                        )
+
+                        await notify_coach_stale_truthgate_basis(
+                            project_id=project_id,
+                            task={**task_data, "id": task_id},
+                            audit_kind=kind,
+                            auditor=effective_auditor,
+                            warnings=targeted_check.warnings,
+                        )
+                    except Exception:
+                        pass
+                    return _err(
+                        "targeted TruthGate check blocks PASS because a "
+                        "cited truth_basis file changed after the recorded "
+                        "TruthGate run. Coach has been notified. Do not "
+                        "submit FAIL solely for administrative staleness; "
+                        "wait for Coach to call coord_refresh_truthgate_basis "
+                        "with an explicit rationale, reroute/rework, or make "
+                        "another deliberate decision. "
+                        + " ".join(details)
                     )
                 return _err(
                     "targeted TruthGate check blocks PASS. Submit FAIL "
@@ -9568,6 +9593,115 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         )
 
     @tool(
+        "coord_refresh_truthgate_basis",
+        (
+            "Coach-only. Refresh the recorded TruthGate basis checkpoint "
+            "for an in-flight task that is already in audit_syntax or "
+            "audit_semantics and whose cited truth_basis changed after "
+            "the recorded TruthGate run. This is an explicit Coach "
+            "decision path for administrative stale-basis blocks: it "
+            "updates truthgate_at/truthgate_warning with Coach's rationale "
+            "so the auditor can resubmit, but it does NOT record an audit "
+            "PASS, rerun the classifier, advance the stage, or wake a "
+            "Player.\n\n"
+            "Params:\n"
+            "- task_id: required\n"
+            "- rationale: required; why the current cited truth still "
+            "authorizes this in-flight task without rework"
+        ),
+        {"task_id": str, "rationale": str},
+    )
+    async def refresh_truthgate_basis(args: dict[str, Any]) -> dict[str, Any]:
+        if not caller_is_coach:
+            return _err("coord_refresh_truthgate_basis is Coach-only.")
+        task_id = (args.get("task_id") or "").strip()
+        rationale = (args.get("rationale") or "").strip()
+        if not task_id:
+            return _err("task_id is required")
+        if not rationale:
+            return _err("rationale is required")
+        if len(rationale) > 1000:
+            return _err(
+                f"rationale too long ({len(rationale)} chars, max 1000)"
+            )
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT id, title, status, truthgate_verdict, truth_basis, "
+                "truth_concerns, truthgate_at, truthgate_method, "
+                "truthgate_warning, provisional, closure_reference "
+                "FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return _err(f"task {task_id} not found")
+            task_data = dict(row)
+            status = str(task_data.get("status") or "")
+            if status not in AUDIT_STAGES:
+                return _err(
+                    "coord_refresh_truthgate_basis only applies while "
+                    f"task {task_id} is in audit_syntax/audit_semantics "
+                    f"(stage={status or 'unknown'})."
+                )
+            verdict = str(task_data.get("truthgate_verdict") or "").strip()
+            if verdict not in TRUTHGATE_EXIT_VERDICTS:
+                return _err(
+                    f"task {task_id} has no TruthGate pass/override verdict "
+                    f"to refresh (current verdict: {verdict or 'none'})."
+                )
+            from server.truthgate.targeted import (  # noqa: PLC0415
+                check_audit_against_truthgate,
+            )
+
+            targeted_check = check_audit_against_truthgate(
+                project_id=project_id,
+                task=task_data,
+                audit_body="Administrative stale TruthGate basis refresh.",
+                verdict="pass",
+            )
+            if not targeted_check.stale_basis:
+                warnings = "; ".join(targeted_check.warnings)
+                suffix = f" Warnings: {warnings}" if warnings else ""
+                return _err(
+                    f"task {task_id} does not have a stale TruthGate basis "
+                    f"checkpoint to refresh.{suffix}"
+                )
+
+            now = _now_iso()
+            refresh_warning = (
+                "TruthGate basis refreshed by Coach during audit at "
+                f"{now}: {rationale}"
+            )
+            await c.execute(
+                "UPDATE tasks SET truthgate_at = ?, truthgate_warning = ? "
+                "WHERE id = ? AND project_id = ?",
+                (now, refresh_warning[:1000], task_id, project_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+
+        await bus.publish({
+            "ts": _now_iso(),
+            "agent_id": caller_id,
+            "type": "task_truthgate_basis_refreshed",
+            "task_id": task_id,
+            "project_id": project_id,
+            "stage": status,
+            "rationale": rationale,
+            "warnings": list(targeted_check.warnings),
+        })
+        return _ok(
+            f"Refreshed TruthGate basis checkpoint for {task_id} in "
+            f"{status}. No audit PASS was recorded and no stage was "
+            "advanced; the assigned auditor may resubmit after reviewing "
+            "Coach's rationale."
+        )
+
+    @tool(
         "coord_record_truthgate_override",
         (
             "Coach-only. Record an explicit TruthGate override for a task "
@@ -10530,6 +10664,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         archive_task,
         role_complete,
         run_truthgate,
+        refresh_truthgate_basis,
         record_truthgate_override,
         record_provisional_closure,
         request_plan_review,
@@ -10873,6 +11008,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_archive_task",
     "mcp__coord__coord_role_complete",
     "mcp__coord__coord_run_truthgate",
+    "mcp__coord__coord_refresh_truthgate_basis",
     "mcp__coord__coord_record_truthgate_override",
     "mcp__coord__coord_record_provisional_closure",
     "mcp__coord__coord_request_plan_review",
