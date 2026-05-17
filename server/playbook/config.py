@@ -63,10 +63,10 @@ ADJUST_DELTA_CAP = _env_float("HARNESS_PLAYBOOK_ADJUST_DELTA_CAP", 0.25)
 
 # ----------------------------------------------------------- caps
 # Statement-count caps. Soft cap is the working ceiling; hard cap is
-# the operator-review trigger (spec §5.7). Pressure cap is the
-# sweep-engine auto-archive trigger — when active > PRESSURE_CAP at the
-# end of sweep_engine_actions, lowest-weight non-immutable statements
-# are archived until active <= SOFT_STATEMENT_CAP (spec §5.7.1).
+# the operator-review trigger (spec §5.7). Pressure cap governs the
+# reflection prompt directive: above this count the LLM is pushed toward
+# merges and downward adjustments before proposing growth. The final
+# pressure sweep is stricter: it only archives when active > HARD.
 SOFT_STATEMENT_CAP = _env_int("HARNESS_PLAYBOOK_SOFT_CAP", 60)
 HARD_STATEMENT_CAP = _env_int("HARNESS_PLAYBOOK_HARD_CAP", 80)
 PRESSURE_CAP = _env_int("HARNESS_PLAYBOOK_PRESSURE_CAP", 60)

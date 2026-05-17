@@ -80,6 +80,10 @@ class MergeProposalBody(BaseModel):
     drop_id: str
 
 
+class BatchProposalBody(BaseModel):
+    operations: list[dict[str, Any]]
+
+
 # ---------------------------------------------------------------- helpers
 
 
@@ -151,6 +155,69 @@ def build_router(
 ) -> APIRouter:
     router = APIRouter(prefix="/api/playbook", tags=["playbook"])
     deps = [Depends(require_token)]
+
+    async def _apply_dashboard_operations(
+        operations: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], bool]:
+        """Apply dashboard proposals through the same mutation path as
+        runner/MCP, then run the final hard-cap pressure sweep."""
+        lattice = load_lattice()
+        archive = load_archive()
+        engine_actions: list[dict[str, Any]] = []
+        applied, rejected, hard_cap_hit = mutate.apply_coach_proposals(
+            lattice,
+            archive,
+            operations,
+            creation_weight=config.COACH_CREATION_WEIGHT,
+            engine_actions=engine_actions,
+        )
+        engine_actions.extend(
+            mutate.sweep_engine_actions(
+                lattice,
+                archive,
+                include_hygiene=False,
+                include_pressure=True,
+            )
+        )
+        if applied or engine_actions:
+            await save_lattice(lattice)
+            await save_archive(archive)
+        return applied, rejected, engine_actions, hard_cap_hit
+
+    async def _publish_dashboard_outcome(
+        *,
+        applied: list[dict[str, Any]],
+        engine_actions: list[dict[str, Any]],
+        rejected: list[dict[str, Any]],
+        hard_cap_hit: bool,
+        creation_count: int,
+    ) -> None:
+        if applied or engine_actions:
+            await _publish({
+                "type": "playbook_changes_applied",
+                "operations_count": len(applied),
+                "source": "human_dashboard",
+            })
+        if hard_cap_hit:
+            hard_rejected = [
+                r for r in rejected if r.get("reason") == "hard_cap_pressure"
+            ]
+            await _publish({
+                "type": "playbook_soft_cap_exceeded",
+                "count": hard_rejected[0].get("pressure") if hard_rejected else config.HARD_STATEMENT_CAP + 1,
+                "dropped": len(hard_rejected) or creation_count,
+            })
+            await _publish({
+                "type": "human_attention",
+                "agent_id": "playbook",
+                "subject": "Playbook hard cap pressure",
+                "body": (
+                    "Dashboard proposal pressure exceeded the hard cap; "
+                    "creations were rejected. Review the lattice for "
+                    "merges, downward adjustments, or deletions."
+                ),
+                "urgency": "high",
+            })
 
     # ---- GET /state
     @router.get("/state", dependencies=deps)
@@ -381,21 +448,21 @@ def build_router(
         if not ok_lock:
             raise HTTPException(status_code=503, detail="playbook engine busy")
         try:
-            lattice = load_lattice()
-            ok, err = mutate.apply_op_adjust(
-                lattice, sid=sid, delta=body.delta,
-                reason=f"human_proposal_apply (actor={actor})",
+            applied, rejected, engine_actions, hard = await _apply_dashboard_operations(
+                [{"op": "adjust", "id": sid, "delta": body.delta,
+                  "reason": f"human_proposal_apply (actor={actor})"}]
             )
-            if not ok:
-                raise HTTPException(status_code=400, detail=err or "adjust_failed")
-            await save_lattice(lattice)
         finally:
             runner._run_lock.release()
-        await _publish({
-            "type": "playbook_changes_applied",
-            "operations_count": 1,
-            "source": "human_dashboard",
-        })
+        await _publish_dashboard_outcome(
+            applied=applied,
+            engine_actions=engine_actions,
+            rejected=rejected,
+            hard_cap_hit=hard,
+            creation_count=0,
+        )
+        if rejected:
+            raise HTTPException(status_code=400, detail=rejected[0].get("reason") or "adjust_failed")
         return {"ok": True, "id": sid}
 
     @router.post("/proposals/create/new", dependencies=deps)
@@ -408,25 +475,57 @@ def build_router(
         if not ok_lock:
             raise HTTPException(status_code=503, detail="playbook engine busy")
         try:
-            lattice = load_lattice()
-            archive = load_archive()
-            applied, rejected, hard = mutate.apply_coach_proposals(
-                lattice, archive,
+            applied, rejected, engine_actions, hard = await _apply_dashboard_operations(
                 [{"op": "create", "text": body.text, "weight": body.weight,
-                  "reason": f"human_proposal_create (actor={actor})"}],
-                creation_weight=config.COACH_CREATION_WEIGHT,
+                  "reason": f"human_proposal_create (actor={actor})"}]
             )
-            if rejected:
-                raise HTTPException(status_code=400, detail=rejected[0].get("reason") or "create_failed")
-            await save_lattice(lattice)
         finally:
             runner._run_lock.release()
-        await _publish({
-            "type": "playbook_changes_applied",
-            "operations_count": 1,
-            "source": "human_dashboard",
-        })
-        return {"ok": True, "applied": applied}
+        await _publish_dashboard_outcome(
+            applied=applied,
+            engine_actions=engine_actions,
+            rejected=rejected,
+            hard_cap_hit=hard,
+            creation_count=1,
+        )
+        if rejected:
+            raise HTTPException(status_code=400, detail=rejected[0].get("reason") or "create_failed")
+        return {"ok": True, "applied": applied, "engine_actions": engine_actions}
+
+    @router.post("/proposals/batch", dependencies=deps)
+    async def post_proposal_batch(
+        body: BatchProposalBody,
+        request: Request,
+    ) -> dict[str, Any]:
+        actor = audit_actor(request)
+        operations = []
+        for op in body.operations:
+            if isinstance(op, dict):
+                operations.append({**op, "reason": op.get("reason") or f"human_batch (actor={actor})"})
+        if not operations:
+            raise HTTPException(status_code=400, detail="operations required")
+        ok_lock = await _acquire_with_timeout(timeout=10.0)
+        if not ok_lock:
+            raise HTTPException(status_code=503, detail="playbook engine busy")
+        try:
+            applied, rejected, engine_actions, hard = await _apply_dashboard_operations(operations)
+        finally:
+            runner._run_lock.release()
+        creation_count = sum(1 for op in operations if op.get("op") == "create")
+        await _publish_dashboard_outcome(
+            applied=applied,
+            engine_actions=engine_actions,
+            rejected=rejected,
+            hard_cap_hit=hard,
+            creation_count=creation_count,
+        )
+        return {
+            "ok": bool(applied or not rejected),
+            "applied": applied,
+            "rejected": rejected,
+            "engine_actions": engine_actions,
+            "hard_cap_hit": hard,
+        }
 
     @router.post("/proposals/merge/{keep_id}", dependencies=deps)
     async def post_proposal_merge(
@@ -441,24 +540,21 @@ def build_router(
         if not ok_lock:
             raise HTTPException(status_code=503, detail="playbook engine busy")
         try:
-            lattice = load_lattice()
-            archive = load_archive()
-            ok, err = mutate.apply_op_merge(
-                lattice, archive,
-                keep_id=body.keep_id, drop_id=body.drop_id,
-                reason=f"human_proposal_merge (actor={actor})",
+            applied, rejected, engine_actions, hard = await _apply_dashboard_operations(
+                [{"op": "merge", "keep_id": body.keep_id, "drop_id": body.drop_id,
+                  "reason": f"human_proposal_merge (actor={actor})"}]
             )
-            if not ok:
-                raise HTTPException(status_code=400, detail=err or "merge_failed")
-            await save_lattice(lattice)
-            await save_archive(archive)
         finally:
             runner._run_lock.release()
-        await _publish({
-            "type": "playbook_changes_applied",
-            "operations_count": 1,
-            "source": "human_dashboard",
-        })
+        await _publish_dashboard_outcome(
+            applied=applied,
+            engine_actions=engine_actions,
+            rejected=rejected,
+            hard_cap_hit=hard,
+            creation_count=0,
+        )
+        if rejected:
+            raise HTTPException(status_code=400, detail=rejected[0].get("reason") or "merge_failed")
         return {"ok": True, "keep_id": keep_id, "drop_id": body.drop_id}
 
     # ---- GET /runs

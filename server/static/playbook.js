@@ -286,6 +286,15 @@ export function PlaybookPane({ slot, authedFetch, playbookEvents, onClose, onDro
   const [error, setError] = useState(null);
   const [overrideTarget, setOverrideTarget] = useState(null);
   const [busyAction, setBusyAction] = useState(null);
+  const [feedback, setFeedback] = useState(null);
+  const [mergeKeepId, setMergeKeepId] = useState("");
+  const [mergeDropId, setMergeDropId] = useState("");
+  const [createDraft, setCreateDraft] = useState({ text: "", weight: "0.60" });
+  const [createQueue, setCreateQueue] = useState([]);
+
+  const showFeedback = useCallback((kind, text) => {
+    setFeedback({ kind, text });
+  }, []);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -381,6 +390,104 @@ export function PlaybookPane({ slot, authedFetch, playbookEvents, onClose, onDro
     }
   }, [authedFetch, refresh]);
 
+  const handleMerge = useCallback(async () => {
+    if (!mergeKeepId || !mergeDropId) {
+      showFeedback("warn", "Choose two active statements before merging.");
+      return;
+    }
+    if (mergeKeepId === mergeDropId) {
+      showFeedback("warn", "Keep and drop ids must be different.");
+      return;
+    }
+    if (!window.confirm(`Merge ${mergeDropId} into ${mergeKeepId}?`)) return;
+    setBusyAction("merge");
+    try {
+      await apiFetch(authedFetch, `/proposals/merge/${mergeKeepId}`, {
+        method: "POST",
+        body: JSON.stringify({ keep_id: mergeKeepId, drop_id: mergeDropId }),
+      });
+      showFeedback("ok", `Merged ${mergeDropId} into ${mergeKeepId}.`);
+      setMergeDropId("");
+      await refresh();
+    } catch (e) {
+      showFeedback("err", `Merge failed: ${e.message}`);
+    } finally {
+      setBusyAction(null);
+    }
+  }, [authedFetch, mergeKeepId, mergeDropId, refresh, showFeedback]);
+
+  const addCreation = useCallback((e) => {
+    e.preventDefault();
+    const text = (createDraft.text || "").trim();
+    const weight = Number(createDraft.weight);
+    if (!text) {
+      showFeedback("warn", "Creation text is required.");
+      return;
+    }
+    if (!Number.isFinite(weight) || weight < 0 || weight > 1) {
+      showFeedback("warn", "Creation weight must be between 0 and 1.");
+      return;
+    }
+    setCreateQueue((items) => [
+      ...items,
+      { key: `${Date.now()}-${items.length}`, text, weight },
+    ]);
+    setCreateDraft({ text: "", weight: "0.60" });
+    showFeedback("ok", "Creation added to ordered queue.");
+  }, [createDraft, showFeedback]);
+
+  const moveCreation = useCallback((idx, dir) => {
+    setCreateQueue((items) => {
+      const nextIdx = idx + dir;
+      if (nextIdx < 0 || nextIdx >= items.length) return items;
+      const copy = items.slice();
+      const tmp = copy[idx];
+      copy[idx] = copy[nextIdx];
+      copy[nextIdx] = tmp;
+      return copy;
+    });
+  }, []);
+
+  const removeCreation = useCallback((idx) => {
+    setCreateQueue((items) => items.filter((_, i) => i !== idx));
+  }, []);
+
+  const applyCreationQueue = useCallback(async () => {
+    if (createQueue.length === 0) {
+      showFeedback("warn", "Creation queue is empty.");
+      return;
+    }
+    setBusyAction("createQueue");
+    try {
+      const result = await apiFetch(authedFetch, "/proposals/batch", {
+        method: "POST",
+        body: JSON.stringify({
+          operations: createQueue.map((item) => ({
+            op: "create",
+            text: item.text,
+            weight: item.weight,
+            reason: "human_dashboard_ordered_create",
+          })),
+        }),
+      });
+      const applied = result.applied || [];
+      const rejected = result.rejected || [];
+      const rejectedReasons = rejected.map((r) => r.reason).filter(Boolean);
+      showFeedback(
+        rejected.length ? "warn" : "ok",
+        `Applied ${applied.length}; rejected ${rejected.length}${
+          rejectedReasons.length ? ` (${rejectedReasons.join(", ")})` : ""
+        }.`,
+      );
+      if (applied.length || rejected.length) setCreateQueue([]);
+      await refresh();
+    } catch (e) {
+      showFeedback("err", `Create failed: ${e.message}`);
+    } finally {
+      setBusyAction(null);
+    }
+  }, [authedFetch, createQueue, refresh, showFeedback]);
+
   const grouped = useMemo(() => {
     if (!state) return BUCKETS.map(() => []);
     const out = BUCKETS.map(() => []);
@@ -408,6 +515,10 @@ export function PlaybookPane({ slot, authedFetch, playbookEvents, onClose, onDro
 
   const { active = [], archived = [], runs = [], flags = {}, caps = {} } = state;
   const capPct = caps.soft ? (caps.active_count / caps.soft) * 100 : 0;
+  const aboveSoft = !!(caps.soft && caps.active_count > caps.soft);
+  const aboveHard = !!(caps.hard && caps.active_count > caps.hard);
+  const activeOptions = active.slice().sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  const capClass = aboveHard ? "pb-cap-hard" : aboveSoft ? "pb-cap-soft" : "";
 
   return html`
     <div class="pb-pane">
@@ -422,9 +533,10 @@ export function PlaybookPane({ slot, authedFetch, playbookEvents, onClose, onDro
 
       <!-- Header bar -->
       <div class="pb-header">
-        <div class="pb-cap">
+        <div class=${`pb-cap ${capClass}`}>
           <div class="pb-cap-label">
-            ${caps.active_count} / ${caps.soft || "?"} statements
+            ${caps.active_count} / ${caps.soft || "?"} active
+            <span class="pb-cap-hard-label">hard ${caps.hard || "?"}</span>
           </div>
           <div class="pb-cap-bar">
             <div class="pb-cap-fill" style=${`width: ${clamp(capPct, 0, 100)}%`}></div>
@@ -460,11 +572,99 @@ export function PlaybookPane({ slot, authedFetch, playbookEvents, onClose, onDro
         </div>
       </div>
 
+      ${feedback ? html`
+        <div class=${`pb-banner pb-banner-${feedback.kind}`}>
+          <span>${feedback.text}</span>
+          <button class="pb-banner-close" onClick=${() => setFeedback(null)}>x</button>
+        </div>
+      ` : ""}
+
       ${flags.bootstrap_blocked ? html`
         <div class="pb-banner pb-banner-err">
           Bootstrap blocked after 3 consecutive failures. Reset to clear and re-arm.
         </div>
       ` : ""}
+
+      ${aboveHard ? html`
+        <div class="pb-banner pb-banner-err">
+          Above hard cap: the next mutation will archive eligible low-weight statements down toward ${caps.soft}.
+        </div>
+      ` : aboveSoft ? html`
+        <div class="pb-banner pb-banner-warn">
+          Above soft cap: growth is constrained; use merge or downward adjustment before adding statements.
+        </div>
+      ` : ""}
+
+      <div class="pb-workflows">
+        <section class="pb-tool-panel">
+          <h3 class="pb-section-title">Merge</h3>
+          <div class="pb-merge-grid">
+            <label>
+              <span>Keep</span>
+              <select value=${mergeKeepId} onChange=${(e) => setMergeKeepId(e.currentTarget.value)}>
+                <option value="">Select</option>
+                ${activeOptions.map((s) => html`<option key=${`keep-${s.id}`} value=${s.id}>${s.id} - ${s.text}</option>`)}
+              </select>
+            </label>
+            <label>
+              <span>Drop</span>
+              <select value=${mergeDropId} onChange=${(e) => setMergeDropId(e.currentTarget.value)}>
+                <option value="">Select</option>
+                ${activeOptions.map((s) => html`<option key=${`drop-${s.id}`} value=${s.id}>${s.id} - ${s.text}</option>`)}
+              </select>
+            </label>
+            <button
+              class="pb-btn"
+              disabled=${busyAction !== null || activeOptions.length < 2}
+              onClick=${handleMerge}
+            >${busyAction === "merge" ? "Merging..." : "Merge"}</button>
+          </div>
+        </section>
+
+        <section class="pb-tool-panel">
+          <h3 class="pb-section-title">Create Order</h3>
+          <form class="pb-create-form" onSubmit=${addCreation}>
+            <input
+              type="text"
+              value=${createDraft.text}
+              maxlength="160"
+              placeholder="New statement"
+              onInput=${(e) => setCreateDraft({ ...createDraft, text: e.currentTarget.value })}
+            />
+            <input
+              class="pb-weight-input"
+              type="number"
+              min="0"
+              max="1"
+              step="0.01"
+              value=${createDraft.weight}
+              onInput=${(e) => setCreateDraft({ ...createDraft, weight: e.currentTarget.value })}
+            />
+            <button class="pb-btn pb-btn-secondary" type="submit" disabled=${busyAction !== null}>Add</button>
+          </form>
+          ${createQueue.length ? html`
+            <div class="pb-create-queue">
+              ${createQueue.map((item, idx) => html`
+                <div class="pb-create-item" key=${item.key}>
+                  <span class="pb-create-rank">${idx + 1}</span>
+                  <span class="pb-create-text">${item.text}</span>
+                  <span class="pb-create-weight">${fmtWeight(item.weight)}</span>
+                  <button class="pb-btn-mini" disabled=${idx === 0 || busyAction !== null} onClick=${() => moveCreation(idx, -1)}>Up</button>
+                  <button class="pb-btn-mini" disabled=${idx === createQueue.length - 1 || busyAction !== null} onClick=${() => moveCreation(idx, 1)}>Down</button>
+                  <button class="pb-btn-mini" disabled=${busyAction !== null} onClick=${() => removeCreation(idx)}>Remove</button>
+                </div>
+              `)}
+              <div class="pb-create-actions">
+                <button
+                  class="pb-btn"
+                  disabled=${busyAction !== null}
+                  onClick=${applyCreationQueue}
+                >${busyAction === "createQueue" ? "Applying..." : "Apply in Order"}</button>
+              </div>
+            </div>
+          ` : ""}
+        </section>
+      </div>
 
       <!-- Active statements -->
       <div class="pb-section">
