@@ -3308,6 +3308,7 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
     client = _CompactFakeClient()
     notes: list[tuple[str, str | None]] = []
     cleared: list[str] = []
+    exchange_cleared: list[str] = []
     handoffs: list[str] = []
 
     async def fake_get_client(
@@ -3333,10 +3334,6 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
     async def fake_clear_exchange(agent_id):
         exchange_cleared.append(agent_id)
 
-    async def fake_write_handoff(agent_id, body):
-        handoffs.append((agent_id, body))
-        return "p1-auto.md"
-
     monkeypatch.setattr(
         codex_mod, "_get_codex_thread_id",
         lambda agent_id: _async_value("tid_full"),
@@ -3353,7 +3350,7 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
     monkeypatch.setattr(
         agentsmod,
         "_clear_exchange_log",
-        lambda agent_id: _async_value(None),
+        fake_clear_exchange,
     )
     # 800k of 1M = 80% — well above the 70% threshold.
     monkeypatch.setattr(
