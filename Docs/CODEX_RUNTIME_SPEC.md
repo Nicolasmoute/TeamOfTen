@@ -915,6 +915,12 @@ no handoff file can be written. If compact generation raises stale/thread-not-fo
 same durable-handoff gate applies: CodexRuntime may continue only by
 building a non-empty recent-exchange fallback and writing the handoff
 file; otherwise it preserves `codex_thread_id` and the current runtime.
+Compact handoff generation is bounded by
+`HARNESS_CODEX_COMPACT_TIMEOUT_SECONDS` (default 120s). A timeout
+closes the cached Codex client, preserves `codex_thread_id`, emits a
+compact failure reason, and does not use the recent-exchange fallback:
+timeouts are treated as an actionable failed compact attempt rather
+than a synthetic success.
 
 Sketch:
 
@@ -979,22 +985,27 @@ firing prematurely). When the ratio trips, it:
 3. Delegates to its own `run_manual_compact(tc)`, which silently
    resumes the stored Codex thread and asks for COMPACT_PROMPT-style
    markdown without routing the generated handoff through normal UI
-   events.
+   events. The generation/resume/chat stream is bounded by
+   `HARNESS_CODEX_COMPACT_TIMEOUT_SECONDS` so a hung Codex stream
+   cannot leave only the trigger event visible.
 4. After `run_manual_compact` returns, checks
    `tc.turn_ctx.get("got_result")` as the success signal.
    `run_manual_compact` swallows its own auth / ImportError /
    generation exceptions (it emits `error` + sets status=error and
    returns silently), so an unraised-but-failed compact is
    detected by the absence of `got_result`. Both the explicit raise
-   path and the silent-failure path emit `auto_compact_failed` and
-   return False — symmetric with Claude's failure posture.
+   path and the silent-failure path emit `auto_compact_failed` with an
+   actionable `error` payload and return False — symmetric with
+   Claude's failure posture.
 
 On success, the dispatcher then proceeds with the user's original
 prompt; the subsequent prior-session read at `agents.py` returns None
 (the compact cleared `codex_thread_id`), and the fresh Codex thread
 picks up the just-written continuity note from the system prompt
-assembly. On failure, `maybe_auto_compact` emits `auto_compact_failed`
-and leaves the original user turn on the existing stored thread.
+assembly. Success clears `codex_thread_id` and recent exchanges only
+after the handoff file and continuity note are durable. On failure,
+`maybe_auto_compact` emits `auto_compact_failed` and leaves the
+original user turn on the existing stored thread.
 
 **Structural differences from Claude's auto-compact** (intentional;
 documented for future maintainers):

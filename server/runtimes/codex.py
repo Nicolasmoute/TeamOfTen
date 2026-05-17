@@ -119,6 +119,22 @@ def _codex_stdio_stream_limit_bytes() -> int:
     return min(max(value, 256 * 1024), 64 * 1024 * 1024)
 
 
+def _codex_compact_timeout_seconds() -> float:
+    """Wall-clock bound for Codex compact handoff generation.
+
+    Auto-compact emits a visible trigger before the original user turn
+    starts. A hung Codex stream must therefore fail closed with a
+    compact-specific terminal event instead of leaving the UI in
+    trigger-only limbo.
+    """
+    raw = os.environ.get("HARNESS_CODEX_COMPACT_TIMEOUT_SECONDS", "").strip()
+    try:
+        value = float(raw) if raw else 120.0
+    except ValueError:
+        value = 120.0
+    return min(max(value, 0.01), 1800.0)
+
+
 def reset_codex_worktree_sandbox_probe_for_tests() -> None:
     global _CODEX_WORKTREE_SANDBOX_PROBE_CACHE
     _CODEX_WORKTREE_SANDBOX_PROBE_CACHE = None
@@ -3846,12 +3862,16 @@ class CodexRuntime:
         tc.turn_ctx["auto_compact"] = True
         try:
             await self.run_manual_compact(tc)
-        except Exception:
+        except Exception as exc:
+            reason = (
+                f"Codex auto-compact raised {type(exc).__name__}: {exc}; "
+                "codex_thread_id preserved."
+            )
             logger.exception(
                 "codex auto-compact failed for %s; proceeding on original thread",
                 tc.agent_id,
             )
-            await _emit(tc.agent_id, "auto_compact_failed")
+            await _emit(tc.agent_id, "auto_compact_failed", error=reason)
             return False
         # run_manual_compact swallows its own auth / import / SDK
         # errors with an `error` emit + status=error and a silent
@@ -3860,7 +3880,11 @@ class CodexRuntime:
         if not tc.turn_ctx.get("got_result"):
             if tc.turn_ctx.get("auto_compact_skipped"):
                 return False
-            await _emit(tc.agent_id, "auto_compact_failed")
+            reason = (
+                tc.turn_ctx.get("compact_failure_reason")
+                or "Codex auto-compact did not complete; codex_thread_id preserved."
+            )
+            await _emit(tc.agent_id, "auto_compact_failed", error=reason)
             return False
         return True
 
@@ -3893,6 +3917,9 @@ class CodexRuntime:
             xfer_to: str,
             skipped: bool = False,
         ) -> None:
+            tc.turn_ctx["compact_failure_reason"] = reason
+            if skipped:
+                tc.turn_ctx["auto_compact_skipped"] = True
             if xfer_to in ("claude", "codex"):
                 await _emit(
                     tc.agent_id,
@@ -3992,6 +4019,9 @@ class CodexRuntime:
 
         method, env_overrides = await resolve_auth()
         if method == "none":
+            tc.turn_ctx["compact_failure_reason"] = (
+                "Codex auth unavailable; codex_thread_id preserved."
+            )
             await _emit(
                 tc.agent_id,
                 "human_attention",
@@ -4027,6 +4057,9 @@ class CodexRuntime:
                 allowed_tools=tc.allowed_tools,
             )
         except ImportError as exc:
+            tc.turn_ctx["compact_failure_reason"] = (
+                f"Codex SDK unavailable: {exc}; codex_thread_id preserved."
+            )
             await _emit(
                 tc.agent_id,
                 "human_attention",
@@ -4041,7 +4074,9 @@ class CodexRuntime:
         config = _build_thread_config(sdk, tc)
         turn_overrides = _build_turn_overrides(sdk, tc)
 
-        try:
+        timeout_s = _codex_compact_timeout_seconds()
+
+        async def _generate_compact_summary() -> str:
             resumed = client.resume_thread(thread_id, overrides=config)
             thread = await _await_if_needed(resumed)
             stream = thread.chat(
@@ -4056,7 +4091,26 @@ class CodexRuntime:
                 text = _agent_message_text_from_step(step)
                 if text:
                     parts.append(text)
-            generated = "".join(parts).strip()
+            return "".join(parts).strip()
+
+        try:
+            generated = await asyncio.wait_for(
+                _generate_compact_summary(),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            logger.exception(
+                "CodexRuntime: compact generation timed out for slot=%s "
+                "thread=%s after %.1fs",
+                tc.agent_id, thread_id, timeout_s,
+            )
+            await close_client(tc.agent_id)
+            await _fail_compact(
+                "Codex auto-compact timed out after "
+                f"{timeout_s:g}s; codex_thread_id preserved.",
+                xfer_to=xfer_to,
+            )
+            return
         except Exception as exc:
             logger.exception(
                 "CodexRuntime: compact generation failed for slot=%s thread=%s",
