@@ -322,7 +322,7 @@ server/tests/                 pytest suite (DB-level — runs without the Claude
 Dockerfile                    Python 3.12 + Node 20 + claude CLI + codex CLI + git
 mcp-servers.example.json      Template for wiring external MCP servers
 truth/                        The project's source-of-truth (write-protected for agents)
-Docs/TOT-specs.md             Full spec (data model, coordination, tool surface, UI)
+Docs/truth-index.md             Full spec (data model, coordination, tool surface, UI)
 Docs/kanban-specs-v2.md       Kanban task lifecycle (canonical, shape-(2) routing through Coach)
 Docs/kanban-specs-v1-archived.md  Kanban v1 (auto-routing, deployed) — historical archive
 Docs/compass-specs.md         Compass design — lattice, Q&A, audit semantics

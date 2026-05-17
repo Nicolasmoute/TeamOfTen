@@ -135,7 +135,7 @@ def test_parse_accepts_single_markdown_fenced_json_object(
     fresh_db: str,
 ) -> None:
     project_id = "fencedjson"
-    _write_truth(project_id, "TOT-specs.md", "Task rules")
+    _write_truth(project_id, "truth-index.md", "Task rules")
     corpus = gather_truth_corpus(
         project_id,
         total_budget_chars=32_000,
@@ -144,7 +144,7 @@ def test_parse_accepts_single_markdown_fenced_json_object(
     raw = """```json
 {
   "verdict": "truthgate_needs_truth_change",
-  "truth_basis": ["truth/TOT-specs.md"],
+  "truth_basis": ["truth/truth-index.md"],
   "truth_concerns": ["reply affordance must match truth first"],
   "rationale": "t-2026-05-17-ba84bb6d style fenced classifier JSON",
   "suggested_amendment": null,
@@ -155,7 +155,7 @@ def test_parse_accepts_single_markdown_fenced_json_object(
     result = parse_classifier_output(raw, project_id=project_id, corpus=corpus)
 
     assert result["verdict"] == "truthgate_needs_truth_change"
-    assert result["truth_basis"] == ["truth/TOT-specs.md"]
+    assert result["truth_basis"] == ["truth/truth-index.md"]
     assert result["truth_concerns"] == [
         "reply affordance must match truth first"
     ]
@@ -166,7 +166,7 @@ def test_parse_malformed_fenced_json_still_fails_closed(
     fresh_db: str,
 ) -> None:
     project_id = "badfencedjson"
-    _write_truth(project_id, "TOT-specs.md", "Task rules")
+    _write_truth(project_id, "truth-index.md", "Task rules")
     corpus = gather_truth_corpus(
         project_id,
         total_budget_chars=32_000,
@@ -175,7 +175,7 @@ def test_parse_malformed_fenced_json_still_fails_closed(
     raw = """```json
 {
   "verdict": "truthgate_needs_truth_change",
-  "truth_basis": ["truth/TOT-specs.md"],
+  "truth_basis": ["truth/truth-index.md"],
 }
 ```"""
 
@@ -248,7 +248,7 @@ def test_parse_rejects_basis_outside_truth(fresh_db: str) -> None:
     )
     raw = json.dumps({
         "verdict": "truthgate_pass",
-        "truth_basis": ["Docs/TOT-specs.md"],
+        "truth_basis": ["Docs/truth-index.md"],
         "truth_concerns": [],
         "rationale": "bad",
         "suggested_amendment": None,
@@ -263,7 +263,7 @@ def test_corpus_always_includes_core_files_before_alphabetical(
 ) -> None:
     project_id = "corefirst"
     _write_truth(project_id, "aaa.md", "alpha\n")
-    _write_truth(project_id, "TOT-specs.md", "core\n")
+    _write_truth(project_id, "CODEX_RUNTIME_SPEC.md", "core\n")
 
     corpus = gather_truth_corpus(
         project_id,
@@ -273,7 +273,7 @@ def test_corpus_always_includes_core_files_before_alphabetical(
     )
 
     assert corpus.eligible_files == 3
-    assert corpus.files == ("truth/truth-index.md", "truth/TOT-specs.md")
+    assert corpus.files == ("truth/truth-index.md", "truth/CODEX_RUNTIME_SPEC.md")
     assert corpus.skipped == ("truth/aaa.md",)
 
 
@@ -319,7 +319,7 @@ async def test_sparse_uses_actual_eligible_file_count_not_included_slice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project_id = "densebudget"
-    _write_truth(project_id, "TOT-specs.md", "core\n")
+    _write_truth(project_id, "CODEX_RUNTIME_SPEC.md", "core\n")
     _write_truth(project_id, "b.md", "bravo\n")
     _write_truth(project_id, "c.md", "charlie\n")
     called = False
@@ -330,7 +330,7 @@ async def test_sparse_uses_actual_eligible_file_count_not_included_slice(
         return LLMResult(
             text=json.dumps({
                 "verdict": "truthgate_pass",
-                "truth_basis": ["truth/TOT-specs.md"],
+                "truth_basis": ["truth/CODEX_RUNTIME_SPEC.md"],
                 "truth_concerns": [],
                 "rationale": "ok",
                 "suggested_amendment": None,
@@ -353,7 +353,7 @@ async def test_sparse_uses_actual_eligible_file_count_not_included_slice(
     assert called is True
     assert result["method"] == "classifier"
     assert result["corpus_eligible_files"] == 4
-    assert result["corpus_files"] == ["truth/truth-index.md", "truth/TOT-specs.md"]
+    assert result["corpus_files"] == ["truth/truth-index.md", "truth/CODEX_RUNTIME_SPEC.md"]
 
 
 def test_config_rejects_opus_and_gpt_aliases(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,9 +1,17 @@
+---
+schema: teamoften-spec/v1
+title: 'TruthScore Specification'
+status: canonical
+spec_group: truthscore
+source_index: truth-index.md
+last_reorganized: 2026-05-17
+---
 # TruthScore — Specification
 
-> **Subordinate to `Docs/TOT-specs.md`.** When this doc and TOT-specs
-> disagree, TOT-specs wins. This file goes deeper on TruthScore (rubric,
+> **Subordinate to `Docs/truth-index.md`.** When this doc and truth-index
+> disagree, truth-index wins. This file goes deeper on TruthScore (rubric,
 > input gathering, prompt, parsing, storage) but cannot redefine
-> fields, endpoints, events, or invariants that TOT-specs declares.
+> fields, endpoints, events, or invariants that truth-index declares.
 
 **Status:** Implemented (2026-05-09).
 **Target:** TeamOfTen multi-agent harness (Python, Claude Agent SDK, kDrive-backed shared state, single-VPS)

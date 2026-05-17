@@ -754,7 +754,7 @@ async def test_propose_truth_update_accepts_tot_spec_sized_file(
     content = "x" * 220_960
     out = await _propose_truth(
         handler,
-        path="TOT-specs.md",
+        path="truth-index.md",
         content=content,
         summary="mirror current TOT spec",
     )
@@ -766,7 +766,7 @@ async def test_propose_truth_update_accepts_tot_spec_sized_file(
         cur = await c.execute(
             "SELECT length(proposed_content) FROM file_write_proposals "
             "WHERE project_id = ? AND path = ? AND status = 'pending'",
-            (MISC_PROJECT_ID, "TOT-specs.md"),
+            (MISC_PROJECT_ID, "truth-index.md"),
         )
         row = await cur.fetchone()
     finally:
@@ -1879,11 +1879,11 @@ async def test_coord_read_file_accepts_tot_spec_sized_file(fresh_db) -> None:
     from server.paths import ensure_project_scaffold, project_paths
     ensure_project_scaffold(MISC_PROJECT_ID)
     pp = project_paths(MISC_PROJECT_ID)
-    target = pp.root / "Docs" / "TOT-specs.md"
+    target = pp.root / "Docs" / "truth-index.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("x" * 220_960, encoding="utf-8")
 
-    out = await _read_via_handler("coach", "Docs/TOT-specs.md")
+    out = await _read_via_handler("coach", "Docs/truth-index.md")
     assert out.get("is_error") is not True
     assert "(220960 chars)" in out["content"][0]["text"]
 

@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 APP_JS = ROOT / "server" / "static" / "app.js"
 STYLE_CSS = ROOT / "server" / "static" / "style.css"
 TRUTHGATE_DOC = ROOT / "Docs" / "truthgate-approach.md"
-TOT_SPEC = ROOT / "Docs" / "TOT-specs.md"
+FRONTEND_SPEC = ROOT / "Docs" / "tot-specs-16-frontend-specification.md"
 
 
 def test_truthgate_attention_proposal_cards_open_existing_review_surface() -> None:
@@ -50,7 +50,7 @@ def test_proposal_review_outcomes_require_notes_and_notify_coach() -> None:
 def test_truthgate_attention_review_action_is_styled_and_documented() -> None:
     style_css = STYLE_CSS.read_text(encoding="utf-8")
     truthgate_doc = TRUTHGATE_DOC.read_text(encoding="utf-8")
-    tot_spec = TOT_SPEC.read_text(encoding="utf-8")
+    frontend_spec = FRONTEND_SPEC.read_text(encoding="utf-8")
 
     assert ".env-attention-actions" in style_css
     assert ".env-attention-action" in style_css
@@ -59,8 +59,8 @@ def test_truthgate_attention_review_action_is_styled_and_documented() -> None:
     assert ".env-fw-outcome" in style_css
     assert "pending amendment entries include a clear review action" in truthgate_doc
     assert "deny/drop and request-changes outcomes require a human note" in truthgate_doc
-    assert "review action opens this same" in tot_spec
-    assert "file-write proposal row" in tot_spec
-    assert "request-changes is" in tot_spec
-    assert "represented as denial" in tot_spec
-    assert "with a prefixed note" in tot_spec
+    assert "review action opens this same" in frontend_spec
+    assert "file-write proposal row" in frontend_spec
+    assert "request-changes is" in frontend_spec
+    assert "represented as denial" in frontend_spec
+    assert "with a prefixed note" in frontend_spec

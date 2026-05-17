@@ -1,10 +1,18 @@
+---
+schema: teamoften-spec/v1
+title: 'Playbook Specification'
+status: canonical
+spec_group: playbook
+source_index: truth-index.md
+last_reorganized: 2026-05-17
+---
 # Playbook — Specification
 
-> **Subordinate to [TOT-specs.md](TOT-specs.md).** When this doc and
-> TOT-specs disagree, TOT-specs wins. This file goes deeper on the
+> **Subordinate to [truth-index.md](truth-index.md).** When this doc and
+> truth-index disagree, truth-index wins. This file goes deeper on the
 > playbook subsystem (lattice, reflection runner, proposal pipeline,
 > system-prompt injection path) but cannot redefine fields, endpoints,
-> events, or invariants that TOT-specs declares.
+> events, or invariants that truth-index declares.
 
 **Status:** DRAFT (2026-05-08). Pre-implementation, post-second-audit.
 **Target:** TeamOfTen multi-agent harness (Python, Claude Agent SDK, kDrive-backed shared state, single-VPS)
@@ -864,7 +872,7 @@ Listens to `playbook_*` bus events on the existing `/ws` channel and re-fetches 
 
 ## 14 · Cross-references
 
-- [TOT-specs.md](TOT-specs.md) — umbrella spec.
+- [truth-index.md](truth-index.md) — umbrella spec.
 - [compass-specs.md](compass-specs.md) — Compass; the playbook borrows its lattice + proposal mechanism but operates harness-wide on AI orchestration patterns rather than per-project on human intent.
 - [kanban-specs-v2.md](kanban-specs-v2.md) — the playbook reads §22.1 deviations_log + §11.1 player health counters + §9.2 project_events as evidence; the playbook injection follows project CLAUDE.md in `build_system_prompt_suffix`, downstream of the Coach coordination block (which still owns the §14 lifecycle policy). **Binding dependency:** the runner's evidence-bundle composition is hardwired to these three v2 surfaces. A schema change in any of them (column rename, table restructure, event type rename) requires a coordinated playbook-runner update.
 - [recurrence-specs.md](recurrence-specs.md) — the playbook scheduler is a sibling background task, not a recurrence (no Coach turns spawned by the scheduler itself; the reflection is a direct `claude_agent_sdk.query()` call under `agent_id="playbook"`).

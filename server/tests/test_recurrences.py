@@ -471,7 +471,7 @@ async def test_upsert_tick_minutes_auto_enables_disabled_row(
     fresh_db: str,
 ) -> None:
     """Spec contract: passing `minutes` on a disabled row re-enables it
-    (recurrence-specs.md §351, TOT-specs.md §1784). Lock-in test against
+    (recurrence-specs.md §351, truth-index.md §1784). Lock-in test against
     the bug where `/tick N` would silently leave a disabled tick off."""
     await init_db()
     row = await recmod.upsert_tick(project_id="misc", minutes=60)

@@ -15,7 +15,6 @@ CORE_TRUTH_FILES: tuple[str, ...] = (
     "truth/specs.md",
     "truth/architecture.md",
     "truth/api-contract.md",
-    "truth/TOT-specs.md",
     "truth/CODEX_RUNTIME_SPEC.md",
     "truth/kanban-specs-v2.md",
     "truth/compass-specs.md",

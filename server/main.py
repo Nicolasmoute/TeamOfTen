@@ -601,7 +601,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 #
 # Audit follow-up: if a future feature genuinely needs an external
 # script source (Stripe, Sentry, etc.), add it here AND document why
-# in the threat-model section of Docs/TOT-specs.md.
+# in the threat-model section of Docs/truth-index.md.
 _CSP_HEADER_VALUE = (
     "default-src 'self'; "
     "script-src 'self' https://esm.sh; "
@@ -815,7 +815,7 @@ async def health() -> JSONResponse:
     presence, WebDAV probe, MCP server names, …) lives on the
     auth-protected `/api/health/detail` endpoint — see audit finding
     "Public health endpoint leaks deployment details" + the threat
-    model section in Docs/TOT-specs.md.
+    model section in Docs/truth-index.md.
     """
     db_ok = True
     try:
@@ -7345,7 +7345,7 @@ async def get_attachment(filename: str, token: str | None = Query(default=None))
     Kept for one release so cached UI bundles + any external code
     pointing at the old URL keep working. New uploads return
     `signed_url` instead; the UI prefers that. Removal is tracked in
-    the threat-model section of Docs/TOT-specs.md.
+    the threat-model section of Docs/truth-index.md.
     """
     # `<img src=...>` browser loads can't set the Authorization header
     # (browsers only attach it on fetch/XHR), so we accept the token via
