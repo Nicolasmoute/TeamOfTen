@@ -131,12 +131,75 @@ def test_parse_invalid_json_diagnostic_is_bounded(fresh_db: str) -> None:
     assert len(message) < 400
 
 
+def test_parse_accepts_single_markdown_fenced_json_object(
+    fresh_db: str,
+) -> None:
+    project_id = "fencedjson"
+    _write_truth(project_id, "TOT-specs.md", "Task rules")
+    corpus = gather_truth_corpus(
+        project_id,
+        total_budget_chars=32_000,
+        per_file_chars=16_000,
+    )
+    raw = """```json
+{
+  "verdict": "truthgate_needs_truth_change",
+  "truth_basis": ["truth/TOT-specs.md"],
+  "truth_concerns": ["reply affordance must match truth first"],
+  "rationale": "t-2026-05-17-ba84bb6d style fenced classifier JSON",
+  "suggested_amendment": null,
+  "confidence": 0.77
+}
+```"""
+
+    result = parse_classifier_output(raw, project_id=project_id, corpus=corpus)
+
+    assert result["verdict"] == "truthgate_needs_truth_change"
+    assert result["truth_basis"] == ["truth/TOT-specs.md"]
+    assert result["truth_concerns"] == [
+        "reply affordance must match truth first"
+    ]
+    assert result["confidence"] == 0.77
+
+
+def test_parse_malformed_fenced_json_still_fails_closed(
+    fresh_db: str,
+) -> None:
+    project_id = "badfencedjson"
+    _write_truth(project_id, "TOT-specs.md", "Task rules")
+    corpus = gather_truth_corpus(
+        project_id,
+        total_budget_chars=32_000,
+        per_file_chars=16_000,
+    )
+    raw = """```json
+{
+  "verdict": "truthgate_needs_truth_change",
+  "truth_basis": ["truth/TOT-specs.md"],
+}
+```"""
+
+    with pytest.raises(TruthGateClassificationError, match="invalid JSON") as exc:
+        parse_classifier_output(raw, project_id=project_id, corpus=corpus)
+
+    message = str(exc.value)
+    assert "markdown-fenced response inner decode error" in message
+    assert "excerpt=" in message
+    assert len(message) < 400
+
+
 @pytest.mark.parametrize(
     "raw",
     [
         'prefix {"verdict":"truthgate_pass"}',
         '{"verdict":"truthgate_pass"} trailing',
-        '```json\n{"verdict":"truthgate_pass"}\n```',
+        '```json {"verdict":"truthgate_pass"} ```',
+        'before\n```json\n{"verdict":"truthgate_pass"}\n```',
+        '```json\n{"verdict":"truthgate_pass"}\n```\nafter',
+        (
+            '```json\n{"verdict":"truthgate_pass"}\n```\n'
+            '```json\n{"verdict":"truthgate_pass"}\n```'
+        ),
     ],
 )
 def test_parse_rejects_non_whole_response_json(
@@ -151,6 +214,27 @@ def test_parse_rejects_non_whole_response_json(
         per_file_chars=16_000,
     )
     with pytest.raises(TruthGateClassificationError, match="invalid JSON"):
+        parse_classifier_output(raw, project_id=project_id, corpus=corpus)
+
+
+def test_parse_fenced_non_verdict_object_still_uses_schema_validation(
+    fresh_db: str,
+) -> None:
+    project_id = "fencednonverdict"
+    _write_truth(project_id, "a.md", "A")
+    corpus = gather_truth_corpus(
+        project_id,
+        total_budget_chars=32_000,
+        per_file_chars=16_000,
+    )
+    raw = """```json
+{"truth_basis": [], "truth_concerns": []}
+```"""
+
+    with pytest.raises(
+        TruthGateClassificationError,
+        match="verdict must be a non-empty string",
+    ):
         parse_classifier_output(raw, project_id=project_id, corpus=corpus)
 
 
