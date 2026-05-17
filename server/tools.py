@@ -76,6 +76,7 @@ ALL_KANBAN_STAGES: frozenset[str] = frozenset(VALID_TRANSITIONS.keys())
 TRUTHGATE_VERDICTS: frozenset[str] = frozenset({
     "truthgate_pass",
     "truthgate_needs_truth_change",
+    "truthgate_needs_human_clarification",
     "truthgate_rejected_or_needs_human_clarification",
     "truthgate_coach_override",
     "truthgate_emergency_override",
@@ -467,6 +468,17 @@ async def _run_truthgate_assessment(
             "reason": payload.get("blocked_reason"),
             "trigger": trigger,
         })
+        from server.truthgate.notifications import (  # noqa: PLC0415
+            notify_coach_truthgate_action_needed,
+        )
+
+        await notify_coach_truthgate_action_needed(
+            project_id=project_id,
+            task=task,
+            payload=payload,
+            trigger=trigger,
+            classifier_error=classifier_error,
+        )
 
     verdict = payload["verdict"]
     if classifier_error:
@@ -552,7 +564,10 @@ async def _persist_truthgate_result(
             blocked_reason
             or "TruthGate requires a protected truth amendment before work begins."
         )
-    elif verdict == "truthgate_rejected_or_needs_human_clarification":
+    elif verdict in (
+        "truthgate_needs_human_clarification",
+        "truthgate_rejected_or_needs_human_clarification",
+    ):
         blocked = 1
         final_blocked_reason = (
             blocked_reason
