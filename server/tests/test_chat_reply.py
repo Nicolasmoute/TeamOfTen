@@ -6,16 +6,19 @@ still returns the expected payload shape, and that the POST /api/messages
 endpoint still accepts the existing body format (so the reply flow, which
 submits via the existing POST, continues to work).
 
-Intentionally thin: the quote-format helper (buildReplyQuote in app.js)
-is a ~5-line pure JS function; without a JS test runner we verify it
-visually. This file exists to pin the server-side shape that reply
-depends on.
+Static checks pin the plain Preact/HTM reply affordance branches until
+the frontend has a JS test runner.
 """
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
 from server.db import configured_conn, init_db
+
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 # ---------------------------------------------------------------- helpers
@@ -146,3 +149,53 @@ async def test_post_messages_accepts_reply_shaped_body(fresh_db: str) -> None:  
         )
 
     assert r.status_code == 200
+
+
+def test_agent_pane_text_reply_uses_existing_composer_path() -> None:
+    """White final text rows quote into AgentPane's onReply path."""
+    app_js = (ROOT / "server/static/app.js").read_text()
+
+    text_branch = app_js.split('if (type === "text") {', 1)[1].split(
+        'if (type === "thinking") {',
+        1,
+    )[0]
+
+    assert 'const sender = event.agent_id || viewerSlot;' in text_branch
+    assert 'const replyBtn = onReply && sender' in text_branch
+    assert 'class="msg-reply-btn"' in text_branch
+    assert 'onReply(buildReplyQuote("message", sender, _coerceContentToString(event.content)))' in text_branch
+    assert '${replyBtn}' in text_branch
+
+
+def test_message_sent_reply_behavior_stays_sender_based() -> None:
+    """Blue message_sent rows keep their existing sender attribution."""
+    app_js = (ROOT / "server/static/app.js").read_text()
+
+    message_branch = app_js.split('if (type === "message_sent") {', 1)[1].split(
+        'if (type === "connected") {',
+        1,
+    )[0]
+
+    assert 'class="msg-reply-btn"' in message_branch
+    assert 'const sender = event.agent_id === "broadcast" ? "coach" : event.agent_id;' in message_branch
+    assert 'onReply(buildReplyQuote(event.subject, sender, event.body_preview || ""));' in message_branch
+    assert 'const isHumanThread = fromHuman || toHuman;' in message_branch
+    assert 'const cls = "event message_sent" + (isHumanThread ? " human-thread" : " peer-thread") + incomingClass;' in message_branch
+
+
+def test_reply_css_covers_text_and_preserves_message_sent_hover() -> None:
+    css = (ROOT / "server/static/style.css").read_text()
+
+    assert ".event.text .msg-reply-btn" in css
+    assert ".event.text:hover .msg-reply-btn" in css
+    assert ".event.message_sent:hover .msg-reply-btn" in css
+    assert ".event.message_sent .msg-reply-btn" in css
+
+
+def test_docs_describe_text_and_message_sent_reply_paths() -> None:
+    docs = (ROOT / "Docs/TOT-specs.md").read_text()
+    normalized = " ".join(docs.split())
+
+    assert "White `.event.text` final agent replies" in normalized
+    assert "Blue `.event.message_sent.peer-thread` rows keep the existing reply behavior" in normalized
+    assert "No new endpoints or schema changes" in normalized

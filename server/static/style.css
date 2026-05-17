@@ -308,12 +308,13 @@ body {
     border-radius: 9px;
   }
 
-  /* Reply buttons (inbox + agent-pane message_sent rows) use
+  /* Reply buttons (inbox + agent-pane text/message_sent rows) use
      opacity:0 / :hover opacity:1 — hover never fires on touch.
      Always show them on mobile so the action is reachable.
      Use higher-specificity selectors so this override wins regardless
      of source order (the base opacity:0 rules appear later in the file
      and would otherwise win at equal specificity). */
+  .event.text .msg-reply-btn,
   .event.message_sent .msg-reply-btn,
   .env-decision .env-reply-btn {
     opacity: 1;
@@ -3733,11 +3734,12 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
 .event.tool_use .tool-card.comm-tool .tool-summary {
   color: var(--accent) !important;
 }
-/* `.event.message_sent` hover-reveal reply button. position:relative
+/* `.event.text` / `.event.message_sent` hover-reveal reply button. position:relative
    anchors the absolute-positioned button inside the card; the button
    is hidden by default and revealed on hover via opacity transition.
    Modifier classes `.human-thread` / `.peer-thread` live in the
    tiering block above. */
+.event.text,
 .event.message_sent { position: relative; }
 .msg-reply-btn {
   position: absolute;
@@ -3756,6 +3758,7 @@ details.md-callout-collapsible[open] > summary::before { transform: rotate(90deg
   align-items: center;
   justify-content: center;
 }
+.event.text:hover .msg-reply-btn,
 .event.message_sent:hover .msg-reply-btn { opacity: 1; }
 .msg-reply-btn:hover { color: var(--accent); }
 
