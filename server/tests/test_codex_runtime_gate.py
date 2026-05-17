@@ -3304,6 +3304,11 @@ async def test_codex_maybe_auto_compact_trips_native_compact(
         "_codex_session_context_estimate",
         lambda thread_id: _async_value(800_000),
     )
+    monkeypatch.setattr(
+        agentsmod,
+        "_get_recent_exchanges",
+        lambda agent_id: _async_value([]),
+    )
     monkeypatch.setattr(agentsmod, "_context_window_for", lambda model: 1_000_000)
 
     captured = _capture_emit(monkeypatch)
