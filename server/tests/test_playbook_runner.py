@@ -196,7 +196,7 @@ def test_cap_pressure_drops_creations_from_end(runner_env: Path, monkeypatch: py
             created_at="2026-04-01T00:00:00Z",
             created_by="test",
             last_validated_at="2026-04-01T00:00:00Z",
-            applied_count=0, immutable=False,
+            applied_count=1, immutable=False,
         )
         for i in range(55)
     ]
@@ -221,3 +221,97 @@ def test_cap_pressure_drops_creations_from_end(runner_env: Path, monkeypatch: py
     rejected_caps = [op for op in row["proposals_rejected"]
                      if op.get("reason") == "soft_cap_pressure"]
     assert len(rejected_caps) == 3
+
+
+def test_hard_cap_pressure_rejects_all_creations_and_emits_attention(
+    runner_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_activity(runner_env / "harness.db", config.MIN_ACTIVITY_DEFAULT)
+
+    from server.playbook.store import (
+        Lattice, Statement, WeightHistoryEntry, save_lattice
+    )
+    seed_stmts = [
+        Statement(
+            id=f"pb-{i:03d}", text=f"existing hard stmt {i}", weight=0.5,
+            weight_history=[WeightHistoryEntry(ts="2026-04-01T00:00:00Z",
+                                               from_=None, to=0.5, reason="seed")],
+            created_at="2026-04-01T00:00:00Z",
+            created_by="test",
+            last_validated_at="2026-04-01T00:00:00Z",
+            applied_count=1, immutable=False,
+        )
+        for i in range(79)
+    ]
+    asyncio.run(save_lattice(Lattice(schema_version=1, updated_at="now", statements=seed_stmts)))
+
+    events: list[dict] = []
+
+    async def _capture(payload: dict) -> None:
+        events.append(payload)
+
+    monkeypatch.setattr(runner_mod, "_publish", _capture)
+    _stub_llm_call(monkeypatch, json.dumps({
+        "relevant_ids": [],
+        "adjustments": [],
+        "creations": [
+            {"text": "first hard pressure runner creation", "weight": 0.6, "reason": "x"},
+            {"text": "second hard pressure runner creation", "weight": 0.6, "reason": "x"},
+        ],
+        "merges": [],
+    }))
+
+    row = asyncio.run(runner_mod.run_daily_reflection(manual=False))
+
+    assert row["outcome"] == "no_changes"
+    assert {op["reason"] for op in row["proposals_rejected"]} == {"hard_cap_pressure"}
+    assert [ev["type"] for ev in events if ev["type"] in {
+        "playbook_soft_cap_exceeded", "human_attention",
+    }] == ["playbook_soft_cap_exceeded", "human_attention"]
+
+
+def test_pre_creation_hygiene_frees_runner_capacity(
+    runner_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_activity(runner_env / "harness.db", config.MIN_ACTIVITY_DEFAULT)
+
+    from server.playbook.store import (
+        Lattice, Statement, WeightHistoryEntry, save_lattice
+    )
+    old = "2026-01-01T00:00:00Z"
+    seed_stmts = [
+        Statement(
+            id="pb-001", text="old unused statement", weight=0.5,
+            weight_history=[WeightHistoryEntry(ts=old, from_=None, to=0.5, reason="seed")],
+            created_at=old, created_by="test", last_validated_at=old,
+            applied_count=0, immutable=False,
+        ),
+    ]
+    seed_stmts.extend(
+        Statement(
+            id=f"pb-{i:03d}", text=f"kept stmt {i}", weight=0.5,
+            weight_history=[WeightHistoryEntry(ts=old, from_=None, to=0.5, reason="seed")],
+            created_at=old, created_by="test", last_validated_at=old,
+            applied_count=1, immutable=False,
+        )
+        for i in range(2, 61)
+    )
+    asyncio.run(save_lattice(Lattice(schema_version=1, updated_at="now", statements=seed_stmts)))
+    _stub_llm_call(monkeypatch, json.dumps({
+        "relevant_ids": [],
+        "adjustments": [],
+        "creations": [{
+            "text": "runner capacity freed by hygiene",
+            "weight": 0.6,
+            "reason": "x",
+        }],
+        "merges": [],
+    }))
+
+    row = asyncio.run(runner_mod.run_daily_reflection(manual=False))
+
+    assert [a["action"] for a in row["engine_actions"]] == ["stale_unused"]
+    assert [op["op"] for op in row["proposals_applied"]] == ["create"]
+    assert row["proposals_rejected"] == []

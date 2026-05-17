@@ -6575,30 +6575,65 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         try:
             lattice = load_lattice()
             archive = load_archive()
+            engine_actions: list[dict[str, Any]] = []
             applied, rejected, hard_cap_hit = pb_mutate.apply_coach_proposals(
                 lattice, archive, ops_raw,
                 creation_weight=pb_config.COACH_CREATION_WEIGHT,
+                engine_actions=engine_actions,
             )
-            if applied:
+            engine_actions.extend(
+                pb_mutate.sweep_engine_actions(
+                    lattice,
+                    archive,
+                    include_hygiene=False,
+                    include_pressure=True,
+                )
+            )
+            if applied or engine_actions:
                 await save_lattice(lattice)
                 await save_archive(archive)
         finally:
             pb_runner._run_lock.release()
 
         # Bus event for the dashboard's live counter (§9). Skip when
-        # nothing applied so the dashboard isn't pinged with empty
+        # nothing changed so the dashboard isn't pinged with empty
         # 0-op announcements (e.g. all proposals rejected).
-        if applied:
+        if applied or engine_actions or hard_cap_hit:
             try:
                 from server.events import bus  # noqa: PLC0415
 
-                await bus.publish({
-                    "ts": _now_iso(),
-                    "agent_id": "coach",
-                    "type": "playbook_changes_applied",
-                    "operations_count": len(applied),
-                    "source": "coach_mid_turn",
-                })
+                if applied or engine_actions:
+                    await bus.publish({
+                        "ts": _now_iso(),
+                        "agent_id": "coach",
+                        "type": "playbook_changes_applied",
+                        "operations_count": len(applied),
+                        "source": "coach_mid_turn",
+                    })
+                if hard_cap_hit:
+                    hard_rejected = [
+                        r for r in rejected if r.get("reason") == "hard_cap_pressure"
+                    ]
+                    await bus.publish({
+                        "ts": _now_iso(),
+                        "agent_id": "playbook",
+                        "type": "playbook_soft_cap_exceeded",
+                        "count": hard_rejected[0].get("pressure") if hard_rejected else pb_config.HARD_STATEMENT_CAP + 1,
+                        "dropped": len(hard_rejected),
+                    })
+                    await bus.publish({
+                        "ts": _now_iso(),
+                        "agent_id": "playbook",
+                        "type": "human_attention",
+                        "subject": "Playbook hard cap pressure",
+                        "body": (
+                            "Coach playbook proposal pressure exceeded "
+                            "the hard cap; creations were rejected. "
+                            "Review the lattice for merges, downward "
+                            "adjustments, or deletions."
+                        ),
+                        "urgency": "high",
+                    })
             except Exception:
                 pass
 
@@ -6645,6 +6680,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "  ! hard cap pressure — all proposed creations dropped; "
                 "operator must review the lattice."
             )
+        if engine_actions:
+            lines.append("Engine hygiene actions:")
+            for action in engine_actions:
+                lines.append(f"  - {action.get('action')}: {action.get('id')}")
 
         # Active count footer.
         from server.playbook.store import load_lattice as _ll  # noqa: PLC0415
