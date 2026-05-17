@@ -3498,6 +3498,50 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             )
             return rc == 0
 
+        async def _validate_existing_ship_branch() -> str | None:
+            try:
+                if await _worktree_dirty():
+                    return (
+                        f"existing ship branch {branch_name} has "
+                        f"uncommitted changes. Finish or discard them, then "
+                        f"rerun coord_ship_to_dev."
+                    )
+            except RuntimeError as exc:
+                return f"git status failed: {exc}"
+            rc, _, err = await _git(
+                ["git", "merge-base", "--is-ancestor", "origin/dev", "HEAD"]
+            )
+            if rc != 0:
+                detail = (err.strip() or "not based on origin/dev")[:200]
+                return (
+                    f"existing ship branch {branch_name} is not based on "
+                    f"current origin/dev ({detail}). Recreate it with "
+                    f"`git checkout {caller_branch} && "
+                    f"git branch -D {branch_name}`, then rerun "
+                    f"coord_ship_to_dev."
+                )
+            rc, out, err = await _git(
+                ["git", "log", "--format=%B", "origin/dev..HEAD"]
+            )
+            if rc != 0:
+                detail = (err.strip() or out.strip())[:200]
+                return (
+                    f"could not inspect existing ship branch {branch_name}: "
+                    f"{detail}"
+                )
+            expected_marker = f"(cherry picked from commit {executor_sha})"
+            if not any(line.strip() == expected_marker for line in out.splitlines()):
+                return (
+                    f"existing ship branch {branch_name} is clean, but it "
+                    f"does not contain the recorded executor commit "
+                    f"{executor_sha[:12]} in its cherry-pick metadata. "
+                    f"If you already resolved the conflict, run "
+                    f"`git cherry-pick --continue` on {branch_name}; "
+                    f"otherwise delete the temp branch and rerun "
+                    f"coord_ship_to_dev."
+                )
+            return None
+
         async def _executor_patch_on_dev() -> bool:
             rc, _, _ = await _git(
                 ["git", "merge-base", "--is-ancestor", executor_sha, "origin/dev"]
@@ -3575,6 +3619,9 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                     f"`git cherry-pick --abort && "
                     f"git checkout {caller_branch}`."
                 )
+            invalid_reason = await _validate_existing_ship_branch()
+            if invalid_reason:
+                return _err(invalid_reason)
             resumed_branch = True
         else:
             rc, _, err = await _git(
