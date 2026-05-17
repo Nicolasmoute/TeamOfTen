@@ -586,6 +586,28 @@ def _parse_boolish(raw: Any, *, default: bool) -> bool:
     return default
 
 
+_BACKLOG_PRIORITY_RANK: dict[str, int] = {
+    "urgent": 0,
+    "high": 1,
+    "normal": 2,
+    "low": 3,
+}
+
+
+async def _next_eligible_backlog_entry(c: Any) -> dict[str, Any] | None:
+    """Return the next normal backlog item by priority, FIFO within priority."""
+    cur = await c.execute(
+        "SELECT id, title, priority, proposed_at FROM backlog_tasks "
+        "WHERE status = 'pending' "
+        "ORDER BY CASE COALESCE(priority, 'normal') "
+        "WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 "
+        "WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 2 END, "
+        "proposed_at ASC, id ASC LIMIT 1"
+    )
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
 def _string_list_arg(raw: Any) -> list[str]:
     if raw is None or raw == "":
         return []
@@ -1430,11 +1452,16 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 cur = await c.execute(
                     "SELECT id, title, proposed_by, proposed_at, status, priority "
                     "FROM backlog_tasks WHERE status = 'pending' "
-                    "ORDER BY proposed_at DESC LIMIT 100"
+                    "ORDER BY CASE COALESCE(priority, 'normal') "
+                    "WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 "
+                    "WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 2 END, "
+                    "proposed_at ASC, id ASC LIMIT 100"
                 )
                 backlog_rows = await cur.fetchall()
+                eligible_backlog = await _next_eligible_backlog_entry(c)
             else:
                 backlog_rows = []
+                eligible_backlog = None
         finally:
             await c.close()
 
@@ -1472,9 +1499,10 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                         age = f"{secs // 86400}d"
             except Exception:
                 pass
+            eligible = " [next]" if eligible_backlog and d["id"] == eligible_backlog["id"] else ""
             lines.append(
                 f"#{d['id']}  kind=backlog  [{d['status']}]  "
-                f"pri={d.get('priority') or 'normal'}  {d['title']}  "
+                f"pri={d.get('priority') or 'normal'}{eligible}  {d['title']}  "
                 f"by {d['proposed_by']}, {age} ago"
             )
         for r in rows:
@@ -1545,16 +1573,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "parent_id explicitly (must match a task you own), or leave it "
             "blank to auto-nest under your current task.\n"
             "\n"
-            "**Coach top-level tasks land in the Backlog first (FIFO "
-            "discipline).** When Coach calls this tool WITHOUT a parent_id, "
+            "**Coach top-level tasks land in the Backlog first "
+            "(priority/FIFO discipline).** When Coach calls this tool WITHOUT a parent_id, "
             "the task is inserted into the Backlog as a `pending` entry "
             "(same table as coord_propose_task). No kanban row is created "
             "yet, no Player is woken. Coach must then call "
             "coord_triage_backlog(id, action='promote', trajectory=[...]) "
             "to promote it into TruthGate. This "
-            "enforces FIFO priority ordering: items are triaged in the "
-            "order they arrived, not in the order Coach happened to type "
-            "them (LIFO). Use the `priority` param to flag urgency at "
+            "enforces priority/FIFO ordering: highest priority first, "
+            "oldest first within the same priority. Use the `priority` param to flag urgency at "
             "creation time — the Backlog column shows it. "
             "Player SUBTASKS (with parent_id) are unaffected — they still "
             "plant directly on the kanban under their parent.\n"
@@ -1702,8 +1729,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
                 "Task is NOT yet on the kanban — call "
                 f"coord_triage_backlog(id={backlog_id}, "
                 "action='promote', trajectory=[...]) when you're ready "
-                "to start TruthGate. This enforces FIFO ordering: "
-                "triage from oldest to newest, not by creation recency."
+                "to start TruthGate. This enforces priority/FIFO ordering: "
+                "highest priority first, oldest first within priority."
             )
 
         c = await configured_conn()
@@ -9920,12 +9947,16 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         try:
             cur = await c.execute(
                 f"SELECT id, title, proposed_by, proposed_at, status, "
-                f"promoted_task_id "
+                f"priority, promoted_task_id, emergency, emergency_rationale "
                 f"FROM backlog_tasks {where} "
-                f"ORDER BY proposed_at DESC LIMIT ?",
+                f"ORDER BY CASE COALESCE(priority, 'normal') "
+                f"WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 "
+                f"WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 2 END, "
+                f"proposed_at ASC, id ASC LIMIT ?",
                 params + [limit],
             )
             rows = await cur.fetchall()
+            eligible = await _next_eligible_backlog_entry(c)
         finally:
             await c.close()
 
@@ -9959,8 +9990,16 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             extra = ""
             if d.get("promoted_task_id"):
                 extra = f"  → {d['promoted_task_id']}"
+            if int(d.get("emergency") or 0) and d.get("emergency_rationale"):
+                extra += f"  emergency: {d['emergency_rationale']}"
+            eligible_marker = ""
+            if d.get("status") == "pending" and eligible and d["id"] == eligible["id"]:
+                eligible_marker = " [next]"
+            emergency_marker = " [EMERGENCY]" if int(d.get("emergency") or 0) else ""
             lines.append(
-                f"#{d['id']}  [{d['status']}]  \"{d['title']}\"  "
+                f"#{d['id']}  [{d['status']}]  "
+                f"pri={d.get('priority') or 'normal'}{eligible_marker}"
+                f"{emergency_marker}  \"{d['title']}\"  "
                 f"by {d['proposed_by']}, {age} ago{extra}"
             )
         return _ok("\n".join(lines))
@@ -9983,10 +10022,15 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "- modified_title: optional. Rename the idea on promote.\n"
             "- reason: recommended when action='reject'. Short phrase "
             "  explaining why (stored; surfaces to human if the idea "
-            "  was proposed by a human)."
+            "  was proposed by a human).\n"
+            "- emergency: optional boolean. Required to bypass normal "
+            "priority/FIFO promotion order.\n"
+            "- emergency_rationale: required non-empty text when "
+            "emergency=true; recorded and surfaced on the promoted task."
         ),
         {"id": str, "action": str, "trajectory": Any,
-         "modified_title": str, "reason": str},
+         "modified_title": str, "reason": str,
+         "emergency": Any, "emergency_rationale": str},
     )
     async def triage_backlog(args: dict[str, Any]) -> dict[str, Any]:
         if not caller_is_coach:
@@ -10009,7 +10053,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         try:
             cur = await c.execute(
                 "SELECT id, title, description, proposed_by, status, priority, "
-                "trajectory_json, note, success_criteria "
+                "trajectory_json, note, success_criteria, emergency, "
+                "emergency_rationale, promotion_basis "
                 "FROM backlog_tasks WHERE id = ?",
                 (backlog_id,),
             )
@@ -10067,6 +10112,37 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             )
 
         # action == "promote"
+        emergency = _parse_boolish(args.get("emergency"), default=False)
+        emergency_rationale = (
+            args.get("emergency_rationale")
+            or args.get("reason")
+            or ""
+        ).strip()
+        promotion_basis = "priority_fifo"
+        if emergency:
+            if not emergency_rationale:
+                return _err(
+                    "emergency_rationale is required when emergency=true. "
+                    "Explain why this task must bypass the normal "
+                    "priority/FIFO backlog queue."
+                )
+            promotion_basis = "emergency"
+        else:
+            c = await configured_conn()
+            try:
+                next_entry = await _next_eligible_backlog_entry(c)
+            finally:
+                await c.close()
+            if next_entry and int(next_entry["id"]) != backlog_id:
+                return _err(
+                    "promotion blocked: backlog-first discipline requires "
+                    "promoting the highest-priority oldest pending item "
+                    "first, or declaring emergency=true with a non-empty "
+                    "emergency_rationale. Next eligible item is "
+                    f"#{next_entry['id']} ({next_entry.get('priority') or 'normal'}): "
+                    f"\"{next_entry['title']}\"."
+                )
+
         # Trajectory: args wins; fall back to stored trajectory_json from
         # Coach's coord_create_task call (backlog-first flow).
         trajectory_arg = args.get("trajectory")
@@ -10117,18 +10193,28 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             await c.execute(
                 "INSERT INTO tasks (id, project_id, title, description, "
                 "priority, workflow, tracking_reason, trajectory, status, "
-                "owner, last_stage_change_at, created_by, success_criteria) "
+                "owner, last_stage_change_at, created_by, success_criteria, "
+                "emergency, emergency_rationale) "
                 "VALUES (?, ?, ?, ?, ?, 'generic', 'backlog', "
-                "?, ?, ?, ?, ?, ?)",
+                "?, ?, ?, ?, ?, ?, ?, ?)",
                 (task_id, project_id, title, entry.get("description") or "",
                  promote_priority,
                  trajectory_json, initial_status, None,
-                 now_iso, caller_id, promote_sc),
+                 now_iso, caller_id, promote_sc,
+                 1 if emergency else 0,
+                 emergency_rationale if emergency else None),
             )
             await c.execute(
                 "UPDATE backlog_tasks SET status='promoted', "
-                "promoted_task_id=? WHERE id=?",
-                (task_id, backlog_id),
+                "promoted_task_id=?, emergency=?, emergency_rationale=?, "
+                "promotion_basis=? WHERE id=?",
+                (
+                    task_id,
+                    1 if emergency else 0,
+                    emergency_rationale if emergency else None,
+                    promotion_basis,
+                    backlog_id,
+                ),
             )
             await c.commit()
         finally:
@@ -10146,6 +10232,8 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "tracking_reason": "backlog",
             "trajectory": trajectory,
             "project_id": project_id,
+            "emergency": emergency,
+            "emergency_rationale": emergency_rationale if emergency else None,
         })
         await bus.publish({
             "ts": now_iso,
@@ -10166,6 +10254,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "from": "backlog",
             "post_gate_stage": first_post_gate_stage,
             "project_id": project_id,
+            "emergency": emergency,
         })
         await bus.publish({
             "ts": now_iso,
@@ -10175,12 +10264,21 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "task_id": task_id,
             "title": title,
             "priority": promote_priority,
+            "promotion_basis": promotion_basis,
+            "emergency": emergency,
+            "emergency_rationale": emergency_rationale if emergency else None,
         })
+        emergency_text = (
+            f" EMERGENCY promotion recorded: {emergency_rationale}."
+            if emergency else
+            " Promotion basis: priority/FIFO next eligible item."
+        )
         return _ok(
             f"Backlog entry #{backlog_id} promoted → task {task_id} "
             f"(\"{title}\", priority={promote_priority}, "
             f"initial stage: truthgate; post-gate trajectory starts at "
-            f"{first_post_gate_stage}). No Player role was planted and "
+            f"{first_post_gate_stage}).{emergency_text} "
+            f"No Player role was planted and "
             f"no Player was woken. Record/run TruthGate, then drive via "
             f"coord_approve_stage(task_id={task_id!r}, "
             f"next_stage={first_post_gate_stage!r}, assignee=<slot>)."
@@ -10228,12 +10326,17 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         try:
             cur = await c.execute(
                 f"SELECT id, title, proposed_by, proposed_at, status, "
-                f"reject_reason, promoted_task_id "
+                f"priority, reject_reason, promoted_task_id, emergency, "
+                f"emergency_rationale, promotion_basis "
                 f"FROM backlog_tasks{where} "
-                f"ORDER BY proposed_at DESC LIMIT ?",
+                f"ORDER BY CASE COALESCE(priority, 'normal') "
+                f"WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 "
+                f"WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 2 END, "
+                f"proposed_at ASC, id ASC LIMIT ?",
                 [*params, limit],
             )
             rows = await cur.fetchall()
+            eligible = await _next_eligible_backlog_entry(c)
         finally:
             await c.close()
 
@@ -10264,14 +10367,22 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             status_tag = d["status"]
             title = (d.get("title") or "").strip()
             proposer = d.get("proposed_by") or "?"
+            eligible_marker = ""
+            if status_tag == "pending" and eligible and d["id"] == eligible["id"]:
+                eligible_marker = " [next]"
+            emergency_marker = " [EMERGENCY]" if int(d.get("emergency") or 0) else ""
             line = (
-                f"#{d['id']}  kind=backlog  [{status_tag}]  \"{title}\"  "
+                f"#{d['id']}  kind=backlog  [{status_tag}]  "
+                f"pri={d.get('priority') or 'normal'}{eligible_marker}"
+                f"{emergency_marker}  \"{title}\"  "
                 f"by {proposer}, {age} ago"
             )
             if status_tag == "rejected" and d.get("reject_reason"):
                 line += f"  reason: {d['reject_reason']}"
             elif status_tag == "promoted" and d.get("promoted_task_id"):
                 line += f"  → task {d['promoted_task_id']}"
+            if int(d.get("emergency") or 0) and d.get("emergency_rationale"):
+                line += f"  emergency: {d['emergency_rationale']}"
             lines.append(line)
         return _ok("\n".join(lines))
 

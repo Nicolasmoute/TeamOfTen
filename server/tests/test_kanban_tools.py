@@ -910,7 +910,7 @@ async def test_list_tasks_include_backlog_shows_active_board_not_archive(
     text = _ok_text(await _handler(server, "list_tasks")({}))
 
     assert f"#{backlog_id}  kind=backlog  [pending]" in text
-    assert "pri=high  pending board idea" in text
+    assert "pri=high [next]  pending board idea" in text
     assert "promoted old idea" not in text
     assert "t-2026-05-13-plan0001  kind=task  [plan]" in text
     assert "t-2026-05-13-verify02  kind=task  [verify]" in text

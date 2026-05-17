@@ -728,6 +728,8 @@ class CreateTaskRequest(BaseModel):
     # `[{"stage":"execute","to":[]}]`. The harness validates via
     # tools.py:_validate_trajectory.
     trajectory: list[dict[str, Any]] | None = None
+    emergency: bool = False
+    emergency_rationale: str | None = Field(default=None, max_length=2_000)
 
 
 # ------- kanban-specific request models (Docs/kanban-specs-v2.md §8) -------
@@ -4005,6 +4007,27 @@ _BACKLOG_DESCRIPTION_MAX = 8000
 
 
 _BACKLOG_PRIORITIES = {"low", "normal", "high", "urgent"}
+_BACKLOG_PRIORITY_RANK = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
+
+
+def _backlog_sort_key(row: dict[str, Any]) -> tuple[int, str, int]:
+    return (
+        _BACKLOG_PRIORITY_RANK.get((row.get("priority") or "normal").lower(), 2),
+        row.get("proposed_at") or "",
+        int(row.get("id") or 0),
+    )
+
+
+def _annotate_backlog_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    pending = [r for r in rows if r.get("status") == "pending"]
+    next_id = min(pending, key=_backlog_sort_key)["id"] if pending else None
+    out: list[dict[str, Any]] = []
+    for row in sorted(rows, key=_backlog_sort_key):
+        d = dict(row)
+        d["is_next_eligible"] = d.get("status") == "pending" and d.get("id") == next_id
+        d["emergency"] = bool(d.get("emergency") or 0)
+        out.append(d)
+    return out
 
 
 class BacklogCreateRequest(BaseModel):
@@ -4067,6 +4090,7 @@ async def create_backlog_entry(req: BacklogCreateRequest) -> dict[str, Any]:
     return {
         "id": backlog_id, "title": title, "description": description,
         "priority": priority, "status": "pending",
+        "emergency": False, "is_next_eligible": False,
     }
 
 
@@ -4087,22 +4111,32 @@ async def list_backlog(status: str | None = None) -> dict[str, Any]:
         if not status or status == "pending":
             cur = await c.execute(
                 "SELECT * FROM backlog_tasks WHERE status='pending' "
-                "ORDER BY proposed_at ASC"
+                "ORDER BY CASE COALESCE(priority, 'normal') "
+                "WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 "
+                "WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 2 END, "
+                "proposed_at ASC, id ASC"
             )
         elif status == "all":
             cur = await c.execute(
-                "SELECT * FROM backlog_tasks ORDER BY proposed_at ASC"
+                "SELECT * FROM backlog_tasks "
+                "ORDER BY CASE COALESCE(priority, 'normal') "
+                "WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 "
+                "WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 2 END, "
+                "proposed_at ASC, id ASC"
             )
         else:
             cur = await c.execute(
                 "SELECT * FROM backlog_tasks WHERE status=? "
-                "ORDER BY proposed_at ASC",
+                "ORDER BY CASE COALESCE(priority, 'normal') "
+                "WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 "
+                "WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 2 END, "
+                "proposed_at ASC, id ASC",
                 (status,),
             )
         rows = await cur.fetchall()
     finally:
         await c.close()
-    return {"backlog": [dict(r) for r in rows]}
+    return {"backlog": _annotate_backlog_rows([dict(r) for r in rows])}
 
 
 class BacklogUpdateRequest(BaseModel):
@@ -4275,12 +4309,12 @@ async def list_tasks(status: str | None = None, owner: str | None = None) -> dic
 
 @app.post("/api/tasks", dependencies=[Depends(require_token)])
 async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
-    """Create a top-level task from the UI (attributed to 'human').
+    """Create a human task request.
 
-    v0.3: routing is driven by the `trajectory` field (ordered list of
-    `{stage, to}` objects). Defaults to `[{stage:'execute', to:[]}]`
-    when omitted — Coach can add stages later via
-    POST /api/tasks/{id}/trajectory.
+    Top-level non-emergency requests are backlog proposals. Top-level
+    emergency requests must include a rationale and enter TruthGate
+    without planting a Player role. Parented child tasks preserve the
+    legacy direct-dispatch behavior.
     """
     from server.tools import _validate_trajectory
     task_id = f"t-{datetime.now(timezone.utc).strftime('%Y-%m-%d')}-{uuid.uuid4().hex[:8]}"
@@ -4291,6 +4325,192 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
         if isinstance(req.tracking_reason, str) and req.tracking_reason.strip()
         else None
     )
+    emergency_rationale = (
+        req.emergency_rationale.strip()
+        if isinstance(req.emergency_rationale, str)
+        and req.emergency_rationale.strip()
+        else None
+    )
+    top_level_default_trajectory = [{"stage": "execute", "to": []}]
+    raw_trajectory = req.trajectory or top_level_default_trajectory
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    if parent_id is None:
+        validated, err = _validate_trajectory(
+            raw_trajectory,
+            enforce_first_stage_assigned=False,
+        )
+        if err:
+            raise HTTPException(400, detail=f"invalid trajectory: {err}")
+        assert validated is not None
+        trajectory = validated
+        trajectory_json = json.dumps(trajectory, separators=(",", ":"))
+
+        if req.emergency and not emergency_rationale:
+            raise HTTPException(
+                400,
+                detail=(
+                    "emergency_rationale is required when emergency=true"
+                ),
+            )
+
+        c = await configured_conn()
+        try:
+            if req.emergency:
+                cur = await c.execute(
+                    "INSERT INTO backlog_tasks "
+                    "(title, description, proposed_by, proposed_at, priority, "
+                    "trajectory_json, status, emergency, emergency_rationale, "
+                    "promotion_basis) "
+                    "VALUES (?, ?, 'human', ?, ?, ?, 'promoted', 1, ?, "
+                    "'emergency')",
+                    (
+                        req.title,
+                        req.description or None,
+                        now_iso,
+                        req.priority,
+                        trajectory_json,
+                        emergency_rationale,
+                    ),
+                )
+                backlog_id = cur.lastrowid
+                await c.execute(
+                    "INSERT INTO tasks (id, project_id, title, description, "
+                    "parent_id, priority, workflow, tracking_reason, "
+                    "trajectory, status, owner, last_stage_change_at, "
+                    "created_by, emergency, emergency_rationale) "
+                    "VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, 'truthgate', "
+                    "NULL, ?, 'human', 1, ?)",
+                    (
+                        task_id,
+                        project_id,
+                        req.title,
+                        req.description,
+                        req.priority,
+                        req.workflow,
+                        tracking_reason,
+                        trajectory_json,
+                        now_iso,
+                        emergency_rationale,
+                    ),
+                )
+                await c.execute(
+                    "UPDATE backlog_tasks SET promoted_task_id = ? "
+                    "WHERE id = ?",
+                    (task_id, backlog_id),
+                )
+                await c.commit()
+            else:
+                cur = await c.execute(
+                    "INSERT INTO backlog_tasks "
+                    "(title, description, proposed_by, proposed_at, priority, "
+                    "trajectory_json) "
+                    "VALUES (?, ?, 'human', ?, ?, ?)",
+                    (
+                        req.title,
+                        req.description or None,
+                        now_iso,
+                        req.priority,
+                        trajectory_json,
+                    ),
+                )
+                backlog_id = cur.lastrowid
+                await c.commit()
+        finally:
+            await c.close()
+
+        if req.emergency:
+            await bus.publish(
+                {
+                    "ts": now_iso,
+                    "agent_id": "human",
+                    "type": "task_created",
+                    "task_id": task_id,
+                    "title": req.title,
+                    "parent_id": None,
+                    "priority": req.priority,
+                    "workflow": req.workflow,
+                    "tracking_reason": tracking_reason,
+                    "trajectory": trajectory,
+                    "project_id": project_id,
+                    "emergency": True,
+                    "emergency_rationale": emergency_rationale,
+                }
+            )
+            await bus.publish(
+                {
+                    "ts": now_iso,
+                    "agent_id": "system",
+                    "type": "task_stage_changed",
+                    "task_id": task_id,
+                    "from": None,
+                    "to": "truthgate",
+                    "reason": "emergency_api_task_created",
+                    "owner": None,
+                    "project_id": project_id,
+                }
+            )
+            await bus.publish(
+                {
+                    "ts": now_iso,
+                    "agent_id": "system",
+                    "type": "task_truthgate_started",
+                    "task_id": task_id,
+                    "from": "api_emergency",
+                    "post_gate_stage": trajectory[0]["stage"],
+                    "project_id": project_id,
+                    "emergency": True,
+                }
+            )
+            await bus.publish(
+                {
+                    "ts": now_iso,
+                    "agent_id": "human",
+                    "type": "backlog_task_promoted",
+                    "backlog_id": backlog_id,
+                    "task_id": task_id,
+                    "title": req.title,
+                    "priority": req.priority,
+                    "promotion_basis": "emergency",
+                    "emergency": True,
+                    "emergency_rationale": emergency_rationale,
+                }
+            )
+            return {
+                "ok": True,
+                "task_id": task_id,
+                "backlog_id": backlog_id,
+                "status": "truthgate",
+                "workflow": req.workflow,
+                "trajectory": trajectory,
+                "emergency": True,
+                "emergency_rationale": emergency_rationale,
+            }
+
+        event: dict[str, Any] = {
+            "ts": now_iso,
+            "agent_id": "human",
+            "type": "backlog_task_proposed",
+            "id": backlog_id,
+            "title": req.title,
+            "proposed_by": "human",
+            "priority": req.priority,
+            "description_present": bool(req.description),
+        }
+        if req.description:
+            event["description"] = req.description
+        await bus.publish(event)
+        return {
+            "ok": True,
+            "backlog_id": backlog_id,
+            "status": "pending",
+            "kind": "backlog",
+            "title": req.title,
+            "description": req.description or None,
+            "priority": req.priority,
+            "trajectory": trajectory,
+            "emergency": False,
+        }
 
     # Validate trajectory. v2.0.1 (2026-05-08): the legacy default of
     # [{stage:'execute', to:[]}] is gone — the caller must supply a
@@ -4311,7 +4531,6 @@ async def create_task_from_human(req: CreateTaskRequest) -> dict[str, Any]:
     assert validated is not None
     trajectory = validated
     trajectory_json = json.dumps(trajectory, separators=(",", ":"))
-    now_iso = datetime.now(timezone.utc).isoformat()
 
     role_for_stage = {
         "plan": "planner",
