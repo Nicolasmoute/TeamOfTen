@@ -270,12 +270,13 @@ async def resolve_file_write_proposal(
     )
     if proposal["scope"] == "truth" and proposal.get("originating_task_id"):
         metadata = _safe_metadata(proposal.get("metadata_json"))
+        originating_task_id = str(proposal.get("originating_task_id") or "")
         await bus.publish({
             "ts": now_iso,
             "agent_id": "human",
             "type": "truth_amendment_resolved",
             "proposal_id": proposal_id,
-            "task_id": proposal.get("originating_task_id"),
+            "task_id": originating_task_id,
             "project_id": proposal["project_id"],
             "path": proposal["path"],
             "status": new_status,
@@ -286,6 +287,31 @@ async def resolve_file_write_proposal(
             "rejection_consequence": metadata.get("rejection_consequence") or "",
             "to": "coach",
         })
+        if new_status == "approved":
+            title: str | None = None
+            c = await configured_conn()
+            try:
+                cur = await c.execute(
+                    "SELECT title FROM tasks WHERE id = ? AND project_id = ?",
+                    (originating_task_id, proposal["project_id"]),
+                )
+                row = await cur.fetchone()
+                if row:
+                    title = str(dict(row).get("title") or "").strip() or None
+            finally:
+                await c.close()
+            from server.truthgate.notifications import (  # noqa: PLC0415
+                notify_coach_truth_amendment_resolved,
+            )
+
+            await notify_coach_truth_amendment_resolved(
+                project_id=proposal["project_id"],
+                task_id=originating_task_id,
+                title=title,
+                proposal_id=proposal_id,
+                path=proposal["path"],
+                status=new_status,
+            )
     return {
         "ok": True,
         "id": proposal_id,
