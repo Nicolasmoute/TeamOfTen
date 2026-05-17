@@ -3962,11 +3962,16 @@ Turn-header (`agent_started`) rendering rules:
   `Your previous turn errored …`) and recurrence-tick wakes do NOT
   match — they stay `var(--fg)` to read as routine.
 
-**Chat reply button.** `message_sent` rows reveal a hover-only
-curved-arrow icon button (CSS-drawn inline SVG, no emoji). Clicking
-pre-fills the pane textarea with a quoted snippet and focuses it:
+**Chat reply button.** White `.event.text` final agent replies and
+`message_sent` rows reveal a hover-only curved-arrow icon button
+(CSS-drawn inline SVG, no emoji). Clicking pre-fills the pane textarea
+with a quoted snippet and focuses it:
 `` `> Re: ${subject} (from ${sender}): ${first 80 chars of body}…\n\n` ``.
-Reply target = original sender's `agent_id`; `broadcast` senders
+For white `.event.text` rows, the reply stays in the same AgentPane
+composer/context and uses `event.agent_id || viewerSlot` as the quote
+sender; if neither is known, no Reply button is rendered. Blue
+`.event.message_sent.peer-thread` rows keep the existing reply behavior:
+reply target = original sender's `agent_id`, and `broadcast` senders
 default to `coach`. No new endpoints or schema changes. The same
 affordance appears on inbox rows in the Environment Pane (§16.6);
 there it opens the EnvPane Inbox composer, sets the `to` field, and
