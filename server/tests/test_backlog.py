@@ -57,14 +57,16 @@ async def _insert_backlog(
     proposed_by: str = "p1",
     proposed_at: str | None = None,
     status: str = "pending",
+    priority: str = "normal",
 ) -> int:
     now = proposed_at or datetime.now(timezone.utc).isoformat()
     c = await configured_conn()
     try:
         cur = await c.execute(
-            "INSERT INTO backlog_tasks (title, proposed_by, proposed_at, status) "
-            "VALUES (?, ?, ?, ?)",
-            (title, proposed_by, now, status),
+            "INSERT INTO backlog_tasks "
+            "(title, proposed_by, proposed_at, status, priority) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (title, proposed_by, now, status, priority),
         )
         row_id = cur.lastrowid
         await c.commit()
@@ -176,7 +178,8 @@ async def test_backlog_table_columns() -> None:
         await c.close()
     expected = {
         "id", "title", "description", "proposed_by", "proposed_at",
-        "status", "reject_reason", "promoted_task_id",
+        "status", "reject_reason", "promoted_task_id", "priority",
+        "emergency", "emergency_rationale", "promotion_basis",
     }
     assert expected <= cols, f"Missing columns: {expected - cols}"
 
@@ -421,6 +424,108 @@ async def test_triage_backlog_promote() -> None:
     assert stage_changed[0]["from"] is None
     assert stage_changed[0]["to"] == "truthgate"
     assert stage_changed[0]["reason"] == "backlog_promoted"
+    role_assigned = [e for e in events if e.get("type") == "task_role_assigned"]
+    assert role_assigned == []
+
+
+@pytest.mark.asyncio
+async def test_triage_backlog_promote_blocks_non_next_priority_fifo() -> None:
+    older_normal = await _insert_backlog(
+        "Older normal",
+        priority="normal",
+        proposed_at="2026-05-17T10:00:00+00:00",
+    )
+    urgent = await _insert_backlog(
+        "Urgent first",
+        priority="urgent",
+        proposed_at="2026-05-17T10:01:00+00:00",
+    )
+    fn = _handler("coach", "coord_triage_backlog")
+
+    blocked = await fn({
+        "id": str(older_normal),
+        "action": "promote",
+        "trajectory": [{"stage": "execute", "to": ["p1"]}],
+    })
+
+    assert _is_err(blocked)
+    assert "promotion blocked" in _text(blocked)
+    assert f"#{urgent}" in _text(blocked)
+
+
+@pytest.mark.asyncio
+async def test_triage_backlog_emergency_requires_rationale() -> None:
+    await _insert_backlog(
+        "Older urgent",
+        priority="urgent",
+        proposed_at="2026-05-17T10:00:00+00:00",
+    )
+    later = await _insert_backlog(
+        "Emergency candidate",
+        priority="normal",
+        proposed_at="2026-05-17T10:01:00+00:00",
+    )
+    fn = _handler("coach", "coord_triage_backlog")
+
+    result = await fn({
+        "id": str(later),
+        "action": "promote",
+        "trajectory": [{"stage": "execute", "to": ["p1"]}],
+        "emergency": "true",
+    })
+
+    assert _is_err(result)
+    assert "emergency_rationale" in _text(result)
+
+
+@pytest.mark.asyncio
+async def test_triage_backlog_emergency_promote_records_visible_metadata() -> None:
+    await _insert_backlog(
+        "Older urgent",
+        priority="urgent",
+        proposed_at="2026-05-17T10:00:00+00:00",
+    )
+    later = await _insert_backlog(
+        "Emergency candidate",
+        priority="normal",
+        proposed_at="2026-05-17T10:01:00+00:00",
+    )
+    q = bus.subscribe()
+    try:
+        fn = _handler("coach", "coord_triage_backlog")
+        result = await fn({
+            "id": str(later),
+            "action": "promote",
+            "trajectory": [{"stage": "execute", "to": ["p1"]}],
+            "emergency": "true",
+            "emergency_rationale": "production outage",
+        })
+        events = _drain(q)
+    finally:
+        bus.unsubscribe(q)
+
+    assert _is_ok(result), _text(result)
+    assert "EMERGENCY promotion recorded" in _text(result)
+    backlog = await _get_backlog(later)
+    assert backlog is not None
+    assert backlog["emergency"] == 1
+    assert backlog["emergency_rationale"] == "production outage"
+    assert backlog["promotion_basis"] == "emergency"
+    task_id = backlog["promoted_task_id"]
+    c = await configured_conn()
+    try:
+        task = dict(await (await c.execute(
+            "SELECT status, emergency, emergency_rationale FROM tasks WHERE id = ?",
+            (task_id,),
+        )).fetchone())
+    finally:
+        await c.close()
+    assert task["status"] == "truthgate"
+    assert task["emergency"] == 1
+    assert task["emergency_rationale"] == "production outage"
+    promoted = [e for e in events if e.get("type") == "backlog_task_promoted"]
+    assert promoted[0]["emergency"] is True
+    assert promoted[0]["emergency_rationale"] == "production outage"
     role_assigned = [e for e in events if e.get("type") == "task_role_assigned"]
     assert role_assigned == []
 
@@ -1020,6 +1125,33 @@ async def test_post_backlog_invalid_priority(fresh_db: str) -> None:
             "/api/backlog", json={"title": "x", "priority": "critical"}
         )
     assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_get_backlog_marks_next_eligible_priority_fifo(fresh_db: str) -> None:
+    await init_db()
+    from httpx import ASGITransport, AsyncClient
+    from server.main import app
+
+    await _insert_backlog(
+        "Older normal",
+        priority="normal",
+        proposed_at="2026-05-17T10:00:00+00:00",
+    )
+    urgent_id = await _insert_backlog(
+        "Newer urgent",
+        priority="urgent",
+        proposed_at="2026-05-17T10:01:00+00:00",
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        r = await client.get("/api/backlog?status=pending")
+    assert r.status_code == 200, r.text
+    rows = r.json()["backlog"]
+    assert rows[0]["id"] == urgent_id
+    assert rows[0]["is_next_eligible"] is True
+    assert rows[1]["is_next_eligible"] is False
 
 
 # ---------------------------------------------------------------- PATCH priority

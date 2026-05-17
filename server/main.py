@@ -4005,6 +4005,27 @@ _BACKLOG_DESCRIPTION_MAX = 8000
 
 
 _BACKLOG_PRIORITIES = {"low", "normal", "high", "urgent"}
+_BACKLOG_PRIORITY_RANK = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
+
+
+def _backlog_sort_key(row: dict[str, Any]) -> tuple[int, str, int]:
+    return (
+        _BACKLOG_PRIORITY_RANK.get((row.get("priority") or "normal").lower(), 2),
+        row.get("proposed_at") or "",
+        int(row.get("id") or 0),
+    )
+
+
+def _annotate_backlog_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    pending = [r for r in rows if r.get("status") == "pending"]
+    next_id = min(pending, key=_backlog_sort_key)["id"] if pending else None
+    out: list[dict[str, Any]] = []
+    for row in sorted(rows, key=_backlog_sort_key):
+        d = dict(row)
+        d["is_next_eligible"] = d.get("status") == "pending" and d.get("id") == next_id
+        d["emergency"] = bool(d.get("emergency") or 0)
+        out.append(d)
+    return out
 
 
 class BacklogCreateRequest(BaseModel):
@@ -4067,6 +4088,7 @@ async def create_backlog_entry(req: BacklogCreateRequest) -> dict[str, Any]:
     return {
         "id": backlog_id, "title": title, "description": description,
         "priority": priority, "status": "pending",
+        "emergency": False, "is_next_eligible": False,
     }
 
 
@@ -4087,22 +4109,32 @@ async def list_backlog(status: str | None = None) -> dict[str, Any]:
         if not status or status == "pending":
             cur = await c.execute(
                 "SELECT * FROM backlog_tasks WHERE status='pending' "
-                "ORDER BY proposed_at ASC"
+                "ORDER BY CASE COALESCE(priority, 'normal') "
+                "WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 "
+                "WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 2 END, "
+                "proposed_at ASC, id ASC"
             )
         elif status == "all":
             cur = await c.execute(
-                "SELECT * FROM backlog_tasks ORDER BY proposed_at ASC"
+                "SELECT * FROM backlog_tasks "
+                "ORDER BY CASE COALESCE(priority, 'normal') "
+                "WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 "
+                "WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 2 END, "
+                "proposed_at ASC, id ASC"
             )
         else:
             cur = await c.execute(
                 "SELECT * FROM backlog_tasks WHERE status=? "
-                "ORDER BY proposed_at ASC",
+                "ORDER BY CASE COALESCE(priority, 'normal') "
+                "WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 "
+                "WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 2 END, "
+                "proposed_at ASC, id ASC",
                 (status,),
             )
         rows = await cur.fetchall()
     finally:
         await c.close()
-    return {"backlog": [dict(r) for r in rows]}
+    return {"backlog": _annotate_backlog_rows([dict(r) for r in rows])}
 
 
 class BacklogUpdateRequest(BaseModel):

@@ -588,6 +588,7 @@ function Card({
                 <span>${task.created_at ? `created ${timeAgo(task.created_at)}` : "created unknown"}</span>
                 ${task.last_stage_change_at ? html`<span>stage ${timeAgo(task.last_stage_change_at)}</span>` : null}
                 ${task.workflow ? html`<span>${task.workflow}</span>` : null}
+                ${task.emergency ? html`<span>EMERGENCY ${task.emergency_rationale || ""}</span>` : null}
                 ${task.required_reviews ? html`<span>reviews ${task.required_reviews}</span>` : null}
                 ${task.blocked_reason ? html`<span>${task.blocked_reason}</span>` : null}
                 ${task.truthgate_warning ? html`<span>${task.truthgate_warning}</span>` : null}
@@ -1398,6 +1399,8 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
 
   const desc = entry.description || "";
   const pri = entry.priority || "normal";
+  const isNext = Boolean(entry.is_next_eligible);
+  const isEmergency = Boolean(entry.emergency);
 
   return html`
     <div
@@ -1408,6 +1411,8 @@ function BacklogCard({ entry, authedFetch, onRefresh }) {
       ${expanded && desc ? html`<div class="kbn-backlog-desc">${desc}</div>` : null}
       <div class="kbn-card-meta">
         <span class="kbn-backlog-priority-chip kbn-backlog-pri-${pri}">${pri.toUpperCase()}</span>
+        ${isNext ? html`<span class="kbn-backlog-priority-chip">NEXT</span>` : html`<span class="kbn-backlog-priority-chip" title="Waiting behind higher-priority or older backlog entries">WAITING</span>`}
+        ${isEmergency ? html`<span class="kbn-backlog-priority-chip kbn-backlog-pri-urgent" title=${entry.emergency_rationale || "Emergency promotion"}>EMERGENCY</span>` : null}
         <span class="kbn-backlog-proposer">${proposerLabel}</span>
         <span class="kbn-card-age">${timeAgo(entry.proposed_at)}</span>
         ${desc && !expanded ? html`<span class="kbn-backlog-has-desc" title="Has description">…</span>` : null}

@@ -5,7 +5,7 @@ Covers:
 - All-status filter returns promoted + rejected entries too.
 - Empty backlog returns a sentinel message.
 - Invalid status param returns an error.
-- Entries are sorted newest-first by proposed_at.
+- Entries are sorted by priority/FIFO and mark the next eligible item.
 - Rejected entries include reject_reason in output.
 - Promoted entries include the promoted task id in output.
 - limit param caps and validates correctly.
@@ -151,23 +151,32 @@ async def test_list_backlog_invalid_status(fresh_db: str) -> None:
 
 
 # -----------------------------------------------------------------------
-# Sort order — newest first
+# Sort order — priority/FIFO
 # -----------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_list_backlog_sorted_newest_first(fresh_db: str) -> None:
-    """Entries are returned newest-first by proposed_at."""
+async def test_list_backlog_sorted_priority_fifo(fresh_db: str) -> None:
+    """Pending entries are returned by priority, FIFO within priority."""
     await init_db()
-    await _seed_backlog(title="older idea", proposed_at="2026-05-10T08:00:00.000Z")
-    await _seed_backlog(title="newer idea", proposed_at="2026-05-14T12:00:00.000Z")
+    await _seed_backlog(title="older normal", proposed_at="2026-05-10T08:00:00.000Z")
+    await _seed_backlog(title="newer urgent", proposed_at="2026-05-14T12:00:00.000Z")
+    c = await configured_conn()
+    try:
+        await c.execute(
+            "UPDATE backlog_tasks SET priority = 'urgent' WHERE title = 'newer urgent'"
+        )
+        await c.commit()
+    finally:
+        await c.close()
 
     server = _server_for("coach")
     result = await _handler(server, "list_backlog")({"status": "pending"})
     text = _ok_text(result)
 
-    newer_pos = text.index("newer idea")
-    older_pos = text.index("older idea")
-    assert newer_pos < older_pos, "newer entry should appear before older one"
+    urgent_pos = text.index("newer urgent")
+    normal_pos = text.index("older normal")
+    assert urgent_pos < normal_pos, "urgent entry should appear before older normal"
+    assert "[next]" in text
 
 
 # -----------------------------------------------------------------------

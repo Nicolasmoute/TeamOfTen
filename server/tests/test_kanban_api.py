@@ -199,6 +199,31 @@ def test_board_priority_sort(client: TestClient) -> None:
     assert plan_ids[-1] == "t-2026-05-03-11111111"  # low last
 
 
+def test_board_serializes_emergency_metadata(client: TestClient) -> None:
+    import asyncio
+    task_id = "t-2026-05-03-emergncy"
+    asyncio.run(_seed(task_id=task_id, status="truthgate", priority="urgent"))
+
+    async def mark_emergency() -> None:
+        c = await configured_conn()
+        try:
+            await c.execute(
+                "UPDATE tasks SET emergency = 1, emergency_rationale = ? "
+                "WHERE id = ?",
+                ("production outage", task_id),
+            )
+            await c.commit()
+        finally:
+            await c.close()
+
+    asyncio.run(mark_emergency())
+    r = client.get("/api/tasks/board")
+    assert r.status_code == 200
+    task = next(t for t in r.json()["board"]["truthgate"] if t["id"] == task_id)
+    assert task["emergency"] == 1
+    assert task["emergency_rationale"] == "production outage"
+
+
 def test_flow_health_includes_verify_stage_counts(client: TestClient) -> None:
     import asyncio
     asyncio.run(_seed(

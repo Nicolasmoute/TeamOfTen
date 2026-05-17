@@ -99,6 +99,8 @@ The executor never wakes silently from a FAIL. Coach is the only mechanism that 
 
 The Backlog is a lightweight list of task *ideas* that precedes the kanban proper. Any agent or human can drop a title-only idea into the Backlog; Coach decides whether to promote it into an active task (with trajectory) or reject it (with reason).
 
+Backlog is the default holding area for all non-emergency top-level work. Coach promotes pending entries by explicit pipeline priority first (`urgent`, `high`, `normal`, `low`) and FIFO within the same priority. Bypassing that order is allowed only for true emergencies and must be declared with a non-empty rationale.
+
 ### 4.0.1 Entry shape
 
 | Column | Type | Notes |
@@ -110,6 +112,10 @@ The Backlog is a lightweight list of task *ideas* that precedes the kanban prope
 | `status` | TEXT | `pending` \| `promoted` \| `rejected` |
 | `reject_reason` | TEXT | Null unless rejected |
 | `promoted_task_id` | TEXT | Set on promote; FK into `tasks.id` |
+| `priority` | TEXT | `low` \| `normal` \| `high` \| `urgent`; default `normal` |
+| `emergency` | INTEGER | `1` only when Coach explicitly bypassed the priority/FIFO queue |
+| `emergency_rationale` | TEXT | Required when `emergency=1` |
+| `promotion_basis` | TEXT | `priority_fifo` or `emergency` |
 
 ### 4.0.2 Propose paths
 
@@ -122,12 +128,12 @@ The Backlog is a lightweight list of task *ideas* that precedes the kanban prope
 Coach-only MCP tool. Players who call it receive a "Coach-only" error.
 
 ```
-coord_triage_backlog(id, action, trajectory?, modified_title?, reason?)
+coord_triage_backlog(id, action, trajectory?, modified_title?, reason?, emergency?, emergency_rationale?)
 ```
 
 | `action` | Effect |
 |---|---|
-| `promote` | Atomically: UPDATE `backlog_tasks.status='promoted'`, INSERT into `tasks` with `status='truthgate'` (title = `modified_title ?? title`, `trajectory` required and preserved as the post-gate path), and **do not** plant a Player role or wake a Player. Emits `task_created`, `task_stage_changed{from=null, to='truthgate', reason='backlog_promoted'}`, `task_truthgate_started`, and `backlog_task_promoted {backlog_id, task_id, title}` so open Kanban panes update both the Backlog and active board without manual refresh. |
+| `promote` | Validates backlog-first discipline before mutation. Normal promotion is allowed only for the next pending item by priority/FIFO order. Out-of-order promotion requires `emergency=true` plus non-empty `emergency_rationale`. Atomically: UPDATE `backlog_tasks.status='promoted'` with `promotion_basis` and emergency metadata, INSERT into `tasks` with `status='truthgate'` and matching emergency metadata (title = `modified_title ?? title`, `trajectory` required and preserved as the post-gate path), and **do not** plant a Player role or wake a Player. Emits `task_created`, `task_stage_changed{from=null, to='truthgate', reason='backlog_promoted'}`, `task_truthgate_started`, and `backlog_task_promoted {backlog_id, task_id, title, promotion_basis, emergency, emergency_rationale?}` so open Kanban panes update both the Backlog and active board without manual refresh. |
 | `reject` | UPDATE `backlog_tasks.status='rejected', reject_reason=reason`. Emits `backlog_task_rejected {id, title, reason}`. |
 
 ### 4.0.4 Rejection notification (human-proposed)
@@ -136,7 +142,7 @@ When `proposed_by='human'` and action is `reject`, the harness inserts a row int
 
 ### 4.0.5 Coordination block rule
 
-When the Backlog has pending items, `_build_coach_coordination_block` appends a `## Backlog` section listing the top 5 oldest `pending` entries (oldest-first). Format per line: `[{id}] "{title}" — {proposer}, {age}`. Section is omitted entirely when the Backlog is empty (zero token cost in the common case).
+When the Backlog has pending items, `_build_coach_coordination_block` appends a `## Backlog` section listing the top 5 pending entries by priority/FIFO order. Format per line: `[{id}] "{title}" — {proposer}, {age}` with priority context. Section is omitted entirely when the Backlog is empty (zero token cost in the common case).
 
 ### 4.0.6 Mid-turn view: `coord_list_backlog`
 
@@ -151,17 +157,17 @@ coord_list_backlog(status?, limit?)
 | `status` | `'pending'` | `'pending'` / `'promoted'` / `'rejected'` / `'all'` |
 | `limit` | 50 | Max rows (1–200) |
 
-Available to **Coach and all Players** (read-only, no side effects). Returns entries newest-first. One line per entry:
+Available to **Coach and all Players** (read-only, no side effects). Returns pending entries by priority/FIFO order; the next normally promotable item is marked `[next]`. One line per entry:
 
 ```
-#<id>  kind=backlog  [<status>]  "<title>"  by <proposed_by>, <age> ago
+#<id>  kind=backlog  [<status>]  pri=<priority> [next]  "<title>"  by <proposed_by>, <age> ago
 ```
 
 `coord_list_tasks` includes pending backlog rows in its no-filter and
 `status='pending'` views when no owner filter is present, alongside active
 task rows marked `kind=task`. Concrete kanban stage filters remain task-only.
 
-Rejected entries append `  reason: <reject_reason>`; promoted entries append `  → task <promoted_task_id>`. Titles are never truncated.
+Rejected entries append `  reason: <reject_reason>`; promoted entries append `  → task <promoted_task_id>`. Emergency-promoted entries show `[EMERGENCY]` and append `emergency: <emergency_rationale>`. Titles are never truncated.
 
 ### 4.0.7 Full board view: `coord_list_tasks`
 
