@@ -506,6 +506,11 @@ uses `build_clean_agent_env(extra=env_overrides)` so sensitive
 deployment variables, including `HARNESS_TOKEN`, are not inherited
 from the server process. Only explicit runtime exceptions such as the
 per-slot `HARNESS_COORD_PROXY_TOKEN` are overlaid after scrubbing.
+Verifier-stage Codex agents that need protected post-ship evidence use
+the verifier-only `coord_run_verifier_smoke` MCP tool. That tool runs
+allowlisted smokes inside the harness server and returns sanitized
+evidence; Codex still does not receive `HARNESS_TOKEN`, bearer headers,
+cookies, smoke tokens, session ids, or secret plaintext.
 
 **Deprecated `.mcp.json` path.** `_write_codex_mcp_json` is retained
 only as a reference helper. The runtime no longer relies on workspace

@@ -170,3 +170,74 @@ async def test_submit_verification_report_requires_active_verifier_assignment(
     }))
     assert "no active verifier assignment" in err.lower()
     assert "p5" in err
+
+
+async def test_submit_verification_report_rejects_exact_live_secret(
+    fresh_db: str,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("HARNESS_TOKEN", "live-harness-token")
+    await init_db()
+    await _seed_verify_task()
+
+    server = _server_for("p4")
+    err = _err_text(await _handler(server, "submit_verification_report")({
+        "task_id": "t-2026-05-16-abcdef01",
+        "verdict": "pass",
+        "body": "token live-harness-token should not be here",
+    }))
+    assert "contains live harness secret material" in err.lower()
+
+    c = await configured_conn()
+    try:
+        cur = await c.execute(
+            "SELECT completed_at FROM task_role_assignments "
+            "WHERE task_id = ? AND role = 'verifier'",
+            ("t-2026-05-16-abcdef01",),
+        )
+        row = dict(await cur.fetchone())
+    finally:
+        await c.close()
+    assert row["completed_at"] is None
+
+
+async def test_submit_verification_report_redacts_bearer_and_cookie_material(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed_verify_task()
+
+    q = bus.subscribe()
+    captured: list[dict[str, Any]] = []
+    try:
+        server = _server_for("p4")
+        _ok_text(await _handler(server, "submit_verification_report")({
+            "task_id": "t-2026-05-16-abcdef01",
+            "verdict": "pass",
+            "body": "Authorization: Bearer rawbearersecret\nCookie: sid=rawcookie\n",
+            "message_to_coach": "Bearer rawcoachbearer",
+            "evidence": {
+                "headers": {"Authorization": "Bearer rawevidencebearer"},
+                "cookie": "sid=rawevidencecookie",
+            },
+        }))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        while True:
+            try:
+                captured.append(q.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+    finally:
+        bus.unsubscribe(q)
+
+    report = verification_report_path("misc", "t-2026-05-16-abcdef01", 1)
+    content = report.read_text(encoding="utf-8")
+    assert "rawbearersecret" not in content
+    assert "rawcookie" not in content
+    assert "[REDACTED]" in content
+
+    dumped_events = json.dumps(captured)
+    assert "rawcoachbearer" not in dumped_events
+    assert "rawevidencebearer" not in dumped_events
+    assert "rawevidencecookie" not in dumped_events

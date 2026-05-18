@@ -2417,9 +2417,22 @@ so permissions do not depend on the model truthfully passing its identity.
 
 - Players only; requires task status `verify` and an active verifier role
   row for the caller.
+- Verifiers may first call
+  `coord_run_verifier_smoke(task_id, target, smoke, params?)` for a
+  server-side allowlisted smoke proxy. The proxy accepts only known
+  targets (`local`, `tot-dev`, `production`) and named read-only smokes;
+  it rejects arbitrary URLs, methods, headers, bodies, tokens, cookies,
+  and unknown params. It returns sanitized `PASS`/`FAIL`/`SKIPPED`/
+  `BLOCKED` evidence and never returns raw `HARNESS_TOKEN`,
+  `HARNESS_SECRETS_KEY`, bearer tokens, cookies, session ids, smoke
+  tokens, auth headers, or secret plaintext.
 - Writes `verifications/verification_<round>.md`, records `pass`/`fail`
   on the verifier role row, marks that row complete, resets the verifier
   to idle tools, emits `verification_report_submitted`, and wakes Coach.
+- Verification report body/evidence/message text is defensively
+  sanitized before persistence/events. Exact live harness secrets are
+  rejected so the verifier role stays open for clean resubmission;
+  generic bearer and cookie material is redacted structurally.
 - `verdict='fail'` does not auto-revert, auto-create follow-up work, or
   archive. Coach reads the report and decides whether to archive, create
   a follow-up, roll back, reroute to execute, or re-ship.
