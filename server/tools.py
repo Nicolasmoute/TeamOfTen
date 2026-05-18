@@ -7593,6 +7593,120 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         )
 
     @tool(
+        "coord_run_verifier_smoke",
+        (
+            "Verifier-only server-side smoke proxy. Runs a named, "
+            "allowlisted protected smoke inside the harness process and "
+            "returns only sanitized PASS/FAIL/SKIPPED/BLOCKED evidence. "
+            "Does not accept arbitrary URLs, headers, methods, bodies, "
+            "tokens, cookies, or auth material.\n\n"
+            "Params:\n"
+            "- task_id: required verifier task id\n"
+            "- target: 'local', 'tot-dev', or 'production'\n"
+            "- smoke: one of health_detail, status_summary, task_board_read, "
+            "agent_context, turns_summary\n"
+            "- params: optional smoke-specific safe params"
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "target": {
+                    "type": "string",
+                    "enum": ["local", "tot-dev", "production"],
+                },
+                "smoke": {
+                    "type": "string",
+                    "enum": [
+                        "health_detail",
+                        "status_summary",
+                        "task_board_read",
+                        "agent_context",
+                        "turns_summary",
+                    ],
+                },
+                "params": {
+                    "type": "object",
+                    "additionalProperties": True,
+                },
+            },
+            "required": ["task_id", "target", "smoke"],
+            "additionalProperties": False,
+        },
+    )
+    async def run_verifier_smoke_tool(args: dict[str, Any]) -> dict[str, Any]:
+        if caller_is_coach:
+            return _err(
+                "Coach doesn't run verifier smokes directly. Assign a "
+                "Player verifier via coord_approve_stage(next_stage='verify', "
+                "assignee=<slot>, note=...) and let them run the smoke."
+            )
+        task_id = (args.get("task_id") or "").strip()
+        target = (args.get("target") or "").strip()
+        smoke = (args.get("smoke") or "").strip()
+        params = args.get("params") or {}
+        if not task_id:
+            return _err("task_id is required")
+        if not target:
+            return _err("target is required")
+        if not smoke:
+            return _err("smoke is required")
+        if not isinstance(params, dict):
+            return _err("params must be an object")
+
+        project_id = await resolve_active_project()
+        c = await configured_conn()
+        try:
+            cur = await c.execute(
+                "SELECT status FROM tasks WHERE id = ? AND project_id = ?",
+                (task_id, project_id),
+            )
+            task_row = await cur.fetchone()
+            if not task_row:
+                return _err(f"task {task_id} not found")
+            actual_stage = dict(task_row).get("status")
+            if actual_stage != "verify":
+                return _err(
+                    f"verification is not active for task {task_id} "
+                    f"(stage={actual_stage}). Coach must approve "
+                    f"ship→verify before verifier smokes are available."
+                )
+            cur = await c.execute(
+                "SELECT id FROM task_role_assignments "
+                "WHERE task_id = ? AND role = 'verifier' AND owner = ? "
+                "AND completed_at IS NULL AND superseded_by IS NULL "
+                "ORDER BY assigned_at DESC LIMIT 1",
+                (task_id, caller_id),
+            )
+            if not await cur.fetchone():
+                return _err(
+                    f"no active verifier assignment for {caller_id} on "
+                    f"task {task_id}. Coach must call "
+                    f"coord_approve_stage(next_stage='verify', assignee=<slot>) "
+                    f"before verifier smokes are available."
+                )
+        finally:
+            await c.close()
+
+        from server.verifier_smokes import (
+            VerifierSmokeError,
+            run_verifier_smoke,
+        )
+        try:
+            evidence = await run_verifier_smoke(
+                caller_id=caller_id,
+                task_id=task_id,
+                target=target,
+                smoke=smoke,
+                params=params,
+            )
+        except VerifierSmokeError as exc:
+            return _err(str(exc))
+        except Exception as exc:
+            return _err(f"verifier smoke failed safely: {type(exc).__name__}: {exc}")
+        return _ok(json.dumps(evidence, ensure_ascii=False, sort_keys=True))
+
+    @tool(
         "coord_submit_verification_report",
         (
             "**Your message to Coach that post-ship verification is done.** "
@@ -7676,6 +7790,32 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             evidence_text = str(evidence_raw)
         if len(evidence_text) > 4000:
             return _err(f"evidence too long ({len(evidence_text)} chars, max 4000)")
+
+        from server.verifier_smokes import (
+            contains_live_secret as _contains_live_verifier_secret,
+            redact_sensitive_text as _redact_verifier_text,
+            sanitize_verifier_evidence as _sanitize_verifier_evidence,
+        )
+
+        if (
+            _contains_live_verifier_secret(body)
+            or _contains_live_verifier_secret(message_to_coach)
+            or _contains_live_verifier_secret(evidence_text)
+        ):
+            return _err(
+                "verification report contains live harness secret material. "
+                "Do not paste HARNESS_TOKEN, HARNESS_SECRETS_KEY, bearer "
+                "tokens, cookies, smoke tokens, or secret plaintext into "
+                "reports; rerun coord_run_verifier_smoke and submit its "
+                "sanitized evidence."
+            )
+        body = _redact_verifier_text(body)
+        message_to_coach = _redact_verifier_text(message_to_coach)
+        evidence_text = _redact_verifier_text(evidence_text)
+        evidence_clean = (
+            _sanitize_verifier_evidence(evidence_raw)
+            if evidence_raw is not None else None
+        )
 
         project_id = await resolve_active_project()
         c = await configured_conn()
@@ -7773,7 +7913,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
             "report_path": rel,
             "round": round_num,
             "verifier_id": caller_id,
-            "evidence": evidence_raw if evidence_raw is not None else None,
+            "evidence": evidence_clean,
             "message_to_coach": message_to_coach or None,
             "to": executor_owner or "coach",
         })
@@ -10655,6 +10795,7 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         update_task,
         write_task_spec,
         submit_audit_report,
+        run_verifier_smoke_tool,
         submit_verification_report,
         my_assignments,
         set_task_trajectory,
@@ -10952,6 +11093,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_update_memory",
     "mcp__coord__coord_commit_push",
     "mcp__coord__coord_ship_to_dev",
+    "mcp__coord__coord_run_verifier_smoke",
     "mcp__coord__coord_submit_verification_report",
     "mcp__coord__coord_write_decision",
     "mcp__coord__coord_propose_file_write",
@@ -10999,6 +11141,7 @@ ALLOWED_COORD_TOOLS = [
     # the SDK accept the call.
     "mcp__coord__coord_write_task_spec",
     "mcp__coord__coord_submit_audit_report",
+    "mcp__coord__coord_run_verifier_smoke",
     "mcp__coord__coord_submit_verification_report",
     "mcp__coord__coord_my_assignments",
     "mcp__coord__coord_set_task_trajectory",
@@ -11008,6 +11151,7 @@ ALLOWED_COORD_TOOLS = [
     "mcp__coord__coord_archive_task",
     "mcp__coord__coord_role_complete",
     "mcp__coord__coord_run_truthgate",
+    "mcp__coord__coord_refresh_truthgate_basis",
     "mcp__coord__coord_record_truthgate_override",
     "mcp__coord__coord_record_provisional_closure",
     "mcp__coord__coord_request_plan_review",
