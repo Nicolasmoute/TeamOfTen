@@ -7635,6 +7635,31 @@ def build_coord_server(caller_id: str, *, include_proxy_metadata: bool = False) 
         },
     )
     async def run_verifier_smoke_tool(args: dict[str, Any]) -> dict[str, Any]:
+        allowed_top_keys = {"task_id", "target", "smoke", "params"}
+        forbidden_request_keys = {
+            "url",
+            "headers",
+            "authorization",
+            "cookie",
+            "token",
+            "method",
+            "body",
+        }
+        top_keys = {str(k) for k in args.keys()}
+        forbidden_top = sorted(
+            k for k in top_keys if k.lower() in forbidden_request_keys
+        )
+        if forbidden_top:
+            return _err(
+                "coord_run_verifier_smoke does not accept arbitrary "
+                "request-shape fields: " + ", ".join(forbidden_top)
+            )
+        unknown_top = sorted(k for k in top_keys if k not in allowed_top_keys)
+        if unknown_top:
+            return _err(
+                "unknown coord_run_verifier_smoke fields: "
+                + ", ".join(unknown_top)
+            )
         if caller_is_coach:
             return _err(
                 "Coach doesn't run verifier smokes directly. Assign a "
