@@ -16,13 +16,17 @@
 
 ---
 
-## The 10% problem
+## Keeping control of a team
 
-> AI agents are remarkable 90% of the time. The other 10% quietly compounds.
+> Everyone in agent orchestration is chasing throughput. More agents, more tasks per hour, more autonomy. That's not the problem I have.
 
-A wrong assumption made on turn 3, baked in by turn 30. A constraint missed. A subtle drift from the spec — subtle, then sudden, then everywhere. **Longer prompts don't fix this.** Scale it across a swarm of agents, across multiple projects, and the 10% compounds into chaos. Existing tools either hide drift behind a dashboard or trap you in one-on-one chat.
+Even with **one** agent, I keep having to adjust, correct, and refine the output.
 
-TeamOfTen is the opposite shape. The constraint is deliberate: **one Coach, ten Players, max** — small enough that one operator can keep the wheel. Six things, working together:
+So the goal here isn't throughput. It's **staying in control of a team of agents** — keeping the human just enough in the loop to steer, without drowning in cut-and-paste. One operator, one wheel, ten agents you can actually trust to run while you sleep.
+
+This is also an ongoing, almost-research project: a place to **build tools for keeping humans in control of agent teams and test how well they actually work** — Truth, Compass, Kanban, Playbook, Recurrence. Some will hold up, some won't. The harness is the lab.
+
+TeamOfTen is the shape that falls out of that constraint: **one Coach, ten Players, max** — small enough that one person can keep the wheel. Six things, working together:
 
 | | | |
 |--|--|--|
