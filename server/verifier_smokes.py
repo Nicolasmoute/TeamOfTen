@@ -36,7 +36,7 @@ DISALLOWED_PARAM_KEYS = frozenset({
 _REDACTION = "[REDACTED]"
 _BEARER_RE = re.compile(r"(?i)\b(authorization\s*:\s*bearer\s+)[^\s,;]+")
 _BARE_BEARER_RE = re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
-_COOKIE_RE = re.compile(r"(?im)^(\s*(?:set-cookie|cookie)\s*:\s*).*$")
+_COOKIE_RE = re.compile(r"(?i)\b((?:set-cookie|cookie)\s*:\s*)[^\r\n'\"`]+")
 _TOKEN_ASSIGN_RE = re.compile(
     r"(?i)\b((?:HARNESS_COORD_PROXY_TOKEN|smoke[_-]?token|smoke[_-]?credential|"
     r"session[_-]?id|auth[_-]?header|api[_-]?key|token)\s*[:=]\s*)[^\s,;]+"
