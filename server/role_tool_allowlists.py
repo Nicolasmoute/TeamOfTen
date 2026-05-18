@@ -123,6 +123,7 @@ ROLE_TOOL_ALLOWLISTS: Final[dict[str, list[str]]] = {
         + COORD_BASE
         + COORD_WRITE_CONTEXT
         + [
+            _coord("coord_run_verifier_smoke"),
             _coord("coord_submit_verification_report"),
         ]
         + INTERACTIVE_TOOLS
