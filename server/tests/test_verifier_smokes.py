@@ -96,6 +96,9 @@ def test_sanitizer_redacts_secret_shapes(monkeypatch: pytest.MonkeyPatch) -> Non
         "Authorization: Bearer abcdefghijklmnop\n"
         "Cookie: sid=secret-session\n"
         "Set-Cookie: other=secret\n"
+        "Request header Cookie: sid=inline-secret\n"
+        "curl -H 'Cookie: sid=curl-secret' https://example\n"
+        "Response Set-Cookie: sid=response-secret\n"
         "smoke_token=very-secret-smoke-token\n"
     )
     redacted = redact_sensitive_text(raw)
@@ -105,6 +108,9 @@ def test_sanitizer_redacts_secret_shapes(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "exact-secret-key" not in redacted
     assert "abcdefghijklmnop" not in redacted
     assert "sid=secret-session" not in redacted
+    assert "sid=inline-secret" not in redacted
+    assert "sid=curl-secret" not in redacted
+    assert "sid=response-secret" not in redacted
     assert "very-secret-smoke-token" not in redacted
 
 

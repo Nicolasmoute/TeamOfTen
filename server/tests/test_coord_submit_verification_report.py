@@ -214,11 +214,19 @@ async def test_submit_verification_report_redacts_bearer_and_cookie_material(
         _ok_text(await _handler(server, "submit_verification_report")({
             "task_id": "t-2026-05-16-abcdef01",
             "verdict": "pass",
-            "body": "Authorization: Bearer rawbearersecret\nCookie: sid=rawcookie\n",
-            "message_to_coach": "Bearer rawcoachbearer",
+            "body": (
+                "Authorization: Bearer rawbearersecret\n"
+                "Cookie: sid=rawcookie\n"
+                "Request header Cookie: sid=rawinlinebodycookie\n"
+            ),
+            "message_to_coach": (
+                "Bearer rawcoachbearer; "
+                "curl -H 'Cookie: sid=rawmessagecookie' https://example"
+            ),
             "evidence": {
                 "headers": {"Authorization": "Bearer rawevidencebearer"},
                 "cookie": "sid=rawevidencecookie",
+                "response": "Response Set-Cookie: sid=rawevidenceinlinecookie",
             },
         }))
         await asyncio.sleep(0)
@@ -235,9 +243,13 @@ async def test_submit_verification_report_redacts_bearer_and_cookie_material(
     content = report.read_text(encoding="utf-8")
     assert "rawbearersecret" not in content
     assert "rawcookie" not in content
+    assert "rawinlinebodycookie" not in content
+    assert "rawmessagecookie" not in content
     assert "[REDACTED]" in content
 
     dumped_events = json.dumps(captured)
     assert "rawcoachbearer" not in dumped_events
+    assert "rawmessagecookie" not in dumped_events
     assert "rawevidencebearer" not in dumped_events
     assert "rawevidencecookie" not in dumped_events
+    assert "rawevidenceinlinecookie" not in dumped_events
