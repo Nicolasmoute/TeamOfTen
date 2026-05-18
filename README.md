@@ -16,11 +16,13 @@
 
 ---
 
+## The 10% problem
+
+> AI agents are remarkable 90% of the time. The other 10% quietly compounds.
+
 ## Keeping control of a team
 
-> Everyone in agent orchestration is chasing throughput. More agents, more tasks per hour, more autonomy. That's not the problem I have.
-
-Even with **one** agent, I keep having to adjust, correct, and refine the output.
+Everyone in agent orchestration is chasing throughput. More agents, more tasks per hour, more autonomy. That's not the problem I have — even with **one** agent, I keep having to adjust, correct, and refine the output.
 
 So the goal here isn't throughput. It's **staying in control of a team of agents** — keeping the human just enough in the loop to steer, without drowning in cut-and-paste. One operator, one wheel, ten agents you can actually trust to run while you sleep.
 
