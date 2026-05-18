@@ -130,3 +130,37 @@ async def test_tool_rejects_arbitrary_request_shape(
     }))
 
     assert "arbitrary request fields" in err.lower()
+
+
+async def test_tool_rejects_top_level_request_shape_keys(
+    fresh_db: str,
+) -> None:
+    await init_db()
+    await _seed_task()
+
+    for key, value in {
+        "url": "https://example.test",
+        "headers": {"Authorization": "Bearer should-not-be-accepted"},
+        "authorization": "Bearer should-not-be-accepted",
+        "cookie": "sid=should-not-be-accepted",
+        "token": "should-not-be-accepted",
+        "method": "GET",
+        "body": "{}",
+    }.items():
+        err = _err_text(await _handler(_server_for("p4"), "run_verifier_smoke")({
+            "task_id": "t-2026-05-17-6d918984",
+            "target": "local",
+            "smoke": "health_detail",
+            key: value,
+        }))
+        assert "does not accept arbitrary request-shape fields" in err
+        assert key in err
+
+    unknown = _err_text(await _handler(_server_for("p4"), "run_verifier_smoke")({
+        "task_id": "t-2026-05-17-6d918984",
+        "target": "local",
+        "smoke": "health_detail",
+        "timeout": 30,
+    }))
+    assert "unknown coord_run_verifier_smoke fields" in unknown
+    assert "timeout" in unknown
